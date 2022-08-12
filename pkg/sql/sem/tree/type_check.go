@@ -617,6 +617,8 @@ func (expr *IndirectionExpr) TypeCheck(
 	case types.ArrayFamily:
 		expr.typ = typ.ArrayContents()
 		for i, t := range expr.Indirection {
+
+			// if slice, type check both begin and end expr
 			if t.Slice {
 				return nil, unimplemented.NewWithIssuef(32551, "ARRAY slicing in %s", expr)
 			}
