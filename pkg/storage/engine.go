@@ -153,11 +153,19 @@ type SimpleMVCCIterator interface {
 	// encoded key is identical to the range key's start bound, and they will
 	// be emitted together at that position.
 	NextKey()
-	// UnsafeKey returns the same value as Key, but the memory is invalidated on
-	// the next call to {Next,NextKey,Prev,SeekGE,SeekLT,Close}.
+	// UnsafeKey returns the current key position. This may be a point key, or
+	// the current position inside a range key (typically the start key
+	// or the seek key when using SeekGE within its bounds).
+	//
+	// The memory is invalidated on the next call to {Next,NextKey,Prev,SeekGE,
+	// SeekLT,Close}. Use Key() if this is undesirable.
 	UnsafeKey() MVCCKey
-	// UnsafeValue returns the same value as Value, but the memory is
-	// invalidated on the next call to {Next,NextKey,Prev,SeekGE,SeekLT,Close}.
+	// UnsafeValue returns the current point key value as a byte slice.
+	// This must only be called when it is known that the iterator is positioned
+	// at a point value, i.e. HasPointAndRange has returned (true, *).
+	//
+	// The memory is invalidated on the next call to {Next,NextKey,Prev,SeekGE,SeekLT,Close}.
+	// Use Value() if that is undesirable.
 	UnsafeValue() []byte
 	// HasPointAndRange returns whether the current iterator position has a point
 	// key and/or a range key. Must check Valid() first. At least one of these
@@ -165,16 +173,20 @@ type SimpleMVCCIterator interface {
 	// comment on SimpleMVCCIterator.
 	HasPointAndRange() (bool, bool)
 	// RangeBounds returns the range bounds for the current range key, or an
-	// empty span if there are none. The returned keys are only valid until the
-	// next iterator call.
+	// empty span if there are none. The returned keys are valid until the
+	// range key changes, see RangeKeyChanged().
 	RangeBounds() roachpb.Span
 	// RangeKeys returns a stack of all range keys (with different timestamps) at
 	// the current key position. When at a point key, it will return all range
-	// keys overlapping that point key. The stack is only valid until the next
-	// iterator operation. For details on range keys, see comment on
-	// SimpleMVCCIterator, or this tech note:
+	// keys overlapping that point key. The stack is valid until the range key
+	// changes, see RangeKeyChanged().
+	//
+	// For details on range keys, see SimpleMVCCIterator comment, or tech note:
 	// https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/mvcc-range-tombstones.md
 	RangeKeys() MVCCRangeKeyStack
+	// RangeKeyChanged returns true if the previous seek or step moved to a
+	// different range key (or none at all). This includes an exhausted iterator.
+	RangeKeyChanged() bool
 }
 
 // IteratorStats is returned from {MVCCIterator,EngineIterator}.Stats.
@@ -226,9 +238,7 @@ type MVCCIterator interface {
 	// keys by avoiding the need to iterate over many deleted intents.
 	SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID)
 
-	// Key returns the current key position. This may be a point key, or
-	// the current position inside a range key (typically the start key
-	// or the seek key when using SeekGE within its bounds).
+	// Key is like UnsafeKey, but returns memory now owned by the caller.
 	Key() MVCCKey
 	// UnsafeRawKey returns the current raw key which could be an encoded
 	// MVCCKey, or the more general EngineKey (for a lock table key).
@@ -247,7 +257,7 @@ type MVCCIterator interface {
 	// currently used by callers who pass around key information as a []byte --
 	// this seems avoidable, and we should consider cleaning up the callers.
 	UnsafeRawMVCCKey() []byte
-	// Value returns the current point key value as a byte slice.
+	// Value is like UnsafeValue, but returns memory owned by the caller.
 	Value() []byte
 	// ValueProto unmarshals the value the iterator is currently
 	// pointing to using a protobuf decoder.
@@ -263,6 +273,9 @@ type MVCCIterator interface {
 	FindSplitKey(start, end, minSplitKey roachpb.Key, targetSize int64) (MVCCKey, error)
 	// Stats returns statistics about the iterator.
 	Stats() IteratorStats
+	// IsPrefix returns true if the MVCCIterator is a prefix iterator, i.e.
+	// created with IterOptions.Prefix enabled.
+	IsPrefix() bool
 	// SupportsPrev returns true if MVCCIterator implementation supports reverse
 	// iteration with Prev() or SeekLT().
 	SupportsPrev() bool
@@ -299,6 +312,9 @@ type EngineIterator interface {
 	EngineRangeBounds() (roachpb.Span, error)
 	// EngineRangeKeys returns the engine range keys at the current position.
 	EngineRangeKeys() []EngineRangeKeyValue
+	// RangeKeyChanged returns true if the previous seek or step moved to a
+	// different range key (or none at all). This includes an exhausted iterator.
+	RangeKeyChanged() bool
 	// UnsafeEngineKey returns the same value as EngineKey, but the memory is
 	// invalidated on the next call to {Next,NextKey,Prev,SeekGE,SeekLT,Close}.
 	// REQUIRES: latest positioning function returned valid=true.
@@ -390,6 +406,10 @@ type IterOptions struct {
 	// would return all keys in the old [3-7] SST but not take into account the
 	// separate [3-5] SST where foo@5 was removed or updated. See also:
 	// https://github.com/cockroachdb/pebble/issues/1786
+	//
+	// NB: Range keys are not currently subject to timestamp filtering due to
+	// complications with MVCCIncrementalIterator. See:
+	// https://github.com/cockroachdb/cockroach/issues/86260
 	//
 	// Currently, the only way to correctly use such an iterator is to use it in
 	// concert with an iterator without timestamp hints, as done by
@@ -935,6 +955,10 @@ type Engine interface {
 	// calls to this method. Hence, this should be used with care, with only one
 	// caller, which is currently the admission control subsystem.
 	GetInternalIntervalMetrics() *pebble.InternalIntervalMetrics
+
+	// SetCompactionConcurrency is used to set the engine's compaction
+	// concurrency. It returns the previous compaction concurrency.
+	SetCompactionConcurrency(n uint64) uint64
 }
 
 // Batch is the interface for batch specific operations.

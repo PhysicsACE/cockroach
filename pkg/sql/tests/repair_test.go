@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -259,7 +260,9 @@ func TestDescriptorRepair(t *testing.T) {
 
 	ctx := context.Background()
 	setup := func(t *testing.T) (serverutils.TestServerInterface, *gosql.DB, func()) {
-		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		args := base.TestServerArgs{}
+		args.Knobs.EventLog = &sql.EventLogTestingKnobs{SyncWrites: true}
+		s, db, _ := serverutils.StartServer(t, args)
 		return s, db, func() {
 			s.Stopper().Stop(ctx)
 		}
@@ -381,7 +384,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				upsertInvalidDuplicateColumnDescriptorBefore,
 			},
 			op:       `SELECT crdb_internal.unsafe_upsert_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID);`,
-			expErrRE: `relation "foo" \($invalidTableID\): duplicate column name: "i"`,
+			expErrRE: `relation "foo" \($invalidTableID\): column "i" duplicate ID of column "i"`,
 		},
 		{ // 5
 			// Upsert a descriptor which is invalid, then try to upsert a namespace
@@ -393,7 +396,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			expEventLogEntries: []eventLogPattern{
 				{
 					typ:  "unsafe_upsert_namespace_entry",
-					info: `"Force":true,"FailedValidation":true,"ValidationErrors":".*duplicate column name: \\"i\\""`,
+					info: `"Force":true,"FailedValidation":true,"ValidationErrors":".*duplicate ID of column \\"i\\".*"`,
 				},
 			},
 		},
@@ -405,7 +408,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				`SELECT crdb_internal.unsafe_upsert_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID, true);`,
 			},
 			op:       `SELECT crdb_internal.unsafe_delete_descriptor($invalidTableID);`,
-			expErrRE: `pq: crdb_internal.unsafe_delete_descriptor\(\): relation "foo" \($invalidTableID\): duplicate column name: "i"`,
+			expErrRE: `pq: crdb_internal.unsafe_delete_descriptor\(\): relation "foo" \($invalidTableID\): column "i" duplicate ID of column "i"`,
 		},
 		{ // 7
 			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
@@ -418,7 +421,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			expEventLogEntries: []eventLogPattern{
 				{
 					typ:  "unsafe_delete_descriptor",
-					info: `"Force":true,.*duplicate column name: \\"i\\""`,
+					info: `"Force":true,.*duplicate ID of column \\"i\\".*"`,
 				},
 			},
 		},
@@ -430,7 +433,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				`SELECT crdb_internal.unsafe_upsert_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID, true);`,
 			},
 			op:       updateInvalidDuplicateColumnDescriptorNoForce,
-			expErrRE: `pq: crdb_internal.unsafe_upsert_descriptor\(\): relation "foo" \($invalidTableID\): duplicate column name: "i"`,
+			expErrRE: `pq: crdb_internal.unsafe_upsert_descriptor\(\): relation "foo" \($invalidTableID\): column "i" duplicate ID of column "i"`,
 		},
 		{ // 9
 			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
@@ -443,7 +446,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			expEventLogEntries: []eventLogPattern{
 				{
 					typ:  "unsafe_upsert_descriptor",
-					info: `"Force":true,"ForceNotice":".*duplicate column name: \\"i\\""`,
+					info: `"Force":true,"ForceNotice":".*duplicate ID of column \\"i\\".*"`,
 				},
 			},
 			after: []string{
@@ -459,7 +462,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				`SELECT crdb_internal.unsafe_upsert_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID, true);`,
 			},
 			op:       `SELECT crdb_internal.unsafe_delete_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID);`,
-			expErrRE: `pq: crdb_internal.unsafe_delete_namespace_entry\(\): failed to retrieve descriptor $invalidTableID: relation "foo" \($invalidTableID\): duplicate column name: "i"`,
+			expErrRE: `pq: crdb_internal.unsafe_delete_namespace_entry\(\): failed to retrieve descriptor $invalidTableID: relation "foo" \($invalidTableID\): column "i" duplicate ID of column "i"`,
 		},
 		{ // 11
 			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
@@ -472,7 +475,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			expEventLogEntries: []eventLogPattern{
 				{
 					typ:  "unsafe_delete_namespace_entry",
-					info: `"Force":true,"ForceNotice":".*duplicate column name: \\"i\\""`,
+					info: `"Force":true,"ForceNotice":".*duplicate ID of column \\"i\\".*"`,
 				},
 			},
 		},
@@ -497,6 +500,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			s, db, cleanup := setup(t)
 			now := s.Clock().Now().GoTime()
 			defer cleanup()
+
 			tdb := sqlutils.MakeSQLRunner(db)
 			descs.ValidateOnWriteEnabled.Override(ctx, &s.ClusterSettings().SV, false)
 			for _, op := range tc.before {

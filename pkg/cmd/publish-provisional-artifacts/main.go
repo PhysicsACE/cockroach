@@ -154,10 +154,7 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 		updateLatest = true
 	}
 
-	platforms := []release.Platform{release.PlatformLinux, release.PlatformMacOS, release.PlatformWindows}
-	if !flags.isRelease {
-		platforms = append(platforms, release.PlatformLinuxArm)
-	}
+	platforms := []release.Platform{release.PlatformLinux, release.PlatformMacOS, release.PlatformWindows, release.PlatformLinuxArm}
 	var cockroachBuildOpts []opts
 	for _, platform := range platforms {
 		var o opts
@@ -193,14 +190,21 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 			} else {
 				for _, provider := range providers {
 					release.PutRelease(provider, release.PutReleaseOptions{
-						NoCache:    false,
-						Platform:   o.Platform,
-						VersionStr: o.VersionStr,
+						NoCache:       false,
+						Platform:      o.Platform,
+						VersionStr:    o.VersionStr,
+						ArchivePrefix: "cockroach",
 						Files: append(
 							[]release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.AbsolutePath, "cockroach")},
 							release.MakeCRDBLibraryArchiveFiles(o.PkgDir, o.Platform)...,
 						),
-						ExtraFiles: []release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.CockroachSQLAbsolutePath, "cockroach-sql")},
+					})
+					release.PutRelease(provider, release.PutReleaseOptions{
+						NoCache:       false,
+						Platform:      o.Platform,
+						VersionStr:    o.VersionStr,
+						ArchivePrefix: "cockroach-sql",
+						Files:         []release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.CockroachSQLAbsolutePath, "cockroach-sql")},
 					})
 				}
 			}

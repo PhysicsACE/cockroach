@@ -871,6 +871,8 @@ available replica will error.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="trunc"></a><code>trunc(val: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Truncates the decimal values of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="trunc"></a><code>trunc(val: <a href="decimal.html">decimal</a>, scale: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Truncate <code>val</code> to <code>scale</code> decimal places</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="trunc"></a><code>trunc(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Truncates the decimal values of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr></tbody>
 </table>
@@ -3454,6 +3456,10 @@ A write probe will effectively probe reads as well.</p>
 <tr><td><a name="pg_column_size"></a><code>pg_column_size(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return size in bytes of the column provided as an argument</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="pg_get_serial_sequence"></a><code>pg_get_serial_sequence(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the name of the sequence used by the given column_name in the table table_name.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_viewdef"></a><code>pg_get_viewdef(view_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the CREATE statement for an existing view.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_viewdef"></a><code>pg_get_viewdef(view_oid: oid, pretty_bool: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the CREATE statement for an existing view.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_has_role"></a><code>pg_has_role(role: <a href="string.html">string</a>, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the current user has privileges for role.</p>
 </span></td><td>Stable</td></tr>

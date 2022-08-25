@@ -352,7 +352,7 @@ func (r *Refresher) autoStatsFractionStaleRows(explicitSettings *catpb.AutoStats
 func (r *Refresher) getTableDescriptor(
 	ctx context.Context, tableID descpb.ID,
 ) (desc catalog.TableDescriptor) {
-	if err := r.cache.collectionFactory.Txn(ctx, r.cache.SQLExecutor, r.cache.ClientDB, func(
+	if err := r.cache.collectionFactory.Txn(ctx, r.cache.ClientDB, func(
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) (err error) {
 		flags := tree.ObjectLookupFlagsWithRequired()
@@ -808,6 +808,9 @@ func avgRefreshTime(tableStats []*TableStatistic) time.Duration {
 			continue
 		}
 		if !areEqual(stat.ColumnIDs, reference.ColumnIDs) {
+			continue
+		}
+		if stat.CreatedAt.Equal(reference.CreatedAt) {
 			continue
 		}
 		// Stats are sorted with the most recent first.

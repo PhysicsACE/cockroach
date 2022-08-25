@@ -133,7 +133,6 @@ func TestHeartbeatCB(t *testing.T) {
 		s := newTestServer(t, serverCtx)
 		RegisterHeartbeatServer(s, &HeartbeatService{
 			clock:              clock,
-			maxOffset:          maxOffset,
 			remoteClockMonitor: serverCtx.RemoteClocks,
 			clusterID:          serverCtx.StorageClusterID,
 			nodeID:             serverCtx.NodeID,
@@ -320,8 +319,34 @@ var _ roachpb.InternalServer = &internalServer{}
 
 type internalServer struct {
 	// rangeFeedEvents are returned on RangeFeed() calls.
-	rangeFeedEvents []roachpb.RangeFeedEvent
-	serverStream    roachpb.Internal_RangeFeedServer
+	rangeFeedEvents   []roachpb.RangeFeedEvent
+	rfServerStream    roachpb.Internal_RangeFeedServer
+	muxRfServerStream roachpb.Internal_MuxRangeFeedServer
+}
+
+type rangefeedEventSink struct {
+	ctx    context.Context
+	stream roachpb.Internal_MuxRangeFeedServer
+}
+
+var _ roachpb.RangeFeedEventSink = (*rangefeedEventSink)(nil)
+
+func (s *rangefeedEventSink) Context() context.Context {
+	return s.ctx
+}
+
+func (s *rangefeedEventSink) Send(event *roachpb.RangeFeedEvent) error {
+	return s.stream.Send(&roachpb.MuxRangeFeedEvent{RangeFeedEvent: *event})
+}
+
+func (s *internalServer) MuxRangeFeed(stream roachpb.Internal_MuxRangeFeedServer) error {
+	s.muxRfServerStream = stream
+	_, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	sink := &rangefeedEventSink{ctx: stream.Context(), stream: stream}
+	return s.singleRangeFeed(sink)
 }
 
 func (*internalServer) Batch(
@@ -339,10 +364,18 @@ func (*internalServer) RangeLookup(
 func (s *internalServer) RangeFeed(
 	_ *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) error {
-	s.serverStream = stream
+	s.rfServerStream = stream
+	err := s.singleRangeFeed(stream)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *internalServer) singleRangeFeed(sink roachpb.RangeFeedEventSink) error {
 	for _, ev := range s.rangeFeedEvents {
 		evCpy := ev
-		if err := stream.Send(&evCpy); err != nil {
+		if err := sink.Send(&evCpy); err != nil {
 			return err
 		}
 	}
@@ -540,37 +573,57 @@ func TestInternalClientAdapterWithClientStreamInterceptors(t *testing.T) {
 	serverCtx.NodeID.Set(context.Background(), 1)
 
 	_ /* server */, serverInterceptors := NewServerEx(serverCtx)
+	testutils.RunTrueAndFalse(t, "use_mux_rangefeed", func(t *testing.T, useMux bool) {
+		var clientInterceptors ClientInterceptorInfo
+		var s *testClientStream
+		clientInterceptors.StreamInterceptors = append(clientInterceptors.StreamInterceptors,
+			func(
+				ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn,
+				method string, streamer grpc.Streamer, opts ...grpc.CallOption,
+			) (grpc.ClientStream, error) {
+				clientStream, err := streamer(ctx, desc, cc, method, opts...)
+				if err != nil {
+					return nil, err
+				}
+				s = &testClientStream{inner: clientStream}
+				return s, nil
+			})
 
-	var clientInterceptors ClientInterceptorInfo
-	var s *testClientStream
-	clientInterceptors.StreamInterceptors = append(clientInterceptors.StreamInterceptors,
-		func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-			clientStream, err := streamer(ctx, desc, cc, method, opts...)
-			if err != nil {
-				return nil, err
+		internal := &internalServer{rangeFeedEvents: []roachpb.RangeFeedEvent{{}, {}}}
+		serverCtx.SetLocalInternalServer(internal, serverInterceptors, clientInterceptors)
+		ic := serverCtx.GetLocalInternalClientForAddr(serverCtx.Config.AdvertiseAddr, 1)
+		lic, ok := ic.(internalClientAdapter)
+		require.True(t, ok)
+		require.Equal(t, internal, lic.server)
+
+		var receiveEvent func() error
+		if useMux {
+			stream, err := lic.MuxRangeFeed(ctx)
+			require.NoError(t, err)
+			require.NoError(t, stream.Send(&roachpb.RangeFeedRequest{}))
+			receiveEvent = func() error {
+				e, err := stream.Recv()
+				_ = e
+				return err
 			}
-			s = &testClientStream{inner: clientStream}
-			return s, nil
-		})
-
-	internal := &internalServer{rangeFeedEvents: []roachpb.RangeFeedEvent{{}, {}}}
-	serverCtx.SetLocalInternalServer(internal, serverInterceptors, clientInterceptors)
-	ic := serverCtx.GetLocalInternalClientForAddr(serverCtx.Config.AdvertiseAddr, 1)
-	lic, ok := ic.(internalClientAdapter)
-	require.True(t, ok)
-	require.Equal(t, internal, lic.server)
-
-	stream, err := lic.RangeFeed(ctx, &roachpb.RangeFeedRequest{})
-	require.NoError(t, err)
-	// Consume the stream.
-	for {
-		_, err := stream.Recv()
-		if err == io.EOF {
-			break
+		} else {
+			stream, err := lic.RangeFeed(ctx, &roachpb.RangeFeedRequest{})
+			require.NoError(t, err)
+			receiveEvent = func() error {
+				_, err := stream.Recv()
+				return err
+			}
 		}
-		require.NoError(t, err)
-	}
-	require.Equal(t, len(internal.rangeFeedEvents)+1, s.recvCount)
+		// Consume the stream.
+		for {
+			err := receiveEvent()
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+		}
+		require.Equal(t, len(internal.rangeFeedEvents)+1, s.recvCount)
+	})
 }
 
 // Test that a server stream interceptor can wrap the ServerStream when the
@@ -592,56 +645,79 @@ func TestInternalClientAdapterWithServerStreamInterceptors(t *testing.T) {
 	serverCtx.NodeID.Set(context.Background(), 1)
 
 	_ /* server */, serverInterceptors := NewServerEx(serverCtx)
+	testutils.RunTrueAndFalse(t, "use_mux_rangefeed", func(t *testing.T, useMux bool) {
+		const int1Name = "interceptor 1"
+		serverInterceptors.StreamInterceptors = append(serverInterceptors.StreamInterceptors,
+			func(
+				srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
+			) error {
+				serverStream := &testServerStream{name: "interceptor 1", inner: ss}
+				return handler(srv, serverStream)
+			})
+		var secondInterceptorWrapped grpc.ServerStream
+		const int2Name = "interceptor 2"
+		serverInterceptors.StreamInterceptors = append(serverInterceptors.StreamInterceptors,
+			func(
+				srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
+			) error {
+				secondInterceptorWrapped = ss
+				serverStream := &testServerStream{name: int2Name, inner: ss}
+				return handler(srv, serverStream)
+			})
 
-	const int1Name = "interceptor 1"
-	serverInterceptors.StreamInterceptors = append(serverInterceptors.StreamInterceptors,
-		func(
-			srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
-		) error {
-			serverStream := &testServerStream{name: "interceptor 1", inner: ss}
-			return handler(srv, serverStream)
-		})
-	var secondInterceptorWrapped grpc.ServerStream
-	const int2Name = "interceptor 2"
-	serverInterceptors.StreamInterceptors = append(serverInterceptors.StreamInterceptors,
-		func(
-			srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
-		) error {
-			secondInterceptorWrapped = ss
-			serverStream := &testServerStream{name: int2Name, inner: ss}
-			return handler(srv, serverStream)
-		})
+		internal := &internalServer{rangeFeedEvents: []roachpb.RangeFeedEvent{{}, {}}}
+		serverCtx.SetLocalInternalServer(internal, serverInterceptors, ClientInterceptorInfo{})
+		ic := serverCtx.GetLocalInternalClientForAddr(serverCtx.Config.AdvertiseAddr, 1)
+		lic, ok := ic.(internalClientAdapter)
+		require.True(t, ok)
+		require.Equal(t, internal, lic.server)
 
-	internal := &internalServer{rangeFeedEvents: []roachpb.RangeFeedEvent{{}, {}}}
-	serverCtx.SetLocalInternalServer(internal, serverInterceptors, ClientInterceptorInfo{})
-	ic := serverCtx.GetLocalInternalClientForAddr(serverCtx.Config.AdvertiseAddr, 1)
-	lic, ok := ic.(internalClientAdapter)
-	require.True(t, ok)
-	require.Equal(t, internal, lic.server)
-
-	stream, err := lic.RangeFeed(ctx, &roachpb.RangeFeedRequest{})
-	require.NoError(t, err)
-
-	// Consume the stream. This will synchronize with the server RPC handler
-	// goroutine, ensuring that the server-side interceptors run.
-	for {
-		_, err := stream.Recv()
-		if err == io.EOF {
-			break
+		var receiveEvent func() error
+		if useMux {
+			stream, err := lic.MuxRangeFeed(ctx)
+			require.NoError(t, err)
+			require.NoError(t, stream.Send(&roachpb.RangeFeedRequest{}))
+			receiveEvent = func() error {
+				_, err := stream.Recv()
+				return err
+			}
+		} else {
+			stream, err := lic.RangeFeed(ctx, &roachpb.RangeFeedRequest{})
+			require.NoError(t, err)
+			receiveEvent = func() error {
+				_, err := stream.Recv()
+				return err
+			}
 		}
-		require.NoError(t, err)
-	}
 
-	require.IsType(t, &testServerStream{}, secondInterceptorWrapped)
-	require.Equal(t, int1Name, secondInterceptorWrapped.(*testServerStream).name)
-	require.IsType(t, rangeFeedServerAdapter{}, internal.serverStream)
-	ss := internal.serverStream.(rangeFeedServerAdapter).ServerStream
-	require.IsType(t, &testServerStream{}, ss)
-	topStream := ss.(*testServerStream)
-	require.Equal(t, int2Name, topStream.name)
-	require.IsType(t, &testServerStream{}, topStream.inner)
-	bottomStream := topStream.inner.(*testServerStream)
-	require.Equal(t, int1Name, bottomStream.name)
+		// Consume the stream. This will synchronize with the server RPC handler
+		// goroutine, ensuring that the server-side interceptors run.
+		for {
+			err := receiveEvent()
+			if err == io.EOF {
+				break
+			}
+			require.NoError(t, err)
+		}
+
+		require.IsType(t, &testServerStream{}, secondInterceptorWrapped)
+
+		require.Equal(t, int1Name, secondInterceptorWrapped.(*testServerStream).name)
+		var ss grpc.ServerStream
+		if useMux {
+			require.IsType(t, muxRangeFeedServerAdapter{}, internal.muxRfServerStream)
+			ss = internal.muxRfServerStream.(muxRangeFeedServerAdapter).ServerStream
+		} else {
+			require.IsType(t, rangeFeedServerAdapter{}, internal.rfServerStream)
+			ss = internal.rfServerStream.(rangeFeedServerAdapter).ServerStream
+		}
+		require.IsType(t, &testServerStream{}, ss)
+		topStream := ss.(*testServerStream)
+		require.Equal(t, int2Name, topStream.name)
+		require.IsType(t, &testServerStream{}, topStream.inner)
+		bottomStream := topStream.inner.(*testServerStream)
+		require.Equal(t, int1Name, bottomStream.name)
+	})
 }
 
 type testClientStream struct {
@@ -1025,7 +1101,6 @@ func TestHeartbeatHealthTransport(t *testing.T) {
 	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
-		maxOffset:          maxOffset,
 		remoteClockMonitor: serverCtx.RemoteClocks,
 		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
@@ -1207,7 +1282,6 @@ func TestOffsetMeasurement(t *testing.T) {
 	s := newTestServer(t, serverCtx)
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              serverClock,
-		maxOffset:          maxOffset,
 		remoteClockMonitor: serverCtx.RemoteClocks,
 		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
@@ -1391,7 +1465,6 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 		s := newTestServer(t, nodeCtxs[i].ctx)
 		RegisterHeartbeatServer(s, &HeartbeatService{
 			clock:              clock,
-			maxOffset:          maxOffset,
 			remoteClockMonitor: nodeCtxs[i].ctx.RemoteClocks,
 			clusterID:          nodeCtxs[i].ctx.StorageClusterID,
 			nodeID:             nodeCtxs[i].ctx.NodeID,
@@ -1586,7 +1659,6 @@ func grpcRunKeepaliveTestCase(testCtx context.Context, c grpcKeepaliveTestCase) 
 	hss := &HeartbeatStreamService{
 		HeartbeatService: HeartbeatService{
 			clock:              clock,
-			maxOffset:          maxOffset,
 			remoteClockMonitor: serverCtx.RemoteClocks,
 			clusterID:          serverCtx.StorageClusterID,
 			nodeID:             serverCtx.NodeID,
@@ -1868,7 +1940,6 @@ func TestClusterIDMismatch(t *testing.T) {
 	s := newTestServer(t, serverCtx)
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
-		maxOffset:          maxOffset,
 		remoteClockMonitor: serverCtx.RemoteClocks,
 		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
@@ -1943,7 +2014,6 @@ func TestClusterNameMismatch(t *testing.T) {
 			s := newTestServer(t, serverCtx)
 			RegisterHeartbeatServer(s, &HeartbeatService{
 				clock:                          clock,
-				maxOffset:                      maxOffset,
 				remoteClockMonitor:             serverCtx.RemoteClocks,
 				clusterID:                      serverCtx.StorageClusterID,
 				nodeID:                         serverCtx.NodeID,
@@ -1995,7 +2065,6 @@ func TestNodeIDMismatch(t *testing.T) {
 	s := newTestServer(t, serverCtx)
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
-		maxOffset:          maxOffset,
 		remoteClockMonitor: serverCtx.RemoteClocks,
 		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
@@ -2070,7 +2139,6 @@ func TestVersionCheckBidirectional(t *testing.T) {
 			s := newTestServer(t, serverCtx)
 			RegisterHeartbeatServer(s, &HeartbeatService{
 				clock:              clock,
-				maxOffset:          maxOffset,
 				remoteClockMonitor: serverCtx.RemoteClocks,
 				clusterID:          serverCtx.StorageClusterID,
 				nodeID:             serverCtx.NodeID,
@@ -2118,7 +2186,6 @@ func TestGRPCDialClass(t *testing.T) {
 	s := newTestServer(t, serverCtx)
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
-		maxOffset:          maxOffset,
 		remoteClockMonitor: serverCtx.RemoteClocks,
 		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,
@@ -2178,7 +2245,6 @@ func TestTestingKnobs(t *testing.T) {
 	))
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              clock,
-		maxOffset:          maxOffset,
 		remoteClockMonitor: serverCtx.RemoteClocks,
 		clusterID:          serverCtx.StorageClusterID,
 		nodeID:             serverCtx.NodeID,

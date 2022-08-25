@@ -71,8 +71,10 @@ CREATE TABLE system.role_options (
 	username STRING NOT NULL,
 	option STRING NOT NULL,
 	value STRING,
+	user_id OID NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (username, option),
-	FAMILY "primary" (username, option, value)
+	INDEX users_user_id_idx (user_id ASC),
+	FAMILY "primary" (username, option, value, user_id)
 )`
 
 	// Zone settings per DB/Table.
@@ -124,9 +126,18 @@ CREATE TABLE system.lease (
   CONSTRAINT "primary" PRIMARY KEY ("descID", version, expiration, "nodeID")
 );`
 
-	// TODO(knz): targetID and reportingID are deprecated and should
-	// be removed after v21.1 is released. Their content is now
-	// available inside the info payload, which is a JSON blob.
+	// system.eventlog contains notable events from the cluster.
+	//
+	// This data is also exported to the Observability Service. This table might
+	// go away in the future.
+	//
+	// The "reportingID" column is the SQL instance ID of the
+	// server that reported the event. For node events, this
+	// value is also equal to the node ID.
+	//
+	// Note: the column "targetID" was deprecated in v21.1 and
+	// is not populated any more as of v22.2 (its value remains zero).
+	// TODO(knz): Implement a migration to remove it.
 	EventLogTableSchema = `
 CREATE TABLE system.eventlog (
   timestamp     TIMESTAMP  NOT NULL,
@@ -1798,13 +1809,13 @@ var (
 				{Name: "username", ID: 1, Type: types.String},
 				{Name: "option", ID: 2, Type: types.String},
 				{Name: "value", ID: 3, Type: types.String, Nullable: true},
+				{Name: "user_id", ID: 4, Type: types.Oid},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
-					Name:            "primary",
-					ColumnNames:     []string{"username", "option", "value"},
-					ColumnIDs:       []descpb.ColumnID{1, 2, 3},
-					DefaultColumnID: 3,
+					Name:        "primary",
+					ColumnNames: []string{"username", "option", "value", "user_id"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -1814,6 +1825,16 @@ var (
 				KeyColumnNames:      []string{"username", "option"},
 				KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC, catpb.IndexColumn_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
+			},
+			descpb.IndexDescriptor{
+				Name:                "users_user_id_idx",
+				ID:                  2,
+				Unique:              false,
+				KeyColumnNames:      []string{"user_id"},
+				KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{4},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				KeySuffixColumnIDs:  []descpb.ColumnID{1, 2},
 			},
 		))
 

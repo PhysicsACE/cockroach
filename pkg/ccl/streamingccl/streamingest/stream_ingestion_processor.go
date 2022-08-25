@@ -328,7 +328,7 @@ func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 
 		if streamingKnobs, ok := sip.FlowCtx.TestingKnobs().StreamingTestingKnobs.(*sql.StreamingTestingKnobs); ok {
 			if streamingKnobs != nil && streamingKnobs.BeforeClientSubscribe != nil {
-				streamingKnobs.BeforeClientSubscribe(string(token), startTime)
+				streamingKnobs.BeforeClientSubscribe(addr, string(token), startTime)
 			}
 		}
 
@@ -697,7 +697,7 @@ func (sip *streamIngestionProcessor) bufferKV(kv *roachpb.KeyValue) error {
 }
 
 func (sip *streamIngestionProcessor) bufferCheckpoint(event partitionEvent) error {
-	resolvedSpans := *event.GetResolvedSpans()
+	resolvedSpans := event.GetResolvedSpans()
 	if resolvedSpans == nil {
 		return errors.New("checkpoint event expected to have resolved spans")
 	}

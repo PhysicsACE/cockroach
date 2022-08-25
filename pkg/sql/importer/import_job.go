@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -43,9 +42,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -129,21 +130,13 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 					curDetails = schemaMetadata.schemaPreparedDetails
 				}
 
-				if r.settings.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
-					// In 22.1, the Public schema should always be present in the database.
-					// Make sure it is part of schemaMetadata, it is not guaranteed to
-					// be added in prepareSchemasForIngestion if we're not importing any
-					// schemas.
-					// The Public schema will not change in the database so both the
-					// oldSchemaIDToName and newSchemaIDToName entries will be the
-					// same for the Public schema.
-					_, dbDesc, err := descsCol.GetImmutableDatabaseByID(ctx, txn, details.ParentID, tree.DatabaseLookupFlags{Required: true})
-					if err != nil {
-						return err
-					}
-					schemaMetadata.oldSchemaIDToName[dbDesc.GetSchemaID(tree.PublicSchema)] = tree.PublicSchema
-					schemaMetadata.newSchemaIDToName[dbDesc.GetSchemaID(tree.PublicSchema)] = tree.PublicSchema
+				// The public schema is expected to always be present in the database for 22.2+.
+				_, dbDesc, err := descsCol.GetImmutableDatabaseByID(ctx, txn, details.ParentID, tree.DatabaseLookupFlags{Required: true})
+				if err != nil {
+					return err
 				}
+				schemaMetadata.oldSchemaIDToName[dbDesc.GetSchemaID(tree.PublicSchema)] = tree.PublicSchema
+				schemaMetadata.newSchemaIDToName[dbDesc.GetSchemaID(tree.PublicSchema)] = tree.PublicSchema
 
 				preparedDetails, err = r.prepareTablesForIngestion(ctx, p, curDetails, txn, descsCol,
 					schemaMetadata)
@@ -269,6 +262,14 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 					return errors.Wrap(err, "checking if existing table is empty")
 				}
 				details.Tables[i].WasEmpty = len(res) == 0
+				if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_1) {
+					// Update the descriptor in the job record and in the database with the ImportStartTime
+					details.Tables[i].Desc.ImportStartWallTime = details.Walltime
+					err := bindImportStartTime(ctx, p, tblDesc.GetID(), details.Walltime)
+					if err != nil {
+						return err
+					}
+				}
 			}
 		}
 
@@ -388,7 +389,8 @@ func (r *importResumer) prepareTablesForIngestion(
 				return importDetails, err
 			}
 			importDetails.Tables[i] = jobspb.ImportDetails_Table{
-				Desc: desc, Name: table.Name,
+				Desc:       desc,
+				Name:       table.Name,
 				SeqVal:     table.SeqVal,
 				IsNew:      table.IsNew,
 				TargetCols: table.TargetCols,
@@ -452,10 +454,10 @@ func (r *importResumer) prepareTablesForIngestion(
 	// wait for all nodes to see the same descriptor version before doing so.
 	if !hasExistingTables {
 		importDetails.Walltime = p.ExecCfg().Clock.Now().WallTime
+		// TODO(msbutler): add import start time to IMPORT PGDUMP/MYSQL descriptor
 	} else {
 		importDetails.Walltime = 0
 	}
-
 	return importDetails, nil
 }
 
@@ -680,6 +682,32 @@ func (r *importResumer) prepareSchemasForIngestion(
 	return schemaMetadata, err
 }
 
+// bindImportStarTime writes the ImportStarTime to the descriptor.
+func bindImportStartTime(
+	ctx context.Context, p sql.JobExecContext, id catid.DescID, startWallTime int64,
+) error {
+	if err := sql.DescsTxn(ctx, p.ExecCfg(), func(
+		ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+	) error {
+		mutableDesc, err := descsCol.GetMutableTableVersionByID(ctx, id, txn)
+		if err != nil {
+			return err
+		}
+		if err := mutableDesc.InitializeImport(startWallTime); err != nil {
+			return err
+		}
+		if err := descsCol.WriteDesc(
+			ctx, false /* kvTrace */, mutableDesc, txn,
+		); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
 // createSchemaDescriptorWithID writes a schema descriptor with `id` to disk.
 func createSchemaDescriptorWithID(
 	ctx context.Context,
@@ -824,9 +852,6 @@ func (r *importResumer) parseBundleSchemaIfNeeded(ctx context.Context, phs inter
 func getPublicSchemaDescForDatabase(
 	ctx context.Context, execCfg *sql.ExecutorConfig, db catalog.DatabaseDescriptor,
 ) (scDesc catalog.SchemaDescriptor, err error) {
-	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
-		return schemadesc.GetPublicSchema(), err
-	}
 	if err := sql.DescsTxn(ctx, execCfg, func(
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) error {
@@ -983,7 +1008,7 @@ func (r *importResumer) publishTables(
 					c.Validity = descpb.ConstraintValidity_Unvalidated
 				}
 			}
-
+			newTableDesc.FinalizeImport()
 			// TODO(dt): re-validate any FKs?
 			if err := descsCol.WriteDescToBatch(
 				ctx, false /* kvTrace */, newTableDesc, b,
@@ -1322,16 +1347,11 @@ func emitImportJobEvent(
 }
 
 func constructSchemaAndTableKey(
-	ctx context.Context,
+	_ context.Context,
 	tableDesc *descpb.TableDescriptor,
 	schemaIDToName map[descpb.ID]string,
-	version clusterversion.Handle,
+	_ clusterversion.Handle,
 ) (schemaAndTableName, error) {
-	if !version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
-		if tableDesc.UnexposedParentSchemaID == keys.PublicSchemaIDForBackup {
-			return schemaAndTableName{schema: "", table: tableDesc.GetName()}, nil
-		}
-	}
 	schemaName, ok := schemaIDToName[tableDesc.GetUnexposedParentSchemaID()]
 	if !ok && schemaName != tree.PublicSchema {
 		return schemaAndTableName{}, errors.Newf("invalid parent schema %s with ID %d for table %s",
@@ -1463,10 +1483,7 @@ func (r *importResumer) dropTables(
 		return nil
 	}
 
-	// useDeleteRange indicates that the cluster has been finalized to 22.1 and
-	// can use MVCC compatible DeleteRange to with range tombstones during an import
-	// rollback.
-	useDeleteRange := r.settings.Version.IsActive(ctx, clusterversion.MVCCRangeTombstones)
+	useDeleteRange := storage.CanUseMVCCRangeTombstones(ctx, r.settings)
 
 	var tableWasEmpty bool
 	var intoTable catalog.TableDescriptor
@@ -1554,6 +1571,7 @@ func (r *importResumer) dropTables(
 		return err
 	}
 	intoDesc.SetPublic()
+	intoDesc.FinalizeImport()
 	const kvTrace = false
 	if err := descsCol.WriteDescToBatch(ctx, kvTrace, intoDesc, b); err != nil {
 		return err

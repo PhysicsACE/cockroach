@@ -4,6 +4,7 @@
 -- enable_zigzag_join has the default value: on
 -- optimizer_use_histograms has the default value: on
 -- optimizer_use_multicol_stats has the default value: on
+-- optimizer_use_not_visible_indexes has the default value: off
 -- locality_optimized_partitioned_index_scan has the default value: on
 -- distsql has the default value: auto
 -- vectorize has the default value: on

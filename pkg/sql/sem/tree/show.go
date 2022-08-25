@@ -727,6 +727,7 @@ func (node *ShowFingerprints) Format(ctx *FmtCtx) {
 type ShowTableStats struct {
 	Table     *UnresolvedObjectName
 	UsingJSON bool
+	Options   KVOptions
 }
 
 // Format implements the NodeFormatter interface.
@@ -737,6 +738,10 @@ func (node *ShowTableStats) Format(ctx *FmtCtx) {
 	}
 	ctx.WriteString("FOR TABLE ")
 	ctx.FormatNode(node.Table)
+	if len(node.Options) > 0 {
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(&node.Options)
+	}
 }
 
 // ShowHistogram represents a SHOW HISTOGRAM statement.
@@ -964,3 +969,21 @@ func (node *ShowCreateFunction) Format(ctx *FmtCtx) {
 }
 
 var _ Statement = &ShowCreateFunction{}
+
+// ShowCreateExternalConnections represents a SHOW CREATE EXTERNAL CONNECTION
+// statement.
+type ShowCreateExternalConnections struct {
+	ConnectionLabel Expr
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowCreateExternalConnections) Format(ctx *FmtCtx) {
+	if node.ConnectionLabel != nil {
+		ctx.WriteString("SHOW CREATE EXTERNAL CONNECTION ")
+		ctx.FormatNode(node.ConnectionLabel)
+		return
+	}
+	ctx.Printf("SHOW CREATE ALL EXTERNAL CONNECTIONS")
+}
+
+var _ Statement = &ShowCreateExternalConnections{}

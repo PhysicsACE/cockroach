@@ -56,6 +56,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/echotest"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -738,7 +739,7 @@ func TestBehaviorDuringLeaseTransfer(t *testing.T) {
 			require.Error(t, err)
 			var lErr *roachpb.NotLeaseHolderError
 			require.True(t, errors.As(err, &lErr))
-			require.Equal(t, secondReplica.StoreID, lErr.LeaseHolder.StoreID)
+			require.Equal(t, secondReplica.StoreID, lErr.Lease.Replica.StoreID)
 		} else {
 			// Check that the replica doesn't use its lease, even though there's
 			// no longer a transfer in progress. This is because, even though
@@ -8117,7 +8118,8 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 		r.mu.Unlock()
 
 		// Tick raft.
-		if _, err := r.tick(ctx, nil, nil); err != nil {
+		iot := ioThresholdMap{m: map[roachpb.StoreID]*admissionpb.IOThreshold{}}
+		if _, err := r.tick(ctx, nil, &iot); err != nil {
 			t.Fatal(err)
 		}
 
@@ -13450,8 +13452,7 @@ func TestProposalNotAcknowledgedOrReproposedAfterApplication(t *testing.T) {
 
 	// Round trip another proposal through the replica to ensure that previously
 	// committed entries have been applied.
-	_, _, pErr = tc.repl.sendWithoutRangeID(ctx, &ba)
-	if pErr != nil {
+	if _, pErr := tc.repl.Send(ctx, ba); pErr != nil {
 		t.Fatal(pErr)
 	}
 	log.Flush()

@@ -63,7 +63,11 @@ func getStreamIngestionStats(
 	if err != nil {
 		return nil, err
 	}
-	details := j.Details().(jobspb.StreamIngestionDetails)
+	details, ok := j.Details().(jobspb.StreamIngestionDetails)
+	if !ok {
+		return nil, errors.Errorf("job with id %d is not a stream ingestion job", ingestionJobID)
+	}
+
 	progress := j.Progress()
 	stats := &streampb.StreamIngestionStats{
 		IngestionDetails:  &details,
@@ -424,9 +428,7 @@ func (s *streamIngestionResumer) cancelProducerJob(
 		streamID, s.job.ID())
 	if err = client.Complete(ctx, streamID, false /* successfulIngestion */); err != nil {
 		log.Warningf(ctx, "encountered error when canceling the producer job: %v", err)
-		fmt.Println("canceled failure", err)
 	}
-	fmt.Println("cancel sent")
 	if err = client.Close(ctx); err != nil {
 		log.Warningf(ctx, "encountered error when closing the stream client: %v", err)
 	}

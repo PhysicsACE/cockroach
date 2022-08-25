@@ -9,20 +9,33 @@
 // licenses/APL.txt.
 
 import { unset } from "src/util";
-import { InsightEventsResponse, InsightEventState } from "src/api/insightsApi";
+import {
+  InsightEventsResponse,
+  InsightEventState,
+  InsightEventDetailsResponse,
+  InsightEventDetailsState,
+} from "src/api/insightsApi";
 import {
   Insight,
   InsightExecEnum,
   InsightTypes,
   InsightEvent,
   InsightEventFilters,
+  InsightEventDetails,
 } from "./types";
 
-export const getInsights = (eventState: InsightEventState): Insight[] => {
+export const getInsights = (
+  eventState: InsightEventState | InsightEventDetailsState,
+): Insight[] => {
   const insights: Insight[] = [];
   InsightTypes.forEach(insight => {
-    if (insight(eventState.execType).name == eventState.insightName) {
-      insights.push(insight(eventState.execType));
+    if (
+      insight(eventState.execType, eventState.contentionThreshold).name ==
+      eventState.insightName
+    ) {
+      insights.push(
+        insight(eventState.execType, eventState.contentionThreshold),
+      );
     }
   });
   return insights;
@@ -42,18 +55,35 @@ export function getInsightsFromState(
       return;
     } else {
       insightEvents.push({
-        executionID: e.executionID,
+        transactionID: e.transactionID,
+        fingerprintID: e.fingerprintID,
         queries: e.queries,
         insights: insightsForEvent,
         startTime: e.startTime,
-        elapsedTime: e.elapsedTime,
+        elapsedTimeMillis: e.elapsedTimeMillis,
         application: e.application,
         execType: InsightExecEnum.TRANSACTION,
+        contentionThreshold: e.contentionThreshold,
       });
     }
   });
 
   return insightEvents;
+}
+
+export function getInsightEventDetailsFromState(
+  insightEventDetailsResponse: InsightEventDetailsResponse,
+): InsightEventDetails {
+  let insightEventDetails: InsightEventDetails = null;
+  const insightsForEventDetails = getInsights(insightEventDetailsResponse[0]);
+  if (insightsForEventDetails.length > 0) {
+    delete insightEventDetailsResponse[0].insightName;
+    insightEventDetails = {
+      ...insightEventDetailsResponse[0],
+      insights: insightsForEventDetails,
+    };
+  }
+  return insightEventDetails;
 }
 
 export const filterTransactionInsights = (
@@ -87,11 +117,12 @@ export const filterTransactionInsights = (
     filteredTransactions = filteredTransactions.filter(txn => !isInternal(txn));
   }
   if (search) {
+    search = search.toLowerCase();
     filteredTransactions = filteredTransactions.filter(
       txn =>
         !search ||
-        txn.executionID?.includes(search) ||
-        txn.queries?.find(query => query.includes(search)),
+        txn.transactionID.toLowerCase()?.includes(search) ||
+        txn.queries?.find(query => query.toLowerCase().includes(search)),
     );
   }
   return filteredTransactions;

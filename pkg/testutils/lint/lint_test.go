@@ -227,6 +227,9 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`/embedded.go`),
 			stream.GrepNot(`geo/geographiclib/geodesic\.c$`),
 			stream.GrepNot(`geo/geographiclib/geodesic\.h$`),
+			// The opentelemetry-proto files are copied from otel with their own
+			// license.
+			stream.GrepNot(`opentelemetry-proto/.*.proto$`),
 		), func(filename string) {
 			file, err := os.Open(filepath.Join(pkgDir, filename))
 			if err != nil {
@@ -1638,7 +1641,9 @@ func TestLint(t *testing.T) {
 
 	t.Run("TestReturnCheck", func(t *testing.T) {
 		skip.UnderShort(t)
-		skip.UnderBazelWithIssue(t, 73391, "Going to migrate to nogo")
+		if bazel.BuiltWithBazel() {
+			skip.IgnoreLint(t, "the returncheck tests are run during the bazel build")
+		}
 		// returncheck uses 2GB of ram (as of 2017-07-13), so don't parallelize it.
 		cmd, stderr, filter, err := dirCmd(crdb.Dir, "returncheck", pkgScope)
 		if err != nil {
@@ -2027,6 +2032,7 @@ func TestLint(t *testing.T) {
 			"../../sql/colexec/colexecspan",
 			"../../sql/colexec/colexecwindow",
 			"../../sql/colfetcher",
+			"../../sql/opt",
 			"../../sql/row",
 			"../../kv/kvclient/rangecache",
 			"../../storage",
@@ -2059,6 +2065,47 @@ func TestLint(t *testing.T) {
 
 		if err := stream.ForEach(filter, func(s string) {
 			t.Errorf("\n%s <- forbidden; use []*types.T", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	// TestMapToBool asserts that map[...]bool is not used. In most cases, such
+	// a map can be replaced with map[...]struct{} that is more efficient, and
+	// this linter nudges folks to do so. This linter can be disabled by
+	// '//nolint:maptobool' comment.
+	// TODO(yuzefovich): expand the scope where the linter is applied.
+	t.Run("TestMapToBool", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`map\[.*\]bool`,
+			"--",
+			"sql/opt/norm*.go",
+			":!*_test.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(stream.Sequence(
+			filter,
+			stream.GrepNot(`nolint:maptobool`),
+		), func(s string) {
+			t.Errorf("\n%s <- forbidden; use map[...]struct{} instead", s)
 		}); err != nil {
 			t.Error(err)
 		}

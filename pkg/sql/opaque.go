@@ -14,7 +14,6 @@ import (
 	"context"
 	"reflect"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
@@ -53,13 +52,10 @@ func buildOpaque(
 		if err := p.checkNoConflictingCursors(stmt); err != nil {
 			return nil, err
 		}
-		// TODO (Chengxiong): Remove this version gate in 22.2
-		if evalCtx.Settings.Version.IsActive(ctx, clusterversion.EnableDeclarativeSchemaChanger) {
-			var err error
-			plan, err = p.SchemaChange(ctx, stmt)
-			if err != nil {
-				return nil, err
-			}
+		var err error
+		plan, err = p.SchemaChange(ctx, stmt)
+		if err != nil {
+			return nil, err
 		}
 	}
 	if plan == nil {
@@ -120,6 +116,8 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.AlterFunctionDepExtension(ctx, n)
 	case *tree.AlterIndex:
 		return p.AlterIndex(ctx, n)
+	case *tree.AlterIndexVisible:
+		return p.AlterIndexVisible(ctx, n)
 	case *tree.AlterSchema:
 		return p.AlterSchema(ctx, n)
 	case *tree.AlterTable:
@@ -246,6 +244,8 @@ func planOpaque(ctx context.Context, p *planner, stmt tree.Statement) (planNode,
 		return p.ShowTenantClusterSetting(ctx, n)
 	case *tree.ShowCreateSchedules:
 		return p.ShowCreateSchedule(ctx, n)
+	case *tree.ShowCreateExternalConnections:
+		return p.ShowCreateExternalConnection(ctx, n)
 	case *tree.ShowHistogram:
 		return p.ShowHistogram(ctx, n)
 	case *tree.ShowTableStats:
@@ -296,6 +296,7 @@ func init() {
 		&tree.AlterFunctionSetSchema{},
 		&tree.AlterFunctionDepExtension{},
 		&tree.AlterIndex{},
+		&tree.AlterIndexVisible{},
 		&tree.AlterSchema{},
 		&tree.AlterTable{},
 		&tree.AlterTableLocality{},
@@ -359,6 +360,7 @@ func init() {
 		&tree.ShowClusterSetting{},
 		&tree.ShowTenantClusterSetting{},
 		&tree.ShowCreateSchedules{},
+		&tree.ShowCreateExternalConnections{},
 		&tree.ShowHistogram{},
 		&tree.ShowTableStats{},
 		&tree.ShowTraceForSession{},

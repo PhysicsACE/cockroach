@@ -14,7 +14,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path"
@@ -48,7 +47,7 @@ func (d *dev) getDoctorStatus(ctx context.Context) (int, error) {
 		return -1, err
 	}
 	statusFile := filepath.Join(dir, doctorStatusFile)
-	content, err := ioutil.ReadFile(statusFile)
+	content, err := os.ReadFile(statusFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			content = []byte("0")
@@ -92,7 +91,7 @@ func (d *dev) writeDoctorStatus(ctx context.Context) error {
 	}
 	statusFile := filepath.Join(dir, doctorStatusFile)
 
-	return ioutil.WriteFile(statusFile, []byte(strconv.Itoa(doctorStatusVersion)), 0600)
+	return os.WriteFile(statusFile, []byte(strconv.Itoa(doctorStatusVersion)), 0600)
 }
 
 func printStdoutAndErr(stdoutStr string, err error) {
@@ -263,9 +262,7 @@ You can install node with: `+"`pkg install node`")
 		failedStampTestMsg = failedStampTestMsg + fmt.Sprintf(`
 Make sure one of the following lines is in the file %s/.bazelrc.user:
 `, workspace)
-		if runtime.GOOS == "darwin" && runtime.GOARCH == "amd64" {
-			failedStampTestMsg = failedStampTestMsg + "    build --config=devdarwinx86_64"
-		} else if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+		if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
 			failedStampTestMsg = failedStampTestMsg + "    build --config=dev\n"
 			failedStampTestMsg = failedStampTestMsg + "             OR       \n"
 			failedStampTestMsg = failedStampTestMsg + "    build --config=crosslinux\n"

@@ -14,7 +14,7 @@ import { sessionAttr } from "src/util/constants";
 import { Helmet } from "react-helmet";
 import { Loading } from "../loading";
 import _ from "lodash";
-import { Link, RouteComponentProps } from "react-router-dom";
+import { RouteComponentProps } from "react-router-dom";
 
 import {
   getStatusClassname,
@@ -25,7 +25,7 @@ import {
 import { SummaryCard, SummaryCardItem } from "../summaryCard";
 import SQLActivityError from "../sqlActivity/errorComponent";
 
-import { TimestampToMoment } from "src/util/convert";
+import { DurationToMomentDuration, TimestampToMoment } from "src/util/convert";
 import { Bytes, DATE_FORMAT } from "src/util/format";
 import { Col, Row } from "antd";
 import "antd/lib/col/style";
@@ -40,7 +40,7 @@ import TerminateQueryModal, {
 import { Button } from "../button";
 import { ArrowLeft } from "@cockroachlabs/icons";
 import { Text, TextTypes } from "../text";
-import { SqlBox } from "src/sql/box";
+import { SqlBox, SqlBoxSize } from "src/sql/box";
 import { NodeLink } from "src/statementsTable/statementsTableContent";
 
 import {
@@ -91,7 +91,6 @@ export const MemoryUsageItem: React.FC<{
     value={
       Bytes(alloc_bytes?.toNumber()) + "/" + Bytes(max_alloc_bytes?.toNumber())
     }
-    className={cx("details-item")}
   />
 );
 
@@ -241,68 +240,62 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
       return (
         <section className={cx("section")}>
           <h3>Unable to find session</h3>
-          There is no currently active session with the id{" "}
+          There is no session with the id{" "}
           {getMatchParamByName(this.props.match, sessionAttr)}.
-          <div>
-            <Link className={cx("back-link")} to={"/sessions"}>
-              Back to Sessions
-            </Link>
-          </div>
         </section>
       );
     }
 
-    let txnInfo = <React.Fragment>No Active Transaction</React.Fragment>;
-    if (session.active_txn) {
+    let txnInfo = (
+      <SummaryCard className={cx("details-section")}>
+        No Active Transaction
+      </SummaryCard>
+    );
+    if (session.active_txn && session.end == null) {
       const txn = session.active_txn;
       const start = TimestampToMoment(txn.start);
       txnInfo = (
-        <Row gutter={16}>
-          <Col className="gutter-row" span={10}>
-            <SummaryCardItem
-              label={"Transaction Start Time"}
-              value={start.format(DATE_FORMAT)}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Number of Statements Executed"}
-              value={txn.num_statements_executed}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Number of Retries"}
-              value={txn.num_retries}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Number of Automatic Retries"}
-              value={txn.num_auto_retries}
-              className={cx("details-item")}
-            />
-          </Col>
-          <Col className="gutter-row" span={4} />
-          <Col className="gutter-row" span={10}>
-            <SummaryCardItem
-              label={"Read Only"}
-              value={yesOrNo(txn.read_only)}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"AS OF SYSTEM TIME?"}
-              value={yesOrNo(txn.is_historical)}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Priority"}
-              value={txn.priority}
-              className={cx("details-item")}
-            />
-            <MemoryUsageItem
-              alloc_bytes={txn.alloc_bytes}
-              max_alloc_bytes={txn.max_alloc_bytes}
-            />
-          </Col>
-        </Row>
+        <>
+          <Row gutter={24}>
+            <Col className="gutter-row" span={12}>
+              <SummaryCard className={cx("summary-card")}>
+                <SummaryCardItem
+                  label={"Transaction Start Time"}
+                  value={start.format(DATE_FORMAT)}
+                />
+                <SummaryCardItem
+                  label={"Number of Statements Executed"}
+                  value={txn.num_statements_executed}
+                />
+                <SummaryCardItem
+                  label={"Number of Retries"}
+                  value={txn.num_retries}
+                />
+                <SummaryCardItem
+                  label={"Number of Automatic Retries"}
+                  value={txn.num_auto_retries}
+                />
+              </SummaryCard>
+            </Col>
+            <Col className="gutter-row" span={12}>
+              <SummaryCard className={cx("summary-card")}>
+                <SummaryCardItem
+                  label={"Read Only"}
+                  value={yesOrNo(txn.read_only)}
+                />
+                <SummaryCardItem
+                  label={"AS OF SYSTEM TIME?"}
+                  value={yesOrNo(txn.is_historical)}
+                />
+                <SummaryCardItem label={"Priority"} value={txn.priority} />
+                <MemoryUsageItem
+                  alloc_bytes={txn.alloc_bytes}
+                  max_alloc_bytes={txn.max_alloc_bytes}
+                />
+              </SummaryCard>
+            </Col>
+          </Row>
+        </>
       );
     }
     let curStmtInfo = (
@@ -315,7 +308,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
       const stmt = session.active_queries[0];
       curStmtInfo = (
         <React.Fragment>
-          <SqlBox value={stmt.sql} />
+          <SqlBox value={stmt.sql} size={SqlBoxSize.custom} />
           <SummaryCard className={cx("details-section")}>
             <Row>
               <Col className="gutter-row" span={10}>
@@ -340,14 +333,25 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
     }
 
     return (
-      <React.Fragment>
-        <SummaryCard className={cx("details-section")}>
-          <Row gutter={12}>
-            <Col className="gutter-row" span={10}>
+      <>
+        <Row gutter={24}>
+          <Col className="gutter-row" span={12}>
+            <SummaryCard className={cx("summary-card")}>
               <SummaryCardItem
-                label={"Session Start Time"}
+                label="Session Start Time"
                 value={TimestampToMoment(session.start).format(DATE_FORMAT)}
-                className={cx("details-item")}
+              />
+              {session.end && (
+                <SummaryCardItem
+                  label={"Session End Time"}
+                  value={TimestampToMoment(session.end).format(DATE_FORMAT)}
+                />
+              )}
+              <SummaryCardItem
+                label={"Session Active Duration"}
+                value={DurationToMomentDuration(
+                  session.total_active_time,
+                ).humanize()}
               />
               {!isTenant && (
                 <SummaryCardItem
@@ -364,13 +368,11 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                       session.node_id.toString()
                     )
                   }
-                  className={cx("details-item")}
                 />
               )}
               <SummaryCardItem
                 label={"Application Name"}
                 value={session.application_name}
-                className={cx("details-item")}
               />
               <SummaryCardItem
                 label={"Status"}
@@ -382,37 +384,52 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                     <span>{getStatusString(session.status)}</span>
                   </div>
                 }
-                className={cx("details-item")}
               />
-            </Col>
-            <Col className="gutter-row" span={4} />
-            <Col className="gutter-row" span={10}>
+            </SummaryCard>
+          </Col>
+          <Col className="gutter-row" span={12}>
+            <SummaryCard className={cx("summary-card")}>
               <SummaryCardItem
                 label={"Client IP Address"}
                 value={session.client_address}
-                className={cx("details-item")}
               />
               <MemoryUsageItem
                 alloc_bytes={session.alloc_bytes}
                 max_alloc_bytes={session.max_alloc_bytes}
               />
+              <SummaryCardItem label={"User Name"} value={session.username} />
               <SummaryCardItem
-                label={"User Name"}
-                value={session.username}
-                className={cx("details-item")}
+                label="Transaction Count"
+                value={session.num_txns_executed}
               />
-            </Col>
-          </Row>
-        </SummaryCard>
+            </SummaryCard>
+          </Col>
+        </Row>
         <Text textType={TextTypes.Heading5} className={cx("details-header")}>
           Transaction
         </Text>
-        <SummaryCard className={cx("details-section")}>{txnInfo}</SummaryCard>
+        {txnInfo}
         <Text textType={TextTypes.Heading5} className={cx("details-header")}>
           Most Recent Statement
         </Text>
         {curStmtInfo}
-      </React.Fragment>
+        <div>
+          <Text textType={TextTypes.Heading5} className={cx("details-header")}>
+            Most Recent Transaction Fingerprints Executed
+          </Text>
+          <Text textType={TextTypes.Caption}>
+            A list of the most recent transaction fingerprint IDs executed by
+            this session represented in hexadecimal.
+          </Text>
+          <SummaryCard
+            className={cx("details-section", "session-txn-fingerprints")}
+          >
+            {session.txn_fingerprint_ids.map((txnFingerprintID, i) => (
+              <div key={i}>{txnFingerprintID.toString(16)}</div>
+            ))}
+          </SummaryCard>
+        </div>
+      </>
     );
   };
 }

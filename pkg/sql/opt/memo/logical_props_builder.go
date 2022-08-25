@@ -88,7 +88,7 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	// Not Null Columns
 	// ----------------
 	// Initialize not-NULL columns from the table schema.
-	rel.NotNullCols = tableNotNullCols(md, scan.Table)
+	rel.NotNullCols = makeTableNotNullCols(md, scan.Table).Copy()
 	// Union not-NULL columns with not-NULL columns in the constraint.
 	if scan.Constraint != nil {
 		rel.NotNullCols.UnionWith(scan.Constraint.ExtractNotNullCols(b.evalCtx))
@@ -168,6 +168,12 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 			b.updateCardinalityFromFilters(pred, rel)
 		}
 		b.updateCardinalityFromTypes(rel.OutputCols, rel)
+	}
+	if scan.Locking.WaitPolicy == tree.LockWaitSkipLocked {
+		// SKIP LOCKED can act like a filter. The minimum cardinality of a scan
+		// should never exceed zero based on the logic above, but this provides
+		// extra safety.
+		rel.Cardinality = rel.Cardinality.AsLowAs(0)
 	}
 
 	// Statistics
@@ -476,7 +482,7 @@ func (b *logicalPropsBuilder) buildIndexJoinProps(indexJoin *IndexJoinExpr, rel 
 	// ----------------
 	// Add not-NULL columns from the table schema, and filter out any not-NULL
 	// columns from the input that are not projected by the index join.
-	rel.NotNullCols = tableNotNullCols(md, indexJoin.Table)
+	rel.NotNullCols = makeTableNotNullCols(md, indexJoin.Table).Copy()
 	rel.NotNullCols.IntersectionWith(rel.OutputCols)
 
 	// Outer Columns
@@ -509,6 +515,12 @@ func (b *logicalPropsBuilder) buildIndexJoinProps(indexJoin *IndexJoinExpr, rel 
 
 func (b *logicalPropsBuilder) buildLookupJoinProps(join *LookupJoinExpr, rel *props.Relational) {
 	b.buildJoinProps(join, rel)
+	if join.Locking.WaitPolicy == tree.LockWaitSkipLocked {
+		// SKIP LOCKED can act like a filter. The minimum cardinality of a scan
+		// should never exceed zero based on the logic in buildJoinProps, but
+		// this provides extra safety.
+		rel.Cardinality = rel.Cardinality.AsLowAs(0)
+	}
 }
 
 func (b *logicalPropsBuilder) buildInvertedJoinProps(
@@ -795,33 +807,35 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 	}
 }
 
-func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Relational) {
+func (b *logicalPropsBuilder) buildValuesProps(values ValuesContainer, rel *props.Relational) {
 	BuildSharedProps(values, &rel.Shared, b.evalCtx)
 
-	card := uint32(len(values.Rows))
+	card := uint32(values.Len())
 
 	// Output Columns
 	// --------------
 	// Use output columns that are attached to the values op.
-	rel.OutputCols = values.Cols.ToSet()
+	rel.OutputCols = values.ColList().ToSet()
 
 	// Not Null Columns
 	// ----------------
 	// All columns are assumed to be nullable, unless they contain only constant
 	// non-null values.
 
-	for colIdx, col := range values.Cols {
-		notNull := true
-		for rowIdx := range values.Rows {
-			val := values.Rows[rowIdx].(*TupleExpr).Elems[colIdx]
-			if !opt.IsConstValueOp(val) || val.Op() == opt.NullOp {
-				// Null or not a constant.
-				notNull = false
-				break
+	if v, ok := values.(*ValuesExpr); ok {
+		for colIdx, col := range v.ColList() {
+			notNull := true
+			for rowIdx := range v.Rows {
+				val := v.Rows[rowIdx].(*TupleExpr).Elems[colIdx]
+				if !opt.IsConstValueOp(val) || val.Op() == opt.NullOp {
+					// Null or not a constant.
+					notNull = false
+					break
+				}
 			}
-		}
-		if notNull {
-			rel.NotNullCols.Add(col)
+			if notNull {
+				rel.NotNullCols.Add(col)
+			}
 		}
 	}
 
@@ -845,6 +859,12 @@ func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Re
 	if !b.disableStats {
 		b.sb.buildValues(values, rel)
 	}
+}
+
+func (b *logicalPropsBuilder) buildLiteralValuesProps(
+	values ValuesContainer, rel *props.Relational,
+) {
+	b.buildValuesProps(values, rel)
 }
 
 func (b *logicalPropsBuilder) buildBasicProps(e opt.Expr, cols opt.ColList, rel *props.Relational) {
@@ -2106,7 +2126,7 @@ func ensureLookupJoinInputProps(join *LookupJoinExpr, sb *statisticsBuilder) *pr
 			}
 		}
 
-		relational.NotNullCols = tableNotNullCols(md, join.Table)
+		relational.NotNullCols = makeTableNotNullCols(md, join.Table).Copy()
 		relational.NotNullCols.IntersectionWith(relational.OutputCols)
 		relational.Cardinality = props.AnyCardinality
 		relational.FuncDeps.CopyFrom(MakeTableFuncDep(md, join.Table))
@@ -2123,7 +2143,7 @@ func ensureInvertedJoinInputProps(join *InvertedJoinExpr, sb *statisticsBuilder)
 	if relational.OutputCols.Empty() {
 		md := join.Memo().Metadata()
 		relational.OutputCols = join.Cols.Difference(join.Input.Relational().OutputCols)
-		relational.NotNullCols = tableNotNullCols(md, join.Table)
+		relational.NotNullCols = makeTableNotNullCols(md, join.Table).Copy()
 		relational.NotNullCols.IntersectionWith(relational.OutputCols)
 		relational.Cardinality = props.AnyCardinality
 
@@ -2173,7 +2193,7 @@ func ensureInputPropsForIndex(
 	if relProps.OutputCols.Empty() {
 		relProps.OutputCols = md.TableMeta(tabID).IndexColumns(indexOrd)
 		relProps.OutputCols.IntersectionWith(outputCols)
-		relProps.NotNullCols = tableNotNullCols(md, tabID)
+		relProps.NotNullCols = makeTableNotNullCols(md, tabID).Copy()
 		relProps.NotNullCols.IntersectionWith(relProps.OutputCols)
 		relProps.Cardinality = props.AnyCardinality
 		relProps.FuncDeps.CopyFrom(MakeTableFuncDep(md, tabID))
@@ -2182,9 +2202,17 @@ func ensureInputPropsForIndex(
 	}
 }
 
-// tableNotNullCols returns the set of not-NULL non-mutation columns from the given table.
-func tableNotNullCols(md *opt.Metadata, tabID opt.TableID) opt.ColSet {
-	cs := opt.ColSet{}
+// makeTableNotNullCols returns the set of not-NULL non-mutation columns from
+// the given table. The set is derived lazily and is cached in the metadata,
+// since it may be accessed multiple times during query optimization.
+func makeTableNotNullCols(md *opt.Metadata, tabID opt.TableID) opt.ColSet {
+	cs, ok := md.TableAnnotation(tabID, opt.NotNullAnnID).(opt.ColSet)
+	if ok {
+		// Already made.
+		return cs
+	}
+
+	cs = opt.ColSet{}
 	tab := md.Table(tabID)
 
 	// Only iterate over non-mutation columns, since even non-null mutation
@@ -2196,6 +2224,8 @@ func tableNotNullCols(md *opt.Metadata, tabID opt.TableID) opt.ColSet {
 			cs.Add(tabID.ColumnID(i))
 		}
 	}
+
+	md.SetTableAnnotation(tabID, opt.NotNullAnnID, cs)
 	return cs
 }
 

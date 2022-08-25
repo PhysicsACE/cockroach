@@ -11,7 +11,6 @@ package backupccl
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	math "math"
 	"os"
 	"path/filepath"
@@ -73,7 +72,7 @@ func slurpSSTablesLatestKey(
 			LowerBound: keys.LocalMax,
 			UpperBound: keys.MaxKey,
 		}
-		sst, err := storage.NewPebbleSSTIterator([]sstable.ReadableFile{file}, iterOpts)
+		sst, err := storage.NewPebbleSSTIterator([][]sstable.ReadableFile{{file}}, iterOpts, false /* forwardOnly */)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +205,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 		if err := sst.Finish(); err != nil {
 			t.Fatalf("%+v", err)
 		}
-		if err := ioutil.WriteFile(filepath.Join(dir, "foo", path), sstFile.Data(), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "foo", path), sstFile.Data(), 0644); err != nil {
 			t.Fatalf("%+v", err)
 		}
 		return path

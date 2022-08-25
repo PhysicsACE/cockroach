@@ -168,8 +168,6 @@ const (
 	// This version must be active before any ProbeRequest is issued on the
 	// cluster.
 	ProbeRequest
-	// PublicSchemasWithDescriptors backs public schemas with descriptors.
-	PublicSchemasWithDescriptors
 	// EnsureSpanConfigReconciliation ensures that the host tenant has run its
 	// reconciliation process at least once.
 	EnsureSpanConfigReconciliation
@@ -180,89 +178,9 @@ const (
 	// EnableSpanConfigStore enables the use of the span configs infrastructure
 	// in KV.
 	EnableSpanConfigStore
-	// SCRAM authentication is available.
-	SCRAMAuthentication
-	// UnsafeLossOfQuorumRecoveryRangeLog adds a new value to RangeLogEventReason
-	// that correspond to range descriptor changes resulting from recovery
-	// procedures.
-	UnsafeLossOfQuorumRecoveryRangeLog
-	// AlterSystemProtectedTimestampAddColumn adds a target column to the
-	// system.protected_ts_records table that describes what is protected by the
-	// record.
-	AlterSystemProtectedTimestampAddColumn
-	// EnableProtectedTimestampsForTenant enables the use of protected timestamps
-	// in secondary tenants.
-	EnableProtectedTimestampsForTenant
-	// DeleteCommentsWithDroppedIndexes cleans up left over comments that belong
-	// to dropped indexes.
-	DeleteCommentsWithDroppedIndexes
-	// RemoveIncompatibleDatabasePrivileges adds the migration which guarantees that
-	// databases do not have incompatible privileges
-	RemoveIncompatibleDatabasePrivileges
-	// AddRaftAppliedIndexTermMigration is a migration that causes each range
-	// replica to start populating RangeAppliedState.RaftAppliedIndexTerm field.
-	AddRaftAppliedIndexTermMigration
-	// PostAddRaftAppliedIndexTermMigration is used for asserting that
-	// RaftAppliedIndexTerm is populated.
-	PostAddRaftAppliedIndexTermMigration
-	// DontProposeWriteTimestampForLeaseTransfers stops setting the WriteTimestamp
-	// on lease transfer Raft proposals. New leaseholders now forward their clock
-	// directly to the new lease start time.
-	DontProposeWriteTimestampForLeaseTransfers
-	// EnablePebbleFormatVersionBlockProperties enables a new Pebble SSTable
-	// format version for block property collectors.
-	// NB: this cluster version is paired with PebbleFormatBlockPropertyCollector
-	// in a two-phase migration. The first cluster version acts as a gate for
-	// updating the format major version on all stores, while the second cluster
-	// version is used as a feature gate. A node in a cluster that sees the second
-	// version is guaranteed to have seen the first version, and therefore has an
-	// engine running at the required format major version, as do all other nodes
-	// in the cluster.
-	EnablePebbleFormatVersionBlockProperties
-	// MVCCIndexBackfiller supports MVCC-compliant index
-	// backfillers via a new BACKFILLING index state, delete
-	// preserving temporary indexes, and a post-backfill merging
-	// processing.
-	MVCCIndexBackfiller
-	// EnableLeaseHolderRemoval enables removing a leaseholder and transferring the lease
-	// during joint configuration, including to VOTER_INCOMING replicas.
-	EnableLeaseHolderRemoval
-	// LooselyCoupledRaftLogTruncation allows the cluster to reduce the coupling
-	// for raft log truncation, by allowing each replica to treat a truncation
-	// proposal as an upper bound on what should be truncated.
-	LooselyCoupledRaftLogTruncation
-	// ChangefeedIdleness is the version where changefeed aggregators forward
-	// idleness-related information alnog with resolved spans to the frontier
-	ChangefeedIdleness
-	// EnableDeclarativeSchemaChanger is the version where new declarative schema changer
-	// can be used to construct schema change plan node.
-	EnableDeclarativeSchemaChanger
-	// RowLevelTTL is the version where we allow row level TTL tables.
-	RowLevelTTL
 	// EnableNewStoreRebalancer enables the new store rebalancer introduced in
 	// 22.1.
 	EnableNewStoreRebalancer
-	// ClusterLocksVirtualTable enables querying the crdb_internal.cluster_locks
-	// virtual table, which sends a QueryLocksRequest RPC to all cluster ranges.
-	ClusterLocksVirtualTable
-	// AutoStatsTableSettings is the version where we allow auto stats related
-	// table settings.
-	AutoStatsTableSettings
-	// SuperRegions enables the usage on super regions.
-	SuperRegions
-	// EnableNewChangefeedOptions enables the usage of new changefeed options
-	// such as end_time, initial_scan_only, and setting the value of initial_scan
-	// to 'yes|no|only'
-	EnableNewChangefeedOptions
-	// SpanCountTable adds system.span_count to track the number of committed
-	// tenant spans.
-	SpanCountTable
-	// PreSeedSpanCountTable precedes PreSeedSpanCountTable, it enables span
-	// accounting for incremental schema changes.
-	PreSeedSpanCountTable
-	// SeedSpanCountTable seeds system.span_count with the number of committed
-	// tenant spans.
-	SeedSpanCountTable
 
 	// V22_1 is CockroachDB v22.1. It's used for all v22.1.x patch releases.
 	V22_1
@@ -324,11 +242,11 @@ const (
 	// AddSystemUserIDColumn is the version where the system.users table has
 	// a user_id column for writes only.
 	AddSystemUserIDColumn
-	// UsersHaveIDs is the version where all users in the system.users table
+	// SystemUsersIDColumnIsBackfilled is the version where all users in the system.users table
 	// have ids.
-	UsersHaveIDs
-	// SetUserIDNotNull sets the user_id column in system.users to not null.
-	SetUserIDNotNull
+	SystemUsersIDColumnIsBackfilled
+	// SetSystemUsersUserIDColumnNotNull sets the user_id column in system.users to not null.
+	SetSystemUsersUserIDColumnNotNull
 	// SQLSchemaTelemetryScheduledJobs adds an automatic schedule for SQL schema
 	// telemetry logging jobs.
 	SQLSchemaTelemetryScheduledJobs
@@ -350,6 +268,32 @@ const (
 	//  Cockroach (likely 23.1), a blocking migration will be run to
 	//  rewrite-compact on any remaining marked tables.
 	PebbleFormatPrePebblev1Marked
+	// RoleOptionsTableHasIDColumn is the version where the role options table
+	// has ids.
+	RoleOptionsTableHasIDColumn
+	// RoleOptionsIDColumnIsBackfilled is the version where ids in the role options
+	// table are backfilled.
+	RoleOptionsIDColumnIsBackfilled
+	// SetRoleOptionsUserIDColumnNotNull is the version where the role
+	// options table id column cannot be null. This is the final step
+	// of the system.role_options table migration.
+	SetRoleOptionsUserIDColumnNotNull
+	// UseDelRangeInGCJob enables the use of the DelRange operation in the
+	// GC job. Before it is enabled, the GC job uses ClearRange operations
+	// after the job waits out the GC TTL. After it has been enabled, the
+	// job instead issues DelRange operations at the beginning of the job
+	// and then waits for the data to be removed automatically before removing
+	// the descriptor and zone configurations.
+	UseDelRangeInGCJob
+	// WaitedForDelRangeInGCJob corresponds to the migration which waits for
+	// the GC jobs to adopt the use of DelRange with tombstones.
+	WaitedForDelRangeInGCJob
+	// RangefeedUseOneStreamPerNode changes rangefeed implementation to use 1 RPC stream per node.
+	RangefeedUseOneStreamPerNode
+	// NoNonMVCCAddSSTable adds a migration which waits for all
+	// schema changes to complete. After this point, no non-MVCC
+	// AddSSTable calls will be used outside of tenant streaming.
+	NoNonMVCCAddSSTable
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -399,10 +343,6 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 26},
 	},
 	{
-		Key:     PublicSchemasWithDescriptors,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 34},
-	},
-	{
 		Key:     EnsureSpanConfigReconciliation,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 36},
 	},
@@ -415,103 +355,8 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 40},
 	},
 	{
-		Key:     SCRAMAuthentication,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 44},
-	},
-	{
-		Key:     UnsafeLossOfQuorumRecoveryRangeLog,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 46},
-	},
-	{
-		Key:     AlterSystemProtectedTimestampAddColumn,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 48},
-	},
-	{
-		Key:     EnableProtectedTimestampsForTenant,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 50},
-	},
-	{
-		Key:     DeleteCommentsWithDroppedIndexes,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 52},
-	},
-	{
-		Key:     RemoveIncompatibleDatabasePrivileges,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 54},
-	},
-	{
-		Key:     AddRaftAppliedIndexTermMigration,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 56},
-	},
-	{
-		Key:     PostAddRaftAppliedIndexTermMigration,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 58},
-	},
-	{
-		Key:     DontProposeWriteTimestampForLeaseTransfers,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 60},
-	},
-	{
-		Key:     EnablePebbleFormatVersionBlockProperties,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 64},
-	},
-	{
-		Key:     MVCCIndexBackfiller,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 68},
-	},
-	{
-		Key:     EnableLeaseHolderRemoval,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 70},
-	},
-	// Internal: 72 was reverted (EnsurePebbleFormatVersionRangeKeys)
-	// Internal: 74 was reverted (EnablePebbleFormatVersionRangeKeys)
-	// Internal: 78 was reverted (ExperimentalMVCCRangeTombstones)
-	{
-		Key:     LooselyCoupledRaftLogTruncation,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 80},
-	},
-	{
-		Key:     ChangefeedIdleness,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 82},
-	},
-	{
-		Key:     EnableDeclarativeSchemaChanger,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 86},
-	},
-	{
-		Key:     RowLevelTTL,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 88},
-	},
-	{
 		Key:     EnableNewStoreRebalancer,
 		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 96},
-	},
-	{
-		Key:     ClusterLocksVirtualTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 98},
-	},
-	{
-		Key:     AutoStatsTableSettings,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 100},
-	},
-	{
-		Key:     SuperRegions,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 104},
-	},
-	{
-		Key:     EnableNewChangefeedOptions,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 106},
-	},
-	{
-		Key:     SpanCountTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 108},
-	},
-	{
-		Key:     PreSeedSpanCountTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 110},
-	},
-	{
-		Key:     SeedSpanCountTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 112},
 	},
 	{
 		Key:     V22_1,
@@ -592,11 +437,11 @@ var versionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 36},
 	},
 	{
-		Key:     UsersHaveIDs,
+		Key:     SystemUsersIDColumnIsBackfilled,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 38},
 	},
 	{
-		Key:     SetUserIDNotNull,
+		Key:     SetSystemUsersUserIDColumnNotNull,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 40},
 	},
 	{
@@ -614,6 +459,34 @@ var versionsSingleton = keyedVersions{
 	{
 		Key:     PebbleFormatPrePebblev1Marked,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 48},
+	},
+	{
+		Key:     RoleOptionsTableHasIDColumn,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 50},
+	},
+	{
+		Key:     RoleOptionsIDColumnIsBackfilled,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 52},
+	},
+	{
+		Key:     SetRoleOptionsUserIDColumnNotNull,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 54},
+	},
+	{
+		Key:     UseDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 56},
+	},
+	{
+		Key:     WaitedForDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 58},
+	},
+	{
+		Key:     RangefeedUseOneStreamPerNode,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 60},
+	},
+	{
+		Key:     NoNonMVCCAddSSTable,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 62},
 	},
 	// *************************************************
 	// Step (2): Add new versions here.

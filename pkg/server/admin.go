@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -1415,14 +1415,11 @@ func (s *adminServer) eventsHelper(
 ) (_ *serverpb.EventsResponse, retErr error) {
 	// Execute the query.
 	q := makeSQLQuery()
-	q.Append(`SELECT timestamp, "eventType", "targetID", "reportingID", info, "uniqueID" `)
+	q.Append(`SELECT timestamp, "eventType", "reportingID", info, "uniqueID" `)
 	q.Append("FROM system.eventlog ")
 	q.Append("WHERE true ") // This simplifies the WHERE clause logic below.
 	if len(req.Type) > 0 {
 		q.Append(`AND "eventType" = $ `, req.Type)
-	}
-	if req.TargetId > 0 {
-		q.Append(`AND "targetID" = $ `, req.TargetId)
 	}
 	q.Append("ORDER BY timestamp DESC ")
 	if limit > 0 {
@@ -1467,13 +1464,10 @@ func (s *adminServer) eventsHelper(
 		if err := scanner.ScanIndex(row, 1, &event.EventType); err != nil {
 			return nil, err
 		}
-		if err := scanner.ScanIndex(row, 2, &event.TargetID); err != nil {
+		if err := scanner.ScanIndex(row, 2, &event.ReportingID); err != nil {
 			return nil, err
 		}
-		if err := scanner.ScanIndex(row, 3, &event.ReportingID); err != nil {
-			return nil, err
-		}
-		if err := scanner.ScanIndex(row, 4, &event.Info); err != nil {
+		if err := scanner.ScanIndex(row, 3, &event.Info); err != nil {
 			return nil, err
 		}
 		if event.EventType == eventSetClusterSettingName {
@@ -1481,7 +1475,7 @@ func (s *adminServer) eventsHelper(
 				event.Info = redactSettingsChange(event.Info)
 			}
 		}
-		if err := scanner.ScanIndex(row, 5, &event.UniqueID); err != nil {
+		if err := scanner.ScanIndex(row, 4, &event.UniqueID); err != nil {
 			return nil, err
 		}
 		if redactEvents {
@@ -1864,8 +1858,8 @@ func (s *adminServer) Settings(
 		hasView := false
 		hasModify := false
 		if s.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-			hasView = s.checkHasSystemPrivilege(ctx, user, privilege.VIEWCLUSTERSETTING)
-			hasModify = s.checkHasSystemPrivilege(ctx, user, privilege.MODIFYCLUSTERSETTING)
+			hasView = s.checkHasGlobalPrivilege(ctx, user, privilege.VIEWCLUSTERSETTING)
+			hasModify = s.checkHasGlobalPrivilege(ctx, user, privilege.MODIFYCLUSTERSETTING)
 		}
 		if !hasModify && !hasView {
 			hasView, err := s.hasRoleOption(ctx, user, roleoption.VIEWCLUSTERSETTING)
@@ -2035,9 +2029,12 @@ func (s *adminServer) checkReadinessForHealthCheck(ctx context.Context) error {
 //
 // getLivenessStatusMap() includes removed nodes (dead + decommissioned).
 func getLivenessStatusMap(
-	nl *liveness.NodeLiveness, now time.Time, st *cluster.Settings,
-) map[roachpb.NodeID]livenesspb.NodeLivenessStatus {
-	livenesses := nl.GetLivenesses()
+	ctx context.Context, nl *liveness.NodeLiveness, now time.Time, st *cluster.Settings,
+) (map[roachpb.NodeID]livenesspb.NodeLivenessStatus, error) {
+	livenesses, err := nl.GetLivenessesFromKV(ctx)
+	if err != nil {
+		return nil, err
+	}
 	threshold := storepool.TimeUntilStoreDead.Get(&st.SV)
 
 	statusMap := make(map[roachpb.NodeID]livenesspb.NodeLivenessStatus, len(livenesses))
@@ -2045,23 +2042,41 @@ func getLivenessStatusMap(
 		status := storepool.LivenessStatus(liveness, now, threshold)
 		statusMap[liveness.NodeID] = status
 	}
-	return statusMap
+	return statusMap, nil
 }
 
-// Liveness returns the liveness state of all nodes on the cluster
-// known to gossip. To reach all nodes in the cluster, consider
-// using (statusServer).NodesWithLiveness instead.
-func (s *adminServer) Liveness(
-	context.Context, *serverpb.LivenessRequest,
+// getLivenessResponse returns LivenessResponse: a map from NodeID to LivenessStatus and
+// a slice containing the liveness record of all nodes that have ever been a part of the
+// cluster.
+func getLivenessResponse(
+	ctx context.Context, nl *liveness.NodeLiveness, now time.Time, st *cluster.Settings,
 ) (*serverpb.LivenessResponse, error) {
-	clock := s.server.clock
-	statusMap := getLivenessStatusMap(
-		s.server.nodeLiveness, clock.Now().GoTime(), s.server.st)
-	livenesses := s.server.nodeLiveness.GetLivenesses()
+	livenesses, err := nl.GetLivenessesFromKV(ctx)
+	if err != nil {
+		return nil, serverError(ctx, err)
+	}
+
+	threshold := storepool.TimeUntilStoreDead.Get(&st.SV)
+
+	statusMap := make(map[roachpb.NodeID]livenesspb.NodeLivenessStatus, len(livenesses))
+	for _, liveness := range livenesses {
+		status := storepool.LivenessStatus(liveness, now, threshold)
+		statusMap[liveness.NodeID] = status
+	}
 	return &serverpb.LivenessResponse{
 		Livenesses: livenesses,
 		Statuses:   statusMap,
 	}, nil
+}
+
+// Liveness returns the liveness state of all nodes on the cluster
+// based on a KV transaction. To reach all nodes in the cluster, consider
+// using (statusServer).NodesWithLiveness instead.
+func (s *adminServer) Liveness(
+	ctx context.Context, _ *serverpb.LivenessRequest,
+) (*serverpb.LivenessResponse, error) {
+	clock := s.server.clock
+	return getLivenessResponse(ctx, s.server.nodeLiveness, clock.Now().GoTime(), s.server.st)
 }
 
 func (s *adminServer) Jobs(
@@ -3484,7 +3499,7 @@ func (c *adminPrivilegeChecker) requireViewActivityPermission(ctx context.Contex
 	if !isAdmin {
 		hasView := false
 		if c.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-			hasView = c.checkHasSystemPrivilege(ctx, userName, privilege.VIEWACTIVITY)
+			hasView = c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITY)
 		}
 		if !hasView {
 			hasView, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITY)
@@ -3513,8 +3528,8 @@ func (c *adminPrivilegeChecker) requireViewActivityOrViewActivityRedactedPermiss
 		hasView := false
 		hasViewRedacted := false
 		if c.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-			hasView = c.checkHasSystemPrivilege(ctx, userName, privilege.VIEWACTIVITY)
-			hasViewRedacted = c.checkHasSystemPrivilege(ctx, userName, privilege.VIEWACTIVITYREDACTED)
+			hasView = c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITY)
+			hasViewRedacted = c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITYREDACTED)
 		}
 		if !hasView && !hasViewRedacted {
 			hasView, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITY)
@@ -3549,7 +3564,7 @@ func (c *adminPrivilegeChecker) requireViewActivityAndNoViewActivityRedactedPerm
 	if !isAdmin {
 		hasViewRedacted := false
 		if c.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-			hasViewRedacted = c.checkHasSystemPrivilege(ctx, userName, privilege.VIEWACTIVITYREDACTED)
+			hasViewRedacted = c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITYREDACTED)
 		}
 		if !hasViewRedacted {
 			hasViewRedacted, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITYREDACTED)
@@ -3582,7 +3597,7 @@ func (c *adminPrivilegeChecker) requireViewClusterMetadataPermission(
 	}
 	if !isAdmin {
 		if c.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-			if hasViewClusterMetadata := c.checkHasSystemPrivilege(ctx, userName, privilege.VIEWCLUSTERMETADATA); !hasViewClusterMetadata {
+			if hasViewClusterMetadata := c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWCLUSTERMETADATA); !hasViewClusterMetadata {
 				return status.Errorf(
 					codes.PermissionDenied, "this operation requires the %s system privilege",
 					privilege.VIEWCLUSTERMETADATA)
@@ -3603,7 +3618,7 @@ func (c *adminPrivilegeChecker) requireViewDebugPermission(ctx context.Context) 
 	}
 	if !isAdmin {
 		if c.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-			if hasViewDebug := c.checkHasSystemPrivilege(ctx, userName, privilege.VIEWDEBUG); !hasViewDebug {
+			if hasViewDebug := c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWDEBUG); !hasViewDebug {
 				return status.Errorf(
 					codes.PermissionDenied, "this operation requires the %s system privilege",
 					privilege.VIEWDEBUG)
@@ -3686,10 +3701,10 @@ func (c *adminPrivilegeChecker) hasRoleOption(
 	return bool(dbDatum), nil
 }
 
-// checkHasSystemPrivilege is a helper function which calls
+// checkHasGlobalPrivilege is a helper function which calls
 // CheckPrivilege and returns a true/false based on the returned
 // result.
-func (c *adminPrivilegeChecker) checkHasSystemPrivilege(
+func (c *adminPrivilegeChecker) checkHasGlobalPrivilege(
 	ctx context.Context, user username.SQLUsername, privilege privilege.Kind,
 ) bool {
 	planner, cleanup := c.makePlanner("check-system-privilege")

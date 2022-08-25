@@ -31,6 +31,7 @@ export const WaitTimeInsightsLabels = {
   BLOCKED_TABLE: "Blocked Table",
   BLOCKED_INDEX: "Blocked Index",
   BLOCKED_ROW: "Blocked Row",
+  CONTENDED_KEY: "Contended Key",
   WAIT_TIME: "Time Spent Waiting",
   BLOCKING_TXNS_TABLE_TITLE: (id: string, execType: ExecutionType): string =>
     `${capitalize(execType)} ID: ${id} waiting on`,
@@ -45,6 +46,7 @@ type WaitTimeInsightsPanelProps = {
   schemaName?: string;
   tableName?: string;
   indexName?: string;
+  contendedKey?: string;
   waitTime?: moment.Duration;
   waitingExecutions: ContendedExecution[];
   blockingExecutions: ContendedExecution[];
@@ -57,6 +59,7 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
   schemaName,
   tableName,
   indexName,
+  contendedKey,
   waitTime,
   waitingExecutions,
   blockingExecutions,
@@ -64,7 +67,9 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
   const showWaitTimeInsightsDetails = waitTime != null;
 
   return (
-    <section className={cx("section", "section--container")}>
+    <section
+      className={cx("section", "section--container", "margin-bottom-large")}
+    >
       <Row gutter={24}>
         <Col>
           <Heading type="h5">{WaitTimeInsightsLabels.SECTION_HEADING}</Heading>
@@ -79,38 +84,52 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
                       waitTime ? Duration(waitTime.milliseconds() * 1e6) : "N/A"
                     }
                   />
-                  <SummaryCardItem
-                    label={WaitTimeInsightsLabels.BLOCKED_SCHEMA}
-                    value={schemaName}
-                  />
-                  <SummaryCardItem
-                    label={WaitTimeInsightsLabels.BLOCKED_DATABASE}
-                    value={databaseName}
-                  />
+                  {schemaName && (
+                    <SummaryCardItem
+                      label={WaitTimeInsightsLabels.BLOCKED_SCHEMA}
+                      value={schemaName}
+                    />
+                  )}
+                  {databaseName && (
+                    <SummaryCardItem
+                      label={WaitTimeInsightsLabels.BLOCKED_DATABASE}
+                      value={databaseName}
+                    />
+                  )}
                 </SummaryCard>
               </Col>
-              <Col className="gutter-row" span={12}>
-                <SummaryCard className={cx("summary-card")}>
-                  <SummaryCardItem
-                    label={WaitTimeInsightsLabels.BLOCKED_TABLE}
-                    value={tableName}
-                  />
-                  <SummaryCardItem
-                    label={WaitTimeInsightsLabels.BLOCKED_INDEX}
-                    value={indexName}
-                  />
-                </SummaryCard>
-              </Col>
+              {tableName && (
+                <Col className="gutter-row" span={12}>
+                  <SummaryCard className={cx("summary-card")}>
+                    <SummaryCardItem
+                      label={WaitTimeInsightsLabels.BLOCKED_TABLE}
+                      value={tableName}
+                    />
+                    {indexName && (
+                      <SummaryCardItem
+                        label={WaitTimeInsightsLabels.BLOCKED_INDEX}
+                        value={indexName}
+                      />
+                    )}
+                    {contendedKey && (
+                      <SummaryCardItem
+                        label={WaitTimeInsightsLabels.CONTENDED_KEY}
+                        value={contendedKey}
+                      />
+                    )}
+                  </SummaryCard>
+                </Col>
+              )}
             </Row>
           )}
           {blockingExecutions.length > 0 && (
             <Row>
-              <Text>
+              <Heading type="h5">
                 {WaitTimeInsightsLabels.BLOCKING_TXNS_TABLE_TITLE(
                   executionID,
                   execType,
                 )}
-              </Text>
+              </Heading>
               <div>
                 <ExecutionContentionTable
                   execType={execType}
@@ -121,12 +140,12 @@ export const WaitTimeInsightsPanel: React.FC<WaitTimeInsightsPanelProps> = ({
           )}
           {waitingExecutions.length > 0 && (
             <Row>
-              <Text>
+              <Heading type="h5">
                 {WaitTimeInsightsLabels.WAITING_TXNS_TABLE_TITLE(
                   executionID,
                   execType,
                 )}
-              </Text>
+              </Heading>
               <div>
                 <ExecutionContentionTable
                   execType={execType}

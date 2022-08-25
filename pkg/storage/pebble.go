@@ -16,7 +16,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -35,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -295,6 +293,17 @@ var EngineComparer = &pebble.Comparer{
 		return append(dst, 0)
 	},
 
+	ImmediateSuccessor: func(dst, a []byte) []byte {
+		// The key `a` is guaranteed to be a bare prefix: It's a
+		// `engineKeyNoVersion` key without a version—just a trailing 0-byte to
+		// signify the length of the version. For example the user key "foo" is
+		// encoded as: "foo\0". We need to encode the immediate successor to
+		// "foo", which in the natural byte ordering is "foo\0".  Append a
+		// single additional zero, to encode the user key "foo\0" with a
+		// zero-length version.
+		return append(append(dst, a...), 0)
+	},
+
 	Split: func(k []byte) int {
 		key, ok := GetKeyPartFromEngineKey(k)
 		if !ok {
@@ -527,7 +536,11 @@ func DefaultPebbleOptions() *pebble.Options {
 	// Automatically flush 10s after the first range tombstone is added to a
 	// memtable. This ensures that we can reclaim space even when there's no
 	// activity on the database generating flushes.
-	opts.Experimental.DeleteRangeFlushDelay = 10 * time.Second
+	opts.FlushDelayDeleteRange = 10 * time.Second
+	// Automatically flush 10s after the first range key is added to a memtable.
+	// This ensures that range keys are quickly flushed, allowing use of lazy
+	// combined iteration within Pebble.
+	opts.FlushDelayRangeKey = 10 * time.Second
 	// Enable deletion pacing. This helps prevent disk slowness events on some
 	// SSDs, that kick off an expensive GC if a lot of files are deleted at
 	// once.
@@ -614,9 +627,6 @@ type PebbleConfig struct {
 	base.StorageConfig
 	// Pebble specific options.
 	Opts *pebble.Options
-	// Temporary option while there exist file descriptor leaks. See the
-	// DisableFilesystemMiddlewareTODO ConfigOption that sets this, and #81389.
-	DisableFilesystemMiddlewareTODO bool
 }
 
 // EncryptionStatsHandler provides encryption related stats.
@@ -635,6 +645,17 @@ type EncryptionStatsHandler interface {
 
 // Pebble is a wrapper around a Pebble database instance.
 type Pebble struct {
+	atomic struct {
+		// compactionConcurrency is the current compaction concurrency set on
+		// the Pebble store. The compactionConcurrency option in the Pebble
+		// Options struct is a closure which will return
+		// Pebble.atomic.compactionConcurrency.
+		//
+		// This mechanism allows us to change the Pebble compactionConcurrency
+		// on the fly without restarting Pebble.
+		compactionConcurrency uint64
+	}
+
 	db *pebble.DB
 
 	closed      bool
@@ -716,6 +737,12 @@ type StoreIDSetter interface {
 	SetStoreID(ctx context.Context, storeID int32)
 }
 
+// SetCompactionConcurrency will return the previous compaction concurrency.
+func (p *Pebble) SetCompactionConcurrency(n uint64) uint64 {
+	prevConcurrency := atomic.SwapUint64(&p.atomic.compactionConcurrency, n)
+	return prevConcurrency
+}
+
 // SetStoreID adds the store id to pebble logs.
 func (p *Pebble) SetStoreID(ctx context.Context, storeID int32) {
 	if p == nil {
@@ -782,15 +809,12 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 
 	// Initialize the FS, wrapping it with disk health-checking and
 	// ENOSPC-detection.
-	var filesystemCloser io.Closer
-	if !cfg.DisableFilesystemMiddlewareTODO {
-		filesystemCloser = wrapFilesystemMiddleware(cfg.Opts)
-		defer func() {
-			if err != nil {
-				filesystemCloser.Close()
-			}
-		}()
-	}
+	filesystemCloser := wrapFilesystemMiddleware(cfg.Opts)
+	defer func() {
+		if err != nil {
+			filesystemCloser.Close()
+		}
+	}()
 
 	cfg.Opts.EnsureDefaults()
 	cfg.Opts.ErrorIfNotExists = cfg.MustExist
@@ -875,6 +899,19 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 		storeIDPebbleLog: storeIDContainer,
 		closer:           filesystemCloser,
 	}
+
+	// MaxConcurrentCompactions can be set by multiple sources, but all the
+	// sources will eventually call NewPebble. So, we override
+	// Opts.MaxConcurrentCompactions to a closure which will return
+	// Pebble.atomic.compactionConcurrency. This will allow us to both honor
+	// the compactions concurrency which has already been set and allow us
+	// to update the compactionConcurrency on the fly by changing the
+	// Pebble.atomic.compactionConcurrency variable.
+	p.atomic.compactionConcurrency = uint64(cfg.Opts.MaxConcurrentCompactions())
+	cfg.Opts.MaxConcurrentCompactions = func() int {
+		return int(atomic.LoadUint64(&p.atomic.compactionConcurrency))
+	}
+
 	cfg.Opts.EventListener = pebble.TeeEventListener(
 		pebble.MakeLoggingEventListener(pebbleLogger{
 			ctx:   logCtx,
@@ -1079,17 +1116,11 @@ func (p *Pebble) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIt
 		// Doing defer r.Free() does not inline.
 		iter := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
-		}
-		return iter
+		return maybeWrapInUnsafeIter(iter)
 	}
 
 	iter := newPebbleIterator(p.db, opts, StandardDurability, p.SupportsRangeKeys())
-	if util.RaceEnabled {
-		return wrapInUnsafeIter(iter)
-	}
-	return iter
+	return maybeWrapInUnsafeIter(iter)
 }
 
 // NewEngineIterator implements the Engine interface.
@@ -1695,7 +1726,7 @@ func (p *Pebble) ReadFile(filename string) ([]byte, error) {
 	}
 	defer file.Close()
 
-	return ioutil.ReadAll(file)
+	return io.ReadAll(file)
 }
 
 // WriteFile writes data to a file in this RocksDB's env.
@@ -2004,10 +2035,7 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 		// Doing defer r.Free() does not inline.
 		iter := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
-		}
-		return iter
+		return maybeWrapInUnsafeIter(iter)
 	}
 
 	iter := &p.normalIter
@@ -2032,11 +2060,7 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 	}
 
 	iter.inuse = true
-	var rv MVCCIterator = iter
-	if util.RaceEnabled {
-		rv = wrapInUnsafeIter(rv)
-	}
-	return rv
+	return maybeWrapInUnsafeIter(iter)
 }
 
 // NewEngineIterator implements the Engine interface.
@@ -2277,18 +2301,12 @@ func (p *pebbleSnapshot) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 		// Doing defer r.Free() does not inline.
 		iter := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		if util.RaceEnabled {
-			iter = wrapInUnsafeIter(iter)
-		}
-		return iter
+		return maybeWrapInUnsafeIter(iter)
 	}
 
 	iter := MVCCIterator(newPebbleIterator(
 		p.snapshot, opts, StandardDurability, p.SupportsRangeKeys()))
-	if util.RaceEnabled {
-		iter = wrapInUnsafeIter(iter)
-	}
-	return iter
+	return maybeWrapInUnsafeIter(iter)
 }
 
 // NewEngineIterator implements the Reader interface.

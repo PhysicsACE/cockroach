@@ -34,45 +34,36 @@ func (p Plan) DecorateErrorWithPlanDetails(err error) (retErr error) {
 	if err == nil {
 		return nil
 	}
+	if len(p.Stages) > 0 {
+		err = addDetail(err, "EXPLAIN plan", "", p.ExplainVerbose)
+		err = addDetail(err, "EXPLAIN graphviz URL", "stages graphviz: ", p.StagesURL)
+	}
+	if p.Graph != nil {
+		err = addDetail(err, "dependencies graphviz URL", "dependencies graphviz: ", p.DependenciesURL)
+	}
+	return errors.WithAssertionFailure(err)
+}
+
+func addDetail(
+	undecoratedError error, errWrapStr, detailFmtStr string, genDetail func() (string, error),
+) (err error) {
+	err = undecoratedError
 	defer func() {
 		if r := recover(); r != nil {
 			rAsErr, ok := r.(error)
 			if !ok {
-				rAsErr = errors.Errorf("panic during scplan.DecorateErrorWithPlanDetails: %v", r)
+				rAsErr = errors.Errorf("%v", r)
 			}
-			retErr = errors.CombineErrors(err, rAsErr)
+			rAsErr = errors.Wrapf(rAsErr, "panic when generating plan error detail %s", errWrapStr)
+			err = errors.CombineErrors(err, rAsErr)
 		}
 	}()
-
-	if len(p.Stages) > 0 {
-		explain, explainErr := p.ExplainVerbose()
-		if explainErr != nil {
-			explainErr = errors.Wrapf(explainErr, "error when generating EXPLAIN plan")
-			err = errors.CombineErrors(err, explainErr)
-		} else {
-			err = errors.WithDetailf(err, "%s", explain)
-		}
-
-		stagesURL, stagesErr := p.StagesURL()
-		if stagesErr != nil {
-			stagesErr = errors.Wrapf(stagesErr, "error when generating EXPLAIN graphviz URL")
-			err = errors.CombineErrors(err, stagesErr)
-		} else {
-			err = errors.WithDetailf(err, "stages graphviz: %s", stagesURL)
-		}
+	detail, detailErr := genDetail()
+	if detailErr == nil {
+		return errors.WithDetailf(err, detailFmtStr+"%s", detail)
 	}
-
-	if p.Graph != nil {
-		dependenciesURL, dependenciesErr := p.DependenciesURL()
-		if dependenciesErr != nil {
-			dependenciesErr = errors.Wrapf(dependenciesErr, "error when generating dependencies graphviz URL")
-			err = errors.CombineErrors(err, dependenciesErr)
-		} else {
-			err = errors.WithDetailf(err, "dependencies graphviz: %s", dependenciesURL)
-		}
-	}
-
-	return errors.WithAssertionFailure(err)
+	detailErr = errors.Wrapf(detailErr, "error when generating plan error detail %s", errWrapStr)
+	return errors.CombineErrors(err, detailErr)
 }
 
 // DependenciesURL returns a URL to render the dependency graph in the Plan.
@@ -199,8 +190,11 @@ func (p Plan) explainTargets(s scstage.Stage, sn treeprinter.Node, style treepri
 	// Generate format string for printing element status transition.
 	fmtCompactTransition := fmt.Sprintf("%%-%ds → %%-%ds %%s", beforeMaxLen, afterMaxLen)
 	// Go over each target grouping.
-	targetTypeMap.ForEach(func(key, numTransitions int) {
-		ts := scpb.TargetStatus(key)
+	for _, ts := range []scpb.TargetStatus{scpb.ToPublic, scpb.Transient, scpb.ToAbsent} {
+		numTransitions := targetTypeMap.GetDefault(int(ts))
+		if numTransitions == 0 {
+			continue
+		}
 		plural := "s"
 		if numTransitions == 1 {
 			plural = ""
@@ -242,7 +236,7 @@ func (p Plan) explainTargets(s scstage.Stage, sn treeprinter.Node, style treepri
 				}
 			}
 		}
-	})
+	}
 	return nil
 }
 

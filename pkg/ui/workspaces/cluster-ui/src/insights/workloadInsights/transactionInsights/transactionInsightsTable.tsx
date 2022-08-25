@@ -18,6 +18,7 @@ import {
 import { DATE_FORMAT, Duration } from "src/util";
 import { InsightExecEnum, InsightEvent } from "src/insights";
 import { QueriesCell, InsightCell, insightsTableTitles } from "../util";
+import { Link } from "react-router-dom";
 
 interface TransactionInsightsTable {
   data: InsightEvent[];
@@ -33,8 +34,18 @@ export function makeTransactionInsightsColumns(): ColumnDescriptor<InsightEvent>
     {
       name: "executionID",
       title: insightsTableTitles.executionID(execType),
-      cell: (item: InsightEvent) => String(item.executionID),
-      sort: (item: InsightEvent) => String(item.executionID),
+      cell: (item: InsightEvent) => (
+        <Link to={`/insights/${item.transactionID}`}>
+          {String(item.transactionID)}
+        </Link>
+      ),
+      sort: (item: InsightEvent) => item.transactionID,
+    },
+    {
+      name: "fingerprintID",
+      title: insightsTableTitles.fingerprintID(execType),
+      cell: (item: InsightEvent) => String(item.fingerprintID),
+      sort: (item: InsightEvent) => item.fingerprintID,
     },
     {
       name: "query",
@@ -62,8 +73,8 @@ export function makeTransactionInsightsColumns(): ColumnDescriptor<InsightEvent>
     {
       name: "elapsedTime",
       title: insightsTableTitles.elapsedTime(execType),
-      cell: (item: InsightEvent) => Duration(item.elapsedTime * 1e6),
-      sort: (item: InsightEvent) => item.elapsedTime,
+      cell: (item: InsightEvent) => Duration(item.elapsedTimeMillis * 1e6),
+      sort: (item: InsightEvent) => item.elapsedTimeMillis,
     },
     {
       name: "applicationName",

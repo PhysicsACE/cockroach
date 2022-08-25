@@ -69,6 +69,12 @@ import (
 )
 
 const (
+	// RunningStatusWaitingForMVCCGC is used for the GC job when it has cleared
+	// the data but is waiting for MVCC GC to remove the data.
+	RunningStatusWaitingForMVCCGC jobs.RunningStatus = "waiting for MVCC GC"
+	// RunningStatusDeletingData is used for the GC job when it is about
+	// to clear the data.
+	RunningStatusDeletingData jobs.RunningStatus = "deleting data"
 	// RunningStatusWaitingGC is for jobs that are currently in progress and
 	// are waiting for the GC interval to expire
 	RunningStatusWaitingGC jobs.RunningStatus = "waiting for GC TTL"
@@ -116,11 +122,6 @@ type SchemaChanger struct {
 	settings             *cluster.Settings
 	execCfg              *ExecutorConfig
 	ieFactory            sqlutil.InternalExecutorFactory
-
-	// mvccCompliantAddIndex is set to true early in exec if we
-	// find that the schema change was created under the
-	// mvcc-compliant regime.
-	mvccCompliantAddIndex bool
 }
 
 // NewSchemaChangerForTesting only for tests.
@@ -511,8 +512,11 @@ func startGCJob(
 	userName username.SQLUsername,
 	schemaChangeDescription string,
 	details jobspb.SchemaChangeGCDetails,
+	useLegacyGCJob bool,
 ) error {
-	jobRecord := CreateGCJobRecord(schemaChangeDescription, userName, details)
+	jobRecord := CreateGCJobRecord(
+		schemaChangeDescription, userName, details, useLegacyGCJob,
+	)
 	jobID := jobRegistry.MakeJobID()
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		_, err := jobRegistry.CreateJobWithTxn(ctx, jobRecord, jobID, txn)
@@ -613,20 +617,9 @@ func (sc *SchemaChanger) checkForMVCCCompliantAddIndexMutations(
 		}
 	}
 
-	if tempIndexes > 0 {
-		sc.mvccCompliantAddIndex = true
-
-		if tempIndexes != nonTempAddingIndexes {
-			return errors.Newf("expected %d temporary indexes, but found %d; schema change may have been constructed during cluster version upgrade",
-				tempIndexes,
-				nonTempAddingIndexes)
-		}
-
-		settings := sc.execCfg.Settings
-		mvccCompliantBackfillSupported := settings.Version.IsActive(ctx, clusterversion.MVCCIndexBackfiller) && tabledesc.UseMVCCCompliantIndexCreation.Get(&settings.SV)
-		if !mvccCompliantBackfillSupported {
-			return errors.Newf("schema change requires MVCC-compliant backfiller, but MVCC-compliant backfiller is not supported")
-		}
+	if tempIndexes != nonTempAddingIndexes {
+		return errors.Newf("expected %d temporary indexes, but found %d; schema change may have been constructed on a version too old to resume execution",
+			nonTempAddingIndexes, tempIndexes)
 	}
 	return nil
 }
@@ -720,7 +713,11 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 				},
 			}
 			if err := startGCJob(
-				ctx, sc.db, sc.jobRegistry, sc.job.Payload().UsernameProto.Decode(), sc.job.Payload().Description, gcDetails,
+				ctx, sc.db, sc.jobRegistry,
+				sc.job.Payload().UsernameProto.Decode(),
+				sc.job.Payload().Description,
+				gcDetails,
+				!sc.settings.Version.IsActive(ctx, clusterversion.UseDelRangeInGCJob),
 			); err != nil {
 				return err
 			}
@@ -1063,6 +1060,7 @@ func (sc *SchemaChanger) rollbackSchemaChange(ctx context.Context, err error) er
 					},
 				},
 			},
+			!sc.settings.Version.IsActive(ctx, clusterversion.UseDelRangeInGCJob),
 		)
 		if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, jobRecord, gcJobID, txn); err != nil {
 			return err
@@ -1278,7 +1276,10 @@ func (sc *SchemaChanger) createIndexGCJobWithDropTime(
 		ParentID: sc.descID,
 	}
 
-	gcJobRecord := CreateGCJobRecord(jobDesc, sc.job.Payload().UsernameProto.Decode(), indexGCDetails)
+	gcJobRecord := CreateGCJobRecord(
+		jobDesc, sc.job.Payload().UsernameProto.Decode(), indexGCDetails,
+		!sc.settings.Version.IsActive(ctx, clusterversion.UseDelRangeInGCJob),
+	)
 	jobID := sc.jobRegistry.MakeJobID()
 	if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, gcJobRecord, jobID, txn); err != nil {
 		return err
@@ -1337,7 +1338,7 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 	var didUpdate bool
 	var depMutationJobs []jobspb.JobID
 	var otherJobIDs []jobspb.JobID
-	err := sc.execCfg.CollectionFactory.Txn(ctx, sc.execCfg.InternalExecutor, sc.db, func(
+	err := sc.execCfg.CollectionFactory.Txn(ctx, sc.db, func(
 		ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
 	) error {
 		depMutationJobs = depMutationJobs[:0]
@@ -2161,13 +2162,9 @@ func (sc *SchemaChanger) maybeDropValidatingConstraint(
 }
 
 // validStateForStartingIndex returns the correct starting state for
-// add index mutations based on the whether this schema change is
-// using temporary indexes or not.
+// add index mutations.
 func (sc *SchemaChanger) startingStateForAddIndexMutations() descpb.DescriptorMutation_State {
-	if sc.mvccCompliantAddIndex {
-		return descpb.DescriptorMutation_BACKFILLING
-	}
-	return descpb.DescriptorMutation_DELETE_ONLY
+	return descpb.DescriptorMutation_BACKFILLING
 }
 
 // deleteIndexMutationsWithReversedColumns deletes mutations with a
@@ -2280,7 +2277,10 @@ func (sc *SchemaChanger) reverseMutation(
 // CreateGCJobRecord creates the job record for a GC job, setting some
 // properties which are common for all GC jobs.
 func CreateGCJobRecord(
-	originalDescription string, userName username.SQLUsername, details jobspb.SchemaChangeGCDetails,
+	originalDescription string,
+	userName username.SQLUsername,
+	details jobspb.SchemaChangeGCDetails,
+	useLegacyGCJob bool,
 ) jobs.Record {
 	descriptorIDs := make([]descpb.ID, 0)
 	if len(details.Indexes) > 0 {
@@ -2292,13 +2292,17 @@ func CreateGCJobRecord(
 			descriptorIDs = append(descriptorIDs, table.ID)
 		}
 	}
+	runningStatus := RunningStatusDeletingData
+	if useLegacyGCJob {
+		runningStatus = RunningStatusWaitingGC
+	}
 	return jobs.Record{
 		Description:   fmt.Sprintf("GC for %s", originalDescription),
 		Username:      userName,
 		DescriptorIDs: descriptorIDs,
 		Details:       details,
 		Progress:      jobspb.SchemaChangeGCProgress{},
-		RunningStatus: RunningStatusWaitingGC,
+		RunningStatus: runningStatus,
 		NonCancelable: true,
 	}
 }
@@ -2316,6 +2320,9 @@ type GCJobTestingKnobs struct {
 
 	// Notifier is used to optionally inject a new gcjobnotifier.Notifier.
 	Notifier *gcjobnotifier.Notifier
+
+	// If true, the GC job will not wait for MVCC GC.
+	SkipWaitingForMVCCGC bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -2447,7 +2454,7 @@ func (sc *SchemaChanger) txn(
 			return err
 		}
 	}
-	return sc.execCfg.CollectionFactory.Txn(ctx, sc.execCfg.InternalExecutor, sc.db, f)
+	return sc.execCfg.CollectionFactory.Txn(ctx, sc.db, f)
 }
 
 // txnWithExecutor is to run internal executor within a txn.
@@ -2724,6 +2731,9 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 			r.job.Payload().UsernameProto.Decode(),
 			r.job.Payload().Description,
 			multiTableGCDetails,
+			!p.ExecCfg().Settings.Version.IsActive(
+				ctx, clusterversion.UseDelRangeInGCJob,
+			),
 		); err != nil {
 			return err
 		}
@@ -3043,10 +3053,7 @@ func (sc *SchemaChanger) shouldSplitAndScatter(
 	}
 
 	if m.Adding() && idx.IsSharded() {
-		if sc.mvccCompliantAddIndex {
-			return m.Backfilling() || (idx.IsTemporaryIndexForBackfill() && m.DeleteOnly())
-		}
-		return m.DeleteOnly()
+		return m.Backfilling() || (idx.IsTemporaryIndexForBackfill() && m.DeleteOnly())
 	}
 	return false
 
@@ -3217,4 +3224,17 @@ func isCurrentMutationDiscarded(
 	}
 	// Not discarded by any later operation.
 	return false, descpb.InvalidMutationID
+}
+
+// CanPerformDropOwnedBy returns if we can perform DROP OWNED BY in the new
+// schema changer. Currently, we do not have an element in the new schema
+// changer for system.privileges, thus we cannot properly support drop
+// owned by if the user has entries in the system.privileges table.
+func (p *planner) CanPerformDropOwnedBy(
+	ctx context.Context, role username.SQLUsername,
+) (bool, error) {
+	row, err := p.QueryRowEx(ctx, `role-has-synthetic-privileges`, sessiondata.NodeUserSessionDataOverride,
+		`SELECT count(1) FROM system.privileges WHERE username = $1`, role.Normalized())
+
+	return tree.MustBeDInt(row[0]) == 0, err
 }

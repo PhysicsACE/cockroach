@@ -86,7 +86,7 @@ type intentInterleavingIter struct {
 	constraint intentInterleavingIterConstraint
 
 	// iter is for iterating over MVCC keys and interleaved intents.
-	iter MVCCIterator
+	iter *pebbleIterator // MVCCIterator
 	// The valid value from iter.Valid() after the last positioning call.
 	iterValid bool
 	// When iterValid = true, this contains the result of iter.UnsafeKey(). We
@@ -96,7 +96,7 @@ type intentInterleavingIter struct {
 
 	// intentIter is for iterating over separated intents, so that
 	// intentInterleavingIter can make them look as if they were interleaved.
-	intentIter      EngineIterator
+	intentIter      *pebbleIterator // EngineIterator
 	intentIterState pebble.IterValidityState
 	// The decoded key from the lock table. This is an unsafe key
 	// in that it is only valid when intentIter has not been
@@ -133,6 +133,17 @@ type intentInterleavingIter struct {
 	//
 	// NB: This value is not valid for intentCmp != 0.
 	iterBareRangeAtIntent bool
+	// rangeKeyChanged keeps track of RangeKeyChanged() for the current
+	// iterator position. This can't simply call through to the parent
+	// iterator for two reasons:
+	//
+	// - maybeSkipIntentRangeKey() may step the iterator forward from
+	//   a bare range key onto a provisional value, which would cause
+	//   RangeKeyChanged() to return false rather than true.
+	//
+	// - reverse iteration may prematurely move onto a range key when
+	//   positioned on an intent not overlapping the range key.
+	rangeKeyChanged bool
 	// The current direction. +1 for forward, -1 for reverse.
 	dir   int
 	valid bool
@@ -244,17 +255,21 @@ func newIntentInterleavingIterator(reader Reader, opts IterOptions) MVCCIterator
 		// constrainedToGlobal.
 		intentOpts.UpperBound = keys.LockTableSingleKeyEnd
 	}
+
+	// All readers given to intentInterleavingIter construct pebbleIterators, so
+	// we can use the concrete type here to avoid the cost of dynamic dispatch.
+	//
 	// Note that we can reuse intentKeyBuf, intentLimitKeyBuf after
 	// NewEngineIterator returns.
-	intentIter := reader.NewEngineIterator(intentOpts)
+	intentIter := reader.NewEngineIterator(intentOpts).(*pebbleIterator)
 
 	// The creation of these iterators can race with concurrent mutations, which
 	// may make them inconsistent with each other. So we clone here, to ensure
 	// consistency (certain Reader implementations already ensure consistency,
 	// and we use that when possible to save allocations).
-	var iter MVCCIterator
+	var iter *pebbleIterator
 	if reader.ConsistentIterators() {
-		iter = reader.NewMVCCIterator(MVCCKeyIterKind, opts)
+		iter = maybeUnwrapUnsafeIter(reader.NewMVCCIterator(MVCCKeyIterKind, opts)).(*pebbleIterator)
 	} else {
 		iter = newPebbleIteratorByCloning(
 			intentIter.GetRawIter(), opts, StandardDurability, reader.SupportsRangeKeys())
@@ -334,6 +349,8 @@ func (i *intentInterleavingIter) makeLowerLimitKey() roachpb.Key {
 // NB: This is called before computePos(), and can't rely on intentCmp.
 //
 // REQUIRES: i.dir > 0
+//
+// gcassert:inline
 func (i *intentInterleavingIter) maybeSkipIntentRangeKey() error {
 	if util.RaceEnabled && i.dir < 0 {
 		i.err = errors.AssertionFailedf("maybeSkipIntentRangeKey called in reverse")
@@ -341,42 +358,71 @@ func (i *intentInterleavingIter) maybeSkipIntentRangeKey() error {
 		return i.err
 	}
 	if i.iterValid && i.intentKey != nil {
-		if hasPoint, hasRange := i.iter.HasPointAndRange(); hasRange && !hasPoint {
-			// iter may be on a bare range key that will cover the provisional value,
-			// in which case we can step onto it. We guard against emitting the wrong
-			// range key for the intent if the provisional value turns out to be
-			// missing by:
-			//
-			// 1. Before we step, make sure iter isn't ahead of intentIter. We have
-			//    to do a key comparison anyway in case intentIter is ahead of iter.
-			// 2. After we step, make sure we're on a point key covered by a range key.
-			//    We don't need a key comparison (but do so under race), because if
-			//    the provisional value is missing then we'll either land on a
-			//    different point key below the range key (which will emit the
-			//    correct range key), or we'll land on a different bare range key.
-			//
-			// TODO(erikgrinaker): in cases where we don't step iter, we can save
-			// the result of the comparison in i.intentCmp to avoid another one.
-			if intentCmp := i.intentKey.Compare(i.iterKey.Key); intentCmp < 0 {
-				i.err = errors.Errorf("iter ahead of provisional value for intent %s (at %s)",
-					i.intentKey, i.iterKey)
+		return i.doMaybeSkipIntentRangeKey()
+	}
+	return nil
+}
+
+// doMaybeSkipIntentRangeKey is a helper for maybeSkipIntentRangeKey(), which
+// allows mid-stack inlining of the former.
+func (i *intentInterleavingIter) doMaybeSkipIntentRangeKey() error {
+	if hasPoint, hasRange := i.iter.HasPointAndRange(); hasRange && !hasPoint {
+		// iter may be on a bare range key that will cover the provisional value,
+		// in which case we can step onto it. We guard against emitting the wrong
+		// range key for the intent if the provisional value turns out to be
+		// missing by:
+		//
+		// 1. Before we step, make sure iter isn't ahead of intentIter. We have
+		//    to do a key comparison anyway in case intentIter is ahead of iter.
+		// 2. After we step, make sure we're on a point key covered by a range key.
+		//    We don't need a key comparison (but do so under race), because if
+		//    the provisional value is missing then we'll either land on a
+		//    different point key below the range key (which will emit the
+		//    correct range key), or we'll land on a different bare range key.
+		//
+		// TODO(erikgrinaker): in cases where we don't step iter, we can save
+		// the result of the comparison in i.intentCmp to avoid another one.
+		if intentCmp := i.intentKey.Compare(i.iterKey.Key); intentCmp < 0 {
+			i.err = errors.Errorf("iter ahead of provisional value for intent %s (at %s)",
+				i.intentKey, i.iterKey)
+			i.valid = false
+			return i.err
+		} else if intentCmp == 0 {
+			i.iter.Next()
+			if err := i.tryDecodeKey(); err != nil {
+				return err
+			}
+			hasPoint, hasRange = i.iter.HasPointAndRange()
+			if !hasPoint || !hasRange || (util.RaceEnabled && !i.iterKey.Key.Equal(i.intentKey)) {
+				i.err = errors.Errorf("iter not on provisional value for intent %s", i.intentKey)
 				i.valid = false
 				return i.err
-			} else if intentCmp == 0 {
-				i.iter.Next()
-				if err := i.tryDecodeKey(); err != nil {
-					return err
-				}
-				hasPoint, hasRange = i.iter.HasPointAndRange()
-				if !hasPoint || !hasRange || (util.RaceEnabled && !i.iterKey.Key.Equal(i.intentKey)) {
-					i.err = errors.Errorf("iter not on provisional value for intent %s", i.intentKey)
-					i.valid = false
-					return i.err
-				}
 			}
 		}
 	}
 	return nil
+}
+
+// maybeSuppressRangeKeyChanged will suppress i.rangeKeyChanged in the reverse
+// direction if the underlying iterator has moved past an intent onto a
+// different range key that should not be surfaced yet. Must be called after
+// computePos().
+//
+// gcassert:inline
+func (i *intentInterleavingIter) maybeSuppressRangeKeyChanged() {
+	if util.RaceEnabled && i.dir > 0 {
+		panic(errors.AssertionFailedf("maybeSuppressRangeKeyChanged called in forward direction"))
+	}
+	// NB: i.intentCmp implies isCurAtIntentIterReverse(), but cheaper.
+	if i.rangeKeyChanged && i.intentCmp > 0 {
+		i.doMaybeSuppressRangeKeyChanged()
+	}
+}
+
+// doMaybeSuppressRangeKeyChanges is a helper for maybeSuppressRangeKeyChanged
+// which allows mid-stack inlining of the former.
+func (i *intentInterleavingIter) doMaybeSuppressRangeKeyChanged() {
+	i.rangeKeyChanged = i.iter.RangeBounds().EndKey.Compare(i.intentKey) > 0
 }
 
 func (i *intentInterleavingIter) SeekGE(key MVCCKey) {
@@ -391,6 +437,7 @@ func (i *intentInterleavingIter) SeekGE(key MVCCKey) {
 	if err := i.tryDecodeKey(); err != nil {
 		return
 	}
+	i.rangeKeyChanged = i.iter.RangeKeyChanged()
 	var intentSeekKey roachpb.Key
 	if key.Timestamp.IsEmpty() {
 		// Common case.
@@ -436,6 +483,7 @@ func (i *intentInterleavingIter) SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID
 	if err := i.tryDecodeKey(); err != nil {
 		return
 	}
+	i.rangeKeyChanged = i.iter.RangeKeyChanged()
 	var engineKey EngineKey
 	engineKey, i.intentKeyBuf = LockTableKey{
 		Key:      key,
@@ -619,6 +667,7 @@ func (i *intentInterleavingIter) Next() {
 			if err := i.tryDecodeKey(); err != nil {
 				return
 			}
+			i.rangeKeyChanged = i.iter.RangeKeyChanged()
 			var limitKey roachpb.Key
 			if i.iterValid && !i.prefix {
 				limitKey = i.makeUpperLimitKey()
@@ -649,6 +698,7 @@ func (i *intentInterleavingIter) Next() {
 			if err := i.tryDecodeKey(); err != nil {
 				return
 			}
+			i.rangeKeyChanged = i.iter.RangeKeyChanged()
 			i.intentCmp = 0
 			if !i.iterValid {
 				i.err = errors.Errorf("intent has no provisional value")
@@ -719,6 +769,7 @@ func (i *intentInterleavingIter) Next() {
 		if err = i.tryDecodeLockKey(iterState, err); err != nil {
 			return
 		}
+		i.rangeKeyChanged = false // already surfaced at the intent
 		// NB: doesn't need maybeSkipIntentRangeKey() as intentCmp > 0.
 		i.intentCmp = +1
 		if util.RaceEnabled && i.intentKey != nil {
@@ -737,6 +788,7 @@ func (i *intentInterleavingIter) Next() {
 		if err := i.tryDecodeKey(); err != nil {
 			return
 		}
+		i.rangeKeyChanged = i.iter.RangeKeyChanged()
 		if i.intentIterState == pebble.IterAtLimit && i.iterValid && !i.prefix {
 			// TODO(sumeer): could avoid doing this if i.iter has stepped to
 			// different version of same key.
@@ -777,6 +829,7 @@ func (i *intentInterleavingIter) NextKey() {
 		if err := i.tryDecodeKey(); err != nil {
 			return
 		}
+		i.rangeKeyChanged = i.iter.RangeKeyChanged()
 		var limitKey roachpb.Key
 		if i.iterValid && !i.prefix {
 			limitKey = i.makeUpperLimitKey()
@@ -798,6 +851,7 @@ func (i *intentInterleavingIter) NextKey() {
 	if err := i.tryDecodeKey(); err != nil {
 		return
 	}
+	i.rangeKeyChanged = i.iter.RangeKeyChanged()
 	if i.intentIterState == pebble.IterAtLimit && i.iterValid && !i.prefix {
 		limitKey := i.makeUpperLimitKey()
 		iterState, err := i.intentIter.NextEngineKeyWithLimit(limitKey)
@@ -940,6 +994,11 @@ func (i *intentInterleavingIter) RangeKeys() MVCCRangeKeyStack {
 	return i.iter.RangeKeys()
 }
 
+// RangeKeyChanged implements SimpleMVCCIterator.
+func (i *intentInterleavingIter) RangeKeyChanged() bool {
+	return i.rangeKeyChanged
+}
+
 func (i *intentInterleavingIter) Close() {
 	i.iter.Close()
 	i.intentIter.Close()
@@ -1008,6 +1067,8 @@ func (i *intentInterleavingIter) SeekLT(key MVCCKey) {
 		return
 	}
 	i.computePos()
+	i.rangeKeyChanged = i.iter.RangeKeyChanged()
+	i.maybeSuppressRangeKeyChanged()
 }
 
 func (i *intentInterleavingIter) Prev() {
@@ -1034,6 +1095,8 @@ func (i *intentInterleavingIter) Prev() {
 				return
 			}
 			i.computePos()
+			i.rangeKeyChanged = i.iter.RangeKeyChanged()
+			i.maybeSuppressRangeKeyChanged()
 			return
 		}
 		// At least one of the iterators is not exhausted.
@@ -1059,6 +1122,8 @@ func (i *intentInterleavingIter) Prev() {
 				return
 			}
 			i.computePos()
+			i.rangeKeyChanged = i.iter.RangeKeyChanged()
+			i.maybeSuppressRangeKeyChanged()
 		} else {
 			// The intentIter is after the iter. We don't know whether the iter key
 			// has an intent. Note that the iter could itself be positioned at an
@@ -1069,6 +1134,7 @@ func (i *intentInterleavingIter) Prev() {
 				return
 			}
 			i.computePos()
+			i.maybeSuppressRangeKeyChanged()
 		}
 	}
 	if !i.valid {
@@ -1080,13 +1146,16 @@ func (i *intentInterleavingIter) Prev() {
 		// positioned on the start of a range key colocated with the intent.
 		// Stepping intentIter backward will ensure that intentKey is <= the key
 		// of iter (when neither is exhausted), but we may also need to step
-		// off the bare range key if there is one.
+		// off the bare range key if there is one, and account for the fact
+		// that the range key may have already changed on the intent.
 		if i.iterBareRangeAtIntent {
 			i.iter.Prev()
 			if err := i.tryDecodeKey(); err != nil {
 				return
 			}
 		}
+		i.rangeKeyChanged = i.iter.RangeKeyChanged() && (i.iterBareRangeAtIntent ||
+			i.iter.RangeBounds().EndKey.Compare(i.intentKey) <= 0)
 		var limitKey roachpb.Key
 		if i.iterValid {
 			limitKey = i.makeLowerLimitKey()
@@ -1108,6 +1177,7 @@ func (i *intentInterleavingIter) Prev() {
 		i.intentCmp = -1
 		if i.intentKey != nil {
 			i.computePos()
+			i.maybeSuppressRangeKeyChanged()
 			if i.intentCmp > 0 {
 				i.err = errors.Errorf("intentIter should not be after iter")
 				i.valid = false
@@ -1132,6 +1202,8 @@ func (i *intentInterleavingIter) Prev() {
 			}
 		}
 		i.computePos()
+		i.rangeKeyChanged = i.iter.RangeKeyChanged()
+		i.maybeSuppressRangeKeyChanged()
 	}
 }
 
@@ -1185,11 +1257,16 @@ func (i *intentInterleavingIter) Stats() IteratorStats {
 	return stats
 }
 
+// IsPrefix implements the MVCCIterator interface.
+func (i *intentInterleavingIter) IsPrefix() bool {
+	return i.prefix
+}
+
 func (i *intentInterleavingIter) SupportsPrev() bool {
 	return true
 }
 
-// unsageMVCCIterator is used in RaceEnabled test builds to randomly inject
+// unsafeMVCCIterator is used in RaceEnabled test builds to randomly inject
 // changes to unsafe keys retrieved from MVCCIterators.
 type unsafeMVCCIterator struct {
 	MVCCIterator
@@ -1198,8 +1275,22 @@ type unsafeMVCCIterator struct {
 	rawMVCCKeyBuf []byte
 }
 
-func wrapInUnsafeIter(iter MVCCIterator) MVCCIterator {
-	return &unsafeMVCCIterator{MVCCIterator: iter}
+// gcassert:inline
+func maybeWrapInUnsafeIter(iter MVCCIterator) MVCCIterator {
+	if util.RaceEnabled {
+		return &unsafeMVCCIterator{MVCCIterator: iter}
+	}
+	return iter
+}
+
+// gcassert:inline
+func maybeUnwrapUnsafeIter(iter MVCCIterator) MVCCIterator {
+	if util.RaceEnabled {
+		if unsafeIter, ok := iter.(*unsafeMVCCIterator); ok {
+			return unsafeIter.MVCCIterator
+		}
+	}
+	return iter
 }
 
 var _ MVCCIterator = &unsafeMVCCIterator{}

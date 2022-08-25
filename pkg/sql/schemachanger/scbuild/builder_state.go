@@ -230,10 +230,10 @@ func (b *builderState) NextViewIndexID(view *scpb.View) (ret catid.IndexID) {
 }
 
 // NextTableConstraintID implements the scbuildstmt.TableHelpers interface.
-func (b *builderState) NextTableConstraintID(table *scpb.Table) (ret catid.ConstraintID) {
+func (b *builderState) NextTableConstraintID(id catid.DescID) (ret catid.ConstraintID) {
 	{
-		b.ensureDescriptor(table.TableID)
-		desc := b.descCache[table.TableID].desc
+		b.ensureDescriptor(id)
+		desc := b.descCache[id].desc
 		tbl, ok := desc.(catalog.TableDescriptor)
 		if !ok {
 			panic(errors.AssertionFailedf("Expected table descriptor for ID %d, instead got %s",
@@ -245,7 +245,7 @@ func (b *builderState) NextTableConstraintID(table *scpb.Table) (ret catid.Const
 		}
 	}
 
-	b.QueryByID(table.TableID).ForEachElementStatus(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) {
+	b.QueryByID(id).ForEachElementStatus(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) {
 		v, _ := screl.Schema.GetAttribute(screl.ConstraintID, e)
 		if id, ok := v.(catid.ConstraintID); ok && id >= ret {
 			ret = id + 1
@@ -377,7 +377,7 @@ func newTypeT(t *types.T) scpb.TypeT {
 }
 
 // WrapExpression implements the scbuildstmt.TableHelpers interface.
-func (b *builderState) WrapExpression(parentID catid.DescID, expr tree.Expr) *scpb.Expression {
+func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scpb.Expression {
 	// We will serialize and reparse the expression, so that type information
 	// annotations are directly embedded inside, otherwise while parsing the
 	// expression table record implicit types will not be correctly detected
@@ -413,7 +413,7 @@ func (b *builderState) WrapExpression(parentID catid.DescID, expr tree.Expr) *sc
 			// Validate that no cross DB type references will exist here.
 			// Determine the parent database ID, since cross database references are
 			// disallowed.
-			_, _, parentNamespace := scpb.FindNamespace(b.QueryByID(parentID))
+			_, _, parentNamespace := scpb.FindNamespace(b.QueryByID(tableID))
 			if desc.GetParentID() != parentNamespace.DatabaseID {
 				typeName := tree.MakeTypeNameWithPrefix(b.descCache[id].prefix, desc.GetName())
 				panic(pgerror.Newf(
@@ -466,10 +466,26 @@ func (b *builderState) WrapExpression(parentID catid.DescID, expr tree.Expr) *sc
 			}
 		}
 	}
+	cachedDesc, ok := b.descCache[tableID]
+	if !ok {
+		panic(errors.AssertionFailedf("failed to get descriptor for table %d", tableID))
+	}
+	tableDesc, ok := cachedDesc.desc.(catalog.TableDescriptor)
+	if !ok {
+		panic(errors.AssertionFailedf(
+			"descriptor %d should be a table but is %v",
+			tableID, cachedDesc.desc.DescriptorType(),
+		))
+	}
+	ids, err := schemaexpr.ExtractColumnIDs(tableDesc, expr)
+	if err != nil {
+		panic(err)
+	}
 	ret := &scpb.Expression{
-		Expr:            catpb.Expression(tree.Serialize(expr)),
-		UsesSequenceIDs: seqIDs.Ordered(),
-		UsesTypeIDs:     typeIDs.Ordered(),
+		Expr:                catpb.Expression(tree.Serialize(expr)),
+		UsesSequenceIDs:     seqIDs.Ordered(),
+		UsesTypeIDs:         typeIDs.Ordered(),
+		ReferencedColumnIDs: ids.Ordered(),
 	}
 	return ret
 }
@@ -925,7 +941,7 @@ func (b *builderState) ensureDescriptor(id catid.DescID) {
 	if err := b.commentCache.LoadCommentsForObjects(b.ctx, []descpb.ID{c.desc.GetID()}); err != nil {
 		panic(err)
 	}
-	c.backrefs = scdecomp.WalkDescriptor(b.ctx, c.desc, crossRefLookupFn, visitorFn, b.commentCache)
+	c.backrefs = scdecomp.WalkDescriptor(b.ctx, c.desc, crossRefLookupFn, visitorFn, b.commentCache, b.zoneConfigReader)
 	// Name prefix and namespace lookups.
 	switch d := c.desc.(type) {
 	case catalog.DatabaseDescriptor:

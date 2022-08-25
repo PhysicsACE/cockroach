@@ -140,7 +140,7 @@ func TestBackupRestoreStatementResult(t *testing.T) {
 	t.Run("GZipBackupManifest", func(t *testing.T) {
 		backupDir := fmt.Sprintf("%s/foo", dir)
 		backupManifestFile := backupDir + "/" + backupbase.BackupManifestName
-		backupManifestBytes, err := ioutil.ReadFile(backupManifestFile)
+		backupManifestBytes, err := os.ReadFile(backupManifestFile)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -297,7 +297,7 @@ func TestBackupRestorePartitioned(t *testing.T) {
 				fName := f.Name()
 				if partitionMatcher.MatchString(fName) {
 					backupPartitionFile := subDir + "/" + fName
-					backupPartitionBytes, err := ioutil.ReadFile(backupPartitionFile)
+					backupPartitionBytes, err := os.ReadFile(backupPartitionFile)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -1589,7 +1589,7 @@ func TestBackupRestoreResume(t *testing.T) {
 					t.Fatal(err)
 				}
 				checkpointFile := backupDir + item.checkpointDirectory + "/" + backupinfo.BackupManifestCheckpointName
-				if err := ioutil.WriteFile(checkpointFile, mockManifest, 0644); err != nil {
+				if err := os.WriteFile(checkpointFile, mockManifest, 0644); err != nil {
 					t.Fatal(err)
 				}
 				createAndWaitForJob(
@@ -1604,7 +1604,7 @@ func TestBackupRestoreResume(t *testing.T) {
 				// If the backup properly took the (incorrect) checkpoint into account, it
 				// won't have tried to re-export any keys within backupCompletedSpan.
 				backupManifestFile := backupDir + "/" + backupbase.BackupManifestName
-				backupManifestBytes, err := ioutil.ReadFile(backupManifestFile)
+				backupManifestBytes, err := os.ReadFile(backupManifestFile)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -3952,7 +3952,7 @@ func TestBackupRestoreChecksum(t *testing.T) {
 
 	var backupManifest backuppb.BackupManifest
 	{
-		backupManifestBytes, err := ioutil.ReadFile(filepath.Join(dir, backupbase.BackupManifestName))
+		backupManifestBytes, err := os.ReadFile(filepath.Join(dir, backupbase.BackupManifestName))
 		if err != nil {
 			t.Fatalf("%+v", err)
 		}
@@ -4110,7 +4110,7 @@ func checkBackupStatsEncrypted(t *testing.T, rawDir string) {
 			return err
 		}
 		if partitionMatcher.MatchString(fName) {
-			statsBytes, err := ioutil.ReadFile(fName)
+			statsBytes, err := os.ReadFile(fName)
 			if err != nil {
 				return err
 			}
@@ -4129,7 +4129,7 @@ func checkBackupFilesEncrypted(t *testing.T, rawDir string) {
 	checkedFiles := 0
 	if err := filepath.Walk(rawDir, func(path string, info os.FileInfo, err error) error {
 		if !info.IsDir() && !strings.Contains(path, "foo/cleartext") {
-			data, err := ioutil.ReadFile(path)
+			data, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -8220,7 +8220,7 @@ func TestManifestTooNew(t *testing.T) {
 
 	// Load/deserialize the manifest so we can mess with it.
 	manifestPath := filepath.Join(rawDir, "too_new", backupbase.BackupManifestName)
-	manifestData, err := ioutil.ReadFile(manifestPath)
+	manifestData, err := os.ReadFile(manifestPath)
 	require.NoError(t, err)
 	manifestData, err = backupinfo.DecompressData(context.Background(), nil, manifestData)
 	require.NoError(t, err)
@@ -8231,11 +8231,11 @@ func TestManifestTooNew(t *testing.T) {
 	backupManifest.ClusterVersion = roachpb.Version{Major: 99, Minor: 1}
 	manifestData, err = protoutil.Marshal(&backupManifest)
 	require.NoError(t, err)
-	require.NoError(t, ioutil.WriteFile(manifestPath, manifestData, 0644 /* perm */))
+	require.NoError(t, os.WriteFile(manifestPath, manifestData, 0644 /* perm */))
 	// Also write the checksum file to match the new manifest.
 	checksum, err := backupinfo.GetChecksum(manifestData)
 	require.NoError(t, err)
-	require.NoError(t, ioutil.WriteFile(manifestPath+backupinfo.BackupManifestChecksumSuffix, checksum, 0644 /* perm */))
+	require.NoError(t, os.WriteFile(manifestPath+backupinfo.BackupManifestChecksumSuffix, checksum, 0644 /* perm */))
 
 	// Verify we reject it.
 	sqlDB.ExpectErr(t, "backup from version 99.1 is newer than current version", `RESTORE DATABASE r1 FROM 'nodelocal://0/too_new'`)
@@ -8244,11 +8244,11 @@ func TestManifestTooNew(t *testing.T) {
 	backupManifest.ClusterVersion = roachpb.Version{Major: 20, Minor: 2, Internal: 2}
 	manifestData, err = protoutil.Marshal(&backupManifest)
 	require.NoError(t, err)
-	require.NoError(t, ioutil.WriteFile(manifestPath, manifestData, 0644 /* perm */))
+	require.NoError(t, os.WriteFile(manifestPath, manifestData, 0644 /* perm */))
 	// Also write the checksum file to match the new manifest.
 	checksum, err = backupinfo.GetChecksum(manifestData)
 	require.NoError(t, err)
-	require.NoError(t, ioutil.WriteFile(manifestPath+backupinfo.BackupManifestChecksumSuffix, checksum, 0644 /* perm */))
+	require.NoError(t, os.WriteFile(manifestPath+backupinfo.BackupManifestChecksumSuffix, checksum, 0644 /* perm */))
 
 	// Prove we can restore again.
 	sqlDB.Exec(t, `RESTORE DATABASE r1 FROM 'nodelocal://0/too_new'`)
@@ -8258,11 +8258,11 @@ func TestManifestTooNew(t *testing.T) {
 	backupManifest.ClusterVersion = roachpb.Version{}
 	manifestData, err = protoutil.Marshal(&backupManifest)
 	require.NoError(t, err)
-	require.NoError(t, ioutil.WriteFile(manifestPath, manifestData, 0644 /* perm */))
+	require.NoError(t, os.WriteFile(manifestPath, manifestData, 0644 /* perm */))
 	// Also write the checksum file to match the new manifest.
 	checksum, err = backupinfo.GetChecksum(manifestData)
 	require.NoError(t, err)
-	require.NoError(t, ioutil.WriteFile(manifestPath+backupinfo.BackupManifestChecksumSuffix, checksum, 0644 /* perm */))
+	require.NoError(t, os.WriteFile(manifestPath+backupinfo.BackupManifestChecksumSuffix, checksum, 0644 /* perm */))
 	// Prove we can restore again.
 	sqlDB.Exec(t, `RESTORE DATABASE r1 FROM 'nodelocal://0/too_new'`)
 	sqlDB.Exec(t, `DROP DATABASE r1`)
@@ -8303,10 +8303,10 @@ func flipBitInManifests(t *testing.T, rawDir string) {
 		log.Infof(context.Background(), "visiting %s", path)
 		if filepath.Base(path) == backupbase.BackupManifestName {
 			foundManifest = true
-			data, err := ioutil.ReadFile(path)
+			data, err := os.ReadFile(path)
 			require.NoError(t, err)
 			data[20] ^= 1
-			if err := ioutil.WriteFile(path, data, 0644 /* perm */); err != nil {
+			if err := os.WriteFile(path, data, 0644 /* perm */); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -8963,12 +8963,15 @@ func TestGCDropIndexSpanExpansion(t *testing.T) {
 		// the tenant. More investigation is required. Tracked with #76378.
 		DisableDefaultTestTenant: true,
 		Knobs: base.TestingKnobs{
-			GCJob: &sql.GCJobTestingKnobs{RunBeforePerformGC: func(id jobspb.JobID) error {
-				gcJobID = id
-				aboutToGC <- struct{}{}
-				<-allowGC
-				return nil
-			}},
+			GCJob: &sql.GCJobTestingKnobs{
+				RunBeforePerformGC: func(id jobspb.JobID) error {
+					gcJobID = id
+					aboutToGC <- struct{}{}
+					<-allowGC
+					return nil
+				},
+				SkipWaitingForMVCCGC: true,
+			},
 		},
 	}})
 	defer tc.Stopper().Stop(ctx)
@@ -10170,4 +10173,134 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 		ErrorText:    redact.Sprintf("testing injected failure: %s", "sensitive text"),
 	}
 	requireRecoveryEvent(t, beforeRestore.UnixNano(), restoreJobEventType, expectedRestoreFailEvent)
+}
+
+// This is a regression test ensuring that the spans represented by views are
+// not included in backups when their descriptors are included in descriptor
+// revisions.
+func TestViewRevisions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	_, sqlDB, _, cleanup := backupRestoreTestSetup(t, singleNode, 10, InitManualReplication)
+	defer cleanup()
+
+	sqlDB.Exec(t, `
+		CREATE DATABASE test;
+		USE test;
+		CREATE VIEW v AS SELECT 1;
+	`)
+	sqlDB.Exec(t, `BACKUP TO 'nodelocal://1/foo' WITH revision_history;`)
+	sqlDB.Exec(t, `BACKUP TO 'nodelocal://1/foo' WITH revision_history;`)
+	sqlDB.Exec(t, `ALTER VIEW v RENAME TO v2;`)
+	sqlDB.Exec(t, `BACKUP TO 'nodelocal://1/foo' WITH revision_history;`)
+}
+
+// This tests checks that backups do not contain spans of views, but do contain
+// view descriptors.
+func TestBackupDoNotIncludeViewSpans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tc, sqlDB, dir, cleanupFn := backupRestoreTestSetup(t, singleNode, 0, InitManualReplication)
+	defer cleanupFn()
+	kvDB := tc.Server(0).DB()
+
+	// Generate some testdata and back it up.
+	sqlDB.Exec(t, "CREATE DATABASE d")
+	sqlDB.Exec(t, "CREATE TABLE d.t (k INT, a INT, b INT)")
+	sqlDB.Exec(t, "INSERT INTO d.t VALUES(1, 100, 101), (2, 200, 202)")
+	sqlDB.Exec(t, "CREATE VIEW d.tview AS SELECT k, b FROM d.t")
+	sqlDB.Exec(t, `BACKUP DATABASE d INTO $1`, localFoo)
+
+	res := sqlDB.QueryStr(t, `SHOW BACKUPS IN $1`, localFoo)
+	if len(res) != 1 {
+		t.Fatal("expected 1 backup")
+	}
+
+	// Read the backup manifest.
+	var backupManifest backuppb.BackupManifest
+	{
+		backupManifestBytes, err := os.ReadFile(filepath.Join(dir, "foo", res[0][0], backupbase.BackupManifestName))
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+		if backupinfo.IsGZipped(backupManifestBytes) {
+			backupManifestBytes, err = backupinfo.DecompressData(context.Background(), nil, backupManifestBytes)
+			require.NoError(t, err)
+		}
+		if err := protoutil.Unmarshal(backupManifestBytes, &backupManifest); err != nil {
+			t.Fatalf("%+v", err)
+		}
+	}
+
+	// Verify that the manifest doesn't contain any spans that intersect the span
+	// for the view.
+	tbDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "tview")
+	viewSpan := tbDesc.TableSpan(keys.SystemSQLCodec)
+
+	for _, sp := range backupManifest.Spans {
+		if sp.Overlaps(viewSpan) {
+			t.Fatalf("backup span %v overlaps view span %v", sp, viewSpan)
+		}
+	}
+
+	sqlDB.Exec(t, "DROP DATABASE d")
+	sqlDB.Exec(t, "RESTORE DATABASE d FROM LATEST IN $1", localFoo)
+	sqlDB.CheckQueryResults(t, "SHOW CREATE VIEW d.tview", [][]string{{"d.public.tview", "CREATE VIEW public.tview (\n\tk,\n\tb\n) AS SELECT k, b FROM d.public.t"}})
+	sqlDB.CheckQueryResults(t, "SELECT * from d.tview", [][]string{{"1", "101"}, {"2", "202"}})
+}
+
+// Because we do not split ranges at view boundaries, it is possible that the
+// range the view span belongs to is shared by another object in the cluster
+// (that we may or may not be backing up) that might have its own bespoke zone
+// configurations, namely one with a short GC TTL. This could lead to a
+// situation where the short GC TTL on the range we are not backing up causes
+// our protectedts verification to fail when attempting to backup the view span.
+//
+// This test verifies that backups succeed on a database with a view that's on
+// another database's range because we are no longer backing up that view's
+// span.
+func TestBackupDBWithViewOnAdjacentDBRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tc, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, 0, InitManualReplication)
+	defer cleanupFn()
+	s0 := tc.Servers[0]
+
+	// Speeds up the test.
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
+
+	// Create two databases da and db, and tables in such a way that the view
+	// db.dbview is on the same range as db.t2. Set da to have a short GC TTL of 1
+	// second.
+	sqlDB.Exec(t, `
+		CREATE DATABASE da;
+		CREATE TABLE da.t1 (k INT PRIMARY KEY, v INT);
+		CREATE DATABASE db;
+		CREATE TABLE db.t2 (k INT PRIMARY KEY, v INT);
+		CREATE TABLE da.t2 (k INT PRIMARY KEY, v INT);
+		CREATE VIEW db.dbview AS SELECT k, v FROM db.t2;
+		ALTER DATABASE da CONFIGURE ZONE USING gc.ttlseconds=1;
+
+		INSERT INTO da.t2 VALUES (1, 100), (2, 200), (3, 300);
+		UPDATE da.t2 SET v = 101 WHERE k = 1;
+	`)
+
+	// Wait for splits to be created on the new tables.
+	waitForTableSplit(t, tc.Conns[0], "t2", "da")
+
+	sqlDB.Exec(t, `BACKUP DATABASE db INTO 'userfile:///a' WITH revision_history;`)
+
+	time.Sleep(5 * time.Second)
+
+	// Force GC on da.t2 to advance its GC threshold.
+	err := s0.ForceTableGC(context.Background(), "da", "t2", s0.Clock().Now().Add(-int64(1*time.Second), 0))
+	require.NoError(t, err)
+
+	// This statement should succeed as we are not backing up the span for dbview,
+	// but would fail if it was backed up.
+	sqlDB.Exec(t, `BACKUP database db into latest in 'userfile:///a' with revision_history;`)
 }

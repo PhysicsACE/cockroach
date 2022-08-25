@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React, { useState } from "react";
+import React, { useContext, useState } from "react";
 import { Helmet } from "react-helmet";
 import { ArrowLeft } from "@cockroachlabs/icons";
 import {
@@ -29,6 +29,7 @@ import {
 } from "../../insightsTable/insightsTable";
 import classNames from "classnames/bind";
 import styles from "../statementDetails.module.scss";
+import { CockroachCloudContext } from "../../contexts";
 
 const cx = classNames.bind(styles);
 
@@ -120,7 +121,8 @@ function ExplainPlan({
   onChangeSortSetting,
 }: ExplainPlanProps): React.ReactElement {
   const explainPlan =
-    plan.explain_plan === "" ? "unavailable" : plan.explain_plan;
+    `Plan Gist: ${plan.stats.plan_gists[0]} \n\n` +
+    (plan.explain_plan === "" ? "unavailable" : plan.explain_plan);
   const hasInsights = plan.stats.index_recommendations?.length > 0;
   return (
     <div>
@@ -135,7 +137,7 @@ function ExplainPlan({
       >
         All Plans
       </Button>
-      <SqlBox value={explainPlan} size={SqlBoxSize.large} />
+      <SqlBox value={explainPlan} size={SqlBoxSize.custom} />
       {hasInsights && (
         <Insights
           idxRecommendations={plan.stats.index_recommendations}
@@ -173,8 +175,6 @@ function formatIdxRecommendations(
     const idxRec: InsightRecommendation = {
       type: idxType,
       database: plan.metadata.databases[0],
-      table: "",
-      index_id: 0,
       query: rec.split(" : ")[1],
       execution: {
         statement: plan.metadata.query,
@@ -200,8 +200,6 @@ interface InsightsProps {
   onChangeSortSetting: (ss: SortSetting) => void;
 }
 
-const insightsColumns = makeInsightsColumns();
-
 function Insights({
   idxRecommendations,
   plan,
@@ -209,6 +207,8 @@ function Insights({
   sortSetting,
   onChangeSortSetting,
 }: InsightsProps): React.ReactElement {
+  const isCockroachCloud = useContext(CockroachCloudContext);
+  const insightsColumns = makeInsightsColumns(isCockroachCloud);
   const data = formatIdxRecommendations(
     idxRecommendations,
     plan,

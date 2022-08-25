@@ -315,7 +315,7 @@ export const refreshStores = storesReducerObj.refresh;
 const queriesReducerObj = new CachedDataReducer(
   api.getCombinedStatements,
   "statements",
-  moment.duration(5, "m"),
+  null,
   moment.duration(30, "m"),
 );
 export const invalidateStatements = queriesReducerObj.invalidateData;
@@ -403,6 +403,25 @@ const insightsReducerObj = new CachedDataReducer(
 );
 export const refreshInsights = insightsReducerObj.refresh;
 
+const statementInsightsReducerObj = new CachedDataReducer(
+  clusterUiApi.getStatementInsightsApi,
+  "statementInsights",
+  null,
+  moment.duration(30, "s"), // Timeout
+);
+export const refreshStatementInsights = statementInsightsReducerObj.refresh;
+
+export const insightRequestKey = (
+  req: clusterUiApi.InsightEventDetailsRequest,
+): string => `${req.id}`;
+
+const insightDetailsReducerObj = new KeyedCachedDataReducer(
+  clusterUiApi.getInsightEventDetailsState,
+  "insightDetails",
+  insightRequestKey,
+);
+export const refreshInsightDetails = insightDetailsReducerObj.refresh;
+
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
   events: CachedDataReducerState<api.EventsResponseMessage>;
@@ -439,6 +458,8 @@ export interface APIReducersState {
   hotRanges: PaginatedCachedDataReducerState<api.HotRangesV2ResponseMessage>;
   clusterLocks: CachedDataReducerState<clusterUiApi.ClusterLocksResponse>;
   insights: CachedDataReducerState<clusterUiApi.InsightEventsResponse>;
+  insightDetails: KeyedCachedDataReducerState<clusterUiApi.InsightEventDetailsResponse>;
+  statementInsights: CachedDataReducerState<clusterUiApi.StatementInsights>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -481,6 +502,9 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [hotRangesReducerObj.actionNamespace]: hotRangesReducerObj.reducer,
   [clusterLocksReducerObj.actionNamespace]: clusterLocksReducerObj.reducer,
   [insightsReducerObj.actionNamespace]: insightsReducerObj.reducer,
+  [insightDetailsReducerObj.actionNamespace]: insightDetailsReducerObj.reducer,
+  [statementInsightsReducerObj.actionNamespace]:
+    statementInsightsReducerObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

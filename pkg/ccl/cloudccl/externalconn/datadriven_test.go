@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/externalconn/providers" // register all the concrete External Connection implementations
@@ -38,9 +39,13 @@ func TestDataDriven(t *testing.T) {
 		defer dirCleanupFn()
 
 		var skipCheckExternalStorageConnection bool
+		var skipCheckKMSConnection bool
 		ecTestingKnobs := &externalconn.TestingKnobs{
 			SkipCheckingExternalStorageConnection: func() bool {
 				return skipCheckExternalStorageConnection
+			},
+			SkipCheckingKMSConnection: func() bool {
+				return skipCheckKMSConnection
 			},
 		}
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
@@ -82,6 +87,12 @@ func TestDataDriven(t *testing.T) {
 			case "disable-check-external-storage":
 				skipCheckExternalStorageConnection = true
 
+			case "enable-check-kms":
+				skipCheckKMSConnection = false
+
+			case "disable-check-kms":
+				skipCheckKMSConnection = true
+
 			case "exec-sql":
 				if d.HasArg("user") {
 					var user string
@@ -94,6 +105,12 @@ func TestDataDriven(t *testing.T) {
 				}
 
 			case "query-sql":
+				if d.HasArg("user") {
+					var user string
+					d.ScanArgs(t, "user", &user)
+					resetToRootUser := externalConnTestCluster.SetSQLDBForUser(tenantID, user)
+					defer resetToRootUser()
+				}
 				var rows *gosql.Rows
 				var err error
 				if rows, err = tenant.QueryWithErr(d.Input); err != nil {

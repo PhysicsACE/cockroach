@@ -510,6 +510,12 @@ var (
 		Measurement: "SSTables",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaRdbKeysRangeKeySets = metric.Metadata{
+		Name:        "storage.keys.range-key-set.count",
+		Help:        "Approximate count of RangeKeySet internal keys across the storage engine.",
+		Measurement: "Keys",
+		Unit:        metric.Unit_COUNT,
+	}
 	// NB: bytes only ever get flushed into L0, so this metric does not
 	// exist for any other level.
 	metaRdbL0BytesFlushed = storageLevelMetricMetadata(
@@ -1004,9 +1010,16 @@ Such Replicas will be ignored for the purposes of proposal quota, and will not
 receive replication traffic. They are essentially treated as offline for the
 purpose of replication. This serves as a crude form of admission control.
 
-The count is emitted by the leaseholder of each range.
-.`,
+The count is emitted by the leaseholder of each range.`,
 		Measurement: "Followers",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRaftPausedFollowerDroppedMsgs = metric.Metadata{
+		Name: "admission.raft.paused_replicas_dropped_msgs",
+		Help: `Number of messages dropped instead of being sent to paused replicas.
+
+The messages are dropped to help these replicas to recover from I/O overload.`,
+		Measurement: "Messages",
 		Unit:        metric.Unit_COUNT,
 	}
 
@@ -1349,6 +1362,18 @@ The count is emitted by the leaseholder of each range.
 		Measurement: "Intent Resolutions",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaGCUsedClearRange = metric.Metadata{
+		Name:        "queue.gc.info.clearrangesuccess",
+		Help:        "Number of successful ClearRange operation during GC",
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaGCFailedClearRange = metric.Metadata{
+		Name:        "queue.gc.info.clearrangefailed",
+		Help:        "Number of failed ClearRange operation during GC",
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
 
 	// Slow request metrics.
 	metaLatchRequests = metric.Metadata{
@@ -1670,6 +1695,7 @@ type StoreMetrics struct {
 	RdbNumSSTables              *metric.Gauge
 	RdbPendingCompaction        *metric.Gauge
 	RdbMarkedForCompactionFiles *metric.Gauge
+	RdbKeysRangeKeySets         *metric.Gauge
 	RdbL0BytesFlushed           *metric.Gauge
 	RdbL0Sublevels              *metric.Gauge
 	RdbL0NumFiles               *metric.Gauge
@@ -1742,7 +1768,8 @@ type StoreMetrics struct {
 	RaftLogFollowerBehindCount *metric.Gauge
 	RaftLogTruncated           *metric.Counter
 
-	RaftPausedFollowerCount *metric.Gauge
+	RaftPausedFollowerCount       *metric.Gauge
+	RaftPausedFollowerDroppedMsgs *metric.Counter
 
 	RaftCoalescedHeartbeatsPending *metric.Gauge
 
@@ -1807,6 +1834,8 @@ type StoreMetrics struct {
 	GCResolveFailed *metric.Counter
 	// Failures resolving intents that belong to local transactions.
 	GCTxnIntentsResolveFailed *metric.Counter
+	GCUsedClearRange          *metric.Counter
+	GCFailedClearRange        *metric.Counter
 
 	// Slow request counts.
 	SlowLatchRequests *metric.Gauge
@@ -2175,6 +2204,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RdbNumSSTables:              metric.NewGauge(metaRdbNumSSTables),
 		RdbPendingCompaction:        metric.NewGauge(metaRdbPendingCompaction),
 		RdbMarkedForCompactionFiles: metric.NewGauge(metaRdbMarkedForCompactionFiles),
+		RdbKeysRangeKeySets:         metric.NewGauge(metaRdbKeysRangeKeySets),
 		RdbL0BytesFlushed:           metric.NewGauge(metaRdbL0BytesFlushed),
 		RdbL0Sublevels:              metric.NewGauge(metaRdbL0Sublevels),
 		RdbL0NumFiles:               metric.NewGauge(metaRdbL0NumFiles),
@@ -2252,7 +2282,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftLogFollowerBehindCount: metric.NewGauge(metaRaftLogFollowerBehindCount),
 		RaftLogTruncated:           metric.NewCounter(metaRaftLogTruncated),
 
-		RaftPausedFollowerCount: metric.NewGauge(metaRaftFollowerPaused),
+		RaftPausedFollowerCount:       metric.NewGauge(metaRaftFollowerPaused),
+		RaftPausedFollowerDroppedMsgs: metric.NewCounter(metaRaftPausedFollowerDroppedMsgs),
 
 		// This Gauge measures the number of heartbeats queued up just before
 		// the queue is cleared, to avoid flapping wildly.
@@ -2317,6 +2348,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		GCResolveSuccess:             metric.NewCounter(metaGCResolveSuccess),
 		GCResolveFailed:              metric.NewCounter(metaGCResolveFailed),
 		GCTxnIntentsResolveFailed:    metric.NewCounter(metaGCTxnIntentsResolveFailed),
+		GCUsedClearRange:             metric.NewCounter(metaGCUsedClearRange),
+		GCFailedClearRange:           metric.NewCounter(metaGCFailedClearRange),
 
 		// Wedge request counters.
 		SlowLatchRequests: metric.NewGauge(metaLatchRequests),
@@ -2447,6 +2480,7 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.RdbReadAmplification.Update(int64(m.ReadAmp()))
 	sm.RdbPendingCompaction.Update(int64(m.Compact.EstimatedDebt))
 	sm.RdbMarkedForCompactionFiles.Update(int64(m.Compact.MarkedFiles))
+	sm.RdbKeysRangeKeySets.Update(int64(m.Keys.RangeKeySetsCount))
 	sm.RdbNumSSTables.Update(m.NumSSTables())
 	sm.RdbWriteStalls.Update(m.WriteStallCount)
 	sm.RdbWriteStallNanos.Update(m.WriteStallDuration.Nanoseconds())

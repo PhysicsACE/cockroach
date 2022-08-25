@@ -13,22 +13,28 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -67,6 +73,10 @@ var localityCfgs = map[string]roachpb.Locality{
 			{Key: "availability-zone", Value: "eu-north-1"},
 		},
 	},
+}
+
+var clusterVersionKeys = map[string]clusterversion.Key{
+	"Start22_2": clusterversion.Start22_2,
 }
 
 type sqlDBKey struct {
@@ -110,12 +120,14 @@ func (d *datadrivenTestState) cleanup(ctx context.Context) {
 }
 
 type serverCfg struct {
-	name       string
-	iodir      string
-	nodes      int
-	splits     int
-	ioConf     base.ExternalIODirConfig
-	localities string
+	name           string
+	iodir          string
+	nodes          int
+	splits         int
+	ioConf         base.ExternalIODirConfig
+	localities     string
+	beforeVersion  string
+	testingKnobCfg string
 }
 
 func (d *datadrivenTestState) addServer(t *testing.T, cfg serverCfg) error {
@@ -128,6 +140,23 @@ func (d *datadrivenTestState) addServer(t *testing.T, cfg serverCfg) error {
 	}
 
 	settings := cluster.MakeTestingClusterSettings()
+
+	if cfg.beforeVersion != "" {
+		beforeKey, ok := clusterVersionKeys[cfg.beforeVersion]
+		if !ok {
+			t.Fatalf("clusterVersion %s does not exist in data driven global map", cfg.beforeVersion)
+		}
+		beforeKey--
+		params.ServerArgs.Knobs.Server = &server.TestingKnobs{
+			BinaryVersionOverride:          clusterversion.ByKey(beforeKey),
+			DisableAutomaticVersionUpgrade: make(chan struct{})}
+		settings = cluster.MakeTestingClusterSettingsWithVersions(
+			clusterversion.TestingBinaryVersion,
+			clusterversion.ByKey(beforeKey),
+			false,
+		)
+	}
+
 	closedts.TargetDuration.Override(context.Background(), &settings.SV, 10*time.Millisecond)
 	closedts.SideTransportCloseInterval.Override(context.Background(), &settings.SV, 10*time.Millisecond)
 	sql.TempObjectWaitInterval.Override(context.Background(), &settings.SV, time.Millisecond)
@@ -145,6 +174,18 @@ func (d *datadrivenTestState) addServer(t *testing.T, cfg serverCfg) error {
 			serverArgsPerNode[i] = param
 		}
 		params.ServerArgsPerNode = serverArgsPerNode
+	}
+	if cfg.testingKnobCfg != "" {
+		switch cfg.testingKnobCfg {
+		case "RecoverFromIterPanic":
+			params.ServerArgs.Knobs.DistSQL = &execinfra.TestingKnobs{
+				BackupRestoreTestingKnobs: &sql.BackupRestoreTestingKnobs{
+					RecoverFromIterPanic: true,
+				},
+			}
+		default:
+			t.Fatalf("TestingKnobCfg %s not found", cfg.testingKnobCfg)
+		}
 	}
 	if cfg.iodir == "" {
 		tc, _, cfg.iodir, cleanup = backupRestoreTestSetupWithParams(t, clusterSize, cfg.splits,
@@ -225,6 +266,19 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, server string, user string)
 //
 //   + splits: specifies the number of ranges the bank table is split into.
 //
+//   + before-version=<beforeVersion>: creates a mixed version cluster where all
+//   nodes running the test server binary think the clusterVersion is one
+//   version before the passed in <beforeVersion> key. See cockroach_versions.go
+//   for possible values.
+//
+//   + testingKnobCfg: specifies a key to a hardcoded testingKnob configuration
+//
+//
+// - "upgrade-server version=<version>"
+//    Upgrade the cluster version of the active server to the passed in
+//    clusterVersion key. See cockroach_versions.go for possible values.
+//
+//
 // - "exec-sql [server=<name>] [user=<name>] [args]"
 //   Executes the input SQL query on the target server. By default, server is
 //   the last created server.
@@ -240,8 +294,11 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, server string, user string)
 //   + ignore-notice: does not print out the notice that is buffered during
 //   query execution.
 //
-// - "query-sql [server=<name>] [user=<name>]"
+// - "query-sql [server=<name>] [user=<name>] [regex=<regex pattern>]"
 //   Executes the input SQL query and print the results.
+//
+//   + regex: return true if the query result matches the regex pattern and
+//   false otherwise.
 //
 // - "reset"
 //    Clear all state associated with the test.
@@ -310,6 +367,9 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, server string, user string)
 //
 //   + target: SQL target. Currently, only table names are supported.
 //
+//
+// - "corrupt-backup" uri=<collectionUri>
+//   Finds the latest backup in the provided collection uri an flips a bit in one SST in the backup
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -338,7 +398,7 @@ func TestDataDriven(t *testing.T) {
 				return ""
 
 			case "new-server":
-				var name, shareDirWith, iodir, localities string
+				var name, shareDirWith, iodir, localities, beforeVersion, testingKnobCfg string
 				var splits int
 				nodes := singleNode
 				var io base.ExternalIODirConfig
@@ -364,15 +424,23 @@ func TestDataDriven(t *testing.T) {
 				if d.HasArg("splits") {
 					d.ScanArgs(t, "splits", &splits)
 				}
+				if d.HasArg("beforeVersion") {
+					d.ScanArgs(t, "beforeVersion", &beforeVersion)
+				}
+				if d.HasArg("testingKnobCfg") {
+					d.ScanArgs(t, "testingKnobCfg", &testingKnobCfg)
+				}
 
 				lastCreatedServer = name
 				cfg := serverCfg{
-					name:       name,
-					iodir:      iodir,
-					nodes:      nodes,
-					splits:     splits,
-					ioConf:     io,
-					localities: localities,
+					name:           name,
+					iodir:          iodir,
+					nodes:          nodes,
+					splits:         splits,
+					ioConf:         io,
+					localities:     localities,
+					beforeVersion:  beforeVersion,
+					testingKnobCfg: testingKnobCfg,
 				}
 				err := ds.addServer(t, cfg)
 				if err != nil {
@@ -384,6 +452,23 @@ func TestDataDriven(t *testing.T) {
 				var name string
 				d.ScanArgs(t, "name", &name)
 				lastCreatedServer = name
+				return ""
+
+			case "upgrade-server":
+				server := lastCreatedServer
+				user := "root"
+
+				var version string
+				if d.HasArg("version") {
+					d.ScanArgs(t, "version", &version)
+				}
+				key, ok := clusterVersionKeys[version]
+				if !ok {
+					t.Fatalf("clusterVersion %s does not exist in data driven global map", version)
+				}
+				clusterVersion := clusterversion.ByKey(key)
+				_, err := ds.getSQLDB(t, server, user).Exec("SET CLUSTER SETTING version = $1", clusterVersion.String())
+				require.NoError(t, err)
 				return ""
 
 			case "exec-sql":
@@ -472,6 +557,16 @@ func TestDataDriven(t *testing.T) {
 				}
 				output, err := sqlutils.RowsToDataDrivenOutput(rows)
 				require.NoError(t, err)
+				if d.HasArg("regex") {
+					var pattern string
+					d.ScanArgs(t, "regex", &pattern)
+					matched, err := regexp.MatchString(pattern, output)
+					require.NoError(t, err)
+					if matched {
+						return "true"
+					}
+					return "false"
+				}
 				return output
 
 			case "let":
@@ -505,6 +600,30 @@ func TestDataDriven(t *testing.T) {
 				server := lastCreatedServer
 				user := "root"
 				jobType := "BACKUP"
+
+				// First, run the backup.
+				_, err := ds.getSQLDB(t, server, user).Exec(d.Input)
+
+				// Tag the job.
+				if d.HasArg("tag") {
+					tagJob(t, server, user, jobType, ds, d)
+				}
+
+				// Check if we expect a pausepoint error.
+				if d.HasArg("expect-pausepoint") {
+					expectPausepoint(t, err, jobType, server, user, ds)
+					ret := append(ds.noticeBuffer, "job paused at pausepoint")
+					return strings.Join(ret, "\n")
+				}
+
+				// All other errors are bad.
+				require.NoError(t, err)
+				return ""
+
+			case "import":
+				server := lastCreatedServer
+				user := "root"
+				jobType := "IMPORT"
 
 				// First, run the backup.
 				_, err := ds.getSQLDB(t, server, user).Exec(d.Input)
@@ -724,6 +843,28 @@ func TestDataDriven(t *testing.T) {
 				})
 				require.NoError(t, err)
 				return ""
+
+			case "corrupt-backup":
+				server := lastCreatedServer
+				user := "root"
+				var uri string
+				d.ScanArgs(t, "uri", &uri)
+				parsedURI, err := url.Parse(strings.Replace(uri, "'", "", -1))
+				require.NoError(t, err)
+				var filePath string
+				filePathQuery := fmt.Sprintf("SELECT path FROM [SHOW BACKUP FILES FROM LATEST IN %s] LIMIT 1", uri)
+				err = ds.getSQLDB(t, server, user).QueryRow(filePathQuery).Scan(&filePath)
+				require.NoError(t, err)
+				fullPath := filepath.Join(ds.getIODir(t, server), parsedURI.Path, filePath)
+				print(fullPath)
+				data, err := os.ReadFile(fullPath)
+				require.NoError(t, err)
+				data[20] ^= 1
+				if err := os.WriteFile(fullPath, data, 0644 /* perm */); err != nil {
+					t.Fatal(err)
+				}
+				return ""
+
 			default:
 				return fmt.Sprintf("unknown command: %s", d.Cmd)
 			}

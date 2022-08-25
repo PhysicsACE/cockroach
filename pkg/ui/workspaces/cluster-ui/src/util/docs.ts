@@ -94,6 +94,7 @@ export const enterpriseLicensing =
   "https://www.cockroachlabs.com/docs/stable/enterprise-licensing.html";
 
 // Explain plan
+export const explainPlan = docsURL("explain.html");
 export const distSql = docsURL("architecture/sql-layer.html#distsql");
 export const vectorizedExecution = docsURL(
   "vectorized-execution.html#configuring-vectorized-execution",
@@ -107,6 +108,9 @@ export const fullScan = docsURL(
   "sql-tuning-with-explain.html#issue-full-table-scans",
 );
 export const secondaryIndex = docsURL("schema-design-indexes.html");
+export const onlineSchemaChanges = docsURL("online-schema-changes.html");
+export const createIndex = docsURL("create-index.html");
+export const dropIndex = docsURL("drop-index.html");
 export const lockingStrength = docsURL(
   "explain.html#find-out-if-a-statement-is-using-select-for-update-locking",
 );

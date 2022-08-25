@@ -83,6 +83,7 @@ deallocate_stmt ::=
 
 discard_stmt ::=
 	'DISCARD' 'ALL'
+	| 'DISCARD' 'SEQUENCES'
 
 grant_stmt ::=
 	'GRANT' privileges 'ON' grant_targets 'TO' role_spec_list opt_with_grant_option
@@ -257,6 +258,7 @@ show_stmt ::=
 	| show_constraints_stmt
 	| show_create_stmt
 	| show_create_schedules_stmt
+	| show_create_external_connections_stmt
 	| show_local_or_tenant_csettings_stmt
 	| show_databases_stmt
 	| show_enums_stmt
@@ -777,6 +779,10 @@ show_create_schedules_stmt ::=
 	'SHOW' 'CREATE' 'ALL' 'SCHEDULES'
 	| 'SHOW' 'CREATE' 'SCHEDULE' a_expr
 
+show_create_external_connections_stmt ::=
+	'SHOW' 'CREATE' 'ALL' 'EXTERNAL' 'CONNECTIONS'
+	| 'SHOW' 'CREATE' 'EXTERNAL' 'CONNECTION' string_or_placeholder
+
 show_local_or_tenant_csettings_stmt ::=
 	show_csettings_stmt
 	| show_csettings_stmt 'FOR' 'TENANT' d_expr
@@ -877,7 +883,7 @@ show_sessions_stmt ::=
 	| 'SHOW' 'ALL' opt_cluster 'SESSIONS'
 
 show_stats_stmt ::=
-	'SHOW' 'STATISTICS' 'FOR' 'TABLE' table_name
+	'SHOW' 'STATISTICS' 'FOR' 'TABLE' table_name opt_with_options
 
 show_tables_stmt ::=
 	'SHOW' 'TABLES' 'FROM' name '.' name with_comment
@@ -1008,6 +1014,7 @@ unreserved_keyword ::=
 	| 'CONFIGURATIONS'
 	| 'CONFIGURE'
 	| 'CONNECTION'
+	| 'CONNECTIONS'
 	| 'CONSTRAINTS'
 	| 'CONTROLCHANGEFEED'
 	| 'CONTROLJOB'
@@ -1363,6 +1370,7 @@ unreserved_keyword ::=
 	| 'VALIDATE'
 	| 'VALUE'
 	| 'VARYING'
+	| 'VERIFY_BACKUP_TABLE_DATA'
 	| 'VIEW'
 	| 'VIEWACTIVITY'
 	| 'VIEWACTIVITYREDACTED'
@@ -1515,6 +1523,7 @@ alter_index_stmt ::=
 	| alter_scatter_index_stmt
 	| alter_rename_index_stmt
 	| alter_zone_index_stmt
+	| alter_index_visible_stmt
 
 alter_view_stmt ::=
 	alter_rename_view_stmt
@@ -1763,14 +1772,14 @@ drop_table_stmt ::=
 	| 'DROP' 'TABLE' 'IF' 'EXISTS' table_name_list opt_drop_behavior
 
 drop_view_stmt ::=
-	'DROP' 'VIEW' table_name_list opt_drop_behavior
-	| 'DROP' 'VIEW' 'IF' 'EXISTS' table_name_list opt_drop_behavior
-	| 'DROP' 'MATERIALIZED' 'VIEW' table_name_list opt_drop_behavior
-	| 'DROP' 'MATERIALIZED' 'VIEW' 'IF' 'EXISTS' table_name_list opt_drop_behavior
+	'DROP' 'VIEW' view_name_list opt_drop_behavior
+	| 'DROP' 'VIEW' 'IF' 'EXISTS' view_name_list opt_drop_behavior
+	| 'DROP' 'MATERIALIZED' 'VIEW' view_name_list opt_drop_behavior
+	| 'DROP' 'MATERIALIZED' 'VIEW' 'IF' 'EXISTS' view_name_list opt_drop_behavior
 
 drop_sequence_stmt ::=
-	'DROP' 'SEQUENCE' table_name_list opt_drop_behavior
-	| 'DROP' 'SEQUENCE' 'IF' 'EXISTS' table_name_list opt_drop_behavior
+	'DROP' 'SEQUENCE' sequence_name_list opt_drop_behavior
+	| 'DROP' 'SEQUENCE' 'IF' 'EXISTS' sequence_name_list opt_drop_behavior
 
 drop_schema_stmt ::=
 	'DROP' 'SCHEMA' schema_name_list opt_drop_behavior
@@ -2053,6 +2062,10 @@ alter_rename_index_stmt ::=
 alter_zone_index_stmt ::=
 	'ALTER' 'INDEX' table_index_name set_zone_config
 
+alter_index_visible_stmt ::=
+	'ALTER' 'INDEX' table_index_name alter_index_visible
+	| 'ALTER' 'INDEX' 'IF' 'EXISTS' table_index_name alter_index_visible
+
 alter_rename_view_stmt ::=
 	'ALTER' 'VIEW' relation_expr 'RENAME' 'TO' view_name
 	| 'ALTER' 'MATERIALIZED' 'VIEW' relation_expr 'RENAME' 'TO' view_name
@@ -2128,6 +2141,7 @@ alter_database_set_secondary_region_stmt ::=
 
 alter_database_drop_secondary_region ::=
 	'ALTER' 'DATABASE' database_name 'DROP' 'SECONDARY' 'REGION'
+	| 'ALTER' 'DATABASE' database_name 'DROP' 'SECONDARY' 'REGION' 'IF' 'EXISTS'
 
 alter_database_set_zone_config_extension_stmt ::=
 	'ALTER' 'DATABASE' database_name 'ALTER' 'LOCALITY' 'GLOBAL' set_zone_config
@@ -2474,7 +2488,13 @@ table_index_name_list ::=
 	( table_index_name ) ( ( ',' table_index_name ) )*
 
 table_name_list ::=
-	( table_name ) ( ( ',' table_name ) )*
+	db_object_name_list
+
+view_name_list ::=
+	db_object_name_list
+
+sequence_name_list ::=
+	db_object_name_list
 
 non_reserved_word ::=
 	'identifier'
@@ -2512,6 +2532,7 @@ restore_options ::=
 	| 'INCREMENTAL_LOCATION' '=' string_or_placeholder_opt_list
 	| 'TENANT' '=' string_or_placeholder
 	| 'SCHEMA_ONLY'
+	| 'VERIFY_BACKUP_TABLE_DATA'
 
 scrub_option_list ::=
 	( scrub_option ) ( ( ',' scrub_option ) )*
@@ -2717,6 +2738,10 @@ locality ::=
 
 alter_index_cmds ::=
 	( alter_index_cmd ) ( ( ',' alter_index_cmd ) )*
+
+alter_index_visible ::=
+	'NOT' 'VISIBLE'
+	| 'VISIBLE'
 
 sequence_option_list ::=
 	( sequence_option_elem ) ( ( sequence_option_elem ) )*
@@ -3024,6 +3049,9 @@ sortby ::=
 only_signed_fconst ::=
 	'+' 'FCONST'
 	| '-' 'FCONST'
+
+db_object_name_list ::=
+	( db_object_name ) ( ( ',' db_object_name ) )*
 
 scrub_option ::=
 	'INDEX' 'ALL'

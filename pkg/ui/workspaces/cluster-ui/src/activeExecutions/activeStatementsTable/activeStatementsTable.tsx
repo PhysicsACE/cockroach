@@ -9,56 +9,51 @@
 // licenses/APL.txt.
 
 import React from "react";
-import {
-  SortedTable,
-  ISortedTablePagination,
-  ColumnDescriptor,
-} from "../../sortedtable";
-import { SortSetting } from "../../sortedtable";
-import { ActiveStatement, ExecutionType } from "../types";
-import { isSelectedColumn } from "../../columnsSelector/utils";
-import {
-  getLabel,
-  ExecutionsColumn,
-  activeStatementColumnsFromCommon,
-  executionsTableTitles,
-} from "../execTableCommon";
 import { Link } from "react-router-dom";
+import { isSelectedColumn } from "../../columnsSelector/utils";
+import { ColumnDescriptor } from "../../sortedtable";
+import {
+  activeStatementColumnsFromCommon,
+  ExecutionsColumn,
+  executionsTableTitles,
+  getLabel,
+} from "../execTableCommon";
+import { ActiveStatement } from "../types";
+import { Tooltip } from "@cockroachlabs/ui-components";
+import { limitText } from "../../util";
 
-interface ActiveStatementsTable {
-  data: ActiveStatement[];
-  sortSetting: SortSetting;
-  onChangeSortSetting: (ss: SortSetting) => void;
-  pagination: ISortedTablePagination;
-  renderNoResult?: React.ReactNode;
-  selectedColumns: string[];
-}
-
-export function makeActiveStatementsColumns(): ColumnDescriptor<ActiveStatement>[] {
+export function makeActiveStatementsColumns(
+  isCockroachCloud: boolean,
+): ColumnDescriptor<ActiveStatement>[] {
   return [
     activeStatementColumnsFromCommon.executionID,
     {
       name: "execution",
       title: executionsTableTitles.execution("statement"),
       cell: (item: ActiveStatement) => (
-        <Link to={`/execution/statement/${item.statementID}`}>
-          {item.query}
-        </Link>
+        <Tooltip placement="bottom" content={item.query}>
+          <Link to={`/execution/statement/${item.statementID}`}>
+            {limitText(item.query, 70)}
+          </Link>
+        </Tooltip>
       ),
       sort: (item: ActiveStatement) => item.query,
     },
     activeStatementColumnsFromCommon.status,
     activeStatementColumnsFromCommon.startTime,
     activeStatementColumnsFromCommon.elapsedTime,
-    activeStatementColumnsFromCommon.timeSpentWaiting,
+    !isCockroachCloud
+      ? activeStatementColumnsFromCommon.timeSpentWaiting
+      : null,
     activeStatementColumnsFromCommon.applicationName,
-  ];
+  ].filter(col => col != null);
 }
 
 export function getColumnOptions(
+  columns: ColumnDescriptor<ActiveStatement>[],
   selectedColumns: string[] | null,
 ): { label: string; value: string; isSelected: boolean }[] {
-  return makeActiveStatementsColumns()
+  return columns
     .filter(col => !col.alwaysShow)
     .map(col => ({
       value: col.name,
@@ -66,16 +61,3 @@ export function getColumnOptions(
       isSelected: isSelectedColumn(selectedColumns, col),
     }));
 }
-
-export const ActiveStatementsTable: React.FC<ActiveStatementsTable> = props => {
-  const { selectedColumns, ...rest } = props;
-  const columns = makeActiveStatementsColumns().filter(col =>
-    isSelectedColumn(selectedColumns, col),
-  );
-
-  return (
-    <SortedTable columns={columns} className="statements-table" {...rest} />
-  );
-};
-
-ActiveStatementsTable.defaultProps = {};

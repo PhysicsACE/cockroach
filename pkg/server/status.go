@@ -327,7 +327,7 @@ func (b *baseStatusServer) checkCancelPrivilege(
 			// sessions/queries.
 			hasCancelQuery := false
 			if b.privilegeChecker.st.Version.IsActive(ctx, clusterversion.SystemPrivilegesTable) {
-				hasCancelQuery = b.privilegeChecker.checkHasSystemPrivilege(ctx, reqUser, privilege.CANCELQUERY)
+				hasCancelQuery = b.privilegeChecker.checkHasGlobalPrivilege(ctx, reqUser, privilege.CANCELQUERY)
 			}
 			if !hasCancelQuery {
 				ok, err := b.privilegeChecker.hasRoleOption(ctx, reqUser, roleoption.CANCELQUERY)
@@ -424,7 +424,7 @@ func (b *baseStatusServer) localExecutionInsights(
 ) (*serverpb.ListExecutionInsightsResponse, error) {
 	var response serverpb.ListExecutionInsightsResponse
 
-	reader := b.sqlServer.pgServer.SQLServer.GetSQLStatsProvider()
+	reader := b.sqlServer.pgServer.SQLServer.GetInsightsReader()
 	reader.IterateInsights(ctx, func(ctx context.Context, insight *insights.Insight) {
 		response.Insights = append(response.Insights, *insight)
 	})
@@ -1664,7 +1664,10 @@ func (s *statusServer) nodesHelper(
 	}
 
 	clock := s.admin.server.clock
-	resp.LivenessByNodeID = getLivenessStatusMap(s.nodeLiveness, clock.Now().GoTime(), s.st)
+	resp.LivenessByNodeID, err = getLivenessStatusMap(ctx, s.nodeLiveness, clock.Now().GoTime(), s.st)
+	if err != nil {
+		return nil, 0, err
+	}
 	return &resp, next, nil
 }
 
@@ -1681,7 +1684,10 @@ func (s *statusServer) nodesStatusWithLiveness(
 		return nil, err
 	}
 	clock := s.admin.server.clock
-	statusMap := getLivenessStatusMap(s.nodeLiveness, clock.Now().GoTime(), s.st)
+	statusMap, err := getLivenessStatusMap(ctx, s.nodeLiveness, clock.Now().GoTime(), s.st)
+	if err != nil {
+		return nil, err
+	}
 	ret := make(map[roachpb.NodeID]nodeStatusWithLiveness)
 	for _, node := range nodes.Nodes {
 		nodeID := node.Desc.NodeID
@@ -2045,6 +2051,7 @@ func (s *statusServer) rangesHelper(
 				QuiescentEqualsTicking: raftStatus != nil && metrics.Quiescent == metrics.Ticking,
 				RaftLogTooLarge:        metrics.RaftLogTooLarge,
 				CircuitBreakerError:    len(state.CircuitBreakerError) > 0,
+				PausedFollowers:        metrics.PausedFollowerCount > 0,
 			},
 			LeaseStatus:                 metrics.LeaseStatus,
 			Quiescent:                   metrics.Quiescent,
@@ -2367,16 +2374,16 @@ func (s *statusServer) HotRangesV2(
 	rangeReportMetas := make(map[uint32]hotRangeReportMeta)
 	var descrs []catalog.Descriptor
 	var err error
-	if err := s.sqlServer.distSQLServer.CollectionFactory.Txn(
-		ctx, s.sqlServer.internalExecutor, s.db,
-		func(ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error {
-			all, err := descriptors.GetAllDescriptors(ctx, txn)
-			if err != nil {
-				return err
-			}
-			descrs = all.OrderedDescriptors()
-			return nil
-		}); err != nil {
+	if err := s.sqlServer.distSQLServer.CollectionFactory.Txn(ctx, s.db, func(
+		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+	) error {
+		all, err := descriptors.GetAllDescriptors(ctx, txn)
+		if err != nil {
+			return err
+		}
+		descrs = all.OrderedDescriptors()
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 

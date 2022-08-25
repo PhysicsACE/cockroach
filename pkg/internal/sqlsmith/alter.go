@@ -254,7 +254,19 @@ func makeDropColumn(s *Smither) (tree.Statement, bool) {
 	if !ok {
 		return nil, false
 	}
-	col := tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
+	// Pick a random column to drop while ignoring the system columns since
+	// those cannot be dropped.
+	var col *tree.ColumnTableDef
+	for {
+		col = tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
+		var isSystemCol bool
+		for _, systemColDesc := range colinfo.AllSystemColumnDescs {
+			isSystemCol = isSystemCol || string(col.Name) == systemColDesc.Name
+		}
+		if !isSystemCol {
+			break
+		}
+	}
 
 	return &tree.AlterTable{
 		Table: tableRef.TableName.ToUnresolvedObjectName(),
@@ -351,9 +363,7 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		Storing:      storing,
 		Inverted:     inverted,
 		Concurrently: s.coin(),
-		// TODO(wenyihu6): uncomment the following line after we support not visible
-		// index.
-		// NotVisible:   s.d6() == 1, // NotVisible index is rare 1/6 chance.
+		NotVisible:   s.d6() == 1, // NotVisible index is rare 1/6 chance.
 	}, true
 }
 

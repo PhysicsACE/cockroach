@@ -24,10 +24,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/redact"
 )
@@ -313,34 +313,32 @@ func (p *planner) maybeLogStatementInternal(
 
 	if auditEventsDetected {
 		// TODO(knz): re-add the placeholders and age into the logging event.
-		entries := make([]eventLogEntry, len(p.curPlan.auditEvents))
+		entries := make([]logpb.EventPayload, len(p.curPlan.auditEvents))
 		for i, ev := range p.curPlan.auditEvents {
 			mode := "r"
 			if ev.writing {
 				mode = "rw"
 			}
 			tableName := ""
-			if t, ok := ev.desc.(catalog.TableDescriptor); ok {
-				// We only have a valid *table* name if the object being
-				// audited is table-like (includes view, sequence etc). For
-				// now, this is sufficient because the auditing feature can
-				// only audit tables. If/when the mechanisms are extended to
-				// audit databases and schema, we need more logic here to
-				// extract a name to include in the logging events.
-				tn, err := p.getQualifiedTableName(ctx, t)
-				if err != nil {
-					log.Warningf(ctx, "name for audited table ID %d not found: %v", ev.desc.GetID(), err)
-				} else {
-					tableName = tn.FQString()
-				}
+			// We only have a valid *table* name if the object being
+			// audited is table-like (includes view, sequence etc). For
+			// now, this is sufficient because the auditing feature can
+			// only audit tables. If/when the mechanisms are extended to
+			// audit databases and schema, we need more logic here to
+			// extract a name to include in the logging events.
+			tn, err := p.getQualifiedTableName(ctx, ev.desc)
+			if err != nil {
+				log.Warningf(ctx, "name for audited table ID %d not found: %v", ev.desc.GetID(), err)
+			} else {
+				tableName = tn.FQString()
 			}
-			entries[i] = eventLogEntry{
-				targetID: int32(ev.desc.GetID()),
-				event: &eventpb.SensitiveTableAccess{
-					CommonSQLExecDetails: execDetails,
-					TableName:            tableName,
-					AccessMode:           mode,
+			entries[i] = &eventpb.SensitiveTableAccess{
+				CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
+					DescriptorID: uint32(ev.desc.GetID()),
 				},
+				CommonSQLExecDetails: execDetails,
+				TableName:            tableName,
+				AccessMode:           mode,
 			}
 		}
 		p.logEventsOnlyExternally(ctx, entries...)
@@ -355,12 +353,12 @@ func (p *planner) maybeLogStatementInternal(
 		switch {
 		case execType == executorTypeExec:
 			// Non-internal queries are always logged to the slow query log.
-			p.logEventsOnlyExternally(ctx, eventLogEntry{event: &eventpb.SlowQuery{CommonSQLExecDetails: execDetails}})
+			p.logEventsOnlyExternally(ctx, &eventpb.SlowQuery{CommonSQLExecDetails: execDetails})
 
 		case execType == executorTypeInternal && slowInternalQueryLogEnabled:
 			// Internal queries that surpass the slow query log threshold should only
 			// be logged to the slow-internal-only log if the cluster setting dictates.
-			p.logEventsOnlyExternally(ctx, eventLogEntry{event: &eventpb.SlowQueryInternal{CommonSQLExecDetails: execDetails}})
+			p.logEventsOnlyExternally(ctx, &eventpb.SlowQueryInternal{CommonSQLExecDetails: execDetails})
 		}
 	}
 
@@ -376,11 +374,11 @@ func (p *planner) maybeLogStatementInternal(
 				dst:               LogExternally | LogToDevChannelIfVerbose,
 				verboseTraceLevel: execType.vLevel(),
 			},
-			eventLogEntry{event: &eventpb.QueryExecute{CommonSQLExecDetails: execDetails}})
+			&eventpb.QueryExecute{CommonSQLExecDetails: execDetails})
 	}
 
 	if shouldLogToAdminAuditLog {
-		p.logEventsOnlyExternally(ctx, eventLogEntry{event: &eventpb.AdminQuery{CommonSQLExecDetails: execDetails}})
+		p.logEventsOnlyExternally(ctx, &eventpb.AdminQuery{CommonSQLExecDetails: execDetails})
 	}
 
 	if telemetryLoggingEnabled && !p.SessionData().TroubleshootingMode {
@@ -394,7 +392,13 @@ func (p *planner) maybeLogStatementInternal(
 			requiredTimeElapsed = 0
 		}
 		if telemetryMetrics.maybeUpdateLastEmittedTime(telemetryMetrics.timeNow(), requiredTimeElapsed) {
-			contentionNanos := telemetryMetrics.getContentionTime(p.instrumentation.queryLevelStatsWithErr.Stats.ContentionTime.Nanoseconds())
+			var contentionNanos int64
+			if queryLevelStats, ok := p.instrumentation.GetQueryLevelStats(); ok {
+				contentionNanos = queryLevelStats.ContentionTime.Nanoseconds()
+			}
+
+			contentionNanos = telemetryMetrics.getContentionTime(contentionNanos)
+
 			skippedQueries := telemetryMetrics.resetSkippedQueryCount()
 			sampledQuery := eventpb.SampledQuery{
 				CommonSQLExecDetails:     execDetails,
@@ -432,14 +436,14 @@ func (p *planner) maybeLogStatementInternal(
 				ZigZagJoinCount:          int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ZigZagJoin]),
 				ContentionNanos:          contentionNanos,
 			}
-			p.logOperationalEventsOnlyExternally(ctx, eventLogEntry{event: &sampledQuery})
+			p.logOperationalEventsOnlyExternally(ctx, &sampledQuery)
 		} else {
 			telemetryMetrics.incSkippedQueryCount()
 		}
 	}
 }
 
-func (p *planner) logEventsOnlyExternally(ctx context.Context, entries ...eventLogEntry) {
+func (p *planner) logEventsOnlyExternally(ctx context.Context, entries ...logpb.EventPayload) {
 	// The API contract for logEventsWithOptions() is that it returns
 	// no error when system.eventlog is not written to.
 	_ = p.logEventsWithOptions(ctx,
@@ -452,7 +456,7 @@ func (p *planner) logEventsOnlyExternally(ctx context.Context, entries ...eventL
 // options to omit SQL Name redaction. This is used when logging to
 // the telemetry channel when we want additional metadata available.
 func (p *planner) logOperationalEventsOnlyExternally(
-	ctx context.Context, entries ...eventLogEntry,
+	ctx context.Context, entries ...logpb.EventPayload,
 ) {
 	// The API contract for logEventsWithOptions() is that it returns
 	// no error when system.eventlog is not written to.
@@ -474,21 +478,15 @@ func (p *planner) logOperationalEventsOnlyExternally(
 // contributors who later add features do not have to remember to call
 // this to get it right.
 func (p *planner) maybeAudit(privilegeObject catalog.PrivilegeObject, priv privilege.Kind) {
-	switch object := privilegeObject.(type) {
-	case catalog.Descriptor:
-		wantedMode := object.GetAuditMode()
-		if wantedMode == descpb.TableDescriptor_DISABLED {
-			return
-		}
-
-		switch priv {
-		case privilege.INSERT, privilege.DELETE, privilege.UPDATE:
-			p.curPlan.auditEvents = append(p.curPlan.auditEvents, auditEvent{desc: object, writing: true})
-		default:
-			p.curPlan.auditEvents = append(p.curPlan.auditEvents, auditEvent{desc: object, writing: false})
-		}
-	case syntheticprivilege.Object:
-		// TODO(richardjcai): Add auditing here.
+	tableDesc, ok := privilegeObject.(catalog.TableDescriptor)
+	if !ok || tableDesc.GetAuditMode() == descpb.TableDescriptor_DISABLED {
+		return
+	}
+	switch priv {
+	case privilege.INSERT, privilege.DELETE, privilege.UPDATE:
+		p.curPlan.auditEvents = append(p.curPlan.auditEvents, auditEvent{desc: tableDesc, writing: true})
+	default:
+		p.curPlan.auditEvents = append(p.curPlan.auditEvents, auditEvent{desc: tableDesc, writing: false})
 	}
 }
 
@@ -516,7 +514,7 @@ func (p *planner) slowQueryLogReason(
 // auditEvent represents an audit event for a single table.
 type auditEvent struct {
 	// The descriptor being audited.
-	desc catalog.Descriptor
+	desc catalog.TableDescriptor
 	// Whether the event was for INSERT/DELETE/UPDATE.
 	writing bool
 }

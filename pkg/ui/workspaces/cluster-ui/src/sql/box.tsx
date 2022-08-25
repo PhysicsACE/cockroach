@@ -18,6 +18,7 @@ import * as protos from "@cockroachlabs/crdb-protobuf-client";
 export enum SqlBoxSize {
   small = "small",
   large = "large",
+  custom = "custom",
 }
 
 export interface SqlBoxProps {
@@ -31,7 +32,7 @@ const cx = classNames.bind(styles);
 
 export class SqlBox extends React.Component<SqlBoxProps> {
   preNode: React.RefObject<HTMLPreElement> = React.createRef();
-  render() {
+  render(): React.ReactElement {
     const sizeClass = this.props.size ? this.props.size : "";
     return (
       <div className={cx("box-highlight", this.props.className, sizeClass)}>

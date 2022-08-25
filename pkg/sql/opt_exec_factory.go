@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -74,6 +75,24 @@ func (ef *execFactory) ConstructValues(
 		columns:          cols,
 		tuples:           rows,
 		specifiedInQuery: true,
+	}, nil
+}
+
+// ConstructLiteralValues is part of the exec.Factory interface.
+func (ef *execFactory) ConstructLiteralValues(
+	rows tree.ExprContainer, cols colinfo.ResultColumns,
+) (exec.Node, error) {
+	if len(cols) == 0 && rows.NumRows() == 1 {
+		return &unaryNode{}, nil
+	}
+	if rows.NumRows() == 0 {
+		return &zeroNode{columns: cols}, nil
+	}
+	return &valuesNode{
+		columns:                  cols,
+		specifiedInQuery:         true,
+		externallyOwnedContainer: true,
+		valuesRun:                valuesRun{rows: rows.(*rowcontainer.RowContainer)},
 	}, nil
 }
 
@@ -1067,9 +1086,8 @@ func (ef *execFactory) ConstructProjectSet(
 // ConstructWindow is part of the exec.Factory interface.
 func (ef *execFactory) ConstructWindow(root exec.Node, wi exec.WindowInfo) (exec.Node, error) {
 	p := &windowNode{
-		plan:         root.(planNode),
-		columns:      wi.Cols,
-		windowRender: make([]tree.TypedExpr, len(wi.Cols)),
+		plan:    root.(planNode),
+		columns: wi.Cols,
 	}
 
 	partitionIdxs := make([]int, len(wi.Partition))
@@ -1102,8 +1120,6 @@ func (ef *execFactory) ConstructWindow(root exec.Node, wi exec.WindowInfo) (exec
 				return nil, errors.AssertionFailedf("a RANGE mode frame with an offset bound must have an ORDER BY column")
 			}
 		}
-
-		p.windowRender[wi.OutputIdxs[i]] = p.funcs[i]
 	}
 
 	return p, nil

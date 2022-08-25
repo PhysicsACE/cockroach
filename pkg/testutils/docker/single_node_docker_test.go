@@ -19,7 +19,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -39,8 +38,6 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 )
-
-const fsnotifyBinName = "docker-fsnotify-bin"
 
 // sqlQuery consists of a sql query and the expected result.
 type sqlQuery struct {
@@ -79,7 +76,7 @@ func TestSingleNodeDocker(t *testing.T) {
 		t.Fatal(errors.NewAssertionErrorWithWrappedErrf(err, "cannot get pwd"))
 	}
 
-	fsnotifyPath := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(pwd)))))), "docker-fsnotify")
+	fsnotifyBinPath := filepath.Join(pwd, "docker-fsnotify/docker-fsnotify-bin")
 
 	var dockerTests = []singleNodeDockerTest{
 		{
@@ -93,7 +90,7 @@ func TestSingleNodeDocker(t *testing.T) {
 				},
 				volSetting: []string{
 					fmt.Sprintf("%s/testdata/single-node-test/docker-entrypoint-initdb.d/:/docker-entrypoint-initdb.d", pwd),
-					fmt.Sprintf("%s/docker-fsnotify-bin:/cockroach/docker-fsnotify", fsnotifyPath),
+					fmt.Sprintf("%s:/cockroach/docker-fsnotify", fsnotifyBinPath),
 				},
 				cmd: []string{"start-single-node", "--certs-dir=certs"},
 			},
@@ -119,7 +116,7 @@ func TestSingleNodeDocker(t *testing.T) {
 				},
 				volSetting: []string{
 					fmt.Sprintf("%s/testdata/single-node-test/docker-entrypoint-initdb.d/:/docker-entrypoint-initdb.d", pwd),
-					fmt.Sprintf("%s/docker-fsnotify-bin:/cockroach/docker-fsnotify", fsnotifyPath),
+					fmt.Sprintf("%s:/cockroach/docker-fsnotify", fsnotifyBinPath),
 				},
 				cmd: []string{"start-single-node", "--insecure"},
 			},
@@ -146,7 +143,7 @@ func TestSingleNodeDocker(t *testing.T) {
 				},
 				volSetting: []string{
 					fmt.Sprintf("%s/testdata/single-node-test/docker-entrypoint-initdb.d/:/docker-entrypoint-initdb.d", pwd),
-					fmt.Sprintf("%s/docker-fsnotify-bin:/cockroach/docker-fsnotify", fsnotifyPath),
+					fmt.Sprintf("%s:/cockroach/docker-fsnotify", fsnotifyBinPath),
 				},
 				cmd: []string{"start-single-node", "--insecure", "--store=type=mem,size=0.25"},
 			},
@@ -445,11 +442,11 @@ func (dn *dockerNode) InspectExecResp(ctx context.Context, execID string) (execR
 		return execRes, ctx.Err()
 	}
 
-	stdout, err := ioutil.ReadAll(&outBuf)
+	stdout, err := io.ReadAll(&outBuf)
 	if err != nil {
 		return execRes, err
 	}
-	stderr, err := ioutil.ReadAll(&errBuf)
+	stderr, err := io.ReadAll(&errBuf)
 	if err != nil {
 		return execRes, err
 	}

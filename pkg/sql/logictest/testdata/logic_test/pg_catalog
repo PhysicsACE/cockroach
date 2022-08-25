@@ -1146,6 +1146,7 @@ indexrelid  indrelid  indnatts  indisunique  indisprimary  indisexclusion  indim
 2834522046  34        1         true         true          false           true          false           true        false         false       true       false           1              0                          0            2            NULL      NULL                                                                                                                          1
 2880917710  50        2         true         true          false           true          false           true        false         false       true       false           1 2            0 3403232968               0 0          2 2          NULL      NULL                                                                                                                          2
 3094258317  33        2         true         true          false           true          false           true        false         false       true       false           1 2            3403232968 3403232968      0 0          2 2          NULL      NULL                                                                                                                          2
+3094258318  33        1         false        false         false           false         false           true        false         false       true       false           4              0                          0            2            NULL      NULL                                                                                                                          1
 3353994584  36        1         true         true          false           true          false           true        false         false       true       false           1              0                          0            2            NULL      NULL                                                                                                                          1
 3400390248  52        1         true         true          false           true          false           true        false         false       true       false           1              3403232968                 0            2            NULL      NULL                                                                                                                          1
 3446785912  4         1         true         true          false           true          false           true        false         false       true       false           1              3403232968                 0            2            NULL      NULL                                                                                                                          1
@@ -1239,6 +1240,7 @@ indexrelid  operator_argument_type_oid  operator_argument_position
 2880917710  0                           2
 3094258317  0                           1
 3094258317  0                           2
+3094258318  0                           1
 3353994584  0                           1
 3400390248  0                           1
 3446785912  0                           1
@@ -4148,7 +4150,7 @@ SELECT
 FROM
   pg_catalog.pg_settings
 WHERE
-  name NOT IN ('optimizer', 'crdb_version', 'session_id', 'distsql_workmem')
+  name NOT IN ('optimizer', 'crdb_version', 'session_id', 'distsql_workmem', 'copy_fast_path_enabled')
 ----
 name                                                  setting             category  short_desc  extra_desc  vartype
 alter_primary_region_super_region_override            off                 NULL      NULL        NULL        string
@@ -4222,6 +4224,7 @@ on_update_rehome_row_enabled                          on                  NULL  
 opt_split_scan_limit                                  2048                NULL      NULL        NULL        string
 optimizer_use_histograms                              on                  NULL      NULL        NULL        string
 optimizer_use_multicol_stats                          on                  NULL      NULL        NULL        string
+optimizer_use_not_visible_indexes                     off                 NULL      NULL        NULL        string
 override_multi_region_zone_config                     off                 NULL      NULL        NULL        string
 parallelize_multi_key_lookup_joins_enabled            off                 NULL      NULL        NULL        string
 password_encryption                                   scram-sha-256       NULL      NULL        NULL        string
@@ -4273,7 +4276,7 @@ SELECT
 FROM
   pg_catalog.pg_settings
 WHERE
-  name NOT IN ('optimizer', 'crdb_version', 'session_id', 'distsql_workmem')
+  name NOT IN ('optimizer', 'crdb_version', 'session_id', 'distsql_workmem', 'copy_fast_path_enabled')
 ----
 name                                                  setting             unit  context  enumvals  boot_val            reset_val
 alter_primary_region_super_region_override            off                 NULL  user     NULL      off                 off
@@ -4347,10 +4350,11 @@ on_update_rehome_row_enabled                          on                  NULL  
 opt_split_scan_limit                                  2048                NULL  user     NULL      2048                2048
 optimizer_use_histograms                              on                  NULL  user     NULL      on                  on
 optimizer_use_multicol_stats                          on                  NULL  user     NULL      on                  on
+optimizer_use_not_visible_indexes                     off                 NULL  user     NULL      off                 off
 override_multi_region_zone_config                     off                 NULL  user     NULL      off                 off
 parallelize_multi_key_lookup_joins_enabled            off                 NULL  user     NULL      false               false
 password_encryption                                   scram-sha-256       NULL  user     NULL      scram-sha-256       scram-sha-256
-pg_trgm.similarity_threshold                          0.3                 NULL  user     NULL      .3                  .3
+pg_trgm.similarity_threshold                          0.3                 NULL  user     NULL      0.3                 0.3
 prefer_lookup_joins_for_fks                           off                 NULL  user     NULL      off                 off
 propagate_input_ordering                              off                 NULL  user     NULL      off                 off
 reorder_joins_limit                                   8                   NULL  user     NULL      8                   8
@@ -4403,6 +4407,7 @@ bytea_output                                          NULL    NULL     NULL     
 check_function_bodies                                 NULL    NULL     NULL     NULL        NULL
 client_encoding                                       NULL    NULL     NULL     NULL        NULL
 client_min_messages                                   NULL    NULL     NULL     NULL        NULL
+copy_fast_path_enabled                                NULL    NULL     NULL     NULL        NULL
 cost_scans_with_default_col_size                      NULL    NULL     NULL     NULL        NULL
 crdb_version                                          NULL    NULL     NULL     NULL        NULL
 database                                              NULL    NULL     NULL     NULL        NULL
@@ -4469,6 +4474,7 @@ opt_split_scan_limit                                  NULL    NULL     NULL     
 optimizer                                             NULL    NULL     NULL     NULL        NULL
 optimizer_use_histograms                              NULL    NULL     NULL     NULL        NULL
 optimizer_use_multicol_stats                          NULL    NULL     NULL     NULL        NULL
+optimizer_use_not_visible_indexes                     NULL    NULL     NULL     NULL        NULL
 override_multi_region_zone_config                     NULL    NULL     NULL     NULL        NULL
 parallelize_multi_key_lookup_joins_enabled            NULL    NULL     NULL     NULL        NULL
 password_encryption                                   NULL    NULL     NULL     NULL        NULL
@@ -4645,7 +4651,7 @@ FROM pg_proc p
 JOIN pg_type t ON t.typinput = p.oid
 WHERE t.typname = '_int4'
 ----
-2011  array_in  array_in
+2013  array_in  array_in
 
 ## #16285
 ## int2vectors should be 0-indexed
@@ -4683,7 +4689,7 @@ SELECT cur_max_builtin_oid FROM [SELECT max(oid) as cur_max_builtin_oid FROM pg_
 query TT
 SELECT proname, oid FROM pg_catalog.pg_proc WHERE oid = $cur_max_builtin_oid
 ----
-to_regtype  2031
+to_regtype  2033
 
 ## Ensure that unnest works with oid wrapper arrays
 
@@ -5941,3 +5947,41 @@ oid         castsource  casttarget  castfunc  castcontext  castmethod
 3922032069  18          1043        NULL      a            NULL
 3989142581  18          23          NULL      e            NULL
 3989142587  18          25          NULL      i            NULL
+
+subtest seq_bound_should_consistent_with_session_var
+
+statement ok
+DROP sequence serial
+
+statement ok
+set default_int_size=4
+
+statement ok
+CREATE SEQUENCE serial START 101 INCREMENT 5
+
+query TTTOIIIIBII colnames
+SELECT * FROM pg_sequences WHERE sequencename = 'serial'
+----
+schemaname  sequencename  sequenceowner  data_type  start_value  min_value  max_value   increment_by  cycle  cache_size  last_value
+public      serial        root           20         101          1          2147483647  5             false  1           NULL
+
+statement ok
+set default_int_size=8
+
+query TTTOIIIIBII colnames
+SELECT * FROM pg_sequences WHERE sequencename = 'serial'
+----
+schemaname  sequencename  sequenceowner  data_type  start_value  min_value  max_value   increment_by  cycle  cache_size  last_value
+public      serial        root           20         101          1          2147483647  5             false  1           NULL
+
+statement ok
+DROP sequence serial
+
+statement ok
+CREATE SEQUENCE serial START 101 INCREMENT 5
+
+query TTTOIIIIBII colnames
+SELECT * FROM pg_sequences WHERE sequencename = 'serial'
+----
+schemaname  sequencename  sequenceowner  data_type  start_value  min_value  max_value            increment_by  cycle  cache_size  last_value
+public      serial        root           20         101          1          9223372036854775807  5             false  1           NULL

@@ -42,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -749,6 +750,23 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`optimizer_use_not_visible_indexes`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_not_visible_indexes`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_not_visible_indexes", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseNotVisibleIndexes(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseNotVisibleIndexes), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
 	`locality_optimized_partitioned_index_scan`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`locality_optimized_partitioned_index_scan`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
@@ -1144,7 +1162,7 @@ var varGen = map[string]sessionVar{
 		// SetWithPlanner is defined in init(), as otherwise there is a circular
 		// initialization loop with the planner.
 		GlobalDefault: func(sv *settings.Values) string {
-			return ".3"
+			return "0.3"
 		},
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
 			f, err := strconv.ParseFloat(s, 64)
@@ -2120,7 +2138,29 @@ var varGen = map[string]sessionVar{
 			return formatFloatAsPostgresSetting(0)
 		},
 	},
+
+	// CockroachDB extension.
+	`copy_fast_path_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`copy_fast_path_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("copy_fast_path_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetCopyFastPathEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().CopyFastPathEnabled), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(copyFastPathDefault)
+		},
+	},
 }
+
+// We want test coverage for this on and off so make it metamorphic.
+var copyFastPathDefault bool = util.ConstantWithMetamorphicTestBool("copy-fast-path-enabled-default", true)
 
 const compatErrMsg = "this parameter is currently recognized only for compatibility and has no effect in CockroachDB."
 

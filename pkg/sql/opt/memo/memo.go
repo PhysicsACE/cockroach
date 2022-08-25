@@ -139,6 +139,7 @@ type Memo struct {
 	zigzagJoinEnabled                      bool
 	useHistograms                          bool
 	useMultiColStats                       bool
+	useNotVisibleIndex                     bool
 	localityOptimizedSearch                bool
 	safeUpdates                            bool
 	preferLookupJoinsForFKs                bool
@@ -188,6 +189,7 @@ func (m *Memo) Init(evalCtx *eval.Context) {
 		zigzagJoinEnabled:                      evalCtx.SessionData().ZigzagJoinEnabled,
 		useHistograms:                          evalCtx.SessionData().OptimizerUseHistograms,
 		useMultiColStats:                       evalCtx.SessionData().OptimizerUseMultiColStats,
+		useNotVisibleIndex:                     evalCtx.SessionData().OptimizerUseNotVisibleIndexes,
 		localityOptimizedSearch:                evalCtx.SessionData().LocalityOptimizedSearch,
 		safeUpdates:                            evalCtx.SessionData().SafeUpdates,
 		preferLookupJoinsForFKs:                evalCtx.SessionData().PreferLookupJoinsForFKs,
@@ -321,6 +323,7 @@ func (m *Memo) IsStale(
 		m.zigzagJoinEnabled != evalCtx.SessionData().ZigzagJoinEnabled ||
 		m.useHistograms != evalCtx.SessionData().OptimizerUseHistograms ||
 		m.useMultiColStats != evalCtx.SessionData().OptimizerUseMultiColStats ||
+		m.useNotVisibleIndex != evalCtx.SessionData().OptimizerUseNotVisibleIndexes ||
 		m.localityOptimizedSearch != evalCtx.SessionData().LocalityOptimizedSearch ||
 		m.safeUpdates != evalCtx.SessionData().SafeUpdates ||
 		m.preferLookupJoinsForFKs != evalCtx.SessionData().PreferLookupJoinsForFKs ||
@@ -429,17 +432,15 @@ func (m *Memo) RequestColStat(
 	return nil, false
 }
 
-// RequestColStatTable calculates and returns the column statistic in table
-// tabId.
-func (m *Memo) RequestColStatTable(
-	tabID opt.TableID, colSet opt.ColSet,
-) (colStat *props.ColumnStatistic, ok bool) {
+// RequestColAvgSize calculates and returns the column's average size statistic.
+// The column must exist in the table with ID tabId.
+func (m *Memo) RequestColAvgSize(tabID opt.TableID, col opt.ColumnID) uint64 {
 	// When SetRoot is called, the statistics builder may have been cleared.
 	// If this happens, we can't serve the request anymore.
 	if m.logPropsBuilder.sb.md != nil {
-		return m.logPropsBuilder.sb.colStatTable(tabID, colSet), true
+		return m.logPropsBuilder.sb.colAvgSize(tabID, col)
 	}
-	return nil, false
+	return defaultColSize
 }
 
 // RowsProcessed calculates and returns the number of rows processed by the
@@ -491,4 +492,35 @@ func (m *Memo) Detach() {
 // CheckExpr is always a no-op, so DisableCheckExpr has no effect.
 func (m *Memo) DisableCheckExpr() {
 	m.disableCheckExpr = true
+}
+
+// ValuesContainer lets ValuesExpr and LiteralValuesExpr share code.
+type ValuesContainer interface {
+	RelExpr
+
+	Len() int
+	ColList() opt.ColList
+}
+
+var _ ValuesContainer = &ValuesExpr{}
+var _ ValuesContainer = &LiteralValuesExpr{}
+
+// ColList implements the ValuesContainer interface.
+func (v *ValuesExpr) ColList() opt.ColList {
+	return v.Cols
+}
+
+// Len implements the ValuesContainer interface.
+func (v *ValuesExpr) Len() int {
+	return len(v.Rows)
+}
+
+// ColList implements the ValuesContainer interface.
+func (l *LiteralValuesExpr) ColList() opt.ColList {
+	return l.Cols
+}
+
+// Len implements the ValuesContainer interface.
+func (l *LiteralValuesExpr) Len() int {
+	return l.Rows.Rows.NumRows()
 }

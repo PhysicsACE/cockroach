@@ -101,6 +101,7 @@ func RegisterTests(r registry.Registry) {
 	registerSchemaChangeInvertedIndex(r)
 	registerSchemaChangeMixedVersions(r)
 	registerSchemaChangeRandomLoad(r)
+	registerCDCMixedVersions(r)
 	registerScrubAllChecksTPCC(r)
 	registerScrubIndexOnlyTPCC(r)
 	registerSecondaryIndexesMultiVersionCluster(r)
@@ -129,7 +130,6 @@ func RegisterTests(r registry.Registry) {
 	registerMultiTenantUpgrade(r)
 	registerMultiTenantFairness(r)
 	registerValidateSystemSchemaAfterVersionUpgrade(r)
-	registerIndexBackfill(r)
 }
 
 // RegisterBenchmarks registers all benchmarks to the registry. This powers `roachtest bench`.

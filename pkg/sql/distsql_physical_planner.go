@@ -223,15 +223,22 @@ func (dsp *DistSQLPlanner) GetSQLInstanceInfo(
 	return dsp.nodeDescs.GetNodeDescriptor(roachpb.NodeID(sqlInstanceID))
 }
 
-// SetSQLInstanceInfo sets the planner's node descriptor.
-// The first call to SetSQLInstanceInfo leads to the construction of the SpanResolver.
-func (dsp *DistSQLPlanner) SetSQLInstanceInfo(desc roachpb.NodeDescriptor) {
-	dsp.gatewaySQLInstanceID = base.SQLInstanceID(desc.NodeID)
-	if dsp.spanResolver == nil {
-		sr := physicalplan.NewSpanResolver(dsp.st, dsp.distSender, dsp.nodeDescs, desc,
-			dsp.clock, dsp.rpcCtx, ReplicaOraclePolicy)
-		dsp.SetSpanResolver(sr)
+// ConstructAndSetSpanResolver constructs and sets the planner's
+// SpanResolver if it is unset. It's a no-op otherwise.
+func (dsp *DistSQLPlanner) ConstructAndSetSpanResolver(
+	ctx context.Context, nodeID roachpb.NodeID, locality roachpb.Locality,
+) {
+	if dsp.spanResolver != nil {
+		log.Fatal(ctx, "trying to construct and set span resolver when one already exists")
 	}
+	sr := physicalplan.NewSpanResolver(dsp.st, dsp.distSender, dsp.nodeDescs, nodeID, locality,
+		dsp.clock, dsp.rpcCtx, ReplicaOraclePolicy)
+	dsp.SetSpanResolver(sr)
+}
+
+// SetGatewaySQLInstanceID sets the planner's SQL instance ID.
+func (dsp *DistSQLPlanner) SetGatewaySQLInstanceID(id base.SQLInstanceID) {
+	dsp.gatewaySQLInstanceID = id
 }
 
 // GatewayID returns the ID of the gateway.
@@ -263,9 +270,23 @@ func (v *distSQLExprCheckVisitor) VisitPre(expr tree.Expr) (recurse bool, newExp
 			v.err = newQueryNotSupportedErrorf("function %s cannot be executed with distsql", t)
 			return false, expr
 		}
+	case *tree.RoutineExpr:
+		// TODO(86310): enable UDFs in DistSQL.
+		v.err = newQueryNotSupportedErrorf("user-defined routine %s cannot be executed with distsql", t)
+		return false, expr
 	case *tree.DOid:
 		v.err = newQueryNotSupportedError("OID expressions are not supported by distsql")
 		return false, expr
+	case *tree.Subquery:
+		if hasOidType(t.ResolvedType()) {
+			// If a subquery results in a DOid datum, the datum will get a type
+			// annotation (because DOids are ambiguous) when serializing the
+			// render expression involving the result of the subquery. As a
+			// result, we might need to perform a cast on a remote node which
+			// might fail, thus we prohibit the distribution of the main query.
+			v.err = newQueryNotSupportedError("OID expressions are not supported by distsql")
+			return false, expr
+		}
 	case *tree.CastExpr:
 		// TODO (rohany): I'm not sure why this CastExpr doesn't have a type
 		//  annotation at this stage of processing...
@@ -294,6 +315,23 @@ func (v *distSQLExprCheckVisitor) VisitPre(expr tree.Expr) (recurse bool, newExp
 }
 
 func (v *distSQLExprCheckVisitor) VisitPost(expr tree.Expr) tree.Expr { return expr }
+
+// hasOidType returns whether t or its contents include an OID type.
+func hasOidType(t *types.T) bool {
+	switch t.Family() {
+	case types.OidFamily:
+		return true
+	case types.ArrayFamily:
+		return hasOidType(t.ArrayContents())
+	case types.TupleFamily:
+		for _, typ := range t.TupleContents() {
+			if hasOidType(typ) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // checkExpr verifies that an expression doesn't contain things that are not yet
 // supported by distSQL, like distSQL-blocklisted functions.
@@ -4017,26 +4055,12 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 	}
 
 	// We definitely added new columns, so we need to update PlanToStreamColMap.
-	// We need to update the map before adding rendering or projection because
-	// it is used there.
 	plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(plan.GetResultTypes()))
 
 	// windowers do not guarantee maintaining the order at the moment, so we
 	// reset MergeOrdering. There shouldn't be an ordering here, but we reset it
 	// defensively (see #35179).
 	plan.SetMergeOrdering(execinfrapb.Ordering{})
-
-	// After the window functions are computed, we need to add rendering or
-	// projection.
-	if err := addRenderingOrProjection(n, planCtx, plan); err != nil {
-		return nil, err
-	}
-
-	if len(plan.GetResultTypes()) != len(plan.PlanToStreamColMap) {
-		// We added/removed columns while rendering or projecting, so we need to
-		// update PlanToStreamColMap.
-		plan.PlanToStreamColMap = identityMap(plan.PlanToStreamColMap, len(plan.GetResultTypes()))
-	}
 
 	return plan, nil
 }

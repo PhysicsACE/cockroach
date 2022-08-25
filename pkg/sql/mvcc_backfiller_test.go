@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
@@ -128,6 +129,9 @@ func TestIndexBackfillMergeRetry(t *testing.T) {
 		},
 		// Decrease the adopt loop interval so that retries happen quickly.
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		GCJob: &sql.GCJobTestingKnobs{
+			SkipWaitingForMVCCGC: true,
+		},
 	}
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
@@ -188,9 +192,9 @@ func TestIndexBackfillFractionTracking(t *testing.T) {
 
 	split := func(tableDesc catalog.TableDescriptor, idx catalog.Index) {
 		numSplits := 25
-		var sps []sql.SplitPoint
+		var sps []serverutils.SplitPoint
 		for i := 0; i < numSplits; i++ {
-			sps = append(sps, sql.SplitPoint{TargetNodeIdx: 0, Vals: []interface{}{((rowCount * 2) / numSplits) * i}})
+			sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: 0, Vals: []interface{}{((rowCount * 2) / numSplits) * i}})
 		}
 		require.NoError(t, splitIndex(tc, tableDesc, idx, sps))
 	}
@@ -353,9 +357,9 @@ func TestRaceWithIndexBackfillMerge(t *testing.T) {
 			return err
 		}
 
-		var sps []sql.SplitPoint
+		var sps []serverutils.SplitPoint
 		for i := 0; i < numNodes; i++ {
-			sps = append(sps, sql.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue/numNodes*i + 5*maxValue}})
+			sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{maxValue/numNodes*i + 5*maxValue}})
 		}
 
 		return splitIndex(tc, tableDesc, tempIdx, sps)
@@ -567,6 +571,9 @@ func TestIndexBackfillMergeTxnRetry(t *testing.T) {
 			},
 		},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		GCJob: &sql.GCJobTestingKnobs{
+			SkipWaitingForMVCCGC: true,
+		},
 	}
 
 	s, sqlDB, kvDB = serverutils.StartServer(t, params)
@@ -629,7 +636,7 @@ func splitIndex(
 	tc serverutils.TestClusterInterface,
 	desc catalog.TableDescriptor,
 	index catalog.Index,
-	sps []sql.SplitPoint,
+	sps []serverutils.SplitPoint,
 ) error {
 	if tc.ReplicationMode() != base.ReplicationManual {
 		return errors.Errorf("splitIndex called on a test cluster that was not in manual replication mode")
@@ -694,7 +701,11 @@ func splitIndex(
 		}
 
 		for _, target := range rkt.KT.Targets {
-			if err := tc.TransferRangeLease(desc, target); err != nil {
+			if err := retry.WithMaxAttempts(context.Background(), retry.Options{
+				MaxBackoff: time.Millisecond,
+			}, 10, func() error {
+				return tc.TransferRangeLease(desc, target)
+			}); err != nil {
 				return err
 			}
 		}

@@ -160,6 +160,12 @@ type SchemaFeatureChecker interface {
 	// CheckFeature returns if the feature name specified is allowed or disallowed,
 	// by the database administrator.
 	CheckFeature(ctx context.Context, featureName tree.SchemaFeatureName) error
+
+	// CanPerformDropOwnedBy returns if we can do DROP OWNED BY for the
+	// given role.
+	CanPerformDropOwnedBy(
+		ctx context.Context, role username.SQLUsername,
+	) (bool, error)
 }
 
 // PrivilegeChecker checks an element's privileges.
@@ -198,7 +204,7 @@ type TableHelpers interface {
 
 	// NextTableConstraintID returns the ID that should be used for any new constraint
 	// added to this table.
-	NextTableConstraintID(table *scpb.Table) catid.ConstraintID
+	NextTableConstraintID(id catid.DescID) catid.ConstraintID
 
 	// IndexPartitioningDescriptor creates a new partitioning descriptor
 	// for the secondary index element, or panics.

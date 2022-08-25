@@ -365,6 +365,17 @@ func (*AlterIndex) StatementTag() string { return "ALTER INDEX" }
 func (*AlterIndex) hiddenFromShowQueries() {}
 
 // StatementReturnType implements the Statement interface.
+func (*AlterIndexVisible) StatementReturnType() StatementReturnType { return DDL }
+
+// StatementType implements the Statement interface.
+func (*AlterIndexVisible) StatementType() StatementType { return TypeDDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterIndexVisible) StatementTag() string { return "ALTER INDEX" }
+
+func (*AlterIndexVisible) hiddenFromShowQueries() {}
+
+// StatementReturnType implements the Statement interface.
 func (*AlterTable) StatementReturnType() StatementReturnType { return DDL }
 
 // StatementType implements the Statement interface.
@@ -842,7 +853,13 @@ func (*Discard) StatementReturnType() StatementReturnType { return Ack }
 func (*Discard) StatementType() StatementType { return TypeTCL }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*Discard) StatementTag() string { return "DISCARD" }
+func (d *Discard) StatementTag() string {
+	switch d.Mode {
+	case DiscardModeAll:
+		return "DISCARD ALL"
+	}
+	return "DISCARD"
+}
 
 // StatementReturnType implements the Statement interface.
 func (n *DeclareCursor) StatementReturnType() StatementReturnType { return Ack }
@@ -1029,6 +1046,15 @@ func (*Import) StatementType() StatementType { return TypeDML }
 func (*Import) StatementTag() string { return "IMPORT" }
 
 func (*Import) cclOnlyStatement() {}
+
+// StatementReturnType implements the Statement interface.
+func (*LiteralValuesClause) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*LiteralValuesClause) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*LiteralValuesClause) StatementTag() string { return "VALUES" }
 
 // StatementReturnType implements the Statement interface.
 func (*ParenSelect) StatementReturnType() StatementReturnType { return Rows }
@@ -1795,6 +1821,17 @@ func (*ShowCreateFunction) StatementType() StatementType { return TypeDML }
 func (*ShowCreateFunction) StatementTag() string { return "SHOW CREATE FUNCTION" }
 
 // StatementReturnType implements the Statement interface.
+func (*ShowCreateExternalConnections) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*ShowCreateExternalConnections) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowCreateExternalConnections) StatementTag() string {
+	return "SHOW CREATE EXTERNAL CONNECTIONS"
+}
+
+// StatementReturnType implements the Statement interface.
 func (*Split) StatementReturnType() StatementReturnType { return Rows }
 
 // StatementType implements the Statement interface.
@@ -1940,6 +1977,7 @@ func (n *AlterBackup) String() string                         { return AsString(
 func (n *AlterBackupSchedule) String() string                 { return AsString(n) }
 func (n *AlterBackupScheduleCmds) String() string             { return AsString(n) }
 func (n *AlterIndex) String() string                          { return AsString(n) }
+func (n *AlterIndexVisible) String() string                   { return AsString(n) }
 func (n *AlterDatabaseOwner) String() string                  { return AsString(n) }
 func (n *AlterDatabaseAddRegion) String() string              { return AsString(n) }
 func (n *AlterDatabaseDropRegion) String() string             { return AsString(n) }
@@ -2034,6 +2072,7 @@ func (n *GrantRole) String() string                           { return AsString(
 func (n *MoveCursor) String() string                          { return AsString(n) }
 func (n *Insert) String() string                              { return AsString(n) }
 func (n *Import) String() string                              { return AsString(n) }
+func (n *LiteralValuesClause) String() string                 { return AsString(n) }
 func (n *ParenSelect) String() string                         { return AsString(n) }
 func (n *Prepare) String() string                             { return AsString(n) }
 func (n *ReassignOwnedBy) String() string                     { return AsString(n) }
@@ -2082,6 +2121,7 @@ func (n *ShowDatabaseIndexes) String() string                 { return AsString(
 func (n *ShowEnums) String() string                           { return AsString(n) }
 func (n *ShowFullTableScans) String() string                  { return AsString(n) }
 func (n *ShowCreateFunction) String() string                  { return AsString(n) }
+func (n *ShowCreateExternalConnections) String() string       { return AsString(n) }
 func (n *ShowGrants) String() string                          { return AsString(n) }
 func (n *ShowHistogram) String() string                       { return AsString(n) }
 func (n *ShowSchedules) String() string                       { return AsString(n) }

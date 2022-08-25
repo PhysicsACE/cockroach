@@ -17,7 +17,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
@@ -30,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -345,7 +345,8 @@ func (r *Replica) leasePostApplyLocked(
 	// lease but not the updated merge or timestamp cache state, which can result
 	// in serializability violations.
 	r.mu.state.Lease = newLease
-	expirationBasedLease := r.requiresExpiringLeaseRLocked()
+	requiresExpirationBasedLease := r.requiresExpiringLeaseRLocked()
+	hasExpirationBasedLease := newLease.Type() == roachpb.LeaseExpiration
 
 	// Gossip the first range whenever its lease is acquired. We check to make
 	// sure the lease is active so that a trailing replica won't process an old
@@ -355,14 +356,26 @@ func (r *Replica) leasePostApplyLocked(
 		r.gossipFirstRangeLocked(ctx)
 	}
 
-	// Whenever we first acquire an expiration-based lease, notify the lease
-	// renewer worker that we want it to keep proactively renewing the lease
-	// before it expires.
-	if leaseChangingHands && iAmTheLeaseHolder && expirationBasedLease && r.ownsValidLeaseRLocked(ctx, now) {
-		r.store.renewableLeases.Store(int64(r.RangeID), unsafe.Pointer(r))
-		select {
-		case r.store.renewableLeasesSignal <- struct{}{}:
-		default:
+	if leaseChangingHands && iAmTheLeaseHolder && hasExpirationBasedLease && r.ownsValidLeaseRLocked(ctx, now) {
+		if requiresExpirationBasedLease {
+			// Whenever we first acquire an expiration-based lease for a range that
+			// requires it, notify the lease renewer worker that we want it to keep
+			// proactively renewing the lease before it expires.
+			r.store.renewableLeases.Store(int64(r.RangeID), unsafe.Pointer(r))
+			select {
+			case r.store.renewableLeasesSignal <- struct{}{}:
+			default:
+			}
+		} else {
+			// We received an expiration lease for a range that doesn't require it,
+			// i.e. comes after the liveness keyspan. We've also applied it before
+			// it has expired. Upgrade this lease to the more efficient epoch-based
+			// one.
+			if log.V(1) {
+				log.VEventf(ctx, 1, "upgrading expiration lease %s to an epoch-based one", newLease)
+			}
+			st := r.leaseStatusForRequestRLocked(ctx, now, hlc.Timestamp{})
+			r.maybeExtendLeaseAsyncLocked(ctx, st)
 		}
 	}
 
@@ -721,18 +734,6 @@ func (r *Replica) evaluateProposal(
 		res.Replicated.IsLeaseRequest = ba.IsSingleRequestLeaseRequest()
 		if ba.AppliesTimestampCache() {
 			res.Replicated.WriteTimestamp = ba.WriteTimestamp()
-		} else {
-			if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.DontProposeWriteTimestampForLeaseTransfers) {
-				// For misc requests, use WriteTimestamp to propagate a clock signal. This
-				// is particularly important for lease transfers, as it assures that the
-				// follower getting the lease will have a clock above the start time of
-				// its lease.
-				//
-				// This is no longer needed in v22.1 because nodes running v22.1 and
-				// above will update their clock directly from the new lease's start
-				// time.
-				res.Replicated.WriteTimestamp = r.store.Clock().Now()
-			}
 		}
 		res.Replicated.Delta = ms.ToStatsDelta()
 

@@ -21,6 +21,11 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// ErrConflictingFunctionOption indicates that there are conflicting or
+// redundant function options from user input to either create or alter a
+// function.
+var ErrConflictingFunctionOption = pgerror.New(pgcode.Syntax, "conflicting or redundant options")
+
 // FunctionName represent a function name in a UDF relevant statement, either
 // DDL or DML statement. Similar to TableName, it is constructed for incoming
 // SQL queries from an UnresolvedObjectName.
@@ -35,6 +40,19 @@ func MakeFunctionNameFromPrefix(prefix ObjectNamePrefix, object Name) FunctionNa
 		ObjectName:       object,
 		ObjectNamePrefix: prefix,
 	}}
+}
+
+// MakeQualifiedFunctionName constructs a FunctionName with the given db and
+// schema name as prefix.
+func MakeQualifiedFunctionName(db string, sc string, fn string) FunctionName {
+	return MakeFunctionNameFromPrefix(
+		ObjectNamePrefix{
+			CatalogName:     Name(db),
+			ExplicitCatalog: true,
+			SchemaName:      Name(sc),
+			ExplicitSchema:  true,
+		}, Name(fn),
+	)
 }
 
 // Format implements the NodeFormatter interface.
@@ -486,5 +504,47 @@ func MaybeFailOnUDFUsage(expr TypedExpr) error {
 	if visitor.FoundUDF {
 		return unimplemented.NewWithIssue(83234, "usage of user-defined function from relations not supported")
 	}
+	return nil
+}
+
+// ValidateFuncOptions checks whether there are conflicting or redundant
+// function options in the given slice.
+func ValidateFuncOptions(options FunctionOptions) error {
+	var hasLang, hasBody, hasLeakProof, hasVolatility, hasNullInputBehavior bool
+	err := func(opt FunctionOption) error {
+		return errors.Wrapf(ErrConflictingFunctionOption, "%s", AsString(opt))
+	}
+	for _, option := range options {
+		switch option.(type) {
+		case FunctionLanguage:
+			if hasLang {
+				return err(option)
+			}
+			hasLang = true
+		case FunctionBodyStr:
+			if hasBody {
+				return err(option)
+			}
+			hasBody = true
+		case FunctionLeakproof:
+			if hasLeakProof {
+				return err(option)
+			}
+			hasLeakProof = true
+		case FunctionVolatility:
+			if hasVolatility {
+				return err(option)
+			}
+			hasVolatility = true
+		case FunctionNullInputBehavior:
+			if hasNullInputBehavior {
+				return err(option)
+			}
+			hasNullInputBehavior = true
+		default:
+			return pgerror.Newf(pgcode.InvalidParameterValue, "unknown function option: ", AsString(option))
+		}
+	}
+
 	return nil
 }

@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -1214,6 +1215,7 @@ type ExecutorConfig struct {
 	CaptureIndexUsageStatsKnobs          *scheduledlogging.CaptureIndexUsageStatsTestingKnobs
 	UnusedIndexRecommendationsKnobs      *idxusage.UnusedIndexRecommendationTestingKnobs
 	ExternalConnectionTestingKnobs       *externalconn.TestingKnobs
+	EventLogTestingKnobs                 *EventLogTestingKnobs
 
 	// HistogramWindowInterval is (server.Config).HistogramWindowInterval.
 	HistogramWindowInterval time.Duration
@@ -1272,6 +1274,10 @@ type ExecutorConfig struct {
 	// perform compaction over a key span.
 	CompactEngineSpanFunc eval.CompactEngineSpanFunc
 
+	// CompactionConcurrencyFunc is used to inform a storage engine to change its
+	// compaction concurrency.
+	CompactionConcurrencyFunc eval.SetCompactionConcurrencyFunc
+
 	// TraceCollector is used to contact all live nodes in the cluster, and
 	// collect trace spans from their inflight node registries.
 	TraceCollector *collector.TraceCollector
@@ -1322,6 +1328,12 @@ type ExecutorConfig struct {
 
 	// SyntheticPrivilegeCache
 	SyntheticPrivilegeCache *cacheutil.Cache
+
+	// RangeStatsFetcher is used to fetch RangeStats.
+	RangeStatsFetcher eval.RangeStatsFetcher
+
+	// EventsExporter is the client for the Observability Service.
+	EventsExporter obs.EventsExporter
 }
 
 // UpdateVersionSystemSettingHook provides a callback that allows us
@@ -1544,9 +1556,9 @@ type TTLTestingKnobs struct {
 	// AOSTDuration changes the AOST timestamp duration to add to the
 	// current time.
 	AOSTDuration *time.Duration
-	// RequireMultipleSpanPartitions is a flag to verify that the DistSQL will
-	// distribute the work across multiple nodes.
-	RequireMultipleSpanPartitions bool
+	// ExpectedNumSpanPartitions causes the TTL job to fail if it does not match
+	// the number of DistSQL processors.
+	ExpectedNumSpanPartitions int
 	// ReturnStatsError causes stats errors to be returned instead of logged as
 	// warnings.
 	ReturnStatsError bool
@@ -1590,6 +1602,9 @@ type BackupRestoreTestingKnobs struct {
 	// testing. This is typically the bulk mem monitor if not
 	// specified here.
 	BackupMemMonitor *mon.BytesMonitor
+
+	// RecoverFromIterClosePanic prevents the node from panicing during ReadAsOfIterator.Close
+	RecoverFromIterPanic bool
 }
 
 var _ base.ModuleTestingKnobs = &BackupRestoreTestingKnobs{}
@@ -1605,7 +1620,7 @@ type StreamingTestingKnobs struct {
 
 	// BeforeClientSubscribe allows observation of parameters about to be passed
 	// to a streaming client
-	BeforeClientSubscribe func(token string, startTime hlc.Timestamp)
+	BeforeClientSubscribe func(addr string, token string, startTime hlc.Timestamp)
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}
@@ -2120,6 +2135,10 @@ type jobsCollection []jobspb.JobID
 
 func (jc *jobsCollection) add(ids ...jobspb.JobID) {
 	*jc = append(*jc, ids...)
+}
+
+func (jc *jobsCollection) reset() {
+	*jc = nil
 }
 
 // truncateStatementStringForTelemetry truncates the string
@@ -3037,6 +3056,10 @@ func (m *sessionDataMutator) SetOptimizerUseMultiColStats(val bool) {
 	m.data.OptimizerUseMultiColStats = val
 }
 
+func (m *sessionDataMutator) SetOptimizerUseNotVisibleIndexes(val bool) {
+	m.data.OptimizerUseNotVisibleIndexes = val
+}
+
 func (m *sessionDataMutator) SetLocalityOptimizedSearch(val bool) {
 	m.data.LocalityOptimizedSearch = val
 }
@@ -3302,6 +3325,10 @@ func (m *sessionDataMutator) SetTroubleshootingModeEnabled(val bool) {
 	m.data.TroubleshootingMode = val
 }
 
+func (m *sessionDataMutator) SetCopyFastPathEnabled(val bool) {
+	m.data.CopyFastPathEnabled = val
+}
+
 // Utility functions related to scrubbing sensitive information on SQL Stats.
 
 // quantizeCounts ensures that the Count field in the
@@ -3408,7 +3435,7 @@ func DescsTxn(
 	execCfg *ExecutorConfig,
 	f func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error,
 ) error {
-	return execCfg.CollectionFactory.Txn(ctx, execCfg.InternalExecutor, execCfg.DB, f)
+	return execCfg.CollectionFactory.Txn(ctx, execCfg.DB, f)
 }
 
 // TestingDescsTxn is a convenience function for running a transaction on

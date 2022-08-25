@@ -1579,6 +1579,7 @@ system              public             630200280_23_3_not_null                  
 system              public             primary                                                                                                         system         public        role_members                     PRIMARY KEY      NO             NO
 system              public             630200280_33_1_not_null                                                                                         system         public        role_options                     CHECK            NO             NO
 system              public             630200280_33_2_not_null                                                                                         system         public        role_options                     CHECK            NO             NO
+system              public             630200280_33_4_not_null                                                                                         system         public        role_options                     CHECK            NO             NO
 system              public             primary                                                                                                         system         public        role_options                     PRIMARY KEY      NO             NO
 system              public             630200280_37_10_not_null                                                                                        system         public        scheduled_jobs                   CHECK            NO             NO
 system              public             630200280_37_1_not_null                                                                                         system         public        scheduled_jobs                   CHECK            NO             NO
@@ -1778,6 +1779,7 @@ system              public             630200280_32_6_not_null                  
 system              public             630200280_32_7_not_null                                                                                         verified IS NOT NULL
 system              public             630200280_33_1_not_null                                                                                         username IS NOT NULL
 system              public             630200280_33_2_not_null                                                                                         option IS NOT NULL
+system              public             630200280_33_4_not_null                                                                                         user_id IS NOT NULL
 system              public             630200280_34_1_not_null                                                                                         id IS NOT NULL
 system              public             630200280_34_3_not_null                                                                                         data IS NOT NULL
 system              public             630200280_35_1_not_null                                                                                         id IS NOT NULL
@@ -2154,6 +2156,7 @@ system         public        role_members                     isAdmin           
 system         public        role_members                     member                                                                                                    2
 system         public        role_members                     role                                                                                                      1
 system         public        role_options                     option                                                                                                    2
+system         public        role_options                     user_id                                                                                                   4
 system         public        role_options                     username                                                                                                  1
 system         public        role_options                     value                                                                                                     3
 system         public        scheduled_jobs                   created                                                                                                   3
@@ -4660,7 +4663,8 @@ WHERE
       'vectorize',
       'experimental_distsql_planning',
       'use_declarative_schema_changer',
-      'distsql_workmem'
+      'distsql_workmem',
+      'copy_fast_path_enabled'
     );
 ----
 variable                                              value
@@ -4740,6 +4744,7 @@ opt_split_scan_limit                                  2048
 optimizer                                             on
 optimizer_use_histograms                              on
 optimizer_use_multicol_stats                          on
+optimizer_use_not_visible_indexes                     off
 override_multi_region_zone_config                     off
 parallelize_multi_key_lookup_joins_enabled            off
 password_encryption                                   scram-sha-256
@@ -4781,7 +4786,7 @@ transaction_rows_read_log                             0
 transaction_rows_written_err                          0
 transaction_rows_written_log                          0
 transaction_status                                    NoTxn
-troubleshooting_mode                          off
+troubleshooting_mode                                  off
 unconstrained_non_covering_index_scan_enabled         off
 xmloption                                             content
 
@@ -5046,3 +5051,62 @@ query TTTTT
 select identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle from information_schema.columns where table_name = 't' and column_name='id27';
 ----
 6  3  12  6  NULL
+
+
+subtest get_seq_opt_with_default_int_size
+
+statement ok
+DROP TABLE IF EXISTS t
+
+statement ok
+SET default_int_size=4
+
+statement ok
+CREATE TABLE t (
+  id1 INT GENERATED BY DEFAULT AS IDENTITY (START WITH 10)
+)
+
+query TTTTT
+select identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle from information_schema.columns where table_name = 't' and column_name='id1';
+----
+10  1  2147483647  1  NULL
+
+statement ok
+DROP TABLE IF EXISTS t
+
+statement ok
+SET default_int_size=8
+
+statement ok
+CREATE TABLE t (
+  id1 INT GENERATED BY DEFAULT AS IDENTITY (START WITH 10)
+)
+
+query TTTTT
+select identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle from information_schema.columns where table_name = 't' and column_name='id1';
+----
+10  1  9223372036854775807  1  NULL
+
+statement ok
+DROP TABLE IF EXISTS t
+
+statement ok
+set default_int_size = 8;
+
+statement ok
+CREATE TABLE t (
+  id1 INT GENERATED BY DEFAULT AS IDENTITY (START WITH 10)
+)
+
+query TTTTT
+select identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle from information_schema.columns where table_name = 't' and column_name='id1';
+----
+10  1  9223372036854775807  1  NULL
+
+statement ok
+set default_int_size = 4;
+
+query TTTTT
+select identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle from information_schema.columns where table_name = 't' and column_name='id1';
+----
+10  1  9223372036854775807  1  NULL

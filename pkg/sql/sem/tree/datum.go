@@ -3027,11 +3027,21 @@ type DInterval struct {
 	duration.Duration
 }
 
+// AsDInterval attempts to retrieve a DInterval from an Expr, panicking if the
+// assertion fails.
+func AsDInterval(e Expr) (*DInterval, bool) {
+	switch t := e.(type) {
+	case *DInterval:
+		return t, true
+	}
+	return nil, false
+}
+
 // MustBeDInterval attempts to retrieve a DInterval from an Expr, panicking if the
 // assertion fails.
 func MustBeDInterval(e Expr) *DInterval {
-	switch t := e.(type) {
-	case *DInterval:
+	t, ok := AsDInterval(e)
+	if ok {
 		return t
 	}
 	panic(errors.AssertionFailedf("expected *DInterval, found %T", e))
@@ -4924,10 +4934,16 @@ type DOid struct {
 // IntToOid is a helper that turns a DInt into a *DOid and checks that the value
 // is in range.
 func IntToOid(i DInt) (*DOid, error) {
-	if i > math.MaxUint32 || i < math.MinInt32 {
-		return nil, pgerror.Newf(pgcode.NumericValueOutOfRange, "OID out of range: %d", i)
+	if intIsOutOfOIDRange(i) {
+		return nil, pgerror.Newf(
+			pgcode.NumericValueOutOfRange, "OID out of range: %d", i,
+		)
 	}
 	return NewDOid(oid.Oid(i)), nil
+}
+
+func intIsOutOfOIDRange(i DInt) bool {
+	return i > math.MaxUint32 || i < math.MinInt32
 }
 
 // MakeDOid is a helper routine to create a DOid initialized from a DInt.

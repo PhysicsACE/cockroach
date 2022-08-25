@@ -30,6 +30,8 @@ export type NodeNames = { [nodeId: string]: string };
 export const statisticsColumnLabels = {
   sessionStart: "Session Start Time (UTC)",
   sessionDuration: "Session Duration",
+  sessionActiveDuration: "Session Active Duration",
+  sessionTxnCount: "Transaction Count",
   mostRecentStatement: "Most Recent Statement",
   status: "Status",
   statementStartTime: "Statement Start Time (UTC)",
@@ -130,6 +132,30 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         content={"The amount of time the session has been open."}
       >
         {getLabel("sessionDuration")}
+      </Tooltip>
+    );
+  },
+  sessionActiveDuration: () => {
+    return (
+      <Tooltip
+        style="tableTitle"
+        placement="bottom"
+        content={
+          "The amount of time the session has been actively running transactions."
+        }
+      >
+        {getLabel("sessionActiveDuration")}
+      </Tooltip>
+    );
+  },
+  sessionTxnCount: () => {
+    return (
+      <Tooltip
+        style="tableTitle"
+        placement="bottom"
+        content={"The number of transactions executed in this session."}
+      >
+        {getLabel("sessionTxnCount")}
       </Tooltip>
     );
   },
@@ -596,7 +622,8 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         content={
           <>
             <p>
-              {`Maximum memory used by a ${contentModifier} with this fingerprint${fingerprintModifier} at any time during its execution within the specified time interval.`}
+              {`Maximum memory used by a ${contentModifier} with this fingerprint${fingerprintModifier} at any time 
+              during its execution within the specified time interval. `}
             </p>
             <p>
               The gray bar indicates the average max memory usage. The blue bar

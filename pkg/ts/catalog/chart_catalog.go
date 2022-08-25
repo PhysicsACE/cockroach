@@ -573,6 +573,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Paused Followers Dropped Messages",
+				Metrics: []string{
+					"admission.raft.paused_replicas_dropped_msgs",
+				},
+			},
+			{
 				Title: "Operations",
 				Metrics: []string{
 					"range.adds",
@@ -891,6 +897,13 @@ var charts = []sectionDescription{
 					"queue.gc.info.transactionspangccommitted",
 					"queue.gc.info.transactionspangcpending",
 					"queue.gc.info.transactionspangcstaging",
+				},
+			},
+			{
+				Title: "GC Clear Range",
+				Metrics: []string{
+					"queue.gc.info.clearrangesuccess",
+					"queue.gc.info.clearrangefailed",
 				},
 			},
 		},
@@ -2021,6 +2034,28 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Successes by Action",
+				Metrics: []string{
+					"queue.replicate.addreplica.success",
+					"queue.replicate.removereplica.success",
+					"queue.replicate.replacedeadreplica.success",
+					"queue.replicate.removedeadreplica.success",
+					"queue.replicate.replacedecommissioningreplica.success",
+					"queue.replicate.removedecommissioningreplica.success",
+				},
+			},
+			{
+				Title: "Errors by Action",
+				Metrics: []string{
+					"queue.replicate.addreplica.error",
+					"queue.replicate.removereplica.error",
+					"queue.replicate.replacedeadreplica.error",
+					"queue.replicate.removedeadreplica.error",
+					"queue.replicate.replacedecommissioningreplica.error",
+					"queue.replicate.removedecommissioningreplica.error",
+				},
+			},
+			{
 				Title: "Successes",
 				Metrics: []string{
 					"queue.replicate.process.failure",
@@ -2253,15 +2288,15 @@ var charts = []sectionDescription{
 		Charts: []chartDescription{
 			{
 				Title:   "Current number of statement fingerprints being monitored for anomaly detection",
-				Metrics: []string{"sql.stats.insights.anomaly_detection.fingerprints"},
+				Metrics: []string{"sql.insights.anomaly_detection.fingerprints"},
 			},
 			{
 				Title:   "Current memory used to support anomaly detection",
-				Metrics: []string{"sql.stats.insights.anomaly_detection.memory"},
+				Metrics: []string{"sql.insights.anomaly_detection.memory"},
 			},
 			{
 				Title:   "Evictions of fingerprint latency summaries due to memory pressure",
-				Metrics: []string{"sql.stats.insights.anomaly_detection.evictions"},
+				Metrics: []string{"sql.insights.anomaly_detection.evictions"},
 			},
 		},
 	},
@@ -2814,7 +2849,7 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{StorageLayer, "RocksDB", "Block Cache"}},
+		Organization: [][]string{{StorageLayer, "Engine", "Block Cache"}},
 		Charts: []chartDescription{
 			{
 				Title: "Size",
@@ -2833,7 +2868,7 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{StorageLayer, "RocksDB", "Encryption at Rest"}},
+		Organization: [][]string{{StorageLayer, "Engine", "Encryption at Rest"}},
 		Charts: []chartDescription{
 			{
 				Title:   "Algorithm Enum",
@@ -2842,7 +2877,16 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{StorageLayer, "RocksDB", "Migrations"}},
+		Organization: [][]string{{StorageLayer, "Engine", "Keys"}},
+		Charts: []chartDescription{
+			{
+				Title:   "Range Key Set Count",
+				Metrics: []string{"storage.keys.range-key-set.count"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{StorageLayer, "Engine", "Migrations"}},
 		Charts: []chartDescription{
 			{
 				Title:   "SSTables Marked for Compaction",
@@ -2851,7 +2895,7 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{StorageLayer, "RocksDB", "Overview"}},
+		Organization: [][]string{{StorageLayer, "Engine", "Overview"}},
 		Charts: []chartDescription{
 			{
 				Title: "Bloom Filter",
@@ -2935,7 +2979,7 @@ var charts = []sectionDescription{
 		},
 	},
 	{
-		Organization: [][]string{{StorageLayer, "RocksDB", "SSTables"}},
+		Organization: [][]string{{StorageLayer, "Engine", "SSTables"}},
 		Charts: []chartDescription{
 			{
 				Title:   "Count",
