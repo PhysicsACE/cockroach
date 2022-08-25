@@ -255,6 +255,11 @@ func typeIndirection(e opt.ScalarExpr) *types.T {
 	case types.JsonFamily:
 		return t
 	case types.ArrayFamily:
+		// if isSlice, ok := e.Child(3).(*tree.DBool); ok {
+		// 	if bool(*isSlice) {
+		// 		return types.MakeArray(t.ArrayContents())
+		// 	}
+		// }
 		return t.ArrayContents()
 	default:
 		panic(errors.AssertionFailedf("unknown type indirection type %s", t.SQLString()))

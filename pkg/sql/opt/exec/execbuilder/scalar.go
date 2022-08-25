@@ -12,6 +12,7 @@ package execbuilder
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
@@ -457,17 +458,32 @@ func (b *Builder) buildAnyScalar(
 func (b *Builder) buildIndirection(
 	ctx *buildScalarCtx, scalar opt.ScalarExpr,
 ) (tree.TypedExpr, error) {
+	fmt.Println(scalar)
 	expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 	if err != nil {
 		return nil, err
 	}
 
-	index, err := b.buildScalar(ctx, scalar.Child(1).(opt.ScalarExpr))
+	beginIndex, err := b.buildScalar(ctx, scalar.Child(1).(opt.ScalarExpr))
 	if err != nil {
 		return nil, err
 	}
 
-	return tree.NewTypedIndirectionExpr(expr, index, scalar.DataType()), nil
+	endIndex, err := b.buildScalar(ctx, scalar.Child(2).(opt.ScalarExpr))
+	if err != nil {
+		return nil, err
+	}
+
+	isSlice, err := b.buildScalar(ctx, scalar.Child(3).(opt.ScalarExpr))
+	if err != nil {
+		return nil, err
+	}
+
+	if slice, ok := isSlice.(*tree.DBool); ok {
+		return tree.NewTypedIndirectionExpr(expr, beginIndex, endIndex, bool(*slice), scalar.DataType()), nil
+	}
+
+	return tree.NewTypedIndirectionExpr(expr, beginIndex, endIndex, false, scalar.DataType()), nil
 }
 
 func (b *Builder) buildCollate(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {

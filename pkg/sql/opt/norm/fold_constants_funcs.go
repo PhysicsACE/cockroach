@@ -479,20 +479,52 @@ func (c *CustomFuncs) FoldComparison(
 // FoldIndirection evaluates an array indirection operator with constant inputs.
 // It returns the referenced array element as a constant value, or ok=false if
 // the evaluation results in an error.
-func (c *CustomFuncs) FoldIndirection(input, index opt.ScalarExpr) (_ opt.ScalarExpr, ok bool) {
+func (c *CustomFuncs) FoldIndirection(input, beginIndex opt.ScalarExpr, endIndex opt.ScalarExpr, isSlice opt.ScalarExpr) (_ opt.ScalarExpr, ok bool) {
 	// Index is 1-based, so convert to 0-based.
-	indexD := memo.ExtractConstDatum(index)
+	var sliceFlag bool 
+	beginIndexD := memo.ExtractConstDatum(beginIndex)
+	endIndexD := memo.ExtractConstDatum(endIndex)
+	isSliceConst := memo.ExtractConstDatum(isSlice)
+	if sliceCheck, ok := isSliceConst.(*tree.DBool); ok {
+		sliceFlag = bool(*sliceCheck)
+	}
+	var beginIdx int
+	var endIdx int
 
 	// Case 1: The input is a static array constructor.
 	if arr, ok := input.(*memo.ArrayExpr); ok {
-		if indexInt, ok := indexD.(*tree.DInt); ok {
-			indexI := int(*indexInt) - 1
+
+		if sliceFlag {
+			if beginIndexD == tree.DNull {
+				beginIdx = 0
+			}
+
+			if beginIndexInt, ok := beginIndexD.(*tree.DInt); ok {
+				beginIdx = int(*beginIndexInt) - 1
+			}
+
+			if endIndexD == tree.DNull {
+				endIdx = len(arr.Elems)
+			}
+
+			if endIndexInt, ok := endIndexD.(*tree.DInt); ok {
+				endIdx = int(*endIndexInt)
+			}
+
+			if beginIdx >= 0 && beginIdx < len(arr.Elems) && endIdx <= len(arr.Elems) && beginIdx <= endIdx {
+				return c.f.ConstructArray(arr.Elems[beginIdx:endIdx], arr.Typ.ArrayContents()), true
+			}
+		}
+		
+
+		if beginIndexInt, ok := beginIndexD.(*tree.DInt); ok {
+			indexI := int(*beginIndexInt) - 1
 			if indexI >= 0 && indexI < len(arr.Elems) {
 				return arr.Elems[indexI], true
 			}
 			return c.f.ConstructNull(arr.Typ.ArrayContents()), true
 		}
-		if indexD == tree.DNull {
+		if beginIndexD == tree.DNull {
 			return c.f.ConstructNull(arr.Typ.ArrayContents()), true
 		}
 		return nil, false
@@ -510,7 +542,7 @@ func (c *CustomFuncs) FoldIndirection(input, index opt.ScalarExpr) (_ opt.Scalar
 			panic(errors.AssertionFailedf("expected array or json; found %s", input.DataType().SQLString()))
 		}
 		inputD := memo.ExtractConstDatum(input)
-		texpr := tree.NewTypedIndirectionExpr(inputD, indexD, resolvedType)
+		texpr := tree.NewTypedIndirectionExpr(inputD, beginIndexD, endIndexD, sliceFlag, resolvedType)
 		result, err := eval.Expr(c.f.evalCtx, texpr)
 		if err == nil {
 			return c.f.ConstructConstVal(result, texpr.ResolvedType()), true
