@@ -45,7 +45,7 @@ func (j *jsonOrArrayJoinPlanner) extractInvertedJoinConditionFromLeaf(
 	ctx context.Context, expr opt.ScalarExpr,
 ) opt.ScalarExpr {
 	switch t := expr.(type) {
-	case *memo.ContainsExpr, *memo.ContainedByExpr:
+	case *memo.ContainsExpr, *memo.ContainedByExpr, *memo.OverlapsExpr:
 		return j.extractJSONOrArrayJoinCondition(t)
 	default:
 		return nil
@@ -60,7 +60,7 @@ func (j *jsonOrArrayJoinPlanner) extractJSONOrArrayJoinCondition(
 	expr opt.ScalarExpr,
 ) opt.ScalarExpr {
 	var left, right, indexCol, val opt.ScalarExpr
-	commuteArgs, containedBy := false, false
+	commuteArgs, containedBy, isOverlaps := false, false, false
 	switch t := expr.(type) {
 	case *memo.ContainsExpr:
 		left = t.Left
@@ -69,6 +69,10 @@ func (j *jsonOrArrayJoinPlanner) extractJSONOrArrayJoinCondition(
 		left = t.Left
 		right = t.Right
 		containedBy = true
+	case *memo.OverlapsExpr:
+		left = t.Left
+		right = t.Right
+		isOverlaps = true
 	default:
 		return nil
 	}
@@ -114,6 +118,9 @@ func (j *jsonOrArrayJoinPlanner) extractJSONOrArrayJoinCondition(
 	if commuteArgs {
 		if containedBy {
 			return j.factory.ConstructContains(right, left)
+		}
+		if isOverlaps {
+			return j.factory.ConstructOverlaps(right, left)
 		}
 		return j.factory.ConstructContainedBy(right, left)
 	}
@@ -324,6 +331,9 @@ func (g *jsonOrArrayDatumsToInvertedExpr) Convert(
 			case treecmp.ContainedBy:
 				return getInvertedExprForJSONOrArrayIndexForContainedBy(g.evalCtx, d), nil
 
+			case treecmp.Overlaps:
+				return getInvertedExprForArrayIndexForOverlaps(g.evalCtx, d), nil
+
 			default:
 				return nil, fmt.Errorf("unsupported expression %v", t)
 			}
@@ -344,7 +354,7 @@ func (g *jsonOrArrayDatumsToInvertedExpr) Convert(
 
 	spanExpr, ok := invertedExpr.(*inverted.SpanExpression)
 	if !ok {
-		return nil, nil, fmt.Errorf("unable to construct span expression")
+		return nil, nil, fmt.Errorf("unable to construct span expression %T", invertedExpr)
 	}
 
 	return spanExpr.ToProto(), nil, nil

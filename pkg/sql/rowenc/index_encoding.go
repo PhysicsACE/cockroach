@@ -869,9 +869,9 @@ func encodeOverlapsArrayInvertedIndexSpans(
 	// or contains only NULLs and thus has effective length 0,
 	// we cannot generate an inverted expression.
 
-	// TODO: This should be a contradiction which is treated as a no-op.
+	// Return empty spans in this case to ensure that empty and null arrays evalutate to false for the overlap operator.
 	if val.Array.Len() == 0 || !val.HasNonNulls {
-		return inverted.NonInvertedColExpression{}, nil
+		return &inverted.SpanExpression{Tight: true, Unique: true}, nil
 	}
 
 	// We always exclude nulls from the list of keys when evaluating &&.
