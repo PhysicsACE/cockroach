@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React, { ReactNode } from "react";
+import React, { ReactNode, useContext, useMemo } from "react";
 import { Col, Row, Tabs } from "antd";
 import "antd/lib/col/style";
 import "antd/lib/row/style";
@@ -16,8 +16,7 @@ import "antd/lib/tabs/style";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { InlineAlert, Text } from "@cockroachlabs/ui-components";
 import { ArrowLeft } from "@cockroachlabs/icons";
-import { Location } from "history";
-import _, { isNil } from "lodash";
+import { isNil } from "lodash";
 import Long from "long";
 import { Helmet } from "react-helmet";
 import { Link, RouteComponentProps } from "react-router-dom";
@@ -44,6 +43,7 @@ import { SqlBox, SqlBoxSize } from "src/sql";
 import { PlanDetails } from "./planDetails";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 import { DiagnosticsView } from "./diagnostics/diagnosticsView";
+import insightTableStyles from "../insightsTable/insightsTable.module.scss";
 import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
 import timeScaleStyles from "src/timeScaleDropdown/timeScale.module.scss";
 import styles from "./statementDetails.module.scss";
@@ -69,13 +69,27 @@ import {
   generateExecRetriesTimeseries,
   generateExecuteAndPlanningTimeseries,
   generateRowsProcessedTimeseries,
+  generateCPUTimeseries,
 } from "./timeseriesUtils";
 import { Delayed } from "../delayed";
 import moment from "moment";
 import {
   InsertStmtDiagnosticRequest,
+  InsightRecommendation,
   StatementDiagnosticsReport,
+  StmtInsightsReq,
 } from "../api";
+import {
+  getStmtInsightRecommendations,
+  InsightNameEnum,
+  InsightType,
+  StmtInsightEvent,
+} from "../insights";
+import {
+  InsightsSortedTable,
+  makeInsightsColumns,
+} from "../insightsTable/insightsTable";
+import { CockroachCloudContext } from "../contexts";
 
 type StatementDetailsResponse =
   cockroach.server.serverpb.StatementDetailsResponse;
@@ -110,6 +124,7 @@ export interface StatementDetailsDispatchProps {
   refreshUserSQLRoles: () => void;
   refreshNodes: () => void;
   refreshNodesLiveness: () => void;
+  refreshStatementFingerprintInsights: (req: StmtInsightsReq) => void;
   createStatementDiagnosticsReport: (
     insertStmtDiagnosticsRequest: InsertStmtDiagnosticRequest,
   ) => void;
@@ -139,6 +154,8 @@ export interface StatementDetailsStateProps {
   uiConfig?: UIConfigState["pages"]["statementDetails"];
   isTenant?: UIConfigState["isTenant"];
   hasViewActivityRedactedRole?: UIConfigState["hasViewActivityRedactedRole"];
+  hasAdminRole?: UIConfigState["hasAdminRole"];
+  statementFingerprintInsights?: StmtInsightEvent[];
 }
 
 export type StatementDetailsOwnProps = StatementDetailsDispatchProps &
@@ -147,6 +164,7 @@ export type StatementDetailsOwnProps = StatementDetailsDispatchProps &
 const cx = classNames.bind(styles);
 const summaryCardStylesCx = classNames.bind(summaryCardStyles);
 const timeScaleStylesCx = classNames.bind(timeScaleStyles);
+const insightsTableCx = classNames.bind(insightTableStyles);
 
 function getStatementDetailsRequestFromProps(
   props: StatementDetailsProps,
@@ -222,15 +240,6 @@ export class StatementDetails extends React.Component<
     }
   }
 
-  static defaultProps: Partial<StatementDetailsProps> = {
-    onDiagnosticBundleDownload: _.noop,
-    uiConfig: {
-      showStatementDiagnosticsLink: true,
-    },
-    isTenant: false,
-    hasViewActivityRedactedRole: false,
-  };
-
   hasDiagnosticReports = (): boolean =>
     this.props.diagnosticsReports.length > 0;
 
@@ -257,10 +266,22 @@ export class StatementDetails extends React.Component<
     }
   }
 
-  refreshStatementDetails = (): void => {
+  refreshStatementDetails = () => {
     const req = getStatementDetailsRequestFromProps(this.props);
     this.props.refreshStatementDetails(req);
+    this.refreshStatementInsights();
     this.resetPolling(this.props.timeScale.key);
+  };
+
+  refreshStatementInsights = () => {
+    const [startTime, endTime] = toRoundedDateRange(this.props.timeScale);
+    const id = BigInt(this.props.statementFingerprintID).toString(16);
+    const req: StmtInsightsReq = {
+      start: startTime,
+      end: endTime,
+      stmtFingerprintId: id,
+    };
+    this.props.refreshStatementFingerprintInsights(req);
   };
 
   handleResize = (): void => {
@@ -531,7 +552,7 @@ export class StatementDetails extends React.Component<
       return this.renderNoDataWithTimeScaleAndSqlBoxTabContent(hasTimeout);
     }
     const { cardWidth } = this.state;
-    const { nodeRegions, isTenant } = this.props;
+    const { nodeRegions, isTenant, statementFingerprintInsights } = this.props;
     const { stats } = this.props.statementDetails.statement;
     const {
       app_names,
@@ -631,6 +652,36 @@ export class StatementDetails extends React.Component<
       width: cardWidth,
     };
 
+    const cpuTimeseries: AlignedData =
+      generateCPUTimeseries(statsPerAggregatedTs);
+    const cpuOps: Partial<Options> = {
+      axes: [{}, { label: "CPU Time" }],
+      series: [{}, { label: "CPU Time" }],
+      legend: { show: false },
+      width: cardWidth,
+    };
+
+    const isCockroachCloud = useContext(CockroachCloudContext);
+    const insightsColumns = makeInsightsColumns(
+      isCockroachCloud,
+      this.props.hasAdminRole,
+      true,
+      true,
+    );
+    const tableData: InsightRecommendation[] = [];
+    if (statementFingerprintInsights) {
+      const tableDataTypes = new Set<InsightType>();
+      statementFingerprintInsights.forEach(insight => {
+        const rec = getStmtInsightRecommendations(insight);
+        rec.forEach(entry => {
+          if (!tableDataTypes.has(entry.type)) {
+            tableData.push(entry);
+            tableDataTypes.add(entry.type);
+          }
+        });
+      });
+    }
+
     return (
       <>
         <PageConfig>
@@ -707,6 +758,22 @@ export class StatementDetails extends React.Component<
               </SummaryCard>
             </Col>
           </Row>
+          {tableData != null && tableData?.length > 0 && (
+            <>
+              <p
+                className={summaryCardStylesCx("summary--card__divider--large")}
+              />
+              <Row gutter={24}>
+                <Col className="gutter-row" span={24}>
+                  <InsightsSortedTable
+                    columns={insightsColumns}
+                    data={tableData}
+                    tableWrapperClassName={insightsTableCx("sorted-table")}
+                  />
+                </Col>
+              </Row>
+            </>
+          )}
           <p className={summaryCardStylesCx("summary--card__divider--large")} />
           <Row gutter={24}>
             <Col className="gutter-row" span={12}>
@@ -754,6 +821,15 @@ export class StatementDetails extends React.Component<
                 yAxisUnits={AxisUnits.Duration}
               />
             </Col>
+            <Col className="gutter-row" span={12}>
+              <BarGraphTimeSeries
+                title={`CPU Time${noSamples}`}
+                alignedData={cpuTimeseries}
+                uPlotOptions={cpuOps}
+                tooltip={unavailableTooltip}
+                yAxisUnits={AxisUnits.Duration}
+              />
+            </Col>
           </Row>
         </section>
       </>
@@ -795,6 +871,7 @@ export class StatementDetails extends React.Component<
           <PlanDetails
             statementFingerprintID={this.props.statementFingerprintID}
             plans={statement_statistics_per_plan_hash}
+            hasAdminRole={this.props.hasAdminRole}
           />
         </section>
       </>
@@ -820,7 +897,7 @@ export class StatementDetails extends React.Component<
           this.props.onDiagnosticCancelRequest(report)
         }
         showDiagnosticsViewLink={
-          this.props.uiConfig.showStatementDiagnosticsLink
+          this.props.uiConfig?.showStatementDiagnosticsLink
         }
         onSortingChange={this.props.onSortingChange}
       />

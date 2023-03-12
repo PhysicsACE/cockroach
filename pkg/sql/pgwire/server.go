@@ -256,7 +256,7 @@ type tenantSpecificMetrics struct {
 	BytesOutCount               *metric.Counter
 	Conns                       *metric.Gauge
 	NewConns                    *metric.Counter
-	ConnLatency                 *metric.Histogram
+	ConnLatency                 metric.IHistogram
 	ConnFailures                *metric.Counter
 	PGWireCancelTotalCount      *metric.Counter
 	PGWireCancelIgnoredCount    *metric.Counter
@@ -273,9 +273,12 @@ func makeTenantSpecificMetrics(
 		BytesOutCount: metric.NewCounter(MetaBytesOut),
 		Conns:         metric.NewGauge(MetaConns),
 		NewConns:      metric.NewCounter(MetaNewConns),
-		ConnLatency: metric.NewHistogram(
-			MetaConnLatency, histogramWindow, metric.IOLatencyBuckets,
-		),
+		ConnLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: MetaConnLatency,
+			Duration: histogramWindow,
+			Buckets:  metric.IOLatencyBuckets,
+		}),
 		ConnFailures:                metric.NewCounter(MetaConnFailures),
 		PGWireCancelTotalCount:      metric.NewCounter(MetaPGWireCancelTotal),
 		PGWireCancelIgnoredCount:    metric.NewCounter(MetaPGWireCancelIgnored),
@@ -637,13 +640,17 @@ func (s *Server) drainImpl(
 
 // SocketType indicates the connection type. This is an optimization to
 // prevent a comparison against conn.LocalAddr().Network().
-type SocketType bool
+type SocketType int
 
 const (
+	SocketUnknown SocketType = iota
 	// SocketTCP is used for TCP sockets. The standard.
-	SocketTCP SocketType = true
+	SocketTCP
 	// SocketUnix is used for unix datagram sockets.
-	SocketUnix SocketType = false
+	SocketUnix
+	// SocketInternalLoopback is used for internal connections running over our
+	// loopback listener.
+	SocketInternalLoopback
 )
 
 func (s SocketType) asConnType() (hba.ConnType, error) {
@@ -652,6 +659,8 @@ func (s SocketType) asConnType() (hba.ConnType, error) {
 		return hba.ConnHostNoSSL, nil
 	case SocketUnix:
 		return hba.ConnLocal, nil
+	case SocketInternalLoopback:
+		return hba.ConnInternalLoopback, nil
 	default:
 		return 0, errors.AssertionFailedf("unimplemented socket type: %v", errors.Safe(s))
 	}
@@ -779,7 +788,6 @@ func (s *Server) ServeConn(
 			connType:        preServeStatus.ConnType,
 			connDetails:     connDetails,
 			insecure:        s.cfg.Insecure,
-			ie:              s.execCfg.InternalExecutor,
 			auth:            hbaConf,
 			identMap:        identMap,
 			testingAuthHook: testingAuthHook,
@@ -817,7 +825,7 @@ func readCancelKeyAndCloseConn(
 // - (*server/statusServer).cancelSemaphore
 // - (*server/statusServer).CancelRequestByKey
 // - (*server/serverController).sqlMux
-func (s *Server) HandleCancel(ctx context.Context, cancelKey pgwirecancel.BackendKeyData) error {
+func (s *Server) HandleCancel(ctx context.Context, cancelKey pgwirecancel.BackendKeyData) {
 	s.tenantMetrics.PGWireCancelTotalCount.Inc(1)
 
 	resp, err := func() (*serverpb.CancelQueryByKeyResponse, error) {
@@ -838,9 +846,9 @@ func (s *Server) HandleCancel(ctx context.Context, cancelKey pgwirecancel.Backen
 	} else if err != nil {
 		if respStatus := status.Convert(err); respStatus.Code() == codes.ResourceExhausted {
 			s.tenantMetrics.PGWireCancelIgnoredCount.Inc(1)
+			log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %v", err)
 		}
 	}
-	return err
 }
 
 // finalizeClientParameters "fills in" the session arguments with

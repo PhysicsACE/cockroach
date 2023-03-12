@@ -34,7 +34,7 @@ type cteSource struct {
 	ordering     opt.Ordering
 	originalExpr tree.Statement
 	expr         memo.RelExpr
-	mtr          tree.MaterializeClause
+	mtr          tree.CTEMaterializeClause
 	// If set, this function is called when a CTE is referenced. It can throw an
 	// error.
 	onRef func()
@@ -95,8 +95,7 @@ func (b *Builder) buildWiths(expr memo.RelExpr, ctes cteSources) memo.RelExpr {
 			OriginalExpr: ctes[i].originalExpr,
 		}
 		if len(ctes[i].ordering) > 0 {
-			private.Mtr.Set = true
-			private.Mtr.Materialize = true
+			private.Mtr = tree.CTEMaterializeAlways
 			private.BindingOrdering.FromOrdering(ctes[i].ordering)
 		}
 		expr = b.factory.ConstructWith(ctes[i].expr, expr, private)
@@ -308,7 +307,7 @@ func (b *Builder) buildCTE(
 	recursiveScope := b.buildStmt(recursive, initialTypes /* desiredTypes */, cteScope)
 	if numRefs == 0 {
 		// Build this as a non-recursive CTE.
-		cteScope := b.buildSetOp(tree.UnionOp, false /* all */, inScope, initialScope, recursiveScope)
+		cteScope := b.buildSetOp(tree.UnionOp, isUnionAll, inScope, initialScope, recursiveScope)
 		return cteScope.expr, b.getCTECols(cteScope, cte.Name), nil
 	}
 

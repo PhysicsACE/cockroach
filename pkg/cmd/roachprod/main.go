@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/user"
 	"path"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/grafana"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
@@ -794,7 +796,7 @@ var sqlCmd = &cobra.Command{
 	Long:  "Run `cockroach sql` on a remote cluster.\n",
 	Args:  cobra.MinimumNArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.SQL(context.Background(), roachprodLibraryLogger, args[0], secure, args[1:])
+		return roachprod.SQL(context.Background(), roachprodLibraryLogger, args[0], secure, tenantName, args[1:])
 	}),
 }
 
@@ -805,7 +807,11 @@ var pgurlCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		urls, err := roachprod.PgURL(context.Background(), roachprodLibraryLogger, args[0], pgurlCertsDir, external, secure)
+		urls, err := roachprod.PgURL(context.Background(), roachprodLibraryLogger, args[0], pgurlCertsDir, roachprod.PGURLOptions{
+			External:   external,
+			Secure:     secure,
+			TenantName: tenantName,
+		})
 		if err != nil {
 			return err
 		}
@@ -903,8 +909,34 @@ var grafanaStartCmd = &cobra.Command{
 	Short: `spins up a prometheus and grafana instance on the last node in the cluster`,
 	Args:  cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		var grafanaDashboardJSONs []string
+		var grafanaConfigURL string
+		if grafanaConfig != "" {
+			url, err := url.Parse(grafanaConfig)
+			if err != nil {
+				return err
+			}
+			switch url.Scheme {
+			case "http", "https":
+				grafanaConfigURL = grafanaConfig
+			case "file", "":
+				if data, err := grafana.GetDashboardJSONFromFile(url.Path); err != nil {
+					return err
+				} else {
+					grafanaDashboardJSONs = []string{data}
+				}
+			default:
+				return errors.Newf("unsupported scheme %s", url.Scheme)
+			}
+		} else {
+			var err error
+			if grafanaDashboardJSONs, err = grafana.GetDefaultDashboardJSONs(); err != nil {
+				return err
+			}
+		}
+
 		return roachprod.StartGrafana(context.Background(), roachprodLibraryLogger, args[0],
-			grafanaConfig, nil)
+			grafanaConfigURL, grafanaDashboardJSONs, nil)
 	}),
 }
 

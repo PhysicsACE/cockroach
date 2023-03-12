@@ -311,6 +311,7 @@ describe("rest api", function () {
           expect(JSON.parse(requestObj.body.toString())).toEqual({
             ...clusterUiApi.buildEventsSQLRequest({}),
             application_name: clusterUiApi.INTERNAL_SQL_API_APP,
+            database: "system",
           });
           return {
             body: JSON.stringify(
@@ -330,7 +331,7 @@ describe("rest api", function () {
 
       return clusterUiApi.getNonRedactedEvents().then(result => {
         expect(fetchMock.calls(clusterUiApi.SQL_API_PATH).length).toBe(1);
-        expect(result.length).toBe(1);
+        expect(result.results.length).toBe(1);
       });
     });
 
@@ -345,6 +346,7 @@ describe("rest api", function () {
           expect(JSON.parse(requestObj.body.toString())).toEqual({
             ...clusterUiApi.buildEventsSQLRequest(req),
             application_name: clusterUiApi.INTERNAL_SQL_API_APP,
+            database: "system",
           });
           return {
             body: JSON.stringify(
@@ -364,7 +366,7 @@ describe("rest api", function () {
 
       return clusterUiApi.getNonRedactedEvents(req).then(result => {
         expect(fetchMock.calls(clusterUiApi.SQL_API_PATH).length).toBe(1);
-        expect(result.length).toBe(1);
+        expect(result.results.length).toBe(1);
       });
     });
 
@@ -377,6 +379,7 @@ describe("rest api", function () {
           expect(JSON.parse(requestObj.body.toString())).toEqual({
             ...clusterUiApi.buildEventsSQLRequest({}),
             application_name: clusterUiApi.INTERNAL_SQL_API_APP,
+            database: "system",
           });
           return { throws: new Error() };
         },
@@ -402,6 +405,7 @@ describe("rest api", function () {
           expect(JSON.parse(requestObj.body.toString())).toEqual({
             ...clusterUiApi.buildEventsSQLRequest({}),
             application_name: clusterUiApi.INTERNAL_SQL_API_APP,
+            database: "system",
           });
           return new Promise<any>(() => {});
         },

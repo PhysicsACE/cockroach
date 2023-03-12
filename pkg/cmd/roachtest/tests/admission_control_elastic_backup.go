@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/grafana"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
@@ -56,7 +57,7 @@ func registerElasticControlForBackups(r registry.Registry) {
 			promCfg.WithPrometheusNode(c.Node(workloadNode).InstallNodes()[0]).
 				WithNodeExporter(c.Range(1, c.Spec().NodeCount-1).InstallNodes()).
 				WithCluster(c.Range(1, c.Spec().NodeCount-1).InstallNodes()).
-				WithGrafanaDashboard("http://go.crdb.dev/p/backup-admission-control-grafana").
+				WithGrafanaDashboardJSON(grafana.BackupAdmissionControlGrafanaJSON).
 				WithScrapeConfigs(
 					prometheus.MakeWorkloadScrapeConfig("workload", "/",
 						makeWorkloadScrapeNodes(
@@ -73,13 +74,14 @@ func registerElasticControlForBackups(r registry.Registry) {
 			}
 
 			runTPCC(ctx, t, c, tpccOptions{
-				Warehouses:         numWarehouses,
-				Duration:           workloadDuration,
-				SetupType:          usingImport,
-				EstimatedSetupTime: estimatedSetupTime,
-				SkipPostRunCheck:   true,
-				ExtraSetupArgs:     "--checks=false",
-				PrometheusConfig:   promCfg,
+				Warehouses:                    numWarehouses,
+				Duration:                      workloadDuration,
+				SetupType:                     usingImport,
+				EstimatedSetupTime:            estimatedSetupTime,
+				SkipPostRunCheck:              true,
+				ExtraSetupArgs:                "--checks=false",
+				PrometheusConfig:              promCfg,
+				DisableDefaultScheduledBackup: true,
 				During: func(ctx context.Context) error {
 					db := c.Conn(ctx, t.L(), crdbNodes)
 					defer db.Close()

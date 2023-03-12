@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -70,7 +71,7 @@ func getTestRandomClientURI(tenantID roachpb.TenantID, tenantName roachpb.Tenant
 		dupProbability, tenantID, tenantName)
 }
 
-func sstMaker(t *testing.T, keyValues []roachpb.KeyValue) roachpb.RangeFeedSSTable {
+func sstMaker(t *testing.T, keyValues []roachpb.KeyValue) kvpb.RangeFeedSSTable {
 	sort.Slice(keyValues, func(i, j int) bool {
 		return keyValues[i].Key.Compare(keyValues[j].Key) < 0
 	})
@@ -89,7 +90,7 @@ func sstMaker(t *testing.T, keyValues []roachpb.KeyValue) roachpb.RangeFeedSSTab
 		})
 	}
 	data, start, end := storageutils.MakeSST(t, clustersettings.MakeTestingClusterSettings(), kvs)
-	return roachpb.RangeFeedSSTable{
+	return kvpb.RangeFeedSSTable{
 		Data: data,
 		Span: roachpb.Span{
 			Key:    start,
@@ -192,7 +193,7 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 	client.ClearInterceptors()
 	client.RegisterInterception(completeJobAfterCheckpoints)
 	client.RegisterInterception(validateFnWithValidator(t, streamValidator))
-	client.RegisterSSTableGenerator(func(keyValues []roachpb.KeyValue) roachpb.RangeFeedSSTable {
+	client.RegisterSSTableGenerator(func(keyValues []roachpb.KeyValue) kvpb.RangeFeedSSTable {
 		return sstMaker(t, keyValues)
 	})
 
@@ -207,10 +208,10 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 		},
 	}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 			for _, req := range ba.Requests {
 				switch r := req.GetInner().(type) {
-				case *roachpb.RevertRangeRequest:
+				case *kvpb.RevertRangeRequest:
 					revertRangeTargetTime = r.TargetTime
 					<-receivedRevertRequest
 				}
@@ -238,9 +239,9 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 
 	// Attempt to run the ingestion job without enabling the experimental setting.
 	_, err = conn.Exec(query)
-	require.True(t, testutils.IsError(err, "stream replication is only supported experimentally"))
+	require.True(t, testutils.IsError(err, "cross cluster replication is disabled"))
 
-	_, err = conn.Exec(`SET enable_experimental_stream_replication = true`)
+	_, err = conn.Exec(`SET CLUSTER SETTING cross_cluster_replication.enabled = true;`)
 	require.NoError(t, err)
 
 	_, err = conn.Exec(query)
@@ -311,7 +312,7 @@ func assertExactlyEqualKVs(
 ) hlc.Timestamp {
 	// Iterate over the store.
 	store := tc.GetFirstStoreFromServer(t, 0)
-	it := store.Engine().NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	it := store.TODOEngine().NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		LowerBound: tenantPrefix,
 		UpperBound: tenantPrefix.PrefixEnd(),
 	})

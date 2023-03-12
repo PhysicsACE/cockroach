@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
@@ -31,9 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -74,7 +75,7 @@ type Reporter struct {
 	liveness  *liveness.NodeLiveness
 	settings  *cluster.Settings
 	storePool *storepool.StorePool
-	executor  sqlutil.InternalExecutor
+	executor  isql.Executor
 	cfgs      config.SystemConfigProvider
 
 	frequencyMu struct {
@@ -91,7 +92,7 @@ func NewReporter(
 	storePool *storepool.StorePool,
 	st *cluster.Settings,
 	liveness *liveness.NodeLiveness,
-	executor sqlutil.InternalExecutor,
+	executor isql.Executor,
 	provider config.SystemConfigProvider,
 ) *Reporter {
 	r := Reporter{
@@ -272,7 +273,7 @@ func (stats *Reporter) update(
 func (stats *Reporter) meta1LeaseHolderStore(ctx context.Context) *kvserver.Store {
 	const meta1RangeID = roachpb.RangeID(1)
 	repl, store, err := stats.localStores.GetReplicaForRangeID(ctx, meta1RangeID)
-	if roachpb.IsRangeNotFoundError(err) {
+	if kvpb.IsRangeNotFoundError(err) {
 		return nil
 	}
 	if err != nil {
@@ -638,7 +639,7 @@ type RangeIterator interface {
 	// the iterator is not to be used any more (except for calling Close(), which will be a no-op).
 	//
 	// The returned error can be a retriable one (i.e.
-	// *roachpb.TransactionRetryWithProtoRefreshError, possibly wrapped). In that case, the iterator
+	// *kvpb.TransactionRetryWithProtoRefreshError, possibly wrapped). In that case, the iterator
 	// is reset automatically; the next Next() call ( should there be one) will
 	// return the first descriptor.
 	// In case of any other error, the iterator is automatically closed.
@@ -754,7 +755,7 @@ func (r *meta2RangeIter) readBatch(ctx context.Context) (retErr error) {
 }
 
 func errIsRetriable(err error) bool {
-	return errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil))
+	return errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil))
 }
 
 // handleErr manipulates the iterator's state in response to an error.
@@ -796,7 +797,7 @@ type reportID int
 // getReportGenerationTime returns the time at a particular report was last
 // generated. Returns time.Time{} if the report is not found.
 func getReportGenerationTime(
-	ctx context.Context, rid reportID, ex sqlutil.InternalExecutor, txn *kv.Txn,
+	ctx context.Context, rid reportID, ex isql.Executor, txn *kv.Txn,
 ) (time.Time, error) {
 	row, err := ex.QueryRowEx(
 		ctx,

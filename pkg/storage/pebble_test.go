@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -256,7 +257,7 @@ func TestPebbleMetricEventListener(t *testing.T) {
 
 	settings := cluster.MakeTestingClusterSettings()
 	MaxSyncDurationFatalOnExceeded.Override(ctx, &settings.SV, false)
-	p, err := Open(ctx, InMemory(), CacheSize(1<<20 /* 1 MiB */), Settings(settings))
+	p, err := Open(ctx, InMemory(), settings, CacheSize(1<<20 /* 1 MiB */))
 	require.NoError(t, err)
 	defer p.Close()
 
@@ -547,7 +548,7 @@ func TestPebbleBackgroundError(t *testing.T) {
 			errorCount: 3,
 		},
 	}
-	eng, err := Open(context.Background(), loc)
+	eng, err := Open(context.Background(), loc, cluster.MakeClusterSettings())
 	require.NoError(t, err)
 	defer eng.Close()
 
@@ -1197,35 +1198,6 @@ func TestPebbleReaderMultipleIterators(t *testing.T) {
 	}
 }
 
-// TestFSOpenFd ensures that an engine opened using the real filesystem
-// correctly implements the Fd() method. The Fd() method is an optional part of
-// the vfs.File interface, that when implemented can be used to perform
-// readahead using prefetch calls.
-func TestFSOpenFd(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	dir := t.TempDir()
-
-	eng, err := Open(context.Background(), Filesystem(dir), ForTesting, MaxSize(1<<20))
-	require.NoError(t, err)
-	defer eng.Close()
-
-	filename := filepath.Join(dir, "foo")
-	require.NoError(t, fs.WriteFile(eng, filename, []byte("hello world")))
-	f, err := eng.Open(filename)
-	require.NoError(t, err)
-	defer f.Close()
-
-	type Fder interface {
-		Fd() uintptr
-	}
-	fder, ok := f.(Fder)
-	require.True(t, ok)
-	if fd := fder.Fd(); fd == 0 {
-		t.Fatalf("Fd() returned %d", fd)
-	}
-}
-
 func TestShortAttributeExtractor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -1306,4 +1278,65 @@ func TestShortAttributeExtractor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIncompatibleVersion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	loc := Location{
+		dir: "",
+		fs:  vfs.NewMem(),
+	}
+
+	p, err := Open(ctx, loc, cluster.MakeTestingClusterSettings())
+	require.NoError(t, err)
+	p.Close()
+
+	// Overwrite the min version file with an unsupported version.
+	version := roachpb.Version{Major: 21, Minor: 1}
+	b, err := protoutil.Marshal(&version)
+	require.NoError(t, err)
+	require.NoError(t, fs.SafeWriteToFile(loc.fs, loc.dir, MinVersionFilename, b))
+
+	_, err = Open(ctx, loc, cluster.MakeTestingClusterSettings())
+	require.ErrorContains(t, err, "is too old for running version")
+}
+
+func TestNoMinVerFile(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	loc := Location{
+		dir: "",
+		fs:  vfs.NewMem(),
+	}
+
+	st := cluster.MakeTestingClusterSettings()
+	p, err := Open(ctx, loc, st)
+	require.NoError(t, err)
+	p.Close()
+
+	// Remove the min version filename.
+	require.NoError(t, loc.fs.Remove(loc.fs.PathJoin(loc.dir, MinVersionFilename)))
+
+	// We are still allowed the open the store if we haven't written anything to it.
+	// This is useful in case the initial Open crashes right before writinng the
+	// min version file.
+	p, err = Open(ctx, loc, st)
+	require.NoError(t, err)
+
+	// Now write something to the store.
+	k := MVCCKey{Key: []byte("a"), Timestamp: hlc.Timestamp{WallTime: 1}}
+	v := MVCCValue{Value: roachpb.MakeValueFromString("a1")}
+	require.NoError(t, p.PutMVCC(k, v))
+	p.Close()
+
+	// Remove the min version filename.
+	require.NoError(t, loc.fs.Remove(loc.fs.PathJoin(loc.dir, MinVersionFilename)))
+
+	_, err = Open(ctx, loc, st)
+	require.ErrorContains(t, err, "store has no min-version file")
 }

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -61,8 +62,11 @@ func StoreGossipKey() roachpb.Key {
 	return MakeStoreKey(localStoreGossipSuffix, nil)
 }
 
-// StoreClusterVersionKey returns a store-local key for the cluster version.
-func StoreClusterVersionKey() roachpb.Key {
+// DeprecatedStoreClusterVersionKey returns a store-local key for the cluster version.
+//
+// We no longer use this key, but still write it out for interoperability with
+// older versions.
+func DeprecatedStoreClusterVersionKey() roachpb.Key {
 	return MakeStoreKey(localStoreClusterVersionSuffix, nil)
 }
 
@@ -122,6 +126,19 @@ func DecodeStoreCachedSettingsKey(key roachpb.Key) (settingKey roachpb.Key, err 
 		return nil, errors.Errorf("invalid key has trailing garbage: %q", detail)
 	}
 	return
+}
+
+// StoreLossOfQuorumRecoveryStatusKey is a key used for storing results of loss
+// of quorum recovery plan application.
+func StoreLossOfQuorumRecoveryStatusKey() roachpb.Key {
+	return MakeStoreKey(localStoreLossOfQuorumRecoveryStatusSuffix, nil)
+}
+
+// StoreLossOfQuorumRecoveryCleanupActionsKey is a key used for storing data for
+// post recovery cleanup actions node would perform after restart if plan was
+// applied.
+func StoreLossOfQuorumRecoveryCleanupActionsKey() roachpb.Key {
+	return MakeStoreKey(localStoreLossOfQuorumRecoveryCleanupActionsSuffix, nil)
 }
 
 // StoreUnsafeReplicaRecoveryKey creates a key for loss of quorum replica
@@ -467,6 +484,24 @@ func LockTableSingleKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
 	buf = append(buf, LocalRangeLockTablePrefix...)
 	buf = append(buf, LockTableSingleKeyInfix...)
 	buf = encoding.EncodeBytesAscending(buf, key)
+	return buf, buf
+}
+
+// LockTableSingleNextKey is equivalent to LockTableSingleKey(key.Next(), buf)
+// but avoids an extra allocation in cases where key.Next() must allocate.
+func LockTableSingleNextKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
+	keyLen := len(LocalRangeLockTablePrefix) + len(LockTableSingleKeyInfix) + encoding.EncodeNextBytesSize(key)
+	if cap(buf) < keyLen {
+		buf = make([]byte, 0, keyLen)
+	} else {
+		buf = buf[:0]
+	}
+	// Don't unwrap any local prefix on key using Addr(key). This allow for
+	// doubly-local lock table keys. For example, local range descriptor keys can
+	// be locked during split and merge transactions.
+	buf = append(buf, LocalRangeLockTablePrefix...)
+	buf = append(buf, LockTableSingleKeyInfix...)
+	buf = encoding.EncodeNextBytesAscending(buf, key)
 	return buf, buf
 }
 
@@ -933,13 +968,13 @@ func EnsureSafeSplitKey(key roachpb.Key) (roachpb.Key, error) {
 }
 
 // Range returns a key range encompassing the key ranges of all requests.
-func Range(reqs []roachpb.RequestUnion) (roachpb.RSpan, error) {
+func Range(reqs []kvpb.RequestUnion) (roachpb.RSpan, error) {
 	from := roachpb.RKeyMax
 	to := roachpb.RKeyMin
 	for _, arg := range reqs {
 		req := arg.GetInner()
 		h := req.Header()
-		if !roachpb.IsRange(req) && len(h.EndKey) != 0 {
+		if !kvpb.IsRange(req) && len(h.EndKey) != 0 {
 			return roachpb.RSpan{}, errors.Errorf("end key specified for non-range operation: %s", req)
 		}
 

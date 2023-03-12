@@ -11,6 +11,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"hash"
 	"hash/fnv"
@@ -191,7 +192,6 @@ func FingerprintRangekeys(
 ) (uint64, error) {
 	ctx, sp := tracing.ChildSpan(ctx, "storage.FingerprintRangekeys")
 	defer sp.Finish()
-	_ = ctx // ctx is currently unused, but this new ctx should be used below in the future.
 
 	if len(ssts) == 0 {
 		return 0, nil
@@ -235,8 +235,8 @@ func FingerprintRangekeys(
 	}
 	defer iter.Close()
 
-	destFile := &MemFile{}
-	fw := makeFingerprintWriter(ctx, fnv.New64(), cs, destFile, opts)
+	var destFile bytes.Buffer
+	fw := makeFingerprintWriter(ctx, fnv.New64(), cs, &destFile, opts)
 	defer fw.Close()
 	fingerprintRangeKey := func(stack MVCCRangeKeyStack) (uint64, error) {
 		defer fw.hasher.Reset()
@@ -282,7 +282,7 @@ func FingerprintRangekeys(
 		fw.xorAgg.add(rangekeyFingerprint)
 	}
 
-	if len(destFile.Data()) != 0 {
+	if destFile.Len() != 0 {
 		return 0, errors.AssertionFailedf("unexpected data found in destFile")
 	}
 

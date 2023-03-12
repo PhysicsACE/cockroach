@@ -108,7 +108,7 @@ func newEventConsumer(
 
 	makeConsumer := func(s EventSink, frontier frontier) (eventConsumer, error) {
 		var err error
-		encoder, err := getEncoder(encodingOpts, feed.Targets)
+		encoder, err := getEncoder(encodingOpts, feed.Targets, makeExternalConnectionProvider(ctx, cfg.DB), sliMetrics)
 		if err != nil {
 			return nil, err
 		}
@@ -125,7 +125,7 @@ func newEventConsumer(
 		// CPU control is disabled.
 		var pacer *admission.Pacer = nil
 		if enablePacer {
-			tenantID, ok := roachpb.TenantFromContext(ctx)
+			tenantID, ok := roachpb.ClientTenantFromContext(ctx)
 			if !ok {
 				tenantID = roachpb.SystemTenantID
 			}
@@ -231,7 +231,7 @@ func newKVEventToRowConsumer(
 
 	var evaluator *cdceval.Evaluator
 	if spec.Select.Expr != "" {
-		evaluator, err = newEvaluator(ctx, cfg, spec)
+		evaluator, err = newEvaluator(ctx, cfg, spec, details.Opts.GetFilters().WithDiff)
 		if err != nil {
 			return nil, err
 		}
@@ -260,7 +260,10 @@ func newKVEventToRowConsumer(
 }
 
 func newEvaluator(
-	ctx context.Context, cfg *sql.ExecutorConfig, spec execinfrapb.ChangeAggregatorSpec,
+	ctx context.Context,
+	cfg *sql.ExecutorConfig,
+	spec execinfrapb.ChangeAggregatorSpec,
+	withDiff bool,
 ) (*cdceval.Evaluator, error) {
 	sc, err := cdceval.ParseChangefeedExpression(spec.Select.Expr)
 	if err != nil {
@@ -290,7 +293,7 @@ func newEvaluator(
 		sd = *spec.Feed.SessionData
 	}
 
-	return cdceval.NewEvaluator(sc, cfg, spec.User(), sd)
+	return cdceval.NewEvaluator(sc, cfg, spec.User(), sd, spec.Feed.StatementTime, withDiff), nil
 }
 
 func (c *kvEventToRowConsumer) topicForEvent(eventMeta cdcevent.Metadata) (TopicDescriptor, error) {

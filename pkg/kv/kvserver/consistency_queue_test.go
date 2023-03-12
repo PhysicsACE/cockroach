@@ -21,13 +21,16 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -42,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -53,7 +57,7 @@ func TestConsistencyQueueRequiresLive(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	manualClock := timeutil.NewManualTime(timeutil.Unix(0, 123))
-	clock := hlc.NewClock(manualClock, 10 /* maxOffset */)
+	clock := hlc.NewClockForTesting(manualClock)
 	interval := time.Second * 5
 	live := true
 	testStart := clock.Now()
@@ -93,15 +97,16 @@ func TestConsistencyQueueRequiresLive(t *testing.T) {
 }
 
 // TestCheckConsistencyMultiStore creates a node with three stores
-// with three way replication. A value is added to the node, and a
-// consistency check is run.
+// with three way replication. A consistency check is run on r1,
+// which always has some data, and on a newly split off range
+// as well.
 func TestCheckConsistencyMultiStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationAuto,
+			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
@@ -115,24 +120,38 @@ func TestCheckConsistencyMultiStore(t *testing.T) {
 	defer tc.Stopper().Stop(context.Background())
 	store := tc.GetFirstStoreFromServer(t, 0)
 
-	// Write something to the DB.
-	putArgs := putArgs([]byte("a"), []byte("b"))
-	if _, err := kv.SendWrapped(context.Background(), store.DB().NonTransactionalSender(), putArgs); err != nil {
-		t.Fatal(err)
+	// Split off a range and write to it; we'll use it below but we test r1 first.
+	k2 := tc.ScratchRange(t)
+	{
+		// Write something to k2.
+		putArgs := putArgs(k2, []byte("b"))
+		_, pErr := kv.SendWrapped(context.Background(), store.DB().NonTransactionalSender(), putArgs)
+		require.NoError(t, pErr.GoError())
 	}
 
-	// Run consistency check.
-	checkArgs := roachpb.CheckConsistencyRequest{
-		RequestHeader: roachpb.RequestHeader{
-			// span of keys that include "a".
-			Key:    []byte("a"),
-			EndKey: []byte("aa"),
-		},
-	}
-	if _, err := kv.SendWrappedWith(context.Background(), store.DB().NonTransactionalSender(), roachpb.Header{
-		Timestamp: store.Clock().Now(),
-	}, &checkArgs); err != nil {
-		t.Fatal(err)
+	// 3x replicate our ranges.
+	//
+	// Depending on what we're doing, we need to use LocalMax or [R]KeyMin
+	// for r1 due to the issue below.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/95055
+	tc.AddVotersOrFatal(t, roachpb.KeyMin, tc.Targets(1, 2)...)
+	tc.AddVotersOrFatal(t, k2, tc.Targets(1, 2)...)
+
+	// Run consistency check on r1 and ScratchRange.
+	for _, k := range []roachpb.Key{keys.LocalMax, k2} {
+		t.Run(k.String(), func(t *testing.T) {
+			checkArgs := kvpb.CheckConsistencyRequest{
+				RequestHeader: kvpb.RequestHeader{
+					Key:    keys.LocalMax,
+					EndKey: keys.LocalMax.Next(),
+				},
+			}
+			_, pErr := kv.SendWrappedWith(context.Background(), store.DB().NonTransactionalSender(), kvpb.Header{
+				Timestamp: store.Clock().Now(),
+			}, &checkArgs)
+			require.NoError(t, pErr.GoError())
+		})
 	}
 }
 
@@ -159,7 +178,7 @@ func TestCheckConsistencyReplay(t *testing.T) {
 	}
 	// Arrange to count the number of times each checksum command applies to each
 	// store.
-	testKnobs.TestingPostApplyFilter = func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+	testKnobs.TestingPostApplyFilter = func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 		state.Lock()
 		defer state.Unlock()
 		if ccr := args.ComputeChecksum; ccr != nil {
@@ -170,14 +189,14 @@ func TestCheckConsistencyReplay(t *testing.T) {
 
 	// Arrange to trigger a retry when a ComputeChecksum request arrives.
 	testKnobs.TestingResponseFilter = func(
-		ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse,
-	) *roachpb.Error {
+		ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse,
+	) *kvpb.Error {
 		state.Lock()
 		defer state.Unlock()
 		if ba.IsSingleComputeChecksumRequest() && !state.forcedRetry {
 			state.forcedRetry = true
 			// We need to return a retryable error from the perspective of the sender
-			return roachpb.NewError(&roachpb.NotLeaseHolderError{})
+			return kvpb.NewError(&kvpb.NotLeaseHolderError{})
 		}
 		return nil
 	}
@@ -196,8 +215,8 @@ func TestCheckConsistencyReplay(t *testing.T) {
 	defer tc.Stopper().Stop(context.Background())
 
 	store := tc.GetFirstStoreFromServer(t, 0)
-	checkArgs := roachpb.CheckConsistencyRequest{
-		RequestHeader: roachpb.RequestHeader{
+	checkArgs := kvpb.CheckConsistencyRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    []byte("a"),
 			EndKey: []byte("b"),
 		},
@@ -241,9 +260,9 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
 
-	// The cluster has 3 node, with 1 store per node. The test writes a few KVs to
-	// a range, which gets replicated to all 3 stores. Then it manually replaces
-	// an entry in s2. The consistency check must detect this and terminate n2/s2.
+	// The cluster has 3 nodes, one store per node. The test writes a few KVs to a
+	// range, which gets replicated to all 3 stores. Then it manually replaces an
+	// entry in s2. The consistency check must detect this and terminate n2/s2.
 	const numStores = 3
 	testKnobs := kvserver.StoreTestingKnobs{DisableConsistencyQueue: true}
 	var tc *testcluster.TestCluster
@@ -283,17 +302,17 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		require.NoError(t, err.GoError())
 	}
 
-	runConsistencyCheck := func() *roachpb.CheckConsistencyResponse {
-		req := roachpb.CheckConsistencyRequest{
-			RequestHeader: roachpb.RequestHeader{ // keys span that includes "a" & "c"
+	runConsistencyCheck := func() *kvpb.CheckConsistencyResponse {
+		req := kvpb.CheckConsistencyRequest{
+			RequestHeader: kvpb.RequestHeader{ // keys span that includes "a" & "c"
 				Key:    []byte("a"),
 				EndKey: []byte("z"),
 			},
-			Mode: roachpb.ChecksumMode_CHECK_VIA_QUEUE,
+			Mode: kvpb.ChecksumMode_CHECK_VIA_QUEUE,
 		}
 		resp, err := kv.SendWrapped(context.Background(), store.DB().NonTransactionalSender(), &req)
 		require.NoError(t, err.GoError())
-		return resp.(*roachpb.CheckConsistencyResponse)
+		return resp.(*kvpb.CheckConsistencyResponse)
 	}
 
 	onDiskCheckpointPaths := func(nodeIdx int) []string {
@@ -301,7 +320,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 			base.StoreSpec{StickyInMemoryEngineID: strconv.FormatInt(int64(nodeIdx), 10)})
 		require.NoError(t, err)
 		store := tc.GetFirstStoreFromServer(t, nodeIdx)
-		checkpointPath := filepath.Join(store.Engine().GetAuxiliaryDir(), "checkpoints")
+		checkpointPath := filepath.Join(store.TODOEngine().GetAuxiliaryDir(), "checkpoints")
 		checkpoints, _ := fs.List(checkpointPath)
 		var checkpointPaths []string
 		for _, cpDirName := range checkpoints {
@@ -313,7 +332,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	// Run the check the first time, it shouldn't find anything.
 	resp := runConsistencyCheck()
 	require.Len(t, resp.Result, 1)
-	assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_CONSISTENT, resp.Result[0].Status)
+	assert.Equal(t, kvpb.CheckConsistencyResponse_RANGE_CONSISTENT, resp.Result[0].Status)
 	select {
 	case <-notifyFatal:
 		t.Fatal("unexpected panic")
@@ -333,7 +352,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	var val roachpb.Value
 	val.SetInt(42)
 	// Put an inconsistent key "e" to s2, and have s1 and s3 still agree.
-	require.NoError(t, storage.MVCCPut(context.Background(), store1.Engine(), nil,
+	require.NoError(t, storage.MVCCPut(context.Background(), store1.TODOEngine(), nil,
 		roachpb.Key("e"), tc.Server(0).Clock().Now(), hlc.ClockTimestamp{}, val, nil))
 
 	// Run consistency check again, this time it should find something.
@@ -345,7 +364,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	}
 
 	require.Len(t, resp.Result, 1)
-	assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_INCONSISTENT, resp.Result[0].Status)
+	assert.Equal(t, kvpb.CheckConsistencyResponse_RANGE_INCONSISTENT, resp.Result[0].Status)
 	assert.Contains(t, resp.Result[0].Detail, `[minority]`)
 	assert.Contains(t, resp.Result[0].Detail, `stats`)
 
@@ -365,8 +384,10 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 		// Create a new store on top of checkpoint location inside existing in-mem
 		// VFS to verify its contents.
 		fs, err := stickyEngineRegistry.GetUnderlyingFS(base.StoreSpec{StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10)})
-		assert.NoError(t, err)
-		cpEng := storage.InMemFromFS(context.Background(), fs, cps[0], storage.CacheSize(1<<20))
+		require.NoError(t, err)
+		// Copy the min-version file so we can open the checkpoint as a store.
+		require.NoError(t, vfs.Copy(fs, storage.MinVersionFilename, fs.PathJoin(cps[0], storage.MinVersionFilename)))
+		cpEng := storage.InMemFromFS(context.Background(), fs, cps[0], cluster.MakeClusterSettings(), storage.CacheSize(1<<20))
 		defer cpEng.Close()
 
 		// Find the problematic range in the storage.
@@ -382,7 +403,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 
 		// Compute a checksum over the content of the problematic range.
 		rd, err := kvserver.CalcReplicaDigest(context.Background(), *desc, cpEng,
-			roachpb.ChecksumMode_CHECK_FULL, quotapool.NewRateLimiter("test", quotapool.Inf(), 0))
+			kvpb.ChecksumMode_CHECK_FULL, quotapool.NewRateLimiter("test", quotapool.Inf(), 0))
 		require.NoError(t, err)
 		hashes[i] = rd.SHA512[:]
 	}
@@ -391,7 +412,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	assert.NotEqual(t, hashes[0], hashes[1]) // s2 diverged
 
 	// A death rattle should have been written on s2 (store index 1).
-	eng := store1.Engine()
+	eng := store1.TODOEngine()
 	f, err := eng.Open(base.PreventedStartupFile(eng.GetAuxiliaryDir()))
 	require.NoError(t, err)
 	b, err := io.ReadAll(f)
@@ -431,10 +452,10 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 		ScanMaxIdleTime: 100 * time.Millisecond,
 	}
 
-	ccCh := make(chan roachpb.CheckConsistencyResponse, 1)
+	ccCh := make(chan kvpb.CheckConsistencyResponse, 1)
 	knobs := &kvserver.StoreTestingKnobs{}
-	knobs.ConsistencyTestingKnobs.ConsistencyQueueResultHook = func(resp roachpb.CheckConsistencyResponse) {
-		if len(resp.Result) == 0 || resp.Result[0].Status != roachpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT {
+	knobs.ConsistencyTestingKnobs.ConsistencyQueueResultHook = func(resp kvpb.CheckConsistencyResponse) {
+		if len(resp.Result) == 0 || resp.Result[0].Status != kvpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT {
 			// Ignore recomputations triggered by the time series ranges.
 			return
 		}
@@ -461,12 +482,12 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 
 	computeDelta := func(db *kv.DB) enginepb.MVCCStats {
 		var b kv.Batch
-		b.AddRawRequest(&roachpb.RecomputeStatsRequest{
-			RequestHeader: roachpb.RequestHeader{Key: key},
+		b.AddRawRequest(&kvpb.RecomputeStatsRequest{
+			RequestHeader: kvpb.RequestHeader{Key: key},
 			DryRun:        true,
 		})
 		require.NoError(t, db.Run(ctx, &b))
-		resp := b.RawResponse().Responses[0].GetInner().(*roachpb.RecomputeStatsResponse)
+		resp := b.RawResponse().Responses[0].GetInner().(*kvpb.RecomputeStatsResponse)
 		delta := enginepb.MVCCStats(resp.AddedDelta)
 		delta.AgeTo(0)
 		return delta
@@ -504,6 +525,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 	func() {
 		eng, err := storage.Open(ctx,
 			storage.Filesystem(path),
+			cluster.MakeClusterSettings(),
 			storage.CacheSize(1<<20 /* 1 MiB */),
 			storage.MustExist)
 		require.NoError(t, err)
@@ -599,7 +621,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 	select {
 	case resp := <-ccCh:
 		assert.Contains(t, resp.Result[0].Detail, `KeyBytes`) // contains printed stats
-		assert.Equal(t, roachpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT, resp.Result[0].Status)
+		assert.Equal(t, kvpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT, resp.Result[0].Status)
 		assert.False(t, hadEstimates)
 	default:
 		assert.True(t, hadEstimates)

@@ -13,6 +13,7 @@ package kvserver
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"go.etcd.io/raft/v3"
 )
@@ -138,7 +140,7 @@ func (sm *replicaStateMachine) NewBatch() apply.Batch {
 	b := &sm.batch
 	b.r = r
 	b.applyStats = &sm.applyStats
-	b.batch = r.store.engine.NewBatch()
+	b.batch = r.store.TODOEngine().NewBatch()
 	r.mu.RLock()
 	b.state = r.mu.state
 	b.state.Stats = &sm.stats
@@ -147,6 +149,26 @@ func (sm *replicaStateMachine) NewBatch() apply.Batch {
 	r.mu.RUnlock()
 	b.start = timeutil.Now()
 	return b
+}
+
+func formatReplicatedCmd(cmd *replicatedCmd) redact.RedactableString {
+	var buf redact.StringBuilder
+	// We need to zero various data structures that would otherwise
+	// cause panics in `pretty.Sprint`.
+	var pd ProposalData
+	if cmd.proposal != nil {
+		pd = *cmd.proposal
+		pd.ctx = nil
+		pd.sp = nil
+		pd.command.TraceData = nil
+		pd.quotaAlloc = nil
+		pd.tok = TrackedRequestToken{}
+		pd.ec = endCmds{}
+	}
+
+	// NB: this redacts very poorly, but this is considered acceptable for now.
+	redact.Fprintf(&buf, "cmd:%s\n\nproposal: %s", pretty.Sprint(cmd.ReplicatedCmd), pretty.Sprint(pd))
+	return buf.RedactableString()
 }
 
 // ApplySideEffects implements the apply.StateMachine interface. The method
@@ -197,7 +219,9 @@ func (sm *replicaStateMachine) ApplySideEffects(
 			// Assert that the on-disk state doesn't diverge from the in-memory
 			// state as a result of the side effects.
 			sm.r.mu.RLock()
-			sm.r.assertStateRaftMuLockedReplicaMuRLocked(ctx, sm.r.store.Engine())
+			// TODO(sep-raft-log): either check only statemachine invariants or
+			// pass both engines in.
+			sm.r.assertStateRaftMuLockedReplicaMuRLocked(ctx, sm.r.store.TODOEngine())
 			sm.r.mu.RUnlock()
 			sm.applyStats.stateAssertions++
 		}
@@ -220,30 +244,21 @@ func (sm *replicaStateMachine) ApplySideEffects(
 			sm.r.handleReadWriteLocalEvalResult(ctx, *cmd.localResult)
 		}
 
-		rejected := cmd.Rejected()
-		higherReproposalsExist := cmd.Cmd.MaxLeaseIndex != cmd.proposal.command.MaxLeaseIndex
-		if !rejected && higherReproposalsExist {
-			log.Fatalf(ctx, "finishing proposal with outstanding reproposal at a higher max lease index")
-		}
-		if !rejected && cmd.proposal.applied {
-			// If the command already applied then we shouldn't be "finishing" its
-			// application again because it should only be able to apply successfully
-			// once. We expect that when any reproposal for the same command attempts
-			// to apply it will be rejected by the below raft lease sequence or lease
-			// index check in checkForcedErr.
-			log.Fatalf(ctx, "command already applied: %+v; unexpected successful result", cmd)
-		}
-		// If any reproposals at a higher MaxLeaseIndex exist we know that they will
-		// never successfully apply, remove them from the map to avoid future
-		// reproposals. If there is no command referencing this proposal at a higher
-		// MaxLeaseIndex then it will already have been removed (see
-		// shouldRemove in replicaDecoder.retrieveLocalProposals()). It is possible
-		// that a later command in this batch referred to this proposal but it must
-		// have failed because it carried the same MaxLeaseIndex.
-		if higherReproposalsExist {
-			sm.r.mu.Lock()
-			delete(sm.r.mu.proposals, cmd.ID)
-			sm.r.mu.Unlock()
+		if !cmd.Rejected() {
+			if cmd.proposal.applied {
+				// If the command already applied then we shouldn't be "finishing" its
+				// application again because it should only be able to apply successfully
+				// once. We expect that when any reproposal for the same command attempts
+				// to apply it will be rejected by the below raft lease sequence or lease
+				// index check in checkForcedErr.
+				log.Fatalf(ctx, "command already applied: %+v; unexpected successful result", cmd)
+			}
+			if cmd.proposal.Supersedes(cmd.Cmd.MaxLeaseIndex) {
+				// If an entry is superseded but it wasn't rejected, something is wrong.
+				// The superseding reproposal could apply as well, leading to doubly applying
+				// a command.
+				log.Fatalf(ctx, "applying superseded proposal: %s", formatReplicatedCmd(cmd))
+			}
 		}
 		cmd.proposal.applied = true
 	}
@@ -444,7 +459,7 @@ type closedTimestampSetterInfo struct {
 	// NOTE: We only keep track of lease requests because keeping track of all
 	// requests would be too expensive: cloning the request is expensive and also
 	// requests can be large in memory.
-	leaseReq *roachpb.RequestLeaseRequest
+	leaseReq *kvpb.RequestLeaseRequest
 	// split and merge are set if the request was an EndTxn with the respective
 	// commit trigger set.
 	split, merge bool
@@ -460,9 +475,9 @@ func (s *closedTimestampSetterInfo) record(cmd *replicatedCmd, lease *roachpb.Le
 		return
 	}
 	req := cmd.proposal.Request
-	et, ok := req.GetArg(roachpb.EndTxn)
+	et, ok := req.GetArg(kvpb.EndTxn)
 	if ok {
-		endTxn := et.(*roachpb.EndTxnRequest)
+		endTxn := et.(*kvpb.EndTxnRequest)
 		if trig := endTxn.InternalCommitTrigger; trig != nil {
 			if trig.SplitTrigger != nil {
 				s.split = true
@@ -473,7 +488,7 @@ func (s *closedTimestampSetterInfo) record(cmd *replicatedCmd, lease *roachpb.Le
 	} else if req.IsSingleRequestLeaseRequest() {
 		// Make a deep copy since we're not allowed to hold on to request
 		// memory.
-		lr, _ := req.GetArg(roachpb.RequestLease)
-		s.leaseReq = protoutil.Clone(lr).(*roachpb.RequestLeaseRequest)
+		lr, _ := req.GetArg(kvpb.RequestLease)
+		s.leaseReq = protoutil.Clone(lr).(*kvpb.RequestLeaseRequest)
 	}
 }

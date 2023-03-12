@@ -74,6 +74,10 @@ func getVecsMemoryFootprint(vecs []coldata.Vec) int64 {
 	return size
 }
 
+func init() {
+	coldata.GetBatchMemSize = GetBatchMemSize
+}
+
 // GetBatchMemSize returns the total memory footprint of the batch.
 func GetBatchMemSize(b coldata.Batch) int64 {
 	if b == nil || b == coldata.ZeroBatch {
@@ -183,11 +187,6 @@ func (a *Allocator) NewMemBatchNoCols(typs []*types.T, capacity int) coldata.Bat
 	return coldata.NewMemBatchNoCols(typs, capacity)
 }
 
-// ResetBatch resets the batch while keeping the memory accounting updated.
-func (a *Allocator) ResetBatch(batch coldata.Batch) {
-	a.ReleaseMemory(batch.ResetInternalBatch())
-}
-
 // truncateToMemoryLimit returns the largest batch capacity that is still within
 // the memory limit for the given type schema. The returned value is at most
 // minDesiredCapacity and at least 1.
@@ -246,6 +245,9 @@ func growCapacity(oldCapacity int, minDesiredCapacity int) int {
 // that minDesiredCapacity. If oldBatchReachedMemSize is true, then the old
 // batch is reused (the converse is not necessarily true).
 //
+// If alwaysReallocate=true is used, then the old batch is never reused and a
+// new one is always allocated.
+//
 // NOTE: if the reallocation occurs, then the memory under the old batch is
 // released, so it is expected that the caller will lose the references to the
 // old batch.
@@ -257,6 +259,7 @@ func (a *Allocator) resetMaybeReallocate(
 	minDesiredCapacity int,
 	maxBatchMemSize int64,
 	desiredCapacitySufficient bool,
+	alwaysReallocate bool,
 ) (newBatch coldata.Batch, reallocated bool, oldBatchReachedMemSize bool) {
 	if minDesiredCapacity < 0 {
 		colexecerror.InternalError(errors.AssertionFailedf("invalid minDesiredCapacity %d", minDesiredCapacity))
@@ -309,9 +312,22 @@ func (a *Allocator) resetMaybeReallocate(
 				useOldBatch = oldBatchReachedMemSize
 			}
 		}
+		// If we want to use the old batch, but the batch reuse is not allowed,
+		// we won't use the old one.
+		if useOldBatch && alwaysReallocate {
+			useOldBatch = false
+			// Make sure that we get the footprint of the old batch so that it
+			// can be correctly released from the allocator (it is the caller's
+			// responsibility to track the memory usage of all previous
+			// batches).
+			if oldBatchMemSize == 0 {
+				oldBatchMemSize = GetBatchMemSize(oldBatch)
+				oldBatchReachedMemSize = oldBatchMemSize >= maxBatchMemSize
+			}
+		}
 		if useOldBatch {
 			reallocated = false
-			a.ResetBatch(oldBatch)
+			oldBatch.ResetInternalBatch()
 			newBatch = oldBatch
 		} else {
 			a.ReleaseMemory(oldBatchMemSize)
@@ -334,7 +350,10 @@ const noMemLimit = math.MaxInt64
 func (a *Allocator) ResetMaybeReallocateNoMemLimit(
 	typs []*types.T, oldBatch coldata.Batch, requiredCapacity int,
 ) (newBatch coldata.Batch, reallocated bool) {
-	newBatch, reallocated, _ = a.resetMaybeReallocate(typs, oldBatch, requiredCapacity, noMemLimit, true /* desiredCapacitySufficient */)
+	newBatch, reallocated, _ = a.resetMaybeReallocate(
+		typs, oldBatch, requiredCapacity, noMemLimit,
+		true /* desiredCapacitySufficient */, false, /* alwaysReallocate */
+	)
 	return newBatch, reallocated
 }
 
@@ -399,11 +418,7 @@ func (a *Allocator) MaybeAppendColumn(b coldata.Batch, t *types.T, colIdx int) {
 				b.ReplaceCol(a.NewMemColumn(t, desiredCapacity), colIdx)
 				return
 			}
-			if presentVec.CanonicalTypeFamily() == typeconv.DatumVecCanonicalTypeFamily {
-				a.ReleaseMemory(presentVec.Datum().Reset())
-			} else {
-				coldata.ResetIfBytesLike(presentVec)
-			}
+			coldata.ResetIfBytesLike(presentVec)
 			if presentVec.MaybeHasNulls() {
 				presentVec.Nulls().UnsetNulls()
 			}
@@ -602,11 +617,15 @@ func EstimateBatchSizeBytes(vecTypes []*types.T, batchLength int) int64 {
 			// use the flat struct size as an estimate.
 			acc += memsize.Decimal
 		case typeconv.DatumVecCanonicalTypeFamily:
-			// Initially, only []tree.Datum slice is allocated for the
-			// datum-backed vectors right away, so that's what we're including
-			// in the estimate. Later on, once the actual values are set, they
-			// will be accounted for properly.
-			acc += memsize.DatumOverhead
+			// In datum vec we need to account for memory underlying the struct
+			// that is the implementation of tree.Datum interface (for example,
+			// tree.DBoolFalse) as well as for the overhead of storing that
+			// implementation in the slice of tree.Datums. Note that if t is of
+			// variable size, the memory will be properly accounted in
+			// getVecMemoryFootprint.
+			// Note: keep the calculation here in line with datumVec.Size.
+			implementationSize, _ := tree.DatumTypeSize(t)
+			acc += int64(implementationSize) + memsize.DatumOverhead
 		case
 			types.BoolFamily,
 			types.IntFamily,
@@ -690,6 +709,10 @@ type AccountingHelper struct {
 	// "successes" (a batch of maxCapacity not reaching the memory limit)
 	// reaches some threshold.
 	maxCapacity int
+	// alwaysReallocate, if set, indicates that a new batch must be returned on
+	// each ResetMaybeReallocate call. At the moment, it can only be set by the
+	// SetAccountingHelper.
+	alwaysReallocate bool
 }
 
 // discardBatch returns true if the batch with the given memory footprint has
@@ -775,7 +798,7 @@ func (h *AccountingHelper) ResetMaybeReallocate(
 	}
 	var oldBatchReachedMemSize bool
 	newBatch, reallocated, oldBatchReachedMemSize = h.allocator.resetMaybeReallocate(
-		typs, oldBatch, minDesiredCapacity, h.memoryLimit, desiredCapacitySufficient,
+		typs, oldBatch, minDesiredCapacity, h.memoryLimit, desiredCapacitySufficient, h.alwaysReallocate,
 	)
 	if oldBatchReachedMemSize && h.maxCapacity == 0 {
 		// The old batch has just reached the memory size for the first time, so
@@ -807,8 +830,8 @@ func (h *AccountingHelper) ResetMaybeReallocate(
 // only perform "set" operations on the coldata.Batch (i.e. neither copies nor
 // appends). It encapsulates the logic for performing the memory accounting for
 // these sets.
-// NOTE: it works under the assumption that only a single coldata.Batch is being
-// used.
+// NOTE: it works under the assumption that only the last coldata.Batch returned
+// by ResetMaybeReallocate is being modified by the caller.
 type SetAccountingHelper struct {
 	helper AccountingHelper
 
@@ -829,52 +852,67 @@ type SetAccountingHelper struct {
 	// that we have already accounted for.
 	prevBytesLikeTotalSize int64
 
-	// decimalVecIdxs stores the indices of all decimal vectors.
-	decimalVecIdxs intsets.Fast
-	// decimalVecs stores all decimal vectors. They are updated every time a new
-	// batch is allocated.
+	// varSizeVecIdxs stores the indices of all vectors with variable sized
+	// values except for the bytes-like ones.
+	varSizeVecIdxs intsets.Fast
+	// decimalVecs and datumVecs store all decimal and datum-backed vectors,
+	// respectively. They are updated every time a new batch is allocated.
 	decimalVecs []coldata.Decimals
-	// decimalSizes stores the amount of space we have accounted for for the
-	// corresponding decimal values in the corresponding row of the last batch
-	// that the helper has touched. This is necessary to track because when the
-	// batch is reset, the vectors still have references to the old decimals, so
-	// we need to adjust the accounting only by the delta. Similarly, once a new
-	// batch is allocated, we need to track the estimate that we have already
+	datumVecs   []coldata.DatumVec
+	// varSizeDatumSizes stores the amount of space we have accounted for for
+	// the corresponding "row" of variable length values in the last batch that
+	// the helper has touched. This is necessary to track because when the batch
+	// is reset, the vectors still have references to the old datums, so we need
+	// to adjust the accounting only by the delta. Similarly, once a new batch
+	// is allocated, we need to track the estimate that we have already
 	// accounted for.
 	//
 	// Note that because ResetMaybeReallocate caps the capacity of the batch at
 	// coldata.BatchSize(), this slice will never exceed coldata.BatchSize() in
 	// size, and we choose to ignore it for the purposes of memory accounting.
-	decimalSizes []int64
-
-	// varLenDatumVecIdxs stores the indices of all datum-backed vectors with
-	// variable-length values.
-	varLenDatumVecIdxs intsets.Fast
-	// varLenDatumVecs stores all variable-sized datum-backed vectors. They are
-	// updated every time a new batch is allocated.
-	varLenDatumVecs []coldata.DatumVec
+	varSizeDatumSizes []int64
+	// varSizeEstimatePerRow is the total estimated size of single values from
+	// varSizeVecIdxs vectors which is accounted for by EstimateBatchSizeBytes.
+	// It serves as the initial value for varSizeDatumSizes values.
+	varSizeEstimatePerRow int64
 }
 
 // Init initializes the helper. The allocator must **not** be shared with any
 // other component.
-func (h *SetAccountingHelper) Init(allocator *Allocator, memoryLimit int64, typs []*types.T) {
+// - alwaysReallocate indicates whether a fresh batch must be returned on each
+// ResetMaybeReallocate call. If this option is used, the SetAccountingHelper
+// releases the memory of the previous batch from its accounting (in other words
+// only the last batch returned by ResetMaybeReallocate is accounted for by the
+// helper), so it is the caller's responsibility to track the memory usage of
+// all batches except for the last one (should the caller choose to keep them).
+func (h *SetAccountingHelper) Init(
+	allocator *Allocator, memoryLimit int64, typs []*types.T, alwaysReallocate bool,
+) {
 	h.helper.Init(allocator, memoryLimit)
+	h.helper.alwaysReallocate = alwaysReallocate
 
+	numDecimalVecs := 0
 	for vecIdx, typ := range typs {
 		switch typeconv.TypeFamilyToCanonicalTypeFamily(typ.Family()) {
 		case types.BytesFamily, types.JsonFamily:
 			h.bytesLikeVecIdxs.Add(vecIdx)
 		case types.DecimalFamily:
-			h.decimalVecIdxs.Add(vecIdx)
+			h.varSizeVecIdxs.Add(vecIdx)
+			h.varSizeEstimatePerRow += memsize.Decimal
+			numDecimalVecs++
 		case typeconv.DatumVecCanonicalTypeFamily:
-			h.varLenDatumVecIdxs.Add(vecIdx)
+			estimate, isVarlen := tree.DatumTypeSize(typ)
+			if isVarlen {
+				h.varSizeVecIdxs.Add(vecIdx)
+				h.varSizeEstimatePerRow += int64(estimate) + memsize.DatumOverhead
+			}
 		}
 	}
 
-	h.allFixedLength = h.bytesLikeVecIdxs.Empty() && h.decimalVecIdxs.Empty() && h.varLenDatumVecIdxs.Empty()
+	h.allFixedLength = h.bytesLikeVecIdxs.Empty() && h.varSizeVecIdxs.Empty()
 	h.bytesLikeVectors = make([]*coldata.Bytes, h.bytesLikeVecIdxs.Len())
-	h.decimalVecs = make([]coldata.Decimals, h.decimalVecIdxs.Len())
-	h.varLenDatumVecs = make([]coldata.DatumVec, h.varLenDatumVecIdxs.Len())
+	h.decimalVecs = make([]coldata.Decimals, numDecimalVecs)
+	h.datumVecs = make([]coldata.DatumVec, h.varSizeVecIdxs.Len()-numDecimalVecs)
 }
 
 func (h *SetAccountingHelper) getBytesLikeTotalSize() int64 {
@@ -921,24 +959,23 @@ func (h *SetAccountingHelper) ResetMaybeReallocate(
 			}
 			h.prevBytesLikeTotalSize = h.getBytesLikeTotalSize()
 		}
-		if !h.decimalVecIdxs.Empty() {
+		if !h.varSizeVecIdxs.Empty() {
 			h.decimalVecs = h.decimalVecs[:0]
-			for vecIdx, ok := h.decimalVecIdxs.Next(0); ok; vecIdx, ok = h.decimalVecIdxs.Next(vecIdx + 1) {
-				h.decimalVecs = append(h.decimalVecs, vecs[vecIdx].Decimal())
+			h.datumVecs = h.datumVecs[:0]
+			for vecIdx, ok := h.varSizeVecIdxs.Next(0); ok; vecIdx, ok = h.varSizeVecIdxs.Next(vecIdx + 1) {
+				if vecs[vecIdx].CanonicalTypeFamily() == types.DecimalFamily {
+					h.decimalVecs = append(h.decimalVecs, vecs[vecIdx].Decimal())
+				} else {
+					h.datumVecs = append(h.datumVecs, vecs[vecIdx].Datum())
+				}
 			}
-			h.decimalSizes = make([]int64, newBatch.Capacity())
-			for i := range h.decimalSizes {
-				// In EstimateBatchSizeBytes, memsize.Decimal has already been
-				// accounted for for each decimal value, so we multiple that by
-				// the number of decimal vectors to get already included
-				// footprint of all decimal values in a single row.
-				h.decimalSizes[i] = int64(len(h.decimalVecs)) * memsize.Decimal
+			if cap(h.varSizeDatumSizes) < newBatch.Capacity() {
+				h.varSizeDatumSizes = make([]int64, newBatch.Capacity())
+			} else {
+				h.varSizeDatumSizes = h.varSizeDatumSizes[:newBatch.Capacity()]
 			}
-		}
-		if !h.varLenDatumVecIdxs.Empty() {
-			h.varLenDatumVecs = h.varLenDatumVecs[:0]
-			for vecIdx, ok := h.varLenDatumVecIdxs.Next(0); ok; vecIdx, ok = h.varLenDatumVecIdxs.Next(vecIdx + 1) {
-				h.varLenDatumVecs = append(h.varLenDatumVecs, vecs[vecIdx].Datum())
+			for i := range h.varSizeDatumSizes {
+				h.varSizeDatumSizes[i] = h.varSizeEstimatePerRow
 			}
 		}
 	}
@@ -966,25 +1003,18 @@ func (h *SetAccountingHelper) AccountForSet(rowIdx int) (batchDone bool) {
 		h.prevBytesLikeTotalSize = newBytesLikeTotalSize
 	}
 
-	if !h.decimalVecIdxs.Empty() {
-		var newDecimalSizes int64
+	if !h.varSizeVecIdxs.Empty() {
+		var newVarLengthDatumSize int64
 		for _, decimalVec := range h.decimalVecs {
 			d := decimalVec.Get(rowIdx)
-			newDecimalSizes += int64(d.Size())
+			newVarLengthDatumSize += int64(d.Size())
 		}
-		h.helper.allocator.AdjustMemoryUsageAfterAllocation(newDecimalSizes - h.decimalSizes[rowIdx])
-		h.decimalSizes[rowIdx] = newDecimalSizes
-	}
-
-	if !h.varLenDatumVecIdxs.Empty() {
-		var newVarLengthDatumSize int64
-		for _, datumVec := range h.varLenDatumVecs {
+		for _, datumVec := range h.datumVecs {
 			datumSize := datumVec.Get(rowIdx).(tree.Datum).Size()
-			// Note that we're ignoring the overhead of tree.Datum because it
-			// was already included in EstimateBatchSizeBytes.
-			newVarLengthDatumSize += int64(datumSize)
+			newVarLengthDatumSize += int64(datumSize) + memsize.DatumOverhead
 		}
-		h.helper.allocator.AdjustMemoryUsageAfterAllocation(newVarLengthDatumSize)
+		h.helper.allocator.AdjustMemoryUsageAfterAllocation(newVarLengthDatumSize - h.varSizeDatumSizes[rowIdx])
+		h.varSizeDatumSizes[rowIdx] = newVarLengthDatumSize
 	}
 
 	// The allocator is not shared with any other components, so we can just use

@@ -64,10 +64,6 @@ type TestServerArgs struct {
 	// from the base addressed by the specified amount.
 	SecondaryTenantPortOffset int
 
-	// SecondaryTenantKnobs contains the testing knobs to use
-	// for tenant servers started by the serverController.
-	SecondaryTenantKnobs TestingKnobs
-
 	// JoinAddr is the address of a node we are joining.
 	//
 	// If left empty and the TestServer is being added to a nonempty cluster, this
@@ -168,6 +164,10 @@ type TestServerArgs struct {
 	// CockroachDB upgrades and periodically reports diagnostics to
 	// Cockroach Labs. Should remain disabled during unit testing.
 	StartDiagnosticsReporting bool
+
+	// ObsServiceAddr is the address to which events will be exported over OTLP.
+	// If empty, exporting events is inhibited.
+	ObsServiceAddr string
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -198,6 +198,13 @@ type TestClusterArgs struct {
 	// A copy of an entry from this map will be copied to each individual server
 	// and potentially adjusted according to ReplicationMode.
 	ServerArgsPerNode map[int]TestServerArgs
+
+	// If reusable listeners is true, then restart should keep listeners untouched
+	// so that servers are kept on the same ports. It is up to the test to set
+	// proxy listeners to TestServerArgs.Listener that would survive
+	// net.Listener.Close() and then allow restarted server to use them again.
+	// See testutils.ListenerRegistry.
+	ReusableListeners bool
 }
 
 var (
@@ -240,8 +247,24 @@ func DefaultTestTempStorageConfigWithSize(
 	}
 }
 
-// TestTenantArgs are the arguments used when creating a tenant from a
-// TestServer.
+// TestSharedProcessTenantArgs are the arguments to
+// TestServer.StartSharedProcessTenant.
+type TestSharedProcessTenantArgs struct {
+	// TenantName is the name of the tenant to be created. It must be set.
+	TenantName roachpb.TenantName
+	// TenantID is the ID of the tenant to be created. If not set, an ID is
+	// assigned automatically.
+	TenantID roachpb.TenantID
+
+	Knobs TestingKnobs
+
+	// If set, this will be appended to the Postgres URL by functions that
+	// automatically open a connection to the server. That's equivalent to running
+	// SET DATABASE=foo, which works even if the database doesn't (yet) exist.
+	UseDatabase string
+}
+
+// TestTenantArgs are the arguments to TestServer.StartTenant.
 type TestTenantArgs struct {
 	TenantName roachpb.TenantName
 
@@ -335,8 +358,4 @@ type TestTenantArgs struct {
 	// CockroachDB upgrades and periodically reports diagnostics to
 	// Cockroach Labs. Should remain disabled during unit testing.
 	StartDiagnosticsReporting bool
-
-	// UseServerController tells testserver.StartTenant() to use
-	// its serverController to start the secondary tenant.
-	UseServerController bool
 }

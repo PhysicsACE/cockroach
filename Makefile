@@ -164,7 +164,6 @@ DESTDIR :=
 DUPLFLAGS    := -t 100
 GOFLAGS      :=
 TAGS         :=
-ARCHIVE      := cockroach.src.tgz
 STARTFLAGS   := -s type=mem,size=1GiB --logtostderr
 BUILDTARGET  := ./pkg/cmd/cockroach
 SUFFIX       := $(GOEXE)
@@ -1254,36 +1253,6 @@ pre-push: ## Run generate, lint, and test.
 pre-push: generate lint test ui-lint ui-test
 	! git status --porcelain | read || (git status; git --no-pager diff -a 1>&2; exit 1)
 
-# archive builds a source tarball out of this repository. Files in the special
-# directory build/archive/contents are inserted directly into $(ARCHIVE_BASE).
-# All other files in the repository are inserted into the archive with prefix
-# $(ARCHIVE_BASE)/src/github.com/cockroachdb/cockroach to allow the extracted
-# archive to serve directly as a GOPATH root.
-.PHONY: archive
-archive: ## Build a source tarball from this repository.
-archive: $(ARCHIVE)
-
-$(ARCHIVE): $(ARCHIVE).tmp
-	gzip -c $< > $@
-
-# ARCHIVE_EXTRAS are hard-to-generate files and their prerequisites that are
-# pre-generated and distributed in source archives to minimize the number of
-# dependencies required for end-users to build from source.
-ARCHIVE_EXTRAS = \
-	$(BUILDINFO) \
-	$(SQLPARSER_TARGETS) \
-	$(OPTGEN_TARGETS) \
-	pkg/ui/assets.ccl.installed pkg/ui/assets.oss.installed
-
-# TODO(benesch): Make this recipe use `git ls-files --recurse-submodules`
-# instead of scripts/ls-files.sh once Git v2.11 is widely deployed.
-.INTERMEDIATE: $(ARCHIVE).tmp
-$(ARCHIVE).tmp: ARCHIVE_BASE = cockroach-$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))
-$(ARCHIVE).tmp: $(ARCHIVE_EXTRAS)
-	echo "$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))" > .buildinfo/tag
-	scripts/ls-files.sh | $(TAR) -cf $@ -T - $(TAR_XFORM_FLAG),^,$(ARCHIVE_BASE)/src/github.com/cockroachdb/cockroach/, $^
-	(cd build/archive/contents && $(TAR) -rf ../../../$@ $(TAR_XFORM_FLAG),^,$(ARCHIVE_BASE)/, *)
-
 .buildinfo:
 	@mkdir -p $@
 
@@ -1359,15 +1328,15 @@ $(ERRORS_PROTO): bin/.submodules-initialized
 bin/.go_protobuf_sources: $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap bin/protoc-gen-gogoroach c-deps/proto-rebuild vendor/modules.txt
 	$(FIND_RELEVANT) -type f -name '*.pb.go' -exec rm {} +
 	set -e; for dir in $(sort $(dir $(GO_PROTOS))); do \
-	  buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) -I$(ERRORS_PATH) --gogoroach_out=$(PROTO_MAPPINGS)plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/:./pkg $$dir/*.proto; \
+	  buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) -I$(ERRORS_PATH) --gogoroach_out=$(PROTO_MAPPINGS)plugins=grpc,import_prefix=github.com/cockroachdb/cockroach/pkg/,paths=source_relative:./pkg $$dir/*.proto; \
 	done
 	gofmt -s -w $(GO_SOURCES)
 	touch $@
 
 bin/.gw_protobuf_sources: $(GW_SERVER_PROTOS) $(GW_TS_PROTOS) $(GO_PROTOS) $(GOGOPROTO_PROTO) $(ERRORS_PROTO) bin/.bootstrap c-deps/proto-rebuild vendor/modules.txt
 	$(FIND_RELEVANT) -type f -name '*.pb.gw.go' -exec rm {} +
-		buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(ERRORS_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_SERVER_PROTOS)
-		buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(ERRORS_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true:./pkg $(GW_TS_PROTOS)
+		buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(ERRORS_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true,paths=source_relative:./pkg $(GW_SERVER_PROTOS)
+		buf protoc -Ipkg -I$(GOGO_PROTOBUF_PATH) -I$(ERRORS_PATH) -I$(COREOS_PATH) -I$(PROMETHEUS_PATH) -I$(GRPC_GATEWAY_GOOGLEAPIS_PATH) --grpc-gateway_out=logtostderr=true,request_context=true,paths=source_relative:./pkg $(GW_TS_PROTOS)
 	gofmt -s -w $(GW_SOURCES)
 	@# TODO(jordan,benesch) This can be removed along with the above TODO.
 	goimports -w $(GW_SOURCES)
@@ -1751,7 +1720,7 @@ cleanshort:
 	-$(GO) clean $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i github.com/cockroachdb/cockroach...
 	$(FIND_RELEVANT) -type f -name '*.test' -exec rm {} +
 	for f in cockroach*; do if [ -f "$$f" ]; then rm "$$f"; fi; done
-	rm -rf $(ARCHIVE) pkg/sql/parser/gen
+	rm -rf pkg/sql/parser/gen
 
 .PHONY: clean
 clean: ## Like cleanshort, but also includes C++ artifacts, Bazel artifacts, and the go build cache.
@@ -1916,7 +1885,7 @@ endif
 # https://github.com/Reviewable/Reviewable/wiki/FAQ#how-do-i-tell-reviewable-that-a-file-is-generated-and-should-not-be-reviewed
 # Note how the 'prefix' variable is manually appended. This is required by Homebrew.
 .SECONDARY: build/variables.mk
-build/variables.mk: Makefile build/archive/contents/Makefile pkg/ui/Makefile build/defs.mk
+build/variables.mk: Makefile pkg/ui/Makefile build/defs.mk
 	@echo '# Code generated by Make. DO NOT EDIT.' > $@.tmp
 	@echo '# GENERATED FILE DO NOT EDIT' >> $@.tmp
 	@echo 'define VALID_VARS' >> $@.tmp

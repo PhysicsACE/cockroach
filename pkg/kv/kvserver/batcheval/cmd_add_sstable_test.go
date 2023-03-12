@@ -11,6 +11,7 @@
 package batcheval_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -90,12 +92,12 @@ func TestEvalAddSSTable(t *testing.T) {
 		"blind returns WriteIntentError on conflict": {
 			data:      kvs{pointKV("b", intentTS, "b0")},
 			sst:       kvs{pointKV("b", 1, "sst")},
-			expectErr: &roachpb.WriteIntentError{},
+			expectErr: &kvpb.WriteIntentError{},
 		},
 		"blind returns WriteIntentError in span": {
 			data:      kvs{pointKV("b", intentTS, "b0")},
 			sst:       kvs{pointKV("a", 1, "sst"), pointKV("c", 1, "sst")},
-			expectErr: &roachpb.WriteIntentError{},
+			expectErr: &kvpb.WriteIntentError{},
 		},
 		"blind ignores intent outside span": {
 			data:           kvs{pointKV("b", intentTS, "b0")},
@@ -214,7 +216,7 @@ func TestEvalAddSSTable(t *testing.T) {
 			toReqTS:   1,
 			data:      kvs{pointKV("a", intentTS, "intent")},
 			sst:       kvs{pointKV("a", 1, "a@1")},
-			expectErr: &roachpb.WriteIntentError{},
+			expectErr: &kvpb.WriteIntentError{},
 		},
 		"SSTTimestampToRequestTimestamp errors with DisallowConflicts below existing": {
 			reqTS:      5,
@@ -222,7 +224,7 @@ func TestEvalAddSSTable(t *testing.T) {
 			noConflict: true,
 			data:       kvs{pointKV("a", 5, "a5"), pointKV("b", 7, "b7")},
 			sst:        kvs{pointKV("a", 10, "sst"), pointKV("b", 10, "sst")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"SSTTimestampToRequestTimestamp succeeds with DisallowConflicts above existing": {
 			reqTS:      8,
@@ -319,38 +321,38 @@ func TestEvalAddSSTable(t *testing.T) {
 			noConflict: true,
 			data:       kvs{pointKV("a", 3, "a3")},
 			sst:        kvs{pointKV("a", 2, "sst")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts returns WriteTooOldError at existing": {
 			noConflict: true,
 			data:       kvs{pointKV("a", 3, "a3")},
 			sst:        kvs{pointKV("a", 3, "sst")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts returns WriteTooOldError at existing tombstone": {
 			noConflict: true,
 			data:       kvs{pointKV("a", 3, "")},
 			sst:        kvs{pointKV("a", 3, "sst")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts returns WriteTooOldError at existing range tombstone": {
 			noConflict: true,
 			data:       kvs{rangeKV("a", "c", 3, "")},
 			sst:        kvs{pointKV("b", 3, "sst")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		// Regression tests for https://github.com/cockroachdb/cockroach/issues/93968.
 		"DisallowConflicts WriteTooOldError straddling at existing range tombstone": {
 			noConflict: true,
 			data:       kvs{rangeKV("b", "z", 3, "")},
 			sst:        kvs{pointKV("a", 3, "sst"), pointKV("c", 3, "sst")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts WriteTooOldError straddling multiple existing range tombstones": {
 			noConflict: true,
 			data:       kvs{rangeKV("b", "c", 3, ""), rangeKV("d", "f", 3, "")},
 			sst:        kvs{pointKV("a", 3, "sst"), pointKV("e", 3, "sst")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts WriteTooOldError with SSTTimestampToRequestTimestamp straddling range keys below and at timestamp": {
 			toReqTS:    1,
@@ -358,19 +360,19 @@ func TestEvalAddSSTable(t *testing.T) {
 			noConflict: true,
 			data:       kvs{rangeKV("a", "c", 2, ""), rangeKV("e", "g", 3, "")},
 			sst:        kvs{pointKV("b", 1, "sst"), pointKV("d", 1, "sst"), pointKV("f", 1, "sst")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts returns WriteIntentError below intent": {
 			noConflict: true,
 			data:       kvs{pointKV("a", intentTS, "intent")},
 			sst:        kvs{pointKV("a", 3, "sst")},
-			expectErr:  &roachpb.WriteIntentError{},
+			expectErr:  &kvpb.WriteIntentError{},
 		},
 		"DisallowConflicts returns WriteIntentError below intent above range key": {
 			noConflict: true,
 			data:       kvs{pointKV("b", intentTS, "intent"), rangeKV("a", "d", 2, ""), pointKV("b", 1, "b1")},
 			sst:        kvs{pointKV("b", 3, "sst")},
-			expectErr:  &roachpb.WriteIntentError{},
+			expectErr:  &kvpb.WriteIntentError{},
 		},
 		"DisallowConflicts ignores intents in span": { // inconsistent with blind writes
 			noConflict: true,
@@ -382,7 +384,7 @@ func TestEvalAddSSTable(t *testing.T) {
 			noConflict: true,
 			data:       kvs{pointKV("a", 3, "a3")},
 			sst:        kvs{pointKV("a", 3, "a3")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts allows new SST tombstones": {
 			noConflict: true,
@@ -450,13 +452,13 @@ func TestEvalAddSSTable(t *testing.T) {
 			noShadow:  true,
 			data:      kvs{pointKV("a", 3, "")},
 			sst:       kvs{pointKV("a", 3, "sst")},
-			expectErr: &roachpb.WriteTooOldError{},
+			expectErr: &kvpb.WriteTooOldError{},
 		},
 		"DisallowShadowing returns WriteTooOldError below existing tombstone": {
 			noShadow:  true,
 			data:      kvs{pointKV("a", 3, "")},
 			sst:       kvs{pointKV("a", 2, "sst")},
-			expectErr: &roachpb.WriteTooOldError{},
+			expectErr: &kvpb.WriteTooOldError{},
 		},
 		"DisallowShadowing allows above existing tombstone": {
 			noShadow: true,
@@ -468,13 +470,13 @@ func TestEvalAddSSTable(t *testing.T) {
 			noShadow:  true,
 			data:      kvs{pointKV("a", intentTS, "intent")},
 			sst:       kvs{pointKV("a", 3, "sst")},
-			expectErr: &roachpb.WriteIntentError{},
+			expectErr: &kvpb.WriteIntentError{},
 		},
 		"DisallowShadowing returns WriteIntentError below intent above range key": {
 			noShadow:  true,
 			data:      kvs{pointKV("b", intentTS, "intent"), rangeKV("a", "d", 2, ""), pointKV("b", 1, "b1")},
 			sst:       kvs{pointKV("b", 3, "sst")},
-			expectErr: &roachpb.WriteIntentError{},
+			expectErr: &kvpb.WriteIntentError{},
 		},
 		"DisallowShadowing ignores intents in span": { // inconsistent with blind writes
 			noShadow: true,
@@ -578,13 +580,13 @@ func TestEvalAddSSTable(t *testing.T) {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("a", 3, "")},
 			sst:           kvs{pointKV("a", 3, "sst")},
-			expectErr:     &roachpb.WriteTooOldError{},
+			expectErr:     &kvpb.WriteTooOldError{},
 		},
 		"DisallowShadowingBelow returns WriteTooOldError below existing tombstone": {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("a", 3, "")},
 			sst:           kvs{pointKV("a", 2, "sst")},
-			expectErr:     &roachpb.WriteTooOldError{},
+			expectErr:     &kvpb.WriteTooOldError{},
 		},
 		"DisallowShadowingBelow allows above existing tombstone": {
 			noShadowBelow: 5,
@@ -596,13 +598,13 @@ func TestEvalAddSSTable(t *testing.T) {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("a", intentTS, "intent")},
 			sst:           kvs{pointKV("a", 3, "sst")},
-			expectErr:     &roachpb.WriteIntentError{},
+			expectErr:     &kvpb.WriteIntentError{},
 		},
 		"DisallowShadowingBelow returns WriteIntentError below intent above range key": {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("b", intentTS, "intent"), rangeKV("a", "d", 2, ""), pointKV("b", 1, "b1")},
 			sst:           kvs{pointKV("b", 3, "sst")},
-			expectErr:     &roachpb.WriteIntentError{},
+			expectErr:     &kvpb.WriteIntentError{},
 		},
 		"DisallowShadowingBelow ignores intents in span": { // inconsistent with blind writes
 			noShadowBelow: 5,
@@ -620,7 +622,7 @@ func TestEvalAddSSTable(t *testing.T) {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("a", 3, "")},
 			sst:           kvs{pointKV("a", 3, "")},
-			expectErr:     &roachpb.WriteTooOldError{},
+			expectErr:     &kvpb.WriteTooOldError{},
 		},
 		"DisallowShadowingBelow allows new SST tombstones": {
 			noShadowBelow: 5,
@@ -791,13 +793,13 @@ func TestEvalAddSSTable(t *testing.T) {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("a", 8, "a8")},
 			sst:           kvs{pointKV("a", 7, "a8")},
-			expectErr:     &roachpb.WriteTooOldError{},
+			expectErr:     &kvpb.WriteTooOldError{},
 		},
 		"DisallowShadowingBelow above limit errors below tombstone": {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("a", 8, "")},
 			sst:           kvs{pointKV("a", 7, "a8")},
-			expectErr:     &roachpb.WriteTooOldError{},
+			expectErr:     &kvpb.WriteTooOldError{},
 		},
 		// MVCC Range tombstone cases.
 		"DisallowConflicts allows sst range keys": {
@@ -805,6 +807,56 @@ func TestEvalAddSSTable(t *testing.T) {
 			data:       kvs{pointKV("a", 6, "d")},
 			sst:        kvs{rangeKV("a", "b", 8, ""), pointKV("a", 7, "a8")},
 			expect:     kvs{rangeKV("a", "b", 8, ""), pointKV("a", 7, "a8"), pointKV("a", 6, "d")},
+		},
+		"DisallowConflicts allows sst range keys 2": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{pointKV("a", 6, "d"), pointKV("bbb", 6, ""), pointKV("c", 6, "d"), pointKV("d", 6, "d"), pointKV("dd", 6, "")},
+			sst:        kvs{pointKV("aa", 9, ""), pointKV("b", 9, "dee"), rangeKV("bb", "e", 9, ""), pointKV("cc", 10, "")},
+			expect:     kvs{pointKV("a", 6, "d"), pointKV("aa", 9, ""), pointKV("b", 9, "dee"), rangeKV("bb", "e", 9, ""), pointKV("bbb", 6, ""), pointKV("c", 6, "d"), pointKV("cc", 10, ""), pointKV("d", 6, "d"), pointKV("dd", 6, "")},
+		},
+		"DisallowConflicts does not skip sst range keys ahead of first one": {
+			noConflict: true,
+			reqTS:      10,
+			toReqTS:    8,
+			data:       kvs{pointKV("a", 6, "d"), pointKV("e", 5, "d")},
+			sst:        kvs{rangeKV("b", "c", 8, ""), rangeKV("cc", "f", 8, "")},
+			expect:     kvs{pointKV("a", 6, "d"), rangeKV("b", "c", 10, ""), rangeKV("cc", "f", 10, ""), pointKV("e", 5, "d")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("b", "c", 7, ""), rangeKV("b", "c", 6, ""), rangeKV("c", "f", 6, ""), rangeKV("f", "g", 7, ""), rangeKV("f", "g", 6, "")},
+			sst:        kvs{rangeKV("a", "d", 8, ""), rangeKV("e", "g", 8, "")},
+			expect:     kvs{rangeKV("a", "b", 8, ""), rangeKV("b", "c", 8, ""), rangeKV("b", "c", 7, ""), rangeKV("b", "c", 6, ""), rangeKV("c", "d", 8, ""), rangeKV("c", "d", 6, ""), rangeKV("d", "e", 6, ""), rangeKV("e", "f", 8, ""), rangeKV("e", "f", 6, ""), rangeKV("f", "g", 8, ""), rangeKV("f", "g", 7, ""), rangeKV("f", "g", 6, "")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases 2": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("a", "g", 6, ""), pointKV("bb", 5, "bar")},
+			sst:        kvs{rangeKV("b", "c", 8, ""), pointKV("cc", 8, "foo"), rangeKV("e", "f", 8, "")},
+			expect:     kvs{rangeKV("a", "b", 6, ""), rangeKV("b", "c", 8, ""), rangeKV("b", "c", 6, ""), pointKV("bb", 5, "bar"), rangeKV("c", "e", 6, ""), pointKV("cc", 8, "foo"), rangeKV("e", "f", 8, ""), rangeKV("e", "f", 6, ""), rangeKV("f", "g", 6, "")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases 3": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("c", "d", 6, ""), pointKV("e", 6, ""), pointKV("e", 5, "foo"), pointKV("f", 6, ""), pointKV("f", 5, ""), pointKV("g", 6, ""), rangeKV("j", "k", 5, "")},
+			sst:        kvs{rangeKV("a", "l", 8, "")},
+			expect:     kvs{rangeKV("a", "c", 8, ""), rangeKV("c", "d", 8, ""), rangeKV("c", "d", 6, ""), rangeKV("d", "j", 8, ""), pointKV("e", 6, ""), pointKV("e", 5, "foo"), pointKV("f", 6, ""), pointKV("f", 5, ""), pointKV("g", 6, ""), rangeKV("j", "k", 8, ""), rangeKV("j", "k", 5, ""), rangeKV("k", "l", 8, "")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases 4": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("c", "d", 6, ""), rangeKV("j", "k", 5, "")},
+			sst:        kvs{rangeKV("a", "l", 8, "")},
+			expect:     kvs{rangeKV("a", "c", 8, ""), rangeKV("c", "d", 8, ""), rangeKV("c", "d", 6, ""), rangeKV("d", "j", 8, ""), rangeKV("j", "k", 8, ""), rangeKV("j", "k", 5, ""), rangeKV("k", "l", 8, "")},
+		},
+		"DisallowConflicts accounts for point key already deleted in engine": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("b", "d", 6, ""), pointKV("c", 5, "foo")},
+			sst:        kvs{rangeKV("a", "d", 8, "")},
+			expect:     kvs{rangeKV("a", "b", 8, ""), rangeKV("b", "d", 8, ""), rangeKV("b", "d", 6, ""), pointKV("c", 5, "foo")},
 		},
 		"DisallowConflicts allows fragmented sst range keys": {
 			noConflict: true,
@@ -822,25 +874,25 @@ func TestEvalAddSSTable(t *testing.T) {
 			noConflict: true,
 			data:       kvs{pointKV("b", intentTS, "intent")},
 			sst:        kvs{rangeKV("a", "c", intentTS+8, "")},
-			expectErr:  &roachpb.WriteIntentError{},
+			expectErr:  &kvpb.WriteIntentError{},
 		},
 		"DisallowConflicts disallows sst range keys below engine point key": {
 			noConflict: true,
 			data:       kvs{pointKV("a", 6, "d")},
 			sst:        kvs{pointKV("a", 7, "a8"), rangeKV("a", "b", 5, "")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts disallows sst point keys below engine range key": {
 			noConflict: true,
 			data:       kvs{rangeKV("a", "b", 8, ""), pointKV("a", 6, "b6")},
 			sst:        kvs{pointKV("a", 7, "a8")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts disallows sst range keys below engine range key": {
 			noConflict: true,
 			data:       kvs{rangeKV("a", "b", 8, ""), pointKV("a", 6, "d")},
 			sst:        kvs{pointKV("a", 9, "a8"), rangeKV("a", "b", 7, "")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts allows sst range keys above engine range keys": {
 			noConflict: true,
@@ -894,7 +946,7 @@ func TestEvalAddSSTable(t *testing.T) {
 			noConflict: true,
 			data:       kvs{pointKV("a", 6, "d"), rangeKV("b", "c", 9, ""), rangeKV("c", "d", 5, "")},
 			sst:        kvs{pointKV("a", 7, "a8"), rangeKV("a", "e", 8, "")},
-			expectErr:  &roachpb.WriteTooOldError{},
+			expectErr:  &kvpb.WriteTooOldError{},
 		},
 		"DisallowConflicts allows sst range keys contained within engine range keys": {
 			noConflict: true,
@@ -1047,7 +1099,7 @@ func TestEvalAddSSTable(t *testing.T) {
 							}
 						}
 						sst, start, end := storageutils.MakeSST(t, st, sstKvs)
-						resp := &roachpb.AddSSTableResponse{}
+						resp := &kvpb.AddSSTableResponse{}
 						var mvccStats *enginepb.MVCCStats
 						// In the no-overlap case i.e. approxDiskBytes == 0, force a regular
 						// non-prefix Seek in the conflict check. Sending in nil stats
@@ -1061,11 +1113,11 @@ func TestEvalAddSSTable(t *testing.T) {
 						result, err := batcheval.EvalAddSSTable(ctx, engine, batcheval.CommandArgs{
 							EvalCtx: (&batcheval.MockEvalCtx{ClusterSettings: st, Desc: &roachpb.RangeDescriptor{}, ApproxDiskBytes: approxDiskBytes}).EvalContext(),
 							Stats:   stats,
-							Header: roachpb.Header{
+							Header: kvpb.Header{
 								Timestamp: hlc.Timestamp{WallTime: tc.reqTS},
 							},
-							Args: &roachpb.AddSSTableRequest{
-								RequestHeader:                  roachpb.RequestHeader{Key: start, EndKey: end},
+							Args: &kvpb.AddSSTableRequest{
+								RequestHeader:                  kvpb.RequestHeader{Key: start, EndKey: end},
 								Data:                           sst,
 								MVCCStats:                      mvccStats,
 								DisallowConflicts:              tc.noConflict,
@@ -1210,18 +1262,18 @@ func TestEvalAddSSTableRangefeed(t *testing.T) {
 			sst, start, end := storageutils.MakeSST(t, st, tc.sst)
 			result, err := batcheval.EvalAddSSTable(ctx, opLogger, batcheval.CommandArgs{
 				EvalCtx: (&batcheval.MockEvalCtx{ClusterSettings: st, Desc: &roachpb.RangeDescriptor{}}).EvalContext(),
-				Header: roachpb.Header{
+				Header: kvpb.Header{
 					Timestamp: reqTS,
 				},
 				Stats: &enginepb.MVCCStats{},
-				Args: &roachpb.AddSSTableRequest{
-					RequestHeader:                  roachpb.RequestHeader{Key: start, EndKey: end},
+				Args: &kvpb.AddSSTableRequest{
+					RequestHeader:                  kvpb.RequestHeader{Key: start, EndKey: end},
 					Data:                           sst,
 					MVCCStats:                      storageutils.SSTStats(t, sst, 0),
 					SSTTimestampToRequestTimestamp: hlc.Timestamp{WallTime: tc.toReqTS},
 					IngestAsWrites:                 tc.asWrites,
 				},
-			}, &roachpb.AddSSTableResponse{})
+			}, &kvpb.AddSSTableResponse{})
 			require.NoError(t, err)
 
 			if tc.asWrites {
@@ -1420,14 +1472,14 @@ func runTestDBAddSSTable(
 		value := roachpb.MakeValueFromString("1")
 		value.InitChecksum([]byte("foo"))
 
-		sstFile := &storage.MemFile{}
-		w := storage.MakeBackupSSTWriter(ctx, cs, sstFile)
+		var sstFile bytes.Buffer
+		w := storage.MakeBackupSSTWriter(ctx, cs, &sstFile)
 		defer w.Close()
 		require.NoError(t, w.Put(key, value.RawBytes))
 		require.NoError(t, w.Finish())
 
 		_, _, err := db.AddSSTable(
-			ctx, "b", "c", sstFile.Data(), allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS)
+			ctx, "b", "c", sstFile.Bytes(), allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "invalid checksum")
 	}
@@ -1498,16 +1550,16 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 
 	cArgs := batcheval.CommandArgs{
 		EvalCtx: evalCtx.EvalContext(),
-		Header: roachpb.Header{
+		Header: kvpb.Header{
 			Timestamp: ts,
 		},
-		Args: &roachpb.AddSSTableRequest{
-			RequestHeader: roachpb.RequestHeader{Key: start, EndKey: end},
+		Args: &kvpb.AddSSTableRequest{
+			RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end},
 			Data:          sst,
 		},
 		Stats: &enginepb.MVCCStats{},
 	}
-	var resp roachpb.AddSSTableResponse
+	var resp kvpb.AddSSTableResponse
 	_, err := batcheval.EvalAddSSTable(ctx, engine, cArgs, &resp)
 	require.NoError(t, err)
 
@@ -1530,14 +1582,14 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 	sst, start, end = storageutils.MakeSST(t, st, kvs{pointKV("zzzzzzz", int(ts.WallTime), "zzz")})
 	cArgs = batcheval.CommandArgs{
 		EvalCtx: evalCtx.EvalContext(),
-		Header:  roachpb.Header{Timestamp: ts},
-		Args: &roachpb.AddSSTableRequest{
-			RequestHeader: roachpb.RequestHeader{Key: start, EndKey: end},
+		Header:  kvpb.Header{Timestamp: ts},
+		Args: &kvpb.AddSSTableRequest{
+			RequestHeader: kvpb.RequestHeader{Key: start, EndKey: end},
 			Data:          sst,
 		},
 		Stats: &enginepb.MVCCStats{},
 	}
-	_, err = batcheval.EvalAddSSTable(ctx, engine, cArgs, &roachpb.AddSSTableResponse{})
+	_, err = batcheval.EvalAddSSTable(ctx, engine, cArgs, &kvpb.AddSSTableResponse{})
 	require.NoError(t, err)
 	require.Equal(t, enginepb.MVCCStats{
 		ContainsEstimates: 1,
@@ -1600,18 +1652,18 @@ func TestAddSSTableMVCCStatsDisallowShadowing(t *testing.T) {
 
 	cArgs := batcheval.CommandArgs{
 		EvalCtx: evalCtx,
-		Header: roachpb.Header{
+		Header: kvpb.Header{
 			Timestamp: hlc.Timestamp{WallTime: 7},
 		},
-		Args: &roachpb.AddSSTableRequest{
-			RequestHeader:     roachpb.RequestHeader{Key: start, EndKey: end},
+		Args: &kvpb.AddSSTableRequest{
+			RequestHeader:     kvpb.RequestHeader{Key: start, EndKey: end},
 			Data:              sst,
 			DisallowShadowing: true,
 			MVCCStats:         storageutils.SSTStats(t, sst, 0),
 		},
 		Stats: &commandStats,
 	}
-	_, err := batcheval.EvalAddSSTable(ctx, engine, cArgs, &roachpb.AddSSTableResponse{})
+	_, err := batcheval.EvalAddSSTable(ctx, engine, cArgs, &kvpb.AddSSTableResponse{})
 	require.NoError(t, err)
 	firstSSTStats := commandStats
 
@@ -1629,13 +1681,13 @@ func TestAddSSTableMVCCStatsDisallowShadowing(t *testing.T) {
 		pointKV("h", 6, "hh"), // key has the same timestamp and value as the one present in the existing data.
 	})
 
-	cArgs.Args = &roachpb.AddSSTableRequest{
-		RequestHeader:     roachpb.RequestHeader{Key: start, EndKey: end},
+	cArgs.Args = &kvpb.AddSSTableRequest{
+		RequestHeader:     kvpb.RequestHeader{Key: start, EndKey: end},
 		Data:              sst,
 		DisallowShadowing: true,
 		MVCCStats:         storageutils.SSTStats(t, sst, 0),
 	}
-	_, err = batcheval.EvalAddSSTable(ctx, engine, cArgs, &roachpb.AddSSTableResponse{})
+	_, err = batcheval.EvalAddSSTable(ctx, engine, cArgs, &kvpb.AddSSTableResponse{})
 	require.NoError(t, err)
 
 	// Check that there has been no double counting of stats. All keys in second SST are shadowing.
@@ -1654,13 +1706,13 @@ func TestAddSSTableMVCCStatsDisallowShadowing(t *testing.T) {
 		pointKV("x", 7, ""),   // new tombstone.
 	})
 
-	cArgs.Args = &roachpb.AddSSTableRequest{
-		RequestHeader:     roachpb.RequestHeader{Key: start, EndKey: end},
+	cArgs.Args = &kvpb.AddSSTableRequest{
+		RequestHeader:     kvpb.RequestHeader{Key: start, EndKey: end},
 		Data:              sst,
 		DisallowShadowing: true,
 		MVCCStats:         storageutils.SSTStats(t, sst, 0),
 	}
-	_, err = batcheval.EvalAddSSTable(ctx, engine, cArgs, &roachpb.AddSSTableResponse{})
+	_, err = batcheval.EvalAddSSTable(ctx, engine, cArgs, &kvpb.AddSSTableResponse{})
 	require.NoError(t, err)
 
 	// This is the stats contribution of the KVs {"e", 2, "ee"} and {"x", 7, ""}.
@@ -1705,11 +1757,11 @@ func TestAddSSTableIntentResolution(t *testing.T) {
 		pointKV("b", 1, "2"),
 		pointKV("c", 1, "3"),
 	})
-	ba := &roachpb.BatchRequest{
-		Header: roachpb.Header{UserPriority: roachpb.MaxUserPriority},
+	ba := &kvpb.BatchRequest{
+		Header: kvpb.Header{UserPriority: roachpb.MaxUserPriority},
 	}
-	ba.Add(&roachpb.AddSSTableRequest{
-		RequestHeader:     roachpb.RequestHeader{Key: start, EndKey: end},
+	ba.Add(&kvpb.AddSSTableRequest{
+		RequestHeader:     kvpb.RequestHeader{Key: start, EndKey: end},
 		Data:              sst,
 		MVCCStats:         storageutils.SSTStats(t, sst, 0),
 		DisallowShadowing: true,
@@ -1743,14 +1795,14 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsTSCache(t *testing.T) {
 
 	// Add an SST writing below the previous write.
 	sst, start, end := storageutils.MakeSST(t, s.ClusterSettings(), kvs{pointKV("key", 1, "sst")})
-	sstReq := &roachpb.AddSSTableRequest{
-		RequestHeader:                  roachpb.RequestHeader{Key: start, EndKey: end},
+	sstReq := &kvpb.AddSSTableRequest{
+		RequestHeader:                  kvpb.RequestHeader{Key: start, EndKey: end},
 		Data:                           sst,
 		MVCCStats:                      storageutils.SSTStats(t, sst, 0),
 		SSTTimestampToRequestTimestamp: hlc.Timestamp{WallTime: 1},
 	}
-	ba := &roachpb.BatchRequest{
-		Header: roachpb.Header{Timestamp: txnTS.Prev()},
+	ba := &kvpb.BatchRequest{
+		Header: kvpb.Header{Timestamp: txnTS.Prev()},
 	}
 	ba.Add(sstReq)
 	_, pErr := db.NonTransactionalSender().Send(ctx, ba)
@@ -1764,8 +1816,8 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsTSCache(t *testing.T) {
 
 	// Adding the SST again and reading results in the new value, because the
 	// tscache pushed the SST forward.
-	ba = &roachpb.BatchRequest{
-		Header: roachpb.Header{Timestamp: txnTS.Prev()},
+	ba = &kvpb.BatchRequest{
+		Header: kvpb.Header{Timestamp: txnTS.Prev()},
 	}
 	ba.Add(sstReq)
 	_, pErr = db.NonTransactionalSender().Send(ctx, ba)
@@ -1807,14 +1859,14 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsClosedTS(t *testing.T) 
 	// Add an SST writing below the closed timestamp. It should get pushed above it.
 	reqTS := closedTS.Prev()
 	sst, start, end := storageutils.MakeSST(t, store.ClusterSettings(), kvs{pointKV("key", 1, "sst")})
-	sstReq := &roachpb.AddSSTableRequest{
-		RequestHeader:                  roachpb.RequestHeader{Key: start, EndKey: end},
+	sstReq := &kvpb.AddSSTableRequest{
+		RequestHeader:                  kvpb.RequestHeader{Key: start, EndKey: end},
 		Data:                           sst,
 		MVCCStats:                      storageutils.SSTStats(t, sst, 0),
 		SSTTimestampToRequestTimestamp: hlc.Timestamp{WallTime: 1},
 	}
-	ba := &roachpb.BatchRequest{
-		Header: roachpb.Header{Timestamp: reqTS},
+	ba := &kvpb.BatchRequest{
+		Header: kvpb.Header{Timestamp: reqTS},
 	}
 	ba.Add(sstReq)
 	result, pErr := db.NonTransactionalSender().Send(ctx, ba)
@@ -1824,7 +1876,7 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsClosedTS(t *testing.T) 
 	require.True(t, closedTS.LessEq(writeTS), "timestamp %s below closed timestamp %s", result.Timestamp, closedTS)
 
 	// Check that the value was in fact written at the write timestamp.
-	kvs, err := storage.Scan(store.Engine(), roachpb.Key("key"), roachpb.Key("key").Next(), 0)
+	kvs, err := storage.Scan(store.TODOEngine(), roachpb.Key("key"), roachpb.Key("key").Next(), 0)
 	require.NoError(t, err)
 	require.Len(t, kvs, 1)
 	require.Equal(t, storage.MVCCKey{Key: roachpb.Key("key"), Timestamp: writeTS}, kvs[0].Key)

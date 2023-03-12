@@ -100,16 +100,19 @@ CREATE TABLE system.settings (
 	DescIDSequenceSchema = `
 CREATE SEQUENCE system.descriptor_id_seq;`
 
-	tenantNameComputeExpr = `crdb_internal.pb_to_json('cockroach.sql.sqlbase.TenantInfo':::STRING, info)->>'name':::STRING`
-	TenantsTableSchema    = `
+	// Note: the "active" column is deprecated.
+	TenantsTableSchema = `
 CREATE TABLE system.tenants (
-	id     INT8 NOT NULL,
-	active BOOL NOT NULL DEFAULT true,
-	info   BYTES,
-	name   STRING GENERATED ALWAYS AS (` + tenantNameComputeExpr + `) VIRTUAL,
+	id           INT8 NOT NULL,
+	active       BOOL NOT NULL DEFAULT true NOT VISIBLE,
+	info         BYTES,
+	name         STRING,
+	data_state   INT,
+	service_mode INT,
 	CONSTRAINT "primary" PRIMARY KEY (id),
-	FAMILY "primary" (id, active, info),
-	UNIQUE INDEX tenants_name_idx (name ASC)
+	FAMILY "primary" (id, active, info, name, data_state, service_mode),
+	UNIQUE INDEX tenants_name_idx (name ASC),
+	INDEX tenants_service_mode_idx (service_mode ASC)
 );`
 
 	// RoleIDSequenceSchema starts at 100 so we have reserved IDs for special
@@ -120,7 +123,6 @@ CREATE SEQUENCE system.role_id_seq START 100 MINVALUE 100 MAXVALUE 2147483647;`
 	indexUsageComputeExpr = `(statistics->'statistics':::STRING)->'indexes':::STRING`
 )
 
-var tenantNameComputeExprStr = tenantNameComputeExpr
 var indexUsageComputeExprStr = indexUsageComputeExpr
 
 // These system tables are not part of the system config.
@@ -241,12 +243,13 @@ CREATE TABLE system.web_sessions (
 	"revokedAt"    TIMESTAMP,
 	"lastUsedAt"   TIMESTAMP  NOT NULL DEFAULT now(),
 	"auditInfo"    STRING,
+	user_id        OID,
 	CONSTRAINT "primary" PRIMARY KEY (id),
 	INDEX ("expiresAt"),
 	INDEX ("createdAt"),
   INDEX ("revokedAt"),
   INDEX ("lastUsedAt"),
-	FAMILY (id, "hashedSecret", username, "createdAt", "expiresAt", "revokedAt", "lastUsedAt", "auditInfo")
+	FAMILY "fam_0_id_hashedSecret_username_createdAt_expiresAt_revokedAt_lastUsedAt_auditInfo" (id, "hashedSecret", username, "createdAt", "expiresAt", "revokedAt", "lastUsedAt", "auditInfo", user_id)
 );`
 
 	// table_statistics is used to track statistics collected about individual
@@ -294,8 +297,8 @@ CREATE TABLE system.role_members (
   "role"    STRING NOT NULL,
   "member"  STRING NOT NULL,
   "isAdmin" BOOL NOT NULL,
-  role_id   OID,
-  member_id OID,
+  role_id   OID NOT NULL,
+  member_id OID NOT NULL,
   CONSTRAINT "primary" PRIMARY KEY ("role", "member"),
   INDEX ("role"),
   INDEX ("member"),
@@ -489,11 +492,11 @@ CREATE TABLE system.sqlliveness (
 
 	MrSqllivenessTableSchema = `
 CREATE TABLE system.sqlliveness (
-    session_uuid         BYTES NOT NULL,
+    session_id           BYTES NOT NULL,
     expiration           DECIMAL NOT NULL,
     crdb_region          BYTES NOT NULL,
-    CONSTRAINT "primary" PRIMARY KEY (crdb_region, session_uuid),
-    FAMILY "primary" (crdb_region, session_uuid, expiration)
+    CONSTRAINT "primary" PRIMARY KEY (crdb_region, session_id),
+    FAMILY "primary" (crdb_region, session_id, expiration)
 )`
 
 	// system.migrations stores completion records for upgrades performed by the
@@ -599,11 +602,14 @@ CREATE TABLE system.database_role_settings (
     database_id  OID NOT NULL,
     role_name    STRING NOT NULL,
     settings     STRING[] NOT NULL,
+    role_id      OID NULL,
     CONSTRAINT "primary" PRIMARY KEY (database_id, role_name),
+    UNIQUE INDEX (database_id, role_id) STORING (settings),
 		FAMILY "primary" (
 			database_id,
-      role_name,
-      settings
+			role_name,
+			settings,
+			role_id
 		)
 );`
 
@@ -738,8 +744,11 @@ CREATE TABLE system.privileges (
 	path STRING NOT NULL,
 	privileges STRING[] NOT NULL,
 	grant_options STRING[] NOT NULL,
+	user_id OID,
 	CONSTRAINT "primary" PRIMARY KEY (username, path),
-	FAMILY "primary" (username, path, privileges, grant_options)
+	UNIQUE INDEX (path, user_id) STORING (privileges, grant_options),
+	UNIQUE INDEX (path, username) STORING (privileges, grant_options),
+	FAMILY "primary" (username, path, privileges, grant_options, user_id)
 );`
 
 	SystemExternalConnectionsTableSchema = `
@@ -750,8 +759,9 @@ CREATE TABLE system.external_connections (
 	connection_type STRING NOT NULL,
 	connection_details BYTES NOT NULL,
 	owner STRING NOT NULL,
+	owner_id OID,
 	CONSTRAINT "primary" PRIMARY KEY (connection_name),
-	FAMILY "primary" (connection_name, created, updated, connection_type, connection_details, owner)
+	FAMILY "primary" (connection_name, created, updated, connection_type, connection_details, owner, owner_id)
 );`
 
 	SystemJobInfoTableSchema = `
@@ -768,6 +778,74 @@ CREATE TABLE system.job_info (
 	value BYTES,
 	CONSTRAINT "primary" PRIMARY KEY (job_id, info_key, written DESC),
 	FAMILY "primary" (job_id, info_key, written, value)
+);`
+
+	// SpanStatsUniqueKeysTableSchema defines the schema to store
+	// the set of unique keys of all samples in SpanStatsSamplesTableSchema.
+	// The raw bytes of keys are stored in this table, so that the cost of storing
+	// a large key is amortized by each bucket that references it.
+	SpanStatsUniqueKeysTableSchema = `
+CREATE TABLE system.span_stats_unique_keys (
+    -- Every key has a unique id. We can't use the value of the key itself
+	-- because we want the cost of storing the key to 
+	-- amortize with repeated references. A UUID is 16 bytes,
+	-- but a roachpb.Key can be arbitrarily large.
+	id UUID DEFAULT gen_random_uuid(),
+	
+	-- key_bytes stores the raw bytes of a roachpb.Key.
+	key_bytes BYTES,
+  	CONSTRAINT "primary" PRIMARY KEY (id),
+  	UNIQUE INDEX unique_keys_key_bytes_idx (key_bytes ASC),
+	FAMILY "primary" (id, key_bytes)
+);`
+
+	// SpanStatsBucketsTableSchema defines the schema to store
+	// keyvispb.SpanStats objects.
+	SpanStatsBucketsTableSchema = `
+CREATE TABLE system.span_stats_buckets (
+    -- Every bucket has a unique id.
+	id UUID DEFAULT gen_random_uuid(),
+	
+	-- The bucket belongs to sample_id
+	sample_id UUID NOT NULL,
+	
+	-- The uuid of this bucket's span's start key.
+	start_key_id UUID NOT NULL,
+	
+	-- The uuid of this bucket's span's start key.
+	end_key_id UUID NOT NULL,
+	
+	-- The number of KV requests destined for this span. 
+	requests INT NOT NULL,
+	CONSTRAINT "primary" PRIMARY KEY (id),
+	INDEX buckets_sample_id_idx (sample_id ASC),
+	FAMILY "primary" (id, sample_id, start_key_id, end_key_id, requests)
+);`
+
+	// SpanStatsSamplesTableSchema defines the schema to store
+	// a keyvispb.Sample.
+	SpanStatsSamplesTableSchema = `
+CREATE TABLE system.span_stats_samples (
+    -- Every sample has a unique id.
+	id UUID DEFAULT gen_random_uuid(),
+	
+	-- sample_time represents the time the sample ended.
+	-- The sample's start time is therefore equal to sample_time - keyvissettings.SampleInterval.
+	sample_time TIMESTAMP NOT NULL DEFAULT now(),
+	CONSTRAINT "primary" PRIMARY KEY (id),
+	UNIQUE INDEX samples_sample_time_idx (sample_time ASC),
+	FAMILY "primary" (id, sample_time)
+);`
+
+	// SpanStatsTenantBoundariesTableSchema stores the boundaries that a tenant
+	// wants KV to collect statistics for. `boundaries` is populated with the
+	// keyvispb.UpdateBoundariesRequest proto.
+	SpanStatsTenantBoundariesTableSchema = `
+CREATE TABLE system.span_stats_tenant_boundaries (
+	tenant_id    INT8 NOT NULL,
+	boundaries	 BYTES NOT NULL,
+	CONSTRAINT "primary" PRIMARY KEY (tenant_id),
+	FAMILY "primary" (tenant_id, boundaries)
 );`
 )
 
@@ -969,6 +1047,10 @@ func MakeSystemTables() []SystemTable {
 		SpanCountTable,
 		SystemPrivilegeTable,
 		SystemExternalConnectionsTable,
+		SpanStatsTenantBoundariesTable,
+		SpanStatsUniqueKeysTable,
+		SpanStatsBucketsTable,
+		SpanStatsSamplesTable,
 	}
 }
 
@@ -1209,17 +1291,17 @@ var (
 			keys.TenantsTableID,
 			[]descpb.ColumnDescriptor{
 				{Name: "id", ID: 1, Type: types.Int},
-				{Name: "active", ID: 2, Type: types.Bool, DefaultExpr: &trueBoolString},
+				{Name: "active", ID: 2, Type: types.Bool, DefaultExpr: &trueBoolString, Hidden: true},
 				{Name: "info", ID: 3, Type: types.Bytes, Nullable: true},
-				{Name: "name", ID: 4, Type: types.String, Nullable: true,
-					Virtual:     true,
-					ComputeExpr: &tenantNameComputeExprStr},
+				{Name: "name", ID: 4, Type: types.String, Nullable: true},
+				{Name: "data_state", ID: 5, Type: types.Int, Nullable: true},
+				{Name: "service_mode", ID: 6, Type: types.Int, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{{
 				Name:        "primary",
 				ID:          0,
-				ColumnNames: []string{"id", "active", "info"},
-				ColumnIDs:   []descpb.ColumnID{1, 2, 3},
+				ColumnNames: []string{"id", "active", "info", "name", "data_state", "service_mode"},
+				ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6},
 			}},
 			pk("id"),
 			descpb.IndexDescriptor{
@@ -1229,6 +1311,15 @@ var (
 				KeyColumnNames:      []string{"name"},
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{4},
+				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:                "tenants_service_mode_idx",
+				ID:                  3,
+				KeyColumnNames:      []string{"service_mode"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{6},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
 				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
@@ -1501,6 +1592,7 @@ var (
 				{Name: "revokedAt", ID: 6, Type: types.Timestamp, Nullable: true},
 				{Name: "lastUsedAt", ID: 7, Type: types.Timestamp, DefaultExpr: &nowString},
 				{Name: "auditInfo", ID: 8, Type: types.String, Nullable: true},
+				{Name: "user_id", ID: 9, Type: types.Oid, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -1515,8 +1607,9 @@ var (
 						"revokedAt",
 						"lastUsedAt",
 						"auditInfo",
+						"user_id",
 					},
-					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8},
+					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9},
 				},
 			},
 			pk("id"),
@@ -1655,8 +1748,8 @@ var (
 				{Name: "role", ID: 1, Type: types.String},
 				{Name: "member", ID: 2, Type: types.String},
 				{Name: "isAdmin", ID: 3, Type: types.Bool},
-				{Name: "role_id", ID: 4, Type: types.Oid, Nullable: true},
-				{Name: "member_id", ID: 5, Type: types.Oid, Nullable: true},
+				{Name: "role_id", ID: 4, Type: types.Oid},
+				{Name: "member_id", ID: 5, Type: types.Oid},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -2220,16 +2313,16 @@ var (
 					catconstants.SqllivenessTableName,
 					keys.SqllivenessID,
 					[]descpb.ColumnDescriptor{
-						{Name: "crdb_region", ID: 4, Type: types.Bytes, Nullable: false},
-						{Name: "session_uuid", ID: 3, Type: types.Bytes, Nullable: false},
+						{Name: "session_id", ID: 1, Type: types.Bytes, Nullable: false},
 						{Name: "expiration", ID: 2, Type: types.Decimal, Nullable: false},
+						{Name: "crdb_region", ID: 3, Type: types.Bytes, Nullable: false},
 					},
 					[]descpb.ColumnFamilyDescriptor{
 						{
 							Name:            "primary",
 							ID:              0,
-							ColumnNames:     []string{"crdb_region", "session_uuid", "expiration"},
-							ColumnIDs:       []descpb.ColumnID{4, 3, 2},
+							ColumnNames:     []string{"session_id", "expiration", "crdb_region"},
+							ColumnIDs:       []descpb.ColumnID{1, 2, 3},
 							DefaultColumnID: 2,
 						},
 					},
@@ -2237,9 +2330,9 @@ var (
 						Name:                "primary",
 						ID:                  2,
 						Unique:              true,
-						KeyColumnNames:      []string{"crdb_region", "session_uuid"},
+						KeyColumnNames:      []string{"crdb_region", "session_id"},
 						KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
-						KeyColumnIDs:        []descpb.ColumnID{4, 3},
+						KeyColumnIDs:        []descpb.ColumnID{3, 1},
 					},
 				))
 		}
@@ -2574,14 +2667,14 @@ var (
 				{Name: "database_id", ID: 1, Type: types.Oid, Nullable: false},
 				{Name: "role_name", ID: 2, Type: types.String, Nullable: false},
 				{Name: "settings", ID: 3, Type: types.StringArray, Nullable: false},
+				{Name: "role_id", ID: 4, Type: types.Oid, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
-					Name:            "primary",
-					ID:              0,
-					ColumnNames:     []string{"database_id", "role_name", "settings"},
-					ColumnIDs:       []descpb.ColumnID{1, 2, 3},
-					DefaultColumnID: 3,
+					Name:        "primary",
+					ID:          0,
+					ColumnNames: []string{"database_id", "role_name", "settings", "role_id"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -2593,6 +2686,18 @@ var (
 					catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC,
 				},
 				KeyColumnIDs: []descpb.ColumnID{1, 2},
+			},
+			descpb.IndexDescriptor{
+				Name:                "database_role_settings_database_id_role_id_key",
+				ID:                  2,
+				Unique:              true,
+				KeyColumnNames:      []string{"database_id", "role_id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{1, 4},
+				KeySuffixColumnIDs:  []descpb.ColumnID{2},
+				StoreColumnNames:    []string{"settings"},
+				StoreColumnIDs:      []descpb.ColumnID{3},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 		))
 
@@ -2828,13 +2933,14 @@ var (
 				{Name: "path", ID: 2, Type: types.String},
 				{Name: "privileges", ID: 3, Type: types.StringArray},
 				{Name: "grant_options", ID: 4, Type: types.StringArray},
+				{Name: "user_id", ID: 5, Type: types.Oid, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
 					Name:        "primary",
 					ID:          0,
-					ColumnNames: []string{"username", "path", "privileges", "grant_options"},
-					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4},
+					ColumnNames: []string{"username", "path", "privileges", "grant_options", "user_id"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -2844,6 +2950,29 @@ var (
 				KeyColumnNames:      []string{"username", "path"},
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
+			},
+			descpb.IndexDescriptor{
+				Name:                "privileges_path_user_id_key",
+				ID:                  2,
+				Unique:              true,
+				KeyColumnNames:      []string{"path", "user_id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{2, 5},
+				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+				StoreColumnNames:    []string{"privileges", "grant_options"},
+				StoreColumnIDs:      []descpb.ColumnID{3, 4},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:                "privileges_path_username_key",
+				ID:                  3,
+				Unique:              true,
+				KeyColumnNames:      []string{"path", "username"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{2, 1},
+				StoreColumnNames:    []string{"privileges", "grant_options"},
+				StoreColumnIDs:      []descpb.ColumnID{3, 4},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 		),
 	)
@@ -2860,13 +2989,14 @@ var (
 				{Name: "connection_type", ID: 4, Type: types.String},
 				{Name: "connection_details", ID: 5, Type: types.Bytes},
 				{Name: "owner", ID: 6, Type: types.String},
+				{Name: "owner_id", ID: 7, Type: types.Oid, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
 					Name:        "primary",
 					ID:          0,
-					ColumnNames: []string{"connection_name", "created", "updated", "connection_type", "connection_details", "owner"},
-					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6},
+					ColumnNames: []string{"connection_name", "created", "updated", "connection_type", "connection_details", "owner", "owner_id"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -2907,6 +3037,166 @@ var (
 				KeyColumnNames:      []string{"job_id", "info_key", "written"},
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_DESC},
 				KeyColumnIDs:        []descpb.ColumnID{1, 2, 3},
+			}),
+	)
+
+	genRandomUUIDString = "gen_random_uuid()"
+
+	SpanStatsUniqueKeysTable = makeSystemTable(
+		SpanStatsUniqueKeysTableSchema,
+		systemTable(
+			catconstants.SpanStatsUniqueKeys,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: "id", ID: 1, Type: types.Uuid, DefaultExpr: &genRandomUUIDString},
+				{Name: "key_bytes", ID: 2, Type: types.Bytes, Nullable: true},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name:            "primary",
+					ID:              0,
+					ColumnNames:     []string{"id", "key_bytes"},
+					ColumnIDs:       []descpb.ColumnID{1, 2},
+					DefaultColumnID: 2,
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:           "primary",
+				ID:             1,
+				Unique:         true,
+				KeyColumnNames: []string{"id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					//catenumpb.IndexColumn_ASC,
+				},
+				KeyColumnIDs: []descpb.ColumnID{1},
+			},
+			descpb.IndexDescriptor{
+				Name:                "unique_keys_key_bytes_idx",
+				ID:                  2,
+				Unique:              true,
+				KeyColumnNames:      []string{"key_bytes"},
+				KeyColumnDirections: singleASC,
+				KeyColumnIDs:        []descpb.ColumnID{2},
+				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+		),
+	)
+
+	SpanStatsBucketsTable = makeSystemTable(
+		SpanStatsBucketsTableSchema,
+		systemTable(
+			catconstants.SpanStatsBuckets,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: "id", ID: 1, Type: types.Uuid, DefaultExpr: &genRandomUUIDString},
+				{Name: "sample_id", ID: 2, Type: types.Uuid},
+				{Name: "start_key_id", ID: 3, Type: types.Uuid},
+				{Name: "end_key_id", ID: 4, Type: types.Uuid},
+				{Name: "requests", ID: 5, Type: types.Int},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name: "primary",
+					ID:   0,
+					ColumnNames: []string{"id", "sample_id", "start_key_id",
+						"end_key_id", "requests"},
+					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5},
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:           "primary",
+				ID:             1,
+				Unique:         true,
+				KeyColumnNames: []string{"id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+				},
+				KeyColumnIDs: []descpb.ColumnID{1},
+			},
+			descpb.IndexDescriptor{
+				Name:                "buckets_sample_id_idx",
+				ID:                  2,
+				Unique:              false,
+				KeyColumnNames:      []string{"sample_id"},
+				KeyColumnDirections: singleASC,
+				KeyColumnIDs:        []descpb.ColumnID{2},
+				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+		),
+	)
+
+	SpanStatsSamplesTable = makeSystemTable(
+		SpanStatsSamplesTableSchema,
+		systemTable(
+			catconstants.SpanStatsSamples, descpb.InvalidID,
+			[]descpb.ColumnDescriptor{
+				{Name: "id", ID: 1, Type: types.Uuid, DefaultExpr: &genRandomUUIDString},
+				{Name: "sample_time", ID: 2, Type: types.Timestamp,
+					DefaultExpr: &nowString},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name:            "primary",
+					ID:              0,
+					ColumnNames:     []string{"id", "sample_time"},
+					ColumnIDs:       []descpb.ColumnID{1, 2},
+					DefaultColumnID: 2,
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:           "primary",
+				ID:             1,
+				Unique:         true,
+				KeyColumnNames: []string{"id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+				},
+				KeyColumnIDs: []descpb.ColumnID{1},
+			},
+			descpb.IndexDescriptor{
+				Name:                "samples_sample_time_idx",
+				ID:                  2,
+				Unique:              true,
+				KeyColumnNames:      []string{"sample_time"},
+				KeyColumnDirections: singleASC,
+				KeyColumnIDs:        []descpb.ColumnID{2},
+				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+		),
+	)
+
+	SpanStatsTenantBoundariesTableTTL = 60 * time.Minute
+	SpanStatsTenantBoundariesTable    = makeSystemTable(
+		SpanStatsTenantBoundariesTableSchema,
+		systemTable(
+			catconstants.SpanStatsTenantBoundaries,
+			descpb.InvalidID, // dynamically assigned table ID
+			[]descpb.ColumnDescriptor{
+				{Name: "tenant_id", ID: 1, Type: types.Int},
+				{Name: "boundaries", ID: 2, Type: types.Bytes},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name:            "primary",
+					ID:              0,
+					ColumnNames:     []string{"tenant_id", "boundaries"},
+					ColumnIDs:       []descpb.ColumnID{1, 2},
+					DefaultColumnID: 2,
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:           "primary",
+				ID:             1,
+				Unique:         true,
+				KeyColumnNames: []string{"tenant_id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+				},
+				KeyColumnIDs: []descpb.ColumnID{1},
 			},
 		),
 	)

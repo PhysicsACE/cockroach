@@ -111,6 +111,7 @@ type ExecStats = {
   maxMemUsage: NumericStat;
   networkBytes: NumericStat;
   networkMsgs: NumericStat;
+  cpuSQLNanos: NumericStat;
 };
 
 type StatementStatistics = {
@@ -137,7 +138,6 @@ export function convertStatementRawFormatToAggregatedStatistics(
   s: StatementRawFormat,
 ): AggregateStatistics {
   return {
-    aggregationInterval: s.agg_interval,
     applicationName: s.app_name,
     database: s.metadata.db,
     fullScan: s.metadata.fullScan,
@@ -155,6 +155,7 @@ export function convertStatementRawFormatToAggregatedStatistics(
         max_mem_usage: s.statistics.execution_statistics.maxMemUsage,
         network_bytes: s.statistics.execution_statistics.networkBytes,
         network_messages: s.statistics.execution_statistics.networkMsgs,
+        cpu_sql_nanos: s.statistics.execution_statistics.cpuSQLNanos,
       },
       bytes_read: s.statistics.statistics.bytesRead,
       count: s.statistics.statistics.cnt,

@@ -225,7 +225,7 @@ func registerVersion(r registry.Registry) {
 				if c.IsLocal() && runtime.GOARCH == "arm64" {
 					t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
 				}
-				pred, err := PredecessorVersion(*t.BuildVersion())
+				pred, err := version.PredecessorVersion(*t.BuildVersion())
 				if err != nil {
 					t.Fatal(err)
 				}

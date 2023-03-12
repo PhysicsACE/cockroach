@@ -19,8 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -264,6 +266,15 @@ func (p *planner) dropTableImpl(
 		}
 	}
 
+	// Remove function dependencies
+	fnIDs, err := tableDesc.GetAllReferencedFunctionIDs()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.removeFunctionReferences(ctx, fnIDs, tableDesc); err != nil {
+		return nil, err
+	}
+
 	// Drop all views that depend on this table, assuming that we wouldn't have
 	// made it to this point if `cascade` wasn't enabled.
 	// Copy out the set of dependencies as it may be overwritten in the loop.
@@ -327,7 +338,7 @@ func (p *planner) dropTableImpl(
 		return droppedViews, err
 	}
 
-	err := p.initiateDropTable(ctx, tableDesc, !droppingParent, jobDesc)
+	err = p.initiateDropTable(ctx, tableDesc, !droppingParent, jobDesc)
 	return droppedViews, err
 }
 
@@ -415,11 +426,11 @@ func (p *planner) markTableMutationJobsSuccessful(
 		// in a batch only when the transaction commits. So, if a job's record exists
 		// in the cache, we can simply delete that record from cache because the
 		// job is not created yet.
-		if record, exists := p.ExtendedEvalContext().SchemaChangeJobRecords[tableDesc.ID]; exists && record.JobID == jobID {
-			delete(p.ExtendedEvalContext().SchemaChangeJobRecords, tableDesc.ID)
+		if record, exists := p.ExtendedEvalContext().jobs.uniqueToCreate[tableDesc.ID]; exists && record.JobID == jobID {
+			delete(p.ExtendedEvalContext().jobs.uniqueToCreate, tableDesc.ID)
 			continue
 		}
-		mutationJob, err := p.execCfg.JobRegistry.LoadJobWithTxn(ctx, jobID, p.txn)
+		mutationJob, err := p.execCfg.JobRegistry.LoadJobWithTxn(ctx, jobID, p.InternalSQLTxn())
 		if err != nil {
 			if jobs.HasJobNotFoundError(err) {
 				log.Warningf(ctx, "mutation job %d not found", jobID)
@@ -427,24 +438,25 @@ func (p *planner) markTableMutationJobsSuccessful(
 			}
 			return err
 		}
-		if err := mutationJob.Update(
-			ctx, p.txn, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-				status := md.Status
-				switch status {
-				case jobs.StatusSucceeded, jobs.StatusCanceled, jobs.StatusFailed, jobs.StatusRevertFailed:
-					log.Warningf(ctx, "mutation job %d in unexpected state %s", jobID, status)
-					return nil
-				case jobs.StatusRunning, jobs.StatusPending:
-					status = jobs.StatusSucceeded
-				default:
-					// We shouldn't mark jobs as succeeded if they're not in a state where
-					// they're eligible to ever succeed, so mark them as failed.
-					status = jobs.StatusFailed
-				}
-				log.Infof(ctx, "marking mutation job %d for dropped table as %s", jobID, status)
-				ju.UpdateStatus(status)
+		if err := mutationJob.WithTxn(p.InternalSQLTxn()).Update(ctx, func(
+			txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+		) error {
+			status := md.Status
+			switch status {
+			case jobs.StatusSucceeded, jobs.StatusCanceled, jobs.StatusFailed, jobs.StatusRevertFailed:
+				log.Warningf(ctx, "mutation job %d in unexpected state %s", jobID, status)
 				return nil
-			}); err != nil {
+			case jobs.StatusRunning, jobs.StatusPending:
+				status = jobs.StatusSucceeded
+			default:
+				// We shouldn't mark jobs as succeeded if they're not in a state where
+				// they're eligible to ever succeed, so mark them as failed.
+				status = jobs.StatusFailed
+			}
+			log.Infof(ctx, "marking mutation job %d for dropped table as %s", jobID, status)
+			ju.UpdateStatus(status)
+			return nil
+		}); err != nil {
 			return errors.Wrap(err, "updating mutation job for dropped table")
 		}
 	}
@@ -545,6 +557,78 @@ func (p *planner) removeFKBackReference(
 	jobDesc := fmt.Sprintf("updating table %q after removing constraint %q from table %q", referencedTableDesc.GetName(), ref.Name, name.FQString())
 
 	return p.writeSchemaChange(ctx, referencedTableDesc, descpb.InvalidMutationID, jobDesc)
+}
+
+func (p *planner) removeFunctionReferences(
+	ctx context.Context, fnIDs catalog.DescriptorIDSet, tableDesc catalog.TableDescriptor,
+) error {
+	for _, id := range fnIDs.Ordered() {
+		fnDesc, err := p.descCollection.MutableByID(p.Txn()).Function(ctx, id)
+		if err != nil {
+			return err
+		}
+		fnDesc.RemoveReference(tableDesc.GetID())
+		if err := p.writeFuncSchemaChange(ctx, fnDesc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *planner) removeCheckBackReferenceInFunctions(
+	ctx context.Context, tableDesc *tabledesc.Mutable, ck *descpb.TableDescriptor_CheckConstraint,
+) error {
+	fns, err := removeCheckBackReferenceInFunctions(
+		ctx, tableDesc, ck, p.Descriptors(), p.Txn(),
+	)
+	if err != nil {
+		return err
+	}
+	for _, fn := range fns {
+		if err := p.writeFuncSchemaChange(ctx, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *planner) removeColumnBackReferenceInFunctions(
+	ctx context.Context, tableDesc *tabledesc.Mutable, col *descpb.ColumnDescriptor,
+) error {
+	for _, id := range col.UsesFunctionIds {
+		fnDesc, err := p.Descriptors().MutableByID(p.Txn()).Function(ctx, id)
+		if err != nil {
+			return err
+		}
+		fnDesc.RemoveColumnReference(tableDesc.GetID(), col.ID)
+		if err := p.writeFuncSchemaChange(ctx, fnDesc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeCheckBackReferenceInFunctions(
+	ctx context.Context,
+	tableDesc *tabledesc.Mutable,
+	ck *descpb.TableDescriptor_CheckConstraint,
+	descCollection *descs.Collection,
+	txn *kv.Txn,
+) ([]*funcdesc.Mutable, error) {
+	fnIDs, err := tableDesc.GetAllReferencedFunctionIDsInConstraint(ck.ConstraintID)
+	if err != nil {
+		return nil, err
+	}
+	ret := make([]*funcdesc.Mutable, 0, fnIDs.Len())
+	for _, id := range fnIDs.Ordered() {
+		fnDesc, err := descCollection.MutableByID(txn).Function(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		fnDesc.RemoveConstraintReference(tableDesc.GetID(), ck.ConstraintID)
+		ret = append(ret, fnDesc)
+	}
+	return ret, nil
 }
 
 // removeFKBackReferenceFromTable edits the supplied referencedTableDesc to

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/grafana"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
@@ -41,14 +42,14 @@ func registerIndexOverload(r registry.Registry) {
 			workloadNode := c.Spec().NodeCount
 
 			c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, crdbNodes))
+			c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings(), c.Range(1, crdbNodes))
 
 			{
 				promCfg := &prometheus.Config{}
 				promCfg.WithPrometheusNode(c.Node(workloadNode).InstallNodes()[0])
 				promCfg.WithNodeExporter(c.All().InstallNodes())
 				promCfg.WithCluster(c.Range(1, crdbNodes).InstallNodes())
-				promCfg.WithGrafanaDashboard("http://go.crdb.dev/p/snapshot-admission-control-grafana")
+				promCfg.WithGrafanaDashboardJSON(grafana.SnapshotAdmissionControlGrafanaJSON)
 				promCfg.ScrapeConfigs = append(promCfg.ScrapeConfigs, prometheus.MakeWorkloadScrapeConfig("workload",
 					"/", makeWorkloadScrapeNodes(c.Node(workloadNode).InstallNodes()[0], []workloadInstance{
 						{nodes: c.Node(workloadNode)},

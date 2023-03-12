@@ -11,12 +11,14 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -49,8 +51,8 @@ func TestCheckSSTConflictsMaxIntents(t *testing.T) {
 
 	// Create SST with keys equal to intents at txn2TS.
 	cs := cluster.MakeTestingClusterSettings()
-	sstFile := &MemFile{}
-	sstWriter := MakeBackupSSTWriter(context.Background(), cs, sstFile)
+	var sstFile bytes.Buffer
+	sstWriter := MakeBackupSSTWriter(context.Background(), cs, &sstFile)
 	defer sstWriter.Close()
 	for _, k := range intents {
 		key := MVCCKey{Key: roachpb.Key(k), Timestamp: txn2TS}
@@ -63,7 +65,10 @@ func TestCheckSSTConflictsMaxIntents(t *testing.T) {
 	sstWriter.Close()
 
 	ctx := context.Background()
-	engine := NewDefaultInMemForTesting(Settings(cs))
+	engine, err := Open(context.Background(), InMemory(), cs, MaxSize(1<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer engine.Close()
 
 	// Write some committed keys and intents at txn1TS.
@@ -89,7 +94,7 @@ func TestCheckSSTConflictsMaxIntents(t *testing.T) {
 					_, err := CheckSSTConflicts(ctx, sstFile.Bytes(), engine, startKey, endKey, startKey.Key, endKey.Key.Next(),
 						false /*disallowShadowing*/, hlc.Timestamp{} /*disallowShadowingBelow*/, hlc.Timestamp{} /* sstReqTS */, tc.maxIntents, usePrefixSeek)
 					require.Error(t, err)
-					writeIntentErr := &roachpb.WriteIntentError{}
+					writeIntentErr := &kvpb.WriteIntentError{}
 					require.ErrorAs(t, err, &writeIntentErr)
 
 					actual := []string{}
@@ -125,7 +130,7 @@ func runUpdateSSTTimestamps(ctx context.Context, b *testing.B, numKeys int, conc
 
 	r := rand.New(rand.NewSource(7))
 	st := cluster.MakeTestingClusterSettings()
-	sstFile := &MemFile{}
+	sstFile := &MemObject{}
 	writer := MakeIngestionSSTWriter(ctx, st, sstFile)
 	defer writer.Close()
 

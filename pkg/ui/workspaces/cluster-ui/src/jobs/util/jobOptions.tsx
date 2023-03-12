@@ -33,12 +33,8 @@ export function jobToVisual(job: Job): JobStatusVisual {
       return JobStatusVisual.BadgeWithErrorMessage;
     case JOB_STATUS_RUNNING:
       return JobStatusVisual.ProgressBarWithDuration;
-    case JOB_STATUS_RETRY_RUNNING:
-      return JobStatusVisual.ProgressBarWithDuration;
     case JOB_STATUS_PENDING:
       return JobStatusVisual.BadgeWithMessage;
-    case JOB_STATUS_RETRY_REVERTING:
-      return JobStatusVisual.BadgeWithRetrying;
     case JOB_STATUS_CANCELED:
     case JOB_STATUS_CANCEL_REQUESTED:
     case JOB_STATUS_PAUSED:
@@ -59,19 +55,14 @@ export const JOB_STATUS_CANCEL_REQUESTED = "cancel-requested";
 export const JOB_STATUS_PAUSED = "paused";
 export const JOB_STATUS_PAUSE_REQUESTED = "paused-requested";
 export const JOB_STATUS_RUNNING = "running";
-export const JOB_STATUS_RETRY_RUNNING = "retry-running";
 export const JOB_STATUS_PENDING = "pending";
 export const JOB_STATUS_REVERTING = "reverting";
 export const JOB_STATUS_REVERT_FAILED = "revert-failed";
-export const JOB_STATUS_RETRY_REVERTING = "retry-reverting";
 
-export function isRetrying(status: string): boolean {
-  return [JOB_STATUS_RETRY_RUNNING, JOB_STATUS_RETRY_REVERTING].includes(
-    status,
-  );
-}
 export function isRunning(status: string): boolean {
-  return [JOB_STATUS_RUNNING, JOB_STATUS_RETRY_RUNNING].includes(status);
+  return [JOB_STATUS_RUNNING, JOB_STATUS_REVERTING].some(s =>
+    status.includes(s),
+  );
 }
 export function isTerminalState(status: string): boolean {
   return [JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED].includes(status);
@@ -79,15 +70,27 @@ export function isTerminalState(status: string): boolean {
 
 export const statusOptions = [
   { value: "", name: "All" },
-  { value: "succeeded", name: "Succeeded" },
-  { value: "failed", name: "Failed" },
-  { value: "paused", name: "Paused" },
-  { value: "canceled", name: "Canceled" },
-  { value: "running", name: "Running" },
-  { value: "pending", name: "Pending" },
-  { value: "reverting", name: "Reverting" },
-  { value: "retrying", name: "Retrying" },
+  { value: JOB_STATUS_SUCCEEDED, name: "Succeeded" },
+  { value: JOB_STATUS_FAILED, name: "Failed" },
+  { value: JOB_STATUS_PAUSED, name: "Paused" },
+  { value: JOB_STATUS_PAUSE_REQUESTED, name: "Pause Requested" },
+  { value: JOB_STATUS_CANCELED, name: "Canceled" },
+  { value: JOB_STATUS_CANCEL_REQUESTED, name: "Cancel Requested" },
+  { value: JOB_STATUS_RUNNING, name: "Running" },
+  { value: JOB_STATUS_PENDING, name: "Pending" },
+  { value: JOB_STATUS_REVERTING, name: "Reverting" },
+  { value: JOB_STATUS_REVERT_FAILED, name: "Revert Failed" },
 ];
+
+const ALL_JOB_STATUSES = new Set(statusOptions.map(option => option.value));
+
+/**
+ * @param jobStatus job status - any string
+ * @returns Returns true if the job status string is a valid status.
+ */
+export function isValidJobStatus(jobStatus: string): boolean {
+  return ALL_JOB_STATUSES.has(jobStatus);
+}
 
 export function jobHasOneOfStatuses(job: Job, ...statuses: string[]): boolean {
   return statuses.indexOf(job.status) !== -1;
@@ -110,109 +113,104 @@ export const jobStatusToBadgeStatus = (status: string): BadgeStatus => {
     case JOB_STATUS_PAUSED:
     case JOB_STATUS_PAUSE_REQUESTED:
     case JOB_STATUS_REVERTING:
-    case JOB_STATUS_RETRY_REVERTING:
     default:
       return "default";
   }
 };
-export const jobStatusToBadgeText = (status: string): string => {
-  switch (status) {
-    case JOB_STATUS_RETRY_REVERTING:
-      return JOB_STATUS_REVERTING;
-    case JOB_STATUS_RETRY_RUNNING:
-      return JOB_STATUS_RUNNING;
-    default:
-      return status;
-  }
-};
+
+const jobTypeKeys = Object.keys(JobType);
 
 export const typeOptions = [
   {
     value: JobType.UNSPECIFIED.toString(),
     name: "All",
-    key: Object.keys(JobType)[JobType.UNSPECIFIED],
+    key: jobTypeKeys[JobType.UNSPECIFIED],
   },
   {
     value: JobType.BACKUP.toString(),
     name: "Backups",
-    key: Object.keys(JobType)[JobType.BACKUP],
+    key: jobTypeKeys[JobType.BACKUP],
   },
   {
     value: JobType.RESTORE.toString(),
     name: "Restores",
-    key: Object.keys(JobType)[JobType.RESTORE],
+    key: jobTypeKeys[JobType.RESTORE],
   },
   {
     value: JobType.IMPORT.toString(),
     name: "Imports",
-    key: Object.keys(JobType)[JobType.IMPORT],
+    key: jobTypeKeys[JobType.IMPORT],
   },
   {
     value: JobType.SCHEMA_CHANGE.toString(),
     name: "Schema Changes",
-    key: Object.keys(JobType)[JobType.SCHEMA_CHANGE],
+    key: jobTypeKeys[JobType.SCHEMA_CHANGE],
   },
   {
     value: JobType.CHANGEFEED.toString(),
     name: "Changefeed",
-    key: Object.keys(JobType)[JobType.CHANGEFEED],
+    key: jobTypeKeys[JobType.CHANGEFEED],
   },
   {
     value: JobType.CREATE_STATS.toString(),
     name: "Statistics Creation",
-    key: Object.keys(JobType)[JobType.CREATE_STATS],
+    key: jobTypeKeys[JobType.CREATE_STATS],
   },
   {
     value: JobType.AUTO_CREATE_STATS.toString(),
     name: "Auto-Statistics Creation",
-    key: Object.keys(JobType)[JobType.AUTO_CREATE_STATS],
+    key: jobTypeKeys[JobType.AUTO_CREATE_STATS],
   },
   {
     value: JobType.SCHEMA_CHANGE_GC.toString(),
     name: "Schema Change GC",
-    key: Object.keys(JobType)[JobType.SCHEMA_CHANGE_GC],
+    key: jobTypeKeys[JobType.SCHEMA_CHANGE_GC],
   },
   {
     value: JobType.TYPEDESC_SCHEMA_CHANGE.toString(),
     name: "Type Descriptor Schema Changes",
-    key: Object.keys(JobType)[JobType.TYPEDESC_SCHEMA_CHANGE],
+    key: jobTypeKeys[JobType.TYPEDESC_SCHEMA_CHANGE],
   },
   {
     value: JobType.STREAM_INGESTION.toString(),
     name: "Stream Ingestion",
-    key: Object.keys(JobType)[JobType.STREAM_INGESTION],
+    key: jobTypeKeys[JobType.STREAM_INGESTION],
   },
   {
     value: JobType.NEW_SCHEMA_CHANGE.toString(),
     name: "New Schema Changes",
-    key: Object.keys(JobType)[JobType.NEW_SCHEMA_CHANGE],
+    key: jobTypeKeys[JobType.NEW_SCHEMA_CHANGE],
   },
   {
     value: JobType.MIGRATION.toString(),
     name: "Migrations",
-    key: Object.keys(JobType)[JobType.MIGRATION],
+    key: jobTypeKeys[JobType.MIGRATION],
   },
   {
     value: JobType.AUTO_SPAN_CONFIG_RECONCILIATION.toString(),
     name: "Span Config Reconciliation",
-    key: Object.keys(JobType)[JobType.AUTO_SPAN_CONFIG_RECONCILIATION],
+    key: jobTypeKeys[JobType.AUTO_SPAN_CONFIG_RECONCILIATION],
   },
   {
     value: JobType.AUTO_SQL_STATS_COMPACTION.toString(),
     name: "SQL Stats Compactions",
-    key: Object.keys(JobType)[JobType.AUTO_SQL_STATS_COMPACTION],
+    key: jobTypeKeys[JobType.AUTO_SQL_STATS_COMPACTION],
   },
   {
     value: JobType.STREAM_REPLICATION.toString(),
     name: "Stream Replication",
-    key: Object.keys(JobType)[JobType.STREAM_REPLICATION],
+    key: jobTypeKeys[JobType.STREAM_REPLICATION],
   },
   {
     value: JobType.ROW_LEVEL_TTL.toString(),
     name: "Time-to-live Deletions",
-    key: Object.keys(JobType)[JobType.ROW_LEVEL_TTL],
+    key: jobTypeKeys[JobType.ROW_LEVEL_TTL],
   },
 ];
+
+export function isValidJobType(jobType: number): boolean {
+  return jobType >= 0 && jobType < jobTypeKeys.length;
+}
 
 export const showOptions = [
   { value: "50", name: "Latest 50" },

@@ -19,6 +19,7 @@ import (
 
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -105,7 +106,7 @@ func (n *Dialer) Dial(
 	}
 	// Don't trip the breaker if we're already canceled.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+		return nil, errors.Wrap(ctxErr, "dial")
 	}
 	breaker := n.getBreaker(nodeID, class)
 	addr, err := n.resolver(nodeID)
@@ -138,7 +139,7 @@ func (n *Dialer) DialNoBreaker(
 }
 
 // DialInternalClient is a specialization of DialClass for callers that
-// want a roachpb.InternalClient. This supports an optimization to bypass the
+// want a kvpb.InternalClient. This supports an optimization to bypass the
 // network for the local node.
 //
 // For a more contextualized explanation, see the comment that decorates
@@ -149,25 +150,25 @@ func (n *Dialer) DialInternalClient(
 	if n == nil || n.resolver == nil {
 		return nil, errors.New("no node dialer configured")
 	}
-	addr, err := n.resolver(nodeID)
-	if err != nil {
-		return nil, err
-	}
-
 	{
 		// If we're dialing the local node, don't go through gRPC.
-		localClient := n.rpcContext.GetLocalInternalClientForAddr(addr.String(), nodeID)
+		localClient := n.rpcContext.GetLocalInternalClientForAddr(nodeID)
 		if localClient != nil && !n.testingKnobs.TestingNoLocalClientOptimization {
 			log.VEvent(ctx, 2, kvbase.RoutingRequestLocallyMsg)
 			return localClient, nil
 		}
+	}
+
+	addr, err := n.resolver(nodeID)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolver error")
 	}
 	log.VEventf(ctx, 2, "sending request to %s", addr)
 	conn, err := n.dial(ctx, nodeID, addr, n.getBreaker(nodeID, class), true /* checkBreaker */, class)
 	if err != nil {
 		return nil, err
 	}
-	return TracingInternalClient{InternalClient: roachpb.NewInternalClient(conn)}, err
+	return TracingInternalClient{InternalClient: kvpb.NewInternalClient(conn)}, nil
 }
 
 // dial performs the dialing of the remote connection. If breaker is nil,
@@ -180,9 +181,10 @@ func (n *Dialer) dial(
 	checkBreaker bool,
 	class rpc.ConnectionClass,
 ) (_ *grpc.ClientConn, err error) {
+	const ctxWrapMsg = "dial"
 	// Don't trip the breaker if we're already canceled.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+		return nil, errors.Wrap(ctxErr, ctxWrapMsg)
 	}
 	if checkBreaker && !breaker.Ready() {
 		err = errors.Wrapf(circuit.ErrBreakerOpen, "unable to dial n%d", nodeID)
@@ -198,7 +200,7 @@ func (n *Dialer) dial(
 	if err != nil {
 		// If we were canceled during the dial, don't trip the breaker.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return nil, errors.Wrap(ctxErr, ctxWrapMsg)
 		}
 		err = errors.Wrapf(err, "failed to connect to n%d at %v", nodeID, addr)
 		if breaker != nil {
@@ -249,6 +251,11 @@ func (n *Dialer) ConnHealth(nodeID roachpb.NodeID, class rpc.ConnectionClass) er
 // down), and should be avoided in latency-sensitive code paths. Preferably,
 // this should be replaced by some other mechanism to maintain RPC connections.
 // See also: https://github.com/cockroachdb/cockroach/issues/70111
+// TODO(baptist): This method is poorly named and confusing. It is used as a
+// "hint" to use a connection if it already exists, but simultaneously kick off
+// a connection attempt in the background if it doesn't and always return
+// immediately. It is only used today by DistSQL and it should probably be
+// removed and moved into that code.
 func (n *Dialer) ConnHealthTryDial(nodeID roachpb.NodeID, class rpc.ConnectionClass) error {
 	err := n.ConnHealth(nodeID, class)
 	if err == nil || !n.getBreaker(nodeID, class).Ready() {
@@ -258,6 +265,8 @@ func (n *Dialer) ConnHealthTryDial(nodeID roachpb.NodeID, class rpc.ConnectionCl
 	if err != nil {
 		return err
 	}
+	// NB: This will always return `ErrNotHeartbeated` since the heartbeat will
+	// not be done by the time `Health` is called since GRPCDialNode is async.
 	return n.rpcContext.GRPCDialNode(addr.String(), nodeID, class).Health()
 }
 
@@ -291,12 +300,7 @@ func (n *Dialer) Latency(nodeID roachpb.NodeID) (time.Duration, error) {
 	if n.rpcContext.RemoteClocks == nil {
 		return 0, errors.AssertionFailedf("can't call Latency in a client command")
 	}
-	addr, err := n.resolver(nodeID)
-	if err != nil {
-		// Don't trip the breaker.
-		return 0, err
-	}
-	latency, ok := n.rpcContext.RemoteClocks.Latency(addr.String())
+	latency, ok := n.rpcContext.RemoteClocks.Latency(nodeID)
 	if !ok {
 		latency = 0
 	}
@@ -305,14 +309,17 @@ func (n *Dialer) Latency(nodeID roachpb.NodeID) (time.Duration, error) {
 
 // TracingInternalClient wraps an InternalClient and fills in trace information
 // on Batch RPCs.
+//
+// Note that TracingInternalClient is not used to wrap the internalClientAdapter
+// - local RPCs don't need this tracing functionality.
 type TracingInternalClient struct {
-	roachpb.InternalClient
+	kvpb.InternalClient
 }
 
 // Batch overrides the Batch RPC client method and fills in tracing information.
 func (tic TracingInternalClient) Batch(
-	ctx context.Context, ba *roachpb.BatchRequest, opts ...grpc.CallOption,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, ba *kvpb.BatchRequest, opts ...grpc.CallOption,
+) (*kvpb.BatchResponse, error) {
 	sp := tracing.SpanFromContext(ctx)
 	if sp != nil && !sp.IsNoop() {
 		ba = ba.ShallowCopy()

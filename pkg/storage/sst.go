@@ -15,6 +15,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -216,7 +217,7 @@ func CheckSSTConflicts(
 		//
 		// TODO(bilal): Close this gap in GCBytesAge calculation, see:
 		// https://github.com/cockroachdb/cockroach/issues/92254
-		statsDiff.ContainsEstimates++
+		statsDiff.ContainsEstimates += 2
 	}
 	extIter := reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
 		KeyTypes:             IterKeyTypePointsAndRanges,
@@ -265,7 +266,7 @@ func CheckSSTConflicts(
 				// of scans.
 				intents = append(intents, roachpb.MakeIntent(mvccMeta.Txn, extIter.Key().Key))
 				if int64(len(intents)) >= maxIntents {
-					return &roachpb.WriteIntentError{Intents: intents}
+					return &kvpb.WriteIntentError{Intents: intents}
 				}
 				return nil
 			}
@@ -336,7 +337,7 @@ func CheckSSTConflicts(
 		// do if AddSSTable had SSTTimestampToRequestTimestamp set, but AddSSTable
 		// cannot be used in transactions so we don't need to check.
 		if sstKey.Timestamp.LessEq(extKey.Timestamp) {
-			return roachpb.NewWriteTooOldError(
+			return kvpb.NewWriteTooOldError(
 				sstKey.Timestamp, extKey.Timestamp.Next(), sstKey.Key)
 		}
 
@@ -460,7 +461,7 @@ func CheckSSTConflicts(
 				if sstTombstone.Timestamp.Less(extRangeKeys.Versions[0].Timestamp) {
 					// Conflict. We can't slide an MVCC range tombstone below an
 					// existing MVCC range tombstone in the engine.
-					return enginepb.MVCCStats{}, roachpb.NewWriteTooOldError(
+					return enginepb.MVCCStats{}, kvpb.NewWriteTooOldError(
 						sstTombstone.Timestamp, extRangeKeys.Versions[0].Timestamp.Next(), sstRangeKeys.Bounds.Key)
 				}
 				if !extRangeKeys.Versions[0].Timestamp.Less(sstTombstone.Timestamp) {
@@ -485,7 +486,7 @@ func CheckSSTConflicts(
 			if extRangeKeys.Covers(sstKey) {
 				// A range tombstone in the engine deletes this SST key. Return
 				// a WriteTooOldError.
-				return enginepb.MVCCStats{}, roachpb.NewWriteTooOldError(
+				return enginepb.MVCCStats{}, kvpb.NewWriteTooOldError(
 					sstKey.Timestamp, extRangeKeys.Versions[0].Timestamp.Next(), sstKey.Key)
 			}
 		}
@@ -511,7 +512,7 @@ func CheckSSTConflicts(
 				}
 				intents = append(intents, roachpb.MakeIntent(mvccMeta.Txn, extIter.Key().Key))
 				if int64(len(intents)) >= maxIntents {
-					return statsDiff, &roachpb.WriteIntentError{Intents: intents}
+					return statsDiff, &kvpb.WriteIntentError{Intents: intents}
 				}
 				extIter.Next()
 				continue
@@ -519,7 +520,7 @@ func CheckSSTConflicts(
 
 			if sstBottomTombstone.Timestamp.LessEq(extKey.Timestamp) {
 				// Conflict.
-				return enginepb.MVCCStats{}, roachpb.NewWriteTooOldError(
+				return enginepb.MVCCStats{}, kvpb.NewWriteTooOldError(
 					sstBottomTombstone.Timestamp, extKey.Timestamp.Next(), sstRangeKeys.Bounds.Key)
 			}
 			if sstRangeKeys.Covers(extKey) {
@@ -677,6 +678,11 @@ func CheckSSTConflicts(
 					statsDiff.Add(updateStatsOnRangeKeyMerge(sstRangeKeys.Bounds.Key, sstRangeKeys.Versions))
 				}
 				extIter.SeekGE(savedExtKey)
+				// After seeking, the old buffers have been invalidated.
+				// Re-retrieve the buffers.
+				if extHasRange {
+					extRangeKeys = extIter.RangeKeys()
+				}
 			}
 			if extRangeKeysChanged && !sstPrevRangeKeys.IsEmpty() && sstPrevRangeKeys.Bounds.Overlaps(extRangeKeys.Bounds) {
 				// Because we always re-seek the extIter after every sstIter step,
@@ -698,24 +704,6 @@ func CheckSSTConflicts(
 			sstPrevRangeKeys = sstRangeKeys.Clone()
 		}
 		if extRangeKeysChanged {
-			if !extPrevRangeKeys.IsEmpty() && extPrevRangeKeys.Bounds.EndKey.Compare(extRangeKeys.Bounds.Key) < 0 &&
-				sstHasRange && sstRangeKeys.Bounds.Key.Compare(extRangeKeys.Bounds.Key) < 0 &&
-				sstRangeKeys.Bounds.Overlaps(extRangeKeys.Bounds) {
-				// We're adding a fragment between two non-abutting engine range keys.
-				startKey := extPrevRangeKeys.Bounds.EndKey
-				if sstRangeKeys.Bounds.Key.Compare(startKey) > 0 {
-					startKey = sstRangeKeys.Bounds.Key
-				}
-				endKey := extRangeKeys.Bounds.Key
-				newRangeKeyStack := MVCCRangeKeyStack{
-					Versions: sstRangeKeys.Versions,
-					Bounds:   roachpb.Span{Key: startKey, EndKey: endKey},
-				}
-				statsDiff.Add(updateStatsOnRangeKeyPut(newRangeKeyStack))
-				if extPrevRangeKeys.CanMergeRight(newRangeKeyStack) {
-					statsDiff.Add(updateStatsOnRangeKeyMerge(startKey, newRangeKeyStack.Versions))
-				}
-			}
 			// Note that we exclude sstRangeKeysChanged below, as this case only
 			// accounts for additional ext range keys that this SST range key stack
 			// could be adding versions to. The very first ext range key stack that
@@ -871,7 +859,7 @@ func CheckSSTConflicts(
 			if err := compareForCollision(sstKey, extKey, sstValueRaw, extValueRaw); err != nil {
 				return enginepb.MVCCStats{}, err
 			}
-		} else if extValueDeletedByRange {
+		} else if sstHasPoint && extValueDeletedByRange {
 			// Don't double-count the current key.
 			var deletedAt hlc.Timestamp
 			if _, isTombstone, err := extIter.MVCCValueLenAndIsTombstone(); err != nil {
@@ -1047,10 +1035,19 @@ func CheckSSTConflicts(
 				if sstErr != nil {
 					return enginepb.MVCCStats{}, sstErr
 				}
-				if sstOK && !sstIter.UnsafeKey().Key.Equal(oldKey.Key) {
-					// sstIter stepped one key ahead. Re-seek extIter at this key.
-					extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
+				if sstOK && !sstIter.UnsafeKey().Key.Equal(oldKey.Key) && extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0 {
+					// sstIter stepped one key ahead. Re-seek both iterators at the next
+					// ext key.
+					extIter.NextKey()
 					extOK, extErr = extIter.Valid()
+					if extOK {
+						sstIter.SeekGE(MVCCKey{Key: extIter.UnsafeKey().Key})
+					}
+					sstOK, sstErr = sstIter.Valid()
+					if sstOK {
+						extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
+						extOK, extErr = extIter.Valid()
+					}
 				}
 				// If sstIter found a point key at the same MVCC Key, we still need
 				// to check for conflicts against it.
@@ -1062,24 +1059,28 @@ func CheckSSTConflicts(
 				// this logic does not guarantee forward progress in those cases.
 				sstIter.Next()
 				sstOK, sstErr = sstIter.Valid()
-				extIter.Next()
-				steppedExtIter = true
-				extOK, extErr = extIter.Valid()
 				sstChangedKeys := !sstOK || !sstIter.UnsafeKey().Key.Equal(oldKey.Key)
-				extChangedKeys := !extOK || !extIter.UnsafeKey().Key.Equal(oldKey.Key)
-				if sstChangedKeys && !extChangedKeys {
-					sstIter.SeekGE(MVCCKey{Key: extIter.UnsafeKey().Key})
-					sstOK, sstErr = sstIter.Valid()
-				}
-				// Re-seek the ext iterator if the ext iterator changed keys and:
-				// 1) the SST iterator did not change keys, and we need to bring the ext
-				//    iterator back.
-				// 2) the ext iterator became invalid
-				// 3) both iterators changed keys and the sst iterator's key is further
-				//    ahead.
-				if extChangedKeys && (!sstChangedKeys || (!extOK && sstOK) || extIter.UnsafeKey().Key.Compare(sstIter.UnsafeKey().Key) < 0) {
+				if sstOK && sstChangedKeys {
 					extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
 					extOK, extErr = extIter.Valid()
+				} else {
+					extIter.Next()
+					steppedExtIter = true
+					extOK, extErr = extIter.Valid()
+					extChangedKeys := !extOK || !extIter.UnsafeKey().Key.Equal(oldKey.Key)
+					if sstChangedKeys && !extChangedKeys {
+						sstIter.SeekGE(MVCCKey{Key: extIter.UnsafeKey().Key})
+						sstOK, sstErr = sstIter.Valid()
+					}
+					// Re-seek the ext iterator if the ext iterator changed keys and:
+					// 1) the SST iterator did not change keys, and we need to bring the ext
+					//    iterator back.
+					// 2) the ext iterator became invalid
+					// 3) both iterators changed keys.
+					if sstOK && extChangedKeys {
+						extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
+						extOK, extErr = extIter.Valid()
+					}
 				}
 				// If both iterators are invalid, we are now done. If one both iterators
 				// are at point keys under the same MVCC key, then we can check for
@@ -1101,6 +1102,7 @@ func CheckSSTConflicts(
 					// This SeekGE is purely to maintain the extIter > sstIter invariant
 					// as in most cases it'll be a no-op.
 					extIter.SeekGE(MVCCKey{Key: sstIter.UnsafeKey().Key})
+					extOK, extErr = extIter.Valid()
 				}
 			}
 		}
@@ -1139,7 +1141,7 @@ func CheckSSTConflicts(
 		return enginepb.MVCCStats{}, sstErr
 	}
 	if len(intents) > 0 {
-		return enginepb.MVCCStats{}, &roachpb.WriteIntentError{Intents: intents}
+		return enginepb.MVCCStats{}, &kvpb.WriteIntentError{Intents: intents}
 	}
 
 	return statsDiff, nil
@@ -1162,7 +1164,7 @@ func UpdateSSTTimestamps(
 		return nil, enginepb.MVCCStats{}, errors.Errorf("to timestamp not given")
 	}
 
-	sstOut := &MemFile{}
+	sstOut := &MemObject{}
 	sstOut.Buffer.Grow(len(sst))
 
 	var statsDelta enginepb.MVCCStats

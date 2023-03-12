@@ -23,7 +23,7 @@ import (
 )
 
 // Analyzer is an analysis.Analyzer that checks for unused or discarded
-// roachpb.Error objects from function calls.
+// kvpb.Error objects from function calls.
 var Analyzer = &analysis.Analyzer{
 	Name:     "redactcheck",
 	Doc:      "checks registered redact-safe types against an allow-list",
@@ -62,6 +62,9 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 					"github.com/cockroachdb/cockroach/pkg/cli/exit": {
 						"Code": {},
 					},
+					"github.com/cockroachdb/cockroach/pkg/config": {
+						"Field": {},
+					},
 					"github.com/cockroachdb/cockroach/pkg/kv/bulk/bulkpb": {
 						"sz":     {},
 						"timing": {},
@@ -73,12 +76,16 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"sz":     {},
 						"timing": {},
 					},
+					"github.com/cockroachdb/cockroach/pkg/kv/kvpb": {
+						"Method": {},
+					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb": {
 						"LAI":    {},
 						"SeqNum": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock": {
 						"Durability": {},
+						"Mode":       {},
 						"Strength":   {},
 						"WaitPolicy": {},
 					},
@@ -90,7 +97,6 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 					},
 					"github.com/cockroachdb/cockroach/pkg/roachpb": {
 						"LeaseSequence":     {},
-						"Method":            {},
 						"NodeID":            {},
 						"RangeGeneration":   {},
 						"RangeID":           {},

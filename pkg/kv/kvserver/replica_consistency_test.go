@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -48,7 +49,7 @@ func TestReplicaChecksumVersion(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "matchingVersion", func(t *testing.T, matchingVersion bool) {
 		cc := kvserverpb.ComputeChecksum{
 			ChecksumID: uuid.FastMakeV4(),
-			Mode:       roachpb.ChecksumMode_CHECK_FULL,
+			Mode:       kvpb.ChecksumMode_CHECK_FULL,
 		}
 		if matchingVersion {
 			cc.Version = batcheval.ReplicaChecksumVersion
@@ -79,6 +80,92 @@ func TestReplicaChecksumVersion(t *testing.T) {
 	})
 }
 
+func TestStoreCheckpointSpans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s := Store{}
+	s.mu.replicasByKey = newStoreReplicaBTree()
+	s.mu.replicaPlaceholders = map[roachpb.RangeID]*ReplicaPlaceholder{}
+
+	makeDesc := func(rangeID roachpb.RangeID, start, end string) roachpb.RangeDescriptor {
+		desc := roachpb.RangeDescriptor{RangeID: rangeID}
+		if start != "" {
+			desc.StartKey = roachpb.RKey(start)
+			desc.EndKey = roachpb.RKey(end)
+		}
+		return desc
+	}
+	var descs []roachpb.RangeDescriptor
+	addReplica := func(rangeID roachpb.RangeID, start, end string) {
+		desc := makeDesc(rangeID, start, end)
+		r := &Replica{RangeID: rangeID, startKey: desc.StartKey}
+		r.mu.state.Desc = &desc
+		r.isInitialized.Set(desc.IsInitialized())
+		require.NoError(t, s.addToReplicasByRangeIDLocked(r))
+		if r.IsInitialized() {
+			require.NoError(t, s.addToReplicasByKeyLocked(r, r.Desc()))
+			descs = append(descs, desc)
+		}
+	}
+	addPlaceholder := func(rangeID roachpb.RangeID, start, end string) {
+		require.NoError(t, s.addPlaceholderLocked(
+			&ReplicaPlaceholder{rangeDesc: makeDesc(rangeID, start, end)},
+		))
+	}
+
+	addReplica(1, "a", "b")
+	addReplica(4, "b", "c")
+	addPlaceholder(5, "c", "d")
+	addReplica(2, "e", "f")
+	addReplica(3, "", "") // uninitialized
+
+	want := [][]string{{
+		// r1 with keys [a, b). The checkpoint includes range-ID replicated and
+		// unreplicated keyspace for ranges 1-2 and 4. Range 2 is included because
+		// it's a neighbour of r1 by range ID. The checkpoint also includes
+		// replicated user keyspace {a-c} owned by ranges 1 and 4.
+		"/Local/RangeID/{1\"\"-3\"\"}",
+		"/Local/RangeID/{4\"\"-5\"\"}",
+		"/Local/Range\"{a\"-c\"}",
+		"/Local/Lock/Intent/Local/Range\"{a\"-c\"}",
+		"/Local/Lock/Intent\"{a\"-c\"}",
+		"{a-c}",
+	}, {
+		// r4 with keys [b, c). The checkpoint includes range-ID replicated and
+		// unreplicated keyspace for ranges 3-4, 1 and 2. Range 3 is included
+		// because it's a neighbour of r4 by range ID. The checkpoint also includes
+		// replicated user keyspace {a-f} owned by ranges 1, 4, and 2.
+		"/Local/RangeID/{3\"\"-5\"\"}",
+		"/Local/RangeID/{1\"\"-2\"\"}",
+		"/Local/RangeID/{2\"\"-3\"\"}",
+		"/Local/Range\"{a\"-f\"}",
+		"/Local/Lock/Intent/Local/Range\"{a\"-f\"}",
+		"/Local/Lock/Intent\"{a\"-f\"}",
+		"{a-f}",
+	}, {
+		// r2 with keys [e, f). The checkpoint includes range-ID replicated and
+		// unreplicated keyspace for ranges 1-3 and 4. Ranges 1 and 3 are included
+		// because they are neighbours of r2 by range ID. The checkpoint also
+		// includes replicated user keyspace {b-f} owned by ranges 4 and 2.
+		"/Local/RangeID/{1\"\"-4\"\"}",
+		"/Local/RangeID/{4\"\"-5\"\"}",
+		"/Local/Range\"{b\"-f\"}",
+		"/Local/Lock/Intent/Local/Range\"{b\"-f\"}",
+		"/Local/Lock/Intent\"{b\"-f\"}",
+		"{b-f}",
+	}}
+
+	require.Len(t, want, len(descs))
+	for i, desc := range descs {
+		spans := s.checkpointSpans(&desc)
+		got := make([]string, 0, len(spans))
+		for _, s := range spans {
+			got = append(got, s.String())
+		}
+		require.Equal(t, want[i], got, i)
+	}
+}
+
 func TestGetChecksumNotSuccessfulExitConditions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -93,7 +180,7 @@ func TestGetChecksumNotSuccessfulExitConditions(t *testing.T) {
 	startChecksumTask := func(ctx context.Context, id uuid.UUID) error {
 		return tc.repl.computeChecksumPostApply(ctx, kvserverpb.ComputeChecksum{
 			ChecksumID: id,
-			Mode:       roachpb.ChecksumMode_CHECK_FULL,
+			Mode:       kvpb.ChecksumMode_CHECK_FULL,
 			Version:    batcheval.ReplicaChecksumVersion,
 		})
 	}
@@ -184,7 +271,7 @@ func TestReplicaChecksumSHA512(t *testing.T) {
 
 	// Hash the empty state.
 	unlim := quotapool.NewRateLimiter("test", quotapool.Inf(), 0)
-	rd, err := CalcReplicaDigest(ctx, desc, eng, roachpb.ChecksumMode_CHECK_FULL, unlim)
+	rd, err := CalcReplicaDigest(ctx, desc, eng, kvpb.ChecksumMode_CHECK_FULL, unlim)
 	require.NoError(t, err)
 	fmt.Fprintf(sb, "checksum0: %x\n", rd.SHA512)
 
@@ -222,13 +309,13 @@ func TestReplicaChecksumSHA512(t *testing.T) {
 			require.NoError(t, storage.MVCCPut(ctx, eng, nil, key, ts, localTS, value, nil))
 		}
 
-		rd, err = CalcReplicaDigest(ctx, desc, eng, roachpb.ChecksumMode_CHECK_FULL, unlim)
+		rd, err = CalcReplicaDigest(ctx, desc, eng, kvpb.ChecksumMode_CHECK_FULL, unlim)
 		require.NoError(t, err)
 		fmt.Fprintf(sb, "checksum%d: %x\n", i+1, rd.SHA512)
 	}
 
 	// Run another check to obtain stats for the final state.
-	rd, err = CalcReplicaDigest(ctx, desc, eng, roachpb.ChecksumMode_CHECK_FULL, unlim)
+	rd, err = CalcReplicaDigest(ctx, desc, eng, kvpb.ChecksumMode_CHECK_FULL, unlim)
 	require.NoError(t, err)
 	jsonpb := protoutil.JSONPb{Indent: "  "}
 	json, err := jsonpb.Marshal(&rd.RecomputedMS)

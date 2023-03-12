@@ -17,11 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -44,7 +43,7 @@ func getTimeFromSeconds(seconds int64) *time.Time {
 func (s *statusServer) CombinedStatementStats(
 	ctx context.Context, req *serverpb.CombinedStatementsStatsRequest,
 ) (*serverpb.StatementsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
@@ -146,19 +145,16 @@ func collectCombinedStatements(
 				app_name,
 				max(aggregated_ts) as aggregated_ts,
 				metadata,
-				crdb_internal.merge_statement_stats(array_agg(statistics)) AS statistics,
-				max(sampled_plan) AS sampled_plan,
-				aggregation_interval
+				crdb_internal.merge_statement_stats(array_agg(statistics)) AS statistics
 		FROM crdb_internal.statement_statistics %s
 		GROUP BY
 				fingerprint_id,
 				transaction_fingerprint_id,
 				app_name,
-				metadata,
-				aggregation_interval
+				metadata
 		%s`, whereClause, orderAndLimit)
 
-	const expectedNumDatums = 8
+	const expectedNumDatums = 6
 
 	it, err := ie.QueryIteratorEx(ctx, "combined-stmts-by-interval", nil,
 		sessiondata.NodeUserSessionDataOverride, query, args...)
@@ -199,7 +195,7 @@ func collectCombinedStatements(
 		app := string(tree.MustBeDString(row[2]))
 		aggregatedTs := tree.MustBeDTimestampTZ(row[3]).Time
 
-		var metadata roachpb.CollectedStatementStatistics
+		var metadata appstatspb.CollectedStatementStatistics
 		metadataJSON := tree.MustBeDJSON(row[4]).JSON
 		if err = sqlstatsutil.DecodeStmtStatsMetadataJSON(metadataJSON, &metadata); err != nil {
 			return nil, serverError(ctx, err)
@@ -207,29 +203,19 @@ func collectCombinedStatements(
 
 		metadata.Key.App = app
 		metadata.Key.TransactionFingerprintID =
-			roachpb.TransactionFingerprintID(transactionFingerprintID)
+			appstatspb.TransactionFingerprintID(transactionFingerprintID)
 
 		statsJSON := tree.MustBeDJSON(row[5]).JSON
 		if err = sqlstatsutil.DecodeStmtStatsStatisticsJSON(statsJSON, &metadata.Stats); err != nil {
 			return nil, serverError(ctx, err)
 		}
 
-		planJSON := tree.MustBeDJSON(row[6]).JSON
-		plan, err := sqlstatsutil.JSONToExplainTreePlanNode(planJSON)
-		if err != nil {
-			return nil, serverError(ctx, err)
-		}
-		metadata.Stats.SensitiveInfo.MostRecentPlanDescription = *plan
-
-		aggInterval := tree.MustBeDInterval(row[7]).Duration
-
 		stmt := serverpb.StatementsResponse_CollectedStatementStatistics{
 			Key: serverpb.StatementsResponse_ExtendedStatementStatisticsKey{
-				KeyData:             metadata.Key,
-				AggregatedTs:        aggregatedTs,
-				AggregationInterval: time.Duration(aggInterval.Nanos()),
+				KeyData:      metadata.Key,
+				AggregatedTs: aggregatedTs,
 			},
-			ID:    roachpb.StmtFingerprintID(statementFingerprintID),
+			ID:    appstatspb.StmtFingerprintID(statementFingerprintID),
 			Stats: metadata.Stats,
 		}
 
@@ -258,17 +244,15 @@ func collectCombinedTransactions(
 				max(aggregated_ts) as aggregated_ts,
 				fingerprint_id,
 				metadata,
-				crdb_internal.merge_transaction_stats(array_agg(statistics)) AS statistics,
-				aggregation_interval
+				crdb_internal.merge_transaction_stats(array_agg(statistics)) AS statistics
 			FROM crdb_internal.transaction_statistics %s
 			GROUP BY
 				app_name,
 				fingerprint_id,
-				metadata,
-				aggregation_interval
+				metadata
 			%s`, whereClause, orderAndLimit)
 
-	const expectedNumDatums = 6
+	const expectedNumDatums = 5
 
 	it, err := ie.QueryIteratorEx(ctx, "combined-txns-by-interval", nil,
 		sessiondata.NodeUserSessionDataOverride, query, args...)
@@ -303,7 +287,7 @@ func collectCombinedTransactions(
 			return nil, serverError(ctx, err)
 		}
 
-		var metadata roachpb.CollectedTransactionStatistics
+		var metadata appstatspb.CollectedTransactionStatistics
 		metadataJSON := tree.MustBeDJSON(row[3]).JSON
 		if err = sqlstatsutil.DecodeTxnStatsMetadataJSON(metadataJSON, &metadata); err != nil {
 			return nil, serverError(ctx, err)
@@ -314,16 +298,13 @@ func collectCombinedTransactions(
 			return nil, serverError(ctx, err)
 		}
 
-		aggInterval := tree.MustBeDInterval(row[5]).Duration
-
 		txnStats := serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics{
-			StatsData: roachpb.CollectedTransactionStatistics{
+			StatsData: appstatspb.CollectedTransactionStatistics{
 				StatementFingerprintIDs:  metadata.StatementFingerprintIDs,
 				App:                      app,
 				Stats:                    metadata.Stats,
 				AggregatedTs:             aggregatedTs,
-				AggregationInterval:      time.Duration(aggInterval.Nanos()),
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(fingerprintID),
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(fingerprintID),
 			},
 		}
 
@@ -340,7 +321,7 @@ func collectCombinedTransactions(
 func (s *statusServer) StatementDetails(
 	ctx context.Context, req *serverpb.StatementDetailsRequest,
 ) (*serverpb.StatementDetailsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
@@ -377,7 +358,7 @@ func getStatementDetails(
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
-	statementStatisticsPerPlanHash, err := getStatementDetailsPerPlanHash(ctx, ie, whereClause, args, limit, settings)
+	statementStatisticsPerPlanHash, err := getStatementDetailsPerPlanHash(ctx, ie, whereClause, args, limit)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -509,8 +490,8 @@ func getTotalStatementDetails(
 		return statement, serverError(ctx, errors.Newf("expected %d columns, received %d", expectedNumDatums))
 	}
 
-	var statistics roachpb.CollectedStatementStatistics
-	var aggregatedMetadata roachpb.AggregatedStatementMetadata
+	var statistics appstatspb.CollectedStatementStatistics
+	var aggregatedMetadata appstatspb.AggregatedStatementMetadata
 	metadataJSON := tree.MustBeDJSON(row[0]).JSON
 
 	if err = sqlstatsutil.DecodeAggregatedMetadataJSON(metadataJSON, &aggregatedMetadata); err != nil {
@@ -613,8 +594,8 @@ func getStatementDetailsPerAggregatedTs(
 
 		aggregatedTs := tree.MustBeDTimestampTZ(row[0]).Time
 
-		var metadata roachpb.CollectedStatementStatistics
-		var aggregatedMetadata roachpb.AggregatedStatementMetadata
+		var metadata appstatspb.CollectedStatementStatistics
+		var aggregatedMetadata appstatspb.AggregatedStatementMetadata
 		metadataJSON := tree.MustBeDJSON(row[1]).JSON
 		if err = sqlstatsutil.DecodeAggregatedMetadataJSON(metadataJSON, &aggregatedMetadata); err != nil {
 			return nil, serverError(ctx, err)
@@ -720,7 +701,6 @@ func getStatementDetailsPerPlanHash(
 	whereClause string,
 	args []interface{},
 	limit int64,
-	settings *cluster.Settings,
 ) ([]serverpb.StatementDetailsResponse_CollectedStatementGroupedByPlanHash, error) {
 
 	query := fmt.Sprintf(
@@ -730,23 +710,6 @@ func getStatementDetailsPerPlanHash(
 				crdb_internal.merge_stats_metadata(array_agg(metadata)) AS metadata,
 				crdb_internal.merge_statement_stats(array_agg(statistics)) AS statistics,
 				max(sampled_plan) as sampled_plan,
-				aggregation_interval
-		FROM crdb_internal.statement_statistics %s
-		GROUP BY
-				plan_hash,
-				plan_gist,
-				aggregation_interval
-		LIMIT $%d`, whereClause, len(args)+1)
-	expectedNumDatums := 6
-
-	if settings.Version.IsActive(ctx, clusterversion.V22_2AlterSystemStatementStatisticsAddIndexRecommendations) {
-		query = fmt.Sprintf(
-			`SELECT
-				plan_hash,
-				(statistics -> 'statistics' -> 'planGists'->>0) as plan_gist,
-				crdb_internal.merge_stats_metadata(array_agg(metadata)) AS metadata,
-				crdb_internal.merge_statement_stats(array_agg(statistics)) AS statistics,
-				max(sampled_plan) as sampled_plan,
 				aggregation_interval,
 				index_recommendations
 		FROM crdb_internal.statement_statistics %s
@@ -756,8 +719,7 @@ func getStatementDetailsPerPlanHash(
 				aggregation_interval,
 				index_recommendations
 		LIMIT $%d`, whereClause, len(args)+1)
-		expectedNumDatums = 7
-	}
+	expectedNumDatums := 7
 
 	args = append(args, limit)
 
@@ -797,8 +759,8 @@ func getStatementDetailsPerPlanHash(
 			explainPlan = getExplainPlanFromGist(ctx, ie, planGist)
 		}
 
-		var metadata roachpb.CollectedStatementStatistics
-		var aggregatedMetadata roachpb.AggregatedStatementMetadata
+		var metadata appstatspb.CollectedStatementStatistics
+		var aggregatedMetadata appstatspb.AggregatedStatementMetadata
 		metadataJSON := tree.MustBeDJSON(row[2]).JSON
 		if err = sqlstatsutil.DecodeAggregatedMetadataJSON(metadataJSON, &aggregatedMetadata); err != nil {
 			return nil, serverError(ctx, err)

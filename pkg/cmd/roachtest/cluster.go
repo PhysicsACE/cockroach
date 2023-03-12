@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
@@ -88,7 +89,6 @@ var (
 	// to make it global and operate on runCmd.Flags() directly.
 	overrideFlagset  *pflag.FlagSet
 	overrideNumNodes = -1
-	buildTag         string
 	clusterName      string
 	clusterWipe      bool
 	zonesF           string
@@ -98,6 +98,7 @@ var (
 
 const (
 	defaultEncryptionProbability = 1
+	defaultCockroachPath         = "./cockroach-default"
 )
 
 type errBinaryOrLibraryNotFound struct {
@@ -267,8 +268,10 @@ func initBinariesAndLibraries() {
 }
 
 // execCmd is like execCmdEx, but doesn't return the command's output.
-func execCmd(ctx context.Context, l *logger.Logger, clusterName string, args ...string) error {
-	return execCmdEx(ctx, l, clusterName, args...).err
+func execCmd(
+	ctx context.Context, l *logger.Logger, clusterName string, secure bool, args ...string,
+) error {
+	return execCmdEx(ctx, l, clusterName, secure, args...).err
 }
 
 type cmdRes struct {
@@ -283,7 +286,9 @@ type cmdRes struct {
 // Note that the output is truncated; only a tail is returned.
 // Also note that if the command exits with an error code, its output is also
 // included in cmdRes.err.
-func execCmdEx(ctx context.Context, l *logger.Logger, clusterName string, args ...string) cmdRes {
+func execCmdEx(
+	ctx context.Context, l *logger.Logger, clusterName string, secure bool, args ...string,
+) cmdRes {
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
@@ -380,7 +385,7 @@ func execCmdEx(ctx context.Context, l *logger.Logger, clusterName string, args .
 		}
 	}
 
-	err := roachprod.Run(ctx, l, clusterName, "" /* SSHOptions */, "" /* processTag */, false /* secure */, roachprodRunStdout, roachprodRunStderr, args)
+	err := roachprod.Run(ctx, l, clusterName, "" /* SSHOptions */, "" /* processTag */, secure, roachprodRunStdout, roachprodRunStderr, args)
 	closePipes(ctx)
 	wg.Wait()
 
@@ -1043,14 +1048,14 @@ func (c *clusterImpl) StopCockroachGracefullyOnNode(
 	gracefulOpts.RoachprodOpts.Sig = 15 // SIGTERM
 	gracefulOpts.RoachprodOpts.Wait = true
 	gracefulOpts.RoachprodOpts.MaxWait = 60
-	c.Stop(ctx, l, gracefulOpts, c.Node(node))
-	// NB: we still call Stop to make sure the process is dead when we try
-	// to restart it (or we'll catch an error from the RocksDB dir being
-	// locked). This won't happen unless run with --local due to timing.
-	c.Stop(ctx, l, option.DefaultStopOpts(), c.Node(node))
-	// TODO(tschottdorf): should return an error. I doubt that we want to
-	//  call these *testing.T-style methods on goroutines.
-	return nil
+	if err := c.StopE(ctx, l, gracefulOpts, c.Node(node)); err != nil {
+		return err
+	}
+
+	// NB: we still call Stop to make sure the process is dead when we
+	// try to restart it (in case it takes longer than `MaxWait` for it
+	// to finish).
+	return c.StopE(ctx, l, option.DefaultStopOpts(), c.Node(node))
 }
 
 // Save marks the cluster as "saved" so that it doesn't get destroyed.
@@ -1152,7 +1157,7 @@ func (c *clusterImpl) FetchLogs(ctx context.Context, l *logger.Logger) error {
 			}
 		}
 
-		if err := c.RunE(ctx, c.All(), "mkdir -p logs/redacted && ./cockroach debug merge-logs --redact logs/*.log > logs/redacted/combined.log"); err != nil {
+		if err := c.RunE(ctx, c.All(), fmt.Sprintf("mkdir -p logs/redacted && %s debug merge-logs --redact logs/*.log > logs/redacted/combined.log", defaultCockroachPath)); err != nil {
 			l.Printf("failed to redact logs: %v", err)
 			if ctx.Err() != nil {
 				return err
@@ -1232,7 +1237,7 @@ func (c *clusterImpl) FetchTimeseriesData(ctx context.Context, l *logger.Logger)
 			sec = fmt.Sprintf("--certs-dir=%s", certs)
 		}
 		if err := c.RunE(
-			ctx, c.Node(node), fmt.Sprintf("./cockroach debug tsdump %s --format=raw > tsdump.gob", sec),
+			ctx, c.Node(node), fmt.Sprintf("%s debug tsdump %s --format=raw > tsdump.gob", defaultCockroachPath, sec),
 		); err != nil {
 			return err
 		}
@@ -1298,14 +1303,17 @@ func (c *clusterImpl) FetchDebugZip(ctx context.Context, l *logger.Logger) error
 		// assumption that a down node will refuse the connection, so it won't
 		// waste our time.
 		for i := 1; i <= c.spec.NodeCount; i++ {
-			// `./cockroach debug zip` is noisy. Suppress the output unless it fails.
+			// `cockroach debug zip` is noisy. Suppress the output unless it fails.
 			//
 			// Ignore the files in the the log directory; we pull the logs separately anyway
 			// so this would only cause duplication.
-			si := strconv.Itoa(i)
-			cmd := []string{"./cockroach", "debug", "zip", "--exclude-files='*.log,*.txt,*.pprof'", "--url", "{pgurl:" + si + "}", zipName}
-			if err := c.RunE(ctx, c.All(), cmd...); err != nil {
-				l.Printf("./cockroach debug zip failed: %v", err)
+			excludeFiles := "*.log,*.txt,*.pprof"
+			cmd := fmt.Sprintf(
+				"%s debug zip --exclude-files='%s' --url {pgurl:%d} %s",
+				defaultCockroachPath, excludeFiles, i, zipName,
+			)
+			if err := c.RunE(ctx, c.Node(i), cmd); err != nil {
+				l.Printf("%s debug zip failed on node %d: %v", defaultCockroachPath, i, err)
 				if i < c.spec.NodeCount {
 					continue
 				}
@@ -1334,15 +1342,14 @@ func (c *clusterImpl) assertNoDeadNode(ctx context.Context, t test.Test) {
 	}
 }
 
-// FailOnReplicaDivergence fails the test if
-// crdb_internal.check_consistency(true, ”, ”) indicates that any ranges'
-// replicas are inconsistent with each other. It uses the first node that
-// is up to run the query.
-func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t *testImpl) {
+// ConnectToLiveNode returns a connection to a live node in the cluster. If no
+// live node is found, it returns nil and -1. If a live node is found it returns
+// a connection to it and the node's index.
+func (c *clusterImpl) ConnectToLiveNode(ctx context.Context, t *testImpl) (*gosql.DB, int) {
+	node := -1
 	if c.spec.NodeCount < 1 {
-		return // unit tests
+		return nil, node // unit tests
 	}
-
 	// Find a live node to run against, if one exists.
 	var db *gosql.DB
 	for i := 1; i <= c.spec.NodeCount; i++ {
@@ -1359,15 +1366,32 @@ func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t *testImpl) 
 			db = nil
 			continue
 		}
-		t.L().Printf("running (fast) consistency checks on node %d", i)
+		node = i
 		break
 	}
 	if db == nil {
-		t.L().Printf("no live node found, skipping consistency check")
-		return
+		return nil, node
 	}
-	defer db.Close()
+	return db, node
+}
 
+// FailOnInvalidDescriptors fails the test if there exists any descriptors in
+// the crdb_internal.invalid_objects virtual table.
+func (c *clusterImpl) FailOnInvalidDescriptors(ctx context.Context, db *gosql.DB, t *testImpl) {
+	if err := contextutil.RunWithTimeout(
+		ctx, "invalid descriptors check", 5*time.Minute,
+		func(ctx context.Context) error {
+			return roachtestutil.CheckInvalidDescriptors(db)
+		},
+	); err != nil {
+		t.Errorf("invalid descriptors check failed: %v", err)
+	}
+}
+
+// FailOnReplicaDivergence fails the test if
+// crdb_internal.check_consistency(true, ”, ”) indicates that any ranges'
+// replicas are inconsistent with each other.
+func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, db *gosql.DB, t *testImpl) {
 	if err := contextutil.RunWithTimeout(
 		ctx, "consistency check", 5*time.Minute,
 		func(ctx context.Context) error {
@@ -1399,7 +1423,7 @@ func (c *clusterImpl) FetchDmesg(ctx context.Context, l *logger.Logger) error {
 		}
 
 		// Run dmesg on all nodes to redirect the kernel ring buffer content to a file.
-		cmd := []string{"/bin/bash", "-c", "'sudo dmesg > " + name + "'"}
+		cmd := []string{"/bin/bash", "-c", "'sudo dmesg -T > " + name + "'"}
 		var results []install.RunResultDetails
 		var combinedDmesgError error
 		if results, combinedDmesgError = c.RunWithDetails(ctx, nil, c.All(), cmd...); combinedDmesgError != nil {
@@ -1632,6 +1656,18 @@ func (c *clusterImpl) PutE(
 	c.status("uploading file")
 	defer c.status("")
 	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, true /* useTreeDist */), "cluster.PutE")
+}
+
+// PutDefaultCockroach uploads the cockroach binary passed in the
+// command line to `defaultCockroachPath` in every node in the
+// cluster. This binary is used by the test runner to collect failure
+// artifacts since tests are free to upload the cockroach binary they
+// use to any location they desire.
+func (c *clusterImpl) PutDefaultCockroach(
+	ctx context.Context, l *logger.Logger, cockroachPath string,
+) error {
+	c.status("uploading default cockroach binary to nodes")
+	return c.PutE(ctx, l, cockroachPath, defaultCockroachPath, c.All())
 }
 
 // PutLibraries inserts the specified libraries, by name, into all nodes on the cluster
@@ -1950,7 +1986,7 @@ func (c *clusterImpl) RunE(ctx context.Context, node option.NodeListOption, args
 	if err := errors.Wrap(ctx.Err(), "cluster.RunE"); err != nil {
 		return err
 	}
-	err = execCmd(ctx, l, c.MakeNodes(node), args...)
+	err = execCmd(ctx, l, c.MakeNodes(node), c.IsSecure(), args...)
 
 	l.Printf("> result: %+v", err)
 	if err := ctx.Err(); err != nil {
@@ -2071,29 +2107,13 @@ func (c *clusterImpl) Install(
 	return errors.Wrap(roachprod.Install(ctx, l, c.MakeNodes(nodes), software), "cluster.Install")
 }
 
-var reOnlyAlphanumeric = regexp.MustCompile(`[^a-zA-Z0-9]+`)
-
 // cmdLogFileName comes up with a log file to use for the given argument string.
 func cmdLogFileName(t time.Time, nodes option.NodeListOption, args ...string) string {
-	// Make sure we treat {"./cockroach start"} like {"./cockroach", "start"}.
-	args = strings.Split(strings.Join(args, " "), " ")
-	prefix := []string{reOnlyAlphanumeric.ReplaceAllString(args[0], "")}
-	for _, arg := range args[1:] {
-		if s := reOnlyAlphanumeric.ReplaceAllString(arg, ""); s != arg {
-			break
-		}
-		prefix = append(prefix, arg)
-	}
-	s := strings.Join(prefix, "_")
-	const maxLen = 70
-	if len(s) > maxLen {
-		s = s[:maxLen]
-	}
 	logFile := fmt.Sprintf(
 		"run_%s_n%s_%s",
 		t.Format(`150405.000000000`),
 		nodes.String()[1:],
-		s,
+		install.GenFilenameFromArgs(20, args...),
 	)
 	return logFile
 }
@@ -2117,9 +2137,12 @@ func (c *clusterImpl) loggerForCmd(
 // internal IPs and communication from a test driver to nodes in a cluster
 // should use external IPs.
 func (c *clusterImpl) pgURLErr(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption, external bool,
+	ctx context.Context, l *logger.Logger, node option.NodeListOption, external bool, tenant string,
 ) ([]string, error) {
-	urls, err := roachprod.PgURL(ctx, l, c.MakeNodes(node), c.localCertsDir, external, c.localCertsDir != "" /* secure */)
+	urls, err := roachprod.PgURL(ctx, l, c.MakeNodes(node), c.localCertsDir, roachprod.PGURLOptions{
+		External:   external,
+		Secure:     c.localCertsDir != "",
+		TenantName: tenant})
 	if err != nil {
 		return nil, err
 	}
@@ -2131,9 +2154,9 @@ func (c *clusterImpl) pgURLErr(
 
 // InternalPGUrl returns the internal Postgres endpoint for the specified nodes.
 func (c *clusterImpl) InternalPGUrl(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, node option.NodeListOption, tenant string,
 ) ([]string, error) {
-	return c.pgURLErr(ctx, l, node, false /* external */)
+	return c.pgURLErr(ctx, l, node, false, tenant)
 }
 
 // Silence unused warning.
@@ -2141,9 +2164,9 @@ var _ = (&clusterImpl{}).InternalPGUrl
 
 // ExternalPGUrl returns the external Postgres endpoint for the specified nodes.
 func (c *clusterImpl) ExternalPGUrl(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, node option.NodeListOption, tenant string,
 ) ([]string, error) {
-	return c.pgURLErr(ctx, l, node, true /* external */)
+	return c.pgURLErr(ctx, l, node, true, tenant)
 }
 
 func addrToAdminUIAddr(c *clusterImpl, addr string) (string, error) {
@@ -2233,7 +2256,7 @@ func (c *clusterImpl) InternalAddr(
 	ctx context.Context, l *logger.Logger, node option.NodeListOption,
 ) ([]string, error) {
 	var addrs []string
-	urls, err := c.pgURLErr(ctx, l, node, false /* external */)
+	urls, err := c.pgURLErr(ctx, l, node, false, "")
 	if err != nil {
 		return nil, err
 	}
@@ -2272,7 +2295,7 @@ func (c *clusterImpl) ExternalAddr(
 	ctx context.Context, l *logger.Logger, node option.NodeListOption,
 ) ([]string, error) {
 	var addrs []string
-	urls, err := c.pgURLErr(ctx, l, node, true /* external */)
+	urls, err := c.pgURLErr(ctx, l, node, true, "")
 	if err != nil {
 		return nil, err
 	}
@@ -2309,12 +2332,10 @@ func (c *clusterImpl) ExternalIP(
 var _ = (&clusterImpl{}).ExternalIP
 
 // Conn returns a SQL connection to the specified node.
-func (c *clusterImpl) Conn(ctx context.Context, l *logger.Logger, node int) *gosql.DB {
-	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node))
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	db, err := gosql.Open("postgres", urls[0])
+func (c *clusterImpl) Conn(
+	ctx context.Context, l *logger.Logger, node int, opts ...func(*option.ConnOption),
+) *gosql.DB {
+	db, err := c.ConnE(ctx, l, node, opts...)
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -2322,33 +2343,28 @@ func (c *clusterImpl) Conn(ctx context.Context, l *logger.Logger, node int) *gos
 }
 
 // ConnE returns a SQL connection to the specified node.
-func (c *clusterImpl) ConnE(ctx context.Context, l *logger.Logger, node int) (*gosql.DB, error) {
-	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node))
-	if err != nil {
-		return nil, err
-	}
-	db, err := gosql.Open("postgres", urls[0])
-	if err != nil {
-		return nil, err
-	}
-	return db, nil
-}
-
-// ConnEAsUser returns a SQL connection to the specified node as a specific user
-func (c *clusterImpl) ConnEAsUser(
-	ctx context.Context, l *logger.Logger, node int, user string,
+func (c *clusterImpl) ConnE(
+	ctx context.Context, l *logger.Logger, node int, opts ...func(*option.ConnOption),
 ) (*gosql.DB, error) {
-	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node))
+
+	connOptions := &option.ConnOption{}
+	for _, opt := range opts {
+		opt(connOptions)
+	}
+	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node), connOptions.TenantName)
 	if err != nil {
 		return nil, err
 	}
 
-	u, err := url.Parse(urls[0])
-	if err != nil {
-		return nil, err
+	dataSourceName := urls[0]
+	if connOptions.User != "" {
+		u, err := url.Parse(urls[0])
+		if err != nil {
+			return nil, err
+		}
+		u.User = url.User(connOptions.User)
+		dataSourceName = u.String()
 	}
-	u.User = url.User(user)
-	dataSourceName := u.String()
 	db, err := gosql.Open("postgres", dataSourceName)
 	if err != nil {
 		return nil, err
@@ -2367,8 +2383,7 @@ func (c *clusterImpl) MakeNodes(opts ...option.Option) string {
 }
 
 func (c *clusterImpl) IsLocal() bool {
-	// FIXME: I think radu made local more flexible and local is a prefix?
-	return c.name == "local"
+	return config.IsLocalClusterName(c.name)
 }
 
 func (c *clusterImpl) IsSecure() bool {
@@ -2397,7 +2412,7 @@ func (c *clusterImpl) NewMonitor(ctx context.Context, opts ...option.Option) clu
 func (c *clusterImpl) StartGrafana(
 	ctx context.Context, l *logger.Logger, promCfg *prometheus.Config,
 ) error {
-	return roachprod.StartGrafana(ctx, l, c.name, "", promCfg)
+	return roachprod.StartGrafana(ctx, l, c.name, "", nil, promCfg)
 }
 
 func (c *clusterImpl) StopGrafana(ctx context.Context, l *logger.Logger, dumpDir string) error {

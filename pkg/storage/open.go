@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/pebble"
@@ -65,9 +66,6 @@ var ForceWriterParallelism ConfigOption = func(cfg *engineConfig) error {
 // ForTesting configures the engine for use in testing. It may randomize some
 // config options to improve test coverage.
 var ForTesting ConfigOption = func(cfg *engineConfig) error {
-	if cfg.Settings == nil {
-		cfg.Settings = cluster.MakeTestingClusterSettings()
-	}
 	return nil
 }
 
@@ -78,9 +76,6 @@ var ForTesting ConfigOption = func(cfg *engineConfig) error {
 // we know there are only separated intents, this sidesteps any test issues
 // due to inconsistencies.
 var ForStickyEngineTesting ConfigOption = func(cfg *engineConfig) error {
-	if cfg.Settings == nil {
-		cfg.Settings = cluster.MakeTestingClusterSettings()
-	}
 	return nil
 }
 
@@ -132,18 +127,37 @@ func MaxOpenFiles(count int) ConfigOption {
 
 }
 
-// Settings sets the cluster settings to use.
-func Settings(settings *cluster.Settings) ConfigOption {
-	return func(cfg *engineConfig) error {
-		cfg.Settings = settings
-		return nil
-	}
-}
-
 // CacheSize configures the size of the block cache.
 func CacheSize(size int64) ConfigOption {
 	return func(cfg *engineConfig) error {
 		cfg.cacheSize = &size
+		return nil
+	}
+}
+
+// Caches sets the block and table caches. Useful when multiple stores share
+// the same caches.
+func Caches(cache *pebble.Cache, tableCache *pebble.TableCache) ConfigOption {
+	return func(cfg *engineConfig) error {
+		cfg.Opts.Cache = cache
+		cfg.Opts.TableCache = tableCache
+		return nil
+	}
+}
+
+// BallastSize sets the amount reserved by a ballast file for manual
+// out-of-disk recovery.
+func BallastSize(size int64) ConfigOption {
+	return func(cfg *engineConfig) error {
+		cfg.BallastSize = size
+		return nil
+	}
+}
+
+// SharedStorage enables use of shared storage (experimental).
+func SharedStorage(sharedStorage cloud.ExternalStorage) ConfigOption {
+	return func(cfg *engineConfig) error {
+		cfg.SharedStorage = sharedStorage
 		return nil
 	}
 }
@@ -154,6 +168,17 @@ func MaxConcurrentCompactions(n int) ConfigOption {
 	return func(cfg *engineConfig) error {
 		cfg.Opts.MaxConcurrentCompactions = func() int { return n }
 		return nil
+	}
+}
+
+// PebbleOptions contains Pebble-specific options in the same format as a
+// Pebble OPTIONS file. For example:
+// [Options]
+// delete_range_flush_delay=2s
+// flush_split_bytes=4096
+func PebbleOptions(pebbleOptions string, parseHooks *pebble.ParseHooks) ConfigOption {
+	return func(cfg *engineConfig) error {
+		return cfg.Opts.Parse(pebbleOptions, parseHooks)
 	}
 }
 
@@ -179,14 +204,6 @@ func Hook(hookFunc func(*base.StorageConfig) error) ConfigOption {
 		}
 		return hookFunc(&cfg.PebbleConfig.StorageConfig)
 	}
-}
-
-// LatestReleaseFormatMajorVersion opens the database already upgraded to the
-// latest release's format major version.
-var LatestReleaseFormatMajorVersion ConfigOption = func(cfg *engineConfig) error {
-	// TODO(jackson): Tie the below to the mapping in SetMinVersion.
-	cfg.PebbleConfig.Opts.FormatMajorVersion = pebble.FormatPrePebblev1Marked // v22.2
-	return nil
 }
 
 // If enables the given option if enable is true.
@@ -233,9 +250,12 @@ type engineConfig struct {
 
 // Open opens a new Pebble storage engine, reading and writing data to the
 // provided Location, configured with the provided options.
-func Open(ctx context.Context, loc Location, opts ...ConfigOption) (*Pebble, error) {
+func Open(
+	ctx context.Context, loc Location, settings *cluster.Settings, opts ...ConfigOption,
+) (*Pebble, error) {
 	var cfg engineConfig
 	cfg.Dir = loc.dir
+	cfg.Settings = settings
 	cfg.Opts = DefaultPebbleOptions()
 	cfg.Opts.FS = loc.fs
 	for _, opt := range opts {
@@ -243,25 +263,13 @@ func Open(ctx context.Context, loc Location, opts ...ConfigOption) (*Pebble, err
 			return nil, err
 		}
 	}
-	if cfg.cacheSize != nil {
+	if cfg.cacheSize != nil && cfg.Opts.Cache == nil {
 		cfg.Opts.Cache = pebble.NewCache(*cfg.cacheSize)
 		defer cfg.Opts.Cache.Unref()
-	}
-	if cfg.Settings == nil {
-		cfg.Settings = cluster.MakeClusterSettings()
 	}
 	p, err := NewPebble(ctx, cfg.PebbleConfig)
 	if err != nil {
 		return nil, err
-	}
-	// Set the active cluster version, ensuring the engine's format
-	// major version is ratcheted sufficiently high to match the
-	// settings cluster version.
-	if v := p.settings.Version.ActiveVersionOrEmpty(ctx).Version; v != (roachpb.Version{}) {
-		if err := p.SetMinVersion(v); err != nil {
-			p.Close()
-			return nil, err
-		}
 	}
 	return p, nil
 }

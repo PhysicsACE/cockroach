@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -65,7 +66,7 @@ func TestRaftSSTableSideloadingProposal(t *testing.T) {
 	}
 
 	{
-		ba := &roachpb.BatchRequest{}
+		ba := &kvpb.BatchRequest{}
 		get := getArgs(roachpb.Key(key))
 		ba.Add(&get)
 		ba.Header.RangeID = tc.repl.RangeID
@@ -74,7 +75,7 @@ func TestRaftSSTableSideloadingProposal(t *testing.T) {
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
-		v := br.Responses[0].GetInner().(*roachpb.GetResponse).Value
+		v := br.Responses[0].GetInner().(*kvpb.GetResponse).Value
 		if v == nil {
 			t.Fatal("expected to read a value")
 		}
@@ -150,7 +151,7 @@ func TestRaftSSTableSideloading(t *testing.T) {
 	// Disable log truncation to make sure our proposal stays in the log.
 	tc.store.SetRaftLogQueueActive(false)
 
-	ba := &roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.RangeID = tc.repl.RangeID
 
 	// Put a sideloaded proposal on the Range.
@@ -158,7 +159,7 @@ func TestRaftSSTableSideloading(t *testing.T) {
 	origSSTData, _ := MakeSSTable(ctx, key, val, hlc.Timestamp{}.Add(0, 1))
 	{
 
-		var addReq roachpb.AddSSTableRequest
+		var addReq kvpb.AddSSTableRequest
 		addReq.Data = origSSTData
 		addReq.Key = roachpb.Key(key)
 		addReq.EndKey = addReq.Key.Next()
@@ -179,11 +180,11 @@ func TestRaftSSTableSideloading(t *testing.T) {
 
 	rsl := logstore.NewStateLoader(tc.repl.RangeID)
 	lo := tc.repl.mu.state.TruncatedState.Index + 1
-	hi := tc.repl.mu.lastIndex + 1
+	hi := tc.repl.mu.lastIndexNotDurable + 1
 
 	tc.store.raftEntryCache.Clear(tc.repl.RangeID, hi)
 	ents, err := logstore.LoadEntries(
-		ctx, rsl, tc.store.Engine(), tc.repl.RangeID, tc.store.raftEntryCache,
+		ctx, rsl, tc.store.TODOEngine(), tc.repl.RangeID, tc.store.raftEntryCache,
 		tc.repl.raftMu.sideloaded, lo, hi, math.MaxUint64,
 	)
 	require.NoError(t, err)
@@ -199,7 +200,7 @@ func TestRaftSSTableSideloading(t *testing.T) {
 	var idx int
 	for idx = 0; idx < len(ents); idx++ {
 		// Get the SST back from the raft log.
-		if typ, _ := raftlog.EncodingOf(ents[idx]); typ != raftlog.EntryEncodingSideloaded {
+		if typ, _ := raftlog.EncodingOf(ents[idx]); !typ.IsSideloaded() {
 			continue
 		}
 		ent, err := logstore.MaybeInlineSideloadedRaftCommand(ctx, tc.repl.RangeID, ents[idx], tc.repl.raftMu.sideloaded, tc.store.raftEntryCache)
@@ -249,7 +250,7 @@ func TestRaftSSTableSideloadingTruncation(t *testing.T) {
 		fmtSideloaded := func() []string {
 			tc.repl.raftMu.Lock()
 			defer tc.repl.raftMu.Unlock()
-			fs, _ := tc.repl.Engine().List(tc.repl.raftMu.sideloaded.Dir())
+			fs, _ := tc.repl.store.TODOEngine().List(tc.repl.raftMu.sideloaded.Dir())
 			sort.Strings(fs)
 			return fs
 		}
@@ -264,7 +265,7 @@ func TestRaftSSTableSideloadingTruncation(t *testing.T) {
 			newFirstIndex := indexes[i] + 1
 			truncateArgs := truncateLogArgs(newFirstIndex, rangeID)
 			log.Eventf(ctx, "truncating to index < %d", newFirstIndex)
-			if _, pErr := kv.SendWrappedWith(ctx, tc.Sender(), roachpb.Header{RangeID: rangeID}, &truncateArgs); pErr != nil {
+			if _, pErr := kv.SendWrappedWith(ctx, tc.Sender(), kvpb.Header{RangeID: rangeID}, &truncateArgs); pErr != nil {
 				t.Fatal(pErr)
 			}
 			waitForTruncationForTesting(t, tc.repl, newFirstIndex, looselyCoupled)

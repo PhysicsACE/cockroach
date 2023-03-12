@@ -10,10 +10,7 @@
 
 import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import {
-  refreshTransactionInsights,
-  refreshExecutionInsights,
-} from "src/redux/apiReducers";
+import { refreshStmtInsights, refreshTxnInsights } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
 import {
   WorkloadInsightEventFilters,
@@ -27,11 +24,14 @@ import {
 } from "@cockroachlabs/cluster-ui";
 import {
   filtersLocalSetting,
-  selectExecutionInsights,
+  selectStmtInsights,
   sortSettingLocalSetting,
   selectTransactionInsights,
-  selectExecutionInsightsLoading,
+  selectStmtInsightsLoading,
   selectTransactionInsightsLoading,
+  selectInsightTypes,
+  selectStmtInsightsMaxApiReached,
+  selectTxnInsightsMaxApiReached,
 } from "src/views/insights/insightsSelectors";
 import { bindActionCreators } from "redux";
 import { LocalSetting } from "src/redux/localsettings";
@@ -51,26 +51,34 @@ const transactionMapStateToProps = (
   state: AdminUIState,
   _props: RouteComponentProps,
 ): TransactionInsightsViewStateProps => ({
+  isDataValid: state.cachedData.txnInsights?.valid,
+  lastUpdated: state.cachedData.txnInsights?.setAt,
   transactions: selectTransactionInsights(state),
-  transactionsError: state.cachedData?.transactionInsights?.lastError,
+  insightTypes: selectInsightTypes(),
+  transactionsError: state.cachedData?.txnInsights?.lastError,
   filters: filtersLocalSetting.selector(state),
   sortSetting: sortSettingLocalSetting.selector(state),
   timeScale: selectTimeScale(state),
   isLoading: selectTransactionInsightsLoading(state),
+  maxSizeApiReached: selectTxnInsightsMaxApiReached(state),
 });
 
 const statementMapStateToProps = (
   state: AdminUIState,
   _props: RouteComponentProps,
 ): StatementInsightsViewStateProps => ({
-  statements: selectExecutionInsights(state),
-  statementsError: state.cachedData?.executionInsights?.lastError,
+  isDataValid: state.cachedData.stmtInsights?.valid,
+  lastUpdated: state.cachedData.stmtInsights?.setAt,
+  statements: selectStmtInsights(state),
+  statementsError: state.cachedData?.stmtInsights?.lastError,
   filters: filtersLocalSetting.selector(state),
+  insightTypes: selectInsightTypes(),
   sortSetting: sortSettingLocalSetting.selector(state),
   selectedColumnNames:
     insightStatementColumnsLocalSetting.selectorToArray(state),
   timeScale: selectTimeScale(state),
-  isLoading: selectExecutionInsightsLoading(state),
+  isLoading: selectStmtInsightsLoading(state),
+  maxSizeApiReached: selectStmtInsightsMaxApiReached(state),
 });
 
 const TransactionDispatchProps = {
@@ -78,14 +86,14 @@ const TransactionDispatchProps = {
     filtersLocalSetting.set(filters),
   onSortChange: (ss: SortSetting) => sortSettingLocalSetting.set(ss),
   setTimeScale: setGlobalTimeScaleAction,
-  refreshTransactionInsights: refreshTransactionInsights,
+  refreshTransactionInsights: refreshTxnInsights,
 };
 
 const StatementDispatchProps: StatementInsightsViewDispatchProps = {
   onFiltersChange: (filters: WorkloadInsightEventFilters) =>
     filtersLocalSetting.set(filters),
   onSortChange: (ss: SortSetting) => sortSettingLocalSetting.set(ss),
-  refreshStatementInsights: refreshExecutionInsights,
+  refreshStatementInsights: refreshStmtInsights,
   onColumnsChange: (value: string[]) =>
     insightStatementColumnsLocalSetting.set(value.join(",")),
   setTimeScale: setGlobalTimeScaleAction,

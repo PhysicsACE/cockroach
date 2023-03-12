@@ -76,7 +76,19 @@ case "${cmd}" in
     fi
 
     # SSH into the node, since that's probably why we started it.
-    $0 ssh
+    echo "****************************************"
+    echo "Hint: you should also be able to directly invoke:"
+    echo "ssh ${FQNAME}"
+    echo "  or"
+    echo "mosh ${FQNAME}"
+    echo "instead of '$0 ssh'."
+    echo
+    if [ -z "${GCEWORKER_START_SSH_COMMAND-}" ]; then
+	echo "Connecting via SSH."
+	echo "Set GCEWORKER_START_SSH_COMMAND=mosh to use mosh instead"
+    fi
+    echo "****************************************"
+    $0 ${GCEWORKER_START_SSH_COMMAND-ssh}
     ;;
     stop)
     read -r -p "This will stop the VM. Are you sure? [yes] " response
@@ -135,13 +147,6 @@ case "${cmd}" in
     exit ${status}
     ;;
     ssh)
-    echo "****************************************"
-    echo "Hint: you should also be able to directly invoke:"
-    echo "ssh ${FQNAME}"
-    echo "  or"
-    echo "mosh ${FQNAME}"
-    echo "instead of '$0 ssh'."
-    echo "****************************************"
     gcloud compute ssh "${NAME}" --ssh-flag="-A" "$@"
     ;;
     mosh)
@@ -151,7 +156,13 @@ case "${cmd}" in
     gcloud "$@"
     ;;
     get)
-    from="${NAME}:go/src/github.com/cockroachdb/cockroach/${1}"
+    rpath="${1}"
+    # Check whether we have an absolute path like /foo, ~foo, or ~/foo.
+    # If not, base the path relative to the CRDB repo.
+    if [[ "${rpath:0:1}" != / && "${rpath:0:2}" != ~[/a-z] ]]; then
+        rpath="go/src/github.com/cockroachdb/cockroach/${rpath}"
+    fi
+    from="${NAME}:${rpath}"
     shift
     gcloud compute scp --recurse "${from}" "$@"
     ;;

@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -47,13 +48,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
@@ -361,7 +362,7 @@ func (s *adminServer) Databases(
 ) (_ *serverpb.DatabasesResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	sessionUser, err := userFromContext(ctx)
+	sessionUser, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -392,7 +393,7 @@ func (s *adminServer) databasesHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 
 	var resp serverpb.DatabasesResponse
 	var hasNext bool
@@ -431,7 +432,7 @@ func (s *adminServer) DatabaseDetails(
 	ctx context.Context, req *serverpb.DatabaseDetailsRequest,
 ) (_ *serverpb.DatabaseDetailsResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -480,7 +481,7 @@ func (s *adminServer) getDatabaseGrants(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 	{
 		const (
 			userCol       = "grantee"
@@ -544,7 +545,7 @@ WHERE table_catalog = $ AND table_type != 'SYSTEM VIEW'`, req.Database)
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 	{
 		ok, err := it.Next(ctx)
 		if err != nil {
@@ -642,7 +643,9 @@ func (s *adminServer) databaseDetailsHelper(
 		if err != nil {
 			return nil, err
 		}
-		dbIndexRecommendations, err := getDatabaseIndexRecommendations(ctx, req.Database, s.ie, s.st, s.sqlServer.execCfg)
+		dbIndexRecommendations, err := getDatabaseIndexRecommendations(
+			ctx, req.Database, s.ie, s.st, s.sqlServer.execCfg.UnusedIndexRecommendationsKnobs,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -667,7 +670,7 @@ func (s *adminServer) getDatabaseTableSpans(
 		if err != nil {
 			return nil, err
 		}
-		tableSpans[tableName] = generateTableSpan(tableID)
+		tableSpans[tableName] = generateTableSpan(tableID, s.sqlServer.execCfg.Codec)
 	}
 	return tableSpans, nil
 }
@@ -797,7 +800,7 @@ func (s *adminServer) TableDetails(
 	ctx context.Context, req *serverpb.TableDetailsRequest,
 ) (_ *serverpb.TableDetailsResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -834,7 +837,7 @@ func (s *adminServer) tableDetailsHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 	// TODO(cdo): protobuf v3's default behavior for fields with zero values (e.g. empty strings)
 	// is to suppress them. So, if protobuf field "foo" is an empty string, "foo" won't show
 	// up in the marshaled JSON. I feel that this is counterintuitive, and this should be fixed
@@ -907,7 +910,7 @@ func (s *adminServer) tableDetailsHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 	{
 		const (
 			nameCol      = "index_name"
@@ -971,7 +974,7 @@ func (s *adminServer) tableDetailsHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 	{
 		const (
 			userCol       = "grantee"
@@ -1158,7 +1161,7 @@ func (s *adminServer) tableDetailsHelper(
 	// Get the number of ranges in the table. We get the key span for the table
 	// data. Then, we count the number of ranges that make up that key span.
 	{
-		tableSpan := generateTableSpan(tableID)
+		tableSpan := generateTableSpan(tableID, s.sqlServer.execCfg.Codec)
 		tableRSpan, err := keys.SpanAddr(tableSpan)
 		if err != nil {
 			return nil, err
@@ -1187,8 +1190,8 @@ func (s *adminServer) tableDetailsHelper(
 //
 // NOTE: this doesn't make sense for interleaved (children) table. As of
 // 03/2018, callers around here use it anyway.
-func generateTableSpan(tableID descpb.ID) roachpb.Span {
-	tableStartKey := keys.TODOSQLCodec.TablePrefix(uint32(tableID))
+func generateTableSpan(tableID descpb.ID, codec keys.SQLCodec) roachpb.Span {
+	tableStartKey := codec.TablePrefix(uint32(tableID))
 	tableEndKey := tableStartKey.PrefixEnd()
 	return roachpb.Span{Key: tableStartKey, EndKey: tableEndKey}
 }
@@ -1200,7 +1203,7 @@ func (s *adminServer) TableStats(
 ) (*serverpb.TableStatsResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1220,7 +1223,7 @@ func (s *adminServer) TableStats(
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
-	tableSpan := generateTableSpan(tableID)
+	tableSpan := generateTableSpan(tableID, s.sqlServer.execCfg.Codec)
 
 	r, err := s.statsForSpan(ctx, tableSpan)
 	if err != nil {
@@ -1333,7 +1336,7 @@ func (s *adminServer) statsForSpan(
 	}
 	type nodeResponse struct {
 		nodeID roachpb.NodeID
-		resp   *serverpb.SpanStatsResponse
+		resp   *roachpb.SpanStatsResponse
 		err    error
 	}
 
@@ -1349,13 +1352,13 @@ func (s *adminServer) statsForSpan(
 			},
 			func(ctx context.Context) {
 				// Set a generous timeout on the context for each individual query.
-				var spanResponse *serverpb.SpanStatsResponse
+				var spanResponse *roachpb.SpanStatsResponse
 				err := contextutil.RunWithTimeout(ctx, "request remote stats", 20*time.Second,
 					func(ctx context.Context) error {
 						conn, err := s.serverIterator.dialNode(ctx, serverID(nodeID))
 						if err == nil {
 							client := serverpb.NewStatusClient(conn)
-							req := serverpb.SpanStatsRequest{
+							req := roachpb.SpanStatsRequest{
 								StartKey: rSpan.Key,
 								EndKey:   rSpan.EndKey,
 								NodeID:   nodeID.String(),
@@ -1441,7 +1444,7 @@ func (s *adminServer) Users(
 	ctx context.Context, req *serverpb.UsersRequest,
 ) (_ *serverpb.UsersResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1467,7 +1470,7 @@ func (s *adminServer) usersHelper(
 		return nil, err
 	}
 	// We have to make sure to close the iterator.
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 
 	var resp serverpb.UsersResponse
 	var ok bool
@@ -1558,7 +1561,7 @@ func (s *adminServer) eventsHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 
 	// Marshal response.
 	var resp serverpb.EventsResponse
@@ -1645,7 +1648,7 @@ func (s *adminServer) RangeLog(
 	ctx = s.AnnotateCtx(ctx)
 
 	// Range keys, even when pretty-printed, contain PII.
-	user, _, err := s.getUserAndRole(ctx)
+	user, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1695,7 +1698,7 @@ func (s *adminServer) rangeLogHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 
 	// Marshal response.
 	var resp serverpb.RangeLogResponse
@@ -1879,7 +1882,7 @@ func (s *adminServer) SetUIData(
 ) (*serverpb.SetUIDataResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1891,7 +1894,7 @@ func (s *adminServer) SetUIData(
 	for key, val := range req.KeyValues {
 		// Do an upsert of the key. We update each key in a separate transaction to
 		// avoid long-running transactions and possible deadlocks.
-		ie := s.sqlServer.internalExecutorFactory.MakeInternalExecutorWithoutTxn()
+		ie := s.sqlServer.internalDB.Executor()
 		query := `UPSERT INTO system.ui (key, value, "lastUpdated") VALUES ($1, $2, now())`
 		rowsAffected, err := ie.ExecEx(
 			ctx, "admin-set-ui-data", nil, /* txn */
@@ -1918,7 +1921,7 @@ func (s *adminServer) GetUIData(
 ) (*serverpb.GetUIDataResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1946,41 +1949,23 @@ func (s *adminServer) Settings(
 		keys = settings.Keys(settings.ForSystemTenant)
 	}
 
-	user, isAdmin, err := s.getUserAndRole(ctx)
+	_, isAdmin, err := s.getUserAndRole(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
 
-	var lookupPurpose settings.LookupPurpose
+	redactValues := true
 	if isAdmin {
 		// Root accesses can customize the purpose.
 		// This is used by the UI to see all values (local access)
 		// and `cockroach zip` to redact the values (telemetry).
-		lookupPurpose = settings.LookupForReporting
 		if req.UnredactedValues {
-			lookupPurpose = settings.LookupForLocalAccess
+			redactValues = false
 		}
 	} else {
 		// Non-root access cannot see the values in any case.
-		lookupPurpose = settings.LookupForReporting
-
-		hasView := s.checkHasGlobalPrivilege(ctx, user, privilege.VIEWCLUSTERSETTING)
-		hasModify := s.checkHasGlobalPrivilege(ctx, user, privilege.MODIFYCLUSTERSETTING)
-		if !hasModify && !hasView {
-			hasView, err := s.hasRoleOption(ctx, user, roleoption.VIEWCLUSTERSETTING)
-			if err != nil {
-				return nil, err
-			}
-
-			hasModify, err := s.hasRoleOption(ctx, user, roleoption.MODIFYCLUSTERSETTING)
-			if err != nil {
-				return nil, err
-			}
-			if !hasModify && !hasView {
-				return nil, grpcstatus.Errorf(
-					codes.PermissionDenied, "this operation requires either %s or %s system privileges",
-					privilege.VIEWCLUSTERSETTING, privilege.MODIFYCLUSTERSETTING)
-			}
+		if err := s.adminPrivilegeChecker.requireViewClusterSettingOrModifyClusterSettingPermission(ctx); err != nil {
+			return nil, err
 		}
 	}
 
@@ -2011,7 +1996,13 @@ func (s *adminServer) Settings(
 
 	resp := serverpb.SettingsResponse{KeyValues: make(map[string]serverpb.SettingsResponse_Value)}
 	for _, k := range keys {
-		v, ok := settings.Lookup(k, lookupPurpose, settings.ForSystemTenant)
+		var v settings.Setting
+		var ok bool
+		if redactValues {
+			v, ok = settings.LookupForReporting(k, settings.ForSystemTenant)
+		} else {
+			v, ok = settings.LookupForLocalAccess(k, settings.ForSystemTenant)
+		}
 		if !ok {
 			continue
 		}
@@ -2199,6 +2190,20 @@ func getLivenessResponse(
 	}, nil
 }
 
+// Liveness is implemented on the tenant-facing admin server
+// as a request through the tenant connector. Since at the
+// time of writing, the request contains no additional SQL
+// permission checks, the tenant capability gate is all
+// that is required. This is handled by the connector.
+func (s *adminServer) Liveness(
+	ctx context.Context, req *serverpb.LivenessRequest,
+) (*serverpb.LivenessResponse, error) {
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	return s.sqlServer.tenantConnect.Liveness(ctx, req)
+}
+
 // Liveness returns the liveness state of all nodes on the cluster
 // based on a KV transaction. To reach all nodes in the cluster, consider
 // using (statusServer).NodesWithLiveness instead.
@@ -2215,7 +2220,7 @@ func (s *adminServer) Jobs(
 ) (_ *serverpb.JobsResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2244,40 +2249,49 @@ func jobsHelper(
 	cfg *BaseConfig,
 	sv *settings.Values,
 ) (_ *serverpb.JobsResponse, retErr error) {
-	retryRunningCondition := "status='running' AND next_run > now() AND num_runs > 1"
-	retryRevertingCondition := "status='reverting' AND next_run > now() AND num_runs > 1"
 
 	q := makeSQLQuery()
 	q.Append(`
-      SELECT job_id, job_type, description, statement, user_name, descriptor_ids,
-            case
-              when ` + retryRunningCondition + ` then 'retry-running' 
-              when ` + retryRevertingCondition + ` then 'retry-reverting' 
-              else status
-            end as status, running_status, created, started, finished, modified, fraction_completed,
-            high_water_timestamp, error, last_run, next_run, num_runs, execution_events::string, coordinator_id
-        FROM crdb_internal.jobs
-       WHERE true
-	`)
-	if req.Status == "retrying" {
-		q.Append(" AND ( ( " + retryRunningCondition + " ) OR ( " + retryRevertingCondition + " ) )")
-	} else if req.Status != "" {
+SELECT
+  job_id,
+  job_type,
+  description,
+  statement,
+  user_name,
+  descriptor_ids,
+  status,
+  running_status,
+  created,
+  started,
+  finished,
+  modified,
+  fraction_completed,
+  high_water_timestamp,
+  error,
+  last_run,
+  next_run,
+  num_runs,
+  execution_events::string,
+  coordinator_id
+FROM crdb_internal.jobs
+WHERE true`) // Simplifies filter construction below.
+	if req.Status != "" {
 		q.Append(" AND status = $", req.Status)
 	}
 	if req.Type != jobspb.TypeUnspecified {
 		q.Append(" AND job_type = $", req.Type.String())
 	} else {
 		// Don't show automatic jobs in the overview page.
-		q.Append(" AND (")
+		q.Append(" AND ( job_type NOT IN (")
 		for idx, jobType := range jobspb.AutomaticJobTypes {
-			q.Append("job_type != $", jobType.String())
-			if idx < len(jobspb.AutomaticJobTypes)-1 {
-				q.Append(" AND ")
+			if idx != 0 {
+				q.Append(", ")
 			}
+			q.Append("$", jobType.String())
 		}
-		q.Append(" OR job_type IS NULL)")
+		q.Append(" ) OR job_type IS NULL)")
 	}
-	q.Append("ORDER BY created DESC")
+	q.Append(" ORDER BY created DESC")
 	if req.Limit > 0 {
 		q.Append(" LIMIT $", tree.DInt(req.Limit))
 	}
@@ -2291,7 +2305,7 @@ func jobsHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 
 	ok, err := it.Next(ctx)
 	if err != nil {
@@ -2410,7 +2424,7 @@ func (s *adminServer) Job(
 ) (_ *serverpb.JobResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2471,7 +2485,7 @@ func (s *adminServer) Locations(
 	ctx = s.AnnotateCtx(ctx)
 
 	// Require authentication.
-	_, err := userFromContext(ctx)
+	_, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2498,7 +2512,7 @@ func (s *adminServer) locationsHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 
 	ok, err := it.Next(ctx)
 	if err != nil {
@@ -2541,7 +2555,7 @@ func (s *adminServer) QueryPlan(
 ) (*serverpb.QueryPlanResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2584,7 +2598,7 @@ func (s *adminServer) QueryPlan(
 // getStatementBundle retrieves the statement bundle with the given id and
 // writes it out as an attachment.
 func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.ResponseWriter) {
-	sessionUser, err := userFromContext(ctx)
+	sessionUser, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2632,6 +2646,99 @@ func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.R
 	)
 
 	_, _ = io.Copy(w, &bundle)
+}
+
+// DecommissionPreCheck runs checks and returns the DecommissionPreCheckResponse
+// for the given nodes.
+func (s *systemAdminServer) DecommissionPreCheck(
+	ctx context.Context, req *serverpb.DecommissionPreCheckRequest,
+) (*serverpb.DecommissionPreCheckResponse, error) {
+	var collectTraces bool
+	if s := tracing.SpanFromContext(ctx); (s != nil && s.RecordingType() != tracingpb.RecordingOff) || req.CollectTraces {
+		collectTraces = true
+	}
+
+	// Initially evaluate node liveness status, so we filter the nodes to check.
+	var nodesToCheck []roachpb.NodeID
+	livenessStatusByNodeID, err := getLivenessStatusMap(ctx, s.nodeLiveness, s.clock.Now().GoTime(), s.st)
+	if err != nil {
+		return nil, serverError(ctx, err)
+	}
+
+	resp := &serverpb.DecommissionPreCheckResponse{}
+	resultsByNodeID := make(map[roachpb.NodeID]serverpb.DecommissionPreCheckResponse_NodeCheckResult)
+
+	// Any nodes that are already decommissioned or have unknown liveness should
+	// not be checked, and are added to response without replica counts or errors.
+	for _, nID := range req.NodeIDs {
+		livenessStatus := livenessStatusByNodeID[nID]
+		if livenessStatus == livenesspb.NodeLivenessStatus_UNKNOWN {
+			resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+				NodeID:                nID,
+				DecommissionReadiness: serverpb.DecommissionPreCheckResponse_UNKNOWN,
+				LivenessStatus:        livenessStatus,
+			}
+		} else if livenessStatus == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
+			resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+				NodeID:                nID,
+				DecommissionReadiness: serverpb.DecommissionPreCheckResponse_ALREADY_DECOMMISSIONED,
+				LivenessStatus:        livenessStatus,
+			}
+		} else {
+			nodesToCheck = append(nodesToCheck, nID)
+		}
+	}
+
+	results, err := s.server.DecommissionPreCheck(ctx, nodesToCheck, req.StrictReadiness, collectTraces, int(req.NumReplicaReport))
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect ranges that encountered errors by the nodes on which their replicas
+	// exist. Ranges with replicas on multiple checked nodes will result in the
+	// error being reported for each nodeID.
+	rangeCheckErrsByNode := make(map[roachpb.NodeID][]serverpb.DecommissionPreCheckResponse_RangeCheckResult)
+	for _, rangeWithErr := range results.rangesNotReady {
+		rangeCheckResult := serverpb.DecommissionPreCheckResponse_RangeCheckResult{
+			RangeID: rangeWithErr.desc.RangeID,
+			Action:  rangeWithErr.action,
+			Events:  recordedSpansToTraceEvents(rangeWithErr.tracingSpans),
+			Error:   rangeWithErr.err.Error(),
+		}
+
+		for _, nID := range nodesToCheck {
+			if rangeWithErr.desc.Replicas().HasReplicaOnNode(nID) {
+				rangeCheckErrsByNode[nID] = append(rangeCheckErrsByNode[nID], rangeCheckResult)
+			}
+		}
+	}
+
+	// Evaluate readiness by validating that there are no ranges with replicas on
+	// the given node(s) that did not pass checks.
+	for _, nID := range nodesToCheck {
+		numReplicas := len(results.replicasByNode[nID])
+		var readiness serverpb.DecommissionPreCheckResponse_NodeReadiness
+		if len(rangeCheckErrsByNode[nID]) > 0 {
+			readiness = serverpb.DecommissionPreCheckResponse_ALLOCATION_ERRORS
+		} else {
+			readiness = serverpb.DecommissionPreCheckResponse_READY
+		}
+
+		resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+			NodeID:                nID,
+			DecommissionReadiness: readiness,
+			LivenessStatus:        livenessStatusByNodeID[nID],
+			ReplicaCount:          int64(numReplicas),
+			CheckedRanges:         rangeCheckErrsByNode[nID],
+		}
+	}
+
+	// Reorder checked nodes to match request order.
+	for _, nID := range req.NodeIDs {
+		resp.CheckedNodes = append(resp.CheckedNodes, resultsByNodeID[nID])
+	}
+
+	return resp, nil
 }
 
 // DecommissionStatus returns the DecommissionStatus for all or the given nodes.
@@ -2816,7 +2923,7 @@ func (s *adminServer) DataDistribution(
 		return nil, err
 	}
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2859,7 +2966,7 @@ func (s *adminServer) dataDistributionHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 
 	// Used later when we're scanning Meta2 and only have IDs, not names.
 	tableInfosByTableID := map[uint32]serverpb.DataDistributionResponse_TableInfo{}
@@ -2991,7 +3098,7 @@ func (s *adminServer) dataDistributionHelper(
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
-	defer func(it sqlutil.InternalRows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
+	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(it)
 
 	for hasNext, err = it.Next(ctx); hasNext; hasNext, err = it.Next(ctx) {
 		row := it.Cur()
@@ -3021,7 +3128,7 @@ func (s *adminServer) dataDistributionHelper(
 func (s *systemAdminServer) EnqueueRange(
 	ctx context.Context, req *serverpb.EnqueueRangeRequest,
 ) (*serverpb.EnqueueRangeResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.requireAdminUser(ctx); err != nil {
@@ -3166,8 +3273,8 @@ func (s *systemAdminServer) enqueueRangeLocal(
 // SendKVBatch proxies the given BatchRequest into KV, returning the
 // response. It is for use by the CLI `debug send-kv-batch` command.
 func (s *systemAdminServer) SendKVBatch(
-	ctx context.Context, ba *roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 	// Note: the root user will bypass SQL auth checks, which is useful in case of
 	// a cluster outage.
@@ -3200,11 +3307,15 @@ func (s *systemAdminServer) SendKVBatch(
 	log.StructuredEvent(ctx, event)
 
 	ctx, sp := s.server.node.setupSpanForIncomingRPC(ctx, roachpb.SystemTenantID, ba)
-	var br *roachpb.BatchResponse
+	// Wipe the tracing information from the request. We've used this info in the
+	// setupSpanForIncomingRPC() call above; from now on the request is traced as
+	// per the span we just created.
+	ba.TraceInfo = nil
+	var br *kvpb.BatchResponse
 	// NB: wrapped to delay br evaluation to its value when returning.
 	defer func() {
 		var redact redactOpt
-		if redactServerTracesForSecondaryTenants.Get(&s.server.ClusterSettings().SV) {
+		if RedactServerTracesForSecondaryTenants.Get(&s.server.ClusterSettings().SV) {
 			redact = redactIfTenantRequest
 		} else {
 			redact = dontRedactEvenIfTenantRequest
@@ -3213,10 +3324,77 @@ func (s *systemAdminServer) SendKVBatch(
 	}()
 	br, pErr := s.db.NonTransactionalSender().Send(ctx, ba)
 	if br == nil {
-		br = &roachpb.BatchResponse{}
+		br = &kvpb.BatchResponse{}
 	}
 	br.Error = pErr
 	return br, nil
+}
+
+func (s *systemAdminServer) RecoveryCollectReplicaInfo(
+	request *serverpb.RecoveryCollectReplicaInfoRequest,
+	stream serverpb.Admin_RecoveryCollectReplicaInfoServer,
+) error {
+	ctx := stream.Context()
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return err
+	}
+	log.Ops.Info(ctx, "streaming cluster replica recovery info")
+
+	return s.server.recoveryServer.ServeClusterReplicas(ctx, request, stream, s.server.db)
+}
+
+func (s *systemAdminServer) RecoveryCollectLocalReplicaInfo(
+	request *serverpb.RecoveryCollectLocalReplicaInfoRequest,
+	stream serverpb.Admin_RecoveryCollectLocalReplicaInfoServer,
+) error {
+	ctx := stream.Context()
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return err
+	}
+
+	log.Ops.Info(ctx, "streaming local replica recovery info")
+	return s.server.recoveryServer.ServeLocalReplicas(ctx, request, stream)
+}
+
+func (s *systemAdminServer) RecoveryStagePlan(
+	ctx context.Context, request *serverpb.RecoveryStagePlanRequest,
+) (*serverpb.RecoveryStagePlanResponse, error) {
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Ops.Info(ctx, "staging recovery plan")
+	return s.server.recoveryServer.StagePlan(ctx, request)
+}
+
+func (s *systemAdminServer) RecoveryNodeStatus(
+	ctx context.Context, request *serverpb.RecoveryNodeStatusRequest,
+) (*serverpb.RecoveryNodeStatusResponse, error) {
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.server.recoveryServer.NodeStatus(ctx, request)
+}
+
+func (s *systemAdminServer) RecoveryVerify(
+	ctx context.Context, request *serverpb.RecoveryVerifyRequest,
+) (*serverpb.RecoveryVerifyResponse, error) {
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.server.recoveryServer.Verify(ctx, request, s.nodeLiveness.GetIsLiveMap(), s.db)
 }
 
 // sqlQuery allows you to incrementally build a SQL query that uses
@@ -3480,7 +3658,7 @@ func (rs resultScanner) Scan(row tree.Datums, colName string, dst interface{}) e
 // TODO(mrtracy): The following methods, used to look up the zone configuration
 // for a database or table, use the same algorithm as a set of methods in
 // cli/zone.go for the same purpose. However, as that code connects to the
-// server with a SQL connections, while this code uses the InternalExecutor, the
+// server with a SQL connections, while this code uses the Executor, the
 // code cannot be commonized.
 //
 // queryZone retrieves the specific ZoneConfig associated with the supplied ID,
@@ -3618,7 +3796,7 @@ func (s *adminServer) dialNode(
 // adminPrivilegeChecker is a helper struct to check whether given usernames
 // have admin privileges.
 type adminPrivilegeChecker struct {
-	ie *sql.InternalExecutor
+	ie isql.Executor
 	st *cluster.Settings
 	// makePlanner is a function that calls NewInternalPlanner
 	// to make a planner outside of the sql package. This is a hack
@@ -3649,21 +3827,22 @@ func (c *adminPrivilegeChecker) requireViewActivityPermission(ctx context.Contex
 	if err != nil {
 		return serverError(ctx, err)
 	}
-	if !isAdmin {
-		hasView := c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITY)
-		if !hasView {
-			hasView, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITY)
-			if err != nil {
-				return serverError(ctx, err)
-			}
-			if !hasView {
-				return grpcstatus.Errorf(
-					codes.PermissionDenied, "this operation requires the %s system privilege",
-					roleoption.VIEWACTIVITY)
-			}
-		}
+	if isAdmin {
+		return nil
 	}
-	return nil
+	if hasView, err := c.hasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITY); err != nil {
+		return serverError(ctx, err)
+	} else if hasView {
+		return nil
+	}
+	if hasView, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITY); err != nil {
+		return serverError(ctx, err)
+	} else if hasView {
+		return nil
+	}
+	return grpcstatus.Errorf(
+		codes.PermissionDenied, "this operation requires the %s system privilege",
+		roleoption.VIEWACTIVITY)
 }
 
 // requireViewActivityOrViewActivityRedactedPermission's error return is a gRPC error.
@@ -3674,26 +3853,68 @@ func (c *adminPrivilegeChecker) requireViewActivityOrViewActivityRedactedPermiss
 	if err != nil {
 		return serverError(ctx, err)
 	}
-	if !isAdmin {
-		hasView := c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITY)
-		hasViewRedacted := c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITYREDACTED)
-		if !hasView && !hasViewRedacted {
-			hasView, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITY)
-			if err != nil {
-				return serverError(ctx, err)
-			}
-			hasViewRedacted, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITYREDACTED)
-			if err != nil {
-				return serverError(ctx, err)
-			}
-			if !hasView && !hasViewRedacted {
-				return grpcstatus.Errorf(
-					codes.PermissionDenied, "this operation requires the %s or %s system privileges",
-					roleoption.VIEWACTIVITY, roleoption.VIEWACTIVITYREDACTED)
-			}
-		}
+	if isAdmin {
+		return nil
 	}
-	return nil
+	if hasView, err := c.hasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITY); err != nil {
+		return serverError(ctx, err)
+	} else if hasView {
+		return nil
+	}
+	if hasViewRedacted, err := c.hasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITYREDACTED); err != nil {
+		return serverError(ctx, err)
+	} else if hasViewRedacted {
+		return nil
+	}
+	if hasView, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITY); err != nil {
+		return serverError(ctx, err)
+	} else if hasView {
+		return nil
+	}
+	if hasViewRedacted, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITYREDACTED); err != nil {
+		return serverError(ctx, err)
+	} else if hasViewRedacted {
+		return nil
+	}
+	return grpcstatus.Errorf(
+		codes.PermissionDenied, "this operation requires the %s or %s system privileges",
+		roleoption.VIEWACTIVITY, roleoption.VIEWACTIVITYREDACTED)
+}
+
+// requireViewClusterSettingOrModifyClusterSettingPermission's error return is a gRPC error.
+func (c *adminPrivilegeChecker) requireViewClusterSettingOrModifyClusterSettingPermission(
+	ctx context.Context,
+) (err error) {
+	userName, isAdmin, err := c.getUserAndRole(ctx)
+	if err != nil {
+		return serverError(ctx, err)
+	}
+	if isAdmin {
+		return nil
+	}
+	if hasView, err := c.hasGlobalPrivilege(ctx, userName, privilege.VIEWCLUSTERSETTING); err != nil {
+		return serverError(ctx, err)
+	} else if hasView {
+		return nil
+	}
+	if hasModify, err := c.hasGlobalPrivilege(ctx, userName, privilege.MODIFYCLUSTERSETTING); err != nil {
+		return serverError(ctx, err)
+	} else if hasModify {
+		return nil
+	}
+	if hasView, err := c.hasRoleOption(ctx, userName, roleoption.VIEWCLUSTERSETTING); err != nil {
+		return serverError(ctx, err)
+	} else if hasView {
+		return nil
+	}
+	if hasModify, err := c.hasRoleOption(ctx, userName, roleoption.MODIFYCLUSTERSETTING); err != nil {
+		return serverError(ctx, err)
+	} else if hasModify {
+		return nil
+	}
+	return grpcstatus.Errorf(
+		codes.PermissionDenied, "this operation requires the %s or %s system privileges",
+		privilege.VIEWCLUSTERSETTING, privilege.MODIFYCLUSTERSETTING)
 }
 
 // This function requires that the user have the VIEWACTIVITY role, but does not
@@ -3708,7 +3929,10 @@ func (c *adminPrivilegeChecker) requireViewActivityAndNoViewActivityRedactedPerm
 	}
 
 	if !isAdmin {
-		hasViewRedacted := c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITYREDACTED)
+		hasViewRedacted, err := c.hasGlobalPrivilege(ctx, userName, privilege.VIEWACTIVITYREDACTED)
+		if err != nil {
+			return serverError(ctx, err)
+		}
 		if !hasViewRedacted {
 			hasViewRedacted, err := c.hasRoleOption(ctx, userName, roleoption.VIEWACTIVITYREDACTED)
 			if err != nil {
@@ -3738,14 +3962,17 @@ func (c *adminPrivilegeChecker) requireViewClusterMetadataPermission(
 	if err != nil {
 		return serverError(ctx, err)
 	}
-	if !isAdmin {
-		if hasViewClusterMetadata := c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWCLUSTERMETADATA); !hasViewClusterMetadata {
-			return grpcstatus.Errorf(
-				codes.PermissionDenied, "this operation requires the %s system privilege",
-				privilege.VIEWCLUSTERMETADATA)
-		}
+	if isAdmin {
+		return nil
 	}
-	return nil
+	if hasViewClusterMetadata, err := c.hasGlobalPrivilege(ctx, userName, privilege.VIEWCLUSTERMETADATA); err != nil {
+		return serverError(ctx, err)
+	} else if hasViewClusterMetadata {
+		return nil
+	}
+	return grpcstatus.Errorf(
+		codes.PermissionDenied, "this operation requires the %s system privilege",
+		privilege.VIEWCLUSTERMETADATA)
 }
 
 // requireViewDebugPermission requires the user have admin or the VIEWDEBUG system privilege
@@ -3755,14 +3982,17 @@ func (c *adminPrivilegeChecker) requireViewDebugPermission(ctx context.Context) 
 	if err != nil {
 		return serverError(ctx, err)
 	}
-	if !isAdmin {
-		if hasViewDebug := c.checkHasGlobalPrivilege(ctx, userName, privilege.VIEWDEBUG); !hasViewDebug {
-			return grpcstatus.Errorf(
-				codes.PermissionDenied, "this operation requires the %s system privilege",
-				privilege.VIEWDEBUG)
-		}
+	if isAdmin {
+		return nil
 	}
-	return nil
+	if hasViewDebug, err := c.hasGlobalPrivilege(ctx, userName, privilege.VIEWDEBUG); err != nil {
+		return serverError(ctx, err)
+	} else if hasViewDebug {
+		return nil
+	}
+	return grpcstatus.Errorf(
+		codes.PermissionDenied, "this operation requires the %s system privilege",
+		privilege.VIEWDEBUG)
 }
 
 // Note that the function returns plain errors, and it is the caller's
@@ -3770,7 +4000,7 @@ func (c *adminPrivilegeChecker) requireViewDebugPermission(ctx context.Context) 
 func (c *adminPrivilegeChecker) getUserAndRole(
 	ctx context.Context,
 ) (userName username.SQLUsername, isAdmin bool, err error) {
-	userName, err = userFromContext(ctx)
+	userName, err = userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return userName, false, err
 	}
@@ -3836,17 +4066,16 @@ func (c *adminPrivilegeChecker) hasRoleOption(
 	return bool(dbDatum), nil
 }
 
-// checkHasGlobalPrivilege is a helper function which calls
+// hasGlobalPrivilege is a helper function which calls
 // CheckPrivilege and returns a true/false based on the returned
 // result.
-func (c *adminPrivilegeChecker) checkHasGlobalPrivilege(
+func (c *adminPrivilegeChecker) hasGlobalPrivilege(
 	ctx context.Context, user username.SQLUsername, privilege privilege.Kind,
-) bool {
+) (bool, error) {
 	planner, cleanup := c.makePlanner("check-system-privilege")
 	defer cleanup()
 	aa := planner.(sql.AuthorizationAccessor)
-	err := aa.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege, user)
-	return err == nil
+	return aa.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege, user)
 }
 
 var errRequiresAdmin = grpcstatus.Error(codes.PermissionDenied, "this operation requires admin privilege")
@@ -3866,13 +4095,24 @@ func (s *adminServer) ListTracingSnapshots(
 	}
 
 	snapshotInfo := s.sqlServer.cfg.Tracer.GetSnapshots()
-	snapshots := make([]*serverpb.SnapshotInfo, len(snapshotInfo))
+	autoSnapshotInfo := s.sqlServer.cfg.Tracer.GetAutomaticSnapshots()
+	snapshots := make([]*serverpb.SnapshotInfo, 0, len(snapshotInfo)+len(autoSnapshotInfo))
 	for i := range snapshotInfo {
 		si := snapshotInfo[i]
-		snapshots[i] = &serverpb.SnapshotInfo{
+		snapshots = append(snapshots, &serverpb.SnapshotInfo{
 			SnapshotID: int64(si.ID),
 			CapturedAt: &si.CapturedAt,
-		}
+		})
+	}
+	for i := range autoSnapshotInfo {
+		si := autoSnapshotInfo[i]
+		snapshots = append(snapshots, &serverpb.SnapshotInfo{
+			// Flip the IDs of automatic snapshots to negative so we can tell when the
+			// client asks for one of these that we should look for it in the auto
+			// snapshots not the regular ones.
+			SnapshotID: int64(si.ID * -1),
+			CapturedAt: &si.CapturedAt,
+		})
 	}
 	resp := &serverpb.ListTracingSnapshotsResponse{
 		Snapshots: snapshots,
@@ -3938,7 +4178,14 @@ func (s *adminServer) GetTracingSnapshot(
 
 	id := tracing.SnapshotID(req.SnapshotId)
 	tr := s.sqlServer.cfg.Tracer
-	snapshot, err := tr.GetSnapshot(id)
+	var snapshot tracing.SpansSnapshot
+	// If the ID is negative it indicates it is an automatic snapshot, so flip it
+	// back to positive and fetch it from the automatic API instead.
+	if id < 0 {
+		snapshot, err = tr.GetAutomaticSnapshot(id * -1)
+	} else {
+		snapshot, err = tr.GetSnapshot(id)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -4092,4 +4339,40 @@ func (s *adminServer) RecoveryVerify(
 	ctx context.Context, request *serverpb.RecoveryVerifyRequest,
 ) (*serverpb.RecoveryVerifyResponse, error) {
 	return nil, errors.AssertionFailedf("To be implemented by #93043")
+}
+
+// ListTenants returns a list of tenants that are served
+// by shared-process services in this server.
+func (s *systemAdminServer) ListTenants(
+	ctx context.Context, _ *serverpb.ListTenantsRequest,
+) (*serverpb.ListTenantsResponse, error) {
+	tenantNames, err := s.server.serverController.getExpectedRunningTenants(ctx, s.internalExecutor)
+	if err != nil {
+		return nil, err
+	}
+
+	tenantList := make([]*serverpb.Tenant, 0, len(tenantNames))
+	for _, tenantName := range tenantNames {
+		server, err := s.server.serverController.getServer(ctx, tenantName)
+		if err != nil {
+			if errors.Is(err, errNoTenantServerRunning) {
+				// The service for this tenant is not started yet. This is not
+				// an error - the services are started asynchronously. The
+				// client can try again later.
+				continue
+			}
+			return nil, err
+		}
+		tenantID := server.getTenantID()
+		tenantList = append(tenantList, &serverpb.Tenant{
+			TenantId:   &tenantID,
+			TenantName: string(tenantName),
+			SqlAddr:    server.getSQLAddr(),
+			RpcAddr:    server.getRPCAddr(),
+		})
+	}
+
+	return &serverpb.ListTenantsResponse{
+		Tenants: tenantList,
+	}, nil
 }

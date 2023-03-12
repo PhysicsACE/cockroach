@@ -15,7 +15,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -65,7 +67,7 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		desiredTypes := make([]*types.T, index.NumKeyColumns())
 		for i := 0; i < index.NumKeyColumns(); i++ {
 			colID := index.GetKeyColumnID(i)
-			c, err := tableDesc.FindColumnWithID(colID)
+			c, err := catalog.MustFindColumnByID(tableDesc, colID)
 			if err != nil {
 				return nil, err
 			}
@@ -133,15 +135,15 @@ type scatterRun struct {
 }
 
 func (n *scatterNode) startExec(params runParams) error {
-	req := &roachpb.AdminScatterRequest{
-		RequestHeader:   roachpb.RequestHeader{Key: n.run.span.Key, EndKey: n.run.span.EndKey},
+	req := &kvpb.AdminScatterRequest{
+		RequestHeader:   kvpb.RequestHeader{Key: n.run.span.Key, EndKey: n.run.span.EndKey},
 		RandomizeLeases: true,
 	}
 	res, pErr := kv.SendWrapped(params.ctx, params.ExecCfg().DB.NonTransactionalSender(), req)
 	if pErr != nil {
 		return pErr.GoError()
 	}
-	scatterRes := res.(*roachpb.AdminScatterResponse)
+	scatterRes := res.(*kvpb.AdminScatterResponse)
 	n.run.rangeIdx = -1
 	n.run.ranges = make([]roachpb.Span, len(scatterRes.RangeInfos))
 	for i, rangeInfo := range scatterRes.RangeInfos {

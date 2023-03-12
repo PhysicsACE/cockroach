@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -33,7 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
@@ -189,46 +192,57 @@ func getAllDescChanges(
 	startKey := codec.TablePrefix(keys.DescriptorTableID)
 	endKey := startKey.PrefixEnd()
 
-	allRevs, err := kvclient.GetAllRevisions(ctx, db, startKey, endKey, startTime, endTime)
-	if err != nil {
-		return nil, err
-	}
+	g := ctxgroup.WithContext(ctx)
+	allRevs := make(chan []kvclient.VersionedValues)
+	g.GoCtx(func(ctx context.Context) error {
+		defer close(allRevs)
+		return kvclient.GetAllRevisions(ctx, db, startKey, endKey, startTime, endTime, allRevs)
+	})
 
 	var res []backuppb.BackupManifest_DescriptorRevision
-
-	for _, revs := range allRevs {
-		id, err := codec.DecodeDescMetadataID(revs.Key)
-		if err != nil {
-			return nil, err
-		}
-		for _, rev := range revs.Values {
-			r := backuppb.BackupManifest_DescriptorRevision{ID: descpb.ID(id), Time: rev.Timestamp}
-			if len(rev.RawBytes) != 0 {
-				// We update the modification time for the descriptors here with the
-				// timestamp of the KV row so that we can identify the appropriate
-				// descriptors to use during restore.
-				// Note that the modification time of descriptors on disk is usually 0.
-				// See the comment on descpb.FromSerializedValue for more details.
-				b, err := descbuilder.FromSerializedValue(&rev)
+	g.GoCtx(func(ctx context.Context) error {
+		for revs := range allRevs {
+			for _, rev := range revs {
+				id, err := codec.DecodeDescMetadataID(rev.Key)
 				if err != nil {
-					return nil, err
+					return err
 				}
-				if b == nil {
-					continue
-				}
-				desc := b.BuildCreatedMutable()
-				r.Desc = desc.DescriptorProto()
-				// Collect the prior IDs of table descriptors, as the ID may have been
-				// changed during truncate prior to 20.2.
-				switch t := desc.(type) {
-				case *tabledesc.Mutable:
-					if priorIDs != nil && t.ReplacementOf.ID != descpb.InvalidID {
-						priorIDs[t.ID] = t.ReplacementOf.ID
+				for _, values := range rev.Values {
+					r := backuppb.BackupManifest_DescriptorRevision{ID: descpb.ID(id), Time: values.Timestamp}
+					if len(values.RawBytes) != 0 {
+						// We update the modification time for the descriptors here with the
+						// timestamp of the KV row so that we can identify the appropriate
+						// descriptors to use during restore.
+						// Note that the modification time of descriptors on disk is usually 0.
+						// See the comment on descpb.FromSerializedValue for more details.
+						b, err := descbuilder.FromSerializedValue(&values)
+						if err != nil {
+							return err
+						}
+						if b == nil {
+							continue
+						}
+						desc := b.BuildCreatedMutable()
+						r.Desc = desc.DescriptorProto()
+						// Collect the prior IDs of table descriptors, as the ID may have been
+						// changed during truncate prior to 20.2.
+						switch t := desc.(type) {
+						case *tabledesc.Mutable:
+							if priorIDs != nil && t.ReplacementOf.ID != descpb.InvalidID {
+								priorIDs[t.ID] = t.ReplacementOf.ID
+							}
+						}
 					}
+					res = append(res, r)
 				}
 			}
-			res = append(res, r)
 		}
+
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return res, nil
 }
@@ -280,12 +294,15 @@ func fullClusterTargets(
 }
 
 func fullClusterTargetsRestore(
-	ctx context.Context, allDescs []catalog.Descriptor, lastBackupManifest backuppb.BackupManifest,
+	ctx context.Context,
+	allDescs []catalog.Descriptor,
+	lastBackupManifest backuppb.BackupManifest,
+	restoreAllTenants bool,
 ) (
 	[]catalog.Descriptor,
 	[]catalog.DatabaseDescriptor,
 	map[tree.TablePattern]catalog.Descriptor,
-	[]descpb.TenantInfoWithUsage,
+	[]mtinfopb.TenantInfoWithUsage,
 	error,
 ) {
 	ctx, span := tracing.ChildSpan(ctx, "backupccl.fullClusterTargetsRestore")
@@ -308,7 +325,13 @@ func fullClusterTargetsRestore(
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	return filteredDescs, filteredDBs, nil, lastBackupManifest.GetTenants(), nil
+
+	tenantsToRestore := []mtinfopb.TenantInfoWithUsage{}
+	if restoreAllTenants {
+		tenantsToRestore = lastBackupManifest.GetTenants()
+	}
+
+	return filteredDescs, filteredDBs, nil, tenantsToRestore, nil
 }
 
 // fullClusterTargetsBackup returns the same descriptors referenced in
@@ -348,8 +371,10 @@ func fullClusterTargetsBackup(
 // mainBackupManifests are sorted by Endtime and this check only applies to
 // backups with a start time that is less than the restore AOST.
 func checkMissingIntroducedSpans(
+	ctx context.Context,
 	restoringDescs []catalog.Descriptor,
 	mainBackupManifests []backuppb.BackupManifest,
+	layerToIterFactory backupinfo.LayerToBackupManifestFileIterFactory,
 	endTime hlc.Timestamp,
 	codec keys.SQLCodec,
 ) error {
@@ -374,10 +399,29 @@ func checkMissingIntroducedSpans(
 
 		// Gather the _online_ tables included in the previous backup.
 		prevOnlineTables := make(map[descpb.ID]struct{})
-		for _, desc := range mainBackupManifests[i-1].Descriptors {
-			if table, _, _, _, _ := descpb.GetDescriptors(&desc); table != nil && table.Public() {
+		prevDescIt := layerToIterFactory[i-1].NewDescIter(ctx)
+		defer prevDescIt.Close()
+		for ; ; prevDescIt.Next() {
+			if ok, err := prevDescIt.Valid(); err != nil {
+				return err
+			} else if !ok {
+				break
+			}
+
+			if table, _, _, _, _ := descpb.GetDescriptors(prevDescIt.Value()); table != nil && table.Public() {
 				prevOnlineTables[table.GetID()] = struct{}{}
 			}
+		}
+
+		prevDescRevIt := layerToIterFactory[i-1].NewDescriptorChangesIter(ctx)
+		defer prevDescRevIt.Close()
+		for ; ; prevDescRevIt.Next() {
+			if ok, err := prevDescRevIt.Valid(); err != nil {
+				return err
+			} else if !ok {
+				break
+			}
+
 		}
 
 		// Gather the tables that were reintroduced in the current backup (i.e.
@@ -430,10 +474,19 @@ that was running an IMPORT at the time of the previous incremental in this chain
 			})
 		}
 
-		for _, desc := range mainBackupManifests[i].Descriptors {
+		descIt := layerToIterFactory[i].NewDescIter(ctx)
+		defer descIt.Close()
+
+		for ; ; descIt.Next() {
+			if ok, err := descIt.Valid(); err != nil {
+				return err
+			} else if !ok {
+				break
+			}
+
 			// Check that all online tables at backup time were either introduced or
 			// in the previous backup.
-			if table, _, _, _, _ := descpb.GetDescriptors(&desc); table != nil && table.Public() {
+			if table, _, _, _, _ := descpb.GetDescriptors(descIt.Value()); table != nil && table.Public() {
 				if err := requiredIntroduction(table); err != nil {
 					return err
 				}
@@ -444,8 +497,17 @@ that was running an IMPORT at the time of the previous incremental in this chain
 		// where a descriptor may appear in manifest.DescriptorChanges but not
 		// manifest.Descriptors. If a descriptor switched from offline to online at
 		// any moment during the backup interval, it needs to be reintroduced.
-		for _, desc := range mainBackupManifests[i].DescriptorChanges {
-			if table, _, _, _, _ := descpb.GetDescriptors(desc.Desc); table != nil && table.Public() {
+		descRevIt := layerToIterFactory[i].NewDescriptorChangesIter(ctx)
+		defer descRevIt.Close()
+
+		for ; ; descRevIt.Next() {
+			if ok, err := descRevIt.Valid(); err != nil {
+				return err
+			} else if !ok {
+				break
+			}
+
+			if table, _, _, _, _ := descpb.GetDescriptors(descRevIt.Value().Desc); table != nil && table.Public() {
 				if err := requiredIntroduction(table); err != nil {
 					return err
 				}
@@ -470,25 +532,27 @@ func selectTargets(
 	ctx context.Context,
 	p sql.PlanHookState,
 	backupManifests []backuppb.BackupManifest,
+	layerToIterFactory backupinfo.LayerToBackupManifestFileIterFactory,
 	targets tree.BackupTargetList,
 	descriptorCoverage tree.DescriptorCoverage,
 	asOf hlc.Timestamp,
+	restoreAllTenants bool,
 ) (
 	[]catalog.Descriptor,
 	[]catalog.DatabaseDescriptor,
 	map[tree.TablePattern]catalog.Descriptor,
-	[]descpb.TenantInfoWithUsage,
+	[]mtinfopb.TenantInfoWithUsage,
 	error,
 ) {
 	ctx, span := tracing.ChildSpan(ctx, "backupccl.selectTargets")
 	defer span.Finish()
-	allDescs, lastBackupManifest, err := backupinfo.LoadSQLDescsFromBackupsAtTime(backupManifests, asOf)
+	allDescs, lastBackupManifest, err := backupinfo.LoadSQLDescsFromBackupsAtTime(ctx, backupManifests, layerToIterFactory, asOf)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 
 	if descriptorCoverage == tree.AllDescriptors {
-		return fullClusterTargetsRestore(ctx, allDescs, lastBackupManifest)
+		return fullClusterTargetsRestore(ctx, allDescs, lastBackupManifest, restoreAllTenants)
 	}
 
 	if descriptorCoverage == tree.SystemUsers {
@@ -518,7 +582,7 @@ func selectTargets(
 			// TODO(dt): for now it is zero-or-one but when that changes, we should
 			// either keep it sorted or build a set here.
 			if tenant.ID == targets.TenantID.ID {
-				return nil, nil, nil, []descpb.TenantInfoWithUsage{tenant}, nil
+				return nil, nil, nil, []mtinfopb.TenantInfoWithUsage{tenant}, nil
 			}
 		}
 		return nil, nil, nil, nil, errors.Errorf("tenant %d not in backup", targets.TenantID.ID)
@@ -595,22 +659,28 @@ func checkMultiRegionCompatible(
 		// For REGION BY TABLE IN <region> tables, allow the restore if the
 		// database has the region.
 		regionEnumID := database.GetRegionConfig().RegionEnumID
-		regionEnum, err := col.ByID(txn).Get().Type(ctx, regionEnumID)
+		typeDesc, err := col.ByID(txn).Get().Type(ctx, regionEnumID)
 		if err != nil {
 			return err
 		}
-		dbRegionNames, err := regionEnum.RegionNames()
-		if err != nil {
-			return err
+		regionEnum := typeDesc.AsRegionEnumTypeDescriptor()
+		if regionEnum == nil {
+			return errors.AssertionFailedf("expected region enum type, not %s for type %q (%d)",
+				typeDesc.GetKind(), typeDesc.GetName(), typeDesc.GetID())
 		}
-		existingRegions := make([]string, len(dbRegionNames))
-		for i, dbRegionName := range dbRegionNames {
+		var existingRegions []string
+		var found bool
+		_ = regionEnum.ForEachPublicRegion(func(dbRegionName catpb.RegionName) error {
 			if dbRegionName == regionName {
-				return nil
+				found = true
+				return iterutil.StopIteration()
 			}
-			existingRegions[i] = fmt.Sprintf("%q", dbRegionName)
+			existingRegions = append(existingRegions, fmt.Sprintf("%q", dbRegionName))
+			return nil
+		})
+		if found {
+			return nil
 		}
-
 		return errors.Newf(
 			"cannot restore REGIONAL BY TABLE %s IN REGION %q (table ID: %d) into database %q; region %q not found in database regions %s",
 			table.GetName(), regionName, table.GetID(),

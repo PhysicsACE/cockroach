@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -40,9 +42,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -271,6 +276,13 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 	)
 
 	defer tc.Stopper().Stop(ctx)
+
+	// Disable delegating snapshots to different senders, which would otherwise
+	// fail this test as snapshots could queue on different stores.
+	settings := cluster.MakeTestingClusterSettings()
+	sv := &settings.SV
+	kvserver.NumDelegateLimit.Override(ctx, sv, 0)
+
 	scratch := tc.ScratchRange(t)
 	replicationChange := make(chan error, 2)
 	g := ctxgroup.WithContext(ctx)
@@ -283,7 +295,7 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 				return err
 			}
 			_, err = tc.Servers[0].DB().AdminChangeReplicas(ctx, scratch, desc,
-				roachpb.MakeReplicationChanges(roachpb.ADD_NON_VOTER, tc.Target(2)),
+				kvpb.MakeReplicationChanges(roachpb.ADD_NON_VOTER, tc.Target(2)),
 			)
 			replicationChange <- err
 			return err
@@ -307,7 +319,7 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 				return err
 			}
 			_, err = tc.Servers[0].DB().AdminChangeReplicas(
-				ctx, scratch, desc, roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+				ctx, scratch, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
 			)
 			replicationChange <- err
 			return err
@@ -336,6 +348,195 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 
 	// Wait for the goroutines to finish.
 	require.NoError(t, g.Wait())
+}
+
+// TestDelegateSnapshot verifies that the correct delegate is chosen when
+// sending snapshots to stores.
+// TODO: It is currently disabled because with raft snapshots sometimes being
+// required and not going through snapshot delegation, the results are
+// unpredictable.
+func TestDelegateSnapshot(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 96841, "Occasionally fails until 87553 is resolved")
+
+	ctx := context.Background()
+
+	// Synchronize on the moment before the snapshot gets sent to measure the
+	// state at that time.
+	requestChannel := make(chan *kvserverpb.DelegateSendSnapshotRequest, 10)
+
+	setupFn := func(t *testing.T) (
+		*testcluster.TestCluster,
+		roachpb.Key,
+	) {
+		knobs, ltk := makeReplicationTestKnobs()
+		ltk.storeKnobs.DisableRaftSnapshotQueue = true
+
+		ltk.storeKnobs.SendSnapshot = func(request *kvserverpb.DelegateSendSnapshotRequest) {
+			requestChannel <- request
+		}
+
+		localityA := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "a"}}}
+		localityB := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "b"}}}
+
+		localityServerArgs := make(map[int]base.TestServerArgs)
+		localityServerArgs[0] = base.TestServerArgs{Knobs: knobs, Locality: localityA}
+		localityServerArgs[1] = base.TestServerArgs{Knobs: knobs, Locality: localityA}
+		localityServerArgs[2] = base.TestServerArgs{Knobs: knobs, Locality: localityB}
+		localityServerArgs[3] = base.TestServerArgs{Knobs: knobs, Locality: localityB}
+
+		tc := testcluster.StartTestCluster(
+			t, 4, base.TestClusterArgs{
+				ServerArgsPerNode: localityServerArgs,
+				ReplicationMode:   base.ReplicationManual,
+			},
+		)
+		scratchKey := tc.ScratchRange(t)
+		return tc, scratchKey
+	}
+
+	tc, scratchKey := setupFn(t)
+	defer tc.Stopper().Stop(ctx)
+
+	// Node 3 (loc B) can only get the data from node 1 as its the only one that has it.
+	_ = tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2)...)
+	request := <-requestChannel
+	require.Equal(t, request.DelegatedSender.StoreID, roachpb.StoreID(1))
+	// Drain the channel. Unfortunately there are occasionally spurious raft snapshots sent.
+	for len(requestChannel) > 0 {
+		<-requestChannel
+	}
+
+	// Node 4 (loc B) should get the snapshot from node 3 as its the same locality.
+	_ = tc.AddVotersOrFatal(t, scratchKey, tc.Targets(3)...)
+	request = <-requestChannel
+	require.Equal(t, request.DelegatedSender.StoreID, roachpb.StoreID(3))
+	for len(requestChannel) > 0 {
+		<-requestChannel
+	}
+
+	// Node 2 (loc A) should get the snapshot from node 1 as it is the same locality.
+	_ = tc.AddVotersOrFatal(t, scratchKey, tc.Targets(1)...)
+	request = <-requestChannel
+	require.Equal(t, request.DelegatedSender.StoreID, roachpb.StoreID(1))
+}
+
+// TestDelegateSnapshotFails is a test that ensure we fail fast when the
+// sender or receiver store crashes during delegated snapshot sending.
+func TestDelegateSnapshotFails(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	var senders struct {
+		mu   syncutil.Mutex
+		desc []roachpb.ReplicaDescriptor
+	}
+
+	setupFn := func(t *testing.T) (
+		*testcluster.TestCluster,
+		roachpb.Key,
+	) {
+		senders.desc = nil
+		knobs, ltk := makeReplicationTestKnobs()
+		ltk.storeKnobs.ThrottleEmptySnapshots = true
+
+		ltk.storeKnobs.SelectDelegateSnapshotSender =
+			func(descriptor *roachpb.RangeDescriptor) []roachpb.ReplicaDescriptor {
+				senders.mu.Lock()
+				defer senders.mu.Unlock()
+				return senders.desc
+			}
+
+		tc := testcluster.StartTestCluster(
+			t, 4, base.TestClusterArgs{
+				ServerArgs:      base.TestServerArgs{Knobs: knobs},
+				ReplicationMode: base.ReplicationManual,
+			},
+		)
+
+		scratchKey := tc.ScratchRange(t)
+		return tc, scratchKey
+	}
+
+	// Add a learner replica that will need a snapshot, kill the server
+	// the learner is on. Assert that the failure is detected and change replicas
+	// fails fast.
+	t.Run("receiver", func(t *testing.T) {
+		tc, scratchKey := setupFn(t)
+		defer tc.Stopper().Stop(ctx)
+
+		desc, err := tc.LookupRange(scratchKey)
+		require.NoError(t, err, "Unable to lookup the range")
+
+		_, err = setupPartitionedRange(tc, desc.RangeID, 0, 0, true, unreliableRaftHandlerFuncs{})
+		require.NoError(t, err)
+
+		_, err = tc.Servers[0].DB().AdminChangeReplicas(
+			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+		)
+
+		require.True(t, testutils.IsError(err, "partitioned"), `expected partitioned error got: %+v`, err)
+	})
+
+	// Add a follower replica to act as the snapshot sender, and kill the server
+	// the sender is on. Assert that the failure is detected and change replicas
+	// fails fast.
+	t.Run("sender_no_fallback", func(t *testing.T) {
+		tc, scratchKey := setupFn(t)
+		defer tc.Stopper().Stop(ctx)
+
+		// Add a replica that will be the delegated sender, and another so we have
+		// quorum with this node down
+		desc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2, 3)...)
+
+		replicaDesc, ok := desc.GetReplicaDescriptor(3)
+		require.True(t, ok)
+		// Always use node 3 (index 2) as the only delegate.
+		senders.mu.Lock()
+		senders.desc = append(senders.desc, replicaDesc)
+		senders.mu.Unlock()
+
+		// Now stop accepting traffic to node 3 (index 2).
+		_, err := setupPartitionedRange(tc, desc.RangeID, 0, 2, true, unreliableRaftHandlerFuncs{})
+		require.NoError(t, err)
+
+		_, err = tc.Servers[0].DB().AdminChangeReplicas(
+			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+		)
+		log.Infof(ctx, "Err=%v", err)
+		require.True(t, testutils.IsError(err, "partitioned"), `expected partitioned error got: %+v`, err)
+	})
+
+	// Identical setup as the previous test, but allow a fallback to the leaseholder.
+	t.Run("sender_with_fallback", func(t *testing.T) {
+		tc, scratchKey := setupFn(t)
+		defer tc.Stopper().Stop(ctx)
+
+		// Add a replica that will be the delegated sender, and another so we have
+		// quorum with this node down
+		desc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2, 3)...)
+
+		replicaDesc, ok := desc.GetReplicaDescriptor(3)
+		require.True(t, ok)
+		leaseholderDesc, ok := desc.GetReplicaDescriptor(1)
+		require.True(t, ok)
+		// First try to use node 3 (index 2) as the delegate, but fall back to the leaseholder on failure.
+		senders.mu.Lock()
+		senders.desc = append(senders.desc, replicaDesc)
+		senders.desc = append(senders.desc, leaseholderDesc)
+		senders.mu.Unlock()
+
+		// Now stop accepting traffic to node 3 (index 2).
+		_, err := setupPartitionedRange(tc, desc.RangeID, 0, 2, true, unreliableRaftHandlerFuncs{})
+		require.NoError(t, err)
+
+		_, err = tc.Servers[0].DB().AdminChangeReplicas(
+			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+		)
+		require.NoError(t, err)
+	})
 }
 
 func TestLearnerRaftConfState(t *testing.T) {
@@ -502,7 +703,7 @@ func testRaftSnapshotsToNonVoters(t *testing.T, drainReceivingNode bool) {
 	// the state at that time & gather metrics.
 	blockUntilSnapshotSendCh := make(chan struct{})
 	blockSnapshotSendCh := make(chan struct{})
-	ltk.storeKnobs.SendSnapshot = func() {
+	ltk.storeKnobs.SendSnapshot = func(request *kvserverpb.DelegateSendSnapshotRequest) {
 		close(blockUntilSnapshotSendCh)
 		select {
 		case <-blockSnapshotSendCh:
@@ -592,7 +793,7 @@ func testRaftSnapshotsToNonVoters(t *testing.T, drainReceivingNode bool) {
 	// snapshot being sent.
 	<-blockUntilSnapshotSendCh
 	store, repl := getFirstStoreReplica(t, tc.Server(0), scratchStartKey)
-	snapshotLength, err := getExpectedSnapshotSizeBytes(ctx, store, repl, kvserverpb.SnapshotRequest_VIA_SNAPSHOT_QUEUE, tc.Server(1).GetFirstStoreID())
+	snapshotLength, err := getExpectedSnapshotSizeBytes(ctx, store, repl, kvserverpb.SnapshotRequest_VIA_SNAPSHOT_QUEUE)
 	require.NoError(t, err)
 
 	close(blockSnapshotSendCh)
@@ -750,14 +951,14 @@ func TestSplitRetriesOnFailedExitOfJointConfig(t *testing.T) {
 	var rangeIDAtomic int64
 	var rejectedCount int
 	const maxRejects = 3
-	reqFilter := func(ctx context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+	reqFilter := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		rangeID := roachpb.RangeID(atomic.LoadInt64(&rangeIDAtomic))
 		if ba.RangeID == rangeID && ba.IsSingleTransferLeaseRequest() && rejectedCount < maxRejects {
 			rejectedCount++
 			repl := ba.Requests[0].GetTransferLease().Lease.Replica
 			status := raftutil.ReplicaStateProbe
 			err := kvserver.NewLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(repl, status)
-			return roachpb.NewError(err)
+			return kvpb.NewError(err)
 		}
 		return nil
 	}
@@ -1005,7 +1206,7 @@ func TestLearnerAdminChangeReplicasRace(t *testing.T) {
 			return err
 		}
 		_, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, scratchStartKey, desc, roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+			ctx, scratchStartKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
 		)
 		return err
 	})
@@ -1046,9 +1247,10 @@ func TestLearnerReplicateQueueRace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
+	var tc *testcluster.TestCluster
+
 	var skipReceiveSnapshotKnobAtomic int64 = 1
-	blockUntilSnapshotCh := make(chan struct{}, 2)
-	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
 	// We must disable eager replica removal to make this test reliable.
 	// If we don't then it's possible that the removed replica on store 2 will
@@ -1056,16 +1258,26 @@ func TestLearnerReplicateQueueRace(t *testing.T) {
 	// In this case we'll get a snapshot error from the replicate queue which
 	// will retry the up-replication with a new descriptor and succeed.
 	ltk.storeKnobs.DisableEagerReplicaRemoval = true
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
-		if atomic.LoadInt64(&skipReceiveSnapshotKnobAtomic) > 0 {
-			return nil
+	ltk.storeKnobs.VoterAddStopAfterLearnerSnapshot = func(targets []roachpb.ReplicationTarget) bool {
+		// We need to be careful not to interfere with up-replication to node 2
+		// during test setup and only invoke "concurrent queue" behavior for
+		// specific target which is on node 3.
+		if targets[0].NodeID != 3 {
+			return false
 		}
-		blockUntilSnapshotCh <- struct{}{}
-		<-blockSnapshotsCh
-		return nil
+		// Remove the learner on node 3 out from under the replicate queue. This
+		// simulates a second replicate queue running concurrently. The first thing
+		// this second replicate queue would do is remove any learners it sees,
+		// leaving the 2 voters.
+		startKey := tc.ScratchRange(t)
+		desc, err := tc.RemoveVoters(startKey, tc.Target(2))
+		// NB: don't fatal on this goroutine, as we can't recover cleanly.
+		assert.NoError(t, err)
+		assert.Len(t, desc.Replicas().VoterDescriptors(), 2)
+		assert.Len(t, desc.Replicas().LearnerDescriptors(), 0)
+		return false
 	}
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+	tc = testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs:      base.TestServerArgs{Knobs: knobs, SnapshotSendLimit: 1},
 		ReplicationMode: base.ReplicationManual,
 	})
@@ -1091,10 +1303,8 @@ func TestLearnerReplicateQueueRace(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if !strings.Contains(processErr.Error(), `descriptor changed`) {
-				// NB: errors.Wrapf(nil, ...) returns nil.
-				// nolint:errwrap
-				return errors.Errorf(`expected "descriptor changed" error got: %+v`, processErr)
+			if processErr == nil || !strings.Contains(processErr.Error(), `descriptor changed`) {
+				return errors.Wrap(processErr, `expected "descriptor changed" error got: %+v`)
 			}
 			formattedTrace := trace.String()
 			expectedMessages := []string{
@@ -1105,24 +1315,8 @@ func TestLearnerReplicateQueueRace(t *testing.T) {
 		}()
 	}()
 
-	// Wait until the snapshot starts, which happens after the learner has been
-	// added.
-	<-blockUntilSnapshotCh
-
-	// Remove the learner on node 3 out from under the replicate queue. This
-	// simulates a second replicate queue running concurrently. The first thing
-	// this second replicate queue would do is remove any learners it sees,
-	// leaving the 2 voters.
-	desc, err := tc.RemoveVoters(scratchStartKey, tc.Target(2))
-	require.NoError(t, err)
-	require.Len(t, desc.Replicas().VoterDescriptors(), 2)
-	require.Len(t, desc.Replicas().LearnerDescriptors(), 0)
-
-	// Unblock the snapshot, and surprise the replicate queue. It should retry,
-	// get a descriptor changed error, and realize it should stop.
-	close(blockSnapshotsCh)
 	require.NoError(t, <-queue1ErrCh)
-	desc = tc.LookupRangeOrFatal(t, scratchStartKey)
+	desc := tc.LookupRangeOrFatal(t, scratchStartKey)
 	require.Len(t, desc.Replicas().VoterDescriptors(), 2)
 	require.Len(t, desc.Replicas().LearnerDescriptors(), 0)
 }
@@ -1215,12 +1409,12 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	check := func() {
 		ts := tc.Server(0).Clock().Now()
 		txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0, int32(tc.Server(0).SQLInstanceID()))
-		req := &roachpb.BatchRequest{Header: roachpb.Header{
+		req := &kvpb.BatchRequest{Header: kvpb.Header{
 			RangeID:   scratchDesc.RangeID,
 			Timestamp: ts,
 			Txn:       &txn,
 		}}
-		req.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+		req.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{
 			Key: scratchDesc.StartKey.AsRawKey(), EndKey: scratchDesc.EndKey.AsRawKey(),
 		}})
 
@@ -1272,6 +1466,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 
 func TestLearnerOrJointConfigAdminRelocateRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 95500, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1772,15 +1967,14 @@ func getExpectedSnapshotSizeBytes(
 	originStore *kvserver.Store,
 	originRepl *kvserver.Replica,
 	snapType kvserverpb.SnapshotRequest_Type,
-	recipientStoreID roachpb.StoreID,
 ) (int64, error) {
-	snap, err := originRepl.GetSnapshot(ctx, snapType, recipientStoreID)
+	snap, err := originRepl.GetSnapshot(ctx, snapType, uuid.MakeV4())
 	if err != nil {
 		return 0, err
 	}
 	defer snap.Close()
 
-	b := originStore.Engine().NewUnindexedBatch(true)
+	b := originStore.TODOEngine().NewUnindexedBatch(true)
 	defer b.Close()
 
 	err = rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true, /* replicatedOnly */
@@ -1837,7 +2031,7 @@ func TestRebalancingSnapshotMetrics(t *testing.T) {
 	// the state at that time.
 	blockUntilSnapshotSendCh := make(chan struct{})
 	blockSnapshotSendCh := make(chan struct{})
-	ltk.storeKnobs.SendSnapshot = func() {
+	ltk.storeKnobs.SendSnapshot = func(request *kvserverpb.DelegateSendSnapshotRequest) {
 		close(blockUntilSnapshotSendCh)
 		select {
 		case <-blockSnapshotSendCh:
@@ -1871,7 +2065,7 @@ func TestRebalancingSnapshotMetrics(t *testing.T) {
 	// snapshot being sent.
 	<-blockUntilSnapshotSendCh
 	store, repl := getFirstStoreReplica(t, tc.Server(0), scratchStartKey)
-	snapshotLength, err := getExpectedSnapshotSizeBytes(ctx, store, repl, kvserverpb.SnapshotRequest_INITIAL, tc.Server(1).GetFirstStoreID())
+	snapshotLength, err := getExpectedSnapshotSizeBytes(ctx, store, repl, kvserverpb.SnapshotRequest_INITIAL)
 	require.NoError(t, err)
 
 	close(blockSnapshotSendCh)

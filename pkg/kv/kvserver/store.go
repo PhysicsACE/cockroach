@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
@@ -46,9 +47,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnrecovery"
@@ -61,12 +64,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
@@ -105,19 +108,6 @@ const (
 	// maxes out RaftMaxInflightMsgs, we want the receiving replica to still have
 	// some buffer for other messages, primarily heartbeats.
 	replicaQueueExtraSize = 10
-
-	// GossipWhenCapacityDeltaExceedsFraction specifies the fraction from the
-	// last gossiped store capacity values which need be exceeded before the
-	// store will gossip immediately without waiting for the periodic gossip
-	// interval.
-	defaultGossipWhenCapacityDeltaExceedsFraction = 0.05
-
-	// systemDataGossipInterval is the interval at which range lease
-	// holders verify that the most recent system data is gossiped.
-	// This ensures that system data is always eventually gossiped, even
-	// if a range lease holder experiences a failure causing a missed
-	// gossip update.
-	systemDataGossipInterval = 1 * time.Minute
 )
 
 var storeSchedulerConcurrency = envutil.EnvOrDefaultInt(
@@ -245,7 +235,7 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 
 func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 	if clock == nil {
-		clock = hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+		clock = hlc.NewClockForTesting(nil)
 	}
 	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
 	tracer := tracing.NewTracerWithOpt(context.TODO(), tracing.WithClusterSettings(&st.SV))
@@ -283,12 +273,14 @@ func newRaftConfig(
 	return &raft.Config{
 		ID:                        id,
 		Applied:                   appliedIndex,
+		AsyncStorageWrites:        true,
 		ElectionTick:              storeCfg.RaftElectionTimeoutTicks,
 		HeartbeatTick:             storeCfg.RaftHeartbeatIntervalTicks,
 		MaxUncommittedEntriesSize: storeCfg.RaftMaxUncommittedEntriesSize,
 		MaxCommittedSizePerReady:  storeCfg.RaftMaxCommittedSizePerReady,
 		MaxSizePerMsg:             storeCfg.RaftMaxSizePerMsg,
 		MaxInflightMsgs:           storeCfg.RaftMaxInflightMsgs,
+		MaxInflightBytes:          storeCfg.RaftMaxInflightBytes,
 		Storage:                   strg,
 		Logger:                    logger,
 
@@ -454,6 +446,23 @@ func (rs *storeReplicaVisitor) EstimatedCount() int {
 	return len(rs.repls) - rs.visited
 }
 
+// internalEngines contains the engines that support the operations of
+// this Store. At the time of writing, all three fields will be populated
+// with the same Engine. As work on CRDB-220 (separate raft log) proceeds,
+// we will be able to experimentally run with a separate log engine, and
+// ultimately allow doing so in production deployments.
+type internalEngines struct {
+	// stateEngine is the engine that materializes the raft logs on the system.
+	stateEngine storage.Engine
+	// todoEngine is a placeholder while we work on CRDB-220, used in cases where
+	// - the code does not yet cleanly separate between state and log engine
+	// - it is still unclear which of the two engines is the better choice for a
+	//   particular write, or there is a candidate, but it needs to be verified.
+	todoEngine storage.Engine
+	// logEngine is the engine holding the raft state.
+	logEngine storage.Engine
+}
+
 /*
 A Store maintains a set of Replicas whose data is stored on a storage.Engine
 usually corresponding to a dedicated storage medium. It also houses a collection
@@ -510,7 +519,7 @@ transaction, and so the transaction record will be created on the affected
 range. This allows us to establish a helpful invariant:
 
 INVARIANT: an intent on keys.RangeDescriptorKey is resolved atomically with
-the (application of the) roachpb.EndTxnRequest committing the transaction.
+the (application of the) kvpb.EndTxnRequest committing the transaction.
 
 A Replica's active configuration is dictated by its visible version of the
 RangeDescriptor, and the above invariant simplifies this. Without the invariant,
@@ -550,7 +559,7 @@ Store.HandleRaftRequest (which is part of the RaftMessageHandler interface),
 ultimately resulting in a call to Replica.handleRaftReadyRaftMuLocked, which
 houses the integration with the etcd/raft library (raft.RawNode). This may
 generate Raft messages to be sent to other Stores; these are handed to
-Replica.sendRaftMessagesRaftMuLocked which ultimately hands them to the Store's
+Replica.sendRaftMessages which ultimately hands them to the Store's
 RaftTransport.SendAsync method. Raft uses message passing (not
 request-response), and outgoing messages will use a gRPC stream that differs
 from that used for incoming messages (which makes asymmetric partitions more
@@ -696,7 +705,7 @@ descriptor that removes it, or it may be destroyed by the application of a merge
 on its left neighboring Replica, which may also occur through a snapshot. Merges
 are the single most complex reconfiguration operation and can only be touched
 upon here. At their core, they will at some point "freeze" the right-hand side
-Replicas (via roachpb.SubsumeRequest) to prevent additional read or write
+Replicas (via kvpb.SubsumeRequest) to prevent additional read or write
 activity, and also ensure that the two sets of Ranges to be merged are
 co-located on the same Stores as well as are all initialized.
 
@@ -732,8 +741,8 @@ NOTE: to the best of our knowledge, we don't rely on this invariant.
 type Store struct {
 	Ident                *roachpb.StoreIdent // pointer to catch access before Start() is called
 	cfg                  StoreConfig
+	internalEngines      internalEngines
 	db                   *kv.DB
-	engine               storage.Engine          // The underlying key-value store
 	tsCache              tscache.Cache           // Most recent timestamps for keys / key ranges
 	allocator            allocatorimpl.Allocator // Makes allocation decisions
 	replRankings         *ReplicaRankings
@@ -748,34 +757,24 @@ type Store struct {
 	raftLogQueue         *raftLogQueue      // Raft log truncation queue
 	// Carries out truncations proposed by the raft log queue, and "replicated"
 	// via raft, when they are safe. Created in Store.Start.
-	raftTruncator      *raftLogTruncator
-	raftSnapshotQueue  *raftSnapshotQueue          // Raft repair queue
-	tsMaintenanceQueue *timeSeriesMaintenanceQueue // Time series maintenance queue
-	scanner            *replicaScanner             // Replica scanner
-	consistencyQueue   *consistencyQueue           // Replica consistency check queue
-	consistencyLimiter *quotapool.RateLimiter      // Rate limits consistency checks
-	metrics            *StoreMetrics
-	intentResolver     *intentresolver.IntentResolver
-	recoveryMgr        txnrecovery.Manager
-	raftEntryCache     *raftentry.Cache
-	limiters           batcheval.Limiters
-	txnWaitMetrics     *txnwait.Metrics
-	sstSnapshotStorage SSTSnapshotStorage
-	protectedtsReader  spanconfig.ProtectedTSReader
-	ctSender           *sidetransport.Sender
-
-	// gossipRangeCountdown and leaseRangeCountdown are countdowns of
-	// changes to range and leaseholder counts, after which the store
-	// descriptor will be re-gossiped earlier than the normal periodic
-	// gossip interval. Updated atomically.
-	gossipRangeCountdown int32
-	gossipLeaseCountdown int32
-	// gossipQueriesPerSecondVal and gossipWritesPerSecond serve similar
-	// purposes, but simply record the most recently gossiped value so that we
-	// can tell if a newly measured value differs by enough to justify
-	// re-gossiping the store.
-	gossipQueriesPerSecondVal syncutil.AtomicFloat64
-	gossipWritesPerSecondVal  syncutil.AtomicFloat64
+	raftTruncator       *raftLogTruncator
+	raftSnapshotQueue   *raftSnapshotQueue          // Raft repair queue
+	tsMaintenanceQueue  *timeSeriesMaintenanceQueue // Time series maintenance queue
+	scanner             *replicaScanner             // Replica scanner
+	consistencyQueue    *consistencyQueue           // Replica consistency check queue
+	consistencyLimiter  *quotapool.RateLimiter      // Rate limits consistency checks
+	metrics             *StoreMetrics
+	intentResolver      *intentresolver.IntentResolver
+	recoveryMgr         txnrecovery.Manager
+	syncWaiter          *logstore.SyncWaiterLoop
+	raftEntryCache      *raftentry.Cache
+	limiters            batcheval.Limiters
+	txnWaitMetrics      *txnwait.Metrics
+	sstSnapshotStorage  SSTSnapshotStorage
+	protectedtsReader   spanconfig.ProtectedTSReader
+	ctSender            *sidetransport.Sender
+	storeGossip         *StoreGossip
+	rebalanceObjManager *RebalanceObjectiveManager
 
 	coalescedMu struct {
 		syncutil.Mutex
@@ -919,7 +918,8 @@ type Store struct {
 		// creatingReplicas stores IDs of all ranges for which there is an ongoing
 		// attempt to create a replica.
 		creatingReplicas map[roachpb.RangeID]struct{}
-		// All *Replica objects for which Replica.IsInitialized is false.
+		// All *Replica objects for which Replica.IsInitialized is false. Replicas
+		// are added to and removed from this map with Replica.raftMu locked.
 		//
 		// INVARIANT: any entry in this map is also in replicasByRangeID.
 		uninitReplicas map[roachpb.RangeID]*Replica // Map of uninitialized replicas by Range ID
@@ -960,13 +960,6 @@ type Store struct {
 	// reactively, i.e. will refresh on each tick loop iteration only.
 	ioThresholds *ioThresholds
 
-	// cachedCapacity caches information on store capacity to prevent
-	// expensive recomputations in case leases or replicas are rapidly
-	// rebalancing.
-	cachedCapacity struct {
-		syncutil.Mutex
-		roachpb.StoreCapacity
-	}
 	ioThreshold struct {
 		syncutil.Mutex
 		t *admissionpb.IOThreshold // never nil
@@ -1009,8 +1002,8 @@ type StoreConfig struct {
 	DefaultSpanConfig    roachpb.SpanConfig
 	Settings             *cluster.Settings
 	Clock                *hlc.Clock
-	DB                   *kv.DB
 	Gossip               *gossip.Gossip
+	DB                   *kv.DB
 	NodeLiveness         *liveness.NodeLiveness
 	StorePool            *storepool.StorePool
 	Transport            *RaftTransport
@@ -1150,7 +1143,7 @@ type ConsistencyTestingKnobs struct {
 	// checksum, instead of log.Fatal.
 	OnBadChecksumFatal func(roachpb.StoreIdent)
 
-	ConsistencyQueueResultHook func(response roachpb.CheckConsistencyResponse)
+	ConsistencyQueueResultHook func(response kvpb.CheckConsistencyResponse)
 }
 
 // Valid returns true if the StoreConfig is populated correctly.
@@ -1174,10 +1167,6 @@ func (sc *StoreConfig) SetDefaults() {
 	}
 	if sc.RaftEntryCacheSize == 0 {
 		sc.RaftEntryCacheSize = defaultRaftEntryCacheSize
-	}
-
-	if sc.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction == 0 {
-		sc.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction = defaultGossipWhenCapacityDeltaExceedsFraction
 	}
 }
 
@@ -1214,9 +1203,17 @@ func NewStore(
 	iot := ioThresholds{}
 	iot.Replace(nil, 1.0) // init as empty
 	s := &Store{
+		// NB: do not access these fields directly. Instead, use
+		// the StateEngine, TODOEngine, LogEngine methods.
+		// This simplifies going through references to these
+		// engines.
+		internalEngines: internalEngines{
+			stateEngine: eng,
+			todoEngine:  eng,
+			logEngine:   eng,
+		},
 		cfg:                               cfg,
 		db:                                cfg.DB, // TODO(tschottdorf): remove redundancy.
-		engine:                            eng,
 		nodeDesc:                          nodeDesc,
 		metrics:                           newStoreMetrics(cfg.HistogramWindowInterval),
 		ctSender:                          cfg.ClosedTimestampSender,
@@ -1232,6 +1229,20 @@ func NewStore(
 		// store pool in those cases.
 		allocatorStorePool = cfg.StorePool
 		storePoolIsDeterministic = allocatorStorePool.IsDeterministic()
+
+		s.rebalanceObjManager = newRebalanceObjectiveManager(ctx, s.cfg.Settings,
+			func(ctx context.Context, obj LBRebalancingObjective) {
+				s.VisitReplicas(func(r *Replica) (wantMore bool) {
+					r.loadBasedSplitter.SetSplitObjective(
+						s.Clock().PhysicalTime(),
+						obj.ToSplitObjective(),
+					)
+					return true
+				})
+			},
+			allocatorStorePool, /* storeDescProvider */
+			allocatorStorePool, /* capacityChangeNotifier */
+		)
 	}
 	if cfg.RPCContext != nil {
 		s.allocator = allocatorimpl.MakeAllocator(
@@ -1244,7 +1255,7 @@ func NewStore(
 		s.allocator = allocatorimpl.MakeAllocator(
 			cfg.Settings,
 			storePoolIsDeterministic,
-			func(string) (time.Duration, bool) {
+			func(id roachpb.NodeID) (time.Duration, bool) {
 				return 0, false
 			}, cfg.TestingKnobs.AllocatorKnobs,
 		)
@@ -1253,8 +1264,8 @@ func NewStore(
 		s.metrics.registry.AddMetricStruct(s.allocator.Metrics.LoadBasedLeaseTransferMetrics)
 		s.metrics.registry.AddMetricStruct(s.allocator.Metrics.LoadBasedReplicaRebalanceMetrics)
 	}
-	s.replRankings = NewReplicaRankings()
 
+	s.replRankings = NewReplicaRankings()
 	s.replRankingsByTenant = NewReplicaRankingsMap()
 
 	s.raftRecvQueues.mon = mon.NewUnlimitedMonitor(
@@ -1281,6 +1292,8 @@ func NewStore(
 	// unnecessary elections when ticks are temporarily delayed and piled up.
 	s.scheduler = newRaftScheduler(cfg.AmbientCtx, s.metrics, s, storeSchedulerConcurrency,
 		cfg.RaftElectionTimeoutTicks)
+
+	s.syncWaiter = logstore.NewSyncWaiterLoop()
 
 	s.raftEntryCache = raftentry.NewCache(cfg.RaftEntryCacheSize)
 	s.metrics.registry.AddMetricStruct(s.raftEntryCache.Metrics())
@@ -1330,7 +1343,13 @@ func NewStore(
 	// after each snapshot application, except when the node crashed right before
 	// it can clean it up. If this fails it's not a correctness issue since the
 	// storage is also cleared before receiving a snapshot.
-	s.sstSnapshotStorage = NewSSTSnapshotStorage(s.engine, s.limiters.BulkIOWriteRate)
+	//
+	// TODO(sep-raft-log): need a snapshot storage per engine since we'll need to split
+	// the SSTs. Or probably we don't need snapshots on the raft SST at all - the reason
+	// we use them now is because we want snapshot apply to be completely atomic but that
+	// is out the window with two engines, so we may as well break the atomicity in the
+	// common case and do something more effective.
+	s.sstSnapshotStorage = NewSSTSnapshotStorage(s.TODOEngine(), s.limiters.BulkIOWriteRate)
 	if err := s.sstSnapshotStorage.Clear(); err != nil {
 		log.Warningf(ctx, "failed to clear snapshot storage: %v", err)
 	}
@@ -1389,6 +1408,8 @@ func NewStore(
 		updateSystemConfigUpdateQueueLimits)
 
 	if s.cfg.Gossip != nil {
+		s.storeGossip = NewStoreGossip(cfg.Gossip, s, cfg.TestingKnobs.GossipTestingKnobs)
+
 		// Add range scanner and configure with queues.
 		s.scanner = newReplicaScanner(
 			s.cfg.AmbientCtx, s.cfg.Clock, cfg.ScanInterval,
@@ -1770,7 +1791,8 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 
 	// Populate the store ident. If not bootstrapped, ReadStoreIntent will
 	// return an error.
-	ident, err := kvstorage.ReadStoreIdent(ctx, s.engine)
+	// TODO(sep-raft-log): which engine holds the ident?
+	ident, err := kvstorage.ReadStoreIdent(ctx, s.TODOEngine())
 	if err != nil {
 		return err
 	}
@@ -1781,9 +1803,10 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	ctx = s.AnnotateCtx(ctx)
 	log.Event(ctx, "read store identity")
 
-	// Communicate store ID to engine, if it needs it.
-	if logSetter, ok := s.engine.(storage.StoreIDSetter); ok {
-		logSetter.SetStoreID(ctx, int32(s.StoreID()))
+	// Communicate store ID to engine.
+	// TODO(sep-raft-log): do for both engines.
+	if err := s.TODOEngine().SetStoreID(ctx, int32(s.StoreID())); err != nil {
+		return err
 	}
 
 	// Add the store ID to the scanner's AmbientContext before starting it, since
@@ -1844,7 +1867,8 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	s.raftTruncator = makeRaftLogTruncator(s.cfg.AmbientCtx, (*storeForTruncatorImpl)(s), stopper)
 	{
 		truncator := s.raftTruncator
-		s.engine.RegisterFlushCompletedCallback(func() {
+		// When state machine has persisted new RaftAppliedIndex, fire callback.
+		s.TODOEngine().RegisterFlushCompletedCallback(func() {
 			truncator.durabilityAdvancedCallback()
 		})
 	}
@@ -1877,14 +1901,26 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// TODO(peter): While we have to iterate to find the replica descriptors
 	// serially, we can perform the migrations and replica creation
 	// concurrently. Note that while we can perform this initialization
-	// concurrently, all of the initialization must be performed before we start
+	// concurrently, all initialization must be performed before we start
 	// listening for Raft messages and starting the process Raft loop.
-	engRepls, err := kvstorage.LoadAndReconcileReplicas(ctx, s.engine)
+	//
+	// TODO(sep-raft-log): this will need to learn to stitch and reconcile data from
+	// both engines.
+	repls, err := kvstorage.LoadAndReconcileReplicas(ctx, s.TODOEngine())
 	if err != nil {
 		return err
 	}
-	for fullID, desc := range engRepls.Initialized {
-		rep, err := newReplica(ctx, desc, s, fullID.ReplicaID)
+	for _, repl := range repls {
+		if repl.Desc == nil {
+			// Uninitialized Replicas are not currently instantiated at store start.
+			continue
+		}
+		// TODO(pavelkalinnikov): integrate into kvstorage.LoadAndReconcileReplicas.
+		state, err := repl.Load(ctx, s.TODOEngine(), s.StoreID())
+		if err != nil {
+			return err
+		}
+		rep, err := newInitializedReplica(s, state)
 		if err != nil {
 			return err
 		}
@@ -1896,7 +1932,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		// TODO(pavelkalinnikov): hide these in Store's replica create functions.
 		err = s.addToReplicasByRangeIDLocked(rep)
 		if err == nil {
-			err = s.addToReplicasByKeyLocked(rep)
+			err = s.addToReplicasByKeyLocked(rep, rep.Desc())
 		}
 		s.mu.Unlock()
 		if err != nil {
@@ -1942,6 +1978,8 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// Gossip is only ever nil while bootstrapping a cluster and
 	// in unittests.
 	if s.cfg.Gossip != nil {
+		s.storeGossip.stopper = stopper
+		s.storeGossip.Ident = *s.Ident
 
 		// Start a single goroutine in charge of periodically gossiping the
 		// sentinel and first range metadata if we have a first range.
@@ -1996,7 +2034,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 
 	if s.replicateQueue != nil {
 		s.storeRebalancer = NewStoreRebalancer(
-			s.cfg.AmbientCtx, s.cfg.Settings, s.replicateQueue, s.replRankings)
+			s.cfg.AmbientCtx, s.cfg.Settings, s.replicateQueue, s.replRankings, s.rebalanceObjManager)
 		s.storeRebalancer.Start(ctx, s.stopper)
 	}
 
@@ -2025,97 +2063,13 @@ func (s *Store) WaitForInit() {
 	s.initComplete.Wait()
 }
 
-var errPeriodicGossipsDisabled = errors.New("periodic gossip is disabled")
-
-// startGossip runs an infinite loop in a goroutine which regularly checks
-// whether the store has a first range or config replica and asks those ranges
-// to gossip accordingly.
-func (s *Store) startGossip() {
-	wakeReplica := func(ctx context.Context, repl *Replica) error {
-		// Acquire the range lease, which in turn triggers system data gossip
-		// functions (e.g. MaybeGossipSystemConfig or MaybeGossipNodeLiveness).
-		_, pErr := repl.getLeaseForGossip(ctx)
-		return pErr.GoError()
-	}
-	gossipFns := []struct {
-		key         roachpb.Key
-		fn          func(context.Context, *Replica) error
-		description redact.SafeString
-		interval    time.Duration
-	}{
-		{
-			key: roachpb.KeyMin,
-			fn: func(ctx context.Context, repl *Replica) error {
-				// The first range is gossiped by all replicas, not just the lease
-				// holder, so wakeReplica is not used here.
-				return repl.maybeGossipFirstRange(ctx).GoError()
-			},
-			description: "first range descriptor",
-			interval:    s.cfg.SentinelGossipTTL() / 2,
-		},
-		{
-			key:         keys.NodeLivenessSpan.Key,
-			fn:          wakeReplica,
-			description: "node liveness",
-			interval:    systemDataGossipInterval,
-		},
-	}
-
-	cannotGossipEvery := log.Every(time.Minute)
-	cannotGossipEvery.ShouldLog() // only log next time after waiting out the delay
-
-	// Periodic updates run in a goroutine and signal a WaitGroup upon completion
-	// of their first iteration.
-	s.initComplete.Add(len(gossipFns))
-	for _, gossipFn := range gossipFns {
-		gossipFn := gossipFn // per-iteration copy
-		bgCtx := s.AnnotateCtx(context.Background())
-		if err := s.stopper.RunAsyncTask(bgCtx, "store-gossip", func(ctx context.Context) {
-			ticker := time.NewTicker(gossipFn.interval)
-			defer ticker.Stop()
-			for first := true; ; {
-				// Retry in a backoff loop until gossipFn succeeds. The gossipFn might
-				// temporarily fail (e.g. because node liveness hasn't initialized yet
-				// making it impossible to get an epoch-based range lease), in which
-				// case we want to retry quickly.
-				retryOptions := base.DefaultRetryOptions()
-				retryOptions.Closer = s.stopper.ShouldQuiesce()
-				for r := retry.Start(retryOptions); r.Next(); {
-					if repl := s.LookupReplica(roachpb.RKey(gossipFn.key)); repl != nil {
-						annotatedCtx := repl.AnnotateCtx(ctx)
-						if err := gossipFn.fn(annotatedCtx, repl); err != nil {
-							if cannotGossipEvery.ShouldLog() {
-								log.Infof(annotatedCtx, "could not gossip %s: %v", gossipFn.description, err)
-							}
-							if !errors.Is(err, errPeriodicGossipsDisabled) {
-								continue
-							}
-						}
-					}
-					break
-				}
-				if first {
-					first = false
-					s.initComplete.Done()
-				}
-				select {
-				case <-ticker.C:
-				case <-s.stopper.ShouldQuiesce():
-					return
-				}
-			}
-		}); err != nil {
-			s.initComplete.Done()
-		}
-	}
-}
-
-var errSysCfgUnavailable = errors.New("system config not available in gossip")
-
 // GetConfReader exposes access to a configuration reader.
 func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, error) {
 	if s.cfg.TestingKnobs.MakeSystemConfigSpanUnavailableToQueues {
 		return nil, errSysCfgUnavailable
+	}
+	if s.cfg.TestingKnobs.ConfReaderInterceptor != nil {
+		return s.cfg.TestingKnobs.ConfReaderInterceptor(), nil
 	}
 
 	if s.cfg.SpanConfigsDisabled ||
@@ -2164,7 +2118,7 @@ func (s *Store) startLeaseRenewer(ctx context.Context) {
 				repl := (*Replica)(v)
 				annotatedCtx := repl.AnnotateCtx(ctx)
 				if _, pErr := repl.redirectOnOrAcquireLease(annotatedCtx); pErr != nil {
-					if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); !ok {
+					if _, ok := pErr.GetDetail().(*kvpb.NotLeaseHolderError); !ok {
 						log.Warningf(annotatedCtx, "failed to proactively renew lease: %s", pErr)
 					}
 					s.renewableLeases.Delete(k)
@@ -2268,58 +2222,6 @@ func (s *Store) removeReplicaWithRangefeed(rangeID roachpb.RangeID) {
 	s.rangefeedReplicas.Lock()
 	delete(s.rangefeedReplicas.m, rangeID)
 	s.rangefeedReplicas.Unlock()
-}
-
-// systemGossipUpdate is a callback for gossip updates to
-// the system config which affect range split boundaries.
-func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
-	if !s.cfg.SpanConfigsDisabled && spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
-		return // nothing to do
-	}
-
-	ctx := s.AnnotateCtx(context.Background())
-	s.computeInitialMetrics.Do(func() {
-		// Metrics depend in part on the system config. Compute them as soon as we
-		// get the first system config, then periodically in the background
-		// (managed by the Node).
-		if err := s.ComputeMetrics(ctx); err != nil {
-			log.Infof(ctx, "%s: failed initial metrics computation: %s", s, err)
-		}
-		log.Event(ctx, "computed initial metrics")
-	})
-
-	// We'll want to offer all replicas to the split and merge queues. Be a little
-	// careful about not spawning too many individual goroutines.
-	shouldQueue := s.systemConfigUpdateQueueRateLimiter.AdmitN(1)
-
-	// For every range, update its zone config and check if it needs to
-	// be split or merged.
-	now := s.cfg.Clock.NowAsClockTimestamp()
-	newStoreReplicaVisitor(s).Visit(func(repl *Replica) bool {
-		key := repl.Desc().StartKey
-		conf, err := sysCfg.GetSpanConfigForKey(ctx, key)
-		if err != nil {
-			if log.V(1) {
-				log.Infof(context.TODO(), "failed to get span config for key %s", key)
-			}
-			conf = s.cfg.DefaultSpanConfig
-		}
-
-		if s.cfg.SpanConfigsDisabled ||
-			!spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
-			repl.SetSpanConfig(conf)
-		}
-
-		if shouldQueue {
-			s.splitQueue.Async(ctx, "gossip update", true /* wait */, func(ctx context.Context, h queueHelper) {
-				h.MaybeAdd(ctx, repl, now)
-			})
-			s.mergeQueue.Async(ctx, "gossip update", true /* wait */, func(ctx context.Context, h queueHelper) {
-				h.MaybeAdd(ctx, repl, now)
-			})
-		}
-		return true // more
-	})
 }
 
 // onSpanConfigUpdate is the callback invoked whenever this store learns of a
@@ -2427,16 +2329,9 @@ func (s *Store) applyAllFromSpanConfigStore(ctx context.Context) {
 	})
 }
 
-func (s *Store) asyncGossipStore(ctx context.Context, reason string, useCached bool) {
-	if err := s.stopper.RunAsyncTask(
-		ctx, fmt.Sprintf("storage.Store: gossip on %s", reason),
-		func(ctx context.Context) {
-			if err := s.GossipStore(ctx, useCached); err != nil {
-				log.Warningf(ctx, "error gossiping on %s: %+v", reason, err)
-			}
-		}); err != nil {
-		log.Warningf(ctx, "unable to gossip on %s: %+v", reason, err)
-	}
+// GossipStore broadcasts the store on the gossip network.
+func (s *Store) GossipStore(ctx context.Context, useCached bool) error {
+	return s.storeGossip.GossipStore(ctx, useCached)
 }
 
 // UpdateIOThreshold updates the IOThreshold reported in the StoreDescriptor.
@@ -2444,120 +2339,6 @@ func (s *Store) UpdateIOThreshold(ioThreshold *admissionpb.IOThreshold) {
 	s.ioThreshold.Lock()
 	defer s.ioThreshold.Unlock()
 	s.ioThreshold.t = ioThreshold
-}
-
-// GossipStore broadcasts the store on the gossip network.
-func (s *Store) GossipStore(ctx context.Context, useCached bool) error {
-	// Temporarily indicate that we're gossiping the store capacity to avoid
-	// recursively triggering a gossip of the store capacity.
-	syncutil.StoreFloat64(&s.gossipQueriesPerSecondVal, -1)
-	syncutil.StoreFloat64(&s.gossipWritesPerSecondVal, -1)
-
-	storeDesc, err := s.Descriptor(ctx, useCached)
-	if err != nil {
-		return errors.Wrapf(err, "problem getting store descriptor for store %+v", s.Ident)
-	}
-
-	// Set countdown target for re-gossiping capacity to be large enough that
-	// it would only occur when there has been significant changes. We
-	// currently gossip every 10 seconds, meaning that unless significant
-	// redistribution occurs we do not wish to gossip again to avoid wasting
-	// bandwidth and racing with local storepool estimations.
-	// TODO(kvoli): Reconsider what triggers gossip here and possibly limit to
-	// only significant workload changes (load), rather than lease or range
-	// count. Previoulsy, this was not as much as an issue as the gossip
-	// interval was 60 seconds, such that gossiping semi-frequently on changes
-	// was required.
-	rangeCountdown := float64(storeDesc.Capacity.RangeCount) * s.cfg.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction
-	atomic.StoreInt32(&s.gossipRangeCountdown, int32(math.Ceil(math.Max(rangeCountdown, 10))))
-	leaseCountdown := float64(storeDesc.Capacity.LeaseCount) * s.cfg.TestingKnobs.GossipWhenCapacityDeltaExceedsFraction
-	atomic.StoreInt32(&s.gossipLeaseCountdown, int32(math.Ceil(math.Max(leaseCountdown, 10))))
-	syncutil.StoreFloat64(&s.gossipQueriesPerSecondVal, storeDesc.Capacity.QueriesPerSecond)
-	syncutil.StoreFloat64(&s.gossipWritesPerSecondVal, storeDesc.Capacity.WritesPerSecond)
-
-	// Unique gossip key per store.
-	gossipStoreKey := gossip.MakeStoreDescKey(storeDesc.StoreID)
-	// Gossip store descriptor.
-	if fn := s.cfg.TestingKnobs.StoreGossipIntercept; fn != nil {
-		// Give the interceptor a chance to see and/or mutate the descriptor we're about
-		// to gossip.
-		fn(storeDesc)
-	}
-	return s.cfg.Gossip.AddInfoProto(gossipStoreKey, storeDesc, gossip.StoreTTL)
-}
-
-type capacityChangeEvent int
-
-const (
-	rangeAddEvent capacityChangeEvent = iota
-	rangeRemoveEvent
-	leaseAddEvent
-	leaseRemoveEvent
-)
-
-// maybeGossipOnCapacityChange decrements the countdown on range
-// and leaseholder counts. If it reaches 0, then we trigger an
-// immediate gossip of this store's descriptor, to include updated
-// capacity information.
-func (s *Store) maybeGossipOnCapacityChange(ctx context.Context, cce capacityChangeEvent) {
-	if s.cfg.TestingKnobs.DisableLeaseCapacityGossip && (cce == leaseAddEvent || cce == leaseRemoveEvent) {
-		return
-	}
-
-	// Incrementally adjust stats to keep them up to date even if the
-	// capacity is gossiped, but isn't due yet to be recomputed from scratch.
-	s.cachedCapacity.Lock()
-	switch cce {
-	case rangeAddEvent:
-		s.cachedCapacity.RangeCount++
-	case rangeRemoveEvent:
-		s.cachedCapacity.RangeCount--
-	case leaseAddEvent:
-		s.cachedCapacity.LeaseCount++
-	case leaseRemoveEvent:
-		s.cachedCapacity.LeaseCount--
-	}
-	s.cachedCapacity.Unlock()
-
-	if ((cce == rangeAddEvent || cce == rangeRemoveEvent) && atomic.AddInt32(&s.gossipRangeCountdown, -1) == 0) ||
-		((cce == leaseAddEvent || cce == leaseRemoveEvent) && atomic.AddInt32(&s.gossipLeaseCountdown, -1) == 0) {
-		// Reset countdowns to avoid unnecessary gossiping.
-		atomic.StoreInt32(&s.gossipRangeCountdown, 0)
-		atomic.StoreInt32(&s.gossipLeaseCountdown, 0)
-		s.asyncGossipStore(ctx, "capacity change", true /* useCached */)
-	}
-}
-
-// recordNewPerSecondStats takes recently calculated values for the number of
-// queries and key writes the store is handling and decides whether either has
-// changed enough to justify re-gossiping the store's capacity.
-func (s *Store) recordNewPerSecondStats(newQPS, newWPS float64) {
-	oldQPS := syncutil.LoadFloat64(&s.gossipQueriesPerSecondVal)
-	oldWPS := syncutil.LoadFloat64(&s.gossipWritesPerSecondVal)
-	if oldQPS == -1 || oldWPS == -1 {
-		// Gossiping of store capacity is already ongoing.
-		return
-	}
-
-	const minAbsoluteChange = 100
-	updateForQPS := (newQPS < oldQPS*.5 || newQPS > oldQPS*1.5) && math.Abs(newQPS-oldQPS) > minAbsoluteChange
-	updateForWPS := (newWPS < oldWPS*.5 || newWPS > oldWPS*1.5) && math.Abs(newWPS-oldWPS) > minAbsoluteChange
-
-	if !updateForQPS && !updateForWPS {
-		return
-	}
-
-	var message string
-	if updateForQPS && updateForWPS {
-		message = "queries-per-second and writes-per-second change"
-	} else if updateForQPS {
-		message = "queries-per-second change"
-	} else {
-		message = "writes-per-second change"
-	}
-	// TODO(a-robinson): Use the provided values to avoid having to recalculate
-	// them in GossipStore.
-	s.asyncGossipStore(context.TODO(), message, false /* useCached */)
 }
 
 // VisitReplicasOption optionally modifies store.VisitReplicas.
@@ -2611,7 +2392,7 @@ func (s *Store) WriteLastUpTimestamp(ctx context.Context, time hlc.Timestamp) er
 	ctx = s.AnnotateCtx(ctx)
 	return storage.MVCCPutProto(
 		ctx,
-		s.engine,
+		s.TODOEngine(), // TODO(sep-raft-log): probably state engine
 		nil,
 		keys.StoreLastUpKey(),
 		hlc.Timestamp{},
@@ -2628,7 +2409,7 @@ func (s *Store) WriteLastUpTimestamp(ctx context.Context, time hlc.Timestamp) er
 // timestamp is returned instead.
 func (s *Store) ReadLastUpTimestamp(ctx context.Context) (hlc.Timestamp, error) {
 	var timestamp hlc.Timestamp
-	ok, err := storage.MVCCGetProto(ctx, s.Engine(), keys.StoreLastUpKey(), hlc.Timestamp{},
+	ok, err := storage.MVCCGetProto(ctx, s.TODOEngine(), keys.StoreLastUpKey(), hlc.Timestamp{},
 		&timestamp, storage.MVCCGetOptions{})
 	if err != nil {
 		return hlc.Timestamp{}, err
@@ -2642,7 +2423,7 @@ func (s *Store) ReadLastUpTimestamp(ctx context.Context) (hlc.Timestamp, error) 
 func (s *Store) WriteHLCUpperBound(ctx context.Context, time int64) error {
 	ctx = s.AnnotateCtx(ctx)
 	ts := hlc.Timestamp{WallTime: time}
-	batch := s.Engine().NewBatch()
+	batch := s.TODOEngine().NewBatch() // TODO(sep-raft-log): state engine might be useful here due to need to sync
 	// Write has to sync to disk to ensure HLC monotonicity across restarts
 	defer batch.Close()
 	if err := storage.MVCCPutProto(
@@ -2697,76 +2478,6 @@ func ReadMaxHLCUpperBound(ctx context.Context, engines []storage.Engine) (int64,
 	return hlcUpperBound, nil
 }
 
-// checkCanInitializeEngine ensures that the engine is empty except for a
-// cluster version, which must be present.
-func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
-	// See if this is an already-bootstrapped store.
-	ident, err := kvstorage.ReadStoreIdent(ctx, eng)
-	if err == nil {
-		return errors.Errorf("engine already initialized as %s", ident.String())
-	} else if !errors.HasType(err, (*kvstorage.NotBootstrappedError)(nil)) {
-		return errors.Wrap(err, "unable to read store ident")
-	}
-	// Engine is not bootstrapped yet (i.e. no StoreIdent). Does it contain a
-	// cluster version, cached settings and nothing else? Note that there is one
-	// cluster version key and many cached settings key, and the cluster version
-	// key precedes the cached settings.
-	//
-	// We use an EngineIterator to ensure that there are no keys that cannot be
-	// parsed as MVCCKeys (e.g. lock table keys) in the engine.
-	iter := eng.NewEngineIterator(storage.IterOptions{
-		KeyTypes:   storage.IterKeyTypePointsAndRanges,
-		UpperBound: roachpb.KeyMax,
-	})
-	defer iter.Close()
-	valid, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: roachpb.KeyMin})
-	if !valid {
-		if err == nil {
-			return errors.New("no cluster version found on uninitialized engine")
-		}
-		return err
-	}
-	getMVCCKey := func() (storage.MVCCKey, error) {
-		if _, hasRange := iter.HasPointAndRange(); hasRange {
-			bounds, err := iter.EngineRangeBounds()
-			if err != nil {
-				return storage.MVCCKey{}, err
-			}
-			return storage.MVCCKey{}, errors.Errorf("found mvcc range key: %s", bounds)
-		}
-		var k storage.EngineKey
-		k, err = iter.EngineKey()
-		if err != nil {
-			return storage.MVCCKey{}, err
-		}
-		if !k.IsMVCCKey() {
-			return storage.MVCCKey{}, errors.Errorf("found non-mvcc key: %s", k)
-		}
-		return k.ToMVCCKey()
-	}
-	var k storage.MVCCKey
-	if k, err = getMVCCKey(); err != nil {
-		return err
-	}
-	if !k.Key.Equal(keys.StoreClusterVersionKey()) {
-		return errors.New("no cluster version found on uninitialized engine")
-	}
-	valid, err = iter.NextEngineKey()
-	for valid {
-		// Only allowed to find cached cluster settings on an uninitialized
-		// engine.
-		if k, err = getMVCCKey(); err != nil {
-			return err
-		}
-		if _, err := keys.DecodeStoreCachedSettingsKey(k.Key); err != nil {
-			return errors.Errorf("engine cannot be bootstrapped, contains key:\n%s", k.String())
-		}
-		// There may be more cached cluster settings, so continue iterating.
-		valid, err = iter.NextEngineKey()
-	}
-	return err
-}
-
 // GetReplica fetches a replica by Range ID. Returns an error if no replica is found.
 //
 // See also GetReplicaIfExists for a more perfomant version.
@@ -2774,7 +2485,7 @@ func (s *Store) GetReplica(rangeID roachpb.RangeID) (*Replica, error) {
 	if r := s.GetReplicaIfExists(rangeID); r != nil {
 		return r, nil
 	}
-	return nil, roachpb.NewRangeNotFoundError(rangeID, s.StoreID())
+	return nil, kvpb.NewRangeNotFoundError(rangeID, s.StoreID())
 }
 
 // GetReplicaIfExists returns the replica with the given RangeID or nil.
@@ -2845,8 +2556,23 @@ func (s *Store) StoreID() roachpb.StoreID { return s.Ident.StoreID }
 // Clock accessor.
 func (s *Store) Clock() *hlc.Clock { return s.cfg.Clock }
 
-// Engine accessor.
-func (s *Store) Engine() storage.Engine { return s.engine }
+// StateEngine returns the statemachine engine.
+func (s *Store) StateEngine() storage.Engine {
+	return s.internalEngines.stateEngine
+}
+
+// TODOEngine is a placeholder for cases in which
+// the caller needs to be updated in order to use
+// only one engine, or a closer check is still
+// pending.
+func (s *Store) TODOEngine() storage.Engine {
+	return s.internalEngines.todoEngine
+}
+
+// LogEngine returns the log engine.
+func (s *Store) LogEngine() storage.Engine {
+	return s.internalEngines.logEngine
+}
 
 // DB accessor.
 func (s *Store) DB() *kv.DB { return s.cfg.DB }
@@ -2876,12 +2602,13 @@ func (s *Store) AllocateRangeID(ctx context.Context) (roachpb.RangeID, error) {
 
 // Attrs returns the attributes of the underlying store.
 func (s *Store) Attrs() roachpb.Attributes {
-	return s.engine.Attrs()
+	return s.TODOEngine().Attrs()
 }
 
 // Properties returns the properties of the underlying store.
 func (s *Store) Properties() roachpb.StoreProperties {
-	return s.engine.Properties()
+	// TODO(sep-raft-log): see if this needs to exist for the logEngine too.
+	return s.TODOEngine().Properties()
 }
 
 // Capacity returns the capacity of the underlying storage engine. Note that
@@ -2890,15 +2617,13 @@ func (s *Store) Properties() roachpb.StoreProperties {
 // internal statistics about its replicas.
 func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapacity, error) {
 	if useCached {
-		s.cachedCapacity.Lock()
-		capacity := s.cachedCapacity.StoreCapacity
-		s.cachedCapacity.Unlock()
+		capacity := s.storeGossip.CachedCapacity()
 		if capacity != (roachpb.StoreCapacity{}) {
 			return capacity, nil
 		}
 	}
 
-	capacity, err := s.engine.Capacity()
+	capacity, err := s.TODOEngine().Capacity()
 	if err != nil {
 		return roachpb.StoreCapacity{}, err
 	}
@@ -2910,11 +2635,11 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	var l0SublevelsMax int64
 	var totalQueriesPerSecond float64
 	var totalWritesPerSecond float64
+	var totalStoreCPUTimePerSecond float64
 	replicaCount := s.metrics.ReplicaCount.Value()
 	bytesPerReplica := make([]float64, 0, replicaCount)
 	writesPerReplica := make([]float64, 0, replicaCount)
-	rankingsAccumulator := NewReplicaAccumulator(
-		LBRebalancingDimension(LoadBasedRebalancingDimension.Get(&s.ClusterSettings().SV)).ToDimension())
+	rankingsAccumulator := NewReplicaAccumulator(s.rebalanceObjManager.Objective().ToDimension())
 	rankingsByTenantAccumulator := NewTenantReplicaAccumulator()
 
 	// Query the current L0 sublevels and record the updated maximum to metrics.
@@ -2932,6 +2657,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 		// starts? We can't easily have a countdown as its value changes like for
 		// leases/replicas.
 		// TODO(a-robinson): Calculate percentiles for qps? Get rid of other percentiles?
+		totalStoreCPUTimePerSecond += usage.RequestCPUNanosPerSecond + usage.RaftCPUNanosPerSecond
 		totalQueriesPerSecond += usage.QueriesPerSecond
 		totalWritesPerSecond += usage.WritesPerSecond
 		writesPerReplica = append(writesPerReplica, usage.WritesPerSecond)
@@ -2943,9 +2669,23 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 		rankingsByTenantAccumulator.AddReplica(cr)
 		return true
 	})
+
+	// It is possible that the cputime utility isn't supported on this node's
+	// architecture. If that is the case, we publish the cpu per second as -1
+	// which is special cased on the receiving end and controls whether the cpu
+	// balancing objective is permitted. If this is not updated, the cpu per
+	// second will be zero and other stores will likely begin rebalancing
+	// towards this store as it will appear underfull.
+	if !grunning.Supported() {
+		totalStoreCPUTimePerSecond = -1
+	} else {
+		totalStoreCPUTimePerSecond = math.Max(totalStoreCPUTimePerSecond, 0)
+	}
+
 	capacity.RangeCount = rangeCount
 	capacity.LeaseCount = leaseCount
 	capacity.LogicalBytes = logicalBytes
+	capacity.CPUPerSecond = totalStoreCPUTimePerSecond
 	capacity.QueriesPerSecond = totalQueriesPerSecond
 	capacity.WritesPerSecond = totalWritesPerSecond
 	capacity.L0Sublevels = l0SublevelsMax
@@ -2956,13 +2696,11 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	}
 	capacity.BytesPerReplica = roachpb.PercentilesFromData(bytesPerReplica)
 	capacity.WritesPerReplica = roachpb.PercentilesFromData(writesPerReplica)
-	s.recordNewPerSecondStats(totalQueriesPerSecond, totalWritesPerSecond)
+	s.storeGossip.RecordNewPerSecondStats(totalQueriesPerSecond, totalWritesPerSecond)
 	s.replRankings.Update(rankingsAccumulator)
 	s.replRankingsByTenant.Update(rankingsByTenantAccumulator)
 
-	s.cachedCapacity.Lock()
-	s.cachedCapacity.StoreCapacity = capacity
-	s.cachedCapacity.Unlock()
+	s.storeGossip.UpdateCachedCapacity(capacity)
 
 	return capacity, nil
 }
@@ -3014,9 +2752,7 @@ func (s *Store) Descriptor(ctx context.Context, useCached bool) (*roachpb.StoreD
 // RangeFeed registers a rangefeed over the specified span. It sends updates to
 // the provided stream and returns with an optional error when the rangefeed is
 // complete.
-func (s *Store) RangeFeed(
-	args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink,
-) *roachpb.Error {
+func (s *Store) RangeFeed(args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink) *kvpb.Error {
 
 	if filter := s.TestingKnobs().TestingRangefeedFilter; filter != nil {
 		if pErr := filter(args, stream); pErr != nil {
@@ -3025,13 +2761,13 @@ func (s *Store) RangeFeed(
 	}
 
 	if err := verifyKeys(args.Span.Key, args.Span.EndKey, true); err != nil {
-		return roachpb.NewError(err)
+		return kvpb.NewError(err)
 	}
 
 	// Get range and add command to the range for execution.
 	repl, err := s.GetReplica(args.RangeID)
 	if err != nil {
-		return roachpb.NewError(err)
+		return kvpb.NewError(err)
 	}
 	if !repl.IsInitialized() {
 		// (*Store).Send has an optimization for uninitialized replicas to send back
@@ -3039,7 +2775,7 @@ func (s *Store) RangeFeed(
 		// be found. RangeFeeds can always be served from followers and so don't
 		// otherwise return NotLeaseHolderError. For simplicity we also don't return
 		// one here.
-		return roachpb.NewError(roachpb.NewRangeNotFoundError(args.RangeID, s.StoreID()))
+		return kvpb.NewError(kvpb.NewRangeNotFoundError(args.RangeID, s.StoreID()))
 	}
 
 	tenID, _ := repl.TenantID()
@@ -3155,7 +2891,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		averageReadsPerSecond += loadStats.ReadKeysPerSecond
 		averageReadBytesPerSecond += loadStats.ReadBytesPerSecond
 		averageWriteBytesPerSecond += loadStats.WriteBytesPerSecond
-		averageCPUNanosPerSecond += loadStats.CPUNanosPerSecond
+		averageCPUNanosPerSecond += loadStats.RaftCPUNanosPerSecond + loadStats.RequestCPUNanosPerSecond
 
 		locks += metrics.LockTableMetrics.Locks
 		totalLockHoldDurationNanos += metrics.LockTableMetrics.TotalLockHoldDurationNanos
@@ -3193,7 +2929,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.metrics.AverageReadBytesPerSecond.Update(averageReadBytesPerSecond)
 	s.metrics.AverageWriteBytesPerSecond.Update(averageWriteBytesPerSecond)
 	s.metrics.AverageCPUNanosPerSecond.Update(averageCPUNanosPerSecond)
-	s.recordNewPerSecondStats(averageQueriesPerSecond, averageWritesPerSecond)
+	s.storeGossip.RecordNewPerSecondStats(averageQueriesPerSecond, averageWritesPerSecond)
 
 	s.metrics.RangeCount.Update(rangeCount)
 	s.metrics.UnavailableRangeCount.Update(unavailableRangeCount)
@@ -3231,21 +2967,81 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 }
 
 func (s *Store) checkpointsDir() string {
-	return filepath.Join(s.engine.GetAuxiliaryDir(), "checkpoints")
+	return filepath.Join(s.TODOEngine().GetAuxiliaryDir(), "checkpoints")
 }
 
-// checkpoint creates a RocksDB checkpoint in the auxiliary directory with the
-// provided tag used in the filepath. The filepath for the checkpoint directory
-// is returned.
-func (s *Store) checkpoint(ctx context.Context, tag string) (string, error) {
-	checkpointBase := s.checkpointsDir()
-	_ = s.engine.MkdirAll(checkpointBase)
-
-	checkpointDir := filepath.Join(checkpointBase, tag)
-	if err := s.engine.CreateCheckpoint(checkpointDir); err != nil {
-		return "", err
+// checkpointSpans returns key spans containing the given range. The spans may
+// be wider, and contain a few extra ranges that surround the given range. The
+// extension of the spans gives more information for debugging consistency or
+// storage issues, e.g. in situations when a recent reconfiguration like split
+// or merge occurred.
+func (s *Store) checkpointSpans(desc *roachpb.RangeDescriptor) []roachpb.Span {
+	_ = s.TODOEngine() // this method needs to return two sets of spans, one for each engine
+	// Find immediate left and right neighbours by range ID.
+	var prevID, nextID roachpb.RangeID
+	s.mu.replicasByRangeID.Range(func(r *Replica) {
+		if id, our := r.RangeID, desc.RangeID; id < our && id > prevID {
+			prevID = id
+		} else if id > our && (nextID == 0 || id < nextID) {
+			nextID = id
+		}
+	})
+	if prevID == 0 {
+		prevID = desc.RangeID
+	}
+	if nextID == 0 {
+		nextID = desc.RangeID
 	}
 
+	// Find immediate left and right neighbours by user key.
+	s.mu.RLock()
+	left := s.mu.replicasByKey.LookupPrecedingReplica(context.Background(), desc.StartKey)
+	right := s.mu.replicasByKey.LookupNextReplica(context.Background(), desc.EndKey)
+	s.mu.RUnlock()
+
+	// Cover all range IDs (prevID, desc.RangeID, nextID) using a continuous span.
+	spanRangeIDs := func(first, last roachpb.RangeID) roachpb.Span {
+		return roachpb.Span{
+			Key:    keys.MakeRangeIDPrefix(first),
+			EndKey: keys.MakeRangeIDPrefix(last).PrefixEnd(),
+		}
+	}
+	spans := []roachpb.Span{spanRangeIDs(prevID, nextID)}
+
+	userKeys := desc.RSpan()
+	// Include the rangeID-local data comprising ranges left, desc, and right.
+	if left != nil {
+		userKeys.Key = left.Desc().StartKey
+		// Skip this range ID if it was already covered by [prevID, nextID].
+		if id := left.RangeID; id < prevID || id > nextID {
+			spans = append(spans, spanRangeIDs(id, id))
+		}
+	}
+	if right != nil {
+		userKeys.EndKey = right.Desc().EndKey
+		// Skip this range ID if it was already covered by [prevID, nextID].
+		if id := right.RangeID; id < prevID || id > nextID {
+			spans = append(spans, spanRangeIDs(id, id))
+		}
+	}
+	// Include replicated user key span containing ranges left, desc, and right.
+	// TODO(tbg): rangeID is ignored here, make a rangeID-agnostic helper.
+	spans = append(spans, rditer.Select(0, rditer.SelectOpts{ReplicatedBySpan: userKeys})...)
+
+	return spans
+}
+
+// checkpoint creates a Pebble checkpoint in the auxiliary directory with the
+// provided tag used in the filepath. Returns the path to the created checkpoint
+// directory. The checkpoint includes only files that intersect with either of
+// the provided key spans. If spans is empty, it includes the entire store.
+func (s *Store) checkpoint(tag string, spans []roachpb.Span) (string, error) {
+	checkpointBase := s.checkpointsDir()
+	_ = s.TODOEngine().MkdirAll(checkpointBase)
+	checkpointDir := filepath.Join(checkpointBase, tag)
+	if err := s.TODOEngine().CreateCheckpoint(checkpointDir, spans); err != nil {
+		return "", err
+	}
 	return checkpointDir, nil
 }
 
@@ -3261,18 +3057,19 @@ func (s *Store) computeMetrics(ctx context.Context) (m storage.Metrics, err erro
 	}
 
 	// Get the latest engine metrics.
-	m = s.engine.GetMetrics()
+	m = s.TODOEngine().GetMetrics()
+	_ = s.TODOEngine() // TODO(sep-raft-log): log engine should also have metrics
 	s.metrics.updateEngineMetrics(m)
 
 	// Get engine Env stats.
-	envStats, err := s.engine.GetEnvStats()
+	envStats, err := s.TODOEngine().GetEnvStats()
 	if err != nil {
 		return m, err
 	}
 	s.metrics.updateEnvStats(*envStats)
 
 	{
-		dirs, err := s.engine.List(s.checkpointsDir())
+		dirs, err := s.TODOEngine().List(s.checkpointsDir())
 		if err != nil { // skip NotFound or any other error
 			dirs = nil
 		}
@@ -3396,7 +3193,7 @@ type HotReplicaInfo struct {
 	WriteKeysPerSecond  float64
 	WriteBytesPerSecond float64
 	ReadBytesPerSecond  float64
-	CPUNanosPerSecond   float64
+	CPUTimePerSecond    float64
 }
 
 // HottestReplicas returns the hottest replicas on a store, sorted by their
@@ -3428,35 +3225,9 @@ func mapToHotReplicasInfo(repls []CandidateReplica) []HotReplicaInfo {
 		hotRepls[i].ReadKeysPerSecond = loadStats.ReadKeysPerSecond
 		hotRepls[i].WriteBytesPerSecond = loadStats.WriteBytesPerSecond
 		hotRepls[i].ReadBytesPerSecond = loadStats.ReadBytesPerSecond
+		hotRepls[i].CPUTimePerSecond = loadStats.RaftCPUNanosPerSecond + loadStats.RequestCPUNanosPerSecond
 	}
 	return hotRepls
-}
-
-// StoreKeySpanStats carries the result of a stats computation over a key range.
-type StoreKeySpanStats struct {
-	ReplicaCount         int
-	MVCC                 enginepb.MVCCStats
-	ApproximateDiskBytes uint64
-}
-
-// ComputeStatsForKeySpan computes the aggregated MVCCStats for all replicas on
-// this store which contain any keys in the supplied range.
-func (s *Store) ComputeStatsForKeySpan(startKey, endKey roachpb.RKey) (StoreKeySpanStats, error) {
-	var result StoreKeySpanStats
-
-	newStoreReplicaVisitor(s).UndefinedOrder().Visit(func(repl *Replica) bool {
-		desc := repl.Desc()
-		if bytes.Compare(startKey, desc.EndKey) >= 0 || bytes.Compare(desc.StartKey, endKey) >= 0 {
-			return true // continue
-		}
-		result.MVCC.Add(repl.GetMVCCStats())
-		result.ReplicaCount++
-		return true
-	})
-
-	var err error
-	result.ApproximateDiskBytes, err = s.engine.ApproximateDiskBytes(startKey.AsRawKey(), endKey.AsRawKey())
-	return result, err
 }
 
 // ReplicateQueueDryRun runs the given replica through the replicate queue
@@ -3500,12 +3271,14 @@ func (s *Store) ReplicateQueueDryRun(
 func (s *Store) AllocatorCheckRange(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
+	collectTraces bool,
 	overrideStorePool storepool.AllocatorStorePool,
 ) (allocatorimpl.AllocatorAction, roachpb.ReplicationTarget, tracingpb.Recording, error) {
-	ctx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx,
-		s.cfg.AmbientCtx.Tracer, "allocator check range",
-	)
-	defer collectAndFinish()
+	var spanOptions []tracing.SpanOption
+	if collectTraces {
+		spanOptions = append(spanOptions, tracing.WithRecording(tracingpb.RecordingVerbose))
+	}
+	ctx, sp := tracing.EnsureChildSpan(ctx, s.cfg.AmbientCtx.Tracer, "allocator check range", spanOptions...)
 
 	confReader, err := s.GetConfReader(ctx)
 	if err == nil {
@@ -3513,13 +3286,13 @@ func (s *Store) AllocatorCheckRange(
 	}
 	if err != nil {
 		log.Eventf(ctx, "span configs unavailable: %s", err)
-		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, collectAndFinish(), err
+		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
 	conf, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
 	if err != nil {
 		log.Eventf(ctx, "error retrieving span config for range %s: %s", desc, err)
-		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, collectAndFinish(), err
+		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
 	// If a store pool was provided, use that, otherwise use the store's
@@ -3535,18 +3308,18 @@ func (s *Store) AllocatorCheckRange(
 
 	// In the case that the action does not require a target, return immediately.
 	if !(action.Add() || action.Replace()) {
-		return action, roachpb.ReplicationTarget{}, collectAndFinish(), err
+		return action, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
-	liveVoters, liveNonVoters, isReplacement, nothingToDo, err :=
+	filteredVoters, filteredNonVoters, replacing, nothingToDo, err :=
 		allocatorimpl.FilterReplicasForAction(storePool, desc, action)
 
 	if nothingToDo || err != nil {
-		return action, roachpb.ReplicationTarget{}, collectAndFinish(), err
+		return action, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
 	target, _, err := s.allocator.AllocateTarget(ctx, storePool, conf,
-		liveVoters, liveNonVoters, action.ReplicaStatus(), action.TargetReplicaType(),
+		filteredVoters, filteredNonVoters, replacing, action.ReplicaStatus(), action.TargetReplicaType(),
 	)
 	if err == nil {
 		log.Eventf(ctx, "found valid allocation of %s target %v", action.TargetReplicaType(), target)
@@ -3558,11 +3331,11 @@ func (s *Store) AllocatorCheckRange(
 			storePool,
 			conf,
 			desc.Replicas().VoterDescriptors(),
-			liveNonVoters,
+			filteredVoters,
 			action.ReplicaStatus(),
 			action.TargetReplicaType(),
 			target,
-			isReplacement,
+			replacing != nil,
 		)
 
 		if fragileQuorumErr != nil {
@@ -3570,7 +3343,7 @@ func (s *Store) AllocatorCheckRange(
 		}
 	}
 
-	return action, target, collectAndFinish(), err
+	return action, target, sp.FinishAndGetConfiguredRecording(), err
 }
 
 // Enqueue runs the given replica through the requested queue. If `async` is
@@ -3776,7 +3549,7 @@ func (s *storeForTruncatorImpl) acquireReplicaForTruncator(
 ) replicaForTruncator {
 	r, err := (*Store)(s).GetReplica(rangeID)
 	if err != nil || r == nil {
-		// The only error we can see here is roachpb.NewRangeNotFoundError, so we
+		// The only error we can see here is kvpb.NewRangeNotFoundError, so we
 		// can ignore it.
 		return nil
 	}
@@ -3798,58 +3571,9 @@ func (s *storeForTruncatorImpl) releaseReplicaForTruncator(r replicaForTruncator
 }
 
 func (s *storeForTruncatorImpl) getEngine() storage.Engine {
-	return (*Store)(s).engine
-}
-
-// WriteClusterVersion writes the given cluster version to the store-local
-// cluster version key. We only accept a raw engine to ensure we're persisting
-// the write durably.
-func WriteClusterVersion(
-	ctx context.Context, eng storage.Engine, cv clusterversion.ClusterVersion,
-) error {
-	err := storage.MVCCPutProto(
-		ctx,
-		eng,
-		nil,
-		keys.StoreClusterVersionKey(),
-		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil,
-		&cv,
-	)
-	if err != nil {
-		return err
-	}
-
-	// The storage engine sometimes must make backwards incompatible
-	// changes. However, the store cluster version key is a key stored
-	// within the storage engine, so it's unavailable when the store is
-	// opened.
-	//
-	// The storage engine maintains its own minimum version on disk that
-	// it may consult it before opening the Engine. This version is
-	// stored in a separate file on the filesystem. For now, write to
-	// this file in combination with the store cluster version key.
-	//
-	// This parallel version state is a bit of a wart and an eventual
-	// goal is to replace the store cluster version key with the storage
-	// engine's flat file. This requires that there are no writes to the
-	// engine until either bootstrapping or joining an existing cluster.
-	// Writing the version to this file would happen before opening the
-	// engine for completing the rest of bootstrapping/joining the
-	// cluster.
-	return eng.SetMinVersion(cv.Version)
-}
-
-// ReadClusterVersion reads the cluster version from the store-local version
-// key. Returns an empty version if the key is not found.
-func ReadClusterVersion(
-	ctx context.Context, reader storage.Reader,
-) (clusterversion.ClusterVersion, error) {
-	var cv clusterversion.ClusterVersion
-	_, err := storage.MVCCGetProto(ctx, reader, keys.StoreClusterVersionKey(), hlc.Timestamp{},
-		&cv, storage.MVCCGetOptions{})
-	return cv, err
+	// TODO(sep-raft-log): we'll need the log engine here but need
+	// to read code to see if more needs to be done.
+	return (*Store)(s).TODOEngine()
 }
 
 func init() {

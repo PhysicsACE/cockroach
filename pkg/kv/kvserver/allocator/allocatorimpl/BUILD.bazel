@@ -22,6 +22,7 @@ go_library(
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/util/admission/admissionpb",
         "//pkg/util/log",
         "//pkg/util/metric",
         "//pkg/util/stop",
@@ -42,7 +43,6 @@ go_test(
     args = ["-test.timeout=295s"],
     embed = [":allocatorimpl"],
     deps = [
-        "//pkg/base",
         "//pkg/config/zonepb",
         "//pkg/gossip",
         "//pkg/keys",
@@ -53,7 +53,6 @@ go_test(
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/kv/kvserver/replicastats",
         "//pkg/roachpb",
-        "//pkg/rpc",
         "//pkg/settings/cluster",
         "//pkg/testutils",
         "//pkg/testutils/gossiputil",

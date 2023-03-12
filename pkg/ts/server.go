@@ -15,6 +15,8 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
@@ -95,6 +97,48 @@ type Server struct {
 	workerMemMonitor *mon.BytesMonitor
 	resultMemMonitor *mon.BytesMonitor
 	workerSem        *quotapool.IntPool
+}
+
+var _ tspb.TimeSeriesServer = &Server{}
+
+type TenantServer struct {
+	tspb.UnimplementedTimeSeriesServer
+
+	log.AmbientContext
+	tenantConnect kvtenant.Connector
+}
+
+var _ tspb.TenantTimeSeriesServer = &TenantServer{}
+
+// Query delegates to the tenant connector to query
+// the tsdb on the system tenant. The only authorization
+// necessary is the tenant capability check on the
+// connector.
+func (t *TenantServer) Query(
+	ctx context.Context, req *tspb.TimeSeriesQueryRequest,
+) (*tspb.TimeSeriesQueryResponse, error) {
+	ctx = t.AnnotateCtx(ctx)
+	return t.tenantConnect.Query(ctx, req)
+}
+
+// RegisterService registers the GRPC service.
+func (s *TenantServer) RegisterService(g *grpc.Server) {
+	tspb.RegisterTimeSeriesServer(g, s)
+}
+
+// RegisterGateway starts the gateway (i.e. reverse proxy) that proxies HTTP requests
+// to the appropriate gRPC endpoints.
+func (s *TenantServer) RegisterGateway(
+	ctx context.Context, mux *gwruntime.ServeMux, conn *grpc.ClientConn,
+) error {
+	return tspb.RegisterTimeSeriesHandler(ctx, mux, conn)
+}
+
+func MakeTenantServer(ambient log.AmbientContext, tenantConnect kvtenant.Connector) *TenantServer {
+	return &TenantServer{
+		AmbientContext: ambient,
+		tenantConnect:  tenantConnect,
+	}
 }
 
 // MakeServer instantiates a new Server which services requests with data from
@@ -433,7 +477,7 @@ func dumpTimeseriesAllSources(
 
 	for span != nil {
 		b := &kv.Batch{}
-		scan := roachpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
+		scan := kvpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
 		b.AddRawRequest(scan)
 		b.Header.MaxSpanRequestKeys = dumpBatchSize
 		err := db.Run(ctx, b)

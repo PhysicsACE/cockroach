@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -161,15 +162,13 @@ func (n *dropSchemaNode) startExec(params runParams) error {
 	}
 
 	// Create the job to drop the schema.
-	if err := p.createDropSchemaJob(
-		params.ctx,
+	p.createDropSchemaJob(
 		schemaIDs,
 		n.d.getDroppedTableDetails(),
 		n.d.typesToDelete,
+		n.d.functionsToDelete,
 		tree.AsStringWithFQNames(n.n, params.Ann()),
-	); err != nil {
-		return err
-	}
+	)
 
 	// Log Drop Schema event. This is an auditable log event and is recorded
 	// in the same transaction as table descriptor update.
@@ -230,18 +229,22 @@ func (p *planner) dropSchemaImpl(
 }
 
 func (p *planner) createDropSchemaJob(
-	ctx context.Context,
 	schemas []descpb.ID,
 	tableDropDetails []jobspb.DroppedTableDetails,
 	typesToDrop []*typedesc.Mutable,
+	functionsToDrop []*funcdesc.Mutable,
 	jobDesc string,
-) error {
+) {
 	typeIDs := make([]descpb.ID, 0, len(typesToDrop))
 	for _, t := range typesToDrop {
 		typeIDs = append(typeIDs, t.ID)
 	}
+	fnIDs := make([]descpb.ID, 0, len(functionsToDrop))
+	for _, f := range functionsToDrop {
+		fnIDs = append(fnIDs, f.ID)
+	}
 
-	_, err := p.extendedEvalCtx.QueueJob(ctx, p.Txn(), jobs.Record{
+	p.extendedEvalCtx.QueueJob(&jobs.Record{
 		Description:   jobDesc,
 		Username:      p.User(),
 		DescriptorIDs: schemas,
@@ -249,6 +252,7 @@ func (p *planner) createDropSchemaJob(
 			DroppedSchemas:    schemas,
 			DroppedTables:     tableDropDetails,
 			DroppedTypes:      typeIDs,
+			DroppedFunctions:  fnIDs,
 			DroppedDatabaseID: descpb.InvalidID,
 			// The version distinction for database jobs doesn't matter for jobs that
 			// drop schemas.
@@ -257,7 +261,6 @@ func (p *planner) createDropSchemaJob(
 		Progress:      jobspb.SchemaChangeProgress{},
 		NonCancelable: true,
 	})
-	return err
 }
 
 func (n *dropSchemaNode) Next(params runParams) (bool, error) { return false, nil }

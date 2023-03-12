@@ -28,17 +28,20 @@ import {
 } from "../recentExecutions/recentStatementUtils";
 import {
   calculateActiveFilters,
+  defaultFilters,
   getFullFiltersAsStringRecord,
-} from "../queryFilter/filter";
+} from "../queryFilter";
 import { RecentStatementsSection } from "../recentExecutions/recentStatementsSection";
-import { inactiveFiltersState } from "../queryFilter/filter";
 import { queryByName, syncHistory } from "src/util/query";
 import { getTableSortFromURL } from "../sortedtable/getTableSortFromURL";
 import { getRecentStatementFiltersFromURL } from "src/queryFilter/utils";
+import { Pagination } from "src/pagination";
+import { InlineAlert } from "@cockroachlabs/ui-components";
 
 import styles from "./statementsPage.module.scss";
 
 const cx = classNames.bind(styles);
+const PAGE_SIZE = 20;
 
 export type RecentStatementsViewDispatchProps = {
   onColumnsSelect: (columns: string[]) => void;
@@ -53,8 +56,10 @@ export type RecentStatementsViewStateProps = {
   sortSetting: SortSetting;
   sessionsError: Error | null;
   filters: RecentStatementFilters;
+  executionStatus: string[];
   internalAppNamePrefix: string;
   isTenant?: boolean;
+  maxSizeApiReached?: boolean;
 };
 
 export type RecentStatementsViewProps = RecentStatementsViewStateProps &
@@ -70,12 +75,14 @@ export const RecentStatementsView: React.FC<RecentStatementsViewProps> = ({
   statements,
   sessionsError,
   filters,
+  executionStatus,
   internalAppNamePrefix,
   isTenant,
+  maxSizeApiReached,
 }: RecentStatementsViewProps) => {
   const [pagination, setPagination] = useState<ISortedTablePagination>({
     current: 1,
-    pageSize: 20,
+    pageSize: PAGE_SIZE,
   });
   const history = useHistory();
   const [search, setSearch] = useState<string>(
@@ -132,8 +139,8 @@ export const RecentStatementsView: React.FC<RecentStatementsViewProps> = ({
 
   const resetPagination = () => {
     setPagination({
+      pageSize: PAGE_SIZE,
       current: 1,
-      pageSize: 20,
     });
   };
 
@@ -154,7 +161,11 @@ export const RecentStatementsView: React.FC<RecentStatementsViewProps> = ({
   };
 
   const clearSearch = () => onSubmitSearch("");
-  const clearFilters = () => onSubmitFilters({ app: inactiveFiltersState.app });
+  const clearFilters = () =>
+    onSubmitFilters({
+      app: defaultFilters.app,
+      executionStatus: defaultFilters.executionStatus,
+    });
 
   const apps = getAppsFromRecentExecutions(statements, internalAppNamePrefix);
   const countActiveFilters = calculateActiveFilters(filters);
@@ -165,6 +176,13 @@ export const RecentStatementsView: React.FC<RecentStatementsViewProps> = ({
     internalAppNamePrefix,
     search,
   );
+
+  const onChangePage = (page: number) => {
+    setPagination({
+      ...pagination,
+      current: page,
+    });
+  };
 
   return (
     <div className={cx("root")}>
@@ -180,6 +198,8 @@ export const RecentStatementsView: React.FC<RecentStatementsViewProps> = ({
           <Filter
             activeFilters={countActiveFilters}
             onSubmitFilters={onSubmitFilters}
+            executionStatuses={executionStatus.sort()}
+            showExecutionStatus={true}
             appNames={apps}
             filters={filters}
           />
@@ -208,6 +228,23 @@ export const RecentStatementsView: React.FC<RecentStatementsViewProps> = ({
             onColumnsSelect={onColumnsSelect}
             isTenant={isTenant}
           />
+          <Pagination
+            pageSize={pagination.pageSize}
+            current={pagination.current}
+            total={filteredStatements?.length}
+            onChange={onChangePage}
+          />
+          {maxSizeApiReached && (
+            <InlineAlert
+              intent="info"
+              title={
+                <>
+                  Not all contention events are displayed because the maximum
+                  number of contention events was reached in the console.
+                </>
+              }
+            />
+          )}
         </Loading>
       </div>
     </div>

@@ -23,18 +23,21 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -73,6 +76,12 @@ const (
 	defaultEventLogEnabled = true
 
 	maximumMaxClockOffset = 5 * time.Second
+
+	// toleratedOffsetMultiplier is the MaxOffset multiplier used for
+	// ToleratedOffset, which determines the tolerated clock skew between this
+	// node and the cluster before self-terminating. It is conservatively set to
+	// 80% to avoid exceeding MaxOffset.
+	toleratedOffsetMultiplier = 0.8
 
 	minimumNetworkFileDescriptors     = 256
 	recommendedNetworkFileDescriptors = 5000
@@ -122,8 +131,7 @@ type BaseConfig struct {
 
 	Tracer *tracing.Tracer
 
-	// idProvider is an interface that makes the logging package
-	// able to peek into the server IDs defined by this configuration.
+	// idProvider contains the tenant and server identity.
 	idProvider *idProvider
 
 	// IDContainer is the Node ID / SQL Instance ID container
@@ -137,23 +145,40 @@ type BaseConfig struct {
 	// AmbientCtx is used to annotate contexts used inside the server.
 	AmbientCtx log.AmbientContext
 
-	// Maximum allowed clock offset for the cluster. If observed clock
-	// offsets exceed this limit, inconsistency may result, and servers
-	// will panic to minimize the likelihood of inconsistent data.
-	// Increasing this value will increase time to recovery after
-	// failures, and increase the frequency and impact of
-	// ReadWithinUncertaintyIntervalError.
+	// MaxOffset is the maximum clock offset for the cluster. If real clock skew
+	// exceeds this limit, it may result in linearizability violations. Increasing
+	// this will increase the frequency of ReadWithinUncertaintyIntervalError and
+	// the write latency of global tables.
+	//
+	// Nodes will self-terminate if they detect that their clock skew with other
+	// nodes is too large, see ToleratedOffset().
 	MaxOffset MaxOffsetType
 
+	// DisableMaxOffsetCheck disables the MaxOffset check with other cluster nodes.
+	// The operator assumes responsibility for ensuring real clock skew never
+	// exceeds MaxOffset. See also ToleratedOffset().
+	DisableMaxOffsetCheck bool
+
+	// DisableRuntimeStatsMonitor prevents this server from starting the
+	// async task that collects runtime stats and triggers
+	// heap/goroutine dumps under high load.
+	DisableRuntimeStatsMonitor bool
+
+	// RuntimeStatSampler, if non-nil, will be used as source for
+	// run-time metrics instead of constructing a fresh one.
+	RuntimeStatSampler *status.RuntimeStatSampler
+
 	// GoroutineDumpDirName is the directory name for goroutine dumps using
-	// goroutinedumper.
+	// goroutinedumper. Only used if DisableRuntimeStatsMonitor is false.
 	GoroutineDumpDirName string
 
 	// HeapProfileDirName is the directory name for heap profiles using
-	// heapprofiler. If empty, no heap profiles will be collected.
+	// heapprofiler. If empty, no heap profiles will be collected. Only
+	// used if DisableRuntimeStatsMonitor is false.
 	HeapProfileDirName string
 
 	// CPUProfileDirName is the directory name for CPU profile dumps.
+	// Only used if DisableRuntimeStatsMonitor is false.
 	CPUProfileDirName string
 
 	// InflightTraceDirName is the directory name for job traces.
@@ -183,10 +208,6 @@ type BaseConfig struct {
 	// TestingKnobs is used for internal test controls only.
 	TestingKnobs base.TestingKnobs
 
-	// SecondaryTenantKnobs contains the testing knobs to use
-	// for tenant servers started by the serverController.
-	SecondaryTenantKnobs base.TestingKnobs
-
 	// TestingInsecureWebAccess enables uses of the HTTP and UI
 	// endpoints without a valid authentication token. This should be
 	// used only in tests what want a secure cluster with RPC
@@ -211,6 +232,9 @@ type BaseConfig struct {
 	// Stores is specified to enable durable key-value storage.
 	Stores base.StoreSpecList
 
+	// SharedStorage is specified to enable disaggregated shared storage.
+	SharedStorage string
+
 	// StartDiagnosticsReporting starts the asynchronous goroutine that
 	// checks for CockroachDB upgrades and periodically reports
 	// diagnostics to Cockroach Labs.
@@ -228,6 +252,11 @@ type BaseConfig struct {
 	// other service (typically, the serverController) will accept and
 	// route SQL connections instead.
 	DisableSQLListener bool
+
+	// ObsServiceAddr is the address of the OTLP sink to send events to, if any.
+	// These events are meant for the Observability Service, but they might pass
+	// through an OpenTelemetry Collector.
+	ObsServiceAddr string
 }
 
 // MakeBaseConfig returns a BaseConfig with default values.
@@ -260,6 +289,7 @@ func (cfg *BaseConfig) SetDefaults(
 	cfg.ClusterIDContainer = idsProvider.clusterID
 	cfg.AmbientCtx = log.MakeServerAmbientContext(tr, idsProvider)
 	cfg.MaxOffset = MaxOffsetType(base.DefaultMaxClockOffset)
+	cfg.DisableMaxOffsetCheck = false
 	cfg.DefaultZoneConfig = zonepb.DefaultZoneConfig()
 	cfg.StorageEngine = storage.DefaultStorageEngine
 	cfg.TestingInsecureWebAccess = disableWebLogin
@@ -310,6 +340,15 @@ func (cfg *BaseConfig) InitTestingKnobs() {
 	}
 }
 
+// ToleratedOffset returns the tolerated clock offset with other cluster nodes
+// as measured via RPC heartbeats, or 0 to disable clock offset checks.
+func (cfg *BaseConfig) ToleratedOffset() time.Duration {
+	if cfg.DisableMaxOffsetCheck {
+		return 0
+	}
+	return time.Duration(toleratedOffsetMultiplier * float64(cfg.MaxOffset))
+}
+
 // Config holds the parameters needed to set up a combined KV and SQL server.
 type Config struct {
 	BaseConfig
@@ -345,10 +384,6 @@ type KVConfig struct {
 	// CacheSize is the amount of memory in bytes to use for caching data.
 	// The value is split evenly between the stores if there are more than one.
 	CacheSize int64
-
-	// SoftSlotGranter can be optionally passed into a store to allow the store
-	// to perform additional CPU bound work.
-	SoftSlotGranter *admission.SoftSlotGranter
 
 	// TimeSeriesServerConfig contains configuration specific to the time series
 	// server.
@@ -387,10 +422,6 @@ type KVConfig struct {
 	// inside the server. It can be overridden during tests by setting the
 	// DefaultSystemZoneConfigOverride server testing knob.
 	DefaultSystemZoneConfig zonepb.ZoneConfig
-
-	// LocalityAddresses contains private IP addresses the can only be accessed
-	// in the corresponding locality.
-	LocalityAddresses []roachpb.LocalityAddress
 
 	// EventLogEnabled is a switch which enables recording into cockroach's SQL
 	// event log tables. These tables record transactional events about changes
@@ -478,6 +509,23 @@ type SQLConfig struct {
 	// node clocks have necessarily passed it.
 	// Environment Variable: COCKROACH_EXPERIMENTAL_LINEARIZABLE
 	Linearizable bool
+
+	// LocalKVServerInfo is set in configs for shared-process tenants. It contains
+	// info for making Batch requests to the local KV server without using gRPC.
+	LocalKVServerInfo *LocalKVServerInfo
+
+	// NodeMetricsRecorder is the node's MetricRecorder; the tenant's metrics will
+	// be recorded with it. Nil if this is not a shared-process tenant.
+	NodeMetricsRecorder *status.MetricsRecorder
+}
+
+// LocalKVServerInfo is used to group information about the local KV server
+// necessary for creating the internalClientAdapter for an in-process tenant
+// talking to that server.
+type LocalKVServerInfo struct {
+	InternalServer     kvpb.InternalServer
+	ServerInterceptors rpc.ServerInterceptorInfo
+	Tracer             *tracing.Tracer
 }
 
 // MakeSQLConfig returns a SQLConfig with default values.
@@ -622,31 +670,36 @@ func (e *Engines) Close() {
 	*e = nil
 }
 
-// cpuWorkPermissionGranter implements the pebble.CPUWorkPermissionGranter
-// interface.
-//type cpuWorkPermissionGranter struct {
-//*admission.SoftSlotGranter
-//}
-
-//func (c *cpuWorkPermissionGranter) TryGetProcs(count int) int {
-//return c.TryGetSlots(count)
-//}
-//func (c *cpuWorkPermissionGranter) ReturnProcs(count int) {
-//c.ReturnSlots(count)
-//}
-
 // CreateEngines creates Engines based on the specs in cfg.Stores.
 func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
-	engines := Engines(nil)
+	var engines Engines
 	defer engines.Close()
 
 	if cfg.enginesCreated {
 		return Engines{}, errors.Errorf("engines already created")
 	}
 	cfg.enginesCreated = true
-	details := []redact.RedactableString{redact.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize))}
+
+	var details []redact.RedactableString
+	detail := func(msg redact.RedactableString) {
+		details = append(details, msg)
+	}
+	detail(redact.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
 	pebbleCache := pebble.NewCache(cfg.CacheSize)
 	defer pebbleCache.Unref()
+
+	var sharedStorage cloud.ExternalStorage
+	if cfg.SharedStorage != "" {
+		var err error
+		// Note that we don't pass an io interceptor here. Instead, we record shared
+		// storage metrics on a per-store basis; see storage.Metrics.
+		sharedStorage, err = cloud.ExternalStorageFromURI(ctx, cfg.SharedStorage,
+			base.ExternalIODirConfig{}, cfg.Settings, nil, cfg.User, nil,
+			nil, cloud.NilMetrics)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	var physicalStores int
 	for _, spec := range cfg.Stores.Specs {
@@ -662,6 +715,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	log.Event(ctx, "initializing engines")
 
 	var tableCache *pebble.TableCache
+	// TODO(radu): use the tableCache for in-memory stores as well.
 	if physicalStores > 0 {
 		perStoreLimit := pebble.TableCacheSize(int(openFileLimitPerStore))
 		totalFileLimit := perStoreLimit * physicalStores
@@ -675,8 +729,44 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
-		var sizeInBytes = spec.Size.InBytes
+
+		if spec.InMemory && spec.StickyInMemoryEngineID != "" {
+			if cfg.TestingKnobs.Server == nil {
+				return Engines{}, errors.AssertionFailedf("Could not create a sticky " +
+					"engine no server knobs available to get a registry. " +
+					"Please use Knobs.Server.StickyEngineRegistry to provide one.")
+			}
+			knobs := cfg.TestingKnobs.Server.(*TestingKnobs)
+			if knobs.StickyEngineRegistry == nil {
+				return Engines{}, errors.Errorf("Could not create a sticky " +
+					"engine no registry available. Please use " +
+					"Knobs.Server.StickyEngineRegistry to provide one.")
+			}
+			eng, err := knobs.StickyEngineRegistry.GetOrCreateStickyInMemEngine(ctx, cfg, spec)
+			if err != nil {
+				return Engines{}, err
+			}
+			detail(redact.Sprintf("store %d: %+v", i, eng.Properties()))
+			engines = append(engines, eng)
+			continue
+		}
+
+		var location storage.Location
+		storageConfigOpts := []storage.ConfigOption{
+			storage.Attributes(spec.Attributes),
+			storage.EncryptionAtRest(spec.EncryptionOptions),
+			storage.If(storeKnobs.SmallEngineBlocks, storage.BlockSize(1)),
+		}
+		if len(storeKnobs.EngineKnobs) > 0 {
+			storageConfigOpts = append(storageConfigOpts, storeKnobs.EngineKnobs...)
+		}
+		addCfgOpt := func(opt storage.ConfigOption) {
+			storageConfigOpts = append(storageConfigOpts, opt)
+		}
+
 		if spec.InMemory {
+			location = storage.InMemory()
+			var sizeInBytes = spec.Size.InBytes
 			if spec.Size.Percent > 0 {
 				sysMem, err := status.GetTotalMemory(ctx)
 				if err != nil {
@@ -688,48 +778,12 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				return Engines{}, errors.Errorf("%f%% of memory is only %s bytes, which is below the minimum requirement of %s",
 					spec.Size.Percent, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
-			details = append(details, redact.Sprintf("store %d: in-memory, size %s",
-				i, humanizeutil.IBytes(sizeInBytes)))
-			if spec.StickyInMemoryEngineID != "" {
-				if cfg.TestingKnobs.Server == nil {
-					return Engines{}, errors.AssertionFailedf("Could not create a sticky " +
-						"engine no server knobs available to get a registry. " +
-						"Please use Knobs.Server.StickyEngineRegistry to provide one.")
-				}
-				knobs := cfg.TestingKnobs.Server.(*TestingKnobs)
-				if knobs.StickyEngineRegistry == nil {
-					return Engines{}, errors.Errorf("Could not create a sticky " +
-						"engine no registry available. Please use " +
-						"Knobs.Server.StickyEngineRegistry to provide one.")
-				}
-				e, err := knobs.StickyEngineRegistry.GetOrCreateStickyInMemEngine(ctx, cfg, spec)
-				if err != nil {
-					return Engines{}, err
-				}
-				details = append(details, redact.Sprintf("store %d: %+v", i, e.Properties()))
-				engines = append(engines, e)
-			} else {
-				storageConfigs := []storage.ConfigOption{
-					storage.Attributes(spec.Attributes),
-					storage.CacheSize(cfg.CacheSize),
-					storage.MaxSize(sizeInBytes),
-					storage.EncryptionAtRest(spec.EncryptionOptions),
-					storage.Settings(cfg.Settings),
-					storage.If(storeKnobs.SmallEngineBlocks, storage.BlockSize(1)),
-				}
-				if len(storeKnobs.EngineKnobs) > 0 {
-					storageConfigs = append(storageConfigs, storeKnobs.EngineKnobs...)
-				}
-				e, err := storage.Open(ctx,
-					storage.InMemory(),
-					storageConfigs...,
-				)
-				if err != nil {
-					return Engines{}, err
-				}
-				engines = append(engines, e)
-			}
+			addCfgOpt(storage.MaxSize(sizeInBytes))
+			addCfgOpt(storage.CacheSize(cfg.CacheSize))
+
+			detail(redact.Sprintf("store %d: in-memory, size %s", i, humanizeutil.IBytes(sizeInBytes)))
 		} else {
+			location = storage.Filesystem(spec.Path)
 			if err := vfs.Default.MkdirAll(spec.Path, 0755); err != nil {
 				return Engines{}, errors.Wrap(err, "creating store directory")
 			}
@@ -737,6 +791,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			if err != nil {
 				return Engines{}, errors.Wrap(err, "retrieving disk usage")
 			}
+			var sizeInBytes = spec.Size.InBytes
 			if spec.Size.Percent > 0 {
 				sizeInBytes = int64(float64(du.TotalBytes) * spec.Size.Percent / 100)
 			}
@@ -745,40 +800,20 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 					spec.Size.Percent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
 
-			details = append(details, redact.Sprintf("store %d: max size %s, max open file limit %d",
-				i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
+			detail(redact.Sprintf("store %d: max size %s, max open file limit %d", i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
 
-			storageConfig := base.StorageConfig{
-				Attrs:             spec.Attributes,
-				Dir:               spec.Path,
-				MaxSize:           sizeInBytes,
-				BallastSize:       storage.BallastSizeBytes(spec, du),
-				Settings:          cfg.Settings,
-				UseFileRegistry:   spec.UseFileRegistry,
-				EncryptionOptions: spec.EncryptionOptions,
-			}
-			pebbleConfig := storage.PebbleConfig{
-				StorageConfig: storageConfig,
-				Opts:          storage.DefaultPebbleOptions(),
-			}
-			pebbleConfig.Opts.Cache = pebbleCache
-			pebbleConfig.Opts.TableCache = tableCache
-			pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
-			pebbleConfig.Opts.Experimental.MaxWriterConcurrency = 2
-			// TODO(jackson): Implement the new pebble.CPUWorkPermissionGranter
-			// interface.
-			//pebbleConfig.Opts.Experimental.CPUWorkPermissionGranter = &cpuWorkPermissionGranter{
-			//cfg.SoftSlotGranter,
-			//}
-			if storeKnobs.SmallEngineBlocks {
-				for i := range pebbleConfig.Opts.Levels {
-					pebbleConfig.Opts.Levels[i].BlockSize = 1
-					pebbleConfig.Opts.Levels[i].IndexBlockSize = 1
-				}
+			addCfgOpt(storage.MaxSize(sizeInBytes))
+			addCfgOpt(storage.BallastSize(storage.BallastSizeBytes(spec, du)))
+			addCfgOpt(storage.Caches(pebbleCache, tableCache))
+			// TODO(radu): move up all remaining settings below so they apply to in-memory stores as well.
+			addCfgOpt(storage.MaxOpenFiles(int(openFileLimitPerStore)))
+			addCfgOpt(storage.MaxWriterConcurrency(2))
+			if sharedStorage != nil {
+				addCfgOpt(storage.SharedStorage(sharedStorage))
 			}
 			// If the spec contains Pebble options, set those too.
-			if len(spec.PebbleOptions) > 0 {
-				err := pebbleConfig.Opts.Parse(spec.PebbleOptions, &pebble.ParseHooks{
+			if spec.PebbleOptions != "" {
+				addCfgOpt(storage.PebbleOptions(spec.PebbleOptions, &pebble.ParseHooks{
 					NewFilterPolicy: func(name string) (pebble.FilterPolicy, error) {
 						switch name {
 						case "none":
@@ -788,21 +823,18 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 						}
 						return nil, nil
 					},
-				})
-				if err != nil {
-					return nil, err
-				}
+				}))
 			}
 			if len(spec.RocksDBOptions) > 0 {
 				return nil, errors.Errorf("store %d: using Pebble storage engine but StoreSpec provides RocksDB options", i)
 			}
-			eng, err := storage.NewPebble(ctx, pebbleConfig)
-			if err != nil {
-				return Engines{}, err
-			}
-			details = append(details, redact.Sprintf("store %d: %+v", i, eng.Properties()))
-			engines = append(engines, eng)
 		}
+		eng, err := storage.Open(ctx, location, cfg.Settings, storageConfigOpts...)
+		if err != nil {
+			return Engines{}, err
+		}
+		detail(redact.Sprintf("store %d: %+v", i, eng.Properties()))
+		engines = append(engines, eng)
 	}
 
 	if tableCache != nil {
@@ -817,6 +849,8 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	for _, s := range details {
 		log.Infof(ctx, "%v", s)
 	}
+
+	// Clear out engines because we have deferred engines.Close().
 	enginesCopy := engines
 	engines = nil
 	return enginesCopy, nil
@@ -960,7 +994,7 @@ func parseAttributes(attrsStr string) roachpb.Attributes {
 //
 // For each of the "main" data items, it also memoizes its
 // representation as a string (the one needed by the
-// log.ServerIdentificationPayload interface) as soon as the value is
+// serverident.ServerIdentificationPayload interface) as soon as the value is
 // initialized. This saves on conversion costs.
 type idProvider struct {
 	// clusterID contains the cluster ID (initialized late).
@@ -981,12 +1015,17 @@ type idProvider struct {
 	serverStr atomic.Value
 }
 
-var _ log.ServerIdentificationPayload = (*idProvider)(nil)
+var _ serverident.ServerIdentificationPayload = (*idProvider)(nil)
 
-// ServerIdentityString implements the log.ServerIdentificationPayload interface.
-func (s *idProvider) ServerIdentityString(key log.ServerIdentificationKey) string {
+// TenantID is part of the serverident.ServerIdentificationPayload interface.
+func (s *idProvider) TenantID() interface{} {
+	return s.tenantID
+}
+
+// ServerIdentityString implements the serverident.ServerIdentificationPayload interface.
+func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKey) string {
 	switch key {
-	case log.IdentifyClusterID:
+	case serverident.IdentifyClusterID:
 		c := s.clusterStr.Load()
 		cs, ok := c.(string)
 		if !ok {
@@ -998,7 +1037,7 @@ func (s *idProvider) ServerIdentityString(key log.ServerIdentificationKey) strin
 		}
 		return cs
 
-	case log.IdentifyTenantID:
+	case serverident.IdentifyTenantID:
 		t := s.tenantStr.Load()
 		ts, ok := t.(string)
 		if !ok {
@@ -1010,7 +1049,7 @@ func (s *idProvider) ServerIdentityString(key log.ServerIdentificationKey) strin
 		}
 		return ts
 
-	case log.IdentifyInstanceID:
+	case serverident.IdentifyInstanceID:
 		// If tenantID is not set, this is a KV node and it has no SQL
 		// instance ID.
 		if !s.tenantID.IsSet() {
@@ -1018,7 +1057,7 @@ func (s *idProvider) ServerIdentityString(key log.ServerIdentificationKey) strin
 		}
 		return s.maybeMemoizeServerID()
 
-	case log.IdentifyKVNodeID:
+	case serverident.IdentifyKVNodeID:
 		// If tenantID is set, this is a SQL-only server and it has no
 		// node ID.
 		if s.tenantID.IsSet() {
@@ -1034,7 +1073,7 @@ func (s *idProvider) ServerIdentityString(key log.ServerIdentificationKey) strin
 // a SQL server.
 //
 // Note: this should not be called concurrently with logging which may
-// invoke the method from the log.ServerIdentificationPayload
+// invoke the method from the serverident.ServerIdentificationPayload
 // interface.
 func (s *idProvider) SetTenant(tenantID roachpb.TenantID) {
 	if !tenantID.IsSet() {

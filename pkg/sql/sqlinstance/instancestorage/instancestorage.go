@@ -21,14 +21,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -85,6 +87,8 @@ type Storage struct {
 	slReader sqlliveness.Reader
 	rowcodec rowCodec
 	settings *cluster.Settings
+	clock    *hlc.Clock
+	f        *rangefeed.Factory
 	// TestingKnobs refers to knobs used for testing.
 	TestingKnobs struct {
 		// JitteredIntervalFn corresponds to the function used to jitter the
@@ -115,25 +119,50 @@ func (r *instancerow) isAvailable() bool {
 func NewTestingStorage(
 	db *kv.DB,
 	codec keys.SQLCodec,
-	sqlInstancesTableID descpb.ID,
+	table catalog.TableDescriptor,
 	slReader sqlliveness.Reader,
 	settings *cluster.Settings,
+	clock *hlc.Clock,
+	f *rangefeed.Factory,
 ) *Storage {
 	s := &Storage{
 		db:       db,
-		rowcodec: makeRowCodec(codec, sqlInstancesTableID),
+		rowcodec: makeRowCodec(codec, table),
 		slReader: slReader,
 		settings: settings,
+		clock:    clock,
+		f:        f,
 	}
 	return s
 }
 
 // NewStorage creates a new storage struct.
 func NewStorage(
-	db *kv.DB, codec keys.SQLCodec, slReader sqlliveness.Reader, settings *cluster.Settings,
+	db *kv.DB,
+	codec keys.SQLCodec,
+	slReader sqlliveness.Reader,
+	settings *cluster.Settings,
+	clock *hlc.Clock,
+	f *rangefeed.Factory,
 ) *Storage {
-	return NewTestingStorage(db, codec, keys.SQLInstancesTableID, slReader, settings)
+	return NewTestingStorage(db, codec, systemschema.SQLInstancesTable(), slReader, settings, clock, f)
 }
+
+// CreateNodeInstance claims a unique instance identifier for the SQL pod, and
+// associates it with its SQL address and session information.
+func (s *Storage) CreateNodeInstance(
+	ctx context.Context,
+	sessionID sqlliveness.SessionID,
+	sessionExpiration hlc.Timestamp,
+	rpcAddr string,
+	sqlAddr string,
+	locality roachpb.Locality,
+	nodeID roachpb.NodeID,
+) (instance sqlinstance.InstanceInfo, _ error) {
+	return s.createInstanceRow(ctx, sessionID, sessionExpiration, rpcAddr, sqlAddr, locality, nodeID)
+}
+
+const noNodeID = 0
 
 // CreateInstance claims a unique instance identifier for the SQL pod, and
 // associates it with its SQL address and session information.
@@ -144,6 +173,18 @@ func (s *Storage) CreateInstance(
 	rpcAddr string,
 	sqlAddr string,
 	locality roachpb.Locality,
+) (instance sqlinstance.InstanceInfo, _ error) {
+	return s.createInstanceRow(ctx, sessionID, sessionExpiration, rpcAddr, sqlAddr, locality, noNodeID)
+}
+
+func (s *Storage) createInstanceRow(
+	ctx context.Context,
+	sessionID sqlliveness.SessionID,
+	sessionExpiration hlc.Timestamp,
+	rpcAddr string,
+	sqlAddr string,
+	locality roachpb.Locality,
+	nodeID roachpb.NodeID,
 ) (instance sqlinstance.InstanceInfo, _ error) {
 	if len(sqlAddr) == 0 || len(rpcAddr) == 0 {
 		return sqlinstance.InstanceInfo{}, errors.AssertionFailedf("missing sql or rpc address information for instance")
@@ -177,11 +218,21 @@ func (s *Storage) CreateInstance(
 				return err
 			}
 
-			// Try to retrieve an available instance ID. This blocks until one
-			// is available.
-			availableID, err = s.getAvailableInstanceIDForRegion(ctx, region, txn)
-			if err != nil {
-				return err
+			// TODO(dt): do we need this at all? this keeps nodeID == instanceID when
+			// running mixed KV and SQL nodes, but bakes in the assumption that any
+			// clusters where this happens will contain _only_ mixed KV and SQL nodes
+			// and thus do not need to worry about finding an _actually_ available ID
+			// and avoiding conflicts. This is true today but may not be in more
+			// complex deployments.
+			if nodeID != noNodeID {
+				availableID = base.SQLInstanceID(nodeID)
+			} else {
+				// Try to retrieve an available instance ID. This blocks until one
+				// is available.
+				availableID, err = s.getAvailableInstanceIDForRegion(ctx, region, txn)
+				if err != nil {
+					return err
+				}
 			}
 
 			key := s.rowcodec.encodeKey(region, availableID)
@@ -242,6 +293,13 @@ func (s *Storage) CreateInstance(
 
 	// If we exit here, it has to be the case where the context has expired.
 	return sqlinstance.InstanceInfo{}, ctx.Err()
+}
+
+// newInstanceCache constructs an instanceCache backed by a range feed over the
+// sql_instances table. newInstanceCache blocks until the initial scan is
+// complete.
+func (s *Storage) newInstanceCache(ctx context.Context) (instanceCache, error) {
+	return newRangeFeedCache(ctx, s.rowcodec, s.clock, s.f)
 }
 
 // getAvailableInstanceIDForRegion retrieves an available instance ID for the
@@ -396,16 +454,18 @@ func (s *Storage) RunInstanceIDReclaimLoop(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	ts timeutil.TimeSource,
-	internalExecutorFactory descs.TxnManager,
+	db descs.DB,
 	sessionExpirationFn func() hlc.Timestamp,
 ) error {
 	loadRegions := func() ([][]byte, error) {
 		// Load regions from the system DB.
 		var regions [][]byte
-		if err := internalExecutorFactory.DescsTxn(ctx, s.db, func(
-			ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+		if err := db.DescsTxn(ctx, func(
+			ctx context.Context, txn descs.Txn,
 		) error {
-			enumReps, _, err := sql.GetRegionEnumRepresentations(ctx, txn, keys.SystemDatabaseID, descsCol)
+			enumReps, _, err := sql.GetRegionEnumRepresentations(
+				ctx, txn.KV(), keys.SystemDatabaseID, txn.Descriptors(),
+			)
 			if err != nil {
 				if errors.Is(err, sql.ErrNotMultiRegionDatabase) {
 					return nil

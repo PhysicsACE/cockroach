@@ -36,35 +36,35 @@ func TestRoachprodEnv(t *testing.T) {
 			node:        1,
 			tag:         "",
 			value:       "1",
-			regex:       `ROACHPROD=1[ \/]`,
+			regex:       `(ROACHPROD=1$|ROACHPROD=1[ \/])`,
 		},
 		{
 			clusterName: "local-foo",
 			node:        2,
 			tag:         "",
 			value:       "local-foo/2",
-			regex:       `ROACHPROD=local-foo\/2[ \/]`,
+			regex:       `(ROACHPROD=local-foo\/2$|ROACHPROD=local-foo\/2[ \/])`,
 		},
 		{
 			clusterName: "a",
 			node:        3,
 			tag:         "foo",
 			value:       "3/foo",
-			regex:       `ROACHPROD=3\/foo[ \/]`,
+			regex:       `(ROACHPROD=3\/foo$|ROACHPROD=3\/foo[ \/])`,
 		},
 		{
 			clusterName: "a",
 			node:        4,
 			tag:         "foo/bar",
 			value:       "4/foo/bar",
-			regex:       `ROACHPROD=4\/foo\/bar[ \/]`,
+			regex:       `(ROACHPROD=4\/foo\/bar$|ROACHPROD=4\/foo\/bar[ \/])`,
 		},
 		{
 			clusterName: "local-foo",
 			node:        5,
 			tag:         "tag",
 			value:       "local-foo/5/tag",
-			regex:       `ROACHPROD=local-foo\/5\/tag[ \/]`,
+			regex:       `(ROACHPROD=local-foo\/5\/tag$|ROACHPROD=local-foo\/5\/tag[ \/])`,
 		},
 	}
 
@@ -98,24 +98,35 @@ func TestRunWithMaybeRetry(t *testing.T) {
 	cases := []struct {
 		f                func() (*RunResultDetails, error)
 		shouldRetryFn    func(*RunResultDetails) bool
+		nilRetryOpts     bool
 		expectedAttempts int
 		shouldError      bool
 	}{
-		{ // Happy path: no error, no retry required
+		{ // 1. Happy path: no error, no retry required
 			f: func() (*RunResultDetails, error) {
 				return newResult(0), nil
 			},
 			expectedAttempts: 1,
 			shouldError:      false,
 		},
-		{ // Error, but not retry function specified
+		{ // 2. Error, but with no retries
 			f: func() (*RunResultDetails, error) {
 				return newResult(1), nil
+			},
+			shouldRetryFn: func(*RunResultDetails) bool {
+				return false
 			},
 			expectedAttempts: 1,
 			shouldError:      true,
 		},
-		{ // Error, with retries exhausted
+		{ // 3. Error, but no retry function specified
+			f: func() (*RunResultDetails, error) {
+				return newResult(1), nil
+			},
+			expectedAttempts: 3,
+			shouldError:      true,
+		},
+		{ // 4. Error, with retries exhausted
 			f: func() (*RunResultDetails, error) {
 				return newResult(255), nil
 			},
@@ -123,7 +134,7 @@ func TestRunWithMaybeRetry(t *testing.T) {
 			expectedAttempts: 3,
 			shouldError:      true,
 		},
-		{ // Eventual success after retries
+		{ // 5. Eventual success after retries
 			f: func() (*RunResultDetails, error) {
 				attempt++
 				if attempt == 3 {
@@ -135,12 +146,24 @@ func TestRunWithMaybeRetry(t *testing.T) {
 			expectedAttempts: 3,
 			shouldError:      false,
 		},
+		{ // 6. Error, runs once because nil retryOpts
+			f: func() (*RunResultDetails, error) {
+				return newResult(255), nil
+			},
+			nilRetryOpts:     true,
+			expectedAttempts: 1,
+			shouldError:      true,
+		},
 	}
 
 	for idx, tc := range cases {
 		attempt = 0
 		t.Run(fmt.Sprintf("%d", idx+1), func(t *testing.T) {
-			res, _ := runWithMaybeRetry(l, testRetryOpts, tc.shouldRetryFn, tc.f)
+			var retryOpts *RunRetryOpts
+			if !tc.nilRetryOpts {
+				retryOpts = newRunRetryOpts(testRetryOpts, tc.shouldRetryFn)
+			}
+			res, _ := runWithMaybeRetry(l, retryOpts, tc.f)
 
 			require.Equal(t, tc.shouldError, res.Err != nil)
 			require.Equal(t, tc.expectedAttempts, res.Attempt)
@@ -170,4 +193,11 @@ func nilLogger() *logger.Logger {
 		panic(err)
 	}
 	return l
+}
+
+func TestGenFilenameFromArgs(t *testing.T) {
+	const exp = "mkdir-p-logsredacted"
+	require.Equal(t, exp, GenFilenameFromArgs(20, "mkdir -p logs/redacted && ./cockroach"))
+	require.Equal(t, exp, GenFilenameFromArgs(20, "mkdir", "-p logs/redacted", "&& ./cockroach"))
+	require.Equal(t, exp, GenFilenameFromArgs(20, "mkdir    -p logs/redacted && ./cockroach    "))
 }

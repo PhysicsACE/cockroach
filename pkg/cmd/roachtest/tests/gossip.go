@@ -153,7 +153,7 @@ SELECT node_id
 type gossipUtil struct {
 	waitTime time.Duration
 	urlMap   map[int]string
-	conn     func(ctx context.Context, l *logger.Logger, i int) *gosql.DB
+	conn     func(ctx context.Context, l *logger.Logger, i int, opts ...func(*option.ConnOption)) *gosql.DB
 }
 
 func newGossipUtil(ctx context.Context, t test.Test, c cluster.Cluster) *gossipUtil {
@@ -430,7 +430,7 @@ SELECT count(replicas)
 	// connections. This will require node 1 to reach out to the other nodes in
 	// the cluster for gossip info.
 	err := c.RunE(ctx, c.Node(1),
-		`./cockroach start --insecure --background --store={store-dir} `+
+		` ./cockroach start --insecure --background --store={store-dir} `+
 			`--log-dir={log-dir} --cache=10% --max-sql-memory=10% `+
 			`--listen-addr=:$[{pgport:1}+10000] --http-port=$[{pgport:1}+1] `+
 			`--join={pghost:1}:{pgport:1}`+
@@ -451,11 +451,11 @@ SELECT count(replicas)
 	// current infrastructure which doesn't know about cockroach nodes started on
 	// non-standard ports.
 	g := newGossipUtil(ctx, t, c)
-	g.conn = func(ctx context.Context, l *logger.Logger, i int) *gosql.DB {
+	g.conn = func(ctx context.Context, l *logger.Logger, i int, opts ...func(*option.ConnOption)) *gosql.DB {
 		if i != 1 {
 			return c.Conn(ctx, l, i)
 		}
-		urls, err := c.ExternalPGUrl(ctx, l, c.Node(1))
+		urls, err := c.ExternalPGUrl(ctx, l, c.Node(1), "")
 		if err != nil {
 			t.Fatal(err)
 		}

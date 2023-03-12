@@ -21,21 +21,22 @@ type metrics struct {
 	ClientDisconnectCount  *metric.Counter
 	CurConnCount           *metric.Gauge
 	RoutingErrCount        *metric.Counter
+	AcceptedConnCount      *metric.Counter
 	RefusedConnCount       *metric.Counter
 	SuccessfulConnCount    *metric.Counter
-	ConnectionLatency      *metric.Histogram
+	ConnectionLatency      metric.IHistogram
 	AuthFailedCount        *metric.Counter
 	ExpiredClientConnCount *metric.Counter
 
-	DialTenantLatency *metric.Histogram
+	DialTenantLatency metric.IHistogram
 	DialTenantRetries *metric.Counter
 
 	ConnMigrationSuccessCount                *metric.Counter
 	ConnMigrationErrorFatalCount             *metric.Counter
 	ConnMigrationErrorRecoverableCount       *metric.Counter
 	ConnMigrationAttemptedCount              *metric.Counter
-	ConnMigrationAttemptedLatency            *metric.Histogram
-	ConnMigrationTransferResponseMessageSize *metric.Histogram
+	ConnMigrationAttemptedLatency            metric.IHistogram
+	ConnMigrationTransferResponseMessageSize metric.IHistogram
 
 	QueryCancelReceivedPGWire *metric.Counter
 	QueryCancelReceivedHTTP   *metric.Counter
@@ -48,6 +49,16 @@ type metrics struct {
 func (metrics) MetricStruct() {}
 
 var _ metric.Struct = metrics{}
+
+const (
+	// maxExpectedTransferResponseMessageSize corresponds to maximum expected
+	// response message size for the SHOW TRANSFER STATE query. We choose 16MB
+	// here to match the defaultMaxReadBufferSize used for ingesting SQL
+	// statements in the SQL server (see pkg/sql/pgwire/pgwirebase/encoding.go).
+	//
+	// This will be used to tune sql.session_transfer.max_session_size.
+	maxExpectedTransferResponseMessageSize = 1 << 24 // 16MB
+)
 
 var (
 	metaCurConnCount = metric.Metadata{
@@ -90,6 +101,12 @@ var (
 		Name:        "proxy.err.client_disconnect",
 		Help:        "Number of disconnects initiated by clients",
 		Measurement: "Client Disconnects",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaAcceptedConnCount = metric.Metadata{
+		Name:        "proxy.sql.accepted_conns",
+		Help:        "Number of accepted connections",
+		Measurement: "Accepted connections",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaRefusedConnCount = metric.Metadata{
@@ -211,20 +228,23 @@ func makeProxyMetrics() metrics {
 		ClientDisconnectCount:  metric.NewCounter(metaClientDisconnectCount),
 		CurConnCount:           metric.NewGauge(metaCurConnCount),
 		RoutingErrCount:        metric.NewCounter(metaRoutingErrCount),
+		AcceptedConnCount:      metric.NewCounter(metaAcceptedConnCount),
 		RefusedConnCount:       metric.NewCounter(metaRefusedConnCount),
 		SuccessfulConnCount:    metric.NewCounter(metaSuccessfulConnCount),
-		ConnectionLatency: metric.NewHistogram(
-			metaConnMigrationAttemptedCount,
-			base.DefaultHistogramWindowInterval(),
-			metric.NetworkLatencyBuckets,
-		),
+		ConnectionLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaConnMigrationAttemptedCount,
+			Duration: base.DefaultHistogramWindowInterval(),
+			Buckets:  metric.NetworkLatencyBuckets,
+		}),
 		AuthFailedCount:        metric.NewCounter(metaAuthFailedCount),
 		ExpiredClientConnCount: metric.NewCounter(metaExpiredClientConnCount),
 		// Connector metrics.
-		DialTenantLatency: metric.NewHistogram(
-			metaDialTenantLatency,
-			base.DefaultHistogramWindowInterval(),
-			metric.NetworkLatencyBuckets,
+		DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaDialTenantLatency,
+			Duration: base.DefaultHistogramWindowInterval(),
+			Buckets:  metric.NetworkLatencyBuckets},
 		),
 		DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		// Connection migration metrics.
@@ -232,16 +252,19 @@ func makeProxyMetrics() metrics {
 		ConnMigrationErrorFatalCount:       metric.NewCounter(metaConnMigrationErrorFatalCount),
 		ConnMigrationErrorRecoverableCount: metric.NewCounter(metaConnMigrationErrorRecoverableCount),
 		ConnMigrationAttemptedCount:        metric.NewCounter(metaConnMigrationAttemptedCount),
-		ConnMigrationAttemptedLatency: metric.NewHistogram(
-			metaConnMigrationAttemptedLatency,
-			base.DefaultHistogramWindowInterval(),
-			metric.NetworkLatencyBuckets,
-		),
-		ConnMigrationTransferResponseMessageSize: metric.NewHistogram(
-			metaConnMigrationTransferResponseMessageSize,
-			base.DefaultHistogramWindowInterval(),
-			metric.DataSize16MBBuckets,
-		),
+		ConnMigrationAttemptedLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaConnMigrationAttemptedLatency,
+			Duration: base.DefaultHistogramWindowInterval(),
+			Buckets:  metric.NetworkLatencyBuckets,
+		}),
+		ConnMigrationTransferResponseMessageSize: metric.NewHistogram(metric.HistogramOptions{
+			Metadata: metaConnMigrationTransferResponseMessageSize,
+			Duration: base.DefaultHistogramWindowInterval(),
+			Buckets:  metric.DataSize16MBBuckets,
+			MaxVal:   maxExpectedTransferResponseMessageSize,
+			SigFigs:  1,
+		}),
 		QueryCancelReceivedPGWire: metric.NewCounter(metaQueryCancelReceivedPGWire),
 		QueryCancelReceivedHTTP:   metric.NewCounter(metaQueryCancelReceivedHTTP),
 		QueryCancelIgnored:        metric.NewCounter(metaQueryCancelIgnored),

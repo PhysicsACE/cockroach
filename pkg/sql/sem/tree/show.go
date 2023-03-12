@@ -23,6 +23,8 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
+	"github.com/cockroachdb/errors"
+	"github.com/google/go-cmp/cmp"
 )
 
 // ShowVar represents a SHOW statement.
@@ -88,18 +90,22 @@ const (
 	// BackupValidateDetails identifies a SHOW BACKUP VALIDATION
 	// statement.
 	BackupValidateDetails
+	// BackupConnectionTest identifies a SHOW BACKUP CONNECTION statement
+	BackupConnectionTest
 )
 
 // TODO (msbutler): 22.2 after removing old style show backup syntax, rename
 // Path to Subdir and InCollection to Dest.
 
 // ShowBackup represents a SHOW BACKUP statement.
+//
+// TODO(msbutler): implement a walkableStmt for ShowBackup.
 type ShowBackup struct {
 	Path         Expr
 	InCollection StringOrPlaceholderOptList
 	From         bool
 	Details      ShowBackupDetails
-	Options      KVOptions
+	Options      ShowBackupOptions
 }
 
 // Format implements the NodeFormatter interface.
@@ -118,6 +124,8 @@ func (node *ShowBackup) Format(ctx *FmtCtx) {
 		ctx.WriteString("FILES ")
 	case BackupSchemaDetails:
 		ctx.WriteString("SCHEMAS ")
+	case BackupConnectionTest:
+		ctx.WriteString("CONNECTION ")
 	}
 
 	if node.From {
@@ -129,10 +137,219 @@ func (node *ShowBackup) Format(ctx *FmtCtx) {
 		ctx.WriteString(" IN ")
 		ctx.FormatNode(&node.InCollection)
 	}
-	if len(node.Options) > 0 {
+	if !node.Options.IsDefault() {
 		ctx.WriteString(" WITH ")
 		ctx.FormatNode(&node.Options)
 	}
+}
+
+type ShowBackupOptions struct {
+	AsJson               bool
+	CheckFiles           bool
+	DebugIDs             bool
+	IncrementalStorage   StringOrPlaceholderOptList
+	DecryptionKMSURI     StringOrPlaceholderOptList
+	EncryptionPassphrase Expr
+	Privileges           bool
+
+	// EncryptionInfoDir is a hidden option used when the user wants to run the deprecated
+	//
+	// SHOW BACKUP <incremental_dir>
+	//
+	// on an encrypted incremental backup will need to pass their full backup's
+	// directory to the encryption_info_dir parameter because the
+	// `ENCRYPTION-INFO` file necessary to decode the incremental backup lives in
+	// the full backup dir.
+	EncryptionInfoDir Expr
+	DebugMetadataSST  bool
+
+	CheckConnectionTransferSize Expr
+	CheckConnectionDuration     Expr
+	CheckConnectionConcurrency  Expr
+}
+
+var _ NodeFormatter = &ShowBackupOptions{}
+
+func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
+	var addSep bool
+	maybeAddSep := func() {
+		if addSep {
+			ctx.WriteString(", ")
+		}
+		addSep = true
+	}
+	if o.AsJson {
+		ctx.WriteString("as_json")
+		addSep = true
+	}
+	if o.CheckFiles {
+		maybeAddSep()
+		ctx.WriteString("check_files")
+	}
+	if o.DebugIDs {
+		maybeAddSep()
+		ctx.WriteString("debug_ids")
+	}
+	if o.EncryptionPassphrase != nil {
+		maybeAddSep()
+		ctx.WriteString("encryption_passphrase = ")
+		if ctx.flags.HasFlags(FmtShowPasswords) {
+			ctx.FormatNode(o.EncryptionPassphrase)
+		} else {
+			ctx.WriteString(PasswordSubstitution)
+		}
+	}
+	if o.IncrementalStorage != nil {
+		maybeAddSep()
+		ctx.WriteString("incremental_location = ")
+		ctx.FormatNode(&o.IncrementalStorage)
+	}
+
+	if o.Privileges {
+		maybeAddSep()
+		ctx.WriteString("privileges")
+	}
+
+	if o.EncryptionInfoDir != nil {
+		maybeAddSep()
+		ctx.WriteString("encryption_info_dir = ")
+		ctx.FormatNode(o.EncryptionInfoDir)
+	}
+	if o.DecryptionKMSURI != nil {
+		maybeAddSep()
+		ctx.WriteString("kms = ")
+		ctx.FormatNode(&o.DecryptionKMSURI)
+	}
+	if o.DebugMetadataSST {
+		ctx.WriteString("debug_dump_metadata_sst")
+	}
+
+	// The following are only used in connection-check SHOW.
+	if o.CheckConnectionTransferSize != nil {
+		maybeAddSep()
+		ctx.WriteString("TRANSFER = ")
+		ctx.FormatNode(o.CheckConnectionTransferSize)
+	}
+	if o.CheckConnectionDuration != nil {
+		maybeAddSep()
+		ctx.WriteString("TIME = ")
+		ctx.FormatNode(o.CheckConnectionDuration)
+	}
+	if o.CheckConnectionConcurrency != nil {
+		maybeAddSep()
+		ctx.WriteString("CONCURRENTLY = ")
+		ctx.FormatNode(o.CheckConnectionConcurrency)
+	}
+}
+
+func (o ShowBackupOptions) IsDefault() bool {
+	options := ShowBackupOptions{}
+	return o.AsJson == options.AsJson &&
+		o.CheckFiles == options.CheckFiles &&
+		o.DebugIDs == options.DebugIDs &&
+		cmp.Equal(o.IncrementalStorage, options.IncrementalStorage) &&
+		cmp.Equal(o.DecryptionKMSURI, options.DecryptionKMSURI) &&
+		o.EncryptionPassphrase == options.EncryptionPassphrase &&
+		o.Privileges == options.Privileges &&
+		o.DebugMetadataSST == options.DebugMetadataSST &&
+		o.EncryptionInfoDir == options.EncryptionInfoDir &&
+		o.CheckConnectionTransferSize == options.CheckConnectionTransferSize &&
+		o.CheckConnectionDuration == options.CheckConnectionDuration &&
+		o.CheckConnectionConcurrency == options.CheckConnectionConcurrency
+}
+
+func combineBools(v1 bool, v2 bool, label string) (bool, error) {
+	if v2 && v1 {
+		return false, errors.Newf("% option specified multiple times", label)
+	}
+	return v2 || v1, nil
+}
+func combineExpr(v1 Expr, v2 Expr, label string) (Expr, error) {
+	if v1 != nil {
+		if v2 != nil {
+			return v1, errors.Newf("% option specified multiple times", label)
+		}
+		return v1, nil
+	}
+	return v2, nil
+}
+func combineStringOrPlaceholderOptList(
+	v1 StringOrPlaceholderOptList, v2 StringOrPlaceholderOptList, label string,
+) (StringOrPlaceholderOptList, error) {
+	if v1 != nil {
+		if v2 != nil {
+			return v1, errors.Newf("% option specified multiple times", label)
+		}
+		return v1, nil
+	}
+	return v2, nil
+}
+
+// CombineWith merges other backup options into this backup options struct.
+// An error is returned if the same option merged multiple times.
+func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
+	var err error
+	o.AsJson, err = combineBools(o.AsJson, other.AsJson, "as_json")
+	if err != nil {
+		return err
+	}
+	o.CheckFiles, err = combineBools(o.CheckFiles, other.CheckFiles, "check_files")
+	if err != nil {
+		return err
+	}
+	o.DebugIDs, err = combineBools(o.DebugIDs, other.DebugIDs, "debug_ids")
+	if err != nil {
+		return err
+	}
+	o.EncryptionPassphrase, err = combineExpr(o.EncryptionPassphrase, other.EncryptionPassphrase,
+		"encryption_passphrase")
+	if err != nil {
+		return err
+	}
+	o.IncrementalStorage, err = combineStringOrPlaceholderOptList(o.IncrementalStorage,
+		other.IncrementalStorage, "incremental_location")
+	if err != nil {
+		return err
+	}
+	o.DecryptionKMSURI, err = combineStringOrPlaceholderOptList(o.DecryptionKMSURI,
+		other.DecryptionKMSURI, "kms")
+	if err != nil {
+		return err
+	}
+	o.Privileges, err = combineBools(o.Privileges, other.Privileges, "privileges")
+	if err != nil {
+		return err
+	}
+	o.DebugMetadataSST, err = combineBools(o.DebugMetadataSST, other.DebugMetadataSST,
+		"debug_dump_metadata_sst")
+	if err != nil {
+		return err
+	}
+	o.EncryptionInfoDir, err = combineExpr(o.EncryptionInfoDir, other.EncryptionInfoDir,
+		"encryption_info_dir")
+	if err != nil {
+		return err
+	}
+
+	o.CheckConnectionTransferSize, err = combineExpr(o.CheckConnectionTransferSize, other.CheckConnectionTransferSize,
+		"transfer")
+	if err != nil {
+		return err
+	}
+
+	o.CheckConnectionDuration, err = combineExpr(o.CheckConnectionDuration, other.CheckConnectionDuration,
+		"time")
+	if err != nil {
+		return err
+	}
+
+	o.CheckConnectionConcurrency, err = combineExpr(o.CheckConnectionConcurrency, other.CheckConnectionConcurrency,
+		"time")
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ShowColumns represents a SHOW COLUMNS statement.
@@ -860,25 +1077,29 @@ func (node *ShowTableStats) Format(ctx *FmtCtx) {
 	}
 }
 
+// ShowTenantOptions represents the WITH clause in SHOW TENANT.
+type ShowTenantOptions struct {
+	WithReplication  bool
+	WithCapabilities bool
+}
+
 // ShowTenant represents a SHOW TENANT statement.
 type ShowTenant struct {
-	Name            Expr
-	WithReplication bool
-	All             bool
+	TenantSpec *TenantSpec
+	ShowTenantOptions
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowTenant) Format(ctx *FmtCtx) {
-	if node.All {
-		ctx.WriteString("SHOW TENANTS")
-		return
-	}
-
 	ctx.WriteString("SHOW TENANT ")
-	ctx.FormatNode(node.Name)
+	ctx.FormatNode(node.TenantSpec)
 
 	if node.WithReplication {
 		ctx.WriteString(" WITH REPLICATION STATUS")
+	}
+
+	if node.WithCapabilities {
+		ctx.WriteString(" WITH CAPABILITIES")
 	}
 }
 
@@ -1056,11 +1277,11 @@ func (n *ShowDefaultPrivileges) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW DEFAULT PRIVILEGES ")
 	if len(n.Roles) > 0 {
 		ctx.WriteString("FOR ROLE ")
-		for i, role := range n.Roles {
+		for i := range n.Roles {
 			if i > 0 {
 				ctx.WriteString(", ")
 			}
-			ctx.FormatNode(&role)
+			ctx.FormatNode(&n.Roles[i])
 		}
 		ctx.WriteString(" ")
 	} else if n.ForAllRoles {

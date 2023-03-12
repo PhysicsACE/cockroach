@@ -10,9 +10,8 @@
 
 syntax = "proto3";
 package cockroach.sql.insights;
-option go_package = "insights";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights";
 
-import "roachpb/api.proto";
 import "gogoproto/gogo.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
@@ -66,7 +65,7 @@ message Transaction {
     (gogoproto.nullable) = false];
   uint64 fingerprint_id = 2
   [(gogoproto.customname) = "FingerprintID",
-    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/roachpb.TransactionFingerprintID",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.TransactionFingerprintID",
     (gogoproto.nullable) = false];
   string user_priority = 3;
   bool implicit_txn = 4;
@@ -81,6 +80,11 @@ message Transaction {
   string auto_retry_reason = 13;
   repeated Problem problems = 14;
   repeated Cause causes = 15;
+  repeated bytes stmt_execution_ids = 16 [ (gogoproto.customname) = "StmtExecutionIDs",
+    (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/sql/clusterunique.ID"];
+  int64 cpu_sql_nanos = 17 [(gogoproto.customname) = "CPUSQLNanos"];
+  // The error code of the last failed statement in the transaction.
+  string last_error_code = 18; 
 }
 
 message Statement {
@@ -93,7 +97,7 @@ message Statement {
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/sql/clusterunique.ID",
     (gogoproto.nullable) = false];
   uint64 fingerprint_id = 2 [(gogoproto.customname) = "FingerprintID",
-    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.StmtFingerprintID"];
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.StmtFingerprintID"];
   double latency_in_seconds = 3;
   string query = 4;
   Status status = 5;
@@ -112,10 +116,11 @@ message Statement {
   repeated int64 nodes = 17;
   google.protobuf.Duration contention = 18 [(gogoproto.stdduration) = true];
   repeated string index_recommendations = 19;
-  // contention_events hit at the statement level.
-  repeated cockroach.roachpb.ContentionEvent contention_events = 20 [(gogoproto.nullable) = false];
+  reserved 20; // previously contention_events
   Problem problem = 21;
   repeated Cause causes = 22;
+  int64 cpu_sql_nanos = 23 [(gogoproto.customname) = "CPUSQLNanos"];
+  string error_code = 24;
 }
 
 

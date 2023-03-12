@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
@@ -28,6 +29,11 @@ const (
 	txnCommittedMsg = "current transaction is committed, commands ignored " +
 		"until end of transaction block"
 )
+
+// EnforceHomeRegionFurtherInfo is the suffix to append to every error returned
+// due to turning on the enforce_home_region session setting, and provides some
+// information for users or app developers.
+const EnforceHomeRegionFurtherInfo = "For more information, see https://www.cockroachlabs.com/docs/stable/cost-based-optimizer.html#control-whether-queries-are-limited-to-a-single-region"
 
 // NewTransactionAbortedError creates an error for trying to run a command in
 // the context of transaction that's in the aborted state. Any statement other
@@ -171,6 +177,11 @@ func NewSchemaAlreadyExistsError(name string) error {
 	return pgerror.Newf(pgcode.DuplicateSchema, "schema %q already exists", name)
 }
 
+func NewUnsupportedUnvalidatedConstraintError(constraintType catconstants.ConstraintType) error {
+	return pgerror.Newf(pgcode.FeatureNotSupported,
+		"%v constraints cannot be marked NOT VALID", constraintType)
+}
+
 // WrapErrorWhileConstructingObjectAlreadyExistsErr is used to wrap an error
 // when an error occurs while trying to get the colliding object for an
 // ObjectAlreadyExistsErr.
@@ -252,6 +263,35 @@ func NewColumnReferencedByComputedColumnError(droppingColumn, computedColumn str
 	)
 }
 
+// NewColumnReferencedByPartialIndex is returned when we drop a column that is
+// referenced in a partial index's predicate.
+func NewColumnReferencedByPartialIndex(droppingColumn, partialIndex string) error {
+	return errors.WithIssueLink(errors.WithHint(
+		pgerror.Newf(
+			pgcode.InvalidColumnReference,
+			"column %q cannot be dropped because it is referenced by partial index %q",
+			droppingColumn, partialIndex,
+		),
+		"drop the partial index first, then drop the column",
+	), errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/pull/97372"})
+}
+
+// NewColumnReferencedByPartialUniqueWithoutIndexConstraint is almost the same as
+// NewColumnReferencedByPartialIndex except it's used when dropping column that is
+// referenced in a partial unique without index constraint's predicate.
+func NewColumnReferencedByPartialUniqueWithoutIndexConstraint(
+	droppingColumn, partialUWIConstraint string,
+) error {
+	return errors.WithIssueLink(errors.WithHint(
+		pgerror.Newf(
+			pgcode.InvalidColumnReference,
+			"column %q cannot be dropped because it is referenced by partial unique constraint %q",
+			droppingColumn, partialUWIConstraint,
+		),
+		"drop the unique constraint first, then drop the column",
+	), errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/pull/97372"})
+}
+
 // NewUniqueConstraintReferencedByForeignKeyError generates an error to be
 // returned when dropping a unique constraint that is relied upon by an
 // inbound foreign key constraint.
@@ -270,6 +310,12 @@ func NewUndefinedUserError(user username.SQLUsername) error {
 	return pgerror.Newf(pgcode.UndefinedObject, "role/user %q does not exist", user)
 }
 
+// NewUndefinedConstraintError returns a missing constraint error.
+func NewUndefinedConstraintError(constraintName, tableName string) error {
+	return pgerror.Newf(pgcode.UndefinedObject,
+		"constraint %q of relation %q does not exist", constraintName, tableName)
+}
+
 // NewRangeUnavailableError creates an unavailable range error.
 func NewRangeUnavailableError(rangeID roachpb.RangeID, origErr error) error {
 	return pgerror.Wrapf(origErr, pgcode.RangeUnavailable, "key range id:%d is unavailable", rangeID)
@@ -286,6 +332,12 @@ func NewWindowInAggError() error {
 // contained within another aggregate function.
 func NewAggInAggError() error {
 	return pgerror.New(pgcode.Grouping, "aggregate function calls cannot be nested")
+}
+
+// NewInvalidVolatilityError creates an error for the case when provided
+// volatility options are not valid through CREATE/REPLACE/ALTER FUNCTION.
+func NewInvalidVolatilityError(err error) error {
+	return pgerror.Wrap(err, pgcode.InvalidFunctionDefinition, "invalid volatility")
 }
 
 // QueryTimeoutError is an error representing a query timeout.

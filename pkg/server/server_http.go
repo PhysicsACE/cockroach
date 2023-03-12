@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -94,6 +95,7 @@ func (s *httpServer) setupRoutes(
 	handleRequestsUnauthenticated http.Handler,
 	handleDebugUnauthenticated http.Handler,
 	apiServer http.Handler,
+	flags serverpb.FeatureFlags,
 ) error {
 	// OIDC Configuration must happen prior to the UI Handler being defined below so that we have
 	// the system settings initialized for it to pick up from the oidcAuthenticationServer.
@@ -111,11 +113,13 @@ func (s *httpServer) setupRoutes(
 		NodeID:   s.cfg.IDContainer,
 		OIDC:     oidc,
 		GetUser: func(ctx context.Context) *string {
-			if u, ok := ctx.Value(webSessionUserKey{}).(string); ok {
-				return &u
+			if user, ok := maybeUserFromHTTPAuthInfoContext(ctx); ok {
+				ustring := user.Normalized()
+				return &ustring
 			}
 			return nil
 		},
+		Flags: flags,
 	})
 
 	// The authentication mux used here is created in "allow anonymous" mode so that the UI
@@ -183,7 +187,7 @@ func makeAdminAuthzCheckHandler(
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// Retrieve the username embedded in the grpc metadata, if any.
 		// This will be provided by the authenticationMux.
-		md := forwardAuthenticationMetadata(req.Context(), req)
+		md := translateHTTPAuthInfoToGRPCMetadata(req.Context(), req)
 		authCtx := metadata.NewIncomingContext(req.Context(), md)
 		// Check the privileges of the requester.
 		err := adminAuthzCheck.requireViewDebugPermission(authCtx)

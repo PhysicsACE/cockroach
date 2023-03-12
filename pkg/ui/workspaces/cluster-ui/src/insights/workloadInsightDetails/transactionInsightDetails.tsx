@@ -7,39 +7,41 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
-import React, { useEffect } from "react";
+import React, { useEffect, useRef } from "react";
 import Helmet from "react-helmet";
 import { RouteComponentProps } from "react-router-dom";
 import { ArrowLeft } from "@cockroachlabs/icons";
 import { Tabs } from "antd";
 import "antd/lib/col/style";
 import "antd/lib/row/style";
+import "antd/lib/tabs/style";
 import { Button } from "src/button";
-import { Loading } from "src/loading";
 import { getMatchParamByName } from "src/util/query";
-import { TxnContentionInsightDetailsRequest } from "src/api";
-import { TxnInsightDetails } from "../types";
+import { TxnInsightDetailsRequest, TxnInsightDetailsReqErrs } from "src/api";
+import { InsightNameEnum, TxnInsightDetails } from "../types";
 
 import { commonStyles } from "src/common";
-import { InsightsError } from "../insightsErrorComponent";
 import { TimeScale } from "../../timeScaleDropdown";
 import { idAttr } from "src/util";
 import { TransactionInsightDetailsOverviewTab } from "./transactionInsightDetailsOverviewTab";
 import { TransactionInsightsDetailsStmtsTab } from "./transactionInsightDetailsStmtsTab";
+import { timeScaleRangeToObj } from "src/timeScaleDropdown/utils";
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import { insights } from "src/util";
+import { Anchor } from "src/anchor";
 
-import "antd/lib/tabs/style";
-import { executionInsightsRequestFromTimeScale } from "../utils";
 export interface TransactionInsightDetailsStateProps {
   insightDetails: TxnInsightDetails;
-  insightError: Error | null;
+  insightError: TxnInsightDetailsReqErrs | null;
   timeScale?: TimeScale;
+  hasAdminRole: boolean;
+  maxSizeApiReached?: boolean;
 }
 
 export interface TransactionInsightDetailsDispatchProps {
-  refreshTransactionInsightDetails: (
-    req: TxnContentionInsightDetailsRequest,
-  ) => void;
+  refreshTransactionInsightDetails: (req: TxnInsightDetailsRequest) => void;
   setTimeScale: (ts: TimeScale) => void;
+  refreshUserSQLRoles: () => void;
 }
 
 export type TransactionInsightDetailsProps =
@@ -52,6 +54,8 @@ enum TabKeysEnum {
   STATEMENTS = "statements",
 }
 
+const MAX_REQ_ATTEMPTS = 3;
+
 export const TransactionInsightDetails: React.FC<
   TransactionInsightDetailsProps
 > = ({
@@ -62,20 +66,60 @@ export const TransactionInsightDetails: React.FC<
   insightError,
   timeScale,
   match,
+  hasAdminRole,
+  refreshUserSQLRoles,
+  maxSizeApiReached,
 }) => {
+  const fetches = useRef<number>(0);
   const executionID = getMatchParamByName(match, idAttr);
-  const noInsights = !insightDetails;
+
   useEffect(() => {
-    const execReq = executionInsightsRequestFromTimeScale(timeScale);
-    if (noInsights) {
-      // Only refresh if we have no data (e.g. refresh the page)
-      refreshTransactionInsightDetails({
-        id: executionID,
+    refreshUserSQLRoles();
+  }, [refreshUserSQLRoles]);
+
+  useEffect(() => {
+    if (fetches.current === MAX_REQ_ATTEMPTS) {
+      return;
+    }
+
+    const txnDetails = insightDetails.txnDetails;
+    const stmts = insightDetails.statements;
+    const contentionInfo = insightDetails.blockingContentionDetails;
+
+    const stmtsComplete =
+      stmts != null && stmts.length === txnDetails?.stmtExecutionIDs?.length;
+
+    const contentionComplete =
+      contentionInfo != null ||
+      (txnDetails != null &&
+        txnDetails.insights.find(
+          i => i.name === InsightNameEnum.highContention,
+        ) == null);
+
+    if (!stmtsComplete || !contentionComplete || txnDetails == null) {
+      // Only fetch if we are missing some information.
+      // Note that we will attempt to refetch if we are stll missing some
+      // information only if the results differ from what we already have,
+      // with the maximum number of retries capped at MAX_REQ_ATTEMPTS.
+      const execReq = timeScaleRangeToObj(timeScale);
+      const req = {
+        mergeResultWith: insightDetails,
         start: execReq.start,
         end: execReq.end,
-      });
+        txnExecutionID: executionID,
+        excludeTxn: txnDetails != null,
+        excludeStmts: stmtsComplete,
+        excludeContention: contentionComplete,
+      };
+      refreshTransactionInsightDetails(req);
+      fetches.current += 1;
     }
-  }, [executionID, refreshTransactionInsightDetails, noInsights, timeScale]);
+  }, [
+    timeScale,
+    executionID,
+    refreshTransactionInsightDetails,
+    insightDetails,
+  ]);
 
   const prevPage = (): void => history.goBack();
 
@@ -91,7 +135,7 @@ export const TransactionInsightDetails: React.FC<
           iconPosition="left"
           className={commonStyles("small-margin")}
         >
-          Insights
+          Previous page
         </Button>
         <h3
           className={commonStyles("base-heading", "no-margin-bottom")}
@@ -100,34 +144,53 @@ export const TransactionInsightDetails: React.FC<
         )}`}</h3>
       </div>
       <section>
-        <Loading
-          loading={!insightDetails || insightDetails === null}
-          page={"Transaction Insight details"}
-          error={insightError}
-          renderError={() => InsightsError()}
+        <Tabs
+          className={commonStyles("cockroach--tabs")}
+          defaultActiveKey={TabKeysEnum.OVERVIEW}
         >
-          <Tabs
-            className={commonStyles("cockroach--tabs")}
-            defaultActiveKey={TabKeysEnum.OVERVIEW}
-          >
-            <Tabs.TabPane tab="Overview" key={TabKeysEnum.OVERVIEW}>
-              <TransactionInsightDetailsOverviewTab
-                insightDetails={insightDetails}
-                setTimeScale={setTimeScale}
+          <Tabs.TabPane tab="Overview" key={TabKeysEnum.OVERVIEW}>
+            <TransactionInsightDetailsOverviewTab
+              maxRequestsReached={fetches.current === MAX_REQ_ATTEMPTS}
+              errors={insightError}
+              statements={insightDetails.statements}
+              txnDetails={insightDetails.txnDetails}
+              contentionDetails={insightDetails.blockingContentionDetails}
+              setTimeScale={setTimeScale}
+              hasAdminRole={hasAdminRole}
+              maxApiSizeReached={maxSizeApiReached}
+            />
+          </Tabs.TabPane>
+          {(insightDetails.txnDetails?.stmtExecutionIDs?.length ||
+            insightDetails.statements?.length) && (
+            <Tabs.TabPane
+              tab="Statement Executions"
+              key={TabKeysEnum.STATEMENTS}
+            >
+              <TransactionInsightsDetailsStmtsTab
+                isLoading={
+                  insightDetails.statements == null &&
+                  fetches.current < MAX_REQ_ATTEMPTS
+                }
+                error={insightError?.statementsErr}
+                statements={insightDetails?.statements}
               />
-            </Tabs.TabPane>
-            {insightDetails?.statementInsights?.length && (
-              <Tabs.TabPane
-                tab="Statement Executions"
-                key={TabKeysEnum.STATEMENTS}
-              >
-                <TransactionInsightsDetailsStmtsTab
-                  insightDetails={insightDetails}
+              {maxSizeApiReached && (
+                <InlineAlert
+                  intent="info"
+                  title={
+                    <>
+                      Not all statements are displayed because the maximum
+                      number of statements was reached in the console.&nbsp;
+                      <Anchor href={insights} target="_blank">
+                        Learn more
+                      </Anchor>
+                    </>
+                  }
                 />
-              </Tabs.TabPane>
-            )}
-          </Tabs>
-        </Loading>
+              )}
+            </Tabs.TabPane>
+          )}
+        </Tabs>
       </section>
     </div>
   );

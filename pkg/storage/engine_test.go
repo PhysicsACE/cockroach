@@ -26,7 +26,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -523,11 +522,11 @@ func TestEngineMustExist(t *testing.T) {
 	tempDir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
 
-	_, err := Open(context.Background(), Filesystem(tempDir), MustExist)
+	_, err := Open(context.Background(), Filesystem(tempDir), cluster.MakeClusterSettings(), MustExist)
 	if err == nil {
 		t.Fatal("expected error related to missing directory")
 	}
-	if !strings.Contains(fmt.Sprint(err), "no such file or directory") {
+	if !strings.Contains(fmt.Sprint(err), "does not exist") {
 		t.Fatal(err)
 	}
 }
@@ -1001,19 +1000,30 @@ func TestCreateCheckpoint(t *testing.T) {
 	db, err := Open(
 		context.Background(),
 		Filesystem(dir),
-		Settings(cluster.MakeTestingClusterSettings()))
+		cluster.MakeTestingClusterSettings())
 	assert.NoError(t, err)
 	defer db.Close()
 
-	dir = filepath.Join(dir, "checkpoint")
+	checkpointDir := filepath.Join(dir, "checkpoint")
 
 	assert.NoError(t, err)
-	assert.NoError(t, db.CreateCheckpoint(dir))
-	assert.DirExists(t, dir)
-	m, err := filepath.Glob(dir + "/*")
+	assert.NoError(t, db.CreateCheckpoint(checkpointDir, nil))
+	assert.DirExists(t, checkpointDir)
+	m, err := filepath.Glob(checkpointDir + "/*")
 	assert.NoError(t, err)
 	assert.True(t, len(m) > 0)
-	if err := db.CreateCheckpoint(dir); !testutils.IsError(err, "exists") {
+
+	// Verify that we can open the checkpoint.
+	db2, err := Open(
+		context.Background(),
+		Filesystem(checkpointDir),
+		cluster.MakeTestingClusterSettings(),
+		MustExist)
+	require.NoError(t, err)
+	db2.Close()
+
+	// Verify that creating another checkpoint in the same directory fails.
+	if err := db.CreateCheckpoint(checkpointDir, nil); !testutils.IsError(err, "exists") {
 		t.Fatal(err)
 	}
 }
@@ -1219,7 +1229,7 @@ func TestEngineFSFileNotFoundError(t *testing.T) {
 
 	dir, dirCleanup := testutils.TempDir(t)
 	defer dirCleanup()
-	db, err := Open(context.Background(), Filesystem(dir), CacheSize(testCacheSize))
+	db, err := Open(context.Background(), Filesystem(dir), cluster.MakeClusterSettings(), CacheSize(testCacheSize))
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1283,7 +1293,7 @@ func TestFS(t *testing.T) {
 	}
 	for name, loc := range engineDest {
 		t.Run(name, func(t *testing.T) {
-			fs, err := Open(context.Background(), loc, CacheSize(testCacheSize), ForTesting)
+			fs, err := Open(context.Background(), loc, cluster.MakeClusterSettings(), CacheSize(testCacheSize), ForTesting)
 			require.NoError(t, err)
 			defer fs.Close()
 
@@ -1348,7 +1358,7 @@ func TestGetIntent(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	reader, err := Open(ctx, InMemory(), CacheSize(1<<20 /* 1 MiB */))
+	reader, err := Open(ctx, InMemory(), cluster.MakeClusterSettings(), CacheSize(1<<20 /* 1 MiB */))
 	require.NoError(t, err)
 	defer reader.Close()
 
@@ -1437,7 +1447,7 @@ func TestScanIntents(t *testing.T) {
 		"1000 bytes":      {keys[0], maxKey, 0, 1000, keys},
 	}
 
-	eng, err := Open(ctx, InMemory(), CacheSize(1<<20 /* 1 MiB */))
+	eng, err := Open(ctx, InMemory(), cluster.MakeClusterSettings(), CacheSize(1<<20 /* 1 MiB */))
 	require.NoError(t, err)
 	defer eng.Close()
 
@@ -1895,6 +1905,366 @@ func TestEngineIteratorVisibility(t *testing.T) {
 	}
 }
 
+// TestScanConflictingIntentsForDroppingLatchesEarly tests
+// ScanConflictingIntentsForDroppingLatchesEarly for all non read-your-own-write
+// cases. Read-your-own-write cases are tested separately in
+// TestScanConflictingIntentsForDroppingLatchesEarlyReadYourOwnWrites.
+func TestScanConflictingIntentsForDroppingLatchesEarly(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	ts := func(nanos int) hlc.Timestamp {
+		return hlc.Timestamp{
+			WallTime: int64(nanos),
+		}
+	}
+	newTxn := func(ts hlc.Timestamp) *roachpb.Transaction {
+		txnID := uuid.MakeV4()
+		return &roachpb.Transaction{
+			TxnMeta: enginepb.TxnMeta{
+				ID:             txnID,
+				Epoch:          1,
+				WriteTimestamp: ts,
+				MinTimestamp:   ts,
+			},
+			ReadTimestamp: ts,
+		}
+	}
+
+	belowTxnTS := ts(1)
+	txnTS := ts(2)
+	aboveTxnTS := ts(3)
+
+	keyA := roachpb.Key("a")
+	keyB := roachpb.Key("b")
+	keyC := roachpb.Key("c")
+	val := roachpb.Value{RawBytes: []byte{'v'}}
+
+	testCases := []struct {
+		name                  string
+		setup                 func(t *testing.T, rw ReadWriter, txn *roachpb.Transaction)
+		start                 roachpb.Key
+		end                   roachpb.Key
+		expNeedsIntentHistory bool
+		expErr                string
+		expNumFoundIntents    int
+	}{
+		{
+			name:               "invalid end key",
+			start:              keyC,
+			end:                keyA,
+			expErr:             "start key must be less than end key",
+			expNumFoundIntents: 0,
+		},
+		{
+			name:                  "no end key",
+			start:                 keyA,
+			end:                   nil,
+			expNeedsIntentHistory: false,
+			expNumFoundIntents:    0,
+		},
+		{
+			name:                  "no intents",
+			start:                 keyB,
+			end:                   keyC,
+			expNeedsIntentHistory: false,
+			expNumFoundIntents:    0,
+		},
+		{
+			name: "conflicting txn intent at lower timestamp",
+			setup: func(t *testing.T, rw ReadWriter, txn *roachpb.Transaction) {
+				conflictingTxn := newTxn(belowTxnTS) // test txn should see this intent
+				err := MVCCPut(
+					ctx, rw, nil, keyA, conflictingTxn.WriteTimestamp, hlc.ClockTimestamp{}, val, conflictingTxn,
+				)
+				require.NoError(t, err)
+			},
+			start:                 keyA,
+			end:                   keyC,
+			expNeedsIntentHistory: false,
+			expNumFoundIntents:    1,
+		},
+		{
+			name: "conflicting txn intent at higher timestamp",
+			setup: func(t *testing.T, rw ReadWriter, txn *roachpb.Transaction) {
+				conflictingTxn := newTxn(aboveTxnTS) // test txn shouldn't see this intent
+				err := MVCCPut(
+					ctx, rw, nil, keyA, conflictingTxn.WriteTimestamp, hlc.ClockTimestamp{}, val, conflictingTxn,
+				)
+				require.NoError(t, err)
+			},
+			start:                 keyA,
+			end:                   keyC,
+			expNeedsIntentHistory: false,
+			expNumFoundIntents:    0,
+		},
+		{
+			name: "bounds do not include (latest) own write",
+			setup: func(t *testing.T, rw ReadWriter, txn *roachpb.Transaction) {
+				err := MVCCPut(ctx, rw, nil, keyA, txn.WriteTimestamp, hlc.ClockTimestamp{}, val, txn)
+				require.NoError(t, err)
+			},
+			start:                 keyB,
+			end:                   keyC,
+			expNeedsIntentHistory: false,
+			expNumFoundIntents:    0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := NewDefaultInMemForTesting()
+			defer eng.Close()
+
+			var intents []roachpb.Intent
+			txn := newTxn(txnTS)
+			if tc.setup != nil {
+				tc.setup(t, eng, txn)
+			}
+			needsIntentHistory, err := ScanConflictingIntentsForDroppingLatchesEarly(
+				ctx,
+				eng,
+				txn.ID,
+				txn.ReadTimestamp,
+				tc.start,
+				tc.end,
+				&intents,
+				0, /* maxIntents */
+			)
+			if tc.expErr != "" {
+				require.Error(t, err)
+				testutils.IsError(err, tc.expErr)
+				return // none of the other fields need to be tested.
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.expNeedsIntentHistory, needsIntentHistory)
+			require.Equal(t, tc.expNumFoundIntents, len(intents))
+		})
+	}
+}
+
+// TestScanConflictingIntentsForDroppingLatchesEarlyReadYourOwnWrites constructs
+// various read-your-own-write cases and ensures we correctly determine whether
+// callers of ScanConflictingIntentsForDroppingLatchesEarly need to consult
+// intent history or not when performing a scan over the MVCC keyspace. Factors
+// that go into this determination are:
+// 1. Sequence numbers of the intent/read op.
+// 2. Timestamps of the intent/read op.
+// 3. Epochs of the intent/read op.
+// 4. Whether any savepoints have been rolled back.
+//
+// NB: When scanning for conflicting intents to determine if latches can be
+// dropped early, we fallback to using the intent interleaving iterator in all
+// read-your-own-write cases. However, doing so is more restrictive than it
+// needs to be -- the in-line test expectations correspond to what an optimized
+// determination for `needsIntentHistory` would look like. However, for the
+// purposes of this test, we assert that we always fall back to using the intent
+// interleaving iterator in ALL read-your-own-write cases.
+func TestScanConflictingIntentsForDroppingLatchesEarlyReadYourOwnWrites(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	alwaysFallbackToIntentInterleavingIteratorForReadYourOwnWrites := true
+
+	ctx := context.Background()
+	ts := func(nanos int) hlc.Timestamp {
+		return hlc.Timestamp{
+			WallTime: int64(nanos),
+		}
+	}
+	belowReadTS := ts(1)
+	readTS := ts(2)
+	aboveReadTS := ts(3)
+
+	belowReadTxnEpoch := enginepb.TxnEpoch(1)
+	readTxnEpoch := enginepb.TxnEpoch(3)
+	aboveReadTxnEpoch := enginepb.TxnEpoch(2)
+
+	belowReadSeqNumber := enginepb.TxnSeq(1)
+	readSeqNumber := enginepb.TxnSeq(2)
+	aboveReadSeqNumber := enginepb.TxnSeq(3)
+
+	keyA := roachpb.Key("a")
+	val := roachpb.Value{RawBytes: []byte{'v'}}
+
+	testCases := []struct {
+		name                  string
+		intentTS              hlc.Timestamp
+		intentSequenceNumber  enginepb.TxnSeq
+		intentEpoch           enginepb.TxnEpoch
+		expNeedsIntentHistory bool // currently unused when testing
+		ignoredSeqNumbers     enginepb.IgnoredSeqNumRange
+	}{
+		{
+			name:                  "equal {timestamp, seq number, epoch}",
+			intentTS:              readTS,
+			intentSequenceNumber:  readSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: false,
+		},
+		{
+			name:                  "higher {intent seq number} equal {timestamp, epoch}",
+			intentTS:              readTS,
+			intentSequenceNumber:  aboveReadSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		{
+			name:                  "higher {intent seq number} equal {epoch} lower {intent timestamp}",
+			intentTS:              belowReadTS,
+			intentSequenceNumber:  aboveReadSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		{
+			name:                  "higher {intent seq number, intent timestamp} equal {epoch}",
+			intentTS:              aboveReadTS,
+			intentSequenceNumber:  aboveReadSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		{
+			// Naively scanning at the read's timestamp, without accounting for the
+			// intent, would result in us missing our own write as the writeTS is
+			// higher than the readTS.
+			name:                  "higher {intent timestamp} equal {epoch} lower {intent seq number}",
+			intentTS:              aboveReadTS,
+			intentSequenceNumber:  belowReadSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		{
+			// Naively scanning at the read's timestamp, without accounting for the
+			// intent, would result in us missing our own write as the writeTS is
+			// higher than the readTS.
+			name:                  "higher {intent timestamp} equal {seq number, epoch}",
+			intentTS:              aboveReadTS,
+			intentSequenceNumber:  readSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		{
+			name:                  "equal {timestamp, epoch} lower {intent seq number}",
+			intentTS:              readTS,
+			intentSequenceNumber:  belowReadSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: false,
+		},
+		{
+			name:                  "equal {epoch} lower {intent timestamp, intent seq number}",
+			intentTS:              belowReadTS,
+			intentSequenceNumber:  belowReadSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: false,
+		},
+		{
+			name:                  "equal {epoch, seq number} lower {intent timestamp}",
+			intentTS:              belowReadTS,
+			intentSequenceNumber:  readSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			expNeedsIntentHistory: false,
+		},
+
+		// lower/higher epoch test cases aren't exhaustive.
+		{
+			name:                  "equal {timestamp, seq number} lower {epoch}",
+			intentTS:              readTS,
+			intentSequenceNumber:  readSeqNumber,
+			intentEpoch:           belowReadTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		{
+			name:                  "higher{epoch} equal {timestamp, seq number}",
+			intentTS:              readTS,
+			intentSequenceNumber:  readSeqNumber,
+			intentEpoch:           aboveReadTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		{
+			name:                  "lower {epoch, intent timestamp, intent seq number}",
+			intentTS:              belowReadTS,
+			intentSequenceNumber:  belowReadSeqNumber,
+			intentEpoch:           belowReadTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		{
+			name:                  "higher {epoch} lower {intent timestamp, intent seq number}",
+			intentTS:              belowReadTS,
+			intentSequenceNumber:  belowReadSeqNumber,
+			intentEpoch:           aboveReadTxnEpoch,
+			expNeedsIntentHistory: true,
+		},
+		// Savepoint related tests.
+		{
+			// Scenario from https://github.com/cockroachdb/cockroach/issues/94337.
+			name:                  "intent part of rolled back savepoint",
+			intentTS:              belowReadTS,
+			intentSequenceNumber:  belowReadSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			ignoredSeqNumbers:     enginepb.IgnoredSeqNumRange{Start: belowReadSeqNumber, End: belowReadSeqNumber},
+			expNeedsIntentHistory: true,
+		},
+		{
+			name:                  "intent not part of rolled back savepoint",
+			intentTS:              readTS,
+			intentSequenceNumber:  readSeqNumber,
+			intentEpoch:           readTxnEpoch,
+			ignoredSeqNumbers:     enginepb.IgnoredSeqNumRange{Start: belowReadSeqNumber, End: belowReadSeqNumber},
+			expNeedsIntentHistory: true, // should be false
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := NewDefaultInMemForTesting()
+			defer eng.Close()
+
+			txnID := uuid.MakeV4()
+			txn := &roachpb.Transaction{
+				TxnMeta: enginepb.TxnMeta{
+					ID: txnID,
+				},
+			}
+
+			// Write the intent as dictated by the test case.
+			txn.Epoch = tc.intentEpoch
+			txn.Sequence = tc.intentSequenceNumber
+			txn.ReadTimestamp = tc.intentTS
+			txn.WriteTimestamp = tc.intentTS
+			err := MVCCPut(ctx, eng, nil, keyA, txn.WriteTimestamp, hlc.ClockTimestamp{}, val, txn)
+			require.NoError(t, err)
+
+			// Set up the read.
+			txn.Epoch = readTxnEpoch
+			txn.Sequence = readSeqNumber
+			txn.ReadTimestamp = readTS
+			txn.WriteTimestamp = readTS
+			txn.IgnoredSeqNums = []enginepb.IgnoredSeqNumRange{tc.ignoredSeqNumbers}
+
+			var intents []roachpb.Intent
+			needsIntentHistory, err := ScanConflictingIntentsForDroppingLatchesEarly(
+				ctx,
+				eng,
+				txn.ID,
+				txn.ReadTimestamp,
+				keyA,
+				nil,
+				&intents,
+				0, /* maxIntents */
+			)
+			require.NoError(t, err)
+			if alwaysFallbackToIntentInterleavingIteratorForReadYourOwnWrites {
+				require.Equal(t, true, needsIntentHistory)
+			} else {
+				require.Equal(t, tc.expNeedsIntentHistory, needsIntentHistory)
+			}
+		})
+	}
+}
+
 // TestEngineRangeKeyMutations tests that range key mutations work as expected,
 // both for the engine directly and for batches.
 func TestEngineRangeKeyMutations(t *testing.T) {
@@ -1910,8 +2280,6 @@ func TestEngineRangeKeyMutations(t *testing.T) {
 			rw = eng.NewBatch()
 			defer rw.Close()
 		}
-
-		require.True(t, rw.SupportsRangeKeys())
 
 		// Check errors for invalid, empty, and zero-length range keys. Not
 		// exhaustive, since we assume validation dispatches to
@@ -2032,164 +2400,6 @@ func TestEngineRangeKeyMutations(t *testing.T) {
 			}, scanRangeKeys(t, eng))
 		}
 	})
-}
-
-// TestEngineRangeKeysUnsupported tests that engines without range key
-// support behave as expected, i.e. writes fail but reads degrade gracefully.
-func TestEngineRangeKeysUnsupported(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// Set up an engine with a version that doesn't support range keys.
-	version := clusterversion.ByKey(clusterversion.V22_2EnsurePebbleFormatVersionRangeKeys - 1)
-	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
-
-	eng := NewDefaultInMemForTesting(Settings(st))
-	defer eng.Close()
-
-	require.NoError(t, eng.PutMVCC(pointKey("a", 1), stringValue("a1")))
-
-	batch := eng.NewBatch()
-	defer batch.Close()
-	snapshot := eng.NewSnapshot()
-	defer snapshot.Close()
-	readOnly := eng.NewReadOnly(StandardDurability)
-	defer readOnly.Close()
-
-	writers := map[string]Writer{
-		"engine": eng,
-		"batch":  batch,
-	}
-	readers := map[string]Reader{
-		"engine":   eng,
-		"batch":    batch,
-		"snapshot": snapshot,
-		"readonly": readOnly,
-	}
-
-	// Range key puts should error, but clears are noops (since old databases
-	// cannot contain range keys by definition).
-	for name, w := range writers {
-		t.Run(fmt.Sprintf("write/%s", name), func(t *testing.T) {
-			rangeKey := rangeKey("a", "b", 2)
-
-			err := w.PutMVCCRangeKey(rangeKey, MVCCValue{})
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "range keys not supported")
-
-			err = w.PutRawMVCCRangeKey(rangeKey, []byte{})
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "range keys not supported")
-
-			err = w.PutEngineRangeKey(rangeKey.StartKey, rangeKey.EndKey, nil, nil)
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "range keys not supported")
-
-			require.NoError(t, w.ClearMVCCRangeKey(rangeKey))
-			require.NoError(t, w.ClearEngineRangeKey(
-				rangeKey.StartKey, rangeKey.EndKey, EncodeMVCCTimestampSuffix(rangeKey.Timestamp)))
-			require.NoError(t, w.ClearRawRange(
-				rangeKey.StartKey, rangeKey.EndKey, false /* pointKeys */, true /* rangeKeys */))
-		})
-	}
-
-	// All range key iterators should degrade gracefully to point key iterators,
-	// and be empty for IterKeyTypeRangesOnly.
-	keyTypes := map[string]IterKeyType{
-		"PointsOnly":      IterKeyTypePointsOnly,
-		"PointsAndRanges": IterKeyTypePointsAndRanges,
-		"RangesOnly":      IterKeyTypeRangesOnly,
-	}
-	for name, r := range readers {
-		for keyTypeName, keyType := range keyTypes {
-			t.Run(fmt.Sprintf("read/%s/%s", name, keyTypeName), func(t *testing.T) {
-				require.False(t, r.SupportsRangeKeys())
-
-				t.Run("MVCCIterator", func(t *testing.T) {
-					iter := r.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
-						KeyTypes:             keyType,
-						UpperBound:           keys.MaxKey,
-						RangeKeyMaskingBelow: hlc.Timestamp{WallTime: 1}, // should get disabled when unsupported
-					})
-					defer iter.Close()
-
-					iter.SeekGE(pointKey("a", 0))
-
-					ok, err := iter.Valid()
-					require.NoError(t, err)
-
-					if keyType == IterKeyTypeRangesOnly {
-						// With RangesOnly, the iterator must be empty.
-						require.False(t, ok)
-						hasPoint, hasRange := iter.HasPointAndRange()
-						require.False(t, hasPoint)
-						require.False(t, hasRange)
-						return
-					}
-
-					require.True(t, ok)
-					require.Equal(t, pointKey("a", 1), iter.UnsafeKey())
-					v, err := iter.UnsafeValue()
-					require.NoError(t, err)
-					require.Equal(t, stringValueRaw("a1"), v)
-
-					hasPoint, hasRange := iter.HasPointAndRange()
-					require.True(t, hasPoint)
-					require.False(t, hasRange)
-					require.Empty(t, iter.RangeBounds())
-					require.Empty(t, iter.RangeKeys())
-
-					// Exhaust the iterator.
-					iter.Next()
-					ok, err = iter.Valid()
-					require.NoError(t, err)
-					require.False(t, ok)
-				})
-
-				t.Run("EngineIterator", func(t *testing.T) {
-					iter := r.NewEngineIterator(IterOptions{
-						KeyTypes:             keyType,
-						UpperBound:           keys.MaxKey,
-						RangeKeyMaskingBelow: hlc.Timestamp{WallTime: 1}, // should get disabled when unsupported
-					})
-					defer iter.Close()
-
-					ok, err := iter.SeekEngineKeyGE(engineKey("a", 0))
-					require.NoError(t, err)
-
-					if keyType == IterKeyTypeRangesOnly {
-						// With RangesOnly, the iterator must be empty.
-						require.False(t, ok)
-						hasPoint, hasRange := iter.HasPointAndRange()
-						require.False(t, hasPoint)
-						require.False(t, hasRange)
-						return
-					}
-
-					require.True(t, ok)
-					key, err := iter.UnsafeEngineKey()
-					require.NoError(t, err)
-					require.Equal(t, engineKey("a", 1), key)
-					v, err := iter.UnsafeValue()
-					require.NoError(t, err)
-					require.Equal(t, stringValueRaw("a1"), v)
-
-					hasPoint, hasRange := iter.HasPointAndRange()
-					require.True(t, hasPoint)
-					require.False(t, hasRange)
-					rangeBounds, err := iter.EngineRangeBounds()
-					require.NoError(t, err)
-					require.Empty(t, rangeBounds)
-					require.Empty(t, iter.EngineRangeKeys())
-
-					// Exhaust the iterator.
-					ok, err = iter.NextEngineKey()
-					require.NoError(t, err)
-					require.False(t, ok)
-				})
-			})
-		}
-	}
 }
 
 // TODO(erikgrinaker): The below test helpers should be moved to

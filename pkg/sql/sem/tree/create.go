@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/collatedstring"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
@@ -381,13 +382,14 @@ func (node *CreateType) Format(ctx *FmtCtx) {
 		ctx.WriteString(")")
 	case Composite:
 		ctx.WriteString("AS (")
-		for i, elem := range node.CompositeTypeList {
+		for i := range node.CompositeTypeList {
+			elem := &node.CompositeTypeList[i]
 			if i != 0 {
 				ctx.WriteString(", ")
 			}
 			ctx.FormatNode(&elem.Label)
 			ctx.WriteString(" ")
-			ctx.WriteString(elem.Type.SQLString())
+			ctx.FormatTypeReference(elem.Type)
 		}
 		ctx.WriteString(")")
 	}
@@ -569,7 +571,7 @@ func NewColumnTableDef(
 			// In CRDB, collated strings are treated separately to string family types.
 			// To most behave like postgres, set the CollatedString type if a non-"default"
 			// collation is used.
-			if locale != DefaultCollationTag {
+			if locale != collatedstring.DefaultCollationTag {
 				_, err := language.Parse(locale)
 				if err != nil {
 					return nil, pgerror.Wrapf(err, pgcode.Syntax, "invalid locale %s", locale)
@@ -745,7 +747,7 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	// TABLE ... AS query.
 	if node.Type != nil {
 		ctx.WriteByte(' ')
-		ctx.WriteString(node.columnTypeString())
+		node.formatColumnType(ctx)
 	}
 
 	if node.Nullable.Nullability != SilentNull && node.Nullable.ConstraintName != "" {
@@ -878,7 +880,15 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	}
 }
 
-func (node *ColumnTableDef) columnTypeString() string {
+func (node *ColumnTableDef) formatColumnType(ctx *FmtCtx) {
+	if replaced, ok := node.replacedSerialTypeName(); ok {
+		ctx.WriteString(replaced)
+	} else {
+		ctx.FormatTypeReference(node.Type)
+	}
+}
+
+func (node *ColumnTableDef) replacedSerialTypeName() (string, bool) {
 	if node.IsSerial {
 		// Map INT types to SERIAL keyword.
 		// TODO (rohany): This should be pushed until type resolution occurs.
@@ -886,13 +896,14 @@ func (node *ColumnTableDef) columnTypeString() string {
 		//  so we handle those cases here.
 		switch MustBeStaticallyKnownType(node.Type).Width() {
 		case 16:
-			return "SERIAL2"
+			return "SERIAL2", true
 		case 32:
-			return "SERIAL4"
+			return "SERIAL4", true
+		default:
+			return "SERIAL8", true
 		}
-		return "SERIAL8"
 	}
-	return node.Type.SQLString()
+	return "", false
 }
 
 // String implements the fmt.Stringer interface.
@@ -1362,7 +1373,7 @@ func (node *PartitionBy) formatListOrRange(ctx *FmtCtx) {
 
 // ListPartition represents a PARTITION definition within a PARTITION BY LIST.
 type ListPartition struct {
-	Name         UnrestrictedName
+	Name         Name
 	Exprs        Exprs
 	Subpartition *PartitionBy
 }
@@ -1381,7 +1392,7 @@ func (node *ListPartition) Format(ctx *FmtCtx) {
 
 // RangePartition represents a PARTITION definition within a PARTITION BY RANGE.
 type RangePartition struct {
-	Name         UnrestrictedName
+	Name         Name
 	From         Exprs
 	To           Exprs
 	Subpartition *PartitionBy
@@ -2138,23 +2149,27 @@ func (node *CreateExternalConnection) Format(ctx *FmtCtx) {
 
 // CreateTenant represents a CREATE TENANT statement.
 type CreateTenant struct {
-	Name Name
+	TenantSpec *TenantSpec
 }
 
 // Format implements the NodeFormatter interface.
 func (node *CreateTenant) Format(ctx *FmtCtx) {
 	ctx.WriteString("CREATE TENANT ")
-	ctx.FormatNode(&node.Name)
+	ctx.FormatNode(node.TenantSpec)
 }
 
 // CreateTenantFromReplication represents a CREATE TENANT...FROM REPLICATION
 // statement.
 type CreateTenantFromReplication struct {
-	Name Name
+	TenantSpec *TenantSpec
 
-	// ReplicationSourceTenantName is the name of the tenant that we are
-	// replicating into the newly created tenant.
-	ReplicationSourceTenantName Name
+	// ReplicationSourceTenantName is the name of the tenant that
+	// we are replicating into the newly created tenant.
+	// Note: even though this field can only be a name
+	// (this is guaranteed during parsing), we still want
+	// to use the TenantSpec type. This supports the auto-promotion
+	// of simple identifiers to strings.
+	ReplicationSourceTenantName *TenantSpec
 	// ReplicationSourceAddress is the address of the source cluster that we are
 	// replicating data from.
 	ReplicationSourceAddress Expr
@@ -2174,11 +2189,11 @@ func (node *CreateTenantFromReplication) Format(ctx *FmtCtx) {
 	ctx.WriteString("CREATE TENANT ")
 	// NB: we do not anonymize the tenant name because we assume that tenant names
 	// do not contain sensitive information.
-	ctx.FormatNode(&node.Name)
+	ctx.FormatNode(node.TenantSpec)
 
 	if node.ReplicationSourceAddress != nil {
 		ctx.WriteString(" FROM REPLICATION OF ")
-		ctx.FormatNode(&node.ReplicationSourceTenantName)
+		ctx.FormatNode(node.ReplicationSourceTenantName)
 		ctx.WriteString(" ON ")
 		ctx.FormatNode(node.ReplicationSourceAddress)
 	}
@@ -2224,10 +2239,10 @@ func (node *SuperRegion) Format(ctx *FmtCtx) {
 	ctx.WriteString(" SUPER REGION ")
 	ctx.FormatNode(&node.Name)
 	ctx.WriteString(" VALUES ")
-	for i, region := range node.Regions {
+	for i := range node.Regions {
 		if i != 0 {
 			ctx.WriteString(",")
 		}
-		ctx.FormatNode(&region)
+		ctx.FormatNode(&node.Regions[i])
 	}
 }

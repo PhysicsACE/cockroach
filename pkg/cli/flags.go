@@ -59,6 +59,7 @@ var serverHTTPAdvertiseAddr, serverHTTPAdvertisePort string
 var localityAdvertiseHosts localityList
 var startBackground bool
 var storeSpecs base.StoreSpecList
+var goMemLimit int64
 
 // initPreFlagsDefaults initializes the values of the global variables
 // defined above.
@@ -87,6 +88,8 @@ func initPreFlagsDefaults() {
 	startBackground = false
 
 	storeSpecs = base.StoreSpecList{}
+
+	goMemLimit = 0
 }
 
 // AddPersistentPreRunE add 'fn' as a persistent pre-run function to 'cmd'.
@@ -476,7 +479,9 @@ func init() {
 
 			cliflagcfg.VarFlag(f, &storeSpecs, cliflags.Store)
 			cliflagcfg.VarFlag(f, &serverCfg.StorageEngine, cliflags.StorageEngine)
+			cliflagcfg.StringFlag(f, &serverCfg.SharedStorage, cliflags.SharedStorage)
 			cliflagcfg.VarFlag(f, &serverCfg.MaxOffset, cliflags.MaxOffset)
+			cliflagcfg.BoolFlag(f, &serverCfg.DisableMaxOffsetCheck, cliflags.DisableMaxOffsetCheck)
 			cliflagcfg.StringFlag(f, &serverCfg.ClockDevicePath, cliflags.ClockDevice)
 
 			cliflagcfg.StringFlag(f, &startCtx.listeningURLFile, cliflags.ListeningURLFile)
@@ -511,10 +516,11 @@ func init() {
 			// Engine flags.
 			cliflagcfg.VarFlag(f, &startCtx.cacheSizeValue, cliflags.Cache)
 			cliflagcfg.VarFlag(f, &startCtx.sqlSizeValue, cliflags.SQLMem)
+			cliflagcfg.VarFlag(f, &startCtx.goMemLimitValue, cliflags.GoMemLimit)
 			cliflagcfg.VarFlag(f, &startCtx.tsdbSizeValue, cliflags.TSDBMem)
-			// N.B. diskTempStorageSizeValue.ResolvePercentage() will be called after
-			// the stores flag has been parsed and the storage device that a percentage
-			// refers to becomes known.
+			// N.B. diskTempStorageSizeValue.Resolve() will be called after the
+			// stores flag has been parsed and the storage device that a
+			// percentage refers to becomes known.
 			cliflagcfg.VarFlag(f, &startCtx.diskTempStorageSizeValue, cliflags.SQLTempStorage)
 			cliflagcfg.StringFlag(f, &startCtx.tempDir, cliflags.TempDir)
 			cliflagcfg.StringFlag(f, &startCtx.externalIODir, cliflags.ExternalIODir)
@@ -541,6 +547,10 @@ func init() {
 	telemetryEnabledCmds := append(serverCmds, demoCmd, statementBundleRecreateCmd)
 	telemetryEnabledCmds = append(telemetryEnabledCmds, demoCmd.Commands()...)
 	for _, cmd := range telemetryEnabledCmds {
+		f := cmd.Flags()
+		cliflagcfg.StringFlag(f, &serverCfg.ObsServiceAddr, cliflags.ObsServiceAddr)
+		_ = f.MarkHidden(cliflags.ObsServiceAddr.Name)
+
 		// Report flag usage for server commands in telemetry. We do this
 		// only for server commands, as there is no point in accumulating
 		// telemetry if there's no telemetry reporting loop being started.
@@ -574,7 +584,6 @@ func init() {
 		cliflagcfg.StringFlag(f, &certCtx.caKey, cliflags.CAKey)
 		cliflagcfg.IntFlag(f, &certCtx.keySize, cliflags.KeySize)
 		cliflagcfg.BoolFlag(f, &certCtx.overwriteFiles, cliflags.OverwriteFiles)
-		cliflagcfg.VarFlag(f, &tenantIDSetter{tenantIDs: &certCtx.tenantScope}, cliflags.TenantScope)
 
 		if strings.HasSuffix(cmd.Name(), "-ca") {
 			// CA-only commands.
@@ -590,6 +599,8 @@ func init() {
 		}
 
 		if cmd == createClientCertCmd {
+			cliflagcfg.VarFlag(f, &tenantIDSetter{tenantIDs: &certCtx.tenantScope}, cliflags.TenantScope)
+
 			// PKCS8 key format is only available for the client cert command.
 			cliflagcfg.BoolFlag(f, &certCtx.generatePKCS8Key, cliflags.GeneratePKCS8Key)
 			cliflagcfg.BoolFlag(f, &certCtx.disableUsernameValidation, cliflags.DisableUsernameValidation)
@@ -618,6 +629,7 @@ func init() {
 	clientCmds = append(clientCmds, userFileCmds...)
 	clientCmds = append(clientCmds, stmtDiagCmds...)
 	clientCmds = append(clientCmds, debugResetQuorumCmd)
+	clientCmds = append(clientCmds, recoverCommands...)
 	for _, cmd := range clientCmds {
 		clientflags.AddBaseFlags(cmd, &cliCtx.clientOpts, &baseCfg.Insecure, &baseCfg.SSLCertsDir)
 
@@ -691,6 +703,10 @@ func init() {
 
 	// Decommission command.
 	cliflagcfg.VarFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionWait, cliflags.Wait)
+
+	// Decommission pre-check flags.
+	cliflagcfg.VarFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionChecks, cliflags.NodeDecommissionChecks)
+	cliflagcfg.BoolFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionDryRun, cliflags.NodeDecommissionDryRun)
 
 	// Decommission and recommission share --self.
 	for _, cmd := range []*cobra.Command{decommissionNodeCmd, recommissionNodeCmd} {

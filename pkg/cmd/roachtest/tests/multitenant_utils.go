@@ -26,8 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -99,24 +99,8 @@ func createTenantNode(
 		node:       node,
 		sqlPort:    sqlPort,
 	}
-	if tn.cockroachBinSupportsTenantScope(ctx, c) {
-		err := tn.recreateClientCertsWithTenantScope(ctx, c, createOptions.otherTenantIDs)
-		require.NoError(t, err)
-	}
 	tn.createTenantCert(ctx, t, c, createOptions.certNodes)
 	return tn
-}
-
-// cockroachBinSupportsTenantScope is a hack to figure out if the version of
-// cockroach on the node supports tenant scoped certificates. We can't use a
-// version comparison here because we need to compare alpha build versions which
-// are compared lexicographically. This is a problem because our alpha versions
-// contain an integer count of commits, which does not sort correctly.  Once
-// this feature ships in a release, it will be easier to do a version comparison
-// on whether this command line flag is supported.
-func (tn *tenantNode) cockroachBinSupportsTenantScope(ctx context.Context, c cluster.Cluster) bool {
-	err := c.RunE(ctx, c.Node(tn.node), "./cockroach cert create-client --help | grep '\\--tenant-scope'")
-	return err == nil
 }
 
 func (tn *tenantNode) createTenantCert(
@@ -142,23 +126,6 @@ func (tn *tenantNode) createTenantCert(
 		"./cockroach cert create-tenant-client --certs-dir=certs --ca-key=certs/ca.key %d %s --overwrite",
 		tn.tenantID, strings.Join(names, " "))
 	c.Run(ctx, c.Node(tn.node), cmd)
-}
-
-func (tn *tenantNode) recreateClientCertsWithTenantScope(
-	ctx context.Context, c cluster.Cluster, otherIDs []int,
-) error {
-	tenantArgs := fmt.Sprintf("1,%d", tn.tenantID)
-	for _, id := range otherIDs {
-		tenantArgs = fmt.Sprintf("%s,%d", tenantArgs, id)
-	}
-
-	for _, user := range []username.SQLUsername{username.RootUserName(), username.TestUserName()} {
-		cmd := fmt.Sprintf(
-			"./cockroach cert create-client %s --certs-dir=certs --ca-key=certs/ca.key --tenant-scope %s --overwrite",
-			user.Normalized(), tenantArgs)
-		c.Run(ctx, c.Node(tn.node), cmd)
-	}
-	return c.RefetchCertsFromNode(ctx, tn.node)
 }
 
 func (tn *tenantNode) stop(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -204,7 +171,7 @@ func (tn *tenantNode) start(ctx context.Context, t test.Test, c cluster.Cluster,
 		extraArgs...,
 	)
 
-	externalUrls, err := c.ExternalPGUrl(ctx, t.L(), c.Node(tn.node))
+	externalUrls, err := c.ExternalPGUrl(ctx, t.L(), c.Node(tn.node), "")
 	require.NoError(t, err)
 	u, err := url.Parse(externalUrls[0])
 	require.NoError(t, err)
@@ -217,7 +184,9 @@ func (tn *tenantNode) start(ctx context.Context, t test.Test, c cluster.Cluster,
 	// pgURL has full paths to local certs embedded, i.e.
 	// /tmp/roachtest-certs3630333874/certs, on the cluster we want just certs
 	// (i.e. to run workload on the tenant).
-	secureUrls, err := roachprod.PgURL(ctx, t.L(), c.MakeNodes(c.Node(tn.node)), "certs", false /*external*/, true /* secure */)
+	secureUrls, err := roachprod.PgURL(ctx, t.L(), c.MakeNodes(c.Node(tn.node)), "certs", roachprod.PGURLOptions{
+		External: false,
+		Secure:   true})
 	require.NoError(t, err)
 	u, err = url.Parse(strings.Trim(secureUrls[0], "'"))
 	require.NoError(t, err)
@@ -318,4 +287,68 @@ func newTenantInstance(
 	}
 	c.Run(ctx, c.Node(node), "chmod", "0600", filepath.Join("certs", key))
 	return &inst, nil
+}
+
+// createTenantAdminRole creates a role that can be used to log into a secure cluster's db console.
+func createTenantAdminRole(t test.Test, tenantName string, tenantSQL *sqlutils.SQLRunner) {
+	username := "secure"
+	password := "roach"
+	tenantSQL.Exec(t, fmt.Sprintf(`CREATE ROLE %s WITH LOGIN PASSWORD '%s'`, username, password))
+	tenantSQL.Exec(t, fmt.Sprintf(`GRANT ADMIN TO %s`, username))
+	t.L().Printf(`Log into %s db console with username "%s" and password "%s"`,
+		tenantName, username, password)
+}
+
+// createInMemoryTenant runs through the necessary steps to create an in-memory tenant without
+// resource limits.
+func createInMemoryTenant(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	tenantName string,
+	nodes option.NodeListOption,
+	secure bool,
+) {
+	sysSQL := sqlutils.MakeSQLRunner(c.Conn(ctx, t.L(), nodes.RandNode()[0]))
+	sysSQL.Exec(t, "CREATE TENANT $1", tenantName)
+	sysSQL.Exec(t, "ALTER TENANT $1 START SERVICE SHARED", tenantName)
+
+	removeTenantRateLimiters(t, sysSQL, tenantName)
+
+	// Opening a SQL session to a newly created in-process tenant may require a
+	// few retries. Unfortunately, the c.ConnE and MakeSQLRunner APIs do not make
+	// it clear if they eagerly open a session with the tenant or wait until the
+	// first query. Therefore, wrap connection opening and a ping to the tenant
+	// server in a retry loop.
+	var tenantSQL *sqlutils.SQLRunner
+	testutils.SucceedsSoon(t, func() error {
+		tenantConn, err := c.ConnE(ctx, t.L(), nodes.RandNode()[0], option.TenantName(tenantName))
+		if err != nil {
+			return err
+		}
+		if err := tenantConn.Ping(); err != nil {
+			return err
+		}
+		tenantSQL = sqlutils.MakeSQLRunner(tenantConn)
+		return nil
+	})
+
+	if secure {
+		createTenantAdminRole(t, tenantName, tenantSQL)
+	}
+}
+
+// removeTenantRateLimiters ensures the tenant is not throttled by limiters.
+func removeTenantRateLimiters(t test.Test, systemSQL *sqlutils.SQLRunner, tenantName string) {
+	var tenantID int
+	systemSQL.QueryRow(t, `SELECT id FROM [SHOW TENANT $1]`, tenantName).Scan(&tenantID)
+	systemSQL.Exec(t, `SELECT crdb_internal.update_tenant_resource_limits($1, 10000000000, 0,
+10000000000, now(), 0);`, tenantID)
+	systemSQL.ExecMultiple(t,
+		`SET CLUSTER SETTING kv.tenant_rate_limiter.burst_limit_seconds = 10000;`,
+		`SET CLUSTER SETTING kv.tenant_rate_limiter.rate_limit = -1000; `,
+		`SET CLUSTER SETTING kv.tenant_rate_limiter.read_batch_cost = 0;`,
+		`SET CLUSTER SETTING kv.tenant_rate_limiter.read_cost_per_mebibyte = 0;`,
+		`SET CLUSTER SETTING kv.tenant_rate_limiter.write_cost_per_megabyte = 0;`,
+		`SET CLUSTER SETTING kv.tenant_rate_limiter.write_request_cost = 0;`)
 }

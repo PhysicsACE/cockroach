@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -194,6 +195,73 @@ func TestMemoryPoolFlagValues(t *testing.T) {
 	}
 }
 
+func TestGetDefaultGoMemLimitValue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	maxMem, err := status.GetTotalMemory(context.Background())
+	if err != nil {
+		t.Logf("total memory unknown: %v", err)
+		return
+	}
+	if maxMem < 1<<30 /* 1GiB */ {
+		// The test assumes that it is running on a machine with at least 1GiB
+		// of RAM.
+		skip.IgnoreLint(t)
+	}
+
+	// highCachePercentage is such that --cache would be set too high resulting
+	// in the upper bound on the goMemLimit becoming negative, so we'd use the
+	// lower bound.
+	highCachePercentage := defaultGoMemLimitMaxTotalSystemMemUsage/defaultGoMemLimitCacheSlopMultiple + 0.02
+
+	for i, tc := range []struct {
+		maxSQLMemory string
+		cache        string
+		expected     int64
+	}{
+		{
+			maxSQLMemory: "100MiB",
+			cache:        "100MiB",
+			// The default calculation says 225MiB which is smaller than the
+			// lower bound, so we use the latter.
+			expected: defaultGoMemLimitMinValue,
+		},
+		{
+			maxSQLMemory: "200MiB",
+			cache:        "100MiB",
+			// The default 2.25x of --max-sql-memory.
+			expected: defaultGoMemLimitSQLMultiple * 200 << 20, /* 450MiB */
+		},
+		{
+			maxSQLMemory: "200MiB",
+			cache:        fmt.Sprintf("%.2f", highCachePercentage),
+			expected:     defaultGoMemLimitMinValue,
+		},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			// Avoid leaking configuration changes after the test ends.
+			defer initCLIDefaults()
+
+			f := startCmd.Flags()
+
+			args := []string{
+				"--max-sql-memory", tc.maxSQLMemory,
+				"--cache", tc.cache,
+			}
+			if err := f.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+			limit := getDefaultGoMemLimit(context.Background())
+			// Allow for some imprecision since we're dealing with float
+			// arithmetic but the result is converted to integer.
+			if diff := tc.expected - limit; diff > 1 || diff < -1 {
+				t.Errorf("expected %d, but got %d", tc.expected, limit)
+			}
+		})
+	}
+}
+
 func TestClockOffsetFlagValue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -202,23 +270,25 @@ func TestClockOffsetFlagValue(t *testing.T) {
 	defer initCLIDefaults()
 
 	f := startCmd.Flags()
-	testData := []struct {
-		args     []string
-		expected time.Duration
+	testCases := []struct {
+		args            []string
+		expectMax       time.Duration
+		expectTolerated time.Duration
 	}{
-		{nil, base.DefaultMaxClockOffset},
-		{[]string{"--max-offset", "200ms"}, 200 * time.Millisecond},
+		{nil, 500 * time.Millisecond, 400 * time.Millisecond},
+		{[]string{"--max-offset", "100ms"}, 100 * time.Millisecond, 80 * time.Millisecond},
+		{[]string{"--disable-max-offset-check"}, base.DefaultMaxClockOffset, 0},
+		{[]string{"--max-offset", "100ms", "--disable-max-offset-check"}, 100 * time.Millisecond, 0},
 	}
 
-	for i, td := range testData {
-		initCLIDefaults()
+	for _, tc := range testCases {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			initCLIDefaults()
 
-		if err := f.Parse(td.args); err != nil {
-			t.Fatal(err)
-		}
-		if td.expected != time.Duration(serverCfg.MaxOffset) {
-			t.Errorf("%d. MaxOffset expected %v, but got %v", i, td.expected, serverCfg.MaxOffset)
-		}
+			require.NoError(t, f.Parse(tc.args))
+			require.Equal(t, tc.expectMax, time.Duration(serverCfg.MaxOffset))
+			require.Equal(t, tc.expectTolerated, serverCfg.ToleratedOffset())
+		})
 	}
 }
 

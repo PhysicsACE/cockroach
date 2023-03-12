@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs/schedulebase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -80,10 +79,12 @@ type scheduledBackupSpec struct {
 	// We need to evaluate anything in the tree.Backup node that allows
 	// placeholders to be specified so that we store evaluated
 	// backup statement in the schedule.
-	destinations         []string
-	encryptionPassphrase *string
-	kmsURIs              []string
-	incrementalStorage   []string
+	destinations               []string
+	encryptionPassphrase       *string
+	captureRevisionHistory     *bool
+	kmsURIs                    []string
+	incrementalStorage         []string
+	includeAllSecondaryTenants *bool
 }
 
 func makeScheduleDetails(opts map[string]string) (jobspb.ScheduleDetails, error) {
@@ -166,13 +167,13 @@ func doCreateBackupSchedules(
 
 		if exists {
 			p.BufferClientNotice(ctx,
-				pgnotice.Newf("schedule %q already exists, skipping", eval.scheduleLabel),
+				pgnotice.Newf("schedule %q already exists, skipping", *eval.scheduleLabel),
 			)
 			return nil
 		}
 	}
 
-	env := sql.JobSchedulerEnv(p.ExecCfg())
+	env := sql.JobSchedulerEnv(p.ExecCfg().JobsKnobs())
 
 	// Evaluate incremental and full recurrence.
 	incRecurrence, err := schedulebase.ComputeScheduleRecurrence(env.Now(), eval.recurrence)
@@ -208,11 +209,14 @@ func doCreateBackupSchedules(
 	// Prepare backup statement (full).
 	backupNode := &tree.Backup{
 		Options: tree.BackupOptions{
-			CaptureRevisionHistory: eval.BackupOptions.CaptureRevisionHistory,
-			Detached:               tree.DBoolTrue,
+			Detached: tree.DBoolTrue,
 		},
 		Nested:         true,
 		AppendToLatest: false,
+	}
+
+	if eval.captureRevisionHistory != nil {
+		backupNode.Options.CaptureRevisionHistory = tree.MakeDBool(tree.DBool(*eval.captureRevisionHistory))
 	}
 
 	// Evaluate encryption passphrase if set.
@@ -220,6 +224,14 @@ func doCreateBackupSchedules(
 		backupNode.Options.EncryptionPassphrase = tree.NewStrVal(
 			*eval.encryptionPassphrase,
 		)
+	}
+
+	if eval.includeAllSecondaryTenants != nil {
+		if *eval.includeAllSecondaryTenants {
+			backupNode.Options.IncludeAllSecondaryTenants = tree.DBoolTrue
+		} else {
+			backupNode.Options.IncludeAllSecondaryTenants = tree.DBoolFalse
+		}
 	}
 
 	// Evaluate encryption KMS URIs if set.
@@ -285,15 +297,30 @@ func doCreateBackupSchedules(
 		return err
 	}
 
-	ex := p.ExecCfg().InternalExecutor
-
 	unpauseOnSuccessID := jobs.InvalidScheduleID
 
 	var chainProtectedTimestampRecords bool
-	// If needed, create incremental.
+	// If needed, create an incremental schedule.
 	var inc *jobs.ScheduledJob
+	scheduledJobs := jobs.ScheduledJobTxn(p.InternalSQLTxn())
 	var incScheduledBackupArgs *backuppb.ScheduledBackupExecutionArgs
 	if incRecurrence != nil {
+		incrementalScheduleDetails := details
+		// An incremental backup schedule must always wait if there is a running job
+		// that was previously scheduled by this incremental schedule. This is
+		// because until the previous incremental backup job completes, all future
+		// incremental jobs will attempt to backup data from the same `StartTime`
+		// corresponding to the `EndTime` of the last incremental layer. In this
+		// case only the first incremental job to complete will succeed, while the
+		// remaining jobs will either be rejected or worse corrupt the chain of
+		// backups. We can accept both `wait` and `skip` as valid
+		// `on_previous_running` options for an incremental schedule.
+		//
+		// NB: Ideally we'd have a way to configure options for both the full and
+		// incremental schedule separately, in which case we could reject the
+		// `on_previous_running = start` configuration for incremental schedules.
+		// Until then this interception will have to do.
+		incrementalScheduleDetails.Wait = jobspb.ScheduleDetails_WAIT
 		chainProtectedTimestampRecords = scheduledBackupGCProtectionEnabled.Get(&p.ExecCfg().Settings.SV)
 		backupNode.AppendToLatest = true
 
@@ -305,7 +332,7 @@ func doCreateBackupSchedules(
 			}
 		}
 		inc, incScheduledBackupArgs, err = makeBackupSchedule(
-			env, p.User(), scheduleLabel, incRecurrence, details, unpauseOnSuccessID,
+			env, p.User(), scheduleLabel, incRecurrence, incrementalScheduleDetails, unpauseOnSuccessID,
 			updateMetricOnSuccess, backupNode, chainProtectedTimestampRecords)
 		if err != nil {
 			return err
@@ -314,7 +341,7 @@ func doCreateBackupSchedules(
 		inc.Pause()
 		inc.SetScheduleStatus("Waiting for initial backup to complete")
 
-		if err := inc.Create(ctx, ex, p.Txn()); err != nil {
+		if err := scheduledJobs.Create(ctx, inc); err != nil {
 			return err
 		}
 		if err := emitSchedule(inc, backupNode, destinations, nil, /* incrementalFrom */
@@ -347,20 +374,22 @@ func doCreateBackupSchedules(
 	}
 
 	// Create the schedule (we need its ID to link dependent schedules below).
-	if err := full.Create(ctx, ex, p.Txn()); err != nil {
+	if err := scheduledJobs.Create(ctx, full); err != nil {
 		return err
 	}
 
 	// If schedule creation has resulted in a full and incremental schedule then
 	// we update both the schedules with the ID of the other "dependent" schedule.
 	if incRecurrence != nil {
-		if err := setDependentSchedule(ctx, ex, fullScheduledBackupArgs, full, inc.ScheduleID(),
-			p.Txn()); err != nil {
+		if err := setDependentSchedule(
+			ctx, scheduledJobs, fullScheduledBackupArgs, full, inc.ScheduleID(),
+		); err != nil {
 			return errors.Wrap(err,
 				"failed to update full schedule with dependent incremental schedule id")
 		}
-		if err := setDependentSchedule(ctx, ex, incScheduledBackupArgs, inc, full.ScheduleID(),
-			p.Txn()); err != nil {
+		if err := setDependentSchedule(
+			ctx, scheduledJobs, incScheduledBackupArgs, inc, full.ScheduleID(),
+		); err != nil {
 			return errors.Wrap(err,
 				"failed to update incremental schedule with dependent full schedule id")
 		}
@@ -373,11 +402,10 @@ func doCreateBackupSchedules(
 
 func setDependentSchedule(
 	ctx context.Context,
-	ex *sql.InternalExecutor,
+	storage jobs.ScheduledJobStorage,
 	scheduleExecutionArgs *backuppb.ScheduledBackupExecutionArgs,
 	schedule *jobs.ScheduledJob,
 	dependentID int64,
-	txn *kv.Txn,
 ) error {
 	scheduleExecutionArgs.DependentScheduleID = dependentID
 	any, err := pbtypes.MarshalAny(scheduleExecutionArgs)
@@ -387,7 +415,7 @@ func setDependentSchedule(
 	schedule.SetExecutionDetails(
 		schedule.ExecutorType(), jobspb.ExecutionArguments{Args: any},
 	)
-	return schedule.Update(ctx, ex, txn)
+	return storage.Update(ctx, schedule)
 }
 
 // checkForExistingBackupsInCollection checks that there are no existing backups
@@ -536,7 +564,7 @@ func dryRunInvokeBackup(
 	if err != nil {
 		return eventpb.RecoveryEvent{}, err
 	}
-	return invokeBackup(ctx, backupFn, p.ExecCfg().JobRegistry, p.Txn())
+	return invokeBackup(ctx, backupFn, p.ExecCfg().JobRegistry, p.InternalSQLTxn())
 }
 
 // makeScheduleBackupSpec prepares helper scheduledBackupSpec struct to assist in evaluation
@@ -651,6 +679,24 @@ func makeScheduledBackupSpec(
 			return nil, err
 		}
 	}
+	if schedule.BackupOptions.CaptureRevisionHistory != nil {
+		capture, err := exprEval.Bool(
+			ctx, schedule.BackupOptions.CaptureRevisionHistory,
+		)
+		if err != nil {
+			return nil, err
+		}
+		spec.captureRevisionHistory = &capture
+	}
+	if schedule.BackupOptions.IncludeAllSecondaryTenants != nil {
+		includeSecondary, err := exprEval.Bool(ctx,
+			schedule.BackupOptions.IncludeAllSecondaryTenants)
+		if err != nil {
+			return nil, err
+		}
+		spec.includeAllSecondaryTenants = &includeSecondary
+	}
+
 	return spec, nil
 }
 
@@ -728,8 +774,12 @@ func createBackupScheduleTypeCheck(
 		tree.Exprs(schedule.BackupOptions.EncryptionKMSURI),
 		tree.Exprs(schedule.BackupOptions.IncrementalStorage),
 	}
+	bools := exprutil.Bools{
+		schedule.BackupOptions.CaptureRevisionHistory,
+		schedule.BackupOptions.IncludeAllSecondaryTenants,
+	}
 	if err := exprutil.TypeCheck(
-		ctx, scheduleBackupOp, p.SemaCtx(), stringExprs, stringArrays, opts,
+		ctx, scheduleBackupOp, p.SemaCtx(), stringExprs, bools, stringArrays, opts,
 	); err != nil {
 		return false, nil, err
 	}

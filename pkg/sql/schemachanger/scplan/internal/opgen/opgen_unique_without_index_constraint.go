@@ -11,6 +11,8 @@
 package opgen
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 )
@@ -20,12 +22,17 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_WRITE_ONLY,
-				emit(func(this *scpb.UniqueWithoutIndexConstraint) *scop.MakeAbsentUniqueWithoutIndexConstraintWriteOnly {
-					return &scop.MakeAbsentUniqueWithoutIndexConstraintWriteOnly{
+				emit(func(this *scpb.UniqueWithoutIndexConstraint) *scop.AddUniqueWithoutIndexConstraint {
+					var partialExpr catpb.Expression
+					if this.Predicate != nil {
+						partialExpr = this.Predicate.Expr
+					}
+					return &scop.AddUniqueWithoutIndexConstraint{
 						TableID:      this.TableID,
 						ConstraintID: this.ConstraintID,
 						ColumnIDs:    this.ColumnIDs,
-						Predicate:    this.Predicate,
+						PartialExpr:  partialExpr,
+						Validity:     descpb.ConstraintValidity_Validating,
 					}
 				}),
 				emit(func(this *scpb.UniqueWithoutIndexConstraint) *scop.UpdateTableBackReferencesInTypes {
@@ -34,15 +41,6 @@ func init() {
 					}
 					return &scop.UpdateTableBackReferencesInTypes{
 						TypeIDs:               this.Predicate.UsesTypeIDs,
-						BackReferencedTableID: this.TableID,
-					}
-				}),
-				emit(func(this *scpb.UniqueWithoutIndexConstraint) *scop.UpdateBackReferencesInSequences {
-					if this.Predicate == nil || this.Predicate.UsesSequenceIDs == nil || len(this.Predicate.UsesSequenceIDs) == 0 {
-						return nil
-					}
-					return &scop.UpdateBackReferencesInSequences{
-						SequenceIDs:           this.Predicate.UsesSequenceIDs,
 						BackReferencedTableID: this.TableID,
 					}
 				}),
@@ -83,6 +81,15 @@ func init() {
 					return &scop.RemoveUniqueWithoutIndexConstraint{
 						TableID:      this.TableID,
 						ConstraintID: this.ConstraintID,
+					}
+				}),
+				emit(func(this *scpb.UniqueWithoutIndexConstraint) *scop.UpdateTableBackReferencesInTypes {
+					if this.Predicate == nil || this.Predicate.UsesTypeIDs == nil || len(this.Predicate.UsesTypeIDs) == 0 {
+						return nil
+					}
+					return &scop.UpdateTableBackReferencesInTypes{
+						TypeIDs:               this.Predicate.UsesTypeIDs,
+						BackReferencedTableID: this.TableID,
 					}
 				}),
 			),

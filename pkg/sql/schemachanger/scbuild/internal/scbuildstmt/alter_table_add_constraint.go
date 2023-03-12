@@ -26,9 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
@@ -39,19 +41,26 @@ func alterTableAddConstraint(
 ) {
 	switch d := t.ConstraintDef.(type) {
 	case *tree.UniqueConstraintTableDef:
-		if d.PrimaryKey && t.ValidationBehavior == tree.ValidationDefault {
+		if d.PrimaryKey {
 			alterTableAddPrimaryKey(b, tn, tbl, t)
-		} else if d.WithoutIndex && t.ValidationBehavior == tree.ValidationDefault {
+		} else if d.WithoutIndex {
 			alterTableAddUniqueWithoutIndex(b, tn, tbl, t)
+		} else {
+			if t.ValidationBehavior == tree.ValidationSkip {
+				panic(sqlerrors.NewUnsupportedUnvalidatedConstraintError(catconstants.ConstraintTypeUnique))
+			}
+			CreateIndex(b, &tree.CreateIndex{
+				Name:      d.Name,
+				Table:     *tn,
+				Unique:    true,
+				Columns:   d.Columns,
+				Predicate: d.Predicate,
+			})
 		}
 	case *tree.CheckConstraintTableDef:
-		if t.ValidationBehavior == tree.ValidationDefault {
-			alterTableAddCheck(b, tn, tbl, t)
-		}
+		alterTableAddCheck(b, tn, tbl, t)
 	case *tree.ForeignKeyConstraintTableDef:
-		if t.ValidationBehavior == tree.ValidationDefault {
-			alterTableAddForeignKey(b, tn, tbl, t)
-		}
+		alterTableAddForeignKey(b, tn, tbl, t)
 	}
 }
 
@@ -61,8 +70,11 @@ func alterTableAddConstraint(
 func alterTableAddPrimaryKey(
 	b BuildCtx, tn *tree.TableName, tbl *scpb.Table, t *tree.AlterTableAddConstraint,
 ) {
-	d := t.ConstraintDef.(*tree.UniqueConstraintTableDef)
+	if t.ValidationBehavior == tree.ValidationSkip {
+		panic(sqlerrors.NewUnsupportedUnvalidatedConstraintError(catconstants.ConstraintTypePK))
+	}
 
+	d := t.ConstraintDef.(*tree.UniqueConstraintTableDef)
 	// Ensure that there is a default rowid column.
 	oldPrimaryIndex := mustRetrievePrimaryIndexElement(b, tbl.TableID)
 	if getPrimaryIndexDefaultRowIDColumn(
@@ -80,7 +92,7 @@ func alterTableAddPrimaryKey(
 }
 
 // alterTableAddCheck contains logic for building
-// `ALTER TABLE ... ADD CONSTRAINT ... CHECK`.
+// `ALTER TABLE ... ADD CHECK ... [NOT VALID]`.
 // It assumes `t` is such a command.
 func alterTableAddCheck(
 	b BuildCtx, tn *tree.TableName, tbl *scpb.Table, t *tree.AlterTableAddConstraint,
@@ -97,7 +109,7 @@ func alterTableAddCheck(
 	// See the comments of DequalifyAndValidateExprImpl for criteria.
 	ckDef := t.ConstraintDef.(*tree.CheckConstraintTableDef)
 	ckExpr, _, colIDs, err := schemaexpr.DequalifyAndValidateExprImpl(b, ckDef.Expr, types.Bool,
-		"CHECK", b.SemaCtx(), volatility.Volatile, tn,
+		tree.CheckConstraintExpr, b.SemaCtx(), volatility.Volatile, tn, b.ClusterSettings().Version.ActiveVersion(b),
 		func() colinfo.ResultColumns {
 			return getNonDropResultColumns(b, tbl.TableID)
 		},
@@ -113,16 +125,31 @@ func alterTableAddCheck(
 		panic(err)
 	}
 
-	// 3. Add relevant check constraint element: CheckConstraint and ConstraintName.
+	// 3. Add relevant check constraint element:
+	// - CheckConstraint or CheckConstraintUnvalidated
+	// - ConstraintName
 	constraintID := b.NextTableConstraintID(tbl.TableID)
-	b.Add(&scpb.CheckConstraint{
-		TableID:               tbl.TableID,
-		ConstraintID:          constraintID,
-		ColumnIDs:             colIDs.Ordered(),
-		Expression:            *b.WrapExpression(tbl.TableID, typedCkExpr),
-		FromHashShardedColumn: ckDef.FromHashShardedColumn,
-		IndexIDForValidation:  getIndexIDForValidationForConstraint(b, tbl.TableID),
-	})
+	if t.ValidationBehavior == tree.ValidationDefault {
+		ck := &scpb.CheckConstraint{
+			TableID:               tbl.TableID,
+			ConstraintID:          constraintID,
+			ColumnIDs:             colIDs.Ordered(),
+			Expression:            *b.WrapExpression(tbl.TableID, typedCkExpr),
+			FromHashShardedColumn: ckDef.FromHashShardedColumn,
+			IndexIDForValidation:  getIndexIDForValidationForConstraint(b, tbl.TableID),
+		}
+		b.Add(ck)
+		b.LogEventForExistingTarget(ck)
+	} else {
+		ck := &scpb.CheckConstraintUnvalidated{
+			TableID:      tbl.TableID,
+			ConstraintID: constraintID,
+			ColumnIDs:    colIDs.Ordered(),
+			Expression:   *b.WrapExpression(tbl.TableID, typedCkExpr),
+		}
+		b.Add(ck)
+		b.LogEventForExistingTarget(ck)
+	}
 
 	constraintName := string(ckDef.Name)
 	if constraintName == "" {
@@ -160,7 +187,7 @@ func getIndexIDForValidationForConstraint(b BuildCtx, tableID catid.DescID) (ret
 }
 
 // alterTableAddForeignKey contains logic for building
-// `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`.
+// `ALTER TABLE ... ADD FOREIGN KEY ... [NOT VALID]`.
 // It assumes `t` is such a command.
 func alterTableAddForeignKey(
 	b BuildCtx, tn *tree.TableName, tbl *scpb.Table, t *tree.AlterTableAddConstraint,
@@ -192,8 +219,7 @@ func alterTableAddForeignKey(
 	if fkDef.Actions.Delete == tree.SetNull || fkDef.Actions.Update == tree.SetNull {
 		for i, colName := range fkDef.FromCols {
 			colID := mustGetColumnIDFromColumnName(b, tbl.TableID, colName)
-			colIsNullable := mustRetrieveColumnTypeElem(b, tbl.TableID, colID).IsNullable
-			if !colIsNullable {
+			if isColNotNull(b, tbl.TableID, colID) {
 				panic(pgerror.Newf(pgcode.InvalidForeignKey,
 					"cannot add a SET NULL cascading action on column %q which has a NOT NULL constraint", fromColsFRNames[i],
 				))
@@ -209,8 +235,8 @@ func alterTableAddForeignKey(
 		for i, colName := range fkDef.FromCols {
 			colID := mustGetColumnIDFromColumnName(b, tbl.TableID, colName)
 			colHasDefault := retrieveColumnDefaultExpressionElem(b, tbl.TableID, colID) != nil
-			colIsNullable := mustRetrieveColumnTypeElem(b, tbl.TableID, colID).IsNullable
-			if !colHasDefault && !colIsNullable {
+			colIsNotNull := isColNotNull(b, tbl.TableID, colID)
+			if !colHasDefault && colIsNotNull {
 				panic(pgerror.Newf(pgcode.InvalidForeignKey,
 					"cannot add a SET DEFAULT cascading action on column %q which has a "+
 						"NOT NULL constraint and a NULL default expression", fromColsFRNames[i],
@@ -357,17 +383,34 @@ func alterTableAddForeignKey(
 	// 12. (Finally!) Add a ForeignKey_Constraint, ConstraintName element to
 	// builder state.
 	constraintID := b.NextTableConstraintID(tbl.TableID)
-	b.Add(&scpb.ForeignKeyConstraint{
-		TableID:                 tbl.TableID,
-		ConstraintID:            constraintID,
-		ColumnIDs:               originColIDs,
-		ReferencedTableID:       referencedTableID,
-		ReferencedColumnIDs:     referencedColIDs,
-		OnUpdateAction:          tree.ForeignKeyReferenceActionValue[fkDef.Actions.Update],
-		OnDeleteAction:          tree.ForeignKeyReferenceActionValue[fkDef.Actions.Delete],
-		CompositeKeyMatchMethod: tree.CompositeKeyMatchMethodValue[fkDef.Match],
-		IndexIDForValidation:    getIndexIDForValidationForConstraint(b, tbl.TableID),
-	})
+	if t.ValidationBehavior == tree.ValidationDefault {
+		fk := &scpb.ForeignKeyConstraint{
+			TableID:                 tbl.TableID,
+			ConstraintID:            constraintID,
+			ColumnIDs:               originColIDs,
+			ReferencedTableID:       referencedTableID,
+			ReferencedColumnIDs:     referencedColIDs,
+			OnUpdateAction:          tree.ForeignKeyReferenceActionValue[fkDef.Actions.Update],
+			OnDeleteAction:          tree.ForeignKeyReferenceActionValue[fkDef.Actions.Delete],
+			CompositeKeyMatchMethod: tree.CompositeKeyMatchMethodValue[fkDef.Match],
+			IndexIDForValidation:    getIndexIDForValidationForConstraint(b, tbl.TableID),
+		}
+		b.Add(fk)
+		b.LogEventForExistingTarget(fk)
+	} else {
+		fk := &scpb.ForeignKeyConstraintUnvalidated{
+			TableID:                 tbl.TableID,
+			ConstraintID:            constraintID,
+			ColumnIDs:               originColIDs,
+			ReferencedTableID:       referencedTableID,
+			ReferencedColumnIDs:     referencedColIDs,
+			OnUpdateAction:          tree.ForeignKeyReferenceActionValue[fkDef.Actions.Update],
+			OnDeleteAction:          tree.ForeignKeyReferenceActionValue[fkDef.Actions.Delete],
+			CompositeKeyMatchMethod: tree.CompositeKeyMatchMethodValue[fkDef.Match],
+		}
+		b.Add(fk)
+		b.LogEventForExistingTarget(fk)
+	}
 	b.Add(&scpb.ConstraintWithoutIndexName{
 		TableID:      tbl.TableID,
 		ConstraintID: constraintID,
@@ -375,7 +418,8 @@ func alterTableAddForeignKey(
 	})
 }
 
-// alterTableAddUniqueWithoutIndex contains logic for building ALTER TABLE ... ADD CONSTRAINT ... UNIQUE WITHOUT INDEX.
+// alterTableAddUniqueWithoutIndex contains logic for building
+// `ALTER TABLE ... ADD UNIQUE WITHOUT INDEX ... [NOT VALID]`.
 // It assumes `t` is such a command.
 func alterTableAddUniqueWithoutIndex(
 	b BuildCtx, tn *tree.TableName, tbl *scpb.Table, t *tree.AlterTableAddConstraint,
@@ -439,7 +483,8 @@ func alterTableAddUniqueWithoutIndex(
 
 	// 4. If there is a predicate, validate it.
 	if d.Predicate != nil {
-		predicate, _, _, err := schemaexpr.DequalifyAndValidateExprImpl(b, d.Predicate, types.Bool, "unique without index predicate", b.SemaCtx(), volatility.Immutable, tn,
+		predicate, _, _, err := schemaexpr.DequalifyAndValidateExprImpl(b, d.Predicate, types.Bool,
+			tree.UniqueWithoutIndexPredicateExpr, b.SemaCtx(), volatility.Immutable, tn, b.ClusterSettings().Version.ActiveVersion(b),
 			func() colinfo.ResultColumns {
 				return getNonDropResultColumns(b, tbl.TableID)
 			},
@@ -459,16 +504,30 @@ func alterTableAddUniqueWithoutIndex(
 
 	// 5. (Finally!) Add a UniqueWithoutIndex, ConstraintName element to builder state.
 	constraintID := b.NextTableConstraintID(tbl.TableID)
-	uwi := &scpb.UniqueWithoutIndexConstraint{
-		TableID:              tbl.TableID,
-		ConstraintID:         constraintID,
-		ColumnIDs:            colIDs,
-		IndexIDForValidation: getIndexIDForValidationForConstraint(b, tbl.TableID),
+	if t.ValidationBehavior == tree.ValidationDefault {
+		uwi := &scpb.UniqueWithoutIndexConstraint{
+			TableID:              tbl.TableID,
+			ConstraintID:         constraintID,
+			ColumnIDs:            colIDs,
+			IndexIDForValidation: getIndexIDForValidationForConstraint(b, tbl.TableID),
+		}
+		if d.Predicate != nil {
+			uwi.Predicate = b.WrapExpression(tbl.TableID, d.Predicate)
+		}
+		b.Add(uwi)
+		b.LogEventForExistingTarget(uwi)
+	} else {
+		uwi := &scpb.UniqueWithoutIndexConstraintUnvalidated{
+			TableID:      tbl.TableID,
+			ConstraintID: constraintID,
+			ColumnIDs:    colIDs,
+		}
+		if d.Predicate != nil {
+			uwi.Predicate = b.WrapExpression(tbl.TableID, d.Predicate)
+		}
+		b.Add(uwi)
+		b.LogEventForExistingTarget(uwi)
 	}
-	if d.Predicate != nil {
-		uwi.Predicate = b.WrapExpression(tbl.TableID, d.Predicate)
-	}
-	b.Add(uwi)
 	b.Add(&scpb.ConstraintWithoutIndexName{
 		TableID:      tbl.TableID,
 		ConstraintID: constraintID,
@@ -550,9 +609,9 @@ func validateConstraintNameIsNotUsed(
 
 	var isInUse bool
 	scpb.ForEachConstraintWithoutIndexName(b.QueryByID(tbl.TableID), func(
-		_ scpb.Status, _ scpb.TargetStatus, e *scpb.ConstraintWithoutIndexName,
+		_ scpb.Status, target scpb.TargetStatus, e *scpb.ConstraintWithoutIndexName,
 	) {
-		if e.Name == string(name) {
+		if target == scpb.ToPublic && e.Name == string(name) {
 			isInUse = true
 		}
 	})

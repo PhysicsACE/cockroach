@@ -24,9 +24,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -86,7 +86,8 @@ type storeMetrics interface {
 	Registry() *metric.Registry
 }
 
-var childMetricsEnabled = settings.RegisterBoolSetting(
+// ChildMetricsEnabled enables exporting of additional prometheus time series with extra labels
+var ChildMetricsEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable, "server.child_metrics.enabled",
 	"enables the exporting of child metrics, additional prometheus time series with extra labels",
 	false).WithPublic()
@@ -100,17 +101,28 @@ var childMetricsEnabled = settings.RegisterBoolSetting(
 // recorded, and they are thus kept separate.
 type MetricsRecorder struct {
 	*HealthChecker
-	gossip       *gossip.Gossip
 	nodeLiveness *liveness.NodeLiveness
-	rpcContext   *rpc.Context
+	remoteClocks *rpc.RemoteClockMonitor
 	settings     *cluster.Settings
-	clock        *hlc.Clock
+	clock        hlc.WallClock
 
 	// Counts to help optimize slice allocation. Should only be accessed atomically.
 	lastDataCount        int64
 	lastSummaryCount     int64
 	lastNodeMetricCount  int64
 	lastStoreMetricCount int64
+
+	// tenantID is the tenantID of the tenant this recorder is attached to.
+	tenantID roachpb.TenantID
+
+	// tenantNameContainer holds the tenant name of the tenant this recorder
+	// is attached to. It will be used to label metrics that are tenant-specific.
+	tenantNameContainer *roachpb.TenantNameContainer
+
+	// prometheusExporter merges metrics into families and generates the
+	// prometheus text format. It has a ScrapeAndPrintAsText method for thread safe
+	// scrape and print so there is no need to have additional lock here.
+	prometheusExporter metric.PrometheusExporter
 
 	// mu synchronizes the reading of node/store registries against the adding of
 	// nodes/stores. Consequently, almost all uses of it only need to take an
@@ -128,12 +140,10 @@ type MetricsRecorder struct {
 		// independent.
 		storeRegistries map[roachpb.StoreID]*metric.Registry
 		stores          map[roachpb.StoreID]storeMetrics
-	}
 
-	// prometheusExporter merges metrics into families and generates the
-	// prometheus text format. It has a ScrapeAndPrintAsText method for thread safe
-	// scrape and print so there is no need to have additional lock here.
-	prometheusExporter metric.PrometheusExporter
+		// tenantRegistries contains the registries for shared-process tenants.
+		tenantRegistries map[roachpb.TenantID]*metric.Registry
+	}
 
 	// WriteNodeStatus is a potentially long-running method (with a network
 	// round-trip) that requires a mutex to be safe for concurrent usage. We
@@ -143,25 +153,40 @@ type MetricsRecorder struct {
 
 // NewMetricsRecorder initializes a new MetricsRecorder object that uses the
 // given clock.
+//
+// If both nodeLiveness and remoteClocks are not-nil, the node status generated
+// by GenerateNodeStatus() will contain info about RPC lantency to all currently
+// live nodes.
 func NewMetricsRecorder(
-	clock *hlc.Clock,
+	tenantID roachpb.TenantID,
+	tenantNameContainer *roachpb.TenantNameContainer,
 	nodeLiveness *liveness.NodeLiveness,
-	rpcContext *rpc.Context,
-	gossip *gossip.Gossip,
+	remoteClocks *rpc.RemoteClockMonitor,
+	clock hlc.WallClock,
 	settings *cluster.Settings,
 ) *MetricsRecorder {
 	mr := &MetricsRecorder{
-		HealthChecker: NewHealthChecker(trackedMetrics),
-		nodeLiveness:  nodeLiveness,
-		rpcContext:    rpcContext,
-		gossip:        gossip,
-		settings:      settings,
+		HealthChecker:       NewHealthChecker(trackedMetrics),
+		nodeLiveness:        nodeLiveness,
+		remoteClocks:        remoteClocks,
+		settings:            settings,
+		clock:               clock,
+		tenantID:            tenantID,
+		tenantNameContainer: tenantNameContainer,
+		prometheusExporter:  metric.MakePrometheusExporter(),
 	}
 	mr.mu.storeRegistries = make(map[roachpb.StoreID]*metric.Registry)
 	mr.mu.stores = make(map[roachpb.StoreID]storeMetrics)
-	mr.prometheusExporter = metric.MakePrometheusExporter()
-	mr.clock = clock
+	mr.mu.tenantRegistries = make(map[roachpb.TenantID]*metric.Registry)
 	return mr
+}
+
+// AddTenantRegistry adds shared-process tenant's registry.
+func (mr *MetricsRecorder) AddTenantRegistry(tenantID roachpb.TenantID, rec *metric.Registry) {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+
+	mr.mu.tenantRegistries[tenantID] = rec
 }
 
 // AddNode adds the Registry from an initialized node, along with its descriptor
@@ -192,6 +217,7 @@ func (mr *MetricsRecorder) AddNode(
 	nodeIDGauge := metric.NewGauge(metadata)
 	nodeIDGauge.Update(int64(desc.NodeID))
 	reg.AddMetric(nodeIDGauge)
+	reg.AddLabel("tenant", mr.tenantNameContainer)
 }
 
 // AddStore adds the Registry from the provided store as a store-level registry
@@ -245,10 +271,13 @@ func (mr *MetricsRecorder) ScrapeIntoPrometheus(pm *metric.PrometheusExporter) {
 			log.Warning(context.TODO(), "MetricsRecorder asked to scrape metrics before NodeID allocation")
 		}
 	}
-	includeChildMetrics := childMetricsEnabled.Get(&mr.settings.SV)
+	includeChildMetrics := ChildMetricsEnabled.Get(&mr.settings.SV)
 	pm.ScrapeRegistry(mr.mu.nodeRegistry, includeChildMetrics)
 	for _, reg := range mr.mu.storeRegistries {
 		pm.ScrapeRegistry(reg, includeChildMetrics)
+	}
+	for _, tenantRegistry := range mr.mu.tenantRegistries {
+		pm.ScrapeRegistry(tenantRegistry, includeChildMetrics)
 	}
 }
 
@@ -277,7 +306,8 @@ func (mr *MetricsRecorder) ExportToGraphite(
 }
 
 // GetTimeSeriesData serializes registered metrics for consumption by
-// CockroachDB's time series system.
+// CockroachDB's time series system. GetTimeSeriesData implements the DataSource
+// interface of the ts package.
 func (mr *MetricsRecorder) GetTimeSeriesData() []tspb.TimeSeriesData {
 	mr.mu.RLock()
 	defer mr.mu.RUnlock()
@@ -294,12 +324,12 @@ func (mr *MetricsRecorder) GetTimeSeriesData() []tspb.TimeSeriesData {
 	data := make([]tspb.TimeSeriesData, 0, lastDataCount)
 
 	// Record time series from node-level registries.
-	now := mr.clock.PhysicalNow()
+	now := mr.clock.Now()
 	recorder := registryRecorder{
 		registry:       mr.mu.nodeRegistry,
 		format:         nodeTimeSeriesPrefix,
 		source:         strconv.FormatInt(int64(mr.mu.desc.NodeID), 10),
-		timestampNanos: now,
+		timestampNanos: now.UnixNano(),
 	}
 	recorder.record(&data)
 
@@ -309,7 +339,7 @@ func (mr *MetricsRecorder) GetTimeSeriesData() []tspb.TimeSeriesData {
 			registry:       r,
 			format:         storeTimeSeriesPrefix,
 			source:         strconv.FormatInt(int64(storeID), 10),
-			timestampNanos: now,
+			timestampNanos: now.UnixNano(),
 		}
 		storeRecorder.record(&data)
 	}
@@ -338,42 +368,38 @@ func (mr *MetricsRecorder) GetMetricsMetadata() map[string]metric.Metadata {
 	// Get a random storeID.
 	var sID roachpb.StoreID
 
+	storeFound := false
 	for storeID := range mr.mu.storeRegistries {
 		sID = storeID
+		storeFound = true
 		break
 	}
 
 	// Get metric metadata from that store because all stores have the same metadata.
-	mr.mu.storeRegistries[sID].WriteMetricsMetadata(metrics)
+	if storeFound {
+		mr.mu.storeRegistries[sID].WriteMetricsMetadata(metrics)
+	}
 
 	return metrics
 }
 
-// getLatencies produces a map of network activity from this node to all other
-// nodes. Latencies are stored as nanos.
+// getNetworkActivity produces a map of network activity from this node to all
+// other nodes. Latencies are stored as nanos.
 func (mr *MetricsRecorder) getNetworkActivity(
 	ctx context.Context,
 ) map[roachpb.NodeID]statuspb.NodeStatus_NetworkActivity {
 	activity := make(map[roachpb.NodeID]statuspb.NodeStatus_NetworkActivity)
-	if mr.nodeLiveness != nil && mr.gossip != nil {
+	if mr.nodeLiveness != nil {
 		isLiveMap := mr.nodeLiveness.GetIsLiveMap()
 
-		var currentAverages map[string]time.Duration
-		if mr.rpcContext.RemoteClocks != nil {
-			currentAverages = mr.rpcContext.RemoteClocks.AllLatencies()
+		var currentAverages map[roachpb.NodeID]time.Duration
+		if mr.remoteClocks != nil {
+			currentAverages = mr.remoteClocks.AllLatencies()
 		}
 		for nodeID, entry := range isLiveMap {
-			address, err := mr.gossip.GetNodeIDAddress(nodeID)
-			if err != nil {
-				if entry.IsLive {
-					log.Warningf(ctx, "%v", err)
-				}
-				continue
-			}
 			na := statuspb.NodeStatus_NetworkActivity{}
-			key := address.String()
 			if entry.IsLive {
-				if latency, ok := currentAverages[key]; ok {
+				if latency, ok := currentAverages[nodeID]; ok {
 					na.Latency = latency.Nanoseconds()
 				}
 			}
@@ -400,7 +426,7 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 		return nil
 	}
 
-	now := mr.clock.PhysicalNow()
+	now := mr.clock.Now()
 
 	lastSummaryCount := atomic.LoadInt64(&mr.lastSummaryCount)
 	lastNodeMetricCount := atomic.LoadInt64(&mr.lastNodeMetricCount)
@@ -415,7 +441,7 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 	nodeStat := &statuspb.NodeStatus{
 		Desc:              mr.mu.desc,
 		BuildInfo:         build.GetInfo(),
-		UpdatedAt:         now,
+		UpdatedAt:         now.UnixNano(),
 		StartedAt:         mr.mu.startedAt,
 		StoreStatuses:     make([]statuspb.StoreStatus, 0, lastSummaryCount),
 		Metrics:           make(map[string]float64, lastNodeMetricCount),
@@ -494,7 +520,7 @@ func (mr *MetricsRecorder) WriteNodeStatus(
 			return errors.New("status entry not found, node may have been decommissioned")
 		}
 		err = db.CPutInline(ctx, key, &nodeStatus, entry.Value.TagAndDataBytes())
-		if detail := (*roachpb.ConditionFailedError)(nil); errors.As(err, &detail) {
+		if detail := (*kvpb.ConditionFailedError)(nil); errors.As(err, &detail) {
 			if detail.ActualValue == nil {
 				return errors.New("status entry not found, node may have been decommissioned")
 			}

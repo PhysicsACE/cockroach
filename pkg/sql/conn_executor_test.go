@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -327,12 +328,12 @@ func TestErrorOnRollback(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingProposalFilter: func(fArgs kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(fArgs kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					if !fArgs.Req.IsSingleRequest() {
 						return nil
 					}
 					req := fArgs.Req.Requests[0]
-					etReq, ok := req.GetInner().(*roachpb.EndTxnRequest)
+					etReq, ok := req.GetInner().(*kvpb.EndTxnRequest)
 					// We only inject the error once. Turns out that during the
 					// life of the test there's two EndTxns being sent - one is
 					// the direct result of the test's call to tx.Rollback(),
@@ -344,7 +345,7 @@ func TestErrorOnRollback(t *testing.T) {
 						atomic.LoadInt64(&injectedErr) == 0 {
 
 						atomic.StoreInt64(&injectedErr, 1)
-						return roachpb.NewErrorf("test injected error")
+						return kvpb.NewErrorf("test injected error")
 					}
 					return nil
 				},
@@ -584,9 +585,9 @@ func TestQueryProgress(t *testing.T) {
 				TableReaderBatchBytesLimit: 1500,
 			},
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(_ context.Context, req *roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(_ context.Context, req *kvpb.BatchRequest) *kvpb.Error {
 					if req.IsSingleRequest() {
-						scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
+						scan, ok := req.Requests[0].GetInner().(*kvpb.ScanRequest)
 						if ok && getTableSpan().ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
 							i := atomic.AddInt64(&scannedBatchesAtomic, 1)
 							if i == stallAfterScans {
@@ -635,7 +636,7 @@ func TestQueryProgress(t *testing.T) {
 		// stalled ch as expected.
 		defer func() {
 			select {
-			case <-stalled: //stalled was closed as expected.
+			case <-stalled: // stalled was closed as expected.
 			default:
 				panic("expected stalled to have been closed during execution")
 			}
@@ -747,7 +748,7 @@ func TestRetriableErrorDuringPrepare(t *testing.T) {
 			SQLExecutor: &sql.ExecutorTestingKnobs{
 				BeforePrepare: func(ctx context.Context, stmt string, txn *kv.Txn) error {
 					if strings.Contains(stmt, uniqueString) && atomic.AddInt64(&failed, 1) <= numToFail {
-						return roachpb.NewTransactionRetryWithProtoRefreshError("boom",
+						return kvpb.NewTransactionRetryWithProtoRefreshError("boom",
 							txn.ID(), *txn.TestingCloneTxn())
 					}
 					return nil
@@ -795,19 +796,19 @@ func TestRetriableErrorDuringUpgradedTransaction(t *testing.T) {
 	testDB.QueryRow(t, "SELECT 'foo'::regclass::oid").Scan(&fooTableId)
 
 	// Inject an error that will happen during execution.
-	filter.setFilter(func(ctx context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+	filter.setFilter(func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if ba.Txn == nil {
 			return nil
 		}
-		if req, ok := ba.GetArg(roachpb.ConditionalPut); ok {
-			put := req.(*roachpb.ConditionalPutRequest)
+		if req, ok := ba.GetArg(kvpb.ConditionalPut); ok {
+			put := req.(*kvpb.ConditionalPutRequest)
 			_, tableID, err := keys.SystemSQLCodec.DecodeTablePrefix(put.Key)
 			if err != nil || tableID != fooTableId {
 				return nil
 			}
 			if atomic.AddInt64(&retryCount, 1) <= numToRetry {
-				return roachpb.NewErrorWithTxn(
-					roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "injected retry error"), ba.Txn,
+				return kvpb.NewErrorWithTxn(
+					kvpb.NewTransactionRetryError(kvpb.RETRY_REASON_UNKNOWN, "injected retry error"), ba.Txn,
 				)
 			}
 		}
@@ -872,19 +873,19 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 	require.NoError(t, err)
 
 	// Inject an error that will happen during planning.
-	filter.setFilter(func(ctx context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+	filter.setFilter(func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if ba.Txn == nil {
 			return nil
 		}
-		if req, ok := ba.GetArg(roachpb.Get); ok {
-			get := req.(*roachpb.GetRequest)
+		if req, ok := ba.GetArg(kvpb.Get); ok {
+			get := req.(*kvpb.GetRequest)
 			_, tableID, err := keys.SystemSQLCodec.DecodeTablePrefix(get.Key)
 			if err != nil || tableID != keys.NamespaceTableID {
 				err = nil
 				return nil
 			}
-			return roachpb.NewErrorWithTxn(
-				roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "boom"), ba.Txn)
+			return kvpb.NewErrorWithTxn(
+				kvpb.NewTransactionRetryError(kvpb.RETRY_REASON_UNKNOWN, "boom"), ba.Txn)
 		}
 		return nil
 	})
@@ -1131,7 +1132,7 @@ func TestTransactionDeadline(t *testing.T) {
 	// This will be used in the tests for accessing mu.
 	locked := func(f func()) { mu.Lock(); defer mu.Unlock(); f() }
 	// Set up a kvserverbase.ReplicaRequestFilter which will extract the deadline for the test transaction.
-	checkTransactionDeadlineFilter := func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+	checkTransactionDeadlineFilter := func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if ba.Txn == nil {
 			return nil
 		}
@@ -1142,8 +1143,8 @@ func TestTransactionDeadline(t *testing.T) {
 			return nil
 		}
 
-		if args, ok := ba.GetArg(roachpb.EndTxn); ok {
-			et := args.(*roachpb.EndTxnRequest)
+		if args, ok := ba.GetArg(kvpb.EndTxn); ok {
+			et := args.(*kvpb.EndTxnRequest)
 			if et.Deadline.IsEmpty() {
 				return nil
 			}
@@ -1516,6 +1517,52 @@ func TestInjectRetryErrors(t *testing.T) {
 	})
 }
 
+func TestInjectRetryOnCommitErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params := base.TestServerArgs{}
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	defer db.Close()
+
+	_, err := db.Exec("SET inject_retry_errors_on_commit_enabled = 'true'")
+	require.NoError(t, err)
+
+	t.Run("test_injection_failure_on_commit_without_savepoints", func(t *testing.T) {
+		var txRes int
+		for attemptCount := 1; attemptCount <= 10; attemptCount++ {
+			tx, err := db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+
+			// Verify that SHOW is exempt from error injection.
+			var s string
+			err = tx.QueryRow("SHOW inject_retry_errors_on_commit_enabled").Scan(&s)
+			require.NoError(t, err)
+
+			if attemptCount == 5 {
+				_, err = tx.Exec("SET inject_retry_errors_on_commit_enabled = 'false'")
+				require.NoError(t, err)
+			}
+
+			err = tx.QueryRow("SELECT $1::int8", attemptCount).Scan(&txRes)
+			require.NoError(t, err)
+			err = tx.Commit()
+			if attemptCount >= 5 {
+				require.NoError(t, err)
+				break
+			} else {
+				pqErr := (*pq.Error)(nil)
+				require.ErrorAs(t, err, &pqErr)
+				require.Equal(t, "40001", string(pqErr.Code), "expected a transaction retry error code. got %v", pqErr)
+				// We should not expect a rollback on commit errors.
+			}
+		}
+		require.Equal(t, 5, txRes)
+	})
+}
+
 func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1799,14 +1846,12 @@ func (f *dynamicRequestFilter) setFilter(filter kvserverbase.ReplicaRequestFilte
 }
 
 // noopRequestFilter is a kvserverbase.ReplicaRequestFilter.
-func (f *dynamicRequestFilter) filter(
-	ctx context.Context, request *roachpb.BatchRequest,
-) *roachpb.Error {
+func (f *dynamicRequestFilter) filter(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 	return f.v.Load().(kvserverbase.ReplicaRequestFilter)(ctx, request)
 }
 
 // noopRequestFilter is a kvserverbase.ReplicaRequestFilter that does nothing.
-func noopRequestFilter(ctx context.Context, request *roachpb.BatchRequest) *roachpb.Error {
+func noopRequestFilter(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 	return nil
 }
 

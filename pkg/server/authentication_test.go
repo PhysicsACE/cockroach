@@ -26,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -95,12 +96,12 @@ func TestSSLEnforcement(t *testing.T) {
 
 	newRPCContext := func(cfg *base.Config) *rpc.Context {
 		return rpc.NewContext(ctx, rpc.ContextOptions{
-			TenantID:  roachpb.SystemTenantID,
-			Config:    cfg,
-			Clock:     &timeutil.DefaultTimeSource{},
-			MaxOffset: time.Nanosecond,
-			Stopper:   s.Stopper(),
-			Settings:  s.ClusterSettings(),
+			TenantID:        roachpb.SystemTenantID,
+			Config:          cfg,
+			Clock:           &timeutil.DefaultTimeSource{},
+			ToleratedOffset: time.Nanosecond,
+			Stopper:         s.Stopper(),
+			Settings:        s.ClusterSettings(),
 		})
 	}
 
@@ -117,7 +118,7 @@ func TestSSLEnforcement(t *testing.T) {
 	plainHTTPCfg.Insecure = true
 	insecureContext := newRPCContext(plainHTTPCfg)
 
-	kvGet := &roachpb.GetRequest{}
+	kvGet := &kvpb.GetRequest{}
 	kvGet.Key = roachpb.Key("/")
 
 	for _, tc := range []struct {
@@ -226,6 +227,8 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 
 		{"richardc", "12345", "NOLOGIN", "", nil},
 		{"richardc2", "12345", "NOSQLLOGIN", "", nil},
+		{"has_global_nosqlogin", "12345", "", "", nil},
+		{"inherits_global_nosqlogin", "12345", "", "", nil},
 		{"before_epoch", "12345", "", "VALID UNTIL '1969-01-01'", nil},
 		{"epoch", "12345", "", "VALID UNTIL '1970-01-01'", nil},
 		{"cockroach", "12345", "", "VALID UNTIL '2100-01-01'", nil},
@@ -245,6 +248,12 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 			t.Fatalf("failed to create user: %s", err)
 		}
 	}
+
+	// Set up NOSQLLOGIN global privilege.
+	_, err = db.Exec("GRANT SYSTEM NOSQLLOGIN TO has_global_nosqlogin")
+	require.NoError(t, err)
+	_, err = db.Exec("GRANT has_global_nosqlogin TO inherits_global_nosqlogin")
+	require.NoError(t, err)
 
 	for _, tc := range []struct {
 		testName           string
@@ -267,8 +276,11 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 		{"username does not exist should fail", "doesntexist", "zxcvbn", false},
 
 		{"user with NOLOGIN role option should fail", "richardc", "12345", false},
-		// This is the one test case where SQL and DB Console login outcomes differ.
+		// The NOSQLLOGIN cases are the only cases where SQL and DB Console login outcomes differ.
 		{"user with NOSQLLOGIN role option should succeed", "richardc2", "12345", true},
+		{"user with NOSQLLOGIN global privilege should succeed", "has_global_nosqlogin", "12345", true},
+		{"user who inherits NOSQLLOGIN global privilege should succeed", "inherits_global_nosqlogin", "12345", true},
+
 		{"user with VALID UNTIL before the Unix epoch should fail", "before_epoch", "12345", false},
 		{"user with VALID UNTIL at Unix epoch should fail", "epoch", "12345", false},
 		{"user with VALID UNTIL future date should succeed", "cockroach", "12345", true},
@@ -559,6 +571,33 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 	}
 }
 
+func TestLogoutClearsCookies(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+	ts := s.(*TestServer)
+
+	// Log in.
+	authHTTPClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(
+		authenticatedUserName(), true, serverutils.SingleTenantSession,
+	)
+	require.NoError(t, err)
+
+	// Log out.
+	resp, err := authHTTPClient.Get(ts.AdminURL() + logoutPath)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	cookies := resp.Cookies()
+	cNames := make([]string, len(cookies))
+	for i, c := range cookies {
+		require.Equal(t, "", c.Value)
+		cNames[i] = c.Name
+	}
+	require.ElementsMatch(t, cNames, []string{SessionCookieName, TenantSelectCookieName})
+}
+
 func TestLogout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -567,7 +606,9 @@ func TestLogout(t *testing.T) {
 	ts := s.(*TestServer)
 
 	// Log in.
-	authHTTPClient, cookie, err := ts.getAuthenticatedHTTPClientAndCookie(authenticatedUserName(), true)
+	authHTTPClient, cookie, err := ts.getAuthenticatedHTTPClientAndCookie(
+		authenticatedUserName(), true, serverutils.SingleTenantSession,
+	)
 	if err != nil {
 		t.Fatal("error opening HTTP client", err)
 	}
@@ -747,7 +788,7 @@ func TestGRPCAuthentication(t *testing.T) {
 			return err
 		}},
 		{"internal", func(ctx context.Context, conn *grpc.ClientConn) error {
-			_, err := roachpb.NewInternalClient(conn).Batch(ctx, &roachpb.BatchRequest{})
+			_, err := kvpb.NewInternalClient(conn).Batch(ctx, &kvpb.BatchRequest{})
 			return err
 		}},
 		{"perReplica", func(ctx context.Context, conn *grpc.ClientConn) error {
@@ -833,7 +874,7 @@ func TestGRPCAuthentication(t *testing.T) {
 	for _, subsystem := range subsystems {
 		t.Run(fmt.Sprintf("bad-user/%s", subsystem.name), func(t *testing.T) {
 			err := subsystem.sendRPC(ctx, conn)
-			if exp := `client certificate CN=testuser,O=Cockroach cannot be used to perform RPC on tenant {1}`; !testutils.IsError(err, exp) {
+			if exp := `need root or node client cert to perform RPCs on this server`; !testutils.IsError(err, exp) {
 				t.Errorf("expected %q error, but got %v", exp, err)
 			}
 		})
@@ -869,66 +910,78 @@ func TestFindSessionCookieValue(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	normalSessionStr := "abcd1234,system,efgh5678,app"
 	tests := []struct {
-		name          string
-		cookieArg     []*http.Cookie
-		resExpected   string
-		errorExpected bool
+		name              string
+		sessionCookie     *http.Cookie
+		tenantSelectValue string
+		resExpected       string
+		errorExpected     bool
 	}{
-		{"standard args", []*http.Cookie{
-			{
-				Name:  MultitenantSessionCookieName,
+		{
+			name: "standard args",
+			sessionCookie: &http.Cookie{
+				Name:  SessionCookieName,
 				Value: normalSessionStr,
 				Path:  "/",
 			},
-			{
-				Name:  TenantSelectCookieName,
-				Value: "system",
-				Path:  "/",
-			},
-		}, "abcd1234", false},
-		{"no multitenant session cookie", []*http.Cookie{
-			{
-				Name:  TenantSelectCookieName,
-				Value: "system",
-				Path:  "/",
-			},
-		}, "", false},
-		{"no tenant cookie", []*http.Cookie{
-			{
-				Name:  MultitenantSessionCookieName,
+			tenantSelectValue: "system",
+			resExpected:       "abcd1234",
+			errorExpected:     false,
+		},
+		{
+			name:              "no multitenant session cookie",
+			sessionCookie:     nil,
+			tenantSelectValue: "system",
+			resExpected:       "",
+			errorExpected:     false,
+		},
+		{
+			name: "no tenant cookie",
+			sessionCookie: &http.Cookie{
+				Name:  SessionCookieName,
 				Value: normalSessionStr,
 				Path:  "/",
 			},
-		}, "abcd1234", false},
-		{"empty string tenant cookie", []*http.Cookie{
-			{
-				Name:  MultitenantSessionCookieName,
+			resExpected:   "abcd1234",
+			errorExpected: false,
+		},
+		{
+			name: "empty string tenant cookie",
+			sessionCookie: &http.Cookie{
+				Name:  SessionCookieName,
 				Value: normalSessionStr,
 				Path:  "/",
 			},
-			{
-				Name:  TenantSelectCookieName,
-				Value: "",
-				Path:  "/",
-			},
-		}, "abcd1234", false},
-		{"no tenant name match", []*http.Cookie{
-			{
-				Name:  MultitenantSessionCookieName,
+			tenantSelectValue: "",
+			resExpected:       "abcd1234",
+			errorExpected:     false,
+		},
+		{
+			name: "no tenant name match",
+			sessionCookie: &http.Cookie{
+				Name:  SessionCookieName,
 				Value: normalSessionStr,
 				Path:  "/",
 			},
-			{
-				Name:  TenantSelectCookieName,
-				Value: "app2",
+			tenantSelectValue: "app2",
+			resExpected:       "",
+			errorExpected:     true,
+		},
+		{
+			name: "legacy session cookie",
+			sessionCookie: &http.Cookie{
+				Name:  SessionCookieName,
+				Value: "aaskjhf218==",
 				Path:  "/",
 			},
-		}, "", true},
+			tenantSelectValue: "",
+			resExpected:       "aaskjhf218==",
+			errorExpected:     false,
+		},
 	}
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("find-session-cookie/%s", test.name), func(t *testing.T) {
 			st := cluster.MakeClusterSettings()
-			res, err := findSessionCookieValue(st, test.cookieArg)
+			res, err := findSessionCookieValueForTenant(st, test.sessionCookie, test.tenantSelectValue)
 			require.Equal(t, test.resExpected, res)
 			require.Equal(t, test.errorExpected, err != nil)
 		})

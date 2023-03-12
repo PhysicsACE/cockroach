@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -45,12 +47,12 @@ func TestFingerprint(t *testing.T) {
 	serv, sqlDB, db := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingResponseFilter: func(ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+				TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
 					mu.Lock()
 					defer mu.Unlock()
 					for i, ru := range br.Responses {
-						if _, ok := ba.Requests[i].GetInner().(*roachpb.ExportRequest); ok {
-							exportResponse := ru.GetInner().(*roachpb.ExportResponse)
+						if _, ok := ba.Requests[i].GetInner().(*kvpb.ExportRequest); ok {
+							exportResponse := ru.GetInner().(*kvpb.ExportResponse)
 							numExportResponses++
 							numSSTsInExportResponses += len(exportResponse.Files)
 						}
@@ -111,7 +113,7 @@ func TestFingerprint(t *testing.T) {
 
 	store, err := s.Stores().GetStore(s.GetFirstStoreID())
 	require.NoError(t, err)
-	eng := store.Engine()
+	eng := store.TODOEngine()
 
 	// Insert some point keys.
 	txn := db.NewTxn(ctx, "test-point-keys")
@@ -215,4 +217,59 @@ func TestFingerprint(t *testing.T) {
 	require.Equal(t, 2, numExportResponses)
 
 	require.Equal(t, fingerprintPreSplit, fingerprintPostSplit)
+}
+
+func TestFingerprintConcurrentTransactions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	db := sqlutils.MakeSQLRunner(sqlDB)
+	db.Exec(t, "CREATE DATABASE IF NOT EXISTS test")
+	db.Exec(t, "CREATE TABLE test.test (k PRIMARY KEY) AS SELECT generate_series(1, 10)")
+
+	startTs := s.Clock().Now()
+
+	fingerprintQuery := `
+SELECT *
+FROM
+	crdb_internal.fingerprint(
+		crdb_internal.table_span((SELECT id FROM system.namespace WHERE name = 'test' AND "parentID" != 0)),
+		0::TIMESTAMPTZ,
+		false
+	)
+`
+
+	txn, err := sqlDB.Begin()
+	require.NoError(t, err)
+
+	var fingerprint1 int
+	require.NoError(t, txn.QueryRow(fingerprintQuery).Scan(&fingerprint1))
+
+	// Write a row in a different transaction.
+	db.Exec(t, "INSERT INTO test.test (k) VALUES (42)")
+
+	// Another fingerprint taken inside the transaction should
+	// yield the same result.
+	var fingerprint2 int
+	require.NoError(t, txn.QueryRow(fingerprintQuery).Scan(&fingerprint2))
+	require.Equal(t, fingerprint1, fingerprint2)
+
+	require.NoError(t, txn.Commit())
+
+	// AOST query back to the start should give the same as value
+	// as those taken during the transaction that can't see the
+	// new write.
+	var fingerprint3 int
+	aost := fmt.Sprintf("%s AS OF SYSTEM TIME %s", fingerprintQuery, startTs.AsOfSystemTime())
+	db.QueryRow(t, aost).Scan(&fingerprint3)
+	require.Equal(t, fingerprint1, fingerprint3)
+
+	// Just to be sure we aren't fooling ourselves, the
+	// fingerprint should be different after the new writes.
+	var fingerprint4 int
+	db.QueryRow(t, fingerprintQuery).Scan(&fingerprint4)
+	require.NotEqual(t, fingerprint1, fingerprint4)
 }

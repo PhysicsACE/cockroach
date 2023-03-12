@@ -17,12 +17,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedbuffer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -114,7 +118,7 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 		EndKey: settingsTablePrefix.PrefixEnd(),
 	}
 	s.resetUpdater()
-	var initialScan = struct {
+	initialScan := struct {
 		ch   chan struct{}
 		done bool
 		err  error
@@ -137,8 +141,7 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 	s.mu.values = make(map[string]settingsValue)
 
 	if s.overridesMonitor != nil {
-		s.mu.overrides = make(map[string]settings.EncodedValue)
-		// Initialize the overrides. We want to do this before processing the
+		s.mu.overrides = make(map[string]settings.EncodedValue) // Initialize the overrides. We want to do this before processing the
 		// settings table, otherwise we could see temporary transitions to the value
 		// in the table.
 		s.updateOverrides(ctx)
@@ -194,7 +197,7 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 		bufferSize,
 		[]roachpb.Span{settingsTableSpan},
 		false, // withPrevValue
-		func(ctx context.Context, kv *roachpb.RangeFeedValue) rangefeedbuffer.Event {
+		func(ctx context.Context, kv *kvpb.RangeFeedValue) rangefeedbuffer.Event {
 			return s.handleKV(ctx, kv)
 		},
 		func(ctx context.Context, update rangefeedcache.Update) {
@@ -231,19 +234,20 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 }
 
 func (s *SettingsWatcher) handleKV(
-	ctx context.Context, kv *roachpb.RangeFeedValue,
+	ctx context.Context, kv *kvpb.RangeFeedValue,
 ) rangefeedbuffer.Event {
+	var alloc tree.DatumAlloc
 	name, val, tombstone, err := s.dec.DecodeRow(roachpb.KeyValue{
 		Key:   kv.Key,
 		Value: kv.Value,
-	})
+	}, &alloc)
 	if err != nil {
 		log.Warningf(ctx, "failed to decode settings row %v: %v", kv.Key, err)
 		return nil
 	}
 
 	if !s.codec.ForSystemTenant() {
-		setting, ok := settings.Lookup(name, settings.LookupForLocalAccess, s.codec.ForSystemTenant())
+		setting, ok := settings.LookupForLocalAccess(name, s.codec.ForSystemTenant())
 		if !ok {
 			log.Warningf(ctx, "unknown setting %s, skipping update", redact.Safe(name))
 			return nil
@@ -333,18 +337,14 @@ func (s *SettingsWatcher) setLocked(ctx context.Context, key string, val setting
 
 // setDefaultLocked sets a setting to its default value.
 func (s *SettingsWatcher) setDefaultLocked(ctx context.Context, key string) {
-	setting, ok := settings.Lookup(key, settings.LookupForLocalAccess, s.codec.ForSystemTenant())
+	setting, ok := settings.LookupForLocalAccess(key, s.codec.ForSystemTenant())
 	if !ok {
 		log.Warningf(ctx, "failed to find setting %s, skipping update", redact.Safe(key))
 		return
 	}
-	ws, ok := setting.(settings.NonMaskedSetting)
-	if !ok {
-		log.Fatalf(ctx, "expected non-masked setting, got %T", s)
-	}
 	val := settings.EncodedValue{
-		Value: ws.EncodedDefault(),
-		Type:  ws.Typ(),
+		Value: setting.EncodedDefault(),
+		Type:  setting.Typ(),
 	}
 	s.setLocked(ctx, key, val)
 }
@@ -439,4 +439,29 @@ func (s *SettingsWatcher) GetStorageClusterVersion() clusterversion.ClusterVersi
 		return clusterversion.ClusterVersion{Version: storageClusterVersion}
 	}
 	return s.mu.storageClusterVersion
+}
+
+// GetClusterVersionFromStorage reads the cluster version from the storage via
+// the given transaction.
+func (s *SettingsWatcher) GetClusterVersionFromStorage(
+	ctx context.Context, txn *kv.Txn,
+) (clusterversion.ClusterVersion, error) {
+	indexPrefix := s.codec.IndexPrefix(keys.SettingsTableID, uint32(1))
+	key := encoding.EncodeUvarintAscending(encoding.EncodeStringAscending(indexPrefix, "version"), uint64(0))
+	row, err := txn.Get(ctx, key)
+	if err != nil {
+		return clusterversion.ClusterVersion{}, err
+	}
+	if row.Value == nil {
+		return clusterversion.ClusterVersion{}, errors.New("got nil value for tenant cluster version row")
+	}
+	_, val, _, err := s.dec.DecodeRow(roachpb.KeyValue{Key: row.Key, Value: *row.Value}, nil /* alloc */)
+	if err != nil {
+		return clusterversion.ClusterVersion{}, err
+	}
+	var version clusterversion.ClusterVersion
+	if err := protoutil.Unmarshal([]byte(val.Value), &version); err != nil {
+		return clusterversion.ClusterVersion{}, err
+	}
+	return version, nil
 }

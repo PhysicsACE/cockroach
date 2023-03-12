@@ -29,6 +29,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -84,6 +85,7 @@ table_name NOT IN (
 	'kv_catalog_descriptor',
 	'kv_catalog_namespace',
 	'kv_catalog_zones',
+	'kv_dropped_relations',
 	'lost_descriptors_with_data',
 	'table_columns',
 	'table_row_statistics',
@@ -272,7 +274,7 @@ func TestUnavailableZip(t *testing.T) {
 	close(closedCh)
 	unavailableCh.Store(closedCh)
 	knobs := &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, _ *roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(ctx context.Context, _ *kvpb.BatchRequest) *kvpb.Error {
 			select {
 			case <-unavailableCh.Load().(chan struct{}):
 			case <-ctx.Done():
@@ -344,15 +346,21 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, `dial tcp ...`)
 	re = regexp.MustCompile(`(?m)rpc error: .*$`)
 	out = re.ReplaceAllString(out, `rpc error: ...`)
+	re = regexp.MustCompile(`(?m)timed out after.*$`)
+	out = re.ReplaceAllString(out, `timed out after...`)
 	re = regexp.MustCompile(`(?m)failed to connect to .*$`)
 	out = re.ReplaceAllString(out, `failed to connect to ...`)
 
 	// The number of memory profiles previously collected is not deterministic.
 	re = regexp.MustCompile(`(?m)^\[node \d+\] \d+ heap profiles found$`)
 	out = re.ReplaceAllString(out, `[node ?] ? heap profiles found`)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] \d+ goroutine dumps found$`)
+	out = re.ReplaceAllString(out, `[node ?] ? goroutine dumps found`)
 	re = regexp.MustCompile(`(?m)^\[node \d+\] retrieving (memprof|memstats).*$` + "\n")
 	out = re.ReplaceAllString(out, ``)
 	re = regexp.MustCompile(`(?m)^\[node \d+\] writing profile.*$` + "\n")
+	out = re.ReplaceAllString(out, ``)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] writing dump.*$` + "\n")
 	out = re.ReplaceAllString(out, ``)
 
 	//out = strings.ReplaceAll(out, "\n\n", "\n")
@@ -428,7 +436,7 @@ func TestPartialZip(t *testing.T) {
 	// we're decommissioning a node in a 3-node cluster, so there's no node to
 	// up-replicate the under-replicated ranges to.
 	{
-		_, err := c.RunWithCapture(fmt.Sprintf("node decommission --wait=none %d", 2))
+		_, err := c.RunWithCapture(fmt.Sprintf("node decommission --checks=skip --wait=none %d", 2))
 		if err != nil {
 			t.Fatal(err)
 		}

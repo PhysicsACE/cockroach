@@ -11,6 +11,7 @@
 package status
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -25,14 +26,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
 	"github.com/cockroachdb/cockroach/pkg/util/system"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/kr/pretty"
+	"github.com/stretchr/testify/require"
 )
 
 // byTimeAndName is a slice of tspb.TimeSeriesData.
@@ -97,6 +99,87 @@ func (fs fakeStore) Registry() *metric.Registry {
 	return fs.registry
 }
 
+func TestMetricsRecorderTenants(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	nodeDesc := roachpb.NodeDescriptor{
+		NodeID: roachpb.NodeID(1),
+	}
+	reg1 := metric.NewRegistry()
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 100))
+	st := cluster.MakeTestingClusterSettings()
+	recorder := NewMetricsRecorder(
+		roachpb.SystemTenantID,
+		roachpb.NewTenantNameContainer(catconstants.SystemTenantName),
+		nil, /* nodeLiveness */
+		nil, /* remoteClocks */
+		manual,
+		st,
+	)
+	recorder.AddNode(reg1, nodeDesc, 50, "foo:26257", "foo:26258", "foo:5432")
+
+	nodeDescTenant := roachpb.NodeDescriptor{
+		NodeID: roachpb.NodeID(1),
+	}
+	regTenant := metric.NewRegistry()
+	stTenant := cluster.MakeTestingClusterSettings()
+	tenantID, err := roachpb.MakeTenantID(123)
+	require.NoError(t, err)
+
+	appNameContainer := roachpb.NewTenantNameContainer("application")
+	recorderTenant := NewMetricsRecorder(
+		tenantID,
+		appNameContainer,
+		nil, /* nodeLiveness */
+		nil, /* remoteClocks */
+		manual,
+		stTenant,
+	)
+	recorderTenant.AddNode(regTenant, nodeDescTenant, 50, "foo:26257", "foo:26258", "foo:5432")
+
+	g := metric.NewGauge(metric.Metadata{Name: "some_metric"})
+	reg1.AddMetric(g)
+	g.Update(123)
+
+	g2 := metric.NewGauge(metric.Metadata{Name: "some_metric"})
+	regTenant.AddMetric(g2)
+	g2.Update(456)
+
+	recorder.AddTenantRegistry(tenantID, regTenant)
+
+	buf := bytes.NewBuffer([]byte{})
+	err = recorder.PrintAsText(buf)
+	require.NoError(t, err)
+
+	require.Contains(t, buf.String(), `some_metric{tenant="system"} 123`)
+	require.Contains(t, buf.String(), `some_metric{tenant="application"} 456`)
+
+	bufTenant := bytes.NewBuffer([]byte{})
+	err = recorderTenant.PrintAsText(bufTenant)
+	require.NoError(t, err)
+
+	require.NotContains(t, bufTenant.String(), `some_metric{tenant="system"} 123`)
+	require.Contains(t, bufTenant.String(), `some_metric{tenant="application"} 456`)
+
+	// Update app name in container and ensure
+	// output changes accordingly.
+	appNameContainer.Set("application2")
+
+	buf = bytes.NewBuffer([]byte{})
+	err = recorder.PrintAsText(buf)
+	require.NoError(t, err)
+
+	require.Contains(t, buf.String(), `some_metric{tenant="system"} 123`)
+	require.Contains(t, buf.String(), `some_metric{tenant="application2"} 456`)
+
+	bufTenant = bytes.NewBuffer([]byte{})
+	err = recorderTenant.PrintAsText(bufTenant)
+	require.NoError(t, err)
+
+	require.NotContains(t, bufTenant.String(), `some_metric{tenant="system"} 123`)
+	require.Contains(t, bufTenant.String(), `some_metric{tenant="application2"} 456`)
+
+}
+
 // TestMetricsRecorder verifies that the metrics recorder properly formats the
 // statistics from various registries, both for Time Series and for Status
 // Summaries.
@@ -143,7 +226,7 @@ func TestMetricsRecorder(t *testing.T) {
 	}
 	manual := timeutil.NewManualTime(timeutil.Unix(0, 100))
 	st := cluster.MakeTestingClusterSettings()
-	recorder := NewMetricsRecorder(hlc.NewClock(manual, time.Nanosecond), nil, nil, nil, st /* maxOffset */)
+	recorder := NewMetricsRecorder(roachpb.SystemTenantID, roachpb.NewTenantNameContainer(""), nil, nil, manual, st)
 	recorder.AddStore(store1)
 	recorder.AddStore(store2)
 	recorder.AddNode(reg1, nodeDesc, 50, "foo:26257", "foo:26258", "foo:5432")
@@ -286,7 +369,12 @@ func TestMetricsRecorder(t *testing.T) {
 				c.Inc((data.val))
 				addExpected(reg.prefix, data.name, reg.source, 100, data.val, reg.isNode)
 			case "histogram":
-				h := metric.NewHistogram(metric.Metadata{Name: reg.prefix + data.name}, time.Second, []float64{1.0, 10.0, 100.0, 1000.0})
+				h := metric.NewHistogram(metric.HistogramOptions{
+					Metadata: metric.Metadata{Name: reg.prefix + data.name},
+					Duration: time.Second,
+					Buckets:  []float64{1.0, 10.0, 100.0, 1000.0},
+					Mode:     metric.HistogramModePrometheus,
+				})
 				reg.reg.AddMetric(h)
 				h.RecordValue(data.val)
 				for _, q := range recordHistogramQuantiles {

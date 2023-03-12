@@ -7,6 +7,7 @@ go_library(
     name = "execinfra",
     srcs = [
         "base.go",
+        "errors.go",
         "flow_context.go",
         "metrics.go",
         "outboxbase.go",
@@ -31,6 +32,7 @@ go_library(
         "//pkg/kv",
         "//pkg/kv/kvclient/kvcoord",
         "//pkg/kv/kvclient/rangecache",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/diskmap",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/kv/kvserver/protectedts",
@@ -56,7 +58,6 @@ go_library(
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
         "//pkg/sql/sqlliveness",
-        "//pkg/sql/sqlutil",
         "//pkg/sql/types",
         "//pkg/storage/fs",
         "//pkg/util/admission",

@@ -25,11 +25,13 @@ import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { IndexDetailsPageData } from "./indexDetailsPage";
 import {
   selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
   selectIsTenant,
 } from "../store/uiConfig";
 import { BreadcrumbItem } from "../breadcrumbs";
 import { RecommendationType as RecType } from "./indexDetailsPage";
 import { nodeRegionsByIDSelector } from "../store/nodes";
+import { selectTimeScale } from "src/store/utils/selectors";
 const { RecommendationType } = cockroach.sql.IndexRecommendation;
 
 export const selectIndexDetails = createSelector(
@@ -41,10 +43,12 @@ export const selectIndexDetails = createSelector(
     getMatchParamByName(props.match, tableNameAttr),
   (_state: AppState, props: RouteComponentProps): string =>
     getMatchParamByName(props.match, indexNameAttr),
-  (state: AppState) => state.adminUI.indexStats.cachedData,
+  (state: AppState) => state.adminUI?.indexStats.cachedData,
   (state: AppState) => selectIsTenant(state),
   (state: AppState) => selectHasViewActivityRedactedRole(state),
   (state: AppState) => nodeRegionsByIDSelector(state),
+  (state: AppState) => selectHasAdminRole(state),
+  (state: AppState) => selectTimeScale(state),
   (
     database,
     schema,
@@ -54,6 +58,8 @@ export const selectIndexDetails = createSelector(
     isTenant,
     hasViewActivityRedactedRole,
     nodeRegions,
+    hasAdminRole,
+    timeScale,
   ): IndexDetailsPageData => {
     const stats = indexStats[generateTableID(database, table)];
     const details = stats?.data?.statistics.filter(
@@ -61,7 +67,7 @@ export const selectIndexDetails = createSelector(
     )[0];
     const filteredIndexRecommendations =
       stats?.data?.index_recommendations.filter(
-        indexRec => indexRec.index_id === details.statistics.key.index_id,
+        indexRec => indexRec.index_id === details?.statistics.key.index_id,
       ) || [];
     const indexRecommendations = filteredIndexRecommendations.map(indexRec => {
       let type: RecType = "Unknown";
@@ -86,7 +92,9 @@ export const selectIndexDetails = createSelector(
         index,
       ),
       isTenant: isTenant,
+      timeScale: timeScale,
       hasViewActivityRedactedRole: hasViewActivityRedactedRole,
+      hasAdminRole: hasAdminRole,
       nodeRegions: nodeRegions,
       details: {
         loading: !!stats?.inFlight,

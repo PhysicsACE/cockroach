@@ -203,12 +203,8 @@ func alterColumnTypeGeneral(
 
 	// Disallow ALTER COLUMN TYPE general for columns that have a check
 	// constraint.
-	for i := range tableDesc.Checks {
-		uses, err := tableDesc.CheckConstraintUsesColumn(tableDesc.Checks[i], col.GetID())
-		if err != nil {
-			return err
-		}
-		if uses {
+	for _, ck := range tableDesc.EnforcedCheckConstraints() {
+		if ck.CollectReferencedColumnIDs().Contains(col.GetID()) {
 			return colWithConstraintNotSupportedErr
 		}
 	}
@@ -264,8 +260,7 @@ func alterColumnTypeGeneral(
 	}
 
 	nameExists := func(name string) bool {
-		_, err := tableDesc.FindColumnWithName(tree.Name(name))
-		return err == nil
+		return catalog.FindColumnByName(tableDesc, name) != nil
 	}
 
 	shadowColName := tabledesc.GenerateUniqueName(col.GetName(), nameExists)
@@ -287,10 +282,11 @@ func alterColumnTypeGeneral(
 			tableDesc,
 			using,
 			toType,
-			"ALTER COLUMN TYPE USING EXPRESSION",
+			tree.AlterColumnTypeUsingExpr,
 			&params.p.semaCtx,
 			volatility.Volatile,
 			tn,
+			params.ExecCfg().Settings.Version.ActiveVersion(ctx),
 		)
 
 		if err != nil {

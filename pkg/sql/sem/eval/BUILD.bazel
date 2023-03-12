@@ -43,6 +43,7 @@ go_library(
         "//pkg/jobs/jobspb",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/repstream/streampb",
         "//pkg/roachpb",
@@ -50,6 +51,7 @@ go_library(
         "//pkg/server/telemetry",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/lex",
         "//pkg/sql/parser",
@@ -113,6 +115,7 @@ go_test(
     embed = [":eval"],
     deps = [
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/sql/faketreeeval",

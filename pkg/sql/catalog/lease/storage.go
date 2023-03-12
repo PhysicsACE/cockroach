@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -27,10 +28,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -47,14 +48,13 @@ import (
 // the manager. Some of these fields belong on the manager, in any case, since
 // they're only used by the manager and not by the store itself.
 type storage struct {
-	nodeIDContainer  *base.SQLIDContainer
-	db               *kv.DB
-	clock            *hlc.Clock
-	internalExecutor sqlutil.InternalExecutor
-	settings         *cluster.Settings
-	codec            keys.SQLCodec
-	regionPrefix     *atomic.Value
-	sysDBCache       *catkv.SystemDatabaseCache
+	nodeIDContainer *base.SQLIDContainer
+	db              isql.DB
+	clock           *hlc.Clock
+	settings        *cluster.Settings
+	codec           keys.SQLCodec
+	regionPrefix    *atomic.Value
+	sysDBCache      *catkv.SystemDatabaseCache
 
 	// group is used for all calls made to acquireNodeLease to prevent
 	// concurrent lease acquisitions from the store.
@@ -86,6 +86,14 @@ var LeaseRenewalDuration = settings.RegisterDurationSetting(
 	"controls the default time before a lease expires when acquisition to renew the lease begins",
 	base.DefaultDescriptorLeaseRenewalTimeout)
 
+// LeaseRenewalCrossValidate controls if cross validation should be done during
+// lease renewal.
+var LeaseRenewalCrossValidate = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.catalog.descriptor_lease_renewal_cross_validation.enabled",
+	"controls if cross validation should be done during lease renewal",
+	base.DefaultLeaseRenewalCrossValidate)
+
 func (s storage) leaseRenewalTimeout() time.Duration {
 	return LeaseRenewalDuration.Get(&s.settings.SV)
 }
@@ -97,6 +105,10 @@ func (s storage) jitteredLeaseDuration() time.Duration {
 	jitterFraction := LeaseJitterFraction.Get(&s.settings.SV)
 	return time.Duration(float64(leaseDuration) * (1 - jitterFraction +
 		2*jitterFraction*rand.Float64()))
+}
+
+func (s storage) crossValidateDuringRenewal() bool {
+	return LeaseRenewalCrossValidate.Get(&s.settings.SV)
 }
 
 // acquire a lease on the most recent version of a descriptor. If the lease
@@ -148,7 +160,6 @@ func (s storage) acquire(
 			// a monotonically increasing expiration.
 			expiration = minExpiration.Add(int64(time.Millisecond), 0)
 		}
-
 		desc, err = s.mustGetDescriptorByID(ctx, txn, id)
 		if err != nil {
 			return err
@@ -175,8 +186,8 @@ func (s storage) acquire(
 	// Run a retry loop to deal with AmbiguousResultErrors. All other error types
 	// are propagated up to the caller.
 	for r := retry.StartWithCtx(ctx, retry.Options{}); r.Next(); {
-		err := s.db.Txn(ctx, acquireInTxn)
-		var pErr *roachpb.AmbiguousResultError
+		err := s.db.KV().Txn(ctx, acquireInTxn)
+		var pErr *kvpb.AmbiguousResultError
 		switch {
 		case errors.As(err, &pErr):
 			log.Infof(ctx, "ambiguous error occurred during lease acquisition for %v, retrying: %v", id, err)
@@ -251,7 +262,7 @@ func (s storage) getForExpiration(
 	ctx context.Context, expiration hlc.Timestamp, id descpb.ID,
 ) (catalog.Descriptor, error) {
 	var desc catalog.Descriptor
-	err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	err := s.db.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		prevTimestamp := expiration.Prev()
 		err := txn.SetFixedTimestamp(ctx, prevTimestamp)
 		if err != nil {
@@ -291,13 +302,17 @@ func (s storage) mustGetDescriptorByID(
 		return nil, err
 	}
 	desc := c.LookupDescriptor(id)
+	validationLevel := catalog.ValidationLevelSelfOnly
+	if s.crossValidateDuringRenewal() {
+		validationLevel = validate.ImmutableRead
+	}
 	vd := catkv.NewCatalogReaderBackedValidationDereferencer(cr, txn, nil /* dvmpMaybe */)
 	ve := validate.Validate(
 		ctx,
 		s.settings.Version.ActiveVersion(ctx),
 		vd,
 		catalog.ValidationReadTelemetry,
-		validate.ImmutableRead,
+		validationLevel,
 		desc,
 	)
 	if err := ve.CombinedError(); err != nil {

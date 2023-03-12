@@ -10,7 +10,6 @@
 
 import { createAction, createReducer } from "@reduxjs/toolkit";
 import { combineReducers, createStore } from "redux";
-import { TxnInsightEvent } from "src/insights";
 import {
   ClusterLocksReqState,
   reducer as clusterLocks,
@@ -24,18 +23,18 @@ import {
   reducer as indexStats,
 } from "./indexStats/indexStats.reducer";
 import {
-  reducer as transactionInsightDetails,
-  TransactionInsightDetailsCachedState,
+  reducer as txnInsightDetails,
+  TxnInsightDetailsCachedState,
 } from "./insightDetails/transactionInsightDetails";
 import {
-  ExecutionInsightsState,
-  reducer as executionInsights,
+  StmtInsightsState,
+  reducer as stmtInsights,
 } from "./insights/statementInsights";
 import {
-  reducer as transactionInsights,
-  TransactionInsightsState,
+  TxnInsightsState,
+  reducer as txnInsights,
 } from "./insights/transactionInsights";
-import { JobState, reducer as job } from "./jobDetails";
+import { JobDetailsReducerState, reducer as job } from "./jobDetails";
 import { JobsState, reducer as jobs } from "./jobs";
 import { LivenessState, reducer as liveness } from "./liveness";
 import { LocalStorageState, reducer as localStorage } from "./localStorage";
@@ -60,6 +59,10 @@ import {
 } from "./terminateQuery";
 import { reducer as uiConfig, UIConfigState } from "./uiConfig";
 import { DOMAIN_NAME } from "./utils";
+import {
+  reducer as statementFingerprintInsights,
+  StatementFingerprintInsightsCachedState,
+} from "./insights/statementFingerprintInsights";
 
 export type AdminUiState = {
   statementDiagnostics: StatementDiagnosticsState;
@@ -73,13 +76,14 @@ export type AdminUiState = {
   sqlDetailsStats: SQLDetailsStatsReducerState;
   indexStats: IndexStatsReducerState;
   jobs: JobsState;
-  job: JobState;
+  job: JobDetailsReducerState;
   clusterLocks: ClusterLocksReqState;
   databasesList: DatabasesListState;
-  transactionInsights: TransactionInsightsState;
-  transactionInsightDetails: TransactionInsightDetailsCachedState;
-  executionInsights: ExecutionInsightsState;
+  stmtInsights: StmtInsightsState;
+  txnInsightDetails: TxnInsightDetailsCachedState;
+  txnInsights: TxnInsightsState;
   schemaInsights: SchemaInsightsState;
+  statementFingerprintInsights: StatementFingerprintInsightsCachedState;
 };
 
 export type AppState = {
@@ -92,9 +96,9 @@ export const reducers = combineReducers<AdminUiState>({
   nodes,
   liveness,
   sessions,
-  transactionInsights,
-  transactionInsightDetails,
-  executionInsights,
+  txnInsightDetails,
+  stmtInsights,
+  txnInsights,
   terminateQuery,
   uiConfig,
   sqlStats,
@@ -105,6 +109,7 @@ export const reducers = combineReducers<AdminUiState>({
   clusterLocks,
   databasesList,
   schemaInsights,
+  statementFingerprintInsights,
 });
 
 export const rootActions = {

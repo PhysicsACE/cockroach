@@ -59,9 +59,11 @@
 /pkg/sql/job_exec_context*   @cockroachdb/sql-queries @cockroachdb/jobs-prs
 /pkg/sql/delegate/*job*.go   @cockroachdb/jobs-prs
 
+/pkg/sql/appstatspb          @cockroachdb/sql-observability
 /pkg/sql/execstats/          @cockroachdb/sql-observability
 /pkg/sql/scheduledlogging/   @cockroachdb/sql-observability
 /pkg/sql/sqlstats/           @cockroachdb/sql-observability
+/pkg/ccl/testccl/sqlstatsccl/ @cockroachdb/sql-observability
 
 /pkg/sql/sem/tree/           @cockroachdb/sql-syntax-prs
 /pkg/sql/parser/             @cockroachdb/sql-syntax-prs
@@ -84,7 +86,7 @@
 
 /pkg/ccl/schemachangerccl/   @cockroachdb/sql-schema
 /pkg/sql/catalog/            @cockroachdb/sql-schema
-/pkg/sql/catalog/multiregion @cockroachdb/multiregion
+/pkg/sql/catalog/multiregion @cockroachdb/sql-schema
 /pkg/sql/doctor/             @cockroachdb/sql-schema
 /pkg/sql/gcjob/              @cockroachdb/sql-schema
 /pkg/sql/gcjob_test/         @cockroachdb/sql-schema
@@ -152,6 +154,8 @@
 /pkg/server/pgurl/                       @cockroachdb/sql-sessions @cockroachdb/cli-prs
 /pkg/server/server_http*.go              @cockroachdb/obs-inf-prs @cockroachdb/server-prs
 /pkg/server/server_import_ts*.go         @cockroachdb/obs-inf-prs @cockroachdb/kv-prs
+/pkg/server/server_controller_http.go    @cockroachdb/obs-inf-prs @cockroachdb/server-prs
+/pkg/server/server_controller_sql.go     @cockroachdb/sql-sessions @cockroachdb/server-prs
 /pkg/server/serverpb/                    @cockroachdb/obs-inf-prs @cockroachdb/server-prs
 /pkg/server/serverpb/authentication*     @cockroachdb/obs-inf-prs @cockroachdb/prodsec @cockroachdb/server-prs
 /pkg/server/serverpb/index_reco*         @cockroachdb/sql-observability @cockroachdb/obs-inf-prs
@@ -171,10 +175,8 @@
 
 /pkg/ccl/jobsccl/            @cockroachdb/jobs-prs
 /pkg/ccl/changefeedccl/      @cockroachdb/cdc-prs
-# TODO(dt): either add the cockroach repository to this team or remove this team from
-# CODEOWNERS.
-#!/pkg/ccl/streamingccl/       @cockroachdb/tenant-streaming
 
+/pkg/ccl/streamingccl/       @cockroachdb/disaster-recovery
 /pkg/ccl/backupccl/          @cockroachdb/disaster-recovery
 /pkg/ccl/backupccl/*_job.go  @cockroachdb/disaster-recovery @cockroachdb/jobs-prs
 /pkg/ccl/storageccl/         @cockroachdb/disaster-recovery
@@ -196,6 +198,19 @@
 /pkg/kv/kvclient/kvstreamer             @cockroachdb/sql-queries
 /pkg/kv/kvclient/rangefeed/             @cockroachdb/repl-prs
 /pkg/kv/kvnemesis/                      @cockroachdb/kv-prs
+/pkg/kv/kvpb/                           @cockroachdb/kv-prs
+/pkg/kv/kvpb/.gitattributes             @cockroachdb/dev-inf
+/pkg/kv/kvpb/ambiguous_*                @cockroachdb/kv-prs
+/pkg/kv/kvpb/api*                       @cockroachdb/kv-prs
+/pkg/kv/kvpb/batch*                     @cockroachdb/kv-prs
+/pkg/kv/kvpb/error*                     @cockroachdb/kv-prs
+/pkg/kv/kvpb/gen                        @cockroachdb/dev-inf
+/pkg/kv/kvpb/gen.bzl                    @cockroachdb/dev-inf
+/pkg/kv/kvpb/kvpbmock/                  @cockroachdb/kv-prs
+/pkg/kv/kvpb/method*                    @cockroachdb/kv-prs
+/pkg/kv/kvpb/string_test.go             @cockroachdb/kv-prs
+/pkg/kv/kvpb/testdata/ambi*             @cockroachdb/kv-prs
+/pkg/kv/kvpb/testdata/repl*             @cockroachdb/kv-prs
 /pkg/kv/kvprober/                       @cockroachdb/kv-prs
 # Same subdirectory rule as above for `/pkg/kv`
 /pkg/kv/kvserver/*.*                    @cockroachdb/kv-prs
@@ -222,7 +237,8 @@
 /pkg/kv/kvserver/gc/                    @cockroachdb/kv-prs
 /pkg/kv/kvserver/idalloc/               @cockroachdb/kv-prs
 /pkg/kv/kvserver/intentresolver/        @cockroachdb/kv-prs
-/pkg/kv/kvserver/kvadmission/           @cockroachdb/kv-prs
+/pkg/kv/kvserver/kvadmission/           @cockroachdb/admission-control
+/pkg/kv/kvserver/kvflowcontrol/         @cockroachdb/admission-control
 /pkg/kv/kvserver/kvserverbase/          @cockroachdb/kv-prs
 /pkg/kv/kvserver/kvserverpb/            @cockroachdb/kv-prs
 /pkg/kv/kvserver/kvstorage/             @cockroachdb/repl-prs
@@ -285,10 +301,10 @@
 #!/pkg/ccl/upgradeccl/       @cockroachdb/unowned
 #!/pkg/ccl/logictestccl/       @cockroachdb/sql-queries-noreview
 #!/pkg/ccl/sqlitelogictestccl/ @cockroachdb/sql-queries-noreview
-/pkg/ccl/multiregionccl/     @cockroachdb/multiregion
+/pkg/ccl/multiregionccl/     @cockroachdb/sql-schema
 /pkg/ccl/multitenantccl/     @cockroachdb/multi-tenant
 #!/pkg/ccl/oidcccl/          @cockroachdb/unowned
-/pkg/ccl/partitionccl/       @cockroachdb/sql-schema @cockroachdb/multiregion
+/pkg/ccl/partitionccl/       @cockroachdb/sql-schema
 /pkg/ccl/serverccl/          @cockroachdb/server-prs
 /pkg/ccl/serverccl/server_sql* @cockroachdb/multi-tenant @cockroachdb/server-prs
 /pkg/ccl/serverccl/tenant_*  @cockroachdb/multi-tenant @cockroachdb/server-prs
@@ -342,6 +358,7 @@
 /pkg/cmd/returncheck/        @cockroachdb/dev-inf
 /pkg/cmd/roachprod/          @cockroachdb/test-eng
 /pkg/cmd/roachprod/vm/azure/auth.go @cockroachdb/test-eng @cockroachdb/prodsec
+/pkg/cmd/roachprod-microbench/ @cockroachdb/test-eng
 /pkg/cmd/roachprod-stress/   @cockroachdb/test-eng
 /pkg/cmd/roachtest/          @cockroachdb/test-eng
 /pkg/cmd/label-merged-pr/    @cockroachdb/dev-inf
@@ -387,33 +404,21 @@
 # Don't ping KV on updates to reserved descriptor IDs and such.
 #!/pkg/keys/constants.go       @cockroachdb/kv-prs-noreview
 /pkg/upgrade/                @cockroachdb/sql-schema
+/pkg/keyvisualizer/          @cockroachdb/kv-obs-prs
 /pkg/multitenant/            @cockroachdb/multi-tenant
 /pkg/release/                @cockroachdb/dev-inf
 /pkg/roachpb/.gitattributes  @cockroachdb/dev-inf
-/pkg/roachpb/ambiguous_*     @cockroachdb/kv-prs
-/pkg/roachpb/api*            @cockroachdb/kv-prs
-/pkg/roachpb/batch*          @cockroachdb/kv-prs
 #!/pkg/roachpb/BUILD.bazel     @cockroachdb/kv-prs-noreview
 /pkg/roachpb/data*           @cockroachdb/kv-prs
-/pkg/roachpb/dep_test.go     @cockroachdb/dev-inf
-/pkg/roachpb/error*          @cockroachdb/kv-prs
-/pkg/roachpb/gen             @cockroachdb/dev-inf
-/pkg/roachpb/gen.bzl         @cockroachdb/dev-inf
-/pkg/roachpb/app*            @cockroachdb/sql-observability
 /pkg/roachpb/index*          @cockroachdb/sql-observability
 /pkg/roachpb/internal*       @cockroachdb/kv-prs
 /pkg/roachpb/io-formats*     @cockroachdb/disaster-recovery
 #!/pkg/roachpb/main_test.go    @cockroachdb/kv-prs-noreview
 /pkg/roachpb/merge_spans*    @cockroachdb/kv-prs
 /pkg/roachpb/metadata*       @cockroachdb/kv-prs
-/pkg/roachpb/method*         @cockroachdb/kv-prs
-/pkg/roachpb/roachpbmock/    @cockroachdb/kv-prs
-/pkg/roachpb/replica_*       @cockroachdb/kv-prs
 /pkg/roachpb/span*           @cockroachdb/kv-prs
 /pkg/roachpb/string_test.go  @cockroachdb/kv-prs
 /pkg/roachpb/tenant*         @cockroachdb/kv-prs
-/pkg/roachpb/testdata/ambi*  @cockroachdb/kv-prs
-/pkg/roachpb/testdata/repl*  @cockroachdb/kv-prs
 #!/pkg/roachpb/version*      @cockroachdb/unowned
 /pkg/roachprod/              @cockroachdb/test-eng
 /pkg/rpc/                    @cockroachdb/kv-prs

@@ -179,12 +179,16 @@ func (p *PrettyCfg) Doc(f NodeFormatter) pretty.Doc {
 }
 
 func (p *PrettyCfg) docAsString(f NodeFormatter) pretty.Doc {
+	txt := AsStringWithFlags(f, p.fmtFlags())
+	return pretty.Text(strings.TrimSpace(txt))
+}
+
+func (p *PrettyCfg) fmtFlags() FmtFlags {
 	prettyFlags := FmtShowPasswords | FmtParsable
 	if p.ValueRedaction {
 		prettyFlags |= FmtMarkRedactionNode | FmtOmitNameRedaction
 	}
-	txt := AsStringWithFlags(f, prettyFlags)
-	return pretty.Text(strings.TrimSpace(txt))
+	return prettyFlags
 }
 
 func (p *PrettyCfg) nestUnder(a, b pretty.Doc) pretty.Doc {
@@ -656,11 +660,11 @@ func (node *With) docRow(p *PrettyCfg) pretty.TableRow {
 	d := make([]pretty.Doc, len(node.CTEList))
 	for i, cte := range node.CTEList {
 		asString := "AS"
-		if cte.Mtr.Set {
-			if !cte.Mtr.Materialize {
-				asString += " NOT"
-			}
+		switch cte.Mtr {
+		case CTEMaterializeAlways:
 			asString += " MATERIALIZED"
+		case CTEMaterializeNever:
+			asString += " NOT MATERIALIZED"
 		}
 		d[i] = p.nestUnder(
 			p.Doc(&cte.Name),
@@ -1010,14 +1014,14 @@ func (node *Insert) doc(p *PrettyCfg) pretty.Doc {
 
 func (node *NameList) doc(p *PrettyCfg) pretty.Doc {
 	d := make([]pretty.Doc, len(*node))
-	for i, n := range *node {
-		d[i] = p.Doc(&n)
+	for i := range *node {
+		d[i] = p.Doc(&(*node)[i])
 	}
 	return p.commaSeparated(d...)
 }
 
 func (node *CastExpr) doc(p *PrettyCfg) pretty.Doc {
-	typ := pretty.Text(node.Type.SQLString())
+	typ := p.formatType(node.Type)
 
 	switch node.SyntaxMode {
 	case CastPrepend:
@@ -1121,8 +1125,9 @@ func (node *Tuple) doc(p *PrettyCfg) pretty.Doc {
 	d := p.bracket("(", exprDoc, ")")
 	if len(node.Labels) > 0 {
 		labels := make([]pretty.Doc, len(node.Labels))
-		for i, n := range node.Labels {
-			labels[i] = p.Doc((*Name)(&n))
+		for i := range node.Labels {
+			n := &node.Labels[i]
+			labels[i] = p.Doc((*Name)(n))
 		}
 		d = p.bracket("(", pretty.Stack(
 			d,
@@ -1889,7 +1894,12 @@ func (node *ColumnTableDef) docRow(p *PrettyCfg) pretty.TableRow {
 	// ColumnTableDef node type will not be specified if it represents a CREATE
 	// TABLE ... AS query.
 	if node.Type != nil {
-		clauses = append(clauses, pretty.Text(node.columnTypeString()))
+		clauses = append(clauses, func() pretty.Doc {
+			if name, replaced := node.replacedSerialTypeName(); replaced {
+				return pretty.Text(name)
+			}
+			return p.formatType(node.Type)
+		}())
 	}
 
 	// Compute expression (for computed columns).
@@ -2058,6 +2068,12 @@ func (node *ColumnTableDef) docRow(p *PrettyCfg) pretty.TableRow {
 	}
 
 	return tblRow
+}
+
+func (p *PrettyCfg) formatType(typ ResolvableTypeReference) pretty.Doc {
+	ctx := NewFmtCtx(p.fmtFlags())
+	ctx.FormatTypeReference(typ)
+	return pretty.Text(strings.TrimSpace(ctx.String()))
 }
 
 func (node *CheckConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
@@ -2329,7 +2345,7 @@ func (node *Prepare) docTable(p *PrettyCfg) []pretty.TableRow {
 	if len(node.Types) > 0 {
 		typs := make([]pretty.Doc, len(node.Types))
 		for i, t := range node.Types {
-			typs[i] = pretty.Text(t.SQLString())
+			typs[i] = p.formatType(t)
 		}
 		name = pretty.ConcatSpace(name,
 			p.bracket("(", p.commaSeparated(typs...), ")"),
@@ -2437,7 +2453,7 @@ func (p *PrettyCfg) jsonCast(sv *StrVal, op string, typ *types.T) pretty.Doc {
 	return pretty.Fold(pretty.Concat,
 		p.jsonString(sv.RawString()),
 		pretty.Text(op),
-		pretty.Text(typ.SQLString()),
+		p.formatType(typ),
 	)
 }
 

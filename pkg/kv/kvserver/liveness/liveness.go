@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -80,13 +81,13 @@ func (e *errRetryLiveness) Error() string {
 }
 
 func isErrRetryLiveness(ctx context.Context, err error) bool {
-	if errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)) {
+	if errors.HasType(err, (*kvpb.AmbiguousResultError)(nil)) {
 		// We generally want to retry ambiguous errors immediately, except if the
 		// ctx is canceled - in which case the ambiguous error is probably caused
 		// by the cancellation (and in any case it's pointless to retry with a
 		// canceled ctx).
 		return ctx.Err() == nil
-	} else if errors.HasType(err, (*roachpb.TransactionStatusError)(nil)) {
+	} else if errors.HasType(err, (*kvpb.TransactionStatusError)(nil)) {
 		// 21.2 nodes can return a TransactionStatusError when they should have
 		// returned an AmbiguousResultError.
 		// TODO(andrei): Remove this in 22.2.
@@ -144,7 +145,7 @@ type Metrics struct {
 	HeartbeatSuccesses *metric.Counter
 	HeartbeatFailures  telemetry.CounterWithMetric
 	EpochIncrements    telemetry.CounterWithMetric
-	HeartbeatLatency   *metric.Histogram
+	HeartbeatLatency   metric.IHistogram
 }
 
 // IsLiveCallback is invoked when a node's IsLive state changes to true.
@@ -310,9 +311,12 @@ func NewNodeLiveness(opts NodeLivenessOptions) *NodeLiveness {
 		HeartbeatSuccesses: metric.NewCounter(metaHeartbeatSuccesses),
 		HeartbeatFailures:  telemetry.NewCounterWithMetric(metaHeartbeatFailures),
 		EpochIncrements:    telemetry.NewCounterWithMetric(metaEpochIncrements),
-		HeartbeatLatency: metric.NewHistogram(
-			metaHeartbeatLatency, opts.HistogramWindowInterval, metric.NetworkLatencyBuckets,
-		),
+		HeartbeatLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaHeartbeatLatency,
+			Duration: opts.HistogramWindowInterval,
+			Buckets:  metric.NetworkLatencyBuckets,
+		}),
 	}
 	nl.mu.nodes = make(map[roachpb.NodeID]Record)
 	nl.heartbeatToken <- struct{}{}
@@ -582,7 +586,7 @@ func (nl *NodeLiveness) CreateLivenessRecord(ctx context.Context, nodeID roachpb
 			// We don't bother adding a gossip trigger, that'll happen with the
 			// first heartbeat. We still keep it as a 1PC commit to avoid leaving
 			// write intents.
-			b.AddRawRequest(&roachpb.EndTxnRequest{
+			b.AddRawRequest(&kvpb.EndTxnRequest{
 				Commit:     true,
 				Require1PC: true,
 			})
@@ -1351,7 +1355,7 @@ func (nl *NodeLiveness) updateLivenessAttempt(
 		// Use a trigger on EndTxn to indicate that node liveness should be
 		// re-gossiped. Further, require that this transaction complete as a one
 		// phase commit to eliminate the possibility of leaving write intents.
-		b.AddRawRequest(&roachpb.EndTxnRequest{
+		b.AddRawRequest(&kvpb.EndTxnRequest{
 			Commit:     true,
 			Require1PC: true,
 			InternalCommitTrigger: &roachpb.InternalCommitTrigger{
@@ -1365,7 +1369,7 @@ func (nl *NodeLiveness) updateLivenessAttempt(
 		})
 		return txn.Run(ctx, b)
 	}); err != nil {
-		if tErr := (*roachpb.ConditionFailedError)(nil); errors.As(err, &tErr) {
+		if tErr := (*kvpb.ConditionFailedError)(nil); errors.As(err, &tErr) {
 			if tErr.ActualValue == nil {
 				return Record{}, handleCondFailed(Record{})
 			}
@@ -1523,6 +1527,27 @@ func (nl *NodeLiveness) GetNodeCount() int {
 	for _, l := range nl.mu.nodes {
 		if l.Membership.Active() {
 			count++
+		}
+	}
+	return count
+}
+
+// GetNodeCountWithOverrides returns a count of the number of nodes in the cluster,
+// including dead nodes, but excluding decommissioning or decommissioned nodes,
+// using the provided set of liveness overrides.
+func (nl *NodeLiveness) GetNodeCountWithOverrides(
+	overrides map[roachpb.NodeID]livenesspb.NodeLivenessStatus,
+) int {
+	nl.mu.RLock()
+	defer nl.mu.RUnlock()
+	var count int
+	for _, l := range nl.mu.nodes {
+		if l.Membership.Active() {
+			if overrideStatus, ok := overrides[l.NodeID]; !ok ||
+				(overrideStatus != livenesspb.NodeLivenessStatus_DECOMMISSIONING &&
+					overrideStatus != livenesspb.NodeLivenessStatus_DECOMMISSIONED) {
+				count++
+			}
 		}
 	}
 	return count

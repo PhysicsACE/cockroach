@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/grafana"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
@@ -51,7 +52,7 @@ func registerSnapshotOverload(r registry.Registry) {
 			crdbNodes := c.Spec().NodeCount - 1
 			workloadNode := crdbNodes + 1
 			for i := 1; i <= crdbNodes; i++ {
-				startOpts := option.DefaultStartOpts()
+				startOpts := option.DefaultStartOptsNoBackups()
 				startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, fmt.Sprintf("--attrs=n%d", i))
 				c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.Node(i))
 			}
@@ -95,7 +96,7 @@ func registerSnapshotOverload(r registry.Registry) {
 					"/", makeWorkloadScrapeNodes(c.Node(workloadNode).InstallNodes()[0], []workloadInstance{
 						{nodes: c.Node(workloadNode)},
 					})))
-				promCfg.WithGrafanaDashboard("http://go.crdb.dev/p/snapshot-admission-control-grafana")
+				promCfg.WithGrafanaDashboardJSON(grafana.SnapshotAdmissionControlGrafanaJSON)
 				_, cleanupFunc := setupPrometheusForRoachtest(ctx, t, c, promCfg, nil)
 				defer cleanupFunc()
 			}

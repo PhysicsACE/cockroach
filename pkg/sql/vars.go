@@ -473,6 +473,25 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`direct_columnar_scans_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`direct_columnar_scans_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar(`direct_columnar_scans_enabled`, s)
+			if err != nil {
+				return err
+			}
+			m.SetDirectColumnarScansEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().DirectColumnarScansEnabled), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(colfetcher.DirectScansEnabled.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
 	`disable_plan_gists`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`disable_plan_gists`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
@@ -1289,6 +1308,15 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
+	// See https://www.postgresql.org/docs/9.4/runtime-config-connection.html
+	`ssl`: {
+		Hidden: true,
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			insecure := evalCtx.ExecCfg.RPCContext.Config.Insecure || evalCtx.ExecCfg.RPCContext.Config.AcceptSQLWithoutTLS
+			return formatBoolAsPostgresSetting(!insecure), nil
+		},
+	},
+
 	// CockroachDB extension.
 	`crdb_version`: makeReadOnlyVarWithFn(func() string {
 		return build.GetInfo().Short()
@@ -1726,24 +1754,6 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
-	`enable_experimental_stream_replication`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`enable_experimental_stream_replication`),
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar(`enable_experimental_stream_replication`, s)
-			if err != nil {
-				return err
-			}
-			m.SetStreamReplicationEnabled(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().EnableStreamReplication), nil
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(experimentalStreamReplicationEnabled.Get(sv))
-		},
-	},
-
 	// CockroachDB extension. See experimentalComputedColumnRewrites or
 	// ParseComputedColumnRewrites for a description of the format.
 	`experimental_computed_column_rewrites`: {
@@ -1905,6 +1915,24 @@ var varGen = map[string]sessionVar{
 		},
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().InjectRetryErrorsEnabled), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension. Allows for testing of transaction retry logic
+	// using the cockroach_restart savepoint.
+	`inject_retry_errors_on_commit_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`inject_retry_errors_on_commit_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("inject_retry_errors_on_commit_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetInjectRetryErrorsOnCommitEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().InjectRetryErrorsOnCommitEnabled), nil
 		},
 		GlobalDefault: globalFalse,
 	},
@@ -2323,6 +2351,40 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`copy_from_retries_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`copy_from_retries_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("copy_from_retries_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetCopyFromRetriesEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().CopyFromRetriesEnabled), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`declare_cursor_statement_timeout_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`declare_cursor_statement_timeout_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("declare_cursor_statement_timeout_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetDeclareCursorStatementTimeoutEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().DeclareCursorStatementTimeoutEnabled), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
 	`enforce_home_region`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enforce_home_region`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
@@ -2416,6 +2478,57 @@ var varGen = map[string]sessionVar{
 		},
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
+	`optimizer_use_improved_split_disjunction_for_joins`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_improved_split_disjunction_for_joins`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_improved_split_disjunction_for_joins", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseImprovedSplitDisjunctionForJoins(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
+	`enforce_home_region_follower_reads_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enforce_home_region_follower_reads_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enforce_home_region_follower_reads_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetEnforceHomeRegionFollowerReadsEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().EnforceHomeRegionFollowerReadsEnabled), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`optimizer_always_use_histograms`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_always_use_histograms`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_always_use_histograms", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerAlwaysUseHistograms(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerAlwaysUseHistograms), nil
 		},
 		GlobalDefault: globalTrue,
 	},

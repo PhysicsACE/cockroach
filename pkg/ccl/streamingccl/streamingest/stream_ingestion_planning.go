@@ -14,14 +14,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -35,10 +36,25 @@ import (
 const defaultRetentionTTLSeconds = int32(25 * 60 * 60)
 
 func streamIngestionJobDescription(
-	p sql.PlanHookState, streamIngestion *tree.CreateTenantFromReplication,
+	p sql.PlanHookState, sourceAddr string, streamIngestion *tree.CreateTenantFromReplication,
 ) (string, error) {
+	redactedSourceAddr, err := redactSourceURI(sourceAddr)
+	if err != nil {
+		return "", err
+	}
+
+	redactedCreateStmt := &tree.CreateTenantFromReplication{
+		TenantSpec:                  streamIngestion.TenantSpec,
+		ReplicationSourceTenantName: streamIngestion.ReplicationSourceTenantName,
+		ReplicationSourceAddress:    tree.NewDString(redactedSourceAddr),
+		Options:                     streamIngestion.Options,
+	}
 	ann := p.ExtendedEvalContext().Annotations
-	return tree.AsStringWithFQNames(streamIngestion, ann), nil
+	return tree.AsStringWithFQNames(redactedCreateStmt, ann), nil
+}
+
+func redactSourceURI(addr string) (string, error) {
+	return cloud.SanitizeExternalStorageURI(addr, streamclient.RedactableURLParameters)
 }
 
 func ingestionTypeCheck(
@@ -49,6 +65,8 @@ func ingestionTypeCheck(
 		return false, nil, nil
 	}
 	if err := exprutil.TypeCheck(ctx, "INGESTION", p.SemaCtx(),
+		exprutil.TenantSpec{TenantSpec: ingestionStmt.TenantSpec},
+		exprutil.TenantSpec{TenantSpec: ingestionStmt.ReplicationSourceTenantName},
 		exprutil.Strings{
 			ingestionStmt.ReplicationSourceAddress,
 			ingestionStmt.Options.Retention}); err != nil {
@@ -66,17 +84,16 @@ func ingestionPlanHook(
 		return nil, nil, nil, false, nil
 	}
 
-	// Check if the experimental feature is enabled.
-	if !p.SessionData().EnableStreamReplication {
+	if !streamingccl.CrossClusterReplicationEnabled.Get(&p.ExecCfg().Settings.SV) {
 		return nil, nil, nil, false, errors.WithTelemetry(
 			pgerror.WithCandidateCode(
 				errors.WithHint(
-					errors.Newf("stream replication is only supported experimentally"),
-					"You can enable stream replication by running `SET enable_experimental_stream_replication = true`.",
+					errors.Newf("cross cluster replication is disabled"),
+					"You can enable cross cluster replication by running `SET CLUSTER SETTING cross_cluster_replication.enabled = true`.",
 				),
 				pgcode.ExperimentalFeature,
 			),
-			"replication.ingest.disabled",
+			"cross_cluster_replication.enabled",
 		)
 	}
 
@@ -88,6 +105,16 @@ func ingestionPlanHook(
 	exprEval := p.ExprEvaluator("INGESTION")
 
 	from, err := exprEval.String(ctx, ingestionStmt.ReplicationSourceAddress)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+
+	_, _, sourceTenant, err := exprEval.TenantSpec(ctx, ingestionStmt.ReplicationSourceTenantName)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+
+	_, dstTenantID, dstTenantName, err := exprEval.TenantSpec(ctx, ingestionStmt.TenantSpec)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -128,29 +155,27 @@ func ingestionPlanHook(
 		}
 
 		streamAddress = streamingccl.StreamAddress(streamURL.String())
-		sourceTenant := ingestionStmt.ReplicationSourceTenantName
-		destinationTenant := ingestionStmt.Name
 
 		// TODO(adityamaru): Add privileges checks. Probably the same as RESTORE.
 		if roachpb.IsSystemTenantName(roachpb.TenantName(sourceTenant)) ||
-			roachpb.IsSystemTenantName(roachpb.TenantName(destinationTenant)) {
-			return errors.Newf("neither the source tenant %q nor the destination tenant %q can be the system tenant",
-				sourceTenant, destinationTenant)
+			roachpb.IsSystemTenantName(roachpb.TenantName(dstTenantName)) ||
+			roachpb.IsSystemTenantID(dstTenantID) {
+			return errors.Newf("neither the source tenant %q nor the destination tenant %q (%d) can be the system tenant",
+				sourceTenant, dstTenantName, dstTenantID)
 		}
 
-		// Create a new tenant for the replication stream
-		if _, err := sql.GetTenantRecordByName(ctx, p.ExecCfg(), p.Txn(), roachpb.TenantName(destinationTenant)); err == nil {
-			return errors.Newf("tenant with name %q already exists", destinationTenant)
-		}
-
+		// Create a new tenant for the replication stream.
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
-		tenantInfo := &descpb.TenantInfoWithUsage{
-			TenantInfo: descpb.TenantInfo{
-				// We leave the ID field unset so that the tenant is assigned the next
-				// available tenant ID.
-				State:                  descpb.TenantInfo_ADD,
-				Name:                   roachpb.TenantName(destinationTenant),
+		tenantInfo := &mtinfopb.TenantInfoWithUsage{
+			ProtoInfo: mtinfopb.ProtoInfo{
 				TenantReplicationJobID: jobID,
+			},
+			SQLInfo: mtinfopb.SQLInfo{
+				// dstTenantID may be zero which will cause auto-allocation.
+				ID:          dstTenantID,
+				DataState:   mtinfopb.DataStateAdd,
+				ServiceMode: mtinfopb.ServiceModeNone,
+				Name:        roachpb.TenantName(dstTenantName),
 			},
 		}
 
@@ -158,13 +183,18 @@ func ingestionPlanHook(
 		if err != nil {
 			return err
 		}
-		destinationTenantID, err := sql.CreateTenantRecord(ctx, p.ExecCfg(), p.Txn(), tenantInfo, initialTenantZoneConfig)
+		destinationTenantID, err := sql.CreateTenantRecord(
+			ctx, p.ExecCfg().Codec, p.ExecCfg().Settings,
+			p.InternalSQLTxn(),
+			p.ExecCfg().SpanConfigKVAccessor.WithTxn(ctx, p.Txn()),
+			tenantInfo, initialTenantZoneConfig,
+		)
 		if err != nil {
 			return err
 		}
 
 		// Create a new stream with stream client.
-		client, err := streamclient.NewStreamClient(ctx, streamAddress)
+		client, err := streamclient.NewStreamClient(ctx, streamAddress, p.ExecCfg().InternalDB)
 		if err != nil {
 			return err
 		}
@@ -186,12 +216,12 @@ func ingestionPlanHook(
 			Span:                  roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()},
 			DestinationTenantID:   destinationTenantID,
 			SourceTenantName:      roachpb.TenantName(sourceTenant),
-			DestinationTenantName: roachpb.TenantName(destinationTenant),
+			DestinationTenantName: roachpb.TenantName(dstTenantName),
 			ReplicationTTLSeconds: retentionTTLSeconds,
 			ReplicationStartTime:  replicationProducerSpec.ReplicationStartTime,
 		}
 
-		jobDescription, err := streamIngestionJobDescription(p, ingestionStmt)
+		jobDescription, err := streamIngestionJobDescription(p, from, ingestionStmt)
 		if err != nil {
 			return err
 		}
@@ -203,12 +233,10 @@ func ingestionPlanHook(
 			Details:     streamIngestionDetails,
 		}
 
-		_, err = p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(ctx, jr, jobID, p.Txn())
-		if err != nil {
-			return err
-		}
-
-		return nil
+		_, err = p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
+			ctx, jr, jobID, p.InternalSQLTxn(),
+		)
+		return err
 	}
 
 	return fn, nil, nil, false, nil

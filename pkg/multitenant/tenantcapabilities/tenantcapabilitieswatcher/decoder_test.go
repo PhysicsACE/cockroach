@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package tenantcapabilitieswatcher
+package tenantcapabilitieswatcher_test
 
 import (
 	"context"
@@ -17,9 +17,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitieswatcher"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -51,7 +52,7 @@ func TestDecodeCapabilities(t *testing.T) {
 
 	tenantID, err := roachpb.MakeTenantID(10)
 	require.NoError(t, err)
-	info := descpb.TenantInfo{
+	info := mtinfopb.ProtoInfo{
 		Capabilities: tenantcapabilitiespb.TenantCapabilities{
 			CanAdminSplit: true,
 		},
@@ -72,13 +73,12 @@ func TestDecodeCapabilities(t *testing.T) {
 
 	// Decode and verify.
 	row := rows[0]
-	decoder := newDecoder()
-	got, err := decoder.decode(roachpb.KeyValue{
+	got, err := tenantcapabilitieswatcher.TestingDecoderFn()(roachpb.KeyValue{
 		Key:   row.Key,
 		Value: *row.Value,
 	})
 	require.NoError(t, err)
 
 	require.Equal(t, tenantID, got.TenantID)
-	require.Equal(t, info.Capabilities, got.TenantCapabilities)
+	require.Equal(t, &info.Capabilities, got.TenantCapabilities)
 }

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -481,7 +482,7 @@ func TestMVCCGCQueueMakeGCScoreRealistic(t *testing.T) {
 		mc := timeutil.NewManualTime(timeutil.Unix(0, ms.LastUpdateNanos))
 		txn := newTransaction(
 			"txn", roachpb.Key("key"), roachpb.NormalUserPriority,
-			hlc.NewClock(mc, time.Millisecond /* maxOffset */))
+			hlc.NewClockForTesting(mc))
 
 		// Write 1000 distinct 1kb intents at the initial timestamp. This means that
 		// the average intent age is just the time elapsed from now, and this is roughly
@@ -782,7 +783,7 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 		if len(datum.endKey) > 0 {
 			drArgs := deleteRangeArgs(datum.key, datum.endKey)
 			drArgs.UseRangeTombstone = true
-			if _, err := tc.SendWrappedWith(roachpb.Header{
+			if _, err := tc.SendWrappedWith(kvpb.Header{
 				Timestamp: datum.ts,
 			}, &drArgs); err != nil {
 				t.Fatalf("%d: could not delete data: %+v", i, err)
@@ -800,7 +801,7 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 				txn.MinTimestamp = datum.ts
 				assignSeqNumsForReqs(txn, &dArgs)
 			}
-			if _, err := tc.SendWrappedWith(roachpb.Header{
+			if _, err := tc.SendWrappedWith(kvpb.Header{
 				Timestamp: datum.ts,
 				Txn:       txn,
 			}, &dArgs); err != nil {
@@ -818,7 +819,7 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 			txn.MinTimestamp = datum.ts
 			assignSeqNumsForReqs(txn, &pArgs)
 		}
-		if _, err := tc.SendWrappedWith(roachpb.Header{
+		if _, err := tc.SendWrappedWith(kvpb.Header{
 			Timestamp: datum.ts,
 			Txn:       txn,
 		}, &pArgs); err != nil {
@@ -858,7 +859,7 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 
 	// Call Run with dummy functions to get current Info.
 	gcInfo, err := func() (gc.Info, error) {
-		snap := tc.repl.store.Engine().NewSnapshot()
+		snap := tc.repl.store.TODOEngine().NewSnapshot()
 		desc := tc.repl.Desc()
 		defer snap.Close()
 
@@ -941,7 +942,7 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 	// However, because the GC processing pushes transactions and
 	// resolves intents asynchronously, we use a SucceedsSoon loop.
 	testutils.SucceedsSoon(t, func() error {
-		kvs, err := storage.Scan(tc.store.Engine(), key1, keys.MaxKey, 0)
+		kvs, err := storage.Scan(tc.store.TODOEngine(), key1, keys.MaxKey, 0)
 		if err != nil {
 			return err
 		}
@@ -971,7 +972,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	ctx := context.Background()
 
 	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
-	tsc := TestStoreConfig(hlc.NewClock(manual, time.Nanosecond) /* maxOffset */)
+	tsc := TestStoreConfig(hlc.NewClockForTesting(manual))
 	manual.MustAdvanceTo(timeutil.Unix(0, 3*24*time.Hour.Nanoseconds()))
 
 	testTime := manual.Now().Add(2 * time.Hour)
@@ -1080,8 +1081,8 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	// intent resolution.
 	tsc.TestingKnobs.IntentResolverKnobs.MaxIntentResolutionBatchSize = 1
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			if resArgs, ok := filterArgs.Req.(*roachpb.ResolveIntentRequest); ok {
+		func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+			if resArgs, ok := filterArgs.Req.(*kvpb.ResolveIntentRequest); ok {
 				id := string(resArgs.IntentTxn.Key)
 				// Only count finalizing intent resolution attempts in `resolved`.
 				if resArgs.Status != roachpb.PENDING {
@@ -1099,7 +1100,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 				// We've special cased one test case. Note that the intent is still
 				// counted in `resolved`.
 				if testCases[id].failResolve {
-					return roachpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
+					return kvpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
 				}
 			}
 			return nil
@@ -1116,7 +1117,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	txns := map[string]roachpb.Transaction{}
 	for strKey, test := range testCases {
 		baseKey := roachpb.Key(strKey)
-		txnClock := hlc.NewClock(timeutil.NewManualTime(test.orig), time.Nanosecond /* maxOffset */)
+		txnClock := hlc.NewClockForTesting(timeutil.NewManualTime(test.orig))
 		txn := newTransaction("txn1", baseKey, 1, txnClock)
 		txn.Status = test.status
 		txn.LockSpans = testIntents
@@ -1193,7 +1194,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 				return fmt.Errorf("%s: unexpected intent resolutions:\nexpected: %s\nobserved: %s", strKey, expIntents, spans)
 			}
 			entry := &roachpb.AbortSpanEntry{}
-			abortExists, err := tc.repl.abortSpan.Get(ctx, tc.store.Engine(), txns[strKey].ID, entry)
+			abortExists, err := tc.repl.abortSpan.Get(ctx, tc.store.TODOEngine(), txns[strKey].ID, entry)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1207,7 +1208,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	outsideTxnPrefix := keys.TransactionKey(outsideKey, uuid.UUID{})
 	outsideTxnPrefixEnd := keys.TransactionKey(outsideKey.Next(), uuid.UUID{})
 	var count int
-	if _, err := storage.MVCCIterate(ctx, tc.store.Engine(), outsideTxnPrefix, outsideTxnPrefixEnd, hlc.Timestamp{},
+	if _, err := storage.MVCCIterate(ctx, tc.store.TODOEngine(), outsideTxnPrefix, outsideTxnPrefixEnd, hlc.Timestamp{},
 		storage.MVCCScanOptions{}, func(roachpb.KeyValue) error {
 			count++
 			return nil
@@ -1263,7 +1264,7 @@ func TestMVCCGCQueueIntentResolution(t *testing.T) {
 		for j := 0; j < 5; j++ {
 			pArgs := putArgs(roachpb.Key(fmt.Sprintf("%d-%d", i, j)), []byte("value"))
 			assignSeqNumsForReqs(txns[i], &pArgs)
-			if _, err := tc.SendWrappedWith(roachpb.Header{
+			if _, err := tc.SendWrappedWith(kvpb.Header{
 				Txn: txns[i],
 			}, &pArgs); err != nil {
 				t.Fatalf("%d: could not put data: %+v", i, err)
@@ -1290,7 +1291,7 @@ func TestMVCCGCQueueIntentResolution(t *testing.T) {
 		meta := &enginepb.MVCCMetadata{}
 		// The range is specified using only global keys, since the implementation
 		// may use an intentInterleavingIter.
-		return tc.store.Engine().MVCCIterate(
+		return tc.store.TODOEngine().MVCCIterate(
 			keys.LocalMax, roachpb.KeyMax, storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
 			func(kv storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
 				if !kv.Key.IsValue() {
@@ -1374,10 +1375,10 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 
 	var gcRequests int32
 	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
-	tsc := TestStoreConfig(hlc.NewClock(manual, time.Nanosecond) /* maxOffset */)
+	tsc := TestStoreConfig(hlc.NewClockForTesting(manual))
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			if _, ok := filterArgs.Req.(*roachpb.GCRequest); ok {
+		func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+			if _, ok := filterArgs.Req.(*kvpb.GCRequest); ok {
 				atomic.AddInt32(&gcRequests, 1)
 				return nil
 			}
@@ -1400,7 +1401,7 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 	fmtStr := fmt.Sprintf("%%0%dd", keySize)
 
 	// First write 2 * gcKeyVersionChunkBytes different keys (each with two versions).
-	ba1, ba2 := &roachpb.BatchRequest{}, &roachpb.BatchRequest{}
+	ba1, ba2 := &kvpb.BatchRequest{}, &kvpb.BatchRequest{}
 	for i := 0; i < 2*keyCount; i++ {
 		// Create keys which are
 		key := roachpb.Key(fmt.Sprintf(fmtStr, i))
@@ -1409,11 +1410,11 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 		pArgs = putArgs(key, []byte("value2"))
 		ba2.Add(&pArgs)
 	}
-	ba1.Header = roachpb.Header{Timestamp: tc.Clock().Now()}
+	ba1.Header = kvpb.Header{Timestamp: tc.Clock().Now()}
 	if _, pErr := tc.Sender().Send(ctx, ba1); pErr != nil {
 		t.Fatal(pErr)
 	}
-	ba2.Header = roachpb.Header{Timestamp: tc.Clock().Now()}
+	ba2.Header = kvpb.Header{Timestamp: tc.Clock().Now()}
 	if _, pErr := tc.Sender().Send(ctx, ba2); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1423,7 +1424,7 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 	key1 := roachpb.Key(fmt.Sprintf(fmtStr, 2*keyCount))
 	key2 := roachpb.Key(fmt.Sprintf(fmtStr, 2*keyCount+1))
 	for i := 0; i < 2*keyCount+1; i++ {
-		ba := &roachpb.BatchRequest{}
+		ba := &kvpb.BatchRequest{}
 		// Only write keyCount+1 versions of key1.
 		if i < keyCount+1 {
 			pArgs1 := putArgs(key1, []byte(fmt.Sprintf("value%04d", i)))
@@ -1433,7 +1434,7 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 		// tackle key2 in two separate batches.
 		pArgs2 := putArgs(key2, []byte(fmt.Sprintf("value%04d", i)))
 		ba.Add(&pArgs2)
-		ba.Header = roachpb.Header{Timestamp: tc.Clock().Now()}
+		ba.Header = kvpb.Header{Timestamp: tc.Clock().Now()}
 		if _, pErr := tc.Sender().Send(ctx, ba); pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -1481,7 +1482,7 @@ func TestMVCCGCQueueGroupsRangeDeletions(t *testing.T) {
 
 	// Create store and prepare by removing default range.
 	clock := timeutil.NewManualTime(timeutil.Unix(0, 123))
-	cfg := TestStoreConfig(hlc.NewClock(clock, time.Nanosecond) /* maxOffset */)
+	cfg := TestStoreConfig(hlc.NewClockForTesting(clock))
 	cfg.TestingKnobs.MVCCGCQueueLeaseCheckInterceptor = func(ctx context.Context, replica *Replica, now hlc.ClockTimestamp,
 	) bool {
 		return leaseError

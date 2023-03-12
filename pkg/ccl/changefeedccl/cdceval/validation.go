@@ -80,10 +80,10 @@ func normalizeAndValidateSelectForTarget(
 		}
 	}()
 
-	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.V22_2EnablePredicateProjectionChangefeed) {
+	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2EnablePredicateProjectionChangefeed) {
 		return nil, errors.Newf(
 			`filters and projections not supported until upgrade to version %s or higher is finalized`,
-			clusterversion.V22_2EnablePredicateProjectionChangefeed.String())
+			clusterversion.TODODelete_V22_2EnablePredicateProjectionChangefeed.String())
 	}
 
 	// This really shouldn't happen as it's enforced by sql.y.
@@ -228,7 +228,7 @@ func getTargetFamilyDescriptor(
 ) (*descpb.ColumnFamilyDescriptor, error) {
 	switch target.Type {
 	case jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY:
-		return desc.FindFamilyByID(0)
+		return catalog.MustFindFamilyByID(desc, 0 /* id */)
 	case jobspb.ChangefeedTargetSpecification_COLUMN_FAMILY:
 		var fd *descpb.ColumnFamilyDescriptor
 		for _, family := range desc.GetFamilies() {
@@ -366,7 +366,7 @@ func (c *checkColumnsVisitor) VisitCols(expr tree.Expr) (bool, tree.Expr) {
 		return c.VisitCols(vn)
 
 	case *tree.ColumnItem:
-		col, err := c.desc.FindColumnWithName(e.ColumnName)
+		col, err := catalog.MustFindColumnByTreeName(c.desc, e.ColumnName)
 		if err != nil {
 			c.err = err
 			return false, expr

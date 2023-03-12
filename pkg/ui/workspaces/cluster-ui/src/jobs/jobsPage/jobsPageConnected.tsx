@@ -19,7 +19,7 @@ import {
   selectTypeSetting,
   selectStatusSetting,
   selectColumns,
-} from "../../store/jobs/jobs.selectors";
+} from "../../store/jobs";
 import {
   JobsPageStateProps,
   JobsPageDispatchProps,
@@ -30,6 +30,7 @@ import { actions as jobsActions } from "src/store/jobs";
 import { actions as localStorageActions } from "../../store/localStorage";
 import { Dispatch } from "redux";
 import { SortSetting } from "../../sortedtable";
+import { actions as analyticsActions } from "../../store/analytics";
 
 const mapStateToProps = (
   state: AppState,
@@ -42,8 +43,8 @@ const mapStateToProps = (
   const columns = selectColumns(state);
   const jobsState = selectJobsState(state);
   const jobs = jobsState ? jobsState.data : null;
-  const jobsLoading = jobsState ? jobsState.inFlight : false;
   const jobsError = jobsState ? jobsState.lastError : null;
+  const lastUpdated = jobsState?.lastUpdated;
   return {
     sort,
     status,
@@ -51,13 +52,16 @@ const mapStateToProps = (
     type,
     columns,
     jobs,
-    jobsLoading,
+    reqInFlight: jobsState?.inFlight,
+    isDataValid: jobsState?.valid,
     jobsError,
+    lastUpdated,
   };
 };
 
 const mapDispatchToProps = (dispatch: Dispatch): JobsPageDispatchProps => ({
   setShow: (showValue: string) => {
+    dispatch(jobsActions.invalidated());
     dispatch(
       localStorageActions.update({
         key: "showSetting/JobsPage",
@@ -72,8 +76,17 @@ const mapDispatchToProps = (dispatch: Dispatch): JobsPageDispatchProps => ({
         value: ss,
       }),
     );
+    dispatch(
+      analyticsActions.track({
+        name: "Column Sorted",
+        page: "Jobs",
+        tableName: "Jobs Table",
+        columnName: ss.columnTitle,
+      }),
+    );
   },
   setStatus: (statusValue: string) => {
+    dispatch(jobsActions.invalidated());
     dispatch(
       localStorageActions.update({
         key: "statusSetting/JobsPage",
@@ -82,20 +95,38 @@ const mapDispatchToProps = (dispatch: Dispatch): JobsPageDispatchProps => ({
     );
   },
   setType: (jobValue: number) => {
+    dispatch(jobsActions.invalidated());
     dispatch(
       localStorageActions.update({
         key: "typeSetting/JobsPage",
         value: jobValue,
       }),
     );
+    dispatch(
+      analyticsActions.track({
+        name: "Job Type Selected",
+        page: "Jobs",
+        value: jobValue.toString(),
+      }),
+    );
   },
-  onColumnsChange: (selectedColumns: string[]) =>
+  onColumnsChange: (selectedColumns: string[]) => {
+    const columns =
+      selectedColumns.length === 0 ? " " : selectedColumns.join(",");
     dispatch(
       localStorageActions.update({
         key: "showColumns/JobsPage",
-        value: selectedColumns.length === 0 ? " " : selectedColumns.join(","),
+        value: columns,
       }),
-    ),
+    );
+    dispatch(
+      analyticsActions.track({
+        name: "Columns Selected change",
+        page: "Jobs",
+        value: columns,
+      }),
+    );
+  },
   refreshJobs: (req: JobsRequest) => dispatch(jobsActions.refresh(req)),
 });
 

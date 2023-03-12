@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/keysbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
@@ -77,6 +79,24 @@ func (o tsOperator) pgwireEncoding() byte {
 		return 4
 	}
 	panic(errors.AssertionFailedf("no pgwire encoding for operator %d", o))
+}
+
+func (o tsOperator) String() string {
+	switch o {
+	case not:
+		return "!"
+	case and:
+		return "&"
+	case or:
+		return "|"
+	case followedby:
+		return "<->"
+	case lparen:
+		return "("
+	case rparen:
+		return ")"
+	}
+	panic(errors.AssertionFailedf("no string for operator %d", o))
 }
 
 func tsOperatorFromPgwireEncoding(b byte) (tsOperator, error) {
@@ -167,6 +187,105 @@ func (q TSQuery) String() string {
 		return ""
 	}
 	return q.root.String()
+}
+
+// GetInvertedExpr returns the inverted expression that can be used to search
+// an index.
+func (q TSQuery) GetInvertedExpr() (expr inverted.Expression, err error) {
+	return q.root.getInvertedExpr()
+}
+
+func (n *tsNode) getInvertedExpr() (inverted.Expression, error) {
+	switch n.op {
+	case invalid:
+		// We're looking at a lexeme match.
+		// There are 3 options:
+		// 1. Normal match.
+		//    In this case, we make a tight and unique span.
+		// 2. Prefix match.
+		//    In this case, we make a non-unique, tight span that starts with the
+		//    prefix.
+		// 3. Weighted match.
+		//    In this case, we make the match non-tight, because we don't store the
+		//    weights of the lexemes in the index, and are forced to re-check
+		//    once we get the result from the inverted index.
+		// Note that options 2 and 3 can both be present.
+		var weight tsWeight
+		if len(n.term.positions) > 0 {
+			weight = n.term.positions[0].weight
+		}
+		key := EncodeInvertedIndexKey(nil /* inKey */, n.term.lexeme)
+		var span inverted.Span
+
+		prefixMatch := weight&weightStar != 0
+		if prefixMatch {
+			span = inverted.Span{
+				Start: key,
+				End:   EncodeInvertedIndexKey(nil /* inKey */, string(keysbase.PrefixEnd([]byte(n.term.lexeme)))),
+			}
+		} else {
+			span = inverted.MakeSingleValSpan(key)
+		}
+		invertedExpr := inverted.ExprForSpan(span, true /* tight */)
+		if !prefixMatch {
+			// If we don't have a prefix match we also can set unique=true.
+			invertedExpr.Unique = true
+		}
+
+		if weight != 0 && weight != weightStar {
+			// Some weights are set.
+			invertedExpr.SetNotTight()
+		}
+		return invertedExpr, nil
+	case followedby:
+		fallthrough
+	case and:
+		l, lErr := n.l.getInvertedExpr()
+		r, rErr := n.r.getInvertedExpr()
+		if lErr != nil && rErr != nil {
+			// We need a positive match on at least one side.
+			return nil, lErr
+		} else if lErr != nil {
+			// An error on one side means we have to re-check that side's condition
+			// later.
+			r.SetNotTight()
+			//nolint:returnerrcheck
+			return r, nil
+		} else if rErr != nil {
+			// Ditto above.
+			l.SetNotTight()
+			//nolint:returnerrcheck
+			return l, nil
+		}
+		expr := inverted.And(l, r)
+		if n.op == followedby {
+			// If we have a followedby match, we have to re-check the results of the
+			// match after we get them from the inverted index - just because both
+			// terms are present doesn't mean they're properly next to each other,
+			// and the index doesn't store position information at all.
+			expr.SetNotTight()
+		}
+		return expr, nil
+	case or:
+		l, lErr := n.l.getInvertedExpr()
+		r, rErr := n.r.getInvertedExpr()
+		if lErr != nil {
+			// We need a positive match on both sides, so we return an error here.
+			// For example, searching for a | !b would require a full scan, since some
+			// documents could match that contain neither a nor b.
+			return nil, lErr
+		} else if rErr != nil {
+			return nil, rErr
+		}
+		return inverted.Or(l, r), nil
+	case not:
+		// A not would require more advanced machinery than we have, so for now
+		// we'll just assume we can't perform an inverted expression search on a
+		// not. Note that a nested not would make it possible, but we are ignoring
+		// this case for now as it seems marginal.
+		return nil, errors.New("unable to create inverted expr for not")
+	}
+	return nil, errors.AssertionFailedf("invalid operator %d", n.op)
 }
 
 func lexTSQuery(input string) (TSVector, error) {
@@ -303,4 +422,108 @@ func (p *tsQueryParser) parseTSExpr(minBindingPower int) (*tsNode, error) {
 
 func (p *tsQueryParser) syntaxError() (*tsNode, error) {
 	return nil, pgerror.Newf(pgcode.Syntax, "syntax error in TSQuery: %s", p.input)
+}
+
+// ToTSQuery implements the to_tsquery builtin, which lexes an input, performs
+// stopwording and normalization on the tokens, and returns a parsed query.
+func ToTSQuery(config string, input string) (TSQuery, error) {
+	return toTSQuery(config, invalid, input)
+}
+
+// PlainToTSQuery implements the plainto_tsquery builtin, which lexes an input,
+// performs stopwording and normalization on the tokens, and returns a parsed
+// query, interposing the & operator between each token.
+func PlainToTSQuery(config string, input string) (TSQuery, error) {
+	return toTSQuery(config, and, input)
+}
+
+// PhraseToTSQuery implements the phraseto_tsquery builtin, which lexes an input,
+// performs stopwording and normalization on the tokens, and returns a parsed
+// query, interposing the <-> operator between each token.
+func PhraseToTSQuery(config string, input string) (TSQuery, error) {
+	return toTSQuery(config, followedby, input)
+}
+
+// toTSQuery implements the to_tsquery builtin, which lexes an input,
+// performs stopwording and normalization on the tokens, and returns a parsed
+// query. If the interpose operator is not invalid, it's interposed between each
+// token in the input.
+func toTSQuery(config string, interpose tsOperator, input string) (TSQuery, error) {
+	switch config {
+	case "simple":
+	default:
+		return TSQuery{}, pgerror.Newf(pgcode.UndefinedObject, "text search configuration %q does not exist", config)
+	}
+
+	vector, err := lexTSQuery(input)
+	if err != nil {
+		return TSQuery{}, err
+	}
+	tokens := make(TSVector, 0, len(vector))
+	for i := range vector {
+		tok := vector[i]
+
+		foundOperator := tok.operator != invalid
+		var lexemeTokens []string
+
+		if !foundOperator {
+			// Try parsing the token.
+			lexemeTokens = TSParse(tok.lexeme)
+		}
+
+		// If we found an operator or were able to parse lexemes from the token,
+		// add the interpose operator if there is one.
+		if interpose != invalid && i > 0 && (foundOperator || len(lexemeTokens) > 0) {
+			term := tsTerm{operator: interpose}
+			if interpose == followedby {
+				term.followedN = 1
+			}
+			tokens = append(tokens, term)
+		}
+
+		if foundOperator {
+			tokens = append(tokens, tok)
+			continue
+		}
+
+		if len(lexemeTokens) == 0 {
+			// We ate some whitespace or whitespace-like text with no tokens.
+			continue
+		}
+
+		// When we support more than just the simple configuration, we'll also
+		// want to remove stopwords, which will affect the interposing, but we can
+		// worry about that later.
+		// Additionally, if we're doing phraseto_tsquery, if we remove a stopword,
+		// we need to make sure to increase the "followedN" of the followedby
+		// operator. For example, phraseto_tsquery('hello a deer') will return
+		// 'hello <2> deer', since the a stopword would be removed.
+
+		tokInterpose := interpose
+		if tokInterpose == invalid {
+			tokInterpose = followedby
+		}
+		for j := range lexemeTokens {
+			if j > 0 {
+				// We found more than one lexeme in our token, so we need to add all of them
+				// to the query, connected by our interpose operator.
+				// If we aren't running with an interpose, like in to_tsquery, Postgres
+				// uses the <-> operator to connect multiple lexemes from a single token.
+				term := tsTerm{operator: tokInterpose}
+				if tokInterpose == followedby {
+					term.followedN = 1
+				}
+				tokens = append(tokens, term)
+			}
+			lexeme, err := TSLexize(config, lexemeTokens[j])
+			if err != nil {
+				return TSQuery{}, err
+			}
+			tokens = append(tokens, tsTerm{lexeme: lexeme})
+		}
+	}
+
+	// Now create the operator tree.
+	queryParser := tsQueryParser{terms: tokens, input: input}
+	return queryParser.parse()
 }

@@ -19,7 +19,6 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -65,6 +64,11 @@ func newExecFactory(ctx context.Context, p *planner) *execFactory {
 		ctx:     ctx,
 		planner: p,
 	}
+}
+
+// Ctx implements the Factory interface.
+func (ef *execFactory) Ctx() context.Context {
+	return ef.ctx
 }
 
 func (ef *execFactory) getDatumAlloc() *tree.DatumAlloc {
@@ -557,6 +561,7 @@ func (ef *execFactory) ConstructHashSetOp(
 ) (exec.Node, error) {
 	return ef.planner.newUnionNode(
 		typ, all, left.(planNode), right.(planNode), nil, nil, 0, /* hardLimit */
+		false, /* enforceHomeRegion */
 	)
 }
 
@@ -575,13 +580,14 @@ func (ef *execFactory) ConstructStreamingSetOp(
 		right.(planNode),
 		streamingOrdering,
 		ReqOrdering(reqOrdering),
-		0, /* hardLimit */
+		0,     /* hardLimit */
+		false, /* enforceHomeRegion */
 	)
 }
 
 // ConstructUnionAll is part of the exec.Factory interface.
 func (ef *execFactory) ConstructUnionAll(
-	left, right exec.Node, reqOrdering exec.OutputOrdering, hardLimit uint64,
+	left, right exec.Node, reqOrdering exec.OutputOrdering, hardLimit uint64, enforceHomeRegion bool,
 ) (exec.Node, error) {
 	return ef.planner.newUnionNode(
 		tree.UnionOp,
@@ -591,6 +597,7 @@ func (ef *execFactory) ConstructUnionAll(
 		colinfo.ColumnOrdering(reqOrdering),
 		ReqOrdering(reqOrdering),
 		hardLimit,
+		enforceHomeRegion,
 	)
 }
 
@@ -689,6 +696,7 @@ func (ef *execFactory) ConstructLookupJoin(
 	reqOrdering exec.OutputOrdering,
 	locking opt.Locking,
 	limitHint int64,
+	remoteOnlyLookups bool,
 ) (exec.Node, error) {
 	if table.IsVirtualTable() {
 		return ef.constructVirtualTableLookupJoin(joinType, input, table, index, eqCols, lookupCols, onCond)
@@ -723,6 +731,7 @@ func (ef *execFactory) ConstructLookupJoin(
 		isSecondJoinInPairedJoiner: isSecondJoinInPairedJoiner,
 		reqOrdering:                ReqOrdering(reqOrdering),
 		limitHint:                  limitHint,
+		remoteOnlyLookups:          remoteOnlyLookups,
 	}
 	n.eqCols = make([]int, len(eqCols))
 	for i, c := range eqCols {
@@ -1196,7 +1205,7 @@ func (e *urlOutputter) finish() (url.URL, error) {
 func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.Node, error) {
 	var out urlOutputter
 
-	ie := ef.planner.extendedEvalCtx.ExecCfg.InternalExecutorFactory.NewInternalExecutor(
+	ie := ef.planner.extendedEvalCtx.ExecCfg.InternalDB.NewInternalExecutor(
 		ef.planner.SessionData(),
 	)
 	c := makeStmtEnvCollector(ef.ctx, ie.(*InternalExecutor))
@@ -1749,15 +1758,9 @@ func (ef *execFactory) ConstructDeleteRange(
 	var sb span.Builder
 	sb.Init(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, tabDesc.GetPrimaryIndex())
 
-	splitter := span.NoopSplitter()
-	canUsePointDelete := ef.planner.ExecCfg().Settings.Version.IsActive(
-		ef.ctx, clusterversion.V22_2DeleteRequestReturnKey,
+	splitter := span.MakeSplitterForDelete(
+		tabDesc, tabDesc.GetPrimaryIndex(), needed, true, /* forDelete */
 	)
-	if canUsePointDelete {
-		splitter = span.MakeSplitterForDelete(
-			tabDesc, tabDesc.GetPrimaryIndex(), needed, true, /* forDelete */
-		)
-	}
 	spans, err := sb.SpansFromConstraint(indexConstraint, splitter)
 	if err != nil {
 		return nil, err
@@ -1862,6 +1865,14 @@ func (ef *execFactory) ConstructCreateFunction(
 		"CREATE FUNCTION",
 	); err != nil {
 		return nil, err
+	}
+
+	plan, err := ef.planner.SchemaChange(ef.ctx, cf)
+	if err != nil {
+		return nil, err
+	}
+	if plan != nil {
+		return plan, nil
 	}
 
 	planDeps, typeDepSet, err := toPlanDependencies(deps, typeDeps)
@@ -1974,20 +1985,13 @@ func (ef *execFactory) ConstructAlterTableSplit(
 func (ef *execFactory) ConstructAlterTableUnsplit(
 	index cat.Index, input exec.Node,
 ) (exec.Node, error) {
-
-	execCfg := ef.planner.ExecCfg()
 	if err := checkSchemaChangeEnabled(
 		ef.ctx,
-		execCfg,
+		ef.planner.ExecCfg(),
 		"ALTER TABLE/INDEX UNSPLIT AT",
 	); err != nil {
 		return nil, err
 	}
-
-	if err := execCfg.RequireSystemTenant(); err != nil {
-		return nil, err
-	}
-
 	return &unsplitNode{
 		tableDesc: index.Table().(*optTable).desc,
 		index:     index.(*optIndex).idx,
@@ -1997,15 +2001,11 @@ func (ef *execFactory) ConstructAlterTableUnsplit(
 
 // ConstructAlterTableUnsplitAll is part of the exec.Factory interface.
 func (ef *execFactory) ConstructAlterTableUnsplitAll(index cat.Index) (exec.Node, error) {
-	execCfg := ef.planner.ExecCfg()
 	if err := checkSchemaChangeEnabled(
 		ef.ctx,
-		execCfg,
+		ef.planner.ExecCfg(),
 		"ALTER TABLE/INDEX UNSPLIT ALL",
 	); err != nil {
-		return nil, err
-	}
-	if err := execCfg.RequireSystemTenant(); err != nil {
 		return nil, err
 	}
 	return &unsplitAllNode{
@@ -2162,7 +2162,7 @@ func (ef *execFactory) ConstructExplain(
 	}
 	flags := explain.MakeFlags(options)
 	if ef.planner.execCfg.TestingKnobs.DeterministicExplain {
-		flags.Redact = explain.RedactVolatile
+		flags.Deflake = explain.DeflakeVolatile
 	}
 	n := &explainPlanNode{
 		options: options,

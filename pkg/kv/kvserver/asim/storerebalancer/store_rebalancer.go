@@ -73,6 +73,7 @@ type storeRebalancerControl struct {
 
 	allocator  allocatorimpl.Allocator
 	controller op.Controller
+	storepool  storepool.AllocatorStorePool
 }
 
 // NewStoreRebalancer returns a new simulator store rebalancer.
@@ -102,7 +103,10 @@ func newStoreRebalancerControl(
 		allocator,
 		storePool,
 		getRaftStatusFn,
+		simRebalanceObjectiveProvider{settings},
 	)
+
+	sr.AddLogTag("s", storeID)
 
 	return &storeRebalancerControl{
 		sr:       sr,
@@ -112,14 +116,26 @@ func newStoreRebalancerControl(
 		},
 		storeID:    storeID,
 		allocator:  allocator,
+		storepool:  storePool,
 		controller: controller,
 	}
+}
 
+// simRebalanceObjectiveProvider implements the
+// kvserver.RebalanceObjectiveProvider interface.
+type simRebalanceObjectiveProvider struct {
+	settings *config.SimulationSettings
+}
+
+// Objective returns the current rebalance objective.
+func (s simRebalanceObjectiveProvider) Objective() kvserver.LBRebalancingObjective {
+	return kvserver.LBRebalancingObjective(s.settings.LBRebalancingObjective)
 }
 
 func (src *storeRebalancerControl) scorerOptions() *allocatorimpl.LoadScorerOptions {
 	return &allocatorimpl.LoadScorerOptions{
-		StoreHealthOptions:           allocatorimpl.StoreHealthOptions{},
+		IOOverloadOptions:            src.allocator.IOOverloadOptions(),
+		DiskOptions:                  src.allocator.DiskOptions(),
 		Deterministic:                true,
 		LoadDims:                     []load.Dimension{load.Queries},
 		LoadThreshold:                allocatorimpl.MakeQPSOnlyDim(src.settings.LBRebalanceQPSThreshold),
@@ -142,6 +158,8 @@ func (src *storeRebalancerControl) checkPendingTicket() (done bool, next time.Ti
 }
 
 func (src *storeRebalancerControl) Tick(ctx context.Context, tick time.Time, state state.State) {
+	src.sr.AddLogTag("tick", tick)
+	ctx = src.sr.ResetAndAnnotateCtx(ctx)
 	switch src.rebalancerState.phase {
 	case rebalancerSleeping:
 		src.phaseSleep(ctx, tick, state)
@@ -173,7 +191,7 @@ func (src *storeRebalancerControl) phasePrologue(
 		ctx, src.scorerOptions(),
 		hottestRanges(
 			s, src.storeID,
-			kvserver.LBRebalancingDimension(src.settings.LBRebalancingDimension).ToDimension(),
+			kvserver.LBRebalancingObjective(src.settings.LBRebalancingObjective).ToDimension(),
 		),
 		kvserver.LBRebalancingMode(src.settings.LBRebalancingMode),
 	)
@@ -202,6 +220,11 @@ func (src *storeRebalancerControl) checkPendingLeaseRebalance(ctx context.Contex
 	}
 
 	if err == nil {
+		src.storepool.UpdateLocalStoresAfterLeaseTransfer(
+			roachpb.StoreID(src.storeID),
+			src.rebalancerState.pendingTransferTarget.StoreID,
+			src.rebalancerState.pendingTransfer.RangeUsageInfo(),
+		)
 		// The transfer has completed without error, update the local
 		// state to reflect it's success.
 		src.sr.PostLeaseRebalance(

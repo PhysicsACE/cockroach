@@ -22,6 +22,7 @@ const withData: IndexDetailsPageProps = {
   indexName: randomName(),
   isTenant: false,
   nodeRegions: {},
+  timeScale: null,
   details: {
     loading: false,
     loaded: true,
@@ -59,6 +60,8 @@ const withData: IndexDetailsPageProps = {
   refreshIndexStats: () => {},
   resetIndexUsageStats: () => {},
   refreshNodes: () => {},
+  refreshUserSQLRoles: () => {},
+  onTimeScaleChange: () => {},
 };
 
 storiesOf("Index Details Page", module)

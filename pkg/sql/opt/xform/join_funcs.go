@@ -453,7 +453,7 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 		lookupJoin.DerivedEquivCols = lookupConstraint.DerivedEquivCols
 		lookupJoin.LookupExpr = lookupConstraint.LookupExpr
 		lookupJoin.On = lookupConstraint.RemainingFilters
-		lookupJoin.ConstFilters = lookupConstraint.ConstFilters
+		lookupJoin.AllLookupFilters = lookupConstraint.AllLookupFilters
 
 		// Wrap the input in a Project if any projections are required. The
 		// lookup join will project away these synthesized columns.
@@ -769,8 +769,8 @@ func (c *CustomFuncs) mapLookupJoin(
 		lookupJoin.RemoteLookupExpr = *remoteLookupExpr
 	})
 	lookupJoin.Cols = lookupJoin.Cols.CopyAndMaybeRemap(srcColsToDstCols)
-	constFilters := c.e.f.RemapCols(&lookupJoin.ConstFilters, srcColsToDstCols).(*memo.FiltersExpr)
-	lookupJoin.ConstFilters = *constFilters
+	allLookupFilters := c.e.f.RemapCols(&lookupJoin.AllLookupFilters, srcColsToDstCols).(*memo.FiltersExpr)
+	lookupJoin.AllLookupFilters = *allLookupFilters
 	on := c.e.f.RemapCols(&lookupJoin.On, srcColsToDstCols).(*memo.FiltersExpr)
 	lookupJoin.On = *on
 	lookupJoin.DerivedEquivCols = lookupJoin.DerivedEquivCols.CopyAndMaybeRemap(srcColsToDstCols)
@@ -1190,7 +1190,7 @@ func (c *CustomFuncs) ConvertIndexToLookupJoinPrivate(
 		KeyCols:               lookupCols,
 		Cols:                  outCols,
 		LookupColsAreTableKey: true,
-		ConstFilters:          nil,
+		AllLookupFilters:      nil,
 		Locking:               indexPrivate.Locking,
 		JoinPrivate:           memo.JoinPrivate{},
 	}
@@ -1286,6 +1286,18 @@ func (c *CustomFuncs) EmptyFiltersExpr() memo.FiltersExpr {
 	return memo.EmptyFiltersExpr
 }
 
+// CreateRemoteOnlyLookupJoinPrivate creates a new lookup join private from the
+// given private and replaces the LookupExpr with the given filter. It also
+// marks the private as locality optimized and as a join which only does lookups
+// into remote regions.
+func (c *CustomFuncs) CreateRemoteOnlyLookupJoinPrivate(
+	remoteLookupExpr memo.FiltersExpr, private *memo.LookupJoinPrivate,
+) *memo.LookupJoinPrivate {
+	newPrivate := c.CreateLocalityOptimizedLookupJoinPrivate(remoteLookupExpr, c.e.funcs.EmptyFiltersExpr(), private)
+	newPrivate.RemoteOnlyLookups = true
+	return newPrivate
+}
+
 // CreateLocalityOptimizedLookupJoinPrivate creates a new lookup join private
 // from the given private and replaces the LookupExpr and RemoteLookupExpr with
 // the given filters. It also marks the private as locality optimized.
@@ -1296,6 +1308,15 @@ func (c *CustomFuncs) CreateLocalityOptimizedLookupJoinPrivate(
 	newPrivate.LookupExpr = lookupExpr
 	newPrivate.RemoteLookupExpr = remoteLookupExpr
 	newPrivate.LocalityOptimized = true
+	switch private.JoinType {
+	case opt.AntiJoinOp:
+		// Add the filters from the LookupExpr, because we need to account for the
+		// regions selected in our statistics estimation. This is only needed for
+		// anti join because it is the only locality optimized join that is split
+		// into two separate operators. Note that only lookupExpr is used for anti
+		// joins, not remoteLookupExpr.
+		newPrivate.AllLookupFilters = append(newPrivate.AllLookupFilters, lookupExpr...)
+	}
 	return &newPrivate
 }
 
@@ -1459,16 +1480,13 @@ func (c *CustomFuncs) splitValues(
 }
 
 // splitDisjunctionForJoin finds the first disjunction in the ON clause that can
-// be split into an interesting pair of predicates. It returns the pair of
-// predicates and the Filters item they were a part of. If an "interesting"
-// disjunction is not found, ok=false is returned.
+// be split into a pair of predicates. It returns the pair of predicates and the
+// Filters item they were a part of. If a disjunction is not found, ok=false is
+// returned.
 //
 // It is expected that the left and right inputs to joinRel have been
 // pre-checked to be canonical scans, or Selects from canonical scans, and
 // origLeftScan and origRightScan refer to those scans.
-//
-// For details on what makes an "interesting" disjunction, see
-// findInterestingDisjunctionPairForJoin.
 func (c *CustomFuncs) splitDisjunctionForJoin(
 	joinRel memo.RelExpr,
 	filters memo.FiltersExpr,
@@ -1483,7 +1501,7 @@ func (c *CustomFuncs) splitDisjunctionForJoin(
 	for i := range filters {
 		if filters[i].Condition.Op() == opt.OrOp {
 			if leftPreds, rightPreds, ok =
-				c.findInterestingDisjunctionPairForJoin(joinRel, &filters[i], origLeftScan, origRightScan); ok {
+				c.findDisjunctionPairForJoin(joinRel, &filters[i], origLeftScan, origRightScan); ok {
 				itemToReplace = &filters[i]
 				return leftPreds, rightPreds, itemToReplace, true
 			}
@@ -1507,12 +1525,11 @@ func (c *CustomFuncs) makeFilteredSelectForJoin(
 	return newSelect
 }
 
-// SplitJoinWithEquijoinDisjuncts checks a join relation for a disjunction of
-// equijoin predicates in an InnerJoin, SemiJoin or AntiJoin. If present, and
-// the inputs to the join are canonical scans, or Selects from canonical scans,
-// it builds two new join relations of the same join type as the original, but
-// with one disjunct assigned to firstJoin and the remaining disjuncts assigned
-// to secondJoin.
+// SplitJoinWithDisjuncts checks a join relation for a disjunction of predicates
+// in an InnerJoin, SemiJoin or AntiJoin. If present, and the inputs to the join
+// are canonical scans, or Selects from canonical scans, it builds two new join
+// relations of the same join type as the original, but with one disjunct
+// assigned to firstJoin and the remaining disjuncts assigned to secondJoin.
 //
 // In the case of inner join, newRelationCols contains the column ids from the
 // original Scans in the left and right inputs plus primary key columns from
@@ -1523,9 +1540,10 @@ func (c *CustomFuncs) makeFilteredSelectForJoin(
 // aggCols contains the non-key columns of the left and right inputs.
 // groupingCols contains the primary key columns of the left and right inputs,
 // needed for deduplicating results.
-// If there is no disjunction of equijoin predicates, or the join type is not
-// one of the supported join types listed above, ok=false is returned.
-func (c *CustomFuncs) SplitJoinWithEquijoinDisjuncts(
+//
+// If there is no disjunction of predicates, or the join type is not one of the
+// supported join types listed above, ok=false is returned.
+func (c *CustomFuncs) SplitJoinWithDisjuncts(
 	joinRel memo.RelExpr, joinFilters memo.FiltersExpr,
 ) (
 	firstJoin memo.RelExpr,
@@ -1747,25 +1765,20 @@ func (c *CustomFuncs) CanHoistProjectInput(relation memo.RelExpr) (ok bool) {
 	return ok
 }
 
-// findInterestingDisjunctionPairForJoin groups disjunction subexpressions into
-// an "interesting" pair of join predicates.
+// findDisjunctionPairForJoin groups disjunction subexpressions into a pair of
+// join predicates.
 //
-// An "interesting" pair of predicates is one where one predicate is an
-// equality predicate which could enable more performant joins than cross join,
-// such as hash join or lookup join. At least one predicate in the disjunction
-// must be an equality join term referencing both input relations. When there
-// are more than two predicates, the deepest leaf node in the left depth OrExpr
-// tree is returned as "left" and the remaining predicates are built into a
-// brand new OrExpr chain and returned as "right".
+// When there are more than two predicates, the deepest leaf node in the left
+// depth OrExpr tree is returned as "left" and the remaining predicates are
+// built into a brand new OrExpr chain and returned as "right".
 //
 // It is expected that the left and right inputs to joinRel have been
 // pre-checked to be canonical scans, or Selects from canonical scans, and
 // leftScan and rightScan refer to those scans.
 //
-// findInterestingDisjunctionPairForJoin returns an ok=false if at least one of
-// the ORed predicates is not an equality join term referencing both input
-// relations, or if joinRel is not a join relation.
-func (c *CustomFuncs) findInterestingDisjunctionPairForJoin(
+// findDisjunctionPairForJoin returns ok=false if joinRel is not a join
+// relation.
+func (c *CustomFuncs) findDisjunctionPairForJoin(
 	joinRel memo.RelExpr, filter *memo.FiltersItem, leftScan *memo.ScanExpr, rightScan *memo.ScanExpr,
 ) (left opt.ScalarExpr, right opt.ScalarExpr, ok bool) {
 	if !opt.IsJoinOp(joinRel) {
@@ -1784,9 +1797,8 @@ func (c *CustomFuncs) findInterestingDisjunctionPairForJoin(
 	leftColSet := c.OutputCols(leftScan)
 	rightColSet := c.OutputCols(rightScan)
 
-	// An ANDed expression is interesting if it has at least one equality join
-	// predicate.
-	interesting := false
+	// hasJoinEquality returns true if an ANDed expression has at least one
+	// equality join predicate.
 	var hasJoinEquality func(opt.ScalarExpr) bool
 	hasJoinEquality = func(expr opt.ScalarExpr) bool {
 		switch t := expr.(type) {
@@ -1803,14 +1815,18 @@ func (c *CustomFuncs) findInterestingDisjunctionPairForJoin(
 	// Traverse all adjacent OrExpr.
 	var collect func(opt.ScalarExpr)
 	collect = func(expr opt.ScalarExpr) {
-		interesting = false
+		interesting := false
 		switch t := expr.(type) {
 		case *memo.OrExpr:
 			collect(t.Left)
 			collect(t.Right)
 			return
 		default:
-			interesting = hasJoinEquality(expr)
+			if c.e.evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins {
+				interesting = true
+			} else {
+				interesting = hasJoinEquality(expr)
+			}
 		}
 
 		if interesting && len(leftExprs) == 0 {
@@ -2145,8 +2161,9 @@ func (c *CustomFuncs) mapInputSideOfLookupJoin(
 	mappedLookupJoinExpr.ContinuationCol = lookupJoinExpr.ContinuationCol
 	mappedLookupJoinExpr.LocalityOptimized = lookupJoinExpr.LocalityOptimized
 	mappedLookupJoinExpr.ChildOfLocalityOptimizedSearch = lookupJoinExpr.ChildOfLocalityOptimizedSearch
-	constFilters := c.e.f.RemapCols(&lookupJoinExpr.ConstFilters, colMap).(*memo.FiltersExpr)
-	mappedLookupJoinExpr.ConstFilters = *constFilters
+	allLookupFilters := c.e.f.RemapCols(&lookupJoinExpr.AllLookupFilters, colMap).(*memo.FiltersExpr)
+	mappedLookupJoinExpr.AllLookupFilters = *allLookupFilters
 	mappedLookupJoinExpr.Locking = lookupJoinExpr.Locking
+	mappedLookupJoinExpr.RemoteOnlyLookups = lookupJoinExpr.RemoteOnlyLookups
 	return mappedLookupJoinExpr
 }

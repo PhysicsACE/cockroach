@@ -15,7 +15,7 @@ import { Helmet } from "react-helmet";
 import { RouteComponentProps } from "react-router-dom";
 import { JobsRequest, JobsResponse } from "src/api/jobsApi";
 import { Delayed } from "src/delayed";
-import { Dropdown, DropdownOption } from "src/dropdown";
+import { Dropdown } from "src/dropdown";
 import { Loading } from "src/loading";
 import { PageConfig, PageConfigItem } from "src/pageConfig";
 import { ISortedTablePagination, SortSetting } from "src/sortedtable";
@@ -27,10 +27,12 @@ import { isSelectedColumn } from "src/columnsSelector/utils";
 import { DATE_FORMAT_24_UTC, syncHistory, TimestampToMoment } from "src/util";
 import { jobsColumnLabels, JobsTable, makeJobsColumns } from "./jobsTable";
 import {
-  defaultRequestOptions,
   showOptions,
   statusOptions,
   typeOptions,
+  isValidJobStatus,
+  defaultRequestOptions,
+  isValidJobType,
 } from "../util";
 
 import { commonStyles } from "src/common";
@@ -43,13 +45,6 @@ const sortableTableCx = classNames.bind(sortableTableStyles);
 
 type ITimestamp = google.protobuf.ITimestamp;
 type JobType = cockroach.sql.jobs.jobspb.Type;
-type Job = cockroach.server.serverpb.IJobResponse;
-
-export const DEFAULT_JOBS_REQUEST = new cockroach.server.serverpb.JobsRequest({
-  limit: defaultRequestOptions.limit,
-  status: defaultRequestOptions.status,
-  type: defaultRequestOptions.type,
-});
 
 export interface JobsPageStateProps {
   sort: SortSetting;
@@ -58,8 +53,10 @@ export interface JobsPageStateProps {
   type: number;
   jobs: JobsResponse;
   jobsError: Error | null;
-  jobsLoading: boolean;
+  reqInFlight: boolean;
+  isDataValid: boolean;
   columns: string[];
+  lastUpdated: moment.Moment | null;
 }
 
 export interface JobsPageDispatchProps {
@@ -78,6 +75,17 @@ interface PageState {
 export type JobsPageProps = JobsPageStateProps &
   JobsPageDispatchProps &
   RouteComponentProps;
+
+const reqFromProps = (
+  props: JobsPageStateProps,
+): cockroach.server.serverpb.JobsRequest => {
+  const showAsInt = parseInt(props.show, 10);
+  return new cockroach.server.serverpb.JobsRequest({
+    limit: isNaN(showAsInt) ? 0 : showAsInt,
+    status: props.status,
+    type: props.type,
+  });
+};
 
 export class JobsPage extends React.Component<JobsPageProps, PageState> {
   refreshDataInterval: NodeJS.Timeout;
@@ -107,8 +115,8 @@ export class JobsPage extends React.Component<JobsPageProps, PageState> {
     }
 
     // Filter Status.
-    const status = searchParams.get("status") || undefined;
-    if (this.props.setStatus && status && status != this.props.status) {
+    const status = searchParams.get("status");
+    if (this.props.setStatus && status && status !== this.props.status) {
       this.props.setStatus(status);
     }
 
@@ -125,19 +133,48 @@ export class JobsPage extends React.Component<JobsPageProps, PageState> {
     }
   }
 
-  refresh(): void {
-    this.props.refreshJobs(DEFAULT_JOBS_REQUEST);
+  scheduleFetch(): void {
+    clearTimeout(this.refreshDataInterval);
+    const now = moment.utc();
+    const nextRefresh =
+      !this.props.isDataValid && !this.props.jobsError
+        ? now
+        : this.props.lastUpdated?.clone().add(10, "seconds") ?? now;
+    const msToNextRefresh = Math.max(0, nextRefresh.diff(now, "millisecond"));
+    this.refreshDataInterval = setTimeout(() => {
+      const req = reqFromProps(this.props);
+      this.props.refreshJobs(req);
+    }, msToNextRefresh);
   }
 
   componentDidMount(): void {
-    // Refresh every 10 seconds
-    this.refresh();
-    this.refreshDataInterval = setInterval(() => this.refresh(), 10 * 1000);
+    this.scheduleFetch();
+  }
+
+  componentDidUpdate(prevProps: JobsPageProps): void {
+    // Because we removed the retrying status, we add this check
+    // just in case there exists an app that attempts to load a non-existent
+    // status.
+    if (!isValidJobStatus(this.props.status)) {
+      this.onStatusSelected(defaultRequestOptions.status);
+    }
+
+    if (!isValidJobType(this.props.type)) {
+      this.onTypeSelected(defaultRequestOptions.type.toString());
+    }
+
+    if (
+      prevProps.lastUpdated !== this.props.lastUpdated ||
+      prevProps.show !== this.props.show ||
+      prevProps.status !== this.props.status ||
+      prevProps.type !== this.props.type
+    ) {
+      this.scheduleFetch();
+    }
   }
 
   componentWillUnmount(): void {
-    if (!this.refreshDataInterval) return;
-    clearInterval(this.refreshDataInterval);
+    clearTimeout(this.refreshDataInterval);
   }
 
   onChangePage = (current: number): void => {
@@ -167,8 +204,6 @@ export class JobsPage extends React.Component<JobsPageProps, PageState> {
     );
   };
 
-  statusMenuItems: DropdownOption[] = statusOptions;
-
   onTypeSelected = (item: string): void => {
     const type = parseInt(item, 10);
     this.props.setType(type);
@@ -181,9 +216,7 @@ export class JobsPage extends React.Component<JobsPageProps, PageState> {
     );
   };
 
-  typeMenuItems: DropdownOption[] = typeOptions;
-
-  onShowSelected = (item: string) => {
+  onShowSelected = (item: string): void => {
     this.props.setShow(item);
     this.resetPagination();
     syncHistory(
@@ -193,8 +226,6 @@ export class JobsPage extends React.Component<JobsPageProps, PageState> {
       this.props.history,
     );
   };
-
-  showMenuItems: DropdownOption[] = showOptions;
 
   changeSortSetting = (ss: SortSetting): void => {
     if (this.props.setSort) {
@@ -216,42 +247,22 @@ export class JobsPage extends React.Component<JobsPageProps, PageState> {
     )}`;
   };
 
-  getFilteredJobs = (): Job[] => {
-    const { jobs, status, type, show } = this.props;
-    if (jobs) {
-      const filtered = jobs.jobs.filter(
-        job =>
-          (job.status === status || status === "") &&
-          (typeOptions.find(
-            option => option["key"].replace("_", " ") === job.type,
-          )?.value === type.toString() ||
-            type === 0),
-      );
-      const limit = parseInt(show, 10);
-      if (limit !== 0) {
-        return filtered.slice(0, limit);
-      }
-      return filtered;
-    }
-    return [];
-  };
-
   render(): React.ReactElement {
     const {
       jobs,
-      jobsLoading,
       jobsError,
       sort,
       status,
+      reqInFlight,
+      isDataValid,
       type,
       show,
       columns: columnsToDisplay,
       onColumnsChange,
     } = this.props;
-    const isLoading = !jobs || jobsLoading;
-    const error = jobs && jobsError;
+    const isLoading = reqInFlight && (!isDataValid || !jobs);
     const { pagination } = this.state;
-    const filteredJobs = this.getFilteredJobs();
+    const filteredJobs = jobs?.jobs ?? [];
     const columns = makeJobsColumns();
     // Iterate over all available columns and create list of SelectOptions with initial selection
     // values based on stored user selections in local storage and default column configs.
@@ -278,44 +289,36 @@ export class JobsPage extends React.Component<JobsPageProps, PageState> {
         <div>
           <PageConfig>
             <PageConfigItem>
-              <Dropdown
-                items={this.statusMenuItems}
-                onChange={this.onStatusSelected}
-              >
+              <Dropdown items={statusOptions} onChange={this.onStatusSelected}>
                 Status:{" "}
-                {
-                  statusOptions.find(option => option["value"] === status)[
-                    "name"
-                  ]
-                }
+                {statusOptions.find(option => option.value === status)?.name}
               </Dropdown>
             </PageConfigItem>
             <PageConfigItem>
-              <Dropdown
-                items={this.typeMenuItems}
-                onChange={this.onTypeSelected}
-              >
+              <Dropdown items={typeOptions} onChange={this.onTypeSelected}>
                 Type:{" "}
                 {
-                  typeOptions.find(
-                    option => option["value"] === type.toString(),
-                  )["name"]
+                  typeOptions.find(option => option.value === type.toString())
+                    ?.name
                 }
               </Dropdown>
             </PageConfigItem>
             <PageConfigItem>
-              <Dropdown
-                items={this.showMenuItems}
-                onChange={this.onShowSelected}
-              >
-                Show:{" "}
-                {showOptions.find(option => option["value"] === show)["name"]}
+              <Dropdown items={showOptions} onChange={this.onShowSelected}>
+                Show: {showOptions.find(option => option.value === show)?.name}
               </Dropdown>
             </PageConfigItem>
           </PageConfig>
         </div>
         <div className={cx("table-area")}>
-          <Loading loading={isLoading} page={"jobs"} error={error}>
+          {jobsError && jobs && (
+            <InlineAlert intent="danger" title={jobsError.message} />
+          )}
+          <Loading
+            loading={isLoading}
+            page={"jobs"}
+            error={!jobs ? jobsError : null}
+          >
             <div>
               <section className={sortableTableCx("cl-table-container")}>
                 <div className={sortableTableCx("cl-table-statistic")}>
@@ -365,7 +368,7 @@ export class JobsPage extends React.Component<JobsPageProps, PageState> {
               />
             </div>
           </Loading>
-          {isLoading && !error && (
+          {isLoading && !jobsError && (
             <Delayed delay={moment.duration(2, "s")}>
               <InlineAlert
                 intent="info"

@@ -66,7 +66,7 @@ SELECT type_catalog AS database_name,
 FROM "".information_schema.type_privileges`
 	const systemPrivilegeQuery = `
 SELECT a.username AS grantee,
-       privilege,
+       privilege AS privilege_type,
        a.privilege
        IN (
           SELECT unnest(grant_options)
@@ -81,15 +81,15 @@ SELECT a.username AS grantee,
 	const externalConnectionPrivilegeQuery = `
 SELECT *
   FROM (
-        SELECT name,
+        SELECT name AS connection_name,
                a.username AS grantee,
-               privilege,
+               privilege AS privilege_type,
                a.privilege
                IN (
                   SELECT unnest(grant_options)
                     FROM system.privileges
                    WHERE username = a.username
-                ) AS grantable
+                ) AS is_grantable
           FROM (
                 SELECT regexp_extract(
                         path,
@@ -377,9 +377,16 @@ SELECT database_name,
 		if err != nil {
 			return nil, err
 		}
-		userExists, err := d.catalog.RoleExists(d.ctx, user)
-		if err != nil {
-			return nil, err
+		// The `public` role is a pseudo-role, so we check it separately. RoleExists
+		// should not return true for `public` since other operations like GRANT and
+		// REVOKE should fail with a "role `public` does not exist" error if they
+		// are used with `public`.
+		userExists := user.IsPublicRole()
+		if !userExists {
+			userExists, err = d.catalog.RoleExists(d.ctx, user)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if !userExists {
 			return nil, sqlerrors.NewUndefinedUserError(user)

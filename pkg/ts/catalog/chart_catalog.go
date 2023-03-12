@@ -10,6 +10,13 @@
 
 package catalog
 
+import (
+	"fmt"
+	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+)
+
 // chart_catalog.go represents a catalog of pre-defined DB Console charts
 // to aid users in debugging CockroachDB clusters. This file represents
 // a simplified structure of the catalog, meant to make it easier for
@@ -112,6 +119,7 @@ var charts = []sectionDescription{
 					"sys.cpu.sys.percent",
 					"sys.cpu.user.percent",
 					"sys.cpu.combined.percent-normalized",
+					"sys.cpu.host.combined.percent-normalized",
 				},
 			},
 			{
@@ -616,6 +624,8 @@ var charts = []sectionDescription{
 					"range.snapshots.applied-voter",
 					"range.snapshots.applied-initial",
 					"range.snapshots.applied-non-voter",
+					"range.snapshot.delegate.successes",
+					"range.snapshot.delegate.failures",
 				},
 			},
 			{
@@ -640,6 +650,7 @@ var charts = []sectionDescription{
 					"range.snapshots.rebalancing.sent-bytes",
 					"range.snapshots.unknown.rcvd-bytes",
 					"range.snapshots.unknown.sent-bytes",
+					"range.snapshots.delegate.sent-bytes",
 				},
 			},
 		},
@@ -786,6 +797,18 @@ var charts = []sectionDescription{
 			{
 				Title:   "Time Spent",
 				Metrics: []string{"queue.split.processingnanos"},
+			},
+			{
+				Title:   "Sized Based Splits",
+				Metrics: []string{"queue.split.size_based"},
+			},
+			{
+				Title:   "Load Based Splits",
+				Metrics: []string{"queue.split.load_based"},
+			},
+			{
+				Title:   "Span Configuration Based Splits",
+				Metrics: []string{"queue.split.span_config_based"},
 			},
 		},
 	},
@@ -1561,6 +1584,12 @@ var charts = []sectionDescription{
 					"changefeed.internal_retry_message_count",
 				},
 			},
+			{
+				Title: "Schema Registry Retries",
+				Metrics: []string{
+					"changefeed.schema_registry.retry_count",
+				},
+			},
 		},
 	},
 	{
@@ -1568,64 +1597,78 @@ var charts = []sectionDescription{
 		Charts: []chartDescription{
 			{
 				Title:   "Currently Running",
-				Metrics: []string{"streaming.running"},
+				Metrics: []string{"replication.running"},
 			},
 			{
 				Title: "Event admission latency",
 				Metrics: []string{
-					"streaming.admit_latency",
+					"replication.admit_latency",
 				},
 			},
 			{
 				Title: "Commits Latency",
 				Metrics: []string{
-					"streaming.commit_latency",
+					"replication.commit_latency",
 				},
 			},
 			{
 				Title: "Time spent",
 				Metrics: []string{
-					"streaming.flush_hist_nanos",
+					"replication.flush_hist_nanos",
 				},
 			},
 			{
 				Title: "Ingested Events",
 				Metrics: []string{
-					"streaming.events_ingested",
-					"streaming.resolved_events_ingested",
+					"replication.events_ingested",
+					"replication.resolved_events_ingested",
 				},
 			},
 			{
 				Title: "Flushes",
 				Metrics: []string{
-					"streaming.flushes",
+					"replication.flushes",
 				},
 			},
 			{
-				Title: "Ingested Bytes",
+				Title: "Logical Bytes",
 				Metrics: []string{
-					"streaming.ingested_bytes",
+					"replication.logical_bytes",
+				},
+			},
+			{
+				Title: "SST Bytes",
+				Metrics: []string{
+					"replication.sst_bytes",
 				},
 			},
 			{
 				Title:   "Earliest Data Processor Checkpoint Span",
-				Metrics: []string{"streaming.earliest_data_checkpoint_span"},
+				Metrics: []string{"replication.earliest_data_checkpoint_span"},
 			},
 			{
 				Title:   "Latest Data Processor Checkpoint Span",
-				Metrics: []string{"streaming.latest_data_checkpoint_span"},
+				Metrics: []string{"replication.latest_data_checkpoint_span"},
 			},
 			{
 				Title:   "Data Checkpoint Span Count",
-				Metrics: []string{"streaming.data_checkpoint_span_count"},
+				Metrics: []string{"replication.data_checkpoint_span_count"},
 			},
 			{
 				Title:   "Frontier Checkpoint Span Count",
-				Metrics: []string{"streaming.frontier_checkpoint_span_count"},
+				Metrics: []string{"replication.frontier_checkpoint_span_count"},
+			},
+			{
+				Title:   "Frontier Lag",
+				Metrics: []string{"replication.frontier_lag_nanos"},
 			},
 			{
 				Title:   "Job Progress Updates",
-				Metrics: []string{"streaming.job_progress_updates"},
+				Metrics: []string{"replication.job_progress_updates"},
+			},
+			{
+				Title:   "Ranges To Revert",
+				Metrics: []string{"replication.cutover_progress"},
 			},
 		},
 	},
@@ -2514,6 +2557,14 @@ var charts = []sectionDescription{
 				Metrics: []string{"sql.mem.internal.session.current"},
 			},
 			{
+				Title:   "Prepared Statements All",
+				Metrics: []string{"sql.mem.internal.session.prepared.max"},
+			},
+			{
+				Title:   "Prepared Statements Current",
+				Metrics: []string{"sql.mem.internal.session.prepared.current"},
+			},
+			{
 				Title:   "Txn All",
 				Metrics: []string{"sql.mem.internal.txn.max"},
 			},
@@ -2533,6 +2584,14 @@ var charts = []sectionDescription{
 			{
 				Title:   "Max",
 				Metrics: []string{"sql.mem.sql.session.max"},
+			},
+			{
+				Title:   "Prepared Statements Current",
+				Metrics: []string{"sql.mem.sql.session.prepared.current"},
+			},
+			{
+				Title:   "Prepared Statements Max",
+				Metrics: []string{"sql.mem.sql.session.prepared.max"},
 			},
 		},
 	},
@@ -3003,6 +3062,10 @@ var charts = []sectionDescription{
 				Title:   "Range Key Set Count",
 				Metrics: []string{"storage.keys.range-key-set.count"},
 			},
+			{
+				Title:   "Tombstone Count",
+				Metrics: []string{"storage.keys.tombstone.count"},
+			},
 		},
 	},
 	{
@@ -3051,6 +3114,13 @@ var charts = []sectionDescription{
 			{
 				Title:   "L0 Sublevels",
 				Metrics: []string{"storage.l0-sublevels"},
+			},
+			{
+				Title: "Shared Storage Reads/Writes",
+				Metrics: []string{
+					"storage.shared-storage.read",
+					"storage.shared-storage.write",
+				},
 			},
 			{
 				Title: "L0 Files",
@@ -3346,46 +3416,12 @@ var charts = []sectionDescription{
 					"jobs.running_non_idle",
 				},
 			},
-			{
-				Title: "Currently Running",
-				Metrics: []string{
-					"jobs.auto_create_stats.currently_running",
-					"jobs.backup.currently_running",
-					"jobs.changefeed.currently_running",
-					"jobs.create_stats.currently_running",
-					"jobs.import.currently_running",
-					"jobs.restore.currently_running",
-					"jobs.schema_change.currently_running",
-					"jobs.new_schema_change.currently_running",
-					"jobs.schema_change_gc.currently_running",
-					"jobs.typedesc_schema_change.currently_running",
-					"jobs.stream_ingestion.currently_running",
-					"jobs.migration.currently_running",
-					"jobs.auto_span_config_reconciliation.currently_running",
-					"jobs.auto_sql_stats_compaction.currently_running",
-					"jobs.stream_replication.currently_running",
-				},
-			},
-			{
-				Title: "Currently Idle",
-				Metrics: []string{
-					"jobs.auto_create_stats.currently_idle",
-					"jobs.auto_span_config_reconciliation.currently_idle",
-					"jobs.auto_sql_stats_compaction.currently_idle",
-					"jobs.backup.currently_idle",
-					"jobs.changefeed.currently_idle",
-					"jobs.create_stats.currently_idle",
-					"jobs.import.currently_idle",
-					"jobs.migration.currently_idle",
-					"jobs.new_schema_change.currently_idle",
-					"jobs.restore.currently_idle",
-					"jobs.schema_change.currently_idle",
-					"jobs.schema_change_gc.currently_idle",
-					"jobs.stream_ingestion.currently_idle",
-					"jobs.stream_replication.currently_idle",
-					"jobs.typedesc_schema_change.currently_idle",
-				},
-			},
+			jobTypeCharts("Currently Running", "currently_running"),
+			jobTypeCharts("Currently Idle", "currently_idle"),
+			jobTypeCharts("Currently Paused", "currently_paused"),
+			jobTypeCharts("PTS Age", "protected_age_sec"),
+			jobTypeCharts("PTS Record Count", "protected_record_count"),
+			jobTypeCharts("Expired PTS Records", "expired_pts_records"),
 			{
 				Title: "Auto Create Stats",
 				Metrics: []string{
@@ -3560,6 +3596,28 @@ var charts = []sectionDescription{
 					"jobs.auto_sql_stats_compaction.resume_retry_error",
 				},
 			},
+			{
+				Title: "Key Visualizer",
+				Metrics: []string{
+					"jobs.key_visualizer.fail_or_cancel_completed",
+					"jobs.key_visualizer.fail_or_cancel_failed",
+					"jobs.key_visualizer.fail_or_cancel_retry_error",
+					"jobs.key_visualizer.resume_completed",
+					"jobs.key_visualizer.resume_failed",
+					"jobs.key_visualizer.resume_retry_error",
+				},
+			},
+			{
+				Title: "Jobs Stats Polling Job",
+				Metrics: []string{
+					"jobs.poll_jobs_stats.fail_or_cancel_completed",
+					"jobs.poll_jobs_stats.fail_or_cancel_failed",
+					"jobs.poll_jobs_stats.fail_or_cancel_retry_error",
+					"jobs.poll_jobs_stats.resume_completed",
+					"jobs.poll_jobs_stats.resume_failed",
+					"jobs.poll_jobs_stats.resume_retry_error",
+				},
+			},
 		},
 	},
 	{
@@ -3726,10 +3784,23 @@ var charts = []sectionDescription{
 				Metrics: []string{
 					"admission.granter.total_slots.kv",
 					"admission.granter.used_slots.kv",
-					"admission.granter.total_moderate_slots.kv",
-					"admission.granter.used_soft_slots.kv",
 					"admission.granter.used_slots.sql-leaf-start",
 					"admission.granter.used_slots.sql-root-start",
+				},
+			},
+			{
+				Title: "Granter Slot Counters",
+				Metrics: []string{
+					"admission.granter.slot_adjuster_increments.kv",
+					"admission.granter.slot_adjuster_decrements.kv",
+				},
+			},
+			{
+				Title: "Granter Slot Durations",
+				Metrics: []string{
+					"admission.granter.slots_exhausted_duration.kv",
+					"admission.granter.cpu_load_short_period_duration.kv",
+					"admission.granter.cpu_load_long_period_duration.kv",
 				},
 			},
 			{
@@ -3840,4 +3911,20 @@ var charts = []sectionDescription{
 			},
 		},
 	},
+}
+
+func jobTypeCharts(title string, varName string) chartDescription {
+	var metrics []string
+	for i := 0; i < jobspb.NumJobTypes; i++ {
+		jt := jobspb.Type(i)
+		if jt == jobspb.TypeUnspecified {
+			continue
+		}
+		metrics = append(metrics,
+			fmt.Sprintf("jobs.%s.%s", strings.ToLower(jobspb.Type_name[int32(i)]), varName))
+	}
+	return chartDescription{
+		Title:   title,
+		Metrics: metrics,
+	}
 }

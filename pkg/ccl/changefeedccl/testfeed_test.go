@@ -37,15 +37,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -75,7 +76,7 @@ func makeSinklessFeedFactory(
 	return &sinklessFeedFactory{s: s, sink: sink, sinkForUser: sinkForUser}
 }
 
-func (f *sinklessFeedFactory) AsUser(user string, fn func()) error {
+func (f *sinklessFeedFactory) AsUser(user string, fn func(*sqlutils.SQLRunner)) error {
 	prevSink := f.sink
 	password := `hunter2`
 	if err := setPassword(user, password, f.sink); err != nil {
@@ -84,7 +85,19 @@ func (f *sinklessFeedFactory) AsUser(user string, fn func()) error {
 	defer func() { f.sink = prevSink }()
 	var cleanup func()
 	f.sink, cleanup = f.sinkForUser(user, password)
-	fn()
+	pgconn := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(user, password),
+		Host:   f.Server().SQLAddr(),
+		Path:   `d`,
+	}
+	db2, err := gosql.Open("postgres", pgconn.String())
+	if err != nil {
+		return err
+	}
+	defer db2.Close()
+	userDB := sqlutils.MakeSQLRunner(db2)
+	fn(userDB)
 	cleanup()
 	return nil
 }
@@ -243,6 +256,77 @@ func (c *sinklessFeed) Close() error {
 	return c.conn.Close(context.Background())
 }
 
+type logger interface {
+	Log(args ...interface{})
+}
+
+type externalConnectionFeedFactory struct {
+	cdctest.TestFeedFactory
+	db     *gosql.DB
+	logger logger
+}
+
+type externalConnectionCreator func(uri string) error
+
+func (e *externalConnectionFeedFactory) Feed(
+	create string, args ...interface{},
+) (_ cdctest.TestFeed, err error) {
+
+	randomExternalConnectionName := fmt.Sprintf("testconn%d", rand.Int63())
+
+	var c externalConnectionCreator = func(uri string) error {
+		e.logger.Log("creating external connection")
+		createConnStmt := fmt.Sprintf(`CREATE EXTERNAL CONNECTION %s AS '%s'`, randomExternalConnectionName, uri)
+		_, err := e.db.Exec(createConnStmt)
+		e.logger.Log("ran create external connection")
+		if err != nil {
+			e.logger.Log("error creating external connection:" + err.Error())
+		}
+		return err
+	}
+
+	args = append([]interface{}{c}, args...)
+
+	parsed, err := parser.ParseOne(create)
+	if err != nil {
+		return nil, err
+	}
+	createStmt := parsed.AST.(*tree.CreateChangefeed)
+	if createStmt.SinkURI != nil {
+		return nil, errors.Errorf(
+			`unexpected uri provided: "INTO %s"`, tree.AsString(createStmt.SinkURI))
+	}
+	createStmt.SinkURI = tree.NewStrVal(`external://` + randomExternalConnectionName)
+
+	return e.TestFeedFactory.Feed(createStmt.String(), args...)
+
+}
+
+func setURI(
+	createStmt *tree.CreateChangefeed, uri string, allowOverride bool, args *[]interface{},
+) error {
+	if createStmt.SinkURI != nil {
+		u, err := url.Parse(tree.AsStringWithFlags(createStmt.SinkURI, tree.FmtBareStrings))
+		if err != nil {
+			return err
+		}
+		if u.Scheme == changefeedbase.SinkSchemeExternalConnection {
+			fn, ok := (*args)[0].(externalConnectionCreator)
+			if ok {
+				*args = (*args)[1:]
+				return fn(uri)
+			}
+		}
+		if allowOverride {
+			return nil
+		}
+		return errors.Errorf(
+			`unexpected uri provided: "INTO %s"`, tree.AsString(createStmt.SinkURI))
+	}
+	createStmt.SinkURI = tree.NewStrVal(uri)
+	return nil
+}
+
 // reportErrorResumer is a job resumer which reports OnFailOrCancel events.
 type reportErrorResumer struct {
 	wrapped   jobs.Resumer
@@ -266,7 +350,7 @@ func (r *reportErrorResumer) OnFailOrCancel(
 
 // OnPauseRequest implements PauseRequester interface.
 func (r *reportErrorResumer) OnPauseRequest(
-	ctx context.Context, execCtx interface{}, txn *kv.Txn, details *jobspb.Progress,
+	ctx context.Context, execCtx interface{}, txn isql.Txn, details *jobspb.Progress,
 ) error {
 	return r.wrapped.(*changefeedResumer).OnPauseRequest(ctx, execCtx, txn, details)
 }
@@ -672,7 +756,7 @@ func (e *enterpriseFeedFactory) jobsTableConn() *gosql.DB {
 // AsUser uses the previous (assumed to be root) connection to ensure
 // the user has the ability to authenticate, and saves it to poll
 // job status, then implements TestFeedFactory.AsUser().
-func (e *enterpriseFeedFactory) AsUser(user string, fn func()) error {
+func (e *enterpriseFeedFactory) AsUser(user string, fn func(*sqlutils.SQLRunner)) error {
 	prevDB := e.db
 	e.rootDB = e.db
 	defer func() { e.db = prevDB }()
@@ -692,8 +776,10 @@ func (e *enterpriseFeedFactory) AsUser(user string, fn func()) error {
 		return err
 	}
 	defer db2.Close()
+	userDB := sqlutils.MakeSQLRunner(db2)
+
 	e.db = db2
-	fn()
+	fn(userDB)
 	return nil
 }
 
@@ -786,11 +872,9 @@ func (f *tableFeedFactory) Feed(
 		return nil, err
 	}
 	createStmt := parsed.AST.(*tree.CreateChangefeed)
-	if createStmt.SinkURI != nil {
-		return nil, errors.Errorf(
-			`unexpected uri provided: "INTO %s"`, tree.AsString(createStmt.SinkURI))
+	if err := setURI(createStmt, sinkURI.String(), false, &args); err != nil {
+		return nil, err
 	}
-	createStmt.SinkURI = tree.NewStrVal(sinkURI.String())
 
 	if err := f.startFeedJob(c.jobFeed, createStmt.String(), args...); err != nil {
 		return nil, err
@@ -820,6 +904,10 @@ func (c *tableFeed) Partitions() []string {
 	return []string{`0`, `1`, `2`}
 }
 
+func timeoutOp(op string, id jobspb.JobID) string {
+	return fmt.Sprintf("%s-%d", op, id)
+}
+
 // Next implements the TestFeed interface.
 func (c *tableFeed) Next() (*cdctest.TestFeedMessage, error) {
 	// sinkSink writes all changes to a table with primary key of topic,
@@ -837,7 +925,7 @@ func (c *tableFeed) Next() (*cdctest.TestFeedMessage, error) {
 		}
 
 		if err := contextutil.RunWithTimeout(
-			context.Background(), "tableFeed.Next", timeout(),
+			context.Background(), timeoutOp("tableFeed.Next", c.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
@@ -953,9 +1041,6 @@ func (f *cloudFeedFactory) Feed(
 		return nil, err
 	}
 	createStmt := parsed.AST.(*tree.CreateChangefeed)
-	if createStmt.SinkURI != nil {
-		return nil, errors.Errorf(`unexpected uri provided: "INTO %s"`, tree.AsString(createStmt.SinkURI))
-	}
 
 	if createStmt.Select != nil {
 		createStmt.Options = append(createStmt.Options,
@@ -999,11 +1084,13 @@ func (f *cloudFeedFactory) Feed(
 	}
 
 	feedDir := feedSubDir()
-	sinkURI := `experimental-nodelocal://0/` + feedDir
+	sinkURI := `nodelocal://0/` + feedDir
 	// TODO(dan): This is a pretty unsatisfying way to test that the uri passes
 	// through params it doesn't understand to ExternalStorage.
 	sinkURI += `?should_be=ignored`
-	createStmt.SinkURI = tree.NewStrVal(sinkURI)
+	if err := setURI(createStmt, sinkURI, false, &args); err != nil {
+		return nil, err
+	}
 
 	// Nodelocal puts its dir under `ExternalIODir`, which is passed into
 	// cloudFeedFactory.
@@ -1068,7 +1155,7 @@ func reformatJSON(j interface{}) ([]byte, error) {
 	// whitespace back to where it started.
 	parsed, err := json.ParseJSON(string(printed))
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "while reparsing json '%s' marshaled from %v", printed, j)
 	}
 	var buf bytes.Buffer
 	parsed.Format(&buf)
@@ -1081,14 +1168,14 @@ func extractFieldFromJSONValue(
 	parsed := make(map[string]gojson.RawMessage)
 
 	if err := gojson.Unmarshal(wrapped, &parsed); err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Wrapf(err, "unmarshalling json '%s'", wrapped)
 	}
 
 	if isBare {
 		meta := make(map[string]gojson.RawMessage)
 		if metaVal, haveMeta := parsed[jsonMetaSentinel]; haveMeta {
 			if err := gojson.Unmarshal(metaVal, &meta); err != nil {
-				return nil, nil, err
+				return nil, nil, errors.Wrapf(err, "unmarshalling json %v", metaVal)
 			}
 			field = meta[fieldName]
 			delete(meta, fieldName)
@@ -1118,7 +1205,7 @@ func extractKeyFromJSONValue(isBare bool, wrapped []byte) (key []byte, value []b
 	var keyParsed gojson.RawMessage
 	keyParsed, value, err = extractFieldFromJSONValue("key", isBare, wrapped)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Wrapf(err, "extracting key from json payload %s", wrapped)
 	}
 
 	if key, err = reformatJSON(keyParsed); err != nil {
@@ -1342,7 +1429,7 @@ func (c *cloudFeed) Next() (*cdctest.TestFeedMessage, error) {
 		}
 
 		if err := contextutil.RunWithTimeout(
-			context.Background(), "cloudFeed.Next", timeout(),
+			context.Background(), timeoutOp("cloudfeed.Next", c.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
@@ -1366,6 +1453,11 @@ func (c *cloudFeed) Next() (*cdctest.TestFeedMessage, error) {
 func (c *cloudFeed) walkDir(path string, info os.FileInfo, err error) error {
 	if strings.HasSuffix(path, `.tmp`) {
 		// File in the process of being written by ExternalStorage. Ignore.
+		return nil
+	}
+
+	if strings.Contains(path, "crdb_external_storage_location") {
+		// Marker file created when testing "external" connection.
 		return nil
 	}
 
@@ -1545,15 +1637,23 @@ func (c *fakeKafkaClient) Config() *sarama.Config {
 
 var _ kafkaClient = (*fakeKafkaClient)(nil)
 
-type ignoreCloseProducer struct {
-	*asyncProducerMock
+type syncIgnoreCloseProducer struct {
 	*syncProducerMock
 }
 
-var _ sarama.AsyncProducer = &ignoreCloseProducer{}
-var _ sarama.SyncProducer = &ignoreCloseProducer{}
+var _ sarama.SyncProducer = (*syncIgnoreCloseProducer)(nil)
 
-func (p *ignoreCloseProducer) Close() error {
+func (p *syncIgnoreCloseProducer) Close() error {
+	return nil
+}
+
+type asyncIgnoreCloseProducer struct {
+	*asyncProducerMock
+}
+
+var _ sarama.AsyncProducer = (*asyncIgnoreCloseProducer)(nil)
+
+func (p *asyncIgnoreCloseProducer) Close() error {
 	return nil
 }
 
@@ -1586,7 +1686,7 @@ func (s *fakeKafkaSink) Dial() error {
 		// This is because normally, kafka sinks owns the producer and so it closes it.
 		// But in this case, if we let the sink close this producer, the test will panic
 		// because we will attempt to send acknowledgements on a closed channel.
-		producer := &ignoreCloseProducer{newAsyncProducerMock(100), nil}
+		producer := &asyncIgnoreCloseProducer{newAsyncProducerMock(100)}
 
 		interceptor := func(m *sarama.ProducerMessage) bool {
 			if s.knobs != nil && s.knobs.kafkaInterceptor != nil {
@@ -1607,7 +1707,7 @@ func (s *fakeKafkaSink) Dial() error {
 	}
 
 	kafka.knobs.OverrideSyncProducerFromClient = func(client kafkaClient) (sarama.SyncProducer, error) {
-		return &ignoreCloseProducer{nil, &syncProducerMock{
+		return &syncIgnoreCloseProducer{&syncProducerMock{
 			overrideSend: func(m *sarama.ProducerMessage) error {
 				if s.knobs != nil && s.knobs.kafkaInterceptor != nil {
 					err := s.knobs.kafkaInterceptor(m, client)
@@ -1640,6 +1740,17 @@ type kafkaFeedFactory struct {
 }
 
 var _ cdctest.TestFeedFactory = (*kafkaFeedFactory)(nil)
+
+func mustBeKafkaFeedFactory(f cdctest.TestFeedFactory) *kafkaFeedFactory {
+	switch v := f.(type) {
+	case *kafkaFeedFactory:
+		return v
+	case *externalConnectionFeedFactory:
+		return mustBeKafkaFeedFactory(v.TestFeedFactory)
+	default:
+		panic(fmt.Errorf("expected kafkaFeedFactory but got %+v", v))
+	}
+}
 
 // makeKafkaFeedFactory returns a TestFeedFactory implementation using the `kafka` uri.
 func makeKafkaFeedFactory(srvOrCluster interface{}, db *gosql.DB) cdctest.TestFeedFactory {
@@ -1678,9 +1789,9 @@ func (k *kafkaFeedFactory) Feed(create string, args ...interface{}) (cdctest.Tes
 
 	// Set SinkURI if it wasn't provided.  It's okay if it is -- since we may
 	// want to set some kafka specific URI parameters.
-	if createStmt.SinkURI == nil {
-		createStmt.SinkURI = tree.NewStrVal(
-			fmt.Sprintf("%s://does.not.matter/", changefeedbase.SinkSchemeKafka))
+	defaultURI := fmt.Sprintf("%s://does.not.matter/", changefeedbase.SinkSchemeKafka)
+	if err := setURI(createStmt, defaultURI, true, &args); err != nil {
+		return nil, err
 	}
 
 	var registry *cdctest.SchemaRegistry
@@ -1762,7 +1873,7 @@ func (k *kafkaFeed) Next() (*cdctest.TestFeedMessage, error) {
 	for {
 		var msg *sarama.ProducerMessage
 		if err := contextutil.RunWithTimeout(
-			context.Background(), "kafka.Next", timeout(),
+			context.Background(), timeoutOp("kafka.Next", k.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
@@ -1888,11 +1999,13 @@ func (f *webhookFeedFactory) Feed(create string, args ...interface{}) (cdctest.T
 			return nil, err
 		}
 
-		if createStmt.SinkURI == nil {
-			createStmt.SinkURI = tree.NewStrVal(
-				fmt.Sprintf("webhook-%s?insecure_tls_skip_verify=true&client_cert=%s&client_key=%s",
-					sinkDest.URL(), base64.StdEncoding.EncodeToString(clientCertPEM),
-					base64.StdEncoding.EncodeToString(clientKeyPEM)))
+		uri := fmt.Sprintf(
+			"webhook-%s?insecure_tls_skip_verify=true&client_cert=%s&client_key=%s",
+			sinkDest.URL(), base64.StdEncoding.EncodeToString(clientCertPEM),
+			base64.StdEncoding.EncodeToString(clientKeyPEM))
+
+		if err := setURI(createStmt, uri, true, &args); err != nil {
+			return nil, err
 		}
 	} else {
 		sinkDest, err = cdctest.StartMockWebhookSink(cert)
@@ -1900,9 +2013,9 @@ func (f *webhookFeedFactory) Feed(create string, args ...interface{}) (cdctest.T
 			return nil, err
 		}
 
-		if createStmt.SinkURI == nil {
-			createStmt.SinkURI = tree.NewStrVal(
-				fmt.Sprintf("webhook-%s?insecure_tls_skip_verify=true", sinkDest.URL()))
+		uri := fmt.Sprintf("webhook-%s?insecure_tls_skip_verify=true", sinkDest.URL())
+		if err := setURI(createStmt, uri, true, &args); err != nil {
+			return nil, err
 		}
 	}
 
@@ -2046,7 +2159,7 @@ func (f *webhookFeed) Next() (*cdctest.TestFeedMessage, error) {
 		}
 
 		if err := contextutil.RunWithTimeout(
-			context.Background(), "webhook.Next", timeout(),
+			context.Background(), timeoutOp("webhook.Next", f.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
@@ -2181,10 +2294,7 @@ func (p *pubsubFeedFactory) Feed(create string, args ...interface{}) (cdctest.Te
 	}
 	createStmt := parsed.AST.(*tree.CreateChangefeed)
 
-	if createStmt.SinkURI == nil {
-		createStmt.SinkURI = tree.NewStrVal(GcpScheme + "://testfeed?region=testfeedRegion")
-	}
-
+	err = setURI(createStmt, GcpScheme+"://testfeed?region=testfeedRegion", true, &args)
 	if err != nil {
 		return nil, err
 	}
@@ -2301,7 +2411,7 @@ func (p *pubsubFeed) Next() (*cdctest.TestFeedMessage, error) {
 		}
 
 		if err := contextutil.RunWithTimeout(
-			context.Background(), "pubsub.Next", timeout(),
+			context.Background(), timeoutOp("pubsub.Next", p.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
@@ -2350,7 +2460,7 @@ func stopFeedWhenDone(ctx context.Context, f cdctest.TestFeed) func() {
 		})
 	case jobFailedMarker:
 		go whenDone(func() {
-			t.jobFailed(context.Canceled)
+			t.jobFailed(errors.New("stopping job due to TestFeed timeout"))
 		})
 	}
 

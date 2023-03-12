@@ -14,10 +14,12 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -145,7 +147,7 @@ func (b *replicaAppBatch) Stage(
 	// will be committed, but all of these commands will be `IsTrivial()`.
 	if err := b.ab.runPostAddTriggers(ctx, &cmd.ReplicatedCmd, postAddEnv{
 		st:          b.r.store.cfg.Settings,
-		eng:         b.r.store.engine,
+		eng:         b.r.store.TODOEngine(),
 		sideloaded:  b.r.raftMu.sideloaded,
 		bulkLimiter: b.r.store.limiters.BulkIOWriteRate,
 	}); err != nil {
@@ -198,7 +200,7 @@ func (b *replicaAppBatch) runPreAddTriggersReplicaOnly(
 		// in Replica application.
 		if p, filter := b.r.getRangefeedProcessorAndFilter(); p != nil {
 			if err := populatePrevValsInLogicalOpLog(ctx, filter, ops, b.batch); err != nil {
-				b.r.disconnectRangefeedWithErr(p, roachpb.NewError(err))
+				b.r.disconnectRangefeedWithErr(p, kvpb.NewError(err))
 			}
 		}
 	}
@@ -266,7 +268,7 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 	// for this on appBatch.
 	if res.MVCCHistoryMutation != nil {
 		for _, span := range res.MVCCHistoryMutation.Spans {
-			b.r.disconnectRangefeedSpanWithErr(span, roachpb.NewError(&roachpb.MVCCHistoryMutationError{
+			b.r.disconnectRangefeedSpanWithErr(span, kvpb.NewError(&kvpb.MVCCHistoryMutationError{
 				Span: span,
 			}))
 		}
@@ -301,7 +303,7 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		// that overlap with the new range of the split and keep registrations that
 		// are only interested in keys that are still on the original range running.
 		b.r.disconnectRangefeedWithReason(
-			roachpb.RangeFeedRetryError_REASON_RANGE_SPLIT,
+			kvpb.RangeFeedRetryError_REASON_RANGE_SPLIT,
 		)
 	}
 
@@ -324,7 +326,7 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		rhsRepl.readOnlyCmdMu.Lock()
 		rhsRepl.mu.Lock()
 		rhsRepl.mu.destroyStatus.Set(
-			roachpb.NewRangeNotFoundError(rhsRepl.RangeID, rhsRepl.store.StoreID()),
+			kvpb.NewRangeNotFoundError(rhsRepl.RangeID, rhsRepl.store.StoreID()),
 			destroyReasonRemoved)
 		rhsRepl.mu.Unlock()
 		rhsRepl.readOnlyCmdMu.Unlock()
@@ -334,11 +336,10 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		// required for correctness, since the merge protocol should guarantee that
 		// no new replicas of the RHS can ever be created, but it doesn't hurt to
 		// be careful.
-		const clearRangeIDLocalOnly = true
-		const mustClearRange = false
-		if err := rhsRepl.preDestroyRaftMuLocked(
-			ctx, b.batch, b.batch, mergedTombstoneReplicaID, clearRangeIDLocalOnly, mustClearRange,
-		); err != nil {
+		if err := kvstorage.DestroyReplica(ctx, rhsRepl.RangeID, b.batch, b.batch, mergedTombstoneReplicaID, kvstorage.ClearRangeDataOptions{
+			ClearReplicatedByRangeID:   true,
+			ClearUnreplicatedByRangeID: true,
+		}); err != nil {
 			return errors.Wrapf(err, "unable to destroy replica before merge")
 		}
 
@@ -359,10 +360,10 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		// rangefeeds with REASON_REPLICA_REMOVED. That's ok because we will have
 		// already disconnected the rangefeed here.
 		b.r.disconnectRangefeedWithReason(
-			roachpb.RangeFeedRetryError_REASON_RANGE_MERGED,
+			kvpb.RangeFeedRetryError_REASON_RANGE_MERGED,
 		)
 		rhsRepl.disconnectRangefeedWithReason(
-			roachpb.RangeFeedRetryError_REASON_RANGE_MERGED,
+			kvpb.RangeFeedRetryError_REASON_RANGE_MERGED,
 		)
 	}
 
@@ -464,24 +465,22 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		b.r.readOnlyCmdMu.Lock()
 		b.r.mu.Lock()
 		b.r.mu.destroyStatus.Set(
-			roachpb.NewRangeNotFoundError(b.r.RangeID, b.r.store.StoreID()),
+			kvpb.NewRangeNotFoundError(b.r.RangeID, b.r.store.StoreID()),
 			destroyReasonRemoved)
+		span := b.r.descRLocked().RSpan()
 		b.r.mu.Unlock()
 		b.r.readOnlyCmdMu.Unlock()
 		b.changeRemovesReplica = true
 
-		// Delete all of the local data. We're going to delete the hard state too.
-		// In order for this to be safe we need code above this to promise that we're
-		// never going to write hard state in response to a message for a later
-		// replica (with a different replica ID) to this range state.
-		if err := b.r.preDestroyRaftMuLocked(
-			ctx,
-			b.batch,
-			b.batch,
-			change.NextReplicaID(),
-			false, /* clearRangeIDLocalOnly */
-			false, /* mustUseClearRange */
-		); err != nil {
+		// Delete all of the Replica's data. We're going to delete the hard state too.
+		// We've set the replica's in-mem status to reflect the pending destruction
+		// above, and preDestroyRaftMuLocked will also add a range tombstone to the
+		// batch, so that when we commit it, the removal is finalized.
+		if err := kvstorage.DestroyReplica(ctx, b.r.RangeID, b.batch, b.batch, change.NextReplicaID(), kvstorage.ClearRangeDataOptions{
+			ClearReplicatedBySpan:      span,
+			ClearReplicatedByRangeID:   true,
+			ClearUnreplicatedByRangeID: true,
+		}); err != nil {
 			return errors.Wrapf(err, "unable to destroy replica before removal")
 		}
 	}

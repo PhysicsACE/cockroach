@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"os/user"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq" // register postgres driver
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -84,6 +86,7 @@ func main() {
 	// ##teamcity[publishArtifacts] in Teamcity mode.
 	var literalArtifacts string
 	var httpPort int
+	var promPort int
 	var debugOnFailure bool
 	var debugAlways bool
 	var runSkipped bool
@@ -186,10 +189,7 @@ Examples:
    roachtest list tag:weekly
 `,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r, err := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
-			if err != nil {
-				return err
-			}
+			r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
 			if !listBench {
 				tests.RegisterTests(&r)
 			} else {
@@ -237,6 +237,7 @@ runner itself.
 				debugMode:              debugModeFromOpts(),
 				skipInit:               skipInit,
 				httpPort:               httpPort,
+				promPort:               promPort,
 				parallelism:            parallelism,
 				artifactsDir:           artifacts,
 				literalArtifactsDir:    literalArtifacts,
@@ -247,18 +248,15 @@ runner itself.
 		},
 	}
 
-	// TODO(irfansharif): We could remove this by directly running `cockroach
-	// version` against the binary being tested, instead of what we do today
-	// which is defaulting to checking the last git release tag present in the
-	// local checkout.
-	runCmd.Flags().StringVar(
-		&buildTag, "build-tag", "", "build tag (auto-detect if empty)")
 	runCmd.Flags().StringVar(
 		&slackToken, "slack-token", "", "Slack bot token")
 	runCmd.Flags().BoolVar(
 		&teamCity, "teamcity", false, "include teamcity-specific markers in output")
 	runCmd.Flags().BoolVar(
 		&disableIssue, "disable-issue", false, "disable posting GitHub issue for failures")
+	runCmd.Flags().IntVar(
+		&promPort, "prom-port", 2113,
+		"the http port on which to expose prom metrics from the roachtest process")
 
 	var benchCmd = &cobra.Command{
 		// Don't display usage when tests fail.
@@ -377,6 +375,7 @@ type cliCfg struct {
 	runSkipped             bool
 	skipInit               bool
 	httpPort               int
+	promPort               int
 	parallelism            int
 	artifactsDir           string
 	literalArtifactsDir    string
@@ -389,15 +388,12 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	if cfg.count <= 0 {
 		return fmt.Errorf("--count (%d) must by greater than 0", cfg.count)
 	}
-	r, err := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
-	if err != nil {
-		return err
-	}
+	r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
 	register(&r)
 	cr := newClusterRegistry()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
-	runner := newTestRunner(cr, stopper, r.buildVersion)
+	runner := newTestRunner(cr, stopper)
 
 	filter := registry.NewTestFilter(cfg.args, cfg.runSkipped)
 	clusterType := roachprodCluster
@@ -454,13 +450,20 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 		literalArtifactsDir: cfg.literalArtifactsDir,
 		runnerLogPath:       runnerLogPath,
 	}
-
+	go func() {
+		if err := http.ListenAndServe(
+			fmt.Sprintf(":%d", cfg.promPort),
+			promhttp.HandlerFor(r.promRegistry, promhttp.HandlerOpts{}),
+		); err != nil {
+			l.Errorf("error serving prometheus: %v", err)
+		}
+	}()
 	// We're going to run all the workers (and thus all the tests) in a context
 	// that gets canceled when the Interrupt signal is received.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	CtrlC(ctx, l, cancel, cr)
-	err = runner.Run(
+	err := runner.Run(
 		ctx, tests, cfg.count, cfg.parallelism, opt,
 		testOpts{
 			versionsBinaryOverride: cfg.versionsBinaryOverride,

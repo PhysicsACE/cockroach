@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -464,29 +465,30 @@ func TestDrainingProcessorSwallowsUncertaintyError(t *testing.T) {
 				0: {
 					Knobs: base.TestingKnobs{
 						Store: &kvserver.StoreTestingKnobs{
-							TestingRequestFilter: func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+							TestingRequestFilter: func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 								if atomic.LoadInt64(&trapRead) == 0 {
 									return nil
 								}
 								// We're going to trap a read for the rows [1,5].
-								req, ok := ba.GetArg(roachpb.Scan)
+								req, ok := ba.GetArg(kvpb.Scan)
 								if !ok {
 									return nil
 								}
-								key := req.(*roachpb.ScanRequest).Key.String()
-								endKey := req.(*roachpb.ScanRequest).EndKey.String()
+								key := req.(*kvpb.ScanRequest).Key.String()
+								endKey := req.(*kvpb.ScanRequest).EndKey.String()
 								if strings.Contains(key, "/1") && strings.Contains(endKey, "/6") {
 									blockedRead.Lock()
 									for !blockedRead.shouldUnblock {
 										blockedRead.unblockCond.Wait()
 									}
 									blockedRead.Unlock()
-									return roachpb.NewError(
-										roachpb.NewReadWithinUncertaintyIntervalError(
+									return kvpb.NewError(
+										kvpb.NewReadWithinUncertaintyIntervalError(
 											ba.Timestamp,           /* readTs */
-											ba.Timestamp.Add(1, 0), /* existingTs */
-											hlc.Timestamp{},        /* localUncertaintyLimit */
-											ba.Txn))
+											hlc.ClockTimestamp{},   /* localUncertaintyLimit */
+											ba.Txn,                 /* txn */
+											ba.Timestamp.Add(1, 0), /* valueTS */
+											hlc.ClockTimestamp{} /* localTS */))
 								}
 								return nil
 							},
@@ -639,7 +641,7 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 			testClusterArgs.ServerArgsPerNode[node] = base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						TestingRequestFilter: func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+						TestingRequestFilter: func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 							if atomic.LoadInt64(&trapRead) == 0 {
 								return nil
 							}
@@ -651,19 +653,20 @@ func TestUncertaintyErrorIsReturned(t *testing.T) {
 								return nil
 							}
 
-							req, ok := ba.GetArg(roachpb.Scan)
+							req, ok := ba.GetArg(kvpb.Scan)
 							if !ok {
 								return nil
 							}
-							if !bytes.HasPrefix(req.(*roachpb.ScanRequest).Key, keyPrefix) {
+							if !bytes.HasPrefix(req.(*kvpb.ScanRequest).Key, keyPrefix) {
 								return nil
 							}
-							return roachpb.NewError(
-								roachpb.NewReadWithinUncertaintyIntervalError(
+							return kvpb.NewError(
+								kvpb.NewReadWithinUncertaintyIntervalError(
 									ba.Timestamp,
-									ba.Timestamp.Add(1, 0),
-									hlc.Timestamp{},
+									hlc.ClockTimestamp{},
 									ba.Txn,
+									ba.Timestamp.Add(1, 0),
+									hlc.ClockTimestamp{},
 								),
 							)
 						},

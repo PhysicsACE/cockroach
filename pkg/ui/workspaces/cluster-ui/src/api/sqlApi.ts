@@ -15,7 +15,7 @@ export type SqlExecutionRequest = {
   execute?: boolean;
   timeout?: string; // Default 5s
   application_name?: string; // Defaults to '$ api-v2-sql'
-  database?: string; // Defaults to defaultDb
+  database?: string; // Defaults to system
   max_result_size?: number; // Default 10kib
 };
 
@@ -60,6 +60,11 @@ export type SqlExecutionErrorMessage = {
   source: { file: string; line: number; function: "string" };
 };
 
+export type SqlApiResponse<ResultType> = {
+  maxSizeReached: boolean;
+  results: ResultType;
+};
+
 export const SQL_API_PATH = "/api/v2/sql/";
 
 /**
@@ -71,6 +76,11 @@ export const SQL_API_PATH = "/api/v2/sql/";
 export function executeSql<RowType>(
   req: SqlExecutionRequest,
 ): Promise<SqlExecutionResponse<RowType>> {
+  // TODO(maryliag) remove this part of code when cloud is updated with
+  // a new CRDB release.
+  if (!req.database) {
+    req.database = "system";
+  }
   return fetchDataJSON<SqlExecutionResponse<RowType>, SqlExecutionRequest>(
     SQL_API_PATH,
     req,
@@ -118,4 +128,69 @@ export function sqlResultsAreEmpty(
       txn => !txn.rows || txn.rows.length === 0,
     )
   );
+}
+
+// Error messages relating to upgrades in progress.
+// This is a temporary solution until we can use different queries for
+// different versions. For now we just try to give more info as to why
+// this page is unavailable for insights.
+const UPGRADE_RELATED_ERRORS = [
+  /relation "(.*)" does not exist/i,
+  /column "(.*)" does not exist/i,
+];
+
+export function isUpgradeError(message: string): boolean {
+  return UPGRADE_RELATED_ERRORS.some(err => message.search(err) !== -1);
+}
+
+/**
+ * errorMessage cleans the error message returned by the sqlApi,
+ * removing information not useful for the user.
+ * e.g. the error message
+ * "$executing stmt 1: run-query-via-api: only users with either MODIFYCLUSTERSETTING
+ * or VIEWCLUSTERSETTING privileges are allowed to show cluster settings"
+ * became
+ * "only users with either MODIFYCLUSTERSETTING or VIEWCLUSTERSETTING privileges are allowed to show cluster settings"
+ * and the error message
+ * "executing stmt 1: max result size exceeded"
+ * became
+ * "max result size exceeded"
+ * @param message
+ */
+export function sqlApiErrorMessage(message: string): string {
+  if (isUpgradeError(message)) {
+    return "This page may not be available during an upgrade.";
+  }
+
+  message = message.replace("run-query-via-api: ", "");
+  if (message.includes(":")) {
+    return message.split(":")[1];
+  }
+
+  return message;
+}
+
+export function isMaxSizeError(message: string): boolean {
+  return !!message?.includes("max result size exceeded");
+}
+
+export function formatApiResult(
+  results: Array<any>,
+  error: SqlExecutionErrorMessage,
+  errorMessageContext: string,
+): SqlApiResponse<any> {
+  const maxSizeError = isMaxSizeError(error?.message);
+
+  if (error && !maxSizeError) {
+    throw new Error(
+      `Error while ${errorMessageContext}: ${sqlApiErrorMessage(
+        error?.message,
+      )}`,
+    );
+  }
+
+  return {
+    maxSizeReached: maxSizeError,
+    results: results,
+  };
 }

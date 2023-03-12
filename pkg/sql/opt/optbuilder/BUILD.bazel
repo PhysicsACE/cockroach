@@ -50,8 +50,10 @@ go_library(
     deps = [
         "//pkg/server/telemetry",
         "//pkg/settings",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/funcinfo",
         "//pkg/sql/catalog/schemaexpr",
         "//pkg/sql/catalog/seqexpr",
         "//pkg/sql/catalog/tabledesc",

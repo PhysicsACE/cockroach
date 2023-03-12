@@ -18,11 +18,13 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -66,14 +68,30 @@ type results interface {
 	sizeInfo(lenKey, lenValue int) (numKeys, numBytes, numBytesInc int64)
 	// put adds a KV into the results. An error is returned if the memory
 	// reservation is denied by the memory account.
-	put(_ context.Context, key []byte, value []byte, memAccount *mon.BoundAccount, maxNewSize int) error
+	put(_ context.Context, mvccKey []byte, value []byte, memAccount *mon.BoundAccount, maxNewSize int) error
 	// continuesFirstRow returns true if the given key belongs to the same SQL
-	// row as the first KV pair in the result (or if the result is empty). If
-	// either key is not a valid SQL row key, returns false.
+	// row as the first KV pair in the result. If the given key is not a valid
+	// SQL row key, returns false.
+	//
+	// This method is called _after_ having called put() with no error at least
+	// once, meaning that at least one key is in the results.
+	//
+	// Only called when wholeRows option is enabled.
 	continuesFirstRow(key roachpb.Key) bool
 	// maybeTrimPartialLastRow removes the last KV pairs from the result that
 	// are part of the same SQL row as the given key, returning the earliest key
 	// removed.
+	//
+	// pebbleMVCCScanner.getOne can call this method only _before_ calling
+	// put(). This constraint ensures that for the singleResults implementation
+	// of this interface, when this method is called, there is no buffered KV
+	// (i.e. there is no KV that has been `put` into the results but not yet
+	// returned on the NextKVer.NextKV call). This allows for the singleResults
+	// to synchronize with the colfetcher.cFetcher (via the
+	// storage.FirstKeyOfRowGetter) to obtain the first key of the SQL row if
+	// the given key belongs to that row.
+	//
+	// Only called when wholeRows option is enabled.
 	maybeTrimPartialLastRow(key roachpb.Key) (roachpb.Key, error)
 	// lastRowHasFinalColumnFamily returns true if the last key in the result is
 	// the maximum column family ID of the row. If so, we know that the row is
@@ -81,9 +99,10 @@ type results interface {
 	// the row may be omitted, in which case the caller has to scan to the next
 	// key to find out whether the row is complete.
 	//
-	// lastRowHasFinalColumnFamily is only called after having called put() with
-	// no error at least once, meaning that at least one key is in the results.
-	// Also, this is only called when wholeRows option is enabled.
+	// This method is called _after_ having called put() with no error at least
+	// once, meaning that at least one key is in the results.
+	//
+	// Only called when wholeRows option is enabled.
 	lastRowHasFinalColumnFamily(reverse bool) bool
 }
 
@@ -247,15 +266,9 @@ func (p *pebbleResults) continuesFirstRow(key roachpb.Key) bool {
 	return bytes.Equal(rowPrefix, getRowPrefix(extractResultKey(repr)))
 }
 
-// lastRowHasFinalColumnFamily implements the results interface.
-func (p *pebbleResults) lastRowHasFinalColumnFamily(reverse bool) bool {
-	lastOffsetIdx := p.lastOffsetIdx - 1 // p.lastOffsetIdx is where next offset would be stored
-	if lastOffsetIdx < 0 {
-		lastOffsetIdx = len(p.lastOffsets) - 1
-	}
-	lastOffset := p.lastOffsets[lastOffsetIdx]
-
-	key := extractResultKey(p.repr[lastOffset:])
+// keyHasFinalColumnFamily returns whether the given key corresponds to the last
+// column family in a SQL row. Returns false if the key is not a valid SQL key.
+func keyHasFinalColumnFamily(key roachpb.Key, maxFamilyID uint32, reverse bool) bool {
 	colFamilyID, err := keys.DecodeFamilyKey(key)
 	if err != nil {
 		return false
@@ -263,7 +276,18 @@ func (p *pebbleResults) lastRowHasFinalColumnFamily(reverse bool) bool {
 	if reverse {
 		return colFamilyID == 0
 	}
-	return int(colFamilyID) == len(p.lastOffsets)-1
+	return colFamilyID == maxFamilyID
+}
+
+// lastRowHasFinalColumnFamily implements the results interface.
+func (p *pebbleResults) lastRowHasFinalColumnFamily(reverse bool) bool {
+	lastOffsetIdx := p.lastOffsetIdx - 1 // p.lastOffsetIdx is where next offset would be stored
+	if lastOffsetIdx < 0 {
+		lastOffsetIdx = len(p.lastOffsets) - 1
+	}
+	lastOffset := p.lastOffsets[lastOffsetIdx]
+	key := extractResultKey(p.repr[lastOffset:])
+	return keyHasFinalColumnFamily(key, uint32(len(p.lastOffsets)-1), reverse)
 }
 
 // maybeTrimPartialLastRow implements the results interface.
@@ -392,7 +416,7 @@ type pebbleMVCCScanner struct {
 	maxIntents int64
 	// Resume fields describe the resume span to return. resumeReason must be set
 	// to a non-zero value to return a resume span, the others are optional.
-	resumeReason    roachpb.ResumeReason
+	resumeReason    kvpb.ResumeReason
 	resumeKey       roachpb.Key // if unset, falls back to p.advanceKey()
 	resumeNextBytes int64       // set when targetBytes is exceeded
 	// Transaction epoch and sequence number.
@@ -418,14 +442,15 @@ type pebbleMVCCScanner struct {
 	// cur* variables store the "current" record we're pointing to. Updated in
 	// updateCurrent. Note that the timestamp can be clobbered in the case of
 	// adding an intent from the intent history but is otherwise meaningful.
-	curUnsafeKey   MVCCKey
-	curRawKey      []byte
-	curUnsafeValue MVCCValue
-	curRawValue    pebble.LazyValue
-	curRangeKeys   MVCCRangeKeyStack
-	savedRangeKeys MVCCRangeKeyStack
-	results        results
-	intents        pebble.Batch
+	curUnsafeKey      MVCCKey
+	curRawKey         []byte
+	curUnsafeValue    MVCCValue
+	curRawValue       pebble.LazyValue
+	curRangeKeys      MVCCRangeKeyStack
+	savedRangeKeys    MVCCRangeKeyStack
+	savedRangeKeyVers MVCCRangeKeyVersion
+	results           results
+	intents           pebble.Batch
 	// mostRecentTS stores the largest timestamp observed that is equal to or
 	// above the scan timestamp. Only applicable if failOnMoreRecent is true. If
 	// set and no other error is hit, a WriteToOld error will be returned from
@@ -523,6 +548,25 @@ func (p *pebbleMVCCScanner) get(ctx context.Context) {
 	if !p.iterValid() {
 		return
 	}
+
+	// Unlike scans, if tombstones are enabled, we synthesize point tombstones
+	// for MVCC range tombstones even if there is no existing point key below
+	// it. These are often needed for e.g. conflict checks. However, both
+	// processRangeKeys and getOne may need to advance the iterator,
+	// moving away from range key we originally landed on. If we're in tombstone
+	// mode and there's a range key, save the most recent visible value so that
+	// we can use it to synthesize a tombstone if we fail to find a KV.
+	var hadMVCCRangeTombstone bool
+	if p.tombstones {
+		if _, hasRange := p.parent.HasPointAndRange(); hasRange {
+			rangeKeys := p.parent.RangeKeys()
+			if rkv, ok := rangeKeys.FirstAtOrBelow(p.ts); ok {
+				hadMVCCRangeTombstone = true
+				rkv.CloneInto(&p.savedRangeKeyVers)
+			}
+		}
+	}
+
 	var added bool
 	if p.processRangeKeys(true /* seeked */, false /* reverse */) {
 		if p.updateCurrent() {
@@ -530,14 +574,33 @@ func (p *pebbleMVCCScanner) get(ctx context.Context) {
 		}
 	}
 	p.maybeFailOnMoreRecent()
-	// Unlike scans, if tombstones are enabled, we synthesize point tombstones for
-	// MVCC range tombstones even if there is no existing point key below it.
-	// These are often needed for e.g. conflict checks.
-	if p.tombstones && !added && p.err == nil {
-		if rkv, ok := p.coveredByRangeKey(hlc.MinTimestamp); ok {
-			p.addSynthetic(ctx, p.curRangeKeys.Bounds.Key, rkv)
-		}
+
+	// In tombstone mode, if there was no existing point key we may need to
+	// synthesize a point tombstone if we saved a range key before
+	// Unlike scans, if tombstones are enabled, we synthesize point tombstones
+	// for MVCC range tombstones even if there is no existing point key below
+	// it. These are often needed for e.g. conflict checks.
+	if p.tombstones && hadMVCCRangeTombstone && !added && p.err == nil {
+		p.addSynthetic(ctx, p.start, p.savedRangeKeyVers)
 	}
+}
+
+// seekToStartOfScan positions the scanner at the initial key.
+func (p *pebbleMVCCScanner) seekToStartOfScan() (ok bool) {
+	if p.reverse {
+		if !p.iterSeekReverse(MVCCKey{Key: p.end}) {
+			p.maybeFailOnMoreRecent() // may have seen a conflicting range key
+			return false
+		}
+		p.machine.fn = advanceKeyReverse
+	} else {
+		if !p.iterSeek(MVCCKey{Key: p.start}) {
+			p.maybeFailOnMoreRecent() // may have seen a conflicting range key
+			return false
+		}
+		p.machine.fn = advanceKeyForward
+	}
+	return true
 }
 
 // advance advances the iterator according to the current state of the state
@@ -573,31 +636,26 @@ func (p *pebbleMVCCScanner) advance() bool {
 // resume span, resume reason, and for targetBytes the size of the next result.
 func (p *pebbleMVCCScanner) scan(
 	ctx context.Context,
-) (*roachpb.Span, roachpb.ResumeReason, int64, error) {
+) (*roachpb.Span, kvpb.ResumeReason, int64, error) {
 	if p.wholeRows && !p.results.(*pebbleResults).lastOffsetsEnabled {
 		return nil, 0, 0, errors.AssertionFailedf("cannot use wholeRows without trackLastOffsets")
 	}
-
-	if p.reverse {
-		if !p.iterSeekReverse(MVCCKey{Key: p.end}) {
-			p.maybeFailOnMoreRecent() // may have seen a conflicting range key
-			return nil, 0, 0, p.err
-		}
-		p.machine.fn = advanceKeyReverse
-	} else {
-		if !p.iterSeek(MVCCKey{Key: p.start}) {
-			p.maybeFailOnMoreRecent() // may have seen a conflicting range key
-			return nil, 0, 0, p.err
-		}
-		p.machine.fn = advanceKeyForward
+	if !p.seekToStartOfScan() {
+		return nil, 0, 0, p.err
 	}
-
 	for ok := true; ok; {
 		ok, _ = p.getOne(ctx)
 		if ok {
 			ok = p.advance()
 		}
 	}
+	return p.afterScan()
+}
+
+// afterScan checks whether some limit was exceeded during the scan, and if so,
+// it returns a resume span, resume reason, and for targetBytes the size of the
+// next result.
+func (p *pebbleMVCCScanner) afterScan() (*roachpb.Span, kvpb.ResumeReason, int64, error) {
 	p.maybeFailOnMoreRecent()
 
 	if p.err != nil {
@@ -652,8 +710,13 @@ func (p *pebbleMVCCScanner) incrementItersBeforeSeek() {
 // Decrements itersBeforeSeek while ensuring it stays positive.
 func (p *pebbleMVCCScanner) decrementItersBeforeSeek() {
 	p.itersBeforeSeek--
-	if p.itersBeforeSeek < 0 {
-		p.itersBeforeSeek = 0
+	if p.itersBeforeSeek < 1 {
+		if maxItersBeforeSeek > 0 {
+			p.itersBeforeSeek = 1
+		} else if p.itersBeforeSeek < 0 {
+			// maxItersBeforeSeek == 0 && p.itersBeforeSeek < 0.
+			p.itersBeforeSeek = 0
+		}
 	}
 }
 
@@ -695,21 +758,25 @@ func (p *pebbleMVCCScanner) maybeFailOnMoreRecent() {
 	}
 	// The txn can't write at the existing timestamp, so we provide the error
 	// with the timestamp immediately after it.
-	p.err = roachpb.NewWriteTooOldError(p.ts, p.mostRecentTS.Next(), p.mostRecentKey)
+	p.err = kvpb.NewWriteTooOldError(p.ts, p.mostRecentTS.Next(), p.mostRecentKey)
 	p.results.clear()
 	p.intents.Reset()
 }
 
-// Returns an uncertainty error with the specified timestamp and p.txn.
-func (p *pebbleMVCCScanner) uncertaintyError(ts hlc.Timestamp) (ok bool) {
-	p.err = roachpb.NewReadWithinUncertaintyIntervalError(
-		p.ts, ts, p.uncertainty.LocalLimit.ToTimestamp(), p.txn)
+// Returns an uncertainty error with the specified value and local timestamps,
+// along with context about the reader.
+func (p *pebbleMVCCScanner) uncertaintyError(
+	valueTs hlc.Timestamp, localTs hlc.ClockTimestamp,
+) (ok bool) {
+	p.err = kvpb.NewReadWithinUncertaintyIntervalError(
+		p.ts, p.uncertainty.LocalLimit, p.txn, valueTs, localTs)
 	p.results.clear()
 	p.intents.Reset()
 	return false
 }
 
-// Get one tuple into the result set.
+// Get one tuple into the result set. This method will make at most one
+// 'results.put' call regardless of whether 'put' returns an error or not.
 // - ok indicates whether the iteration should continue.
 // - added indicates whether a tuple was included into the result set.
 // (ok=true, added=false) indicates that the current key was skipped for some
@@ -817,7 +884,7 @@ func (p *pebbleMVCCScanner) getOne(ctx context.Context) (ok, added bool) {
 			// errors.
 			localTS := p.curUnsafeValue.GetLocalTimestamp(p.curUnsafeKey.Timestamp)
 			if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp, localTS) {
-				return p.uncertaintyError(p.curUnsafeKey.Timestamp), false
+				return p.uncertaintyError(p.curUnsafeKey.Timestamp, localTS), false
 			}
 
 			// This value is not within the reader's uncertainty window, but
@@ -927,7 +994,7 @@ func (p *pebbleMVCCScanner) getOne(ctx context.Context) (ok, added bool) {
 		}
 		// Limit number of intents returned in write intent error.
 		if p.maxIntents > 0 && int64(p.intents.Count()) >= p.maxIntents {
-			p.resumeReason = roachpb.RESUME_INTENT_LIMIT
+			p.resumeReason = kvpb.RESUME_INTENT_LIMIT
 			return false, false
 		}
 		return true /* ok */, false
@@ -1128,6 +1195,12 @@ func (p *pebbleMVCCScanner) advanceKeyAtNewKeyReverse() bool {
 	return p.prevKey(p.machine.origKey)
 }
 
+// IncludeStartKeyIntoErr wraps with the given error to include the provided
+// start key of the scan as an additional detail.
+func IncludeStartKeyIntoErr(startKey roachpb.Key, err error) error {
+	return errors.Wrapf(err, "scan with start key %s", startKey)
+}
+
 // Adds the specified key and value to the result set, excluding tombstones
 // unless p.tombstones is true.
 //   - ok indicates whether the iteration should continue. This can be false
@@ -1160,11 +1233,11 @@ func (p *pebbleMVCCScanner) add(
 
 	// Check if adding the key would exceed a limit.
 	if p.targetBytes > 0 && numBytes+numBytesInc > p.targetBytes {
-		p.resumeReason = roachpb.RESUME_BYTE_LIMIT
+		p.resumeReason = kvpb.RESUME_BYTE_LIMIT
 		p.resumeNextBytes = numBytesInc
 
 	} else if p.maxKeys > 0 && numKeys >= p.maxKeys {
-		p.resumeReason = roachpb.RESUME_KEY_LIMIT
+		p.resumeReason = kvpb.RESUME_KEY_LIMIT
 	}
 
 	var mustPutKey bool
@@ -1201,7 +1274,7 @@ func (p *pebbleMVCCScanner) add(
 	//
 	// For B we will never set maxNewSize.
 	// For A, we may set maxNewSize, but we already know that
-	//   p.targetBytes >= p.results.bytes + lenToAdd
+	//   p.targetBytes >= numBytes + numBytesInc
 	// so maxNewSize will be sufficient.
 	var maxNewSize int
 	if p.targetBytes > 0 && p.targetBytes > numBytes && !mustPutKey {
@@ -1210,7 +1283,7 @@ func (p *pebbleMVCCScanner) add(
 		maxNewSize = int(p.targetBytes - numBytes)
 	}
 	if err := p.results.put(ctx, rawKey, rawValue, p.memAccount, maxNewSize); err != nil {
-		p.err = errors.Wrapf(err, "scan with start key %s", p.start)
+		p.err = IncludeStartKeyIntoErr(p.start, err)
 		return false, false
 	}
 	numKeys++
@@ -1227,7 +1300,7 @@ func (p *pebbleMVCCScanner) add(
 		// the row may have been omitted (if they are all NULL values) -- to find
 		// out, we must continue scanning to the next key and handle it above.
 		if !p.wholeRows || p.results.lastRowHasFinalColumnFamily(p.reverse) {
-			p.resumeReason = roachpb.RESUME_KEY_LIMIT
+			p.resumeReason = kvpb.RESUME_KEY_LIMIT
 			return false /* ok */, true /* added */
 		}
 	}
@@ -1314,7 +1387,7 @@ func (p *pebbleMVCCScanner) seekVersion(
 			// is uncertain.
 			localTS := p.curUnsafeValue.GetLocalTimestamp(p.curUnsafeKey.Timestamp)
 			if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp, localTS) {
-				return p.uncertaintyError(p.curUnsafeKey.Timestamp), false
+				return p.uncertaintyError(p.curUnsafeKey.Timestamp, localTS), false
 			}
 		}
 	}
@@ -1351,7 +1424,7 @@ func (p *pebbleMVCCScanner) seekVersion(
 		// error.
 		localTS := p.curUnsafeValue.GetLocalTimestamp(p.curUnsafeKey.Timestamp)
 		if p.uncertainty.IsUncertain(p.curUnsafeKey.Timestamp, localTS) {
-			return p.uncertaintyError(p.curUnsafeKey.Timestamp), false
+			return p.uncertaintyError(p.curUnsafeKey.Timestamp, localTS), false
 		}
 		if !p.iterNext() {
 			p.setAdvanceKeyAtEnd()
@@ -1461,7 +1534,7 @@ func (p *pebbleMVCCScanner) processRangeKeys(seeked bool, reverse bool) bool {
 					}
 					localTS := value.GetLocalTimestamp(version.Timestamp)
 					if p.uncertainty.IsUncertain(version.Timestamp, localTS) {
-						return p.uncertaintyError(version.Timestamp)
+						return p.uncertaintyError(version.Timestamp, localTS)
 					}
 				}
 			}
@@ -1607,6 +1680,9 @@ func (p *pebbleMVCCScanner) iterNext() bool {
 		p.parent.Next()
 		// We don't need to process range key changes here, because curRangeKeys
 		// already contains the range keys at this position from before the peek.
+		if buildutil.CrdbTestBuild {
+			p.assertOwnedRangeKeys()
+		}
 		if !p.iterValid() {
 			return false
 		}
@@ -1770,7 +1846,7 @@ func (p *pebbleMVCCScanner) addRawIntent(ctx context.Context, key, value []byte)
 	// chunks to amortize allocations. The memMonitor is under-counting here
 	// by only accounting for the key and value bytes.
 	if p.err = p.memAccount.Grow(ctx, int64(len(key)+len(value))); p.err != nil {
-		p.err = errors.Wrapf(p.err, "scan with start key %s", p.start)
+		p.err = IncludeStartKeyIntoErr(p.start, p.err)
 		return false
 	}
 	p.err = p.intents.Set(key, value, nil)
@@ -1782,4 +1858,17 @@ func (p *pebbleMVCCScanner) intentsRepr() []byte {
 		return nil
 	}
 	return p.intents.Repr()
+}
+
+// assertOwnedRangeKeys asserts that p.curRangeKeys is empty, or backed by
+// p.savedRangeKeys's buffers.
+func (p *pebbleMVCCScanner) assertOwnedRangeKeys() {
+	if p.curRangeKeys.IsEmpty() {
+		return
+	}
+	// NB: We compare on the EndKey in case the start key is /Min, the empty
+	// key.
+	if &p.curRangeKeys.Bounds.EndKey[0] != &p.savedRangeKeys.Bounds.EndKey[0] {
+		panic(errors.AssertionFailedf("current range keys are not scanner-owned"))
+	}
 }

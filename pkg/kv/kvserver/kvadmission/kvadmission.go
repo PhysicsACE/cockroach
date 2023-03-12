@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -29,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 // elasticCPUDurationPerExportRequest controls how many CPU tokens are allotted
@@ -81,6 +83,14 @@ var rangefeedCatchupScanElasticControlEnabled = settings.RegisterBoolSetting(
 	true,
 )
 
+// ProvisionedBandwidth set a value of the provisioned
+// bandwidth for each store in the cluster.
+var ProvisionedBandwidth = settings.RegisterByteSizeSetting(
+	settings.SystemOnly, "kvadmission.store.provisioned_bandwidth",
+	"if set to a non-zero value, this is used as the provisioned bandwidth (in bytes/s), "+
+		"for each store. It can be over-ridden on a per-store basis using the --store flag",
+	0).WithPublic()
+
 // Controller provides admission control for the KV layer.
 type Controller interface {
 	// AdmitKVWork must be called before performing KV work.
@@ -88,7 +98,7 @@ type Controller interface {
 	// populated for admission to work correctly. If err is non-nil, the
 	// returned handle can be ignored. If err is nil, AdmittedKVWorkDone must be
 	// called after the KV work is done executing.
-	AdmitKVWork(context.Context, roachpb.TenantID, *roachpb.BatchRequest) (Handle, error)
+	AdmitKVWork(context.Context, roachpb.TenantID, *kvpb.BatchRequest) (Handle, error)
 	// AdmittedKVWorkDone is called after the admitted KV work is done
 	// executing.
 	AdmittedKVWorkDone(Handle, *StoreWriteBytes)
@@ -96,7 +106,7 @@ type Controller interface {
 	// If enabled, it returns a non-nil Pacer that's to be used within rangefeed
 	// catchup scans (typically CPU-intensive and affecting scheduling
 	// latencies).
-	AdmitRangefeedRequest(roachpb.TenantID, *roachpb.RangeFeedRequest) *admission.Pacer
+	AdmitRangefeedRequest(roachpb.TenantID, *kvpb.RangeFeedRequest) *admission.Pacer
 	// SetTenantWeightProvider is used to set the provider that will be
 	// periodically polled for weights. The stopper should be used to terminate
 	// the periodic polling.
@@ -108,6 +118,9 @@ type Controller interface {
 	// replicated to a raft follower, that have not been subject to admission
 	// control.
 	FollowerStoreWriteBytes(roachpb.StoreID, FollowerStoreWriteBytes)
+	// AdmitRaftEntry informs admission control of a raft log entry being
+	// written to storage.
+	AdmitRaftEntry(roachpb.TenantID, roachpb.StoreID, roachpb.RangeID, raftpb.Entry)
 }
 
 // TenantWeightProvider can be periodically asked to provide the tenant
@@ -180,7 +193,7 @@ func MakeController(
 // TODO(irfansharif): There's a fair bit happening here and there's no test
 // coverage. Fix that.
 func (n *controllerImpl) AdmitKVWork(
-	ctx context.Context, tenantID roachpb.TenantID, ba *roachpb.BatchRequest,
+	ctx context.Context, tenantID roachpb.TenantID, ba *kvpb.BatchRequest,
 ) (handle Handle, retErr error) {
 	ah := Handle{tenantID: tenantID}
 	if n.kvAdmissionQ == nil {
@@ -192,9 +205,9 @@ func (n *controllerImpl) AdmitKVWork(
 	if !roachpb.IsSystemTenantID(tenantID.ToUint64()) {
 		// Request is from a SQL node.
 		bypassAdmission = false
-		source = roachpb.AdmissionHeader_FROM_SQL
+		source = kvpb.AdmissionHeader_FROM_SQL
 	}
-	if source == roachpb.AdmissionHeader_OTHER {
+	if source == kvpb.AdmissionHeader_OTHER {
 		bypassAdmission = true
 	}
 	// TODO(abaptist): Revisit and deprecate this setting in v23.1.
@@ -307,7 +320,7 @@ func (n *controllerImpl) AdmittedKVWorkDone(ah Handle, writeBytes *StoreWriteByt
 
 // AdmitRangefeedRequest implements the Controller interface.
 func (n *controllerImpl) AdmitRangefeedRequest(
-	tenantID roachpb.TenantID, request *roachpb.RangeFeedRequest,
+	tenantID roachpb.TenantID, request *kvpb.RangeFeedRequest,
 ) *admission.Pacer {
 	if !rangefeedCatchupScanElasticControlEnabled.Get(&n.settings.SV) {
 		return nil
@@ -394,13 +407,12 @@ func (n *controllerImpl) FollowerStoreWriteBytes(
 		followerWriteBytes.NumEntries, followerWriteBytes.StoreWorkDoneInfo)
 }
 
-// ProvisionedBandwidth set a value of the provisioned
-// bandwidth for each store in the cluster.
-var ProvisionedBandwidth = settings.RegisterByteSizeSetting(
-	settings.SystemOnly, "kvadmission.store.provisioned_bandwidth",
-	"if set to a non-zero value, this is used as the provisioned bandwidth (in bytes/s), "+
-		"for each store. It can be over-ridden on a per-store basis using the --store flag",
-	0).WithPublic()
+// AdmitRaftEntry implements the Controller interface.
+func (n *controllerImpl) AdmitRaftEntry(
+	roachpb.TenantID, roachpb.StoreID, roachpb.RangeID, raftpb.Entry,
+) {
+	panic("unimplemented")
+}
 
 // FollowerStoreWriteBytes captures stats about writes done to a store by a
 // replica that is not the leaseholder. These are used for admission control.

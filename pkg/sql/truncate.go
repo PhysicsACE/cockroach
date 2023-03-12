@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -257,11 +258,12 @@ func (p *planner) truncateTable(ctx context.Context, id descpb.ID, jobDesc strin
 	record := CreateGCJobRecord(
 		jobDesc, p.User(), details,
 		!p.execCfg.Settings.Version.IsActive(
-			ctx, clusterversion.V22_2UseDelRangeInGCJob,
+			ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob,
 		),
 	)
 	if _, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
-		ctx, record, p.ExecCfg().JobRegistry.MakeJobID(), p.txn); err != nil {
+		ctx, record, p.ExecCfg().JobRegistry.MakeJobID(), p.InternalSQLTxn(),
+	); err != nil {
 		return err
 	}
 
@@ -291,7 +293,7 @@ func (p *planner) truncateTable(ctx context.Context, id descpb.ID, jobDesc strin
 		NewIndexes:        newIndexIDs[1:],
 	}
 	if err := maybeUpdateZoneConfigsForPKChange(
-		ctx, p.txn, p.ExecCfg(), p.ExtendedEvalContext().Tracing.KVTracingEnabled(), p.Descriptors(), tableDesc, swapInfo,
+		ctx, p.InternalSQLTxn(), p.ExecCfg(), p.ExtendedEvalContext().Tracing.KVTracingEnabled(), p.Descriptors(), tableDesc, swapInfo,
 	); err != nil {
 		return err
 	}
@@ -498,8 +500,8 @@ func (p *planner) copySplitPointsToNewIndexes(
 		expirationTime += jitter
 
 		log.Infof(ctx, "truncate sending split request for key %s", sp)
-		b.AddRawRequest(&roachpb.AdminSplitRequest{
-			RequestHeader: roachpb.RequestHeader{
+		b.AddRawRequest(&kvpb.AdminSplitRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key: sp,
 			},
 			SplitKey:       sp,
@@ -513,10 +515,10 @@ func (p *planner) copySplitPointsToNewIndexes(
 
 	// Now scatter the ranges, after we've finished splitting them.
 	b = kv.Batch{}
-	b.AddRawRequest(&roachpb.AdminScatterRequest{
+	b.AddRawRequest(&kvpb.AdminScatterRequest{
 		// Scatter all of the data between the start key of the first new index, and
 		// the PrefixEnd of the last new index.
-		RequestHeader: roachpb.RequestHeader{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    execCfg.Codec.IndexPrefix(uint32(tableID), uint32(newIndexIDs[0])),
 			EndKey: execCfg.Codec.IndexPrefix(uint32(tableID), uint32(newIndexIDs[len(newIndexIDs)-1])).PrefixEnd(),
 		},

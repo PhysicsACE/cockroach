@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -75,10 +75,14 @@ type KVReader interface {
 	GetBatchRequestsIssued() int64
 	// GetContentionInfo returns the amount of time KV reads spent
 	// contending. It must be safe for concurrent use.
-	GetContentionInfo() (time.Duration, []roachpb.ContentionEvent)
+	GetContentionInfo() (time.Duration, []kvpb.ContentionEvent)
 	// GetScanStats returns statistics about the scan that happened during the
 	// KV reads. It must be safe for concurrent use.
 	GetScanStats() execstats.ScanStats
+	// GetKVCPUTime returns the CPU time consumed *on the current goroutine* by
+	// KV requests. It must be safe for concurrent use. It is used to calculate
+	// the SQL CPU time.
+	GetKVCPUTime() time.Duration
 }
 
 // ZeroInputNode is an execopnode.OpNode with no inputs.

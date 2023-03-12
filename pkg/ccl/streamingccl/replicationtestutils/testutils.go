@@ -16,18 +16,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
@@ -50,13 +51,14 @@ type TenantStreamingClustersArgs struct {
 	SrcNumNodes        int
 	SrcClusterSettings map[string]string
 
-	DestTenantName      roachpb.TenantName
-	DestTenantID        roachpb.TenantID
-	DestInitFunc        destInitExecFunc
-	DestNumNodes        int
-	DestClusterSettings map[string]string
-	RetentionTTLSeconds int
-	TestingKnobs        *sql.StreamingTestingKnobs
+	DestTenantName                 roachpb.TenantName
+	DestTenantID                   roachpb.TenantID
+	DestInitFunc                   destInitExecFunc
+	DestNumNodes                   int
+	DestClusterSettings            map[string]string
+	RetentionTTLSeconds            int
+	TestingKnobs                   *sql.StreamingTestingKnobs
+	TenantCapabilitiesTestingKnobs *tenantcapabilities.TestingKnobs
 }
 
 var DefaultTenantStreamingClustersArgs = TenantStreamingClustersArgs{
@@ -206,7 +208,8 @@ func CreateTenantStreamingClusters(
 			DistSQL: &execinfra.TestingKnobs{
 				StreamingTestingKnobs: args.TestingKnobs,
 			},
-			Streaming: args.TestingKnobs,
+			Streaming:                      args.TestingKnobs,
+			TenantCapabilitiesTestingKnobs: args.TenantCapabilitiesTestingKnobs,
 		},
 	}
 
@@ -273,7 +276,7 @@ func CreateTenantStreamingClusters(
 		args.DestInitFunc(t, tsc.DestSysSQL)
 	}
 	// Enable stream replication on dest by default.
-	tsc.DestSysSQL.Exec(t, `SET enable_experimental_stream_replication = true;`)
+	tsc.DestSysSQL.Exec(t, `SET CLUSTER SETTING cross_cluster_replication.enabled = true;`)
 	return tsc, func() {
 		require.NoError(t, srcTenantConn.Close())
 		destCleanup()
@@ -383,7 +386,7 @@ func GetStreamJobIds(
 	destTenantName roachpb.TenantName,
 ) (producer int, consumer int) {
 	var tenantInfoBytes []byte
-	var tenantInfo descpb.TenantInfo
+	var tenantInfo mtinfopb.ProtoInfo
 	sqlRunner.QueryRow(t, "SELECT info FROM system.tenants WHERE name=$1",
 		destTenantName).Scan(&tenantInfoBytes)
 	require.NoError(t, protoutil.Unmarshal(tenantInfoBytes, &tenantInfo))

@@ -17,7 +17,7 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
 import "jobs/jobspb/jobs.proto";
 import "roachpb/io-formats.proto";
@@ -25,7 +25,7 @@ import "sql/catalog/descpb/structured.proto";
 import "util/hlc/timestamp.proto";
 import "gogoproto/gogo.proto";
 import "roachpb/data.proto";
-import "roachpb/api.proto";
+import "kv/kvpb/api.proto";
 import "cloud/cloudpb/external_storage.proto";
 
 // BackfillerSpec is the specification for a "schema change backfiller".
@@ -390,4 +390,52 @@ message IndexBackfillMergerSpec {
   optional util.hlc.Timestamp mergeTimestamp = 8 [(gogoproto.nullable) = false];
 
   // NEXT ID: 9.
+}
+
+message GenerativeSplitAndScatterSpec {
+  repeated TableRekey table_rekeys = 1 [(gogoproto.nullable) = false];
+  repeated TenantRekey tenant_rekeys = 2 [(gogoproto.nullable) = false];
+  optional bool validate_only = 3 [(gogoproto.nullable) = false];
+
+  // URIs is the URIs of the backup manifests.
+  repeated string uris = 4 [(gogoproto.customname) = "URIs"];
+  optional jobs.jobspb.BackupEncryptionOptions encryption = 5;
+
+  // EndTime is the time of the restore.
+  optional util.hlc.Timestamp endTime = 9 [(gogoproto.nullable) = false];
+  // Spans is the required spans in the restore.
+  repeated roachpb.Span spans = 10 [(gogoproto.nullable) = false];
+  repeated jobs.jobspb.RestoreDetails.BackupLocalityInfo backup_locality_info = 11 [(gogoproto.nullable) = false];
+  // HighWater is the high watermark of the previous run of restore.
+  optional bytes high_water = 12;
+  // User who initiated the restore.
+  optional string user_proto = 13 [(gogoproto.nullable) = false, (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security/username.SQLUsernameProto"];
+  // ChunkSize is the number of import spans per chunk.
+  optional int64 chunk_size = 14[(gogoproto.nullable) = false];
+  // TargetSize is the target size for each import span.
+  optional int64 target_size = 15[(gogoproto.nullable) = false];
+  // NumEntries is the total number of import spans in this restore.
+  optional int64 num_entries = 16[(gogoproto.nullable) = false];
+  // NumNodes is the number of nodes available for dist restore.
+  optional int64 num_nodes = 17[(gogoproto.nullable) = false];
+  optional int64 job_id = 18 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
+  optional bool use_simple_import_spans = 19 [(gogoproto.nullable) = false];
+}
+
+
+
+message CloudStorageTestSpec {
+  optional string location = 1 [(gogoproto.nullable) = false];
+  message Params {
+    // TransferSize determines the size of the file that is written and then
+    // read back in its entirety in each iteration of the test.
+    optional int64 transfer_size = 1 [(gogoproto.nullable) = false];
+    // MinDuration causes the test to be run repeatedly until the duration has
+    // elapsed.
+    optional int64 min_duration = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "time.Duration"];
+    // Concurrency causes multiple tests to be run in parallel.
+    optional int64 concurrency = 3 [(gogoproto.nullable) = false];
+  }
+  optional Params params = 2 [(gogoproto.nullable) = false];
+  // NEXT ID: 3;
 }

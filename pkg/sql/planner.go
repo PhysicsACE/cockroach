@@ -16,8 +16,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/repstream"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -35,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
@@ -42,7 +46,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
@@ -93,15 +96,8 @@ type extendedEvalContext struct {
 
 	TxnModesSetter txnModesSetter
 
-	// Jobs refers to jobs in extraTxnState. Jobs is a pointer to a jobsCollection
-	// which is a slice because we need calls to resetExtraTxnState to reset the
-	// jobsCollection.
-	Jobs *jobsCollection
-
-	// SchemaChangeJobRecords refers to schemaChangeJobsCache in extraTxnState of
-	// in sql.connExecutor. sql.connExecutor.createJobs() enqueues jobs with these
-	// records when transaction is committed.
-	SchemaChangeJobRecords map[descpb.ID]*jobs.Record
+	// jobs refers to jobs in extraTxnState.
+	jobs *txnJobsCollection
 
 	statsProvider *persistedsqlstats.PersistedSQLStats
 
@@ -126,6 +122,7 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	evalCtx.NodeID = execCfg.NodeInfo.NodeID
 	evalCtx.Locality = execCfg.Locality
+	evalCtx.OriginalLocality = execCfg.Locality
 	evalCtx.NodesStatusServer = execCfg.NodesStatusServer
 	evalCtx.TenantStatusServer = execCfg.TenantStatusServer
 	evalCtx.SQLStatusServer = execCfg.SQLStatusServer
@@ -143,21 +140,11 @@ func (evalCtx *extendedEvalContext) copy() *extendedEvalContext {
 
 // QueueJob creates a new job from record and queues it for execution after
 // the transaction commits.
-func (evalCtx *extendedEvalContext) QueueJob(
-	ctx context.Context, txn *kv.Txn, record jobs.Record,
-) (*jobs.Job, error) {
+func (evalCtx *extendedEvalContext) QueueJob(record *jobs.Record) jobspb.JobID {
 	jobID := evalCtx.ExecCfg.JobRegistry.MakeJobID()
-	job, err := evalCtx.ExecCfg.JobRegistry.CreateJobWithTxn(
-		ctx,
-		record,
-		jobID,
-		txn,
-	)
-	if err != nil {
-		return nil, err
-	}
-	evalCtx.Jobs.add(jobID)
-	return job, nil
+	record.JobID = jobID
+	evalCtx.jobs.addNonUniqueJobToCreate(record)
+	return jobID
 }
 
 // planner is the centerpiece of SQL statement execution combining session
@@ -173,14 +160,44 @@ type planner struct {
 
 	txn *kv.Txn
 
+	// internalSQLTxn corresponds to the object returned from InternalSQLTxn.
+	// It is here to avoid the need to allocate another structure. The value
+	// is initialized lazily. The assumption is that that method is called
+	// during statement execution when the planner is in a valid state.
+	// The internalSQLTxn may hold on to a stale txn reference and should
+	// never be accessed directly. Nothing explicitly resets this field.
+	internalSQLTxn internalTxn
+
 	// isInternalPlanner is set to true when this planner is not bound to
 	// a SQL session.
 	isInternalPlanner bool
+
+	atomic struct {
+		// innerPlansMustUseLeafTxn is set to 1 if the "outer" plan is using
+		// the LeafTxn forcing the "inner" plans to use the LeafTxns too. An
+		// example of this is apply-join iterations when the main query has
+		// concurrency.
+		//
+		// Note that even though the planner is not safe for concurrent usage,
+		// the "outer" plan modifies this field _before_ the "inner" plans start
+		// or _after_ the "inner" plans finish, so we could have avoided the
+		// usage of an atomic here, but we choose to be defensive about it.
+		// TODO(yuzefovich): this is a bit hacky. The problem is that the
+		// incorrect txn on the planner has already been captured by the
+		// planNodeToRowSource adapter before the "outer" query figured out that
+		// it must use the LeafTxn. Solving that issue properly is not trivial
+		// and is tracked in #41992.
+		innerPlansMustUseLeafTxn uint32
+	}
 
 	monitor *mon.BytesMonitor
 
 	// Corresponding Statement for this query.
 	stmt Statement
+
+	// StmtWithHomeRegionEnforced, if non-nil is the SQL statement for which a
+	// home region is being enforced.
+	StmtNoConstantsWithHomeRegionEnforced string
 
 	instrumentation instrumentationHelper
 
@@ -394,6 +411,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	p.extendedEvalCtx.NodeID = execCfg.NodeInfo.NodeID
 	p.extendedEvalCtx.Locality = execCfg.Locality
+	p.extendedEvalCtx.OriginalLocality = execCfg.Locality
 
 	p.sessionDataMutatorIterator = smi
 	p.autoCommit = false
@@ -452,12 +470,12 @@ func internalExtendedEvalCtx(
 	var sqlStatsController eval.SQLStatsController
 	var schemaTelemetryController eval.SchemaTelemetryController
 	var indexUsageStatsController eval.IndexUsageStatsController
-	if execCfg.InternalExecutor != nil {
-		if execCfg.InternalExecutor.s != nil {
-			indexUsageStats = execCfg.InternalExecutor.s.indexUsageStats
-			sqlStatsController = execCfg.InternalExecutor.s.sqlStatsController
-			schemaTelemetryController = execCfg.InternalExecutor.s.schemaTelemetryController
-			indexUsageStatsController = execCfg.InternalExecutor.s.indexUsageStatsController
+	if ief := execCfg.InternalDB; ief != nil {
+		if ief.server != nil {
+			indexUsageStats = ief.server.indexUsageStats
+			sqlStatsController = ief.server.sqlStatsController
+			schemaTelemetryController = ief.server.schemaTelemetryController
+			indexUsageStatsController = ief.server.indexUsageStatsController
 		} else {
 			// If the indexUsageStats is nil from the sql.Server, we create a dummy
 			// index usage stats collector. The sql.Server in the ExecutorConfig
@@ -515,6 +533,7 @@ func (p *planner) EvalContext() *eval.Context {
 	return &p.extendedEvalCtx.Context
 }
 
+// Descriptors implements the PlanHookState interface.
 func (p *planner) Descriptors() *descs.Collection {
 	return p.extendedEvalCtx.Descs
 }
@@ -556,6 +575,29 @@ func (p *planner) Txn() *kv.Txn {
 	return p.txn
 }
 
+func (p *planner) InternalSQLTxn() descs.Txn {
+	if p.txn == nil {
+		return nil
+	}
+
+	// We lazily initialize the internalSQLTxn structure so that we don't have
+	// to pay to initialize this structure if the statement being executed does
+	// not execute internal sql statements.
+	if p.internalSQLTxn.txn != p.txn {
+		ief := p.ExecCfg().InternalDB
+		ie := MakeInternalExecutor(ief.server, ief.memMetrics, ief.monitor)
+		ie.SetSessionData(p.SessionData())
+		ie.extraTxnState = &extraTxnState{
+			txn:                p.Txn(),
+			descCollection:     p.Descriptors(),
+			jobs:               p.extendedEvalCtx.jobs,
+			schemaChangerState: p.extendedEvalCtx.SchemaChangerState,
+		}
+		p.internalSQLTxn.init(p.txn, ie)
+	}
+	return &p.internalSQLTxn
+}
+
 func (p *planner) User() username.SQLUsername {
 	return p.SessionData().User()
 }
@@ -579,6 +621,10 @@ func (p *planner) SpanConfigReconciler() spanconfig.Reconciler {
 	return p.execCfg.SpanConfigReconciler
 }
 
+func (p *planner) SpanStatsConsumer() keyvisualizer.SpanStatsConsumer {
+	return p.execCfg.SpanStatsConsumer
+}
+
 // GetTypeFromValidSQLSyntax implements the eval.Planner interface.
 // We define this here to break the dependency from eval.go to the parser.
 func (p *planner) GetTypeFromValidSQLSyntax(sql string) (*types.T, error) {
@@ -600,6 +646,18 @@ func (p *planner) ResolveTableName(ctx context.Context, tn *tree.TableName) (tre
 		return 0, err
 	}
 	return tree.ID(desc.GetID()), nil
+}
+
+// CheckPrivilegeForTableID implements the AuthorizationAccessor interface.
+// Requires a valid transaction to be open.
+func (p *planner) CheckPrivilegeForTableID(
+	ctx context.Context, tableID descpb.ID, privilege privilege.Kind,
+) error {
+	desc, err := p.LookupTableByID(ctx, tableID)
+	if err != nil {
+		return err
+	}
+	return p.CheckPrivilegeForUser(ctx, desc, privilege, p.User())
 }
 
 // LookupTableByID looks up a table, by the given descriptor ID. Based on the
@@ -677,21 +735,6 @@ func (p *planner) IsActive(ctx context.Context, key clusterversion.Key) bool {
 	return p.execCfg.Settings.Version.IsActive(ctx, key)
 }
 
-// initInternalExecutor is to initialize an internal executor with a planner.
-// Note that this function should only be used when using internal executor
-// to run sql statement under the planner context.
-func initInternalExecutor(ctx context.Context, p *planner) sqlutil.InternalExecutor {
-	ie := p.ExecCfg().InternalExecutorFactory.NewInternalExecutor(p.SessionData())
-	ie.(*InternalExecutor).extraTxnState = &extraTxnState{
-		txn:                    p.Txn(),
-		descCollection:         p.Descriptors(),
-		jobs:                   p.extendedEvalCtx.Jobs,
-		schemaChangeJobRecords: p.extendedEvalCtx.SchemaChangeJobRecords,
-		schemaChangerState:     p.extendedEvalCtx.SchemaChangerState,
-	}
-	return ie
-}
-
 // QueryRowEx executes the supplied SQL statement and returns a single row, or
 // nil if no row is found, or an error if more that one row is returned.
 //
@@ -704,8 +747,7 @@ func (p *planner) QueryRowEx(
 	stmt string,
 	qargs ...interface{},
 ) (tree.Datums, error) {
-	ie := initInternalExecutor(ctx, p)
-	return ie.QueryRowEx(ctx, opName, p.Txn(), override, stmt, qargs...)
+	return p.InternalSQLTxn().QueryRowEx(ctx, opName, p.Txn(), override, stmt, qargs...)
 }
 
 // ExecEx is like Exec, but allows the caller to override some session data
@@ -717,8 +759,7 @@ func (p *planner) ExecEx(
 	stmt string,
 	qargs ...interface{},
 ) (int, error) {
-	ie := initInternalExecutor(ctx, p)
-	return ie.ExecEx(ctx, opName, p.Txn(), override, stmt, qargs...)
+	return p.InternalSQLTxn().ExecEx(ctx, opName, p.Txn(), override, stmt, qargs...)
 }
 
 // QueryIteratorEx executes the query, returning an iterator that can be used
@@ -734,9 +775,7 @@ func (p *planner) QueryIteratorEx(
 	stmt string,
 	qargs ...interface{},
 ) (eval.InternalRows, error) {
-	ie := initInternalExecutor(ctx, p)
-	rows, err := ie.QueryIteratorEx(ctx, opName, p.Txn(), override, stmt, qargs...)
-	return rows.(eval.InternalRows), err
+	return p.InternalSQLTxn().QueryIteratorEx(ctx, opName, p.Txn(), override, stmt, qargs...)
 }
 
 // QueryBufferedEx executes the supplied SQL statement and returns the resulting
@@ -750,8 +789,7 @@ func (p *planner) QueryBufferedEx(
 	stmt string,
 	qargs ...interface{},
 ) ([]tree.Datums, error) {
-	ie := initInternalExecutor(ctx, p)
-	return ie.QueryBufferedEx(ctx, opName, p.Txn(), session, stmt, qargs...)
+	return p.InternalSQLTxn().QueryBufferedEx(ctx, opName, p.Txn(), session, stmt, qargs...)
 }
 
 // QueryRowExWithCols is like QueryRowEx, additionally returning the computed
@@ -763,8 +801,7 @@ func (p *planner) QueryRowExWithCols(
 	stmt string,
 	qargs ...interface{},
 ) (tree.Datums, colinfo.ResultColumns, error) {
-	ie := initInternalExecutor(ctx, p)
-	return ie.QueryRowExWithCols(ctx, opName, p.Txn(), session, stmt, qargs...)
+	return p.InternalSQLTxn().QueryRowExWithCols(ctx, opName, p.Txn(), session, stmt, qargs...)
 }
 
 // QueryBufferedExWithCols is like QueryBufferedEx, additionally returning the
@@ -776,19 +813,7 @@ func (p *planner) QueryBufferedExWithCols(
 	stmt string,
 	qargs ...interface{},
 ) ([]tree.Datums, colinfo.ResultColumns, error) {
-	ie := initInternalExecutor(ctx, p)
-	return ie.QueryBufferedExWithCols(ctx, opName, p.Txn(), session, stmt, qargs...)
-}
-
-// WithInternalExecutor let user run multiple sql statements within the same
-// internal executor initialized under a planner context. To run single sql
-// statements, please use the query functions above.
-func (p *planner) WithInternalExecutor(
-	ctx context.Context,
-	run func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor) error,
-) error {
-	ie := initInternalExecutor(ctx, p)
-	return run(ctx, p.Txn(), ie)
+	return p.InternalSQLTxn().QueryBufferedExWithCols(ctx, opName, p.Txn(), session, stmt, qargs...)
 }
 
 func (p *planner) resetPlanner(
@@ -810,7 +835,7 @@ func (p *planner) resetPlanner(
 	p.semaCtx.Annotations = nil
 	p.semaCtx.TypeResolver = p
 	p.semaCtx.FunctionResolver = p
-	p.semaCtx.TableNameResolver = p
+	p.semaCtx.NameResolver = p
 	p.semaCtx.DateStyle = sd.GetDateStyle()
 	p.semaCtx.IntervalStyle = sd.GetIntervalStyle()
 
@@ -827,10 +852,53 @@ func (p *planner) resetPlanner(
 func (p *planner) GetReplicationStreamManager(
 	ctx context.Context,
 ) (eval.ReplicationStreamManager, error) {
-	return repstream.GetReplicationStreamManager(ctx, p.EvalContext(), p.Txn())
+	return repstream.GetReplicationStreamManager(ctx, p.EvalContext(), p.InternalSQLTxn())
 }
 
 // GetStreamIngestManager returns a StreamIngestManager.
 func (p *planner) GetStreamIngestManager(ctx context.Context) (eval.StreamIngestManager, error) {
-	return repstream.GetStreamIngestManager(ctx, p.EvalContext(), p.Txn())
+	return repstream.GetStreamIngestManager(ctx, p.EvalContext(), p.InternalSQLTxn())
+}
+
+// SpanStats returns a stats for the given span of keys.
+func (p *planner) SpanStats(
+	ctx context.Context, startKey roachpb.RKey, endKey roachpb.RKey,
+) (*roachpb.SpanStatsResponse, error) {
+	req := &roachpb.SpanStatsRequest{
+		NodeID:   "0",
+		StartKey: startKey,
+		EndKey:   endKey,
+	}
+	return p.ExecCfg().TenantStatusServer.SpanStats(ctx, req)
+}
+
+// GetDetailsForSpanStats ensures that the given database and table id exist.
+// No rows will be returned for database/table ids that do not correspond to an actual
+// database/table.
+func (p *planner) GetDetailsForSpanStats(
+	ctx context.Context, dbId int, tableId int,
+) (eval.InternalRows, error) {
+	query := `SELECT parent_id, table_id FROM crdb_internal.tables`
+	var args []interface{}
+
+	if tableId != 0 {
+		query += ` WHERE parent_id = $1 AND table_id = $2`
+		args = append(args, dbId, tableId)
+	} else if dbId != 0 {
+		query += ` WHERE parent_id = $1`
+		args = append(args, dbId)
+	} else {
+		// Some tables belonging to crdb_internal.tables are not affiliated with a database
+		// and have a parent_id of 0 (usually crdb_internal or pg catalog tables), which aren't useful to the user.
+		query += ` WHERE parent_id != $1`
+		args = append(args, dbId)
+	}
+
+	return p.QueryIteratorEx(
+		ctx,
+		"crdb_internal.database_span_stats",
+		sessiondata.NoSessionDataOverride,
+		query,
+		args...,
+	)
 }

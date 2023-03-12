@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
@@ -78,26 +79,26 @@ type replicaChecksum struct {
 // terminate suspicious nodes. This behavior should be lifted to the consistency
 // checker queue in the future.
 func (r *Replica) CheckConsistency(
-	ctx context.Context, req roachpb.CheckConsistencyRequest,
-) (roachpb.CheckConsistencyResponse, *roachpb.Error) {
-	return r.checkConsistencyImpl(ctx, roachpb.ComputeChecksumRequest{
-		RequestHeader: roachpb.RequestHeader{Key: r.Desc().StartKey.AsRawKey()},
+	ctx context.Context, req kvpb.CheckConsistencyRequest,
+) (kvpb.CheckConsistencyResponse, *kvpb.Error) {
+	return r.checkConsistencyImpl(ctx, kvpb.ComputeChecksumRequest{
+		RequestHeader: kvpb.RequestHeader{Key: r.Desc().StartKey.AsRawKey()},
 		Version:       batcheval.ReplicaChecksumVersion,
 		Mode:          req.Mode,
 	})
 }
 
 func (r *Replica) checkConsistencyImpl(
-	ctx context.Context, args roachpb.ComputeChecksumRequest,
-) (roachpb.CheckConsistencyResponse, *roachpb.Error) {
-	isQueue := args.Mode == roachpb.ChecksumMode_CHECK_VIA_QUEUE
+	ctx context.Context, args kvpb.ComputeChecksumRequest,
+) (kvpb.CheckConsistencyResponse, *kvpb.Error) {
+	isQueue := args.Mode == kvpb.ChecksumMode_CHECK_VIA_QUEUE
 
 	results, err := r.runConsistencyCheck(ctx, args)
 	if err != nil {
-		return roachpb.CheckConsistencyResponse{}, roachpb.NewError(err)
+		return kvpb.CheckConsistencyResponse{}, kvpb.NewError(err)
 	}
 
-	res := roachpb.CheckConsistencyResponse_Result{RangeID: r.RangeID}
+	res := kvpb.CheckConsistencyResponse_Result{RangeID: r.RangeID}
 
 	shaToIdxs := map[string][]int{}
 	var missing []ConsistencyCheckResult
@@ -177,27 +178,27 @@ func (r *Replica) checkConsistencyImpl(
 	}
 
 	res.StartKey = []byte(args.Key)
-	res.Status = roachpb.CheckConsistencyResponse_RANGE_CONSISTENT
+	res.Status = kvpb.CheckConsistencyResponse_RANGE_CONSISTENT
 	if minoritySHA != "" {
-		res.Status = roachpb.CheckConsistencyResponse_RANGE_INCONSISTENT
-	} else if args.Mode != roachpb.ChecksumMode_CHECK_STATS && haveDelta {
+		res.Status = kvpb.CheckConsistencyResponse_RANGE_INCONSISTENT
+	} else if args.Mode != kvpb.ChecksumMode_CHECK_STATS && haveDelta {
 		if delta.ContainsEstimates > 0 {
 			// When ContainsEstimates is set, it's generally expected that we'll get a different
 			// result when we recompute from scratch.
-			res.Status = roachpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_ESTIMATED
+			res.Status = kvpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_ESTIMATED
 		} else {
 			// When ContainsEstimates is unset, we expect the recomputation to agree with the stored stats.
 			// If that's not the case, that's a problem: it could be a bug in the stats computation
 			// or stats maintenance, but it could also hint at the replica having diverged from its peers.
-			res.Status = roachpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT
+			res.Status = kvpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT
 		}
 		res.Detail += fmt.Sprintf("delta (stats-computed): %+v\n",
 			enginepb.MVCCStats(results[0].Response.Delta))
 	} else if len(missing) > 0 {
 		// No inconsistency was detected, but we didn't manage to inspect all replicas.
-		res.Status = roachpb.CheckConsistencyResponse_RANGE_INDETERMINATE
+		res.Status = kvpb.CheckConsistencyResponse_RANGE_INDETERMINATE
 	}
-	var resp roachpb.CheckConsistencyResponse
+	var resp kvpb.CheckConsistencyResponse
 	resp.Result = append(resp.Result, res)
 
 	// Bail out at this point except if the queue is the caller. All of the stuff
@@ -232,11 +233,11 @@ func (r *Replica) checkConsistencyImpl(
 		log.Infof(ctx, "triggering stats recomputation to resolve delta of %+v", results[0].Response.Delta)
 
 		var b kv.Batch
-		b.AddRawRequest(&roachpb.RecomputeStatsRequest{
-			RequestHeader: roachpb.RequestHeader{Key: args.Key},
+		b.AddRawRequest(&kvpb.RecomputeStatsRequest{
+			RequestHeader: kvpb.RequestHeader{Key: args.Key},
 		})
 		err := r.store.db.Run(ctx, &b)
-		return resp, roachpb.NewError(err)
+		return resp, kvpb.NewError(err)
 	}
 
 	if args.Checkpoint {
@@ -314,7 +315,7 @@ func (r *Replica) collectChecksumFromReplica(
 // upon). Requires that the computation succeeds on at least one replica, and
 // puts an arbitrary successful result first in the returned slice.
 func (r *Replica) runConsistencyCheck(
-	ctx context.Context, req roachpb.ComputeChecksumRequest,
+	ctx context.Context, req kvpb.ComputeChecksumRequest,
 ) ([]ConsistencyCheckResult, error) {
 	// Send a ComputeChecksum which will trigger computation of the checksum on
 	// all replicas.
@@ -322,7 +323,7 @@ func (r *Replica) runConsistencyCheck(
 	if pErr != nil {
 		return nil, pErr.GoError()
 	}
-	ccRes := res.(*roachpb.ComputeChecksumResponse)
+	ccRes := res.(*kvpb.ComputeChecksumResponse)
 
 	replicas := r.Desc().Replicas().Descriptors()
 	resultCh := make(chan ConsistencyCheckResult, len(replicas))
@@ -495,10 +496,10 @@ func CalcReplicaDigest(
 	ctx context.Context,
 	desc roachpb.RangeDescriptor,
 	snap storage.Reader,
-	mode roachpb.ChecksumMode,
+	mode kvpb.ChecksumMode,
 	limiter *quotapool.RateLimiter,
 ) (*ReplicaDigest, error) {
-	statsOnly := mode == roachpb.ChecksumMode_CHECK_STATS
+	statsOnly := mode == kvpb.ChecksumMode_CHECK_STATS
 
 	// Iterate over all the data in the range.
 	var intBuf [8]byte
@@ -656,7 +657,7 @@ func (r *Replica) computeChecksumPostApply(
 
 	// Caller is holding raftMu, so an engine snapshot is automatically
 	// Raft-consistent (i.e. not in the middle of an AddSSTable).
-	snap := r.store.engine.NewSnapshot()
+	snap := r.store.TODOEngine().NewSnapshot()
 	if cc.Checkpoint {
 		sl := stateloader.Make(r.RangeID)
 		as, err := sl.LoadRangeAppliedState(ctx, snap)
@@ -665,8 +666,10 @@ func (r *Replica) computeChecksumPostApply(
 		}
 		// NB: the names here will match on all nodes, which is nice for debugging.
 		tag := fmt.Sprintf("r%d_at_%d", r.RangeID, as.RaftAppliedIndex)
-		if dir, err := r.store.checkpoint(ctx, tag); err != nil {
-			log.Warningf(ctx, "unable to create checkpoint %s: %+v", dir, err)
+		spans := r.store.checkpointSpans(&desc)
+		log.Warningf(ctx, "creating checkpoint %s with spans %+v", tag, spans)
+		if dir, err := r.store.checkpoint(tag, spans); err != nil {
+			log.Warningf(ctx, "unable to create checkpoint %s: %+v", tag, err)
 		} else {
 			log.Warningf(ctx, "created checkpoint %s", dir)
 		}
@@ -721,7 +724,6 @@ func (r *Replica) computeChecksumPostApply(
 			}
 			r.computeChecksumDone(c, result)
 		}
-
 		var shouldFatal bool
 		for _, rDesc := range cc.Terminate {
 			if rDesc.StoreID == r.store.StoreID() && rDesc.ReplicaID == r.replicaID {
@@ -738,8 +740,8 @@ func (r *Replica) computeChecksumPostApply(
 		// early, the reply won't make it back to the leaseholder, so it will not be
 		// certain of completing the check. Since we're already in a goroutine
 		// that's about to end, just sleep for a few seconds and then terminate.
-		auxDir := r.store.engine.GetAuxiliaryDir()
-		_ = r.store.engine.MkdirAll(auxDir)
+		auxDir := r.store.TODOEngine().GetAuxiliaryDir()
+		_ = r.store.TODOEngine().MkdirAll(auxDir)
 		path := base.PreventedStartupFile(auxDir)
 
 		const attentionFmt = `ATTENTION:
@@ -757,32 +759,28 @@ A file preventing this node from restarting was placed at:
 
 Checkpoints are created on each node/store hosting this range, to help
 investigate the cause. Only nodes that are more likely to have incorrect data
-are terminated, and usually a majority of replicas continue running.
+are terminated, and usually a majority of replicas continue running. Checkpoints
+are partial, i.e. contain only the data from to the inconsistent range, and
+possibly its neighbouring ranges.
 
-The storage checkpoint directory MUST be deleted or moved away timely, on the
-nodes that continue operating. Over time the storage engine gets updated and
-compacted, which leads to checkpoints becoming a full copy of a past state. Even
-with no writes to the database, on these stores disk consumption may double in a
-matter of hours/days, depending on compaction schedule.
+The storage checkpoint directories can/should be deleted when no longer needed.
+They are very helpful in debugging this issue, so before deleting them, please
+consider alternative actions:
 
-Checkpoints are very helpful in debugging this issue, so before deleting them,
-please consider alternative actions:
-
-- If the store has enough capacity, hold off deleting the checkpoint until CRDB
-  staff has diagnosed the issue.
-- Consider backing up the checkpoints before removing them, e.g. by snapshotting
-  the disk.
+- If the store has enough capacity, hold off the deletion until CRDB staff has
+  diagnosed the issue.
+- Back up the checkpoints for later investigation.
 - If the stores are nearly full, but the cluster has enough capacity, consider
-  gradually decomissioning the affected nodes, to retain the checkpoints.
+  gradually decommissioning the affected nodes, to retain the checkpoints.
 
 To inspect the checkpoints, one can use the cockroach debug range-data tool, and
 command line tools like diff. For example:
 
 $ cockroach debug range-data --replicated data/auxiliary/checkpoints/rN_at_M N
 `
-		attentionArgs := []any{r, desc.Replicas(), auxDir, path}
+		attentionArgs := []any{r, desc.Replicas(), redact.Safe(auxDir), redact.Safe(path)}
 		preventStartupMsg := fmt.Sprintf(attentionFmt, attentionArgs...)
-		if err := fs.WriteFile(r.store.engine, path, []byte(preventStartupMsg)); err != nil {
+		if err := fs.WriteFile(r.store.TODOEngine(), path, []byte(preventStartupMsg)); err != nil {
 			log.Warningf(ctx, "%v", err)
 		}
 

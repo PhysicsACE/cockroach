@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -38,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -436,7 +436,7 @@ func processPgxStartup(ctx context.Context, s serverutils.TestServerInterface, c
 func execQuery(
 	ctx context.Context, query string, s serverutils.TestServerInterface, c *conn,
 ) error {
-	it, err := s.InternalExecutor().(sqlutil.InternalExecutor).QueryIteratorEx(
+	it, err := s.InternalExecutor().(isql.Executor).QueryIteratorEx(
 		ctx, "test", nil, /* txn */
 		sessiondata.InternalExecutorOverride{User: username.RootUserName(), Database: "system"},
 		query,
@@ -576,7 +576,8 @@ func getSessionArgs(
 		}
 
 		ctx := context.Background()
-		cp, err := parseClientProvidedSessionParameters(ctx, &buf, conn.RemoteAddr(), trustRemoteAddr, false /* acceptTenantName */)
+		cp, err := parseClientProvidedSessionParameters(ctx, &buf, conn.RemoteAddr(), trustRemoteAddr,
+			false /* acceptTenantName */, false /* acceptSystemIdentityOption */)
 		if err != nil {
 			return conn, sql.SessionArgs{}, err
 		}
@@ -1569,6 +1570,15 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 				require.Equal(t, "ISO,YMD", args.SessionDefaults["datestyle"])
 			},
 		},
+		{
+			// Regression test for issue #98301.
+			desc:  "special characters that look like urlencoded must not be decoded during option parsing",
+			query: "options=-c application_name=%2566%256f%256f",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.Equal(t, "%66%6f%6f", args.SessionDefaults["application_name"])
+			},
+		},
 	}
 
 	baseURL := fmt.Sprintf("postgres://%s/system?sslmode=disable", serverAddr)
@@ -1592,6 +1602,14 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 				_ = c.Ping(ctx)
 				// closing connection immediately, since getSessionArgs is blocking
 				_ = c.Close(ctx)
+
+				select {
+				case <-c.PgConn().CleanupDone():
+				case <-time.After(20 * time.Second):
+					// 20 seconds was picked because pgconn has an internal deadline of
+					// 15 seconds when performing the async close request.
+					t.Error("pgconn asyncClose did not clean up on time")
+				}
 			}(tc.query)
 			// Wait for the client to connect and perform the handshake.
 			_, args, err := getSessionArgs(ln, true /* trustRemoteAddr */)
@@ -1614,14 +1632,12 @@ func TestSetSessionArguments(t *testing.T) {
 	)
 	defer cleanupFunc()
 
-	q := pgURL.Query()
-	q.Add("options", "  --user=test -c    search_path=public,testsp %20 "+
-		"--default-transaction-isolation=read\\ uncommitted   "+
-		"-capplication_name=test  "+
-		"--DateStyle=ymd\\ ,\\ iso\\  "+
-		"-c intervalstyle%3DISO_8601 "+
-		"-ccustom_option.custom_option=test2")
-	pgURL.RawQuery = q.Encode()
+	pgURL.RawQuery += `&options=` + "  --user=test -c    search_path=public,testsp %20 " +
+		"--default-transaction-isolation=read\\ uncommitted   " +
+		"-capplication_name=test  " +
+		"--DateStyle=ymd\\ ,\\ iso\\  " +
+		"-c intervalstyle%3DISO_8601 " +
+		"-ccustom_option.custom_option=test2"
 	noBufferDB, err := gosql.Open("postgres", pgURL.String())
 
 	if err != nil {

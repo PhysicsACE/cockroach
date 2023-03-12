@@ -27,7 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -36,12 +38,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -83,7 +87,13 @@ func TestGetAllNamesInternal(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	names, err := sql.TestingGetAllNames(ctx, nil, s.InternalExecutor().(*sql.InternalExecutor))
+	var names map[descpb.ID]catalog.NameKey
+	require.NoError(t, s.InternalDB().(isql.DB).Txn(ctx, func(
+		ctx context.Context, txn isql.Txn,
+	) (err error) {
+		names, err = sql.TestingGetAllNames(ctx, txn)
+		return err
+	}))
 	require.NoError(t, err)
 
 	assert.Equal(t, descpb.NameInfo{ParentID: 999, ParentSchemaID: 444, Name: "bob"}, names[9999])
@@ -230,7 +240,7 @@ CREATE TABLE t.test (k INT);
 	}
 	colDef := alterCmd.AST.(*tree.AlterTable).Cmds[0].(*tree.AlterTableAddColumn).ColumnDef
 	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-	cdd, err := tabledesc.MakeColumnDefDescs(ctx, colDef, nil, evalCtx)
+	cdd, err := tabledesc.MakeColumnDefDescs(ctx, colDef, nil, evalCtx, tree.ColumnDefaultExprInAddColumn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -538,10 +548,10 @@ func TestDistSQLFlowsVirtualTables(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(_ context.Context, req *roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(_ context.Context, req *kvpb.BatchRequest) *kvpb.Error {
 					if atomic.LoadInt64(&stallAtomic) == 1 {
 						if req.IsSingleRequest() {
-							scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
+							scan, ok := req.Requests[0].GetInner().(*kvpb.ScanRequest)
 							if ok && getTableSpan().ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
 								t.Logf("stalling on scan at %s and waiting for test to unblock...", scan.Key)
 								<-unblock
@@ -902,7 +912,84 @@ func TestTxnContentionEventsTable(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	conn := tc.ServerConn(0)
 	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	testTxnContentionEventsTableHelper(t, ctx, conn, sqlDB)
+	testTxnContentionEventsTableWithDroppedInfo(t, ctx, conn, sqlDB)
+}
 
+func TestTxnContentionEventsTableMultiTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1,
+		base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				// Test is designed to run with explicit tenants. No need to
+				// implicitly create a tenant.
+				DisableDefaultTestTenant: true,
+			},
+		})
+	defer tc.Stopper().Stop(ctx)
+	_, tSQL := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
+		TenantID: roachpb.MustMakeTenantID(10),
+	})
+
+	conn, err := tSQL.Conn(ctx)
+	require.NoError(t, err)
+	sqlDB := sqlutils.MakeSQLRunner(conn)
+	defer tSQL.Close()
+
+	testTxnContentionEventsTableHelper(t, ctx, tSQL, sqlDB)
+}
+
+func causeContention(
+	t *testing.T, conn *gosql.DB, table string, insertValue string, updateValue string,
+) {
+	// Create a new connection, and then in a go routine have it start a
+	// transaction, update a row, sleep for a time, and then complete the
+	// transaction. With original connection attempt to update the same row
+	// being updated concurrently in the separate go routine, this will be
+	// blocked until the original transaction completes.
+	var wgTxnStarted sync.WaitGroup
+	wgTxnStarted.Add(1)
+
+	// Lock to wait for the txn to complete to avoid the test finishing
+	// before the txn is committed.
+	var wgTxnDone sync.WaitGroup
+	wgTxnDone.Add(1)
+
+	go func() {
+		defer wgTxnDone.Done()
+		tx, errTxn := conn.BeginTx(ctx, &gosql.TxOptions{})
+		require.NoError(t, errTxn)
+		_, errTxn = tx.ExecContext(ctx,
+			fmt.Sprintf("INSERT INTO %s (id, s) VALUES ('test', $1);", table),
+			insertValue)
+		require.NoError(t, errTxn)
+		wgTxnStarted.Done()
+		_, errTxn = tx.ExecContext(ctx, "select pg_sleep(.5);")
+		require.NoError(t, errTxn)
+		errTxn = tx.Commit()
+		require.NoError(t, errTxn)
+	}()
+
+	start := timeutil.Now()
+
+	// Need to wait for the txn to start to ensure lock contention.
+	wgTxnStarted.Wait()
+	// This will be blocked until the updateRowWithDelay finishes.
+	_, errUpdate := conn.ExecContext(
+		ctx, fmt.Sprintf("UPDATE %s SET s = $1 where id = 'test';", table), updateValue)
+	require.NoError(t, errUpdate)
+	end := timeutil.Now()
+	require.GreaterOrEqual(t, end.Sub(start), 500*time.Millisecond)
+
+	wgTxnDone.Wait()
+}
+
+func testTxnContentionEventsTableHelper(
+	t *testing.T, ctx context.Context, conn *gosql.DB, sqlDB *sqlutils.SQLRunner,
+) {
 	sqlDB.Exec(
 		t,
 		`SET CLUSTER SETTING sql.metrics.statement_details.plan_collection.enabled = false;`)
@@ -914,51 +1001,8 @@ func TestTxnContentionEventsTable(t *testing.T) {
 
 	sqlDB.Exec(t, "CREATE TABLE t (id string, s string);")
 
-	causeContention := func(insertValue string, updateValue string) {
-		// Create a new connection, and then in a go routine have it start a
-		// transaction, update a row, sleep for a time, and then complete the
-		// transaction. With original connection attempt to update the same row
-		// being updated concurrently in the separate go routine, this will be
-		// blocked until the original transaction completes.
-		var wgTxnStarted sync.WaitGroup
-		wgTxnStarted.Add(1)
-
-		// Lock to wait for the txn to complete to avoid the test finishing
-		// before the txn is committed.
-		var wgTxnDone sync.WaitGroup
-		wgTxnDone.Add(1)
-
-		go func() {
-			defer wgTxnDone.Done()
-			tx, errTxn := conn.BeginTx(ctx, &gosql.TxOptions{})
-			require.NoError(t, errTxn)
-			_, errTxn = tx.ExecContext(ctx,
-				"INSERT INTO t (id, s) VALUES ('test', $1);",
-				insertValue)
-			require.NoError(t, errTxn)
-			wgTxnStarted.Done()
-			_, errTxn = tx.ExecContext(ctx, "select pg_sleep(.5);")
-			require.NoError(t, errTxn)
-			errTxn = tx.Commit()
-			require.NoError(t, errTxn)
-		}()
-
-		start := timeutil.Now()
-
-		// Need to wait for the txn to start to ensure lock contention.
-		wgTxnStarted.Wait()
-		// This will be blocked until the updateRowWithDelay finishes.
-		_, errUpdate := conn.ExecContext(
-			ctx, "UPDATE t SET s = $1 where id = 'test';", updateValue)
-		require.NoError(t, errUpdate)
-		end := timeutil.Now()
-		require.GreaterOrEqual(t, end.Sub(start), 500*time.Millisecond)
-
-		wgTxnDone.Wait()
-	}
-
-	causeContention("insert1", "update1")
-	causeContention("insert2", "update2")
+	causeContention(t, conn, "t", "insert1", "update1")
+	causeContention(t, conn, "t", "insert2", "update2")
 
 	rowCount := 0
 
@@ -967,17 +1011,28 @@ func TestTxnContentionEventsTable(t *testing.T) {
 	// This ensures the event is the one caused in the test and not by some other
 	// internal workflow.
 	testutils.SucceedsWithin(t, func() error {
-		rows, errVerify := conn.QueryContext(ctx, `SELECT 
-			blocking_txn_id, 
-			waiting_txn_id 
-			FROM crdb_internal.transaction_contention_events tce 
-			inner join ( 
-			select 
-			transaction_fingerprint_id, 
-			metadata->'query' as query 
-			from crdb_internal.statement_statistics t 
-			where metadata->>'query' like 'UPDATE t SET %') stats 
-			on stats.transaction_fingerprint_id = tce.waiting_txn_fingerprint_id`)
+		rows, errVerify := conn.QueryContext(ctx, `SELECT
+			blocking_txn_id,
+			waiting_txn_id,
+			waiting_stmt_id,
+			encode(
+					 waiting_txn_fingerprint_id, 'hex'
+			 ) AS waiting_txn_fingerprint_id,
+			contending_pretty_key,
+			database_name,
+			schema_name,
+			table_name,
+			index_name
+			FROM crdb_internal.transaction_contention_events tce
+			inner join (
+			select
+      fingerprint_id,
+			transaction_fingerprint_id,
+			metadata->'query' as query
+			from crdb_internal.statement_statistics t
+			where metadata->>'query' like 'UPDATE t SET %') stats
+			on stats.transaction_fingerprint_id = tce.waiting_txn_fingerprint_id
+			  and stats.fingerprint_id = tce.waiting_stmt_fingerprint_id`)
 		if errVerify != nil {
 			return errVerify
 		}
@@ -985,12 +1040,41 @@ func TestTxnContentionEventsTable(t *testing.T) {
 		for rows.Next() {
 			rowCount++
 
-			var blocking, waiting string
-			errVerify = rows.Scan(&blocking, &waiting)
+			var blockingTxnId, waitingTxnId, waitingStmtId, waitingStmtFingerprint string
+			var prettyKey, dbName, schemaName, tableName, indexName string
+			errVerify = rows.Scan(&blockingTxnId, &waitingTxnId, &waitingStmtId, &waitingStmtFingerprint, &prettyKey, &dbName, &schemaName, &tableName, &indexName)
 			if errVerify != nil {
 				return errVerify
 			}
 
+			const defaultIdString = "0x0000000000000000"
+			if blockingTxnId == defaultIdString {
+				return fmt.Errorf("transaction_contention_events had default txn blocking id %s, waiting txn id %s", blockingTxnId, waitingTxnId)
+			}
+
+			if waitingTxnId == defaultIdString {
+				return fmt.Errorf("transaction_contention_events had default waiting txn id %s, blocking txn id %s", waitingTxnId, blockingTxnId)
+			}
+
+			if !strings.HasPrefix(prettyKey, "/Table/") {
+				return fmt.Errorf("prettyKey should be defaultdb: %s, %s, %s, %s, %s", prettyKey, dbName, schemaName, tableName, indexName)
+			}
+
+			if dbName != "defaultdb" {
+				return fmt.Errorf("dbName should be defaultdb: %s, %s, %s, %s, %s", prettyKey, dbName, schemaName, tableName, indexName)
+			}
+
+			if schemaName != "public" {
+				return fmt.Errorf("schemaName should be public: %s, %s, %s, %s, %s", prettyKey, dbName, schemaName, tableName, indexName)
+			}
+
+			if tableName != "t" {
+				return fmt.Errorf("tableName should be t: %s, %s, %s, %s, %s", prettyKey, dbName, schemaName, tableName, indexName)
+			}
+
+			if indexName != "t_pkey" {
+				return fmt.Errorf("indexName should be t_pkey: %s, %s, %s, %s, %s", prettyKey, dbName, schemaName, tableName, indexName)
+			}
 		}
 
 		if rowCount < 1 {
@@ -1003,6 +1087,121 @@ func TestTxnContentionEventsTable(t *testing.T) {
 		"found 3 rows. It should only record first, but there is a chance based "+
 		"on sampling to get 2 rows.")
 
+}
+
+func testTxnContentionEventsTableWithDroppedInfo(
+	t *testing.T, ctx context.Context, conn *gosql.DB, sqlDB *sqlutils.SQLRunner,
+) {
+	sqlDB.Exec(
+		t,
+		`SET CLUSTER SETTING sql.metrics.statement_details.plan_collection.enabled = false;`)
+
+	// Reduce the resolution interval to speed up the test.
+	sqlDB.Exec(
+		t,
+		`SET CLUSTER SETTING sql.contention.event_store.resolution_interval = '100ms'`)
+
+	rowCount := 0
+	query := `SELECT
+			database_name,
+			schema_name,
+			table_name,
+			index_name
+			FROM crdb_internal.transaction_contention_events tce
+			inner join (
+			select
+      fingerprint_id,
+			transaction_fingerprint_id,
+			metadata->'query' as query
+			from crdb_internal.statement_statistics t
+			where metadata->>'query' like 'UPDATE test.t2 SET %') stats
+			on stats.transaction_fingerprint_id = tce.waiting_txn_fingerprint_id
+			  and stats.fingerprint_id = tce.waiting_stmt_fingerprint_id`
+	var dbName, schemaName, tableName, indexName string
+
+	checkValues := func(expectedDB string, expectedSchema string, expectedTable string, expectedIndex string) {
+		testutils.SucceedsWithin(t, func() error {
+			rowCount = 0
+			rows, errVerify := conn.QueryContext(ctx, query)
+			if errVerify != nil {
+				return errVerify
+			}
+
+			for rows.Next() {
+				rowCount++
+				errVerify = rows.Scan(&dbName, &schemaName, &tableName, &indexName)
+				if errVerify != nil {
+					return errVerify
+				}
+
+				if dbName != expectedDB {
+					return fmt.Errorf("dbName should be %s: %s, %s, %s, %s", expectedDB, dbName, schemaName, tableName, indexName)
+				}
+
+				if schemaName != expectedSchema {
+					return fmt.Errorf("schemaName should be %s: %s, %s, %s, %s", expectedSchema, dbName, schemaName, tableName, indexName)
+				}
+
+				if !strings.Contains(tableName, expectedTable) {
+					return fmt.Errorf("tableName should contain %s: %s, %s, %s, %s", expectedTable, dbName, schemaName, tableName, indexName)
+				}
+
+				if !strings.Contains(indexName, expectedIndex) {
+					return fmt.Errorf("indexName should contain %s: %s, %s, %s, %s", expectedIndex, dbName, schemaName, tableName, indexName)
+				}
+			}
+
+			if rowCount < 1 {
+				return fmt.Errorf("transaction_contention_events did not return any rows")
+			}
+			return nil
+		}, 5*time.Second)
+	}
+
+	sqlDB.Exec(t, "CREATE DATABASE test")
+	sqlDB.Exec(t, "CREATE TABLE test.t2 (id string, s string);")
+	sqlDB.Exec(t, "CREATE INDEX idx_test ON test.t2 (id);")
+
+	causeContention(t, conn, "test.t2", "insert1", "update1")
+
+	// Test all values as is.
+	checkValues("test", "public", "t2", "idx_test")
+
+	// Test deleting the index.
+	sqlDB.Exec(t, "DROP INDEX test.t2@idx_test;")
+	checkValues("test", "public", "t2", "[dropped index id:")
+
+	// Test deleting the table.
+	sqlDB.Exec(t, "DROP TABLE test.t2;")
+	checkValues("", "", "[dropped table id:", "[dropped index]")
+
+	// Test deleting the database.
+	sqlDB.Exec(t, "DROP DATABASE test;")
+	checkValues("", "", "[dropped table id:", "[dropped index]")
+
+	// New test deleting the database only.
+	query = `SELECT
+			database_name,
+			schema_name,
+			table_name,
+			index_name
+			FROM crdb_internal.transaction_contention_events tce
+			inner join (
+			select
+	   fingerprint_id,
+			transaction_fingerprint_id,
+			metadata->'query' as query
+			from crdb_internal.statement_statistics t
+			where metadata->>'query' like 'UPDATE test2.t3 SET %') stats
+			on stats.transaction_fingerprint_id = tce.waiting_txn_fingerprint_id
+			  and stats.fingerprint_id = tce.waiting_stmt_fingerprint_id`
+	sqlDB.Exec(t, "CREATE DATABASE test2")
+	sqlDB.Exec(t, "CREATE TABLE test2.t3 (id string, s string);")
+	sqlDB.Exec(t, "CREATE INDEX idx_test3 ON test2.t3 (id);")
+	causeContention(t, conn, "test2.t3", "insert1", "update1")
+
+	sqlDB.Exec(t, "DROP DATABASE test2;")
+	checkValues("", "", "[dropped table id:", "[dropped index]")
 }
 
 // This test doesn't care about the contents of these virtual tables;
@@ -1138,7 +1337,7 @@ func TestInternalSystemJobsTableMirrorsSystemJobsTable(t *testing.T) {
 	res := tdb.QueryStr(t, "SELECT * FROM system.jobs ORDER BY id")
 	tdb.CheckQueryResults(t, `SELECT * FROM crdb_internal.system_jobs ORDER BY id`, res)
 	tdb.CheckQueryResults(t, `
-			SELECT id, status, created, payload, progress, created_by_type, created_by_id, claim_session_id, 
+			SELECT id, status, created, payload, progress, created_by_type, created_by_id, claim_session_id,
              claim_instance_id, num_runs, last_run, job_type
 			FROM crdb_internal.system_jobs ORDER BY id`,
 		res,
@@ -1224,8 +1423,8 @@ func TestCorruptPayloadError(t *testing.T) {
 		1, jobs.StatusRunning, timeutil.Now(), []byte("invalid payload"),
 	)
 
-	tdb.ExpectErrWithHint(t, "could not decode the payload for job 1. consider deleting this job from system.jobs", "SELECT * FROM crdb_internal.system_jobs")
-	tdb.ExpectErrWithHint(t, "could not decode the payload for job 1. consider deleting this job from system.jobs", "SELECT * FROM crdb_internal.jobs")
+	tdb.ExpectErrWithHint(t, "proto", "could not decode the payload for job 1. consider deleting this job from system.jobs", "SELECT * FROM crdb_internal.system_jobs")
+	tdb.ExpectErrWithHint(t, "proto", "could not decode the payload for job 1. consider deleting this job from system.jobs", "SELECT * FROM crdb_internal.jobs")
 }
 
 // TestInternalSystemJobsAccess asserts which entries a user can query
@@ -1234,7 +1433,11 @@ func TestInternalSystemJobsAccess(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			KeyVisualizer: &keyvisualizer.TestingKnobs{SkipJobBootstrap: true},
+		},
+	})
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 	rootDB := sqlutils.MakeSQLRunner(db)
@@ -1295,9 +1498,9 @@ func TestInternalSystemJobsAccess(t *testing.T) {
 	_, err = registry.CreateJobWithTxn(ctx, rec, 3, nil /* txn */)
 	assert.NoError(t, err)
 
-	// user1 can see all jobs not owned by admins because they have the CONTROLJOB role option.
+	// user1 can see all jobs because they have the CONTROLJOB role option.
 	asUser("user1", func(userDB *sqlutils.SQLRunner) {
-		userDB.CheckQueryResults(t, "SELECT id FROM crdb_internal.system_jobs WHERE id IN (1,2,3) ORDER BY id", [][]string{{"1"}, {"2"}})
+		userDB.CheckQueryResults(t, "SELECT id FROM crdb_internal.system_jobs WHERE id IN (1,2,3) ORDER BY id", [][]string{{"1"}, {"2"}, {"3"}})
 	})
 
 	// user2 can only see their own job

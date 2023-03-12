@@ -44,7 +44,6 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
@@ -68,13 +67,6 @@ func writeJSONResponse(ctx context.Context, w http.ResponseWriter, code int, pay
 		return
 	}
 	_, _ = w.Write(res)
-}
-
-// Returns a SQL username from the request context of a route requiring login.
-// Only use in routes that require login (requiresAuth = true in its route
-// definition).
-func getSQLUsername(ctx context.Context) username.SQLUsername {
-	return username.MakeSQLUsernameFromPreNormalizedString(ctx.Value(webSessionUserKey{}).(string))
 }
 
 type ApiV2System interface {
@@ -212,7 +204,7 @@ func registerRoutes(
 		{"databases/{database_name:[\\w.]+}/grants/", a.databaseGrants, true, regularRole, noOption, false},
 		{"databases/{database_name:[\\w.]+}/tables/", a.databaseTables, true, regularRole, noOption, false},
 		{"databases/{database_name:[\\w.]+}/tables/{table_name:[\\w.]+}/", a.tableDetails, true, regularRole, noOption, false},
-		{"rules/", a.listRules, false, regularRole, noOption, false},
+		{"rules/", a.listRules, false, regularRole, noOption, true},
 
 		{"sql/", a.execSQL, true, regularRole, noOption, true},
 	}
@@ -325,7 +317,7 @@ func (a *apiV2Server) listSessions(w http.ResponseWriter, r *http.Request) {
 	reqExcludeClosed := r.URL.Query().Get("exclude_closed_sessions") == "true"
 	req := &serverpb.ListSessionsRequest{Username: reqUsername, ExcludeClosedSessions: reqExcludeClosed}
 	response := &listSessionsResponse{}
-	outgoingCtx := apiToOutgoingGatewayCtx(ctx, r)
+	outgoingCtx := forwardHTTPAuthInfoToRPCCalls(ctx, r)
 
 	responseProto, pagState, err := a.status.listSessionsHelper(outgoingCtx, req, limit, start)
 	if err != nil {

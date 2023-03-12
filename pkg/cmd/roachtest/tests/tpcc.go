@@ -99,7 +99,8 @@ type tpccOptions struct {
 	// TODO(tbg): remove this once https://github.com/cockroachdb/cockroach/issues/74705 is completed.
 	EnableCircuitBreakers bool
 	// SkipPostRunCheck, if set, skips post TPC-C run checks.
-	SkipPostRunCheck bool
+	SkipPostRunCheck              bool
+	DisableDefaultScheduledBackup bool
 }
 
 type workloadInstance struct {
@@ -154,7 +155,9 @@ func setupTPCC(
 				settings.Env = append(settings.Env, "COCKROACH_SCAN_INTERVAL=200ms")
 				settings.Env = append(settings.Env, "COCKROACH_SCAN_MAX_IDLE_TIME=5ms")
 			}
-			c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, crdbNodes)
+			startOpts := option.DefaultStartOpts()
+			startOpts.RoachprodOpts.ScheduleBackups = !opts.DisableDefaultScheduledBackup
+			c.Start(ctx, t.L(), startOpts, settings, crdbNodes)
 		}
 	}
 
@@ -298,7 +301,7 @@ func runTPCC(ctx context.Context, t test.Test, c cluster.Cluster, opts tpccOptio
 	// Check no errors from metrics.
 	if ep != nil {
 		if err := ep.err(); err != nil {
-			t.Fatal(err)
+			t.Fatal(errors.Wrap(err, "error detected during DRT"))
 		}
 	}
 }
@@ -405,7 +408,7 @@ func runTPCCMixedHeadroom(
 		bankRows = 1000
 	}
 
-	history, err := PredecessorHistory(*t.BuildVersion(), versionsToUpgrade)
+	history, err := version.PredecessorHistory(*t.BuildVersion(), versionsToUpgrade)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,7 +681,7 @@ func registerTPCC(r registry.Registry) {
 			tc := multiRegionTests[i]
 			r.Add(registry.TestSpec{
 				Name:  tc.name,
-				Owner: registry.OwnerMultiRegion,
+				Owner: registry.OwnerSQLSchema,
 				// Add an extra node which serves as the workload nodes.
 				Cluster:           r.MakeClusterSpec(len(regions)*nodesPerRegion+1, spec.Geo(), spec.Zones(strings.Join(zs, ","))),
 				EncryptionSupport: registry.EncryptionMetamorphic,
@@ -868,6 +871,35 @@ func registerTPCC(r registry.Registry) {
 		LoadWarehouses: 2000,
 		EstimatedMax:   900,
 	})
+
+	// Encryption-At-Rest benchmarks. These are duplicates of variants above,
+	// using encrypted stores.
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  4,
+
+		LoadWarehouses:    1000,
+		EstimatedMax:      gceOrAws(cloud, 750, 900),
+		EncryptionEnabled: true,
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  16,
+
+		LoadWarehouses:    gceOrAws(cloud, 3500, 3900),
+		EstimatedMax:      gceOrAws(cloud, 2900, 3500),
+		EncryptionEnabled: true,
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 12,
+		CPUs:  16,
+
+		LoadWarehouses:    gceOrAws(cloud, 11500, 11500),
+		EstimatedMax:      gceOrAws(cloud, 10000, 10000),
+		EncryptionEnabled: true,
+
+		Tags: []string{`weekly`},
+	})
 }
 
 func gceOrAws(cloud string, gce, aws int) int {
@@ -957,6 +989,9 @@ type tpccBenchSpec struct {
 	MinVersion string
 	// Tags to pass to testRegistryImpl.Add.
 	Tags []string
+	// EncryptionEnabled determines if the benchmark uses encrypted stores (i.e.
+	// Encryption-At-Rest / EAR).
+	EncryptionEnabled bool
 }
 
 // partitions returns the number of partitions specified to the load generator.
@@ -1025,6 +1060,12 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 		panic("unexpected")
 	}
 
+	encryptionSupport := registry.EncryptionAlwaysDisabled
+	if b.EncryptionEnabled {
+		encryptionSupport = registry.EncryptionAlwaysEnabled
+		nameParts = append(nameParts, "enc=true")
+	}
+
 	name := strings.Join(nameParts, "/")
 
 	numNodes := b.Nodes + b.LoadConfig.numLoadNodes(b.Distribution)
@@ -1036,13 +1077,11 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    name,
-		Owner:   owner,
-		Cluster: nodes,
-		Tags:    b.Tags,
-		// NB: intentionally not enabling encryption-at-rest to produce
-		// consistent results.
-		EncryptionSupport: registry.EncryptionAlwaysDisabled,
+		Name:              name,
+		Owner:             owner,
+		Cluster:           nodes,
+		Tags:              b.Tags,
+		EncryptionSupport: encryptionSupport,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCCBench(ctx, t, c, b)
 		},

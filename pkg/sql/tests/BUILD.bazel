@@ -13,6 +13,7 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/roachpb",
@@ -60,6 +61,7 @@ go_test(
         "//pkg/bench",
         "//pkg/ccl",
         "//pkg/cloud/impl:cloudimpl",
+        "//pkg/clusterversion",
         "//pkg/config/zonepb",
         "//pkg/internal/rsg",
         "//pkg/internal/sqlsmith",
@@ -95,6 +97,7 @@ go_test(
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/stats",
         "//pkg/sql/types",
+        "//pkg/storage",
         "//pkg/testutils",
         "//pkg/testutils/datapathutils",
         "//pkg/testutils/serverutils",

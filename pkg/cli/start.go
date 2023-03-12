@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -33,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -333,6 +334,9 @@ type serverStartupInterface interface {
 
 	// AcceptClients starts listening for incoming SQL clients over the network.
 	AcceptClients(ctx context.Context) error
+	// AcceptInternalClients starts listening for incoming internal SQL clients over the
+	// loopback interface.
+	AcceptInternalClients(ctx context.Context) error
 
 	// InitialStart returns whether this node is starting for the first time.
 	// This is (currently) used when displaying the server status report
@@ -465,6 +469,11 @@ func runStartInternal(
 		return clierror.NewError(err, exit.FatalError())
 	}
 
+	// Set a MakeProcessUnavailableFunc that will close all sockets. This guards
+	// against a persistent disk stall that prevents the process from exiting or
+	// making progress.
+	log.SetMakeProcessUnavailableFunc(closeAllSockets)
+
 	// Set up a cancellable context for the entire start command.
 	// The context will be canceled at the end.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -528,6 +537,48 @@ func runStartInternal(
 
 	// Now perform additional configuration tweaks specific to the start
 	// command.
+
+	// Set the soft memory limit on the Go runtime.
+	if err = func() error {
+		if startCtx.goMemLimitValue.IsSet() {
+			if goMemLimit < 0 {
+				return errors.New("--max-go-memory must be non-negative")
+			} else if goMemLimit > 0 && goMemLimit < defaultGoMemLimitMinValue {
+				log.Ops.Shoutf(
+					ctx, severity.WARNING, "--max-go-memory (%s) is smaller "+
+						"than the recommended minimum (%s), consider increasing it",
+					humanizeutil.IBytes(goMemLimit), humanizeutil.IBytes(defaultGoMemLimitMinValue),
+				)
+			}
+		} else {
+			if _, envVarSet := os.LookupEnv("GOMEMLIMIT"); envVarSet {
+				// When --max-go-memory is not specified, but the env var is
+				// set, we don't change it.
+				if envVarLimit := envutil.EnvOrDefaultInt64("GOMEMLIMIT", -1); envVarLimit < defaultGoMemLimitMinValue {
+					log.Ops.Shoutf(
+						ctx, severity.WARNING, "GOMEMLIMIT (%s) is smaller "+
+							"than the recommended minimum (%s), consider increasing it",
+						humanizeutil.IBytes(envVarLimit), humanizeutil.IBytes(defaultGoMemLimitMinValue),
+					)
+				}
+				return nil
+			}
+			// If --max-go-memory wasn't specified, we set it to a reasonable
+			// default value.
+			goMemLimit = getDefaultGoMemLimit(ctx)
+		}
+		if goMemLimit == 0 {
+			// Value of 0 indicates that the soft memory limit should be
+			// disabled.
+			goMemLimit = math.MaxInt64
+		} else {
+			log.Ops.Infof(ctx, "soft memory limit of Go runtime is set to %s", humanizeutil.IBytes(goMemLimit))
+		}
+		debug.SetMemoryLimit(goMemLimit)
+		return nil
+	}(); err != nil {
+		return err
+	}
 
 	// Initialize the node's configuration from startup parameters.
 	// This also reads the part of the configuration that comes from
@@ -600,6 +651,83 @@ If problems persist, please see %s.`
 		// asynchronously in a goroutine above.
 		stopper, serverShutdownReqC, signalCh,
 		srvStatus)
+}
+
+const (
+	// defaultGoMemLimitSQLMultiple determines the multiple of SQL memory pool
+	// size that we use in the calculation of the default value of the
+	// goMemLimit.
+	//
+	// Since not every memory allocation is registered with the memory
+	// accounting system of CRDB, we need to give it some room to prevent Go GC
+	// from being too aggressive to stay under the GOMEMLIMIT. The default
+	// multiple of 2.25x over the memory pool size should give enough room for
+	// those unaccounted for allocations.
+	defaultGoMemLimitSQLMultiple = 2.25
+
+	// Lower bound on the default value for goMemLimit. Lower bound has higher
+	// precedence that the upper bound when two bounds conflict with each other.
+
+	// defaultGoMemLimitMinValue determines the lower bound on the default value
+	// of the goMemLimit.
+	defaultGoMemLimitMinValue = 256 << 20 /* 256MiB */
+
+	// Upper bound on the default value for goMemLimit is computed as follows:
+	//
+	//   upper bound = 0.9 * SystemMemory - 1.15 * PebbleCache
+	//
+	// The rationale for this formula is as follows:
+	// - we don't want for the estimated max memory usage to exceed 90% of the
+	// available RAM to prevent the OOMs
+	// - Go runtime doesn't control the pebble cache, so we need to subtract it
+	// - anecdotally, the pebble cache can have some slop over its target size
+	// (perhaps, due to memory fragmentation), so we adjust the footprint of the
+	// cache by 15%.
+
+	// defaultGoMemLimitMaxTotalSystemMemUsage determines the maximum percentage
+	// of the system memory that goMemLimit and the pebble cache can use
+	// together.
+	defaultGoMemLimitMaxTotalSystemMemUsage = 0.9
+	// defaultGoMemLimitCacheSlopMultiple determines a "slop" multiple that we
+	// use on top of the pebble cache size when computing the upper bound.
+	defaultGoMemLimitCacheSlopMultiple = 1.15
+)
+
+// getDefaultGoMemLimit returns a reasonable default value for the soft memory
+// limit of the Go runtime based on SQL memory pool and the cache sizes (which
+// must be already set in serverCfg). It also warns the user in some cases when
+// suboptimal flags or hardware is detected.
+func getDefaultGoMemLimit(ctx context.Context) int64 {
+	sysMem, err := status.GetTotalMemory(ctx)
+	if err != nil {
+		return 0
+	}
+	maxGoMemLimit := int64(defaultGoMemLimitMaxTotalSystemMemUsage*float64(sysMem) -
+		defaultGoMemLimitCacheSlopMultiple*float64(serverCfg.CacheSize))
+	if maxGoMemLimit < defaultGoMemLimitMinValue {
+		// Most likely, --cache is set to at least 75% of available RAM which
+		// has already triggered a warning in maybeWarnMemorySizes(), so we
+		// don't shout here.
+		maxGoMemLimit = defaultGoMemLimitMinValue
+	}
+	limit := int64(defaultGoMemLimitSQLMultiple * float64(serverCfg.MemoryPoolSize))
+	if limit < defaultGoMemLimitMinValue {
+		log.Ops.Shoutf(
+			ctx, severity.WARNING, "--max-sql-memory (%s) is set too low, "+
+				"consider increasing it", humanizeutil.IBytes(serverCfg.MemoryPoolSize),
+		)
+		limit = defaultGoMemLimitMinValue
+	}
+	if limit > maxGoMemLimit {
+		log.Ops.Shoutf(
+			ctx, severity.WARNING, "recommended default value of "+
+				"--max-go-memory (%s) was truncated to %s, consider reducing "+
+				"--max-sql-memory and / or --cache",
+			humanizeutil.IBytes(limit), humanizeutil.IBytes(maxGoMemLimit),
+		)
+		limit = maxGoMemLimit
+	}
+	return limit
 }
 
 // createAndStartServerAsync starts an async goroutine which instantiates
@@ -702,6 +830,11 @@ func createAndStartServerAsync(
 			// be called by the shutdown goroutine, which in turn will cause
 			// all these startup steps to fail. So we do not need to look at
 			// the "shutdown status" in serverStatusMu any more.
+
+			// Accept internal clients early, as RunInitialSQL might need it.
+			if err := s.AcceptInternalClients(ctx); err != nil {
+				return err
+			}
 
 			// Run one-off cluster initialization.
 			if err := s.RunInitialSQL(ctx, startSingleNode, "" /* adminUser */, "" /* adminPassword */); err != nil {
@@ -1106,7 +1239,7 @@ func reportServerInfo(
 	nodeID := serverCfg.BaseConfig.IDContainer.Get()
 	if serverCfg.SQLConfig.TenantID.IsSystem() {
 		if initialStart {
-			if nodeID == kvserver.FirstNodeID {
+			if nodeID == kvstorage.FirstNodeID {
 				buf.Printf("status:\tinitialized new cluster\n")
 			} else {
 				buf.Printf("status:\tinitialized new node, joined pre-existing cluster\n")
@@ -1219,6 +1352,8 @@ func maybeWarnMemorySizes(ctx context.Context) {
 	// Check that the total suggested "max" memory is well below the available memory.
 	if maxMemory, err := status.GetTotalMemory(ctx); err == nil {
 		requestedMem := serverCfg.CacheSize + serverCfg.MemoryPoolSize + serverCfg.TimeSeriesServerConfig.QueryMemoryMax
+		// TODO(yuzefovich): we might want to adjust this warning higher now
+		// that GOMEMLIMIT is used.
 		maxRecommendedMem := int64(.75 * float64(maxMemory))
 		if requestedMem > maxRecommendedMem {
 			log.Ops.Shoutf(ctx, severity.WARNING,
@@ -1330,15 +1465,13 @@ func setupAndInitializeLoggingAndProfiling(
 	info := build.GetInfo()
 	log.Ops.Infof(ctx, "%s", log.SafeManaged(info.Short()))
 
-	initTraceDir(ctx, serverCfg.InflightTraceDirName)
-	initCPUProfile(ctx, serverCfg.CPUProfileDirName, serverCfg.Settings)
-	initBlockProfile()
-	initMutexProfile()
-
 	// Disable Stopper task tracking as performing that call site tracking is
 	// moderately expensive (certainly outweighing the infrequent benefit it
 	// provides).
 	stopper = stop.NewStopper()
+	initTraceDir(ctx, serverCfg.InflightTraceDirName)
+	initBlockProfile()
+	initMutexProfile()
 	log.Event(ctx, "initialized profiles")
 
 	return stopper, nil

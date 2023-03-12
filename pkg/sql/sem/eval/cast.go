@@ -13,6 +13,7 @@ package eval
 import (
 	"context"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -149,10 +150,12 @@ func performCastWithoutPrecisionTruncation(
 			}
 			ba = &tree.DBitArray{BitArray: res}
 		}
-		if truncateWidth {
-			ba = tree.FormatBitArrayToType(ba, t)
+		if ba != nil {
+			if truncateWidth {
+				ba = tree.FormatBitArrayToType(ba, t)
+			}
+			return ba, nil
 		}
-		return ba, nil
 
 	case types.BoolFamily:
 		switch v := d.(type) {
@@ -443,12 +446,14 @@ func performCastWithoutPrecisionTruncation(
 				d,
 				tree.FmtPgwireText,
 				tree.FmtDataConversionConfig(evalCtx.SessionData().DataConversionConfig),
+				tree.FmtLocation(evalCtx.GetLocation()),
 			)
 		case *tree.DArray:
 			s = tree.AsStringWithFlags(
 				d,
 				tree.FmtPgwireText,
 				tree.FmtDataConversionConfig(evalCtx.SessionData().DataConversionConfig),
+				tree.FmtLocation(evalCtx.GetLocation()),
 			)
 		case *tree.DInterval:
 			// When converting an interval to string, we need a string representation
@@ -462,7 +467,11 @@ func performCastWithoutPrecisionTruncation(
 		case *tree.DUuid:
 			s = t.UUID.String()
 		case *tree.DIPAddr:
-			s = tree.AsStringWithFlags(d, tree.FmtBareStrings)
+			s = t.IPAddr.String()
+			// Ensure the string has a "/mask" suffix.
+			if strings.IndexByte(s, '/') == -1 {
+				s += "/" + strconv.Itoa(int(t.IPAddr.Mask))
+			}
 		case *tree.DString:
 			s = string(*t)
 		case *tree.DCollatedString:
@@ -996,7 +1005,7 @@ func performIntToOidCast(
 			}
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(o, t, name), nil
+		return tree.NewDOidWithTypeAndName(o, t, name.Object()), nil
 
 	default:
 		if v == 0 {

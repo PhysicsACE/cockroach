@@ -265,7 +265,20 @@ func setCertContextDefaults() {
 	certCtx.generatePKCS8Key = false
 	certCtx.disableUsernameValidation = false
 	certCtx.certPrincipalMap = nil
-	certCtx.tenantScope = []roachpb.TenantID{roachpb.SystemTenantID}
+	// Note: we set tenantScope to nil so that by default, client certs
+	// are not scoped to a specific tenant and can be used to connect to
+	// any tenant.
+	//
+	// Note that the scoping is generally useful for security, and it is
+	// used in CockroachCloud. However, CockroachCloud does not use our
+	// CLI code to generate certs and sets its tenant scopes on its own.
+	//
+	// Given that our CLI code is provided for convenience and developer
+	// productivity, and we don't expect certs generated here to be used
+	// in multi-tenant deployments where tenants are adversarial to each
+	// other, defaulting to certs that are valid on every tenant is a
+	// good choice.
+	certCtx.tenantScope = nil
 }
 
 var sqlExecCtx = clisqlexec.Context{
@@ -477,6 +490,7 @@ var startCtx struct {
 	// humanized size value.
 	cacheSizeValue           bytesOrPercentageValue
 	sqlSizeValue             bytesOrPercentageValue
+	goMemLimitValue          bytesOrPercentageValue
 	diskTempStorageSizeValue bytesOrPercentageValue
 	tsdbSizeValue            bytesOrPercentageValue
 }
@@ -501,6 +515,7 @@ func setStartContextDefaults() {
 	startCtx.geoLibsDir = "/usr/local/lib/cockroach"
 	startCtx.cacheSizeValue = makeBytesOrPercentageValue(&serverCfg.CacheSize, memoryPercentResolver)
 	startCtx.sqlSizeValue = makeBytesOrPercentageValue(&serverCfg.MemoryPoolSize, memoryPercentResolver)
+	startCtx.goMemLimitValue = makeBytesOrPercentageValue(&goMemLimit, memoryPercentResolver)
 	startCtx.diskTempStorageSizeValue = makeBytesOrPercentageValue(nil /* v */, nil /* percentResolver */)
 	startCtx.tsdbSizeValue = makeBytesOrPercentageValue(&serverCfg.TimeSeriesServerConfig.QueryMemoryMax, memoryPercentResolver)
 }
@@ -530,6 +545,8 @@ func setDrainContextDefaults() {
 var nodeCtx struct {
 	nodeDecommissionWait   nodeDecommissionWaitType
 	nodeDecommissionSelf   bool
+	nodeDecommissionChecks nodeDecommissionCheckMode
+	nodeDecommissionDryRun bool
 	statusShowRanges       bool
 	statusShowStats        bool
 	statusShowDecommission bool
@@ -542,6 +559,8 @@ var nodeCtx struct {
 func setNodeContextDefaults() {
 	nodeCtx.nodeDecommissionWait = nodeDecommissionWaitAll
 	nodeCtx.nodeDecommissionSelf = false
+	nodeCtx.nodeDecommissionChecks = nodeDecommissionChecksEnabled
+	nodeCtx.nodeDecommissionDryRun = false
 	nodeCtx.statusShowRanges = false
 	nodeCtx.statusShowStats = false
 	nodeCtx.statusShowAll = false

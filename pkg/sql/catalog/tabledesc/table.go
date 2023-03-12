@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -99,7 +100,11 @@ func (cdd *ColumnDefDescs) ForEachTypedExpr(
 //
 // See the ColumnDefDescs definition for a description of the return values.
 func MakeColumnDefDescs(
-	ctx context.Context, d *tree.ColumnTableDef, semaCtx *tree.SemaContext, evalCtx *eval.Context,
+	ctx context.Context,
+	d *tree.ColumnTableDef,
+	semaCtx *tree.SemaContext,
+	evalCtx *eval.Context,
+	defaultExprCtx tree.SchemaExprContext,
 ) (*ColumnDefDescs, error) {
 	if d.IsSerial {
 		// To the reader of this code: if control arrives here, this means
@@ -161,12 +166,17 @@ func MakeColumnDefDescs(
 		// Verify the default expression type is compatible with the column type
 		// and does not contain invalid functions.
 		ret.DefaultExpr, err = schemaexpr.SanitizeVarFreeExpr(
-			ctx, d.DefaultExpr.Expr, resType, "DEFAULT", semaCtx, volatility.Volatile, true, /*allowAssignmentCast*/
+			ctx, d.DefaultExpr.Expr, resType, defaultExprCtx, semaCtx, volatility.Volatile, true, /*allowAssignmentCast*/
 		)
 		if err != nil {
 			return nil, err
 		}
-		if err := tree.MaybeFailOnUDFUsage(ret.DefaultExpr); err != nil {
+		if err := funcdesc.MaybeFailOnUDFUsage(ret.DefaultExpr, defaultExprCtx, evalCtx.Settings.Version.ActiveVersion(ctx)); err != nil {
+			return nil, err
+		}
+
+		ret.DefaultExpr, err = schemaexpr.MaybeReplaceUDFNameWithOIDReferenceInTypedExpr(ret.DefaultExpr)
+		if err != nil {
 			return nil, err
 		}
 
@@ -184,12 +194,12 @@ func MakeColumnDefDescs(
 		// Verify the on update expression type is compatible with the column type
 		// and does not contain invalid functions.
 		ret.OnUpdateExpr, err = schemaexpr.SanitizeVarFreeExpr(
-			ctx, d.OnUpdateExpr.Expr, resType, "ON UPDATE", semaCtx, volatility.Volatile, true, /*allowAssignmentCast*/
+			ctx, d.OnUpdateExpr.Expr, resType, tree.ColumnOnUpdateExpr, semaCtx, volatility.Volatile, true, /*allowAssignmentCast*/
 		)
 		if err != nil {
 			return nil, err
 		}
-		if err := tree.MaybeFailOnUDFUsage(ret.OnUpdateExpr); err != nil {
+		if err := funcdesc.MaybeFailOnUDFUsage(ret.OnUpdateExpr, tree.ColumnOnUpdateExpr, evalCtx.Settings.Version.ActiveVersion(ctx)); err != nil {
 			return nil, err
 		}
 
@@ -323,28 +333,6 @@ func (desc *wrapper) getExistingOrNewConstraintCache() *constraintCache {
 	return newConstraintCache(desc.TableDesc(), desc.getExistingOrNewIndexCache(), desc.getExistingOrNewMutationCache())
 }
 
-// FindConstraintWithID implements the TableDescriptor interface.
-func (desc *wrapper) FindConstraintWithID(id descpb.ConstraintID) (catalog.Constraint, error) {
-	all := desc.AllConstraints()
-	for _, c := range all {
-		if c.GetConstraintID() == id {
-			return c, nil
-		}
-	}
-	return nil, pgerror.Newf(pgcode.UndefinedObject, "constraint-id \"%d\" does not exist", id)
-}
-
-// FindConstraintWithName implements the TableDescriptor interface.
-func (desc *wrapper) FindConstraintWithName(name string) (catalog.Constraint, error) {
-	all := desc.AllConstraints()
-	for _, c := range all {
-		if c.GetName() == name {
-			return c, nil
-		}
-	}
-	return nil, pgerror.Newf(pgcode.UndefinedObject, "constraint named %q does not exist", name)
-}
-
 // AllConstraints implements the catalog.TableDescriptor interface.
 func (desc *wrapper) AllConstraints() []catalog.Constraint {
 	return desc.getExistingOrNewConstraintCache().all
@@ -405,31 +393,6 @@ func (desc *wrapper) EnforcedUniqueConstraintsWithoutIndex() []catalog.UniqueWit
 	return desc.getExistingOrNewConstraintCache().uwoisEnforced
 }
 
-// FindFKReferencedUniqueConstraint finds the first index in the supplied
-// referencedTable that can satisfy a foreign key of the supplied column ids.
-// If no such index exists, attempts to find a unique constraint on the supplied
-// column ids. If neither an index nor unique constraint is found, returns an
-// error.
-func FindFKReferencedUniqueConstraint(
-	referencedTable catalog.TableDescriptor, fk catalog.ForeignKeyConstraint,
-) (catalog.UniqueConstraint, error) {
-	for _, uwi := range referencedTable.UniqueConstraintsWithIndex() {
-		if !uwi.Dropped() && uwi.IsValidReferencedUniqueConstraint(fk) {
-			return uwi, nil
-		}
-	}
-	for _, uwoi := range referencedTable.UniqueConstraintsWithoutIndex() {
-		if !uwoi.Dropped() && uwoi.IsValidReferencedUniqueConstraint(fk) {
-			return uwoi, nil
-		}
-	}
-	return nil, pgerror.Newf(
-		pgcode.ForeignKeyViolation,
-		"there is no unique constraint matching given keys for referenced table %s",
-		referencedTable.GetName(),
-	)
-}
-
 // InitTableDescriptor returns a blank TableDescriptor.
 func InitTableDescriptor(
 	id, parentID, parentSchemaID descpb.ID,
@@ -454,70 +417,6 @@ func InitTableDescriptor(
 			},
 		},
 	}
-}
-
-// FindPublicColumnsWithNames is a convenience function which behaves exactly
-// like FindPublicColumnWithName applied repeatedly to the names in the
-// provided list, returning early at the first encountered error.
-func FindPublicColumnsWithNames(
-	desc catalog.TableDescriptor, names tree.NameList,
-) ([]catalog.Column, error) {
-	cols := make([]catalog.Column, len(names))
-	for i, name := range names {
-		c, err := FindPublicColumnWithName(desc, name)
-		if err != nil {
-			return nil, err
-		}
-		cols[i] = c
-	}
-	return cols, nil
-}
-
-// FindPublicColumnWithName is a convenience function which behaves exactly
-// like desc.FindColumnWithName except it ignores column mutations.
-func FindPublicColumnWithName(
-	desc catalog.TableDescriptor, name tree.Name,
-) (catalog.Column, error) {
-	col, err := desc.FindColumnWithName(name)
-	if err != nil {
-		return nil, err
-	}
-	if !col.Public() {
-		return nil, colinfo.NewUndefinedColumnError(string(name))
-	}
-	return col, nil
-}
-
-// FindPublicColumnWithID is a convenience function which behaves exactly
-// like desc.FindColumnWithID except it ignores column mutations.
-func FindPublicColumnWithID(
-	desc catalog.TableDescriptor, id descpb.ColumnID,
-) (catalog.Column, error) {
-	col, err := desc.FindColumnWithID(id)
-	if err != nil {
-		return nil, err
-	}
-	if !col.Public() {
-		return nil, fmt.Errorf("column-id \"%d\" does not exist", id)
-	}
-	return col, nil
-}
-
-// FindInvertedColumn returns a catalog.Column matching the inverted column
-// descriptor in `spec` if not nil, nil otherwise.
-func FindInvertedColumn(
-	desc catalog.TableDescriptor, invertedColDesc *descpb.ColumnDescriptor,
-) catalog.Column {
-	if invertedColDesc == nil {
-		return nil
-	}
-	found, err := desc.FindColumnWithID(invertedColDesc.ID)
-	if err != nil {
-		panic(errors.HandleAsAssertionFailure(err))
-	}
-	invertedColumn := found.DeepCopy()
-	*invertedColumn.ColumnDesc() = *invertedColDesc
-	return invertedColumn
 }
 
 // PrimaryKeyString returns the pretty-printed primary key declaration for a
@@ -696,7 +595,7 @@ func RenameColumnInTable(
 	// Rename any shard columns which need to be renamed because their name was
 	// based on this column.
 	for oldShardColName, newShardColName := range shardColumnsToRename {
-		shardCol, err := tableDesc.FindColumnWithName(oldShardColName)
+		shardCol, err := catalog.MustFindColumnByTreeName(tableDesc, oldShardColName)
 		if err != nil {
 			return err
 		}

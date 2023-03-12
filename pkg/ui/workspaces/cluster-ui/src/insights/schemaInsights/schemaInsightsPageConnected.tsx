@@ -15,11 +15,12 @@ import {
   selectSchemaInsights,
   selectSchemaInsightsDatabases,
   selectSchemaInsightsError,
+  selectSchemaInsightsMaxApiSizeReached,
   selectSchemaInsightsTypes,
   selectFilters,
   selectSortSetting,
 } from "src/store/schemaInsights";
-import { AppState } from "src/store";
+import { AppState, uiConfigActions } from "src/store";
 import {
   SchemaInsightsView,
   SchemaInsightsViewDispatchProps,
@@ -29,6 +30,8 @@ import { SchemaInsightEventFilters } from "../types";
 import { SortSetting } from "src/sortedtable";
 import { actions as localStorageActions } from "../../store/localStorage";
 import { Dispatch } from "redux";
+import { selectHasAdminRole } from "../../store/uiConfig";
+import { actions as analyticsActions } from "../../store/analytics";
 
 const mapStateToProps = (
   state: AppState,
@@ -40,6 +43,8 @@ const mapStateToProps = (
   schemaInsightsError: selectSchemaInsightsError(state),
   filters: selectFilters(state),
   sortSetting: selectSortSetting(state),
+  hasAdminRole: selectHasAdminRole(state),
+  maxSizeApiReached: selectSchemaInsightsMaxApiSizeReached(state),
 });
 
 const mapDispatchToProps = (
@@ -52,6 +57,14 @@ const mapDispatchToProps = (
         value: filters,
       }),
     );
+    dispatch(
+      analyticsActions.track({
+        name: "Filter Clicked",
+        page: "Schema Insights",
+        filterName: "filters",
+        value: filters.toString(),
+      }),
+    );
   },
   onSortChange: (ss: SortSetting) => {
     dispatch(
@@ -60,10 +73,19 @@ const mapDispatchToProps = (
         value: ss,
       }),
     );
+    dispatch(
+      analyticsActions.track({
+        name: "Column Sorted",
+        page: "Schema Insights",
+        tableName: "Schema Insights Table",
+        columnName: ss.columnTitle,
+      }),
+    );
   },
   refreshSchemaInsights: () => {
     dispatch(actions.refresh());
   },
+  refreshUserSQLRoles: () => dispatch(uiConfigActions.refreshUserSQLRoles()),
 });
 
 export const SchemaInsightsPageConnected = withRouter(

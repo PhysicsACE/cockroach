@@ -247,24 +247,7 @@ func (u UserDefinedTypeName) Basename() string {
 
 // FQName returns the fully qualified name.
 func (u UserDefinedTypeName) FQName() string {
-	var sb strings.Builder
-	// Even though cross-database type references are disabled, we still format
-	// the qualified name with the catalog. Consider the case where the current
-	// database is db1, and a statement like
-	// `CREATE VIEW db2.sc.v AS SELECT 'a'::db2.sc.typ`
-	// is executed. When parsing the inner view query, it's important to include
-	// the explicit catalog name, so the correct (non-cross-database) type is
-	// resolved.
-	if u.Catalog != "" {
-		sb.WriteString(u.Catalog)
-		sb.WriteString(".")
-	}
-	if u.ExplicitSchema {
-		sb.WriteString(u.Schema)
-		sb.WriteString(".")
-	}
-	sb.WriteString(u.Name)
-	return sb.String()
+	return FormatTypeName(u)
 }
 
 // Convenience list of pre-constructed types. Caller code can use any of these
@@ -650,9 +633,15 @@ var (
 	AnyEnumArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: AnyEnum, Oid: oid.T_anyarray, Locale: &emptyLocale}}
 
-	// JSONArray is the type of an array value having JSON-typed elements.
-	JSONArray = &T{InternalType: InternalType{
+	// JSONBArray is the type of an array value having JSONB-typed elements.
+	JSONBArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: Jsonb, Oid: oid.T__jsonb, Locale: &emptyLocale}}
+
+	// JSONArrayForDecodingOnly is the type of an array value having JSON-typed elements.
+	// Note that this struct can only used for decoding an input as we don't fully
+	// support the json array yet.
+	JSONArrayForDecodingOnly = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: Json, Oid: oid.T__json, Locale: &emptyLocale}}
 
 	// Int2Vector is a type-alias for an array of Int2 values with a different
 	// OID (T_int2vector instead of T__int2). It is a special VECTOR type used
@@ -1366,11 +1355,15 @@ func (t *T) WithoutTypeModifiers() *T {
 
 	typ, ok := OidToType[t.Oid()]
 	if !ok {
+		// These special cases for json, json[] is here so we can
+		// support decoding parameters with oid=json/json[] without
+		// adding full support for these type.
+		// TODO(sql-exp): Remove this if we support JSON.
 		if t.Oid() == oid.T_json {
-			// This special case is here so we can support decoding parameters
-			// with oid=json without adding full support for the JSON type.
-			// TODO(sql-exp): Remove this if we support JSON.
 			return Jsonb
+		}
+		if t.Oid() == oid.T__json {
+			return JSONArrayForDecodingOnly
 		}
 		panic(errors.AssertionFailedf("unexpected OID: %d", t.Oid()))
 	}
@@ -1928,6 +1921,14 @@ func (t *T) SQLString() string {
 		return t.TypeMeta.Name.FQName()
 	}
 	return strings.ToUpper(t.Name())
+}
+
+// FormatTypeName is an injected dependency from tree to properly format a
+// type name. The logic for proper formatting lives in the tree package.
+var FormatTypeName = fallbackFormatTypeName
+
+func fallbackFormatTypeName(UserDefinedTypeName) string {
+	return "formatting logic has not been injected from tree"
 }
 
 // Equivalent returns true if this type is "equivalent" to the given type.
@@ -2708,6 +2709,13 @@ func IsAdditiveType(t *T) bool {
 // wildcard type matches a tuple type having any number of fields (including 0).
 func IsWildcardTupleType(t *T) bool {
 	return len(t.TupleContents()) == 1 && t.TupleContents()[0].Family() == AnyFamily
+}
+
+// IsRecordType returns true if this is a RECORD type. This should only be used
+// when processing UDFs. A record differs from AnyTuple in that the tuple
+// contents may contain types other than Any.
+func IsRecordType(typ *T) bool {
+	return typ.Family() == TupleFamily && typ.Oid() == oid.T_record
 }
 
 // collatedStringTypeSQL returns the string representation of a COLLATEDSTRING

@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -48,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/randgen/randgencfg"
@@ -101,6 +103,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/unaccent"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/knz/strtime"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -981,24 +984,6 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 	),
 
-	"text": makeBuiltin(defProps(),
-		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
-			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				dIPAddr := tree.MustBeDIPAddr(args[0])
-				s := dIPAddr.IPAddr.String()
-				// Ensure the string has a "/mask" suffix.
-				if strings.IndexByte(s, '/') == -1 {
-					s += "/" + strconv.Itoa(int(dIPAddr.Mask))
-				}
-				return tree.NewDString(s), nil
-			},
-			Info:       "Converts the IP address and prefix length to text.",
-			Volatility: volatility.Immutable,
-		},
-	),
-
 	"inet_same_family": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
@@ -1048,22 +1033,6 @@ var regularBuiltins = map[string]builtinDefinition{
 			},
 			Info: "Test for subnet inclusion or equality, using only the network parts of the addresses. " +
 				"The host part of the addresses is ignored.",
-			Volatility: volatility.Immutable,
-		},
-	),
-
-	"inet": makeBuiltin(defProps(),
-		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
-			ReturnType: tree.FixedReturnType(types.INet),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				inet, err := eval.PerformCast(ctx, evalCtx, args[0], types.INet)
-				if err != nil {
-					return nil, pgerror.WithCandidateCode(err, pgcode.InvalidTextRepresentation)
-				}
-				return inet, nil
-			},
-			Info:       "If possible, converts input to that of type inet.",
 			Volatility: volatility.Immutable,
 		},
 	),
@@ -3235,7 +3204,7 @@ value if you rely on the HLC for accuracy.`,
 		stringOverload1(
 			func(ctx context.Context, evalCtx *eval.Context, s string) (tree.Datum, error) {
 				ts, dependsOnContext, err := tree.ParseDTimestamp(
-					tree.NewParseTimeContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
+					tree.NewParseContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
 					s,
 					time.Microsecond,
 				)
@@ -3290,7 +3259,7 @@ value if you rely on the HLC for accuracy.`,
 		stringOverload1(
 			func(ctx context.Context, evalCtx *eval.Context, s string) (tree.Datum, error) {
 				ts, dependsOnContext, err := tree.ParseDDate(
-					tree.NewParseTimeContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
+					tree.NewParseContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
 					s,
 				)
 				if err != nil {
@@ -3340,7 +3309,7 @@ value if you rely on the HLC for accuracy.`,
 		stringOverload1(
 			func(ctx context.Context, evalCtx *eval.Context, s string) (tree.Datum, error) {
 				t, dependsOnContext, err := tree.ParseDTime(
-					tree.NewParseTimeContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
+					tree.NewParseContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
 					s,
 					time.Microsecond,
 				)
@@ -3422,7 +3391,7 @@ value if you rely on the HLC for accuracy.`,
 		stringOverload1(
 			func(ctx context.Context, evalCtx *eval.Context, s string) (tree.Datum, error) {
 				t, dependsOnContext, err := tree.ParseDTimeTZ(
-					tree.NewParseTimeContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
+					tree.NewParseContext(evalCtx.GetTxnTimestamp(time.Microsecond).Time),
 					s,
 					time.Microsecond,
 				)
@@ -3789,13 +3758,9 @@ value if you rely on the HLC for accuracy.`,
 	"array_to_tsvector":              makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"get_current_ts_config":          makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"numnode":                        makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"plainto_tsquery":                makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"phraseto_tsquery":               makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"querytree":                      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"setweight":                      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"strip":                          makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"to_tsquery":                     makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"to_tsvector":                    makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"json_to_tsvector":               makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"jsonb_to_tsvector":              makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"ts_delete":                      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
@@ -4209,16 +4174,16 @@ value if you rely on the HLC for accuracy.`,
 	),
 	"crdb_internal.merge_statement_stats": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONBArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
-				var aggregatedStats roachpb.StatementStatistics
+				var aggregatedStats appstatspb.StatementStatistics
 				for _, statsDatum := range arr.Array {
 					if statsDatum == tree.DNull {
 						continue
 					}
-					var stats roachpb.StatementStatistics
+					var stats appstatspb.StatementStatistics
 					statsJSON := tree.MustBeDJSON(statsDatum).JSON
 					if err := sqlstatsutil.DecodeStmtStatsStatisticsJSON(statsJSON, &stats); err != nil {
 						return nil, err
@@ -4234,22 +4199,22 @@ value if you rely on the HLC for accuracy.`,
 
 				return tree.NewDJSON(aggregatedJSON), nil
 			},
-			Info:       "Merge an array of roachpb.StatementStatistics into a single JSONB object",
+			Info:       "Merge an array of appstatspb.StatementStatistics into a single JSONB object",
 			Volatility: volatility.Immutable,
 		},
 	),
 	"crdb_internal.merge_transaction_stats": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONBArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
-				var aggregatedStats roachpb.TransactionStatistics
+				var aggregatedStats appstatspb.TransactionStatistics
 				for _, statsDatum := range arr.Array {
 					if statsDatum == tree.DNull {
 						continue
 					}
-					var stats roachpb.TransactionStatistics
+					var stats appstatspb.TransactionStatistics
 					statsJSON := tree.MustBeDJSON(statsDatum).JSON
 					if err := sqlstatsutil.DecodeTxnStatsStatisticsJSON(statsJSON, &stats); err != nil {
 						return nil, err
@@ -4259,7 +4224,7 @@ value if you rely on the HLC for accuracy.`,
 				}
 
 				aggregatedJSON, err := sqlstatsutil.BuildTxnStatisticsJSON(
-					&roachpb.CollectedTransactionStatistics{
+					&appstatspb.CollectedTransactionStatistics{
 						Stats: aggregatedStats,
 					})
 				if err != nil {
@@ -4268,24 +4233,24 @@ value if you rely on the HLC for accuracy.`,
 
 				return tree.NewDJSON(aggregatedJSON), nil
 			},
-			Info:       "Merge an array of roachpb.TransactionStatistics into a single JSONB object",
+			Info:       "Merge an array of appstatspb.TransactionStatistics into a single JSONB object",
 			Volatility: volatility.Immutable,
 		},
 	),
 	"crdb_internal.merge_stats_metadata": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONBArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
-				metadata := &roachpb.AggregatedStatementMetadata{}
+				metadata := &appstatspb.AggregatedStatementMetadata{}
 
 				for _, metadataDatum := range arr.Array {
 					if metadataDatum == tree.DNull {
 						continue
 					}
 
-					var statistics roachpb.CollectedStatementStatistics
+					var statistics appstatspb.CollectedStatementStatistics
 					metadataJSON := tree.MustBeDJSON(metadataDatum).JSON
 					err := sqlstatsutil.DecodeStmtStatsMetadataJSON(metadataJSON, &statistics)
 					if err != nil {
@@ -4727,17 +4692,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, errors.AssertionFailedf("expected string value, got %T", args[0])
 				}
 				name := strings.ToLower(string(s))
-				rawSetting, ok := settings.Lookup(
-					name, settings.LookupForLocalAccess, evalCtx.Codec.ForSystemTenant(),
-				)
+				setting, ok := settings.LookupForLocalAccess(name, evalCtx.Codec.ForSystemTenant())
 				if !ok {
 					return nil, errors.Newf("unknown cluster setting '%s'", name)
-				}
-				setting, ok := rawSetting.(settings.NonMaskedSetting)
-				if !ok {
-					// If we arrive here, this means Lookup() did not properly
-					// ignore the masked setting, which is a bug in Lookup().
-					return nil, errors.AssertionFailedf("setting '%s' is masked", name)
 				}
 
 				return tree.NewDString(setting.EncodedDefault()), nil
@@ -4765,17 +4722,9 @@ value if you rely on the HLC for accuracy.`,
 					return nil, errors.AssertionFailedf("expected string value, got %T", args[1])
 				}
 				name := strings.ToLower(string(s))
-				rawSetting, ok := settings.Lookup(
-					name, settings.LookupForLocalAccess, evalCtx.Codec.ForSystemTenant(),
-				)
+				setting, ok := settings.LookupForLocalAccess(name, evalCtx.Codec.ForSystemTenant())
 				if !ok {
 					return nil, errors.Newf("unknown cluster setting '%s'", name)
-				}
-				setting, ok := rawSetting.(settings.NonMaskedSetting)
-				if !ok {
-					// If we arrive here, this means Lookup() did not properly
-					// ignore the masked setting, which is a bug in Lookup().
-					return nil, errors.AssertionFailedf("setting '%s' is masked", name)
 				}
 				repr, err := setting.DecodeToString(string(encoded))
 				if err != nil {
@@ -4915,84 +4864,57 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{Name: "id", Typ: types.Int},
+				{Name: "parameters", Typ: types.Jsonb},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sTenID, err := mustBeDIntInTenantRange(args[0])
+				tid, err := evalCtx.Tenant.CreateTenant(ctx,
+					args[0].(*tree.DJSON).JSON.String(),
+				)
 				if err != nil {
 					return nil, err
 				}
-				if err := evalCtx.Tenant.CreateTenantWithID(ctx, uint64(sTenID), ""); err != nil {
-					return nil, err
-				}
-				return args[0], nil
+				return tree.NewDInt(tree.DInt(tid.ToUint64())), nil
 			},
-			Info:       "Creates a new tenant with the provided ID. Must be run by the System tenant.",
+			Info: `Creates a new tenant with the provided parameters. ` +
+				`Must be run by the system tenant.`,
 			Volatility: volatility.Volatile,
 		},
+		// This overload is provided for compatibility with CC Serverless
+		// v22.2 and previous versions.
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "id", Typ: types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			IsUDF:      true,
+			Body: `SELECT crdb_internal.create_tenant(json_build_object('id', $1, 'service_mode',
+ 'external'))`,
+			Info:       `create_tenant(id) is an alias for create_tenant('{"id": id, "service_mode": "external"}'::jsonb)`,
+			Volatility: volatility.Volatile,
+		},
+		// This overload is provided for use in tests.
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "id", Typ: types.Int},
 				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sTenID, err := mustBeDIntInTenantRange(args[0])
-				if err != nil {
-					return nil, err
-				}
-				tenantName := tree.MustBeDString(args[1])
-				if err := evalCtx.Tenant.CreateTenantWithID(ctx, uint64(sTenID), roachpb.TenantName(tenantName)); err != nil {
-					return nil, err
-				}
-				return args[0], nil
-			},
-			Info:       "Creates a new tenant with the provided ID and name. Must be run by the System tenant.",
+			IsUDF:      true,
+			Body:       `SELECT crdb_internal.create_tenant(json_build_object('id', $1, 'name', $2))`,
+			Info:       `create_tenant(id, name) is an alias for create_tenant('{"id": id, "name": name}'::jsonb)`,
 			Volatility: volatility.Volatile,
 		},
+		// This overload is deprecated. Use CREATE TENANT instead.
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				tenantName := tree.MustBeDString(args[0])
-				var tenantID roachpb.TenantID
-				var err error
-				if tenantID, err = evalCtx.Tenant.CreateTenant(ctx, roachpb.TenantName(tenantName)); err != nil {
-					return nil, err
-				}
-				return tree.NewDInt(tree.DInt(tenantID.ToUint64())), nil
-			},
-			Info:       "Creates a new tenant with the provided name. Must be run by the System tenant.",
-			Volatility: volatility.Volatile,
-		},
-	),
-
-	"crdb_internal.rename_tenant": makeBuiltin(
-		tree.FunctionProperties{
-			Category:     builtinconstants.CategoryMultiTenancy,
-			Undocumented: true,
-		},
-		tree.Overload{
-			Types: tree.ParamTypes{
-				{Name: "id", Typ: types.Int},
-				{Name: "name", Typ: types.String},
-			},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sTenID, err := mustBeDIntInTenantRange(args[0])
-				if err != nil {
-					return nil, err
-				}
-				tenantName := tree.MustBeDString(args[1])
-				if err := evalCtx.Tenant.RenameTenant(ctx, uint64(sTenID), roachpb.TenantName(tenantName)); err != nil {
-					return nil, err
-				}
-				return args[0], nil
-			},
-			Info:       "Renames the specified tenant. Must be run by the System tenant.",
+			IsUDF:      true,
+			Body:       `SELECT crdb_internal.create_tenant(json_build_object('name', $1))`,
+			Info: `create_tenant(name) is an alias for create_tenant('{"name": name}'::jsonb).
+DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -5030,6 +4952,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 	),
 
+	// destroy_tenant is preserved for compatibility with CockroachCloud
+	// intrusion for v22.2 and previous versions.
 	"crdb_internal.destroy_tenant": makeBuiltin(
 		tree.FunctionProperties{
 			Category:     builtinconstants.CategoryMultiTenancy,
@@ -5040,19 +4964,9 @@ value if you rely on the HLC for accuracy.`,
 				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sTenID, err := mustBeDIntInTenantRange(args[0])
-				if err != nil {
-					return nil, err
-				}
-				if err := evalCtx.Tenant.DestroyTenantByID(
-					ctx, uint64(sTenID), false, /* synchronous */
-				); err != nil {
-					return nil, err
-				}
-				return args[0], nil
-			},
-			Info:       "Destroys a tenant with the provided ID. Must be run by the System tenant.",
+			IsUDF:      true,
+			Body:       `SELECT crdb_internal.destroy_tenant($1, false)`,
+			Info:       "DO NOT USE -- USE 'DROP TENANT' INSTEAD.",
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
@@ -5067,15 +4981,17 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				synchronous := tree.MustBeDBool(args[1])
-				if err := evalCtx.Tenant.DestroyTenantByID(
-					ctx, uint64(sTenID), bool(synchronous),
+
+				// Note: we pass true to ignoreServiceMode for compatibility
+				// with CC Serverless pre-v23.1.
+				if err := evalCtx.Tenant.DropTenantByID(
+					ctx, uint64(sTenID), bool(synchronous), true, /* ignoreServiceMode */
 				); err != nil {
 					return nil, err
 				}
 				return args[0], nil
 			},
-			Info: "Destroys a tenant with the provided ID. Must be run by the System tenant. " +
-				"Optionally, synchronously destroy the data",
+			Info:       "DO NOT USE -- USE 'DROP TENANT IMMEDIATE' INSTEAD.",
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -5392,8 +5308,8 @@ value if you rely on the HLC for accuracy.`,
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				key := []byte(tree.MustBeDBytes(args[0]))
 				b := &kv.Batch{}
-				b.AddRawRequest(&roachpb.LeaseInfoRequest{
-					RequestHeader: roachpb.RequestHeader{
+				b.AddRawRequest(&kvpb.LeaseInfoRequest{
+					RequestHeader: kvpb.RequestHeader{
 						Key: key,
 					},
 				})
@@ -5404,7 +5320,7 @@ value if you rely on the HLC for accuracy.`,
 				if err := evalCtx.Txn.Run(ctx, b); err != nil {
 					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "error fetching leaseholder")
 				}
-				resp := b.RawResponse().Responses[0].GetInner().(*roachpb.LeaseInfoResponse)
+				resp := b.RawResponse().Responses[0].GetInner().(*kvpb.LeaseInfoResponse)
 
 				return tree.NewDInt(tree.DInt(resp.Lease.Replica.StoreID)), nil
 			},
@@ -5517,11 +5433,11 @@ value if you rely on the HLC for accuracy.`,
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
 				tenantName := roachpb.TenantName(name)
-				tenantInfo, err := evalCtx.Tenant.GetTenantInfo(ctx, tenantName)
+				tid, err := evalCtx.Tenant.LookupTenantID(ctx, tenantName)
 				if err != nil {
 					return nil, err
 				}
-				start := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenantInfo.ID))
+				start := keys.MakeTenantPrefix(tid)
 				end := start.PrefixEnd()
 
 				result := tree.NewDArray(types.Bytes)
@@ -5987,6 +5903,23 @@ value if you rely on the HLC for accuracy.`,
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
 		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "val", Typ: types.TSVector},
+				{Name: "version", Typ: types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DZero, nil
+				}
+				val := args[0].(*tree.DTSVector)
+				return tree.NewDInt(tree.DInt(len(val.TSVector))), nil
+			},
+			Info:              "This function is used only by CockroachDB's developers for testing purposes.",
+			Volatility:        volatility.Stable,
+			CalledOnNullInput: true,
+		},
 	),
 
 	// Returns true iff the current user has admin role.
@@ -6335,6 +6268,33 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Volatile,
 		},
 	),
+	"crdb_internal.upsert_dropped_relation_gc_ttl": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemRepair,
+			DistsqlBlocklist: true,
+			Undocumented:     true,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "desc_id", Typ: types.Int},
+				{Name: "gc_ttl", Typ: types.Interval},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if err := evalCtx.Planner.UpsertDroppedRelationGCTTL(
+					ctx,
+					int64(*args[0].(*tree.DInt)),          // desc_id
+					(*args[1].(*tree.DInterval)).Duration, // gc_ttl
+				); err != nil {
+					return nil, err
+				}
+				return tree.DBoolTrue, nil
+			},
+			Info: "Administrators can use this to effectively perform " +
+				"ALTER TABLE ... CONFIGURE ZONE USING gc.ttlseconds = ...; on dropped tables",
+			Volatility: volatility.Volatile,
+		},
+	),
 
 	// Generate some objects.
 	"crdb_internal.generate_test_objects": makeBuiltin(
@@ -6418,7 +6378,7 @@ Parameters:` + randgencfg.ConfigDoc,
 	),
 
 	"crdb_internal.gc_tenant": makeBuiltin(
-		// TODO(jeffswenson): Delete internal_crdb.gc_tenant after the DestroyTenant
+		// TODO(jeffswenson): Delete crdb_internal.gc_tenant after the DestroyTenant
 		// changes are deployed to all Cockroach Cloud serverless hosts.
 		tree.FunctionProperties{
 			Category:     builtinconstants.CategoryMultiTenancy,
@@ -6445,6 +6405,9 @@ Parameters:` + randgencfg.ConfigDoc,
 	),
 
 	// Used to configure the tenant token bucket. See UpdateTenantResourceLimits.
+	//
+	// TODO(multitenantTeam): use tenantName instead of tenantID. See issue:
+	// https://github.com/cockroachdb/cockroach/issues/96176
 	"crdb_internal.update_tenant_resource_limits": makeBuiltin(
 		tree.FunctionProperties{
 			Category:     builtinconstants.CategoryMultiTenancy,
@@ -7292,7 +7255,7 @@ run from. One of 'mvccGC', 'merge', 'split', 'replicate', 'replicaGC',
 						return nil
 					}
 
-					if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+					if errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 						return nil
 					}
 					return err
@@ -7344,7 +7307,7 @@ store housing the range on the node it's run from. One of 'mvccGC', 'merge', 'sp
 						return nil
 					}
 
-					if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+					if errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 						return nil
 					}
 					return err
@@ -7554,18 +7517,29 @@ expires until the statement bundle is collected`,
 				if !isAdmin {
 					return nil, errors.New("crdb_internal.fingerprint() requires admin privilege")
 				}
+
 				arr := tree.MustBeDArray(args[0])
 				if arr.Len() != 2 {
 					return nil, errors.New("expected an array of two elements")
 				}
 				startKey := []byte(tree.MustBeDBytes(arr.Array[0]))
 				endKey := []byte(tree.MustBeDBytes(arr.Array[1]))
-				endTime := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-				if evalCtx.AsOfSystemTime != nil {
-					endTime = evalCtx.AsOfSystemTime.Timestamp
+				startTime := args[1].(*tree.DTimestampTZ).Time
+				startTimestamp := hlc.Timestamp{WallTime: startTime.UnixNano()}
+				allRevisions := *args[2].(*tree.DBool)
+				filter := kvpb.MVCCFilter_Latest
+				if allRevisions {
+					filter = kvpb.MVCCFilter_All
 				}
-				header := roachpb.Header{
-					Timestamp: endTime,
+
+				req := &kvpb.ExportRequest{
+					RequestHeader:     kvpb.RequestHeader{Key: startKey, EndKey: endKey},
+					StartTime:         startTimestamp,
+					MVCCFilter:        filter,
+					ExportFingerprint: true,
+				}
+				header := kvpb.Header{
+					Timestamp: evalCtx.Txn.ReadTimestamp(),
 					// We set WaitPolicy to Error, so that the export will return an error
 					// to us instead of a blocking wait if it hits any other txns.
 					//
@@ -7573,27 +7547,19 @@ expires until the statement bundle is collected`,
 					// specially in the future so as to allow the fingerprint to complete
 					// in the face of intents.
 					WaitPolicy: lock.WaitPolicy_Error,
+					// TODO(ssd): Setting this disables async sending in
+					// DistSender so it likely substantially impacts
+					// performance.
+					ReturnElasticCPUResumeSpans: true,
 				}
-				startTime := args[1].(*tree.DTimestampTZ).Time
-				startTimestamp := hlc.Timestamp{WallTime: startTime.UnixNano()}
-				allRevisions := *args[2].(*tree.DBool)
-				filter := roachpb.MVCCFilter_Latest
-				if allRevisions {
-					filter = roachpb.MVCCFilter_All
-				}
-				req := &roachpb.ExportRequest{
-					RequestHeader:     roachpb.RequestHeader{Key: startKey, EndKey: endKey},
-					StartTime:         startTimestamp,
-					MVCCFilter:        filter,
-					ExportFingerprint: true,
-				}
-				admissionHeader := roachpb.AdmissionHeader{
+				admissionHeader := kvpb.AdmissionHeader{
 					Priority:                 int32(admissionpb.BulkNormalPri),
 					CreateTime:               timeutil.Now().UnixNano(),
-					Source:                   roachpb.AdmissionHeader_FROM_SQL,
+					Source:                   kvpb.AdmissionHeader_FROM_SQL,
 					NoMemoryReservedAtSource: true,
 				}
-				todo := make(chan *roachpb.ExportRequest, 1)
+
+				todo := make(chan *kvpb.ExportRequest, 1)
 				todo <- req
 				ctxDone := ctx.Done()
 				var fingerprint uint64
@@ -7605,8 +7571,8 @@ expires until the statement bundle is collected`,
 					case <-ctxDone:
 						return nil, ctx.Err()
 					case req := <-todo:
-						var rawResp roachpb.Response
-						var pErr *roachpb.Error
+						var rawResp kvpb.Response
+						var pErr *kvpb.Error
 						exportRequestErr := contextutil.RunWithTimeout(ctx,
 							fmt.Sprintf("ExportRequest fingerprint for span %s", roachpb.Span{Key: startKey, EndKey: endKey}),
 							5*time.Minute, func(ctx context.Context) error {
@@ -7621,7 +7587,7 @@ expires until the statement bundle is collected`,
 							return nil, exportRequestErr
 						}
 
-						resp := rawResp.(*roachpb.ExportResponse)
+						resp := rawResp.(*kvpb.ExportResponse)
 						for _, file := range resp.Files {
 							fingerprint = fingerprint ^ file.Fingerprint
 
@@ -7637,7 +7603,7 @@ expires until the statement bundle is collected`,
 							}
 
 							resumeReq := req
-							resumeReq.RequestHeader = roachpb.RequestHeaderFromSpan(*resp.ResumeSpan)
+							resumeReq.RequestHeader = kvpb.RequestHeaderFromSpan(*resp.ResumeSpan)
 							todo <- resumeReq
 						}
 					default:
@@ -7682,7 +7648,7 @@ expires until the statement bundle is collected`,
 				}
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
-			Volatility: volatility.Immutable,
+			Volatility: volatility.Stable,
 		},
 	),
 	"crdb_internal.hide_sql_constants": makeBuiltin(tree.FunctionProperties{
@@ -7697,13 +7663,16 @@ expires until the statement bundle is collected`,
 
 				parsed, err := parser.ParseOne(sql)
 				if err != nil {
-					return nil, err
+					// If parsing is unsuccessful, we shouldn't return an error, however
+					// we can't return the original stmt since this function is used to
+					// hide sensitive information.
+					return tree.NewDString(""), nil //nolint:returnerrcheck
 				}
 				sqlNoConstants := tree.AsStringWithFlags(parsed.AST, tree.FmtHideConstants)
 				return tree.NewDString(sqlNoConstants), nil
 			},
 			types.String,
-			"Removes constants from a SQL statement. String provided must contain at most"+
+			"Removes constants from a SQL statement. String provided must contain at most "+
 				"1 statement.",
 			volatility.Immutable,
 		),
@@ -7727,11 +7696,10 @@ expires until the statement bundle is collected`,
 
 					if len(sql) != 0 {
 						parsed, err := parser.ParseOne(sql)
-						if err != nil {
-							return nil, err
+						// Leave result as empty string on parsing error.
+						if err == nil {
+							sqlNoConstants = tree.AsStringWithFlags(parsed.AST, tree.FmtHideConstants)
 						}
-
-						sqlNoConstants = tree.AsStringWithFlags(parsed.AST, tree.FmtHideConstants)
 					}
 
 					if err := result.Append(tree.NewDString(sqlNoConstants)); err != nil {
@@ -7741,8 +7709,124 @@ expires until the statement bundle is collected`,
 
 				return result, nil
 			},
-			Info: "Hide constants for each element in an array of SQL statements." +
+			Info: "Hide constants for each element in an array of SQL statements. " +
 				"Note that maximum 1 statement is permitted per string element.",
+			Volatility: volatility.Immutable,
+		},
+	),
+	"crdb_internal.humanize_bytes": makeBuiltin(tree.FunctionProperties{
+		Category:     builtinconstants.CategoryString,
+		Undocumented: true,
+	},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Int}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DNull, nil
+				}
+				b := tree.MustBeDInt(args[0])
+				return tree.NewDString(string(humanizeutil.IBytes(int64(b)))), nil
+			},
+			Info:       "Converts integer size (in bytes) into the human-readable form.",
+			Volatility: volatility.Leakproof,
+		},
+	),
+	"crdb_internal.redactable_sql_constants": makeBuiltin(tree.FunctionProperties{
+		Category:     builtinconstants.CategoryString,
+		Undocumented: true,
+	},
+		stringOverload1(
+			func(_ context.Context, _ *eval.Context, sql string) (tree.Datum, error) {
+				parsed, err := parser.ParseOne(sql)
+				if err != nil {
+					// If parsing was unsuccessful, mark the entire string as redactable.
+					return tree.NewDString(string(redact.Sprintf("%s", sql))), nil //nolint:returnerrcheck
+				}
+				fmtFlags := tree.FmtMarkRedactionNode | tree.FmtOmitNameRedaction
+				sqlRedactable := tree.AsStringWithFlags(parsed.AST, fmtFlags)
+				return tree.NewDString(sqlRedactable), nil
+			},
+			types.String,
+			"Surrounds constants in SQL statement with redaction markers. String provided must "+
+				"contain at most 1 statement.",
+			volatility.Immutable,
+		),
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.StringArray}},
+			ReturnType: tree.FixedReturnType(types.StringArray),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				arr := tree.MustBeDArray(args[0])
+				result := tree.NewDArray(types.String)
+
+				for _, sqlDatum := range arr.Array {
+					if sqlDatum == tree.DNull {
+						if err := result.Append(tree.DNull); err != nil {
+							return nil, err
+						}
+						continue
+					}
+
+					sql := string(tree.MustBeDString(sqlDatum))
+					sqlRedactable := ""
+
+					parsed, err := parser.ParseOne(sql)
+					if err != nil {
+						// If parsing was unsuccessful, mark the entire string as redactable.
+						sqlRedactable = string(redact.Sprintf("%s", sql))
+					} else {
+						fmtFlags := tree.FmtMarkRedactionNode | tree.FmtOmitNameRedaction
+						sqlRedactable = tree.AsStringWithFlags(parsed.AST, fmtFlags)
+					}
+					if err := result.Append(tree.NewDString(sqlRedactable)); err != nil {
+						return nil, err
+					}
+				}
+
+				return result, nil
+			},
+			Info: "Surrounds constants with redaction markers for each element in an array of SQL " +
+				"statements. Note that maximum 1 statement is permitted per string element.",
+			Volatility: volatility.Immutable,
+		},
+	),
+	"crdb_internal.redact": makeBuiltin(tree.FunctionProperties{
+		Category:     builtinconstants.CategoryString,
+		Undocumented: true,
+	},
+		stringOverload1(
+			func(_ context.Context, _ *eval.Context, redactable string) (tree.Datum, error) {
+				return tree.NewDString(string(redact.RedactableString(redactable).Redact())), nil
+			},
+			types.String,
+			"Replaces all occurrences of unsafe substrings (substrings surrounded by the redaction "+
+				"markers, '‹' and '›') with the redacted marker, '‹×›'.",
+			volatility.Immutable,
+		),
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.StringArray}},
+			ReturnType: tree.FixedReturnType(types.StringArray),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				arr := tree.MustBeDArray(args[0])
+				result := tree.NewDArray(types.String)
+				for _, redactableDatum := range arr.Array {
+					if redactableDatum == tree.DNull {
+						if err := result.Append(tree.DNull); err != nil {
+							return nil, err
+						}
+						continue
+					}
+					redactable := string(tree.MustBeDString(redactableDatum))
+					redacted := string(redact.RedactableString(redactable).Redact())
+					if err := result.Append(tree.NewDString(redacted)); err != nil {
+						return nil, err
+					}
+				}
+				return result, nil
+			},
+			Info: "For each element of the array `val`, replaces all occurrences of unsafe substrings " +
+				"(substrings surrounded by the redaction markers, '‹' and '›') with the redacted marker, " +
+				"'‹×›'.",
 			Volatility: volatility.Immutable,
 		},
 	),
@@ -9885,6 +9969,13 @@ func arrayToString(
 	evalCtx *eval.Context, arr *tree.DArray, delim string, nullStr *string,
 ) (tree.Datum, error) {
 	f := evalCtx.FmtCtx(tree.FmtArrayToString)
+	arrayToStringHelper(evalCtx, arr, delim, nullStr, f)
+	return tree.NewDString(f.CloseAndGetString()), nil
+}
+
+func arrayToStringHelper(
+	evalCtx *eval.Context, arr *tree.DArray, delim string, nullStr *string, f *tree.FmtCtx,
+) {
 
 	for i := range arr.Array {
 		if arr.Array[i] == tree.DNull {
@@ -9893,13 +9984,17 @@ func arrayToString(
 			}
 			f.WriteString(*nullStr)
 		} else {
-			f.FormatNode(arr.Array[i])
+			if nestedArray, ok := arr.Array[i].(*tree.DArray); ok {
+				// "Unpack" nested arrays to be consistent with postgres.
+				arrayToStringHelper(evalCtx, nestedArray, delim, nullStr, f)
+			} else {
+				f.FormatNode(arr.Array[i])
+			}
 		}
 		if i < len(arr.Array)-1 {
 			f.WriteString(delim)
 		}
 	}
-	return tree.NewDString(f.CloseAndGetString()), nil
 }
 
 // encodeEscape implements the encode(..., 'escape') Postgres builtin. It's
@@ -10160,7 +10255,7 @@ func asJSONBuildObjectKey(
 		*tree.DDecimal, *tree.DEnum, *tree.DFloat, *tree.DGeography,
 		*tree.DGeometry, *tree.DIPAddr, *tree.DInt, *tree.DInterval, *tree.DOid,
 		*tree.DOidWrapper, *tree.DTime, *tree.DTimeTZ, *tree.DTimestamp,
-		*tree.DUuid, *tree.DVoid:
+		*tree.DTSQuery, *tree.DTSVector, *tree.DUuid, *tree.DVoid:
 		return tree.AsStringWithFlags(d, tree.FmtBareStrings), nil
 	default:
 		return "", errors.AssertionFailedf("unexpected type %T for key value", d)
@@ -10423,7 +10518,7 @@ func arrayNumInvertedIndexEntries(
 
 func parseContextFromDateStyle(
 	evalCtx *eval.Context, dateStyleStr string,
-) (tree.ParseTimeContext, error) {
+) (tree.ParseContext, error) {
 	ds, err := pgdate.ParseDateStyle(dateStyleStr, pgdate.DefaultDateStyle())
 	if err != nil {
 		return nil, err
@@ -10431,9 +10526,9 @@ func parseContextFromDateStyle(
 	if ds.Style != pgdate.Style_ISO {
 		return nil, unimplemented.NewWithIssue(41773, "only ISO style is supported")
 	}
-	return tree.NewParseTimeContext(
+	return tree.NewParseContext(
 		evalCtx.GetTxnTimestamp(time.Microsecond).Time,
-		tree.NewParseTimeContextOptionDateStyle(ds),
+		tree.NewParseContextOptionDateStyle(ds),
 	), nil
 }
 

@@ -14,17 +14,15 @@ import (
 	"context"
 	gosql "database/sql"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -35,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -53,7 +50,7 @@ func TestGetAvailableInstanceIDForRegion(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	getAvailableInstanceID := func(storage *Storage, region []byte) (id base.SQLInstanceID, err error) {
@@ -65,7 +62,7 @@ func TestGetAvailableInstanceIDForRegion(t *testing.T) {
 	}
 
 	t.Run("no rows", func(t *testing.T) {
-		stopper, storage, _, _ := setup(t, sqlDB, kvDB, s.ClusterSettings())
+		stopper, storage, _, _ := setup(t, sqlDB, s)
 		defer stopper.Stop(ctx)
 
 		id, err := getAvailableInstanceID(storage, nil)
@@ -75,7 +72,7 @@ func TestGetAvailableInstanceIDForRegion(t *testing.T) {
 
 	t.Run("preallocated rows", func(t *testing.T) {
 		const expiration = time.Minute
-		stopper, storage, slStorage, clock := setup(t, sqlDB, kvDB, s.ClusterSettings())
+		stopper, storage, slStorage, clock := setup(t, sqlDB, s)
 		defer stopper.Stop(ctx)
 
 		// Pre-allocate four instances.
@@ -290,7 +287,7 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	const expiration = time.Minute
@@ -300,7 +297,7 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 	regions := [][]byte{enum.One}
 
 	t.Run("nothing preallocated", func(t *testing.T) {
-		stopper, storage, _, clock := setup(t, sqlDB, kvDB, s.ClusterSettings())
+		stopper, storage, _, clock := setup(t, sqlDB, s)
 		defer stopper.Stop(ctx)
 
 		sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
@@ -320,7 +317,7 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 	})
 
 	t.Run("with some preallocated", func(t *testing.T) {
-		stopper, storage, slStorage, clock := setup(t, sqlDB, kvDB, s.ClusterSettings())
+		stopper, storage, slStorage, clock := setup(t, sqlDB, s)
 		defer stopper.Stop(ctx)
 
 		sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
@@ -421,20 +418,6 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 	})
 }
 
-func getTableID(
-	t *testing.T, db *sqlutils.SQLRunner, dbName, tableName string,
-) (tableID descpb.ID) {
-	t.Helper()
-	db.QueryRow(t, `
- select u.id
-  from system.namespace t
-  join system.namespace u
-  on t.id = u."parentID"
-  where t.name = $1 and u.name = $2`,
-		dbName, tableName).Scan(&tableID)
-	return tableID
-}
-
 func sortInstancesForTest(instances []sqlinstance.InstanceInfo) {
 	sort.SliceStable(instances, func(idx1, idx2 int) bool {
 		addr1, addr2 := instances[idx1].InstanceRPCAddr, instances[idx2].InstanceRPCAddr
@@ -456,20 +439,19 @@ func sortInstancesForTest(instances []sqlinstance.InstanceInfo) {
 }
 
 func setup(
-	t *testing.T, sqlDB *gosql.DB, kvDB *kv.DB, settings *cluster.Settings,
+	t *testing.T, sqlDB *gosql.DB, s serverutils.TestServerInterface,
 ) (*stop.Stopper, *Storage, *slstorage.FakeStorage, *hlc.Clock) {
 	dbName := t.Name()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 	tDB.Exec(t, `CREATE DATABASE "`+dbName+`"`)
-	schema := strings.Replace(systemschema.SQLInstancesTableSchema,
-		`CREATE TABLE system.sql_instances`,
-		`CREATE TABLE "`+dbName+`".sql_instances`, 1)
+	schema := GetTableSQLForDatabase(dbName)
 	tDB.Exec(t, schema)
-	tableID := getTableID(t, tDB, dbName, "sql_instances")
-	clock := hlc.NewClock(timeutil.NewTestTimeSource(), base.DefaultMaxClockOffset)
+	table := desctestutils.TestingGetPublicTableDescriptor(s.DB(), s.Codec(), dbName, "sql_instances")
+	clock := hlc.NewClockForTesting(nil)
 	stopper := stop.NewStopper()
 	slStorage := slstorage.NewFakeStorage()
-	storage := NewTestingStorage(kvDB, keys.SystemSQLCodec, tableID, slStorage, settings)
+	f := s.RangeFeedFactory().(*rangefeed.Factory)
+	storage := NewTestingStorage(s.DB(), keys.SystemSQLCodec, table, slStorage, s.ClusterSettings(), clock, f)
 	return stopper, storage, slStorage, clock
 }
 

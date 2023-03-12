@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -43,7 +44,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -58,6 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -360,14 +364,14 @@ func newRPCTestContext(ctx context.Context, ts *TestServer, cfg *base.Config) *r
 	var c base.NodeIDContainer
 	ctx = logtags.AddTag(ctx, "n", &c)
 	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:  roachpb.SystemTenantID,
-		NodeID:    &c,
-		Config:    cfg,
-		Clock:     ts.Clock().WallClock(),
-		MaxOffset: ts.Clock().MaxOffset(),
-		Stopper:   ts.Stopper(),
-		Settings:  ts.ClusterSettings(),
-		Knobs:     rpc.ContextTestingKnobs{NoLoopbackDialer: true},
+		TenantID:        roachpb.SystemTenantID,
+		NodeID:          &c,
+		Config:          cfg,
+		Clock:           ts.Clock().WallClock(),
+		ToleratedOffset: ts.Clock().ToleratedOffset(),
+		Stopper:         ts.Stopper(),
+		Settings:        ts.ClusterSettings(),
+		Knobs:           rpc.ContextTestingKnobs{NoLoopbackDialer: true},
 	})
 	// Ensure that the RPC client context validates the server cluster ID.
 	// This ensures that a test where the server is restarted will not let
@@ -675,14 +679,14 @@ func TestStatusLocalLogsTenantFilter(t *testing.T) {
 	defer ts.Stopper().Stop(context.Background())
 
 	ctxSysTenant := context.Background()
-	ctxSysTenant = context.WithValue(ctxSysTenant, log.ServerIdentificationContextKey{}, &idProvider{
+	ctxSysTenant = context.WithValue(ctxSysTenant, serverident.ServerIdentificationContextKey{}, &idProvider{
 		tenantID:  roachpb.SystemTenantID,
 		clusterID: &base.ClusterIDContainer{},
 		serverID:  &base.NodeIDContainer{},
 	})
 	appTenantID := roachpb.MustMakeTenantID(uint64(2))
 	ctxAppTenant := context.Background()
-	ctxAppTenant = context.WithValue(ctxAppTenant, log.ServerIdentificationContextKey{}, &idProvider{
+	ctxAppTenant = context.WithValue(ctxAppTenant, serverident.ServerIdentificationContextKey{}, &idProvider{
 		tenantID:  appTenantID,
 		clusterID: &base.ClusterIDContainer{},
 		serverID:  &base.NodeIDContainer{},
@@ -1053,6 +1057,18 @@ func TestHotRangesResponse(t *testing.T) {
 				if r.Desc.RangeID == 0 || (len(r.Desc.StartKey) == 0 && len(r.Desc.EndKey) == 0) {
 					t.Errorf("unexpected empty/unpopulated range descriptor: %+v", r.Desc)
 				}
+				if r.QueriesPerSecond > 0 {
+					if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
+						t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
+							r.QueriesPerSecond, r.ReadsPerSecond, r.WritesPerSecond)
+					}
+					// If the architecture doesn't support sampling CPU, it
+					// will also be zero.
+					if grunning.Supported() && r.CPUTimePerSecond == 0 {
+						t.Errorf("qps %.2f > 0, expected cpu=%.2f to be non-zero",
+							r.QueriesPerSecond, r.CPUTimePerSecond)
+					}
+				}
 				if r.QueriesPerSecond > lastQPS {
 					t.Errorf("unexpected increase in qps between ranges; prev=%.2f, current=%.2f, desc=%v",
 						lastQPS, r.QueriesPerSecond, r.Desc)
@@ -1081,6 +1097,17 @@ func TestHotRanges2Response(t *testing.T) {
 	for _, r := range hotRangesResp.Ranges {
 		if r.RangeID == 0 {
 			t.Errorf("unexpected empty range id: %d", r.RangeID)
+		}
+		if r.QPS > 0 {
+			if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
+				t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
+					r.QPS, r.ReadsPerSecond, r.WritesPerSecond)
+			}
+			// If the architecture doesn't support sampling CPU, it
+			// will also be zero.
+			if grunning.Supported() && r.CPUTimePerSecond == 0 {
+				t.Errorf("qps %.2f > 0, expected cpu=%.2f to be non-zero", r.QPS, r.CPUTimePerSecond)
+			}
 		}
 		if r.QPS > lastQPS {
 			t.Errorf("unexpected increase in qps between ranges; prev=%.2f, current=%.2f", lastQPS, r.QPS)
@@ -1309,20 +1336,20 @@ func TestStatusVarsTxnMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_begin_count 1")) {
-		t.Errorf("expected `sql_txn_begin_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_begin_count{tenant=\"system\"} 1")) {
+		t.Errorf("expected `sql_txn_begin_count{tenant=\"system\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_count 1")) {
-		t.Errorf("expected `sql_restart_savepoint_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_count{tenant=\"system\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_count{tenant=\"system\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count 1")) {
-		t.Errorf("expected `sql_restart_savepoint_release_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count{tenant=\"system\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_release_count{tenant=\"system\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_commit_count 1")) {
-		t.Errorf("expected `sql_txn_commit_count 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_commit_count{tenant=\"system\"} 1")) {
+		t.Errorf("expected `sql_txn_commit_count{tenant=\"system\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_rollback_count 0")) {
-		t.Errorf("expected `sql_txn_rollback_count 0`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_rollback_count{tenant=\"system\"} 0")) {
+		t.Errorf("expected `sql_txn_rollback_count{tenant=\"system\"} 0`, got: %s", body)
 	}
 }
 
@@ -1337,8 +1364,8 @@ func TestSpanStatsResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var response serverpb.SpanStatsResponse
-	request := serverpb.SpanStatsRequest{
+	var response roachpb.SpanStatsResponse
+	request := roachpb.SpanStatsRequest{
 		NodeID:   "1",
 		StartKey: []byte(roachpb.RKeyMin),
 		EndKey:   []byte(roachpb.RKeyMax),
@@ -1367,7 +1394,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	rpcStopper := stop.NewStopper()
 	defer rpcStopper.Stop(ctx)
 	rpcContext := newRPCTestContext(ctx, ts, ts.RPCContext().Config)
-	request := serverpb.SpanStatsRequest{
+	request := roachpb.SpanStatsRequest{
 		NodeID:   "1",
 		StartKey: []byte(roachpb.RKeyMin),
 		EndKey:   []byte(roachpb.RKeyMax),
@@ -1618,7 +1645,7 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 	}
 
 	// Construct a map of all the statement fingerprint IDs.
-	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
+	statementFingerprintIDs := make(map[appstatspb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
 		statementFingerprintIDs[respStatement.ID] = true
 	}
@@ -1753,7 +1780,7 @@ func TestStatusAPITransactions(t *testing.T) {
 	}
 
 	// Construct a map of all the statement fingerprint IDs.
-	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
+	statementFingerprintIDs := make(map[appstatspb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
 		statementFingerprintIDs[respStatement.ID] = true
 	}
@@ -2142,7 +2169,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 		thirdServerSQL.Exec(t, stmt)
 	}
 	query := `INSERT INTO posts VALUES (_, '_')`
-	fingerprintID := roachpb.ConstructStatementFingerprintID(query,
+	fingerprintID := appstatspb.ConstructStatementFingerprintID(query,
 		false, true, `roachblog`)
 	path := fmt.Sprintf(`stmtdetails/%v`, fingerprintID)
 
@@ -2336,7 +2363,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	}
 
 	selectQuery := "SELECT _, _, _, _"
-	fingerprintID = roachpb.ConstructStatementFingerprintID(selectQuery, false,
+	fingerprintID = appstatspb.ConstructStatementFingerprintID(selectQuery, false,
 		true, "defaultdb")
 
 	testPath(
@@ -3680,7 +3707,7 @@ func TestTransactionContentionEvents(t *testing.T) {
 				WHERE length(contending_key) > 0`,
 				)
 				if tc.testName == "nopermission" {
-					require.Contains(t, err.Error(), "requires VIEWACTIVITY")
+					require.Contains(t, err.Error(), "does not have VIEWACTIVITY")
 				} else {
 					require.NoError(t, err)
 					visibleContendingKeysCount := tree.MustBeDInt(row[0])
@@ -3708,6 +3735,9 @@ func TestTransactionContentionEvents(t *testing.T) {
 				}
 
 				for _, event := range resp.Events {
+					require.NotEqual(t, event.WaitingStmtFingerprintID, 0)
+					require.NotEqual(t, event.WaitingStmtID.String(), clusterunique.ID{}.String())
+
 					require.Equal(t, tc.canViewContendingKey, len(event.BlockingEvent.Key) > 0,
 						"expected to %s, but the contending key has length of %d",
 						expectationStr,

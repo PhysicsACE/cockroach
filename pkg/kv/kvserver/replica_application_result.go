@@ -13,6 +13,7 @@ package kvserver
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
@@ -74,7 +75,7 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 		return
 	}
 
-	var pErr *roachpb.Error
+	var pErr *kvpb.Error
 	if filter := r.store.cfg.TestingKnobs.TestingPostApplyFilter; filter != nil {
 		var newPropRetry int
 		newPropRetry, pErr = filter(kvserverbase.ApplyFilterArgs{
@@ -103,18 +104,119 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 		case kvserverbase.ProposalRejectionPermanent:
 			cmd.response.Err = pErr
 		case kvserverbase.ProposalRejectionIllegalLeaseIndex:
+			// Reset the error as it's now going to be determined by the outcome of
+			// reproposing (or not).
+			//
+			// Note that if pErr remains nil, we will mark the proposal as non-local at
+			// the end of this block and return, so we're not hitting an NPE near the end
+			// of this method where we're attempting to reach into `cmd.proposal`.
+			//
+			// This control flow is sketchy but it preserves existing behavior
+			// that would be too risky to change at the time of writing.
+			//
+			pErr = nil
 			// If we failed to apply at the right lease index, try again with a
 			// new one. This is important for pipelined writes, since they don't
 			// have a client watching to retry, so a failure to eventually apply
 			// the proposal would be a user-visible error.
-			pErr = r.tryReproposeWithNewLeaseIndex(ctx, cmd)
+			//
+			// If the command associated with this rejected raft entry already applied
+			// then we don't want to repropose it. Doing so could lead to duplicate
+			// application of the same proposal. (We can see hit this case if an application
+			// batch contains multiple copies of the same proposal, in which case they are
+			// all marked as local, the first one will apply (and set p.applied) and the
+			// remaining copies will hit this branch).
+			//
+			// Similarly, if the proposal associated with this rejected raft entry is
+			// superseded by a different (larger) MaxLeaseIndex than the one we decoded
+			// from the entry itself, the command must have already passed through
+			// tryReproposeWithNewLeaseIndex previously (this can happen if there are
+			// multiple copies of the command in the logs; see
+			// TestReplicaRefreshMultiple). We must not create multiple copies with
+			// multiple lease indexes, so don't repropose it again. This ensures that at
+			// any time, there is only up to a single lease index that has a chance of
+			// succeeding in the Raft log for a given command.
+			//
+			// Taking a looking glass to the last paragraph, we see that the situation
+			// is much more subtle. As tryReproposeWithNewLeaseIndex gets to the stage
+			// where it calls `(*Replica).propose` (i.e. it passed the closed
+			// timestamp checks), it *resets* `cmd.proposal.MaxLeaseIndex` to zero.
+			// This means that the proposal immediately supersedes any other copy
+			// presently in the log, including for the remainder of application of the
+			// current log entry (since the current entry's LAI is certainly not equal
+			// to zero). However, the proposal buffer adds another layer of
+			// possibility on top of this. Typically, the buffer does not flush
+			// immediately: this only happens at the beginning of the *next* raft
+			// handling cycle, i.e. the proposal will not re-enter the proposals map
+			// while the current batches of commands (recall, which may contain an
+			// arbitrary number of copies of the current command, both with various
+			// LAIs all but at most one of which are too small) are applied. *But*,
+			// the proposal buffer has a capacity, and if it does fill up in
+			// `(*Replica).propose` it will synchronously flush, meaning that a new
+			// LAI will be assigned to `cmd.proposal.MaxLeaseIndex` AND the command
+			// will have re-entered the proposals map. So even if we remove the
+			// "zeroing" of the MaxLeaseIndex prior to proposing, we still have to
+			// contend with the fact that once `tryReproposeWithNewLeaseIndex` may
+			// or may not be in the map. (At least it is assigned a new LAI if and
+			// only if it is back in the map!).
+			//
+			// These many possible worlds are a major source of complexity, a
+			// reduction of which is postponed.
+			if !cmd.proposal.applied && !cmd.proposal.Supersedes(cmd.Cmd.MaxLeaseIndex) {
+				pErr = tryReproposeWithNewLeaseIndex(ctx, cmd, (*replicaReproposer)(r))
+			}
+
 			if pErr != nil {
-				log.Warningf(ctx, "failed to repropose with new lease index: %s", pErr)
+				// An error from tryReproposeWithNewLeaseIndex implies that the current
+				// entry is not superseded (i.e. we don't have a reproposal at a higher
+				// MaxLeaseIndex in the log).
+				//
+				// Commonly the error is an inability to repropose the command due to
+				// the closed timestamp having advanced past the write timestamp at
+				// which the command was originally evaluated, so this path is hit
+				// in practice.
+				//
+				// An error here implies that any additional copies of the command
+				// (which may be present in the log ahead of the current entry) will
+				// also fail.
+				//
+				// It is thus safe to signal the error back to the client, which is also
+				// the only sensible choice at this point.
+				//
+				// We also know that the proposal is not in the proposals map, since the
+				// command is local and wasn't superseded, which is the condition in
+				// retrieveLocalProposals for removing from the map. So we're not leaking
+				// a map entry here, which we assert against below (and which has coverage,
+				// at time of writing, through TestReplicaReproposalWithNewLeaseIndexError).
+				log.Infof(ctx, "failed to repropose %s at idx %d with new lease index: %s", cmd.ID, cmd.Index(), pErr)
 				cmd.response.Err = pErr
+
+				// This assertion can mis-fire if we artificially inject invalid LAIs
+				// during proposal, see the explanatory comment above. If, in the
+				// current app batch, we had two identical copies of an entry (which
+				// maps to a local proposal), and the LAI was stale, then both entries
+				// would be local. The first could succeed to repropose, which, if the
+				// propBuf was full, would immediately insert into the proposals map.
+				// Normally, when we then apply the second entry, it would be superseded
+				// and not hit the assertion. But, if we injected a stale LAI during
+				// this last reproposal, we could "accidentally" assign the same LAI
+				// again. The second entry would then try to repropose again, which is
+				// fine, but it could bump into the closed timestamp, get an error,
+				// enter this branch, and then trip the assertion.
+				//
+				// For proposed simplifications, see:
+				// https://github.com/cockroachdb/cockroach/issues/97633
+				r.mu.RLock()
+				_, inMap := r.mu.proposals[cmd.ID]
+				r.mu.RUnlock()
+
+				if inMap {
+					log.Fatalf(ctx, "failed reproposal unexpectedly in proposals map: %+v", cmd)
+				}
 			} else {
-				// Unbind the entry's local proposal because we just succeeded
-				// in reproposing it and we don't want to acknowledge the client
-				// yet.
+				// Unbind the entry's local proposal because we just succeeded in
+				// reproposing it or decided not to repropose. Either way, we don't want
+				// to acknowledge the client yet.
 				cmd.proposal = nil
 				return
 			}
@@ -135,65 +237,82 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 	}
 }
 
+// reproposer is used by tryReproposeWithNewLeaseIndex.
+type reproposer interface {
+	trackEvaluatingRequest(context.Context, hlc.Timestamp) (hlc.Timestamp, TrackedRequestToken)
+	propose(context.Context, *ProposalData, TrackedRequestToken) *kvpb.Error
+	newNotLeaseHolderError(string) *kvpb.NotLeaseHolderError
+}
+
+type replicaReproposer Replica
+
+var _ reproposer = (*replicaReproposer)(nil)
+
+func (r *replicaReproposer) trackEvaluatingRequest(
+	ctx context.Context, wts hlc.Timestamp,
+) (hlc.Timestamp, TrackedRequestToken) {
+	// NB: must not hold r.mu here, the propBuf acquires it itself.
+	return r.mu.proposalBuf.TrackEvaluatingRequest(ctx, wts)
+}
+
+func (r *replicaReproposer) propose(
+	ctx context.Context, p *ProposalData, tok TrackedRequestToken,
+) *kvpb.Error {
+	return (*Replica)(r).propose(ctx, p, tok)
+}
+
+func (r *replicaReproposer) newNotLeaseHolderError(msg string) *kvpb.NotLeaseHolderError {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return kvpb.NewNotLeaseHolderError(
+		*r.mu.state.Lease,
+		r.store.StoreID(),
+		r.mu.state.Desc,
+		msg,
+	)
+}
+
 // tryReproposeWithNewLeaseIndex is used by prepareLocalResult to repropose
 // commands that have gotten an illegal lease index error, and that we know
 // could not have applied while their lease index was valid (that is, we
 // observed all applied entries between proposal and the lease index becoming
 // invalid, as opposed to skipping some of them by applying a snapshot).
 //
-// It is not intended for use elsewhere and is only a top-level function so that
-// it can avoid the below_raft_protos check. Returns a nil error if the command
-// has already been successfully applied or has been reproposed here or by a
-// different entry for the same proposal that hit an illegal lease index error.
-func (r *Replica) tryReproposeWithNewLeaseIndex(
-	ctx context.Context, cmd *replicatedCmd,
-) *roachpb.Error {
-	// Note that we don't need to validate anything about the proposal's
-	// lease here - if we got this far, we know that everything but the
-	// index is valid at this point in the log.
+// The caller must already have checked that the entry is local and not
+// superseded, and that it was rejected with an illegal lease index error.
+func tryReproposeWithNewLeaseIndex(
+	ctx context.Context, cmd *replicatedCmd, r reproposer,
+) *kvpb.Error {
 	p := cmd.proposal
-	if p.applied || cmd.Cmd.MaxLeaseIndex != p.command.MaxLeaseIndex {
-		// If the command associated with this rejected raft entry already
-		// applied then we don't want to repropose it. Doing so could lead
-		// to duplicate application of the same proposal.
-		//
-		// Similarly, if the command associated with this rejected raft
-		// entry has a different (larger) MaxLeaseIndex than the one we
-		// decoded from the entry itself, the command must have already
-		// been reproposed (this can happen if there are multiple copies
-		// of the command in the logs; see TestReplicaRefreshMultiple).
-		// We must not create multiple copies with multiple lease indexes,
-		// so don't repropose it again. This ensures that at any time,
-		// there is only up to a single lease index that has a chance of
-		// succeeding in the Raft log for a given command.
-		return nil
-	}
-
 	// We need to track the request again in order to protect its timestamp until
 	// it gets reproposed.
 	// TODO(andrei): Only track if the request consults the ts cache. Some
 	// requests (e.g. EndTxn) don't care about closed timestamps.
-	minTS, tok := r.mu.proposalBuf.TrackEvaluatingRequest(ctx, p.Request.WriteTimestamp())
+	minTS, tok := r.trackEvaluatingRequest(ctx, p.Request.WriteTimestamp())
 	defer tok.DoneIfNotMoved(ctx)
 
 	// NB: p.Request.Timestamp reflects the action of ba.SetActiveTimestamp.
 	if p.Request.AppliesTimestampCache() && p.Request.WriteTimestamp().LessEq(minTS) {
 		// The tracker wants us to forward the request timestamp, but we can't
 		// do that without re-evaluating, so give up. The error returned here
-		// will go to back to DistSender, so send something it can digest.
-		err := roachpb.NewNotLeaseHolderError(
-			*r.mu.state.Lease,
-			r.store.StoreID(),
-			r.mu.state.Desc,
-			"reproposal failed due to closed timestamp",
-		)
-		return roachpb.NewError(err)
+		// will go back to DistSender, so send something it can digest.
+		return kvpb.NewError(r.newNotLeaseHolderError("reproposal failed due to closed timestamp"))
 	}
 	// Some tests check for this log message in the trace.
 	log.VEventf(ctx, 2, "retry: proposalIllegalLeaseIndex")
 
+	// Reset the command for reproposal.
+	prevMaxLeaseIndex := p.command.MaxLeaseIndex
+	prevEncodedCommand := p.encodedCommand
+	p.command.MaxLeaseIndex = 0
+	p.encodedCommand = nil
 	pErr := r.propose(ctx, p, tok.Move(ctx))
 	if pErr != nil {
+		// On error, reset the fields we zeroed out to their old value.
+		// This ensures that the proposal doesn't count as Superseded
+		// now.
+		p.command.MaxLeaseIndex = prevMaxLeaseIndex
+		p.encodedCommand = prevEncodedCommand
 		return pErr
 	}
 	log.VEventf(ctx, 2, "reproposed command %x", cmd.ID)

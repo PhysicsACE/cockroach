@@ -29,7 +29,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -79,7 +81,8 @@ var localityCfgs = map[string]roachpb.Locality{
 }
 
 var clusterVersionKeys = map[string]clusterversion.Key{
-	"Start22_2": clusterversion.V22_2Start,
+	"Start22_2":           clusterversion.TODODelete_V22_2Start,
+	"23_1_MVCCTombstones": clusterversion.V23_1_MVCCRangeTombstonesUnconditionallyEnabled,
 }
 
 type sqlDBKey struct {
@@ -151,6 +154,14 @@ func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
 	params.ServerArgs.DisableDefaultTestTenant = cfg.disableTenant
 	params.ServerArgs.Knobs = base.TestingKnobs{
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+	}
+	// Backups issue splits underneath the hood, and as such, will fail capability
+	// checks for tests that run as secondary tenants. Skip these checks at a
+	// global level using a testing knob.
+	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
+		// TODO(arul): This can be removed once
+		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
+		AuthorizerSkipAdminSplitCapabilityChecks: true,
 	}
 
 	settings := cluster.MakeTestingClusterSettings()
@@ -886,9 +897,9 @@ func handleKVRequest(
 			target).Scan(&tableID)
 		require.NoError(t, err)
 		bankSpan := makeTableSpan(keys.SystemSQLCodec, tableID)
-		dr := roachpb.DeleteRangeRequest{
+		dr := kvpb.DeleteRangeRequest{
 			// Bogus span to make it a valid request.
-			RequestHeader: roachpb.RequestHeader{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    bankSpan.Key,
 				EndKey: bankSpan.EndKey,
 			},

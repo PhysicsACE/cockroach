@@ -25,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -139,17 +141,17 @@ func fetchTableDescriptors(
 	var targetDescs []catalog.TableDescriptor
 
 	fetchSpans := func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
 		targetDescs = make([]catalog.TableDescriptor, 0, targets.NumUniqueTables())
-		if err := txn.SetFixedTimestamp(ctx, ts); err != nil {
+		if err := txn.KV().SetFixedTimestamp(ctx, ts); err != nil {
 			return err
 		}
 		// Note that all targets are currently guaranteed to have a Table ID
 		// and lie within the primary index span. Deduplication is important
 		// here as requesting the same span twice will deadlock.
 		return targets.EachTableID(func(id catid.DescID) error {
-			tableDesc, err := descriptors.ByID(txn).WithoutNonPublic().Get().Table(ctx, id)
+			tableDesc, err := descriptors.ByID(txn.KV()).WithoutNonPublic().Get().Table(ctx, id)
 			if err != nil {
 				return err
 			}
@@ -300,7 +302,7 @@ func startDistChangefeed(
 		)
 		defer recv.Release()
 
-		var finishedSetupFn func()
+		var finishedSetupFn func(flowinfra.Flow)
 		if details.SinkURI != `` {
 			// We abuse the job's results channel to make CREATE CHANGEFEED wait for
 			// this before returning to the user to ensure the setup went okay. Job
@@ -309,7 +311,7 @@ func startDistChangefeed(
 			// meaningful so that if we start doing anything with the results
 			// returned by resumed jobs, then it breaks instead of returning
 			// nonsense.
-			finishedSetupFn = func() { resultsCh <- tree.Datums(nil) }
+			finishedSetupFn = func(flowinfra.Flow) { resultsCh <- tree.Datums(nil) }
 		}
 
 		// Copy the evalCtx, as dsp.Run() might change it.
@@ -439,6 +441,7 @@ func makePlan(
 		p := planCtx.NewPhysicalPlan()
 		p.AddNoInputStage(aggregatorCorePlacement, execinfrapb.PostProcessSpec{}, changefeedResultTypes, execinfrapb.Ordering{})
 		p.AddSingleGroupStage(
+			ctx,
 			dsp.GatewayID(),
 			execinfrapb.ProcessorCoreUnion{ChangeFrontier: &changeFrontierSpec},
 			execinfrapb.PostProcessSpec{},
@@ -446,7 +449,7 @@ func makePlan(
 		)
 
 		p.PlanToStreamColMap = []int{1, 2, 3}
-		dsp.FinalizePlan(planCtx, p)
+		sql.FinalizePlan(ctx, planCtx, p)
 
 		return p, planCtx, nil
 	}

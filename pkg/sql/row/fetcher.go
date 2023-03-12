@@ -17,8 +17,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
@@ -63,23 +65,39 @@ type KVBatchFetcherResponse struct {
 	// fetch has already been completed and this response doesn't have any
 	// fetched data.
 	//
-	// Note that it is possible that MoreKVs is true when neither KVs nor
-	// BatchResponse is set. This can occur when there was nothing to fetch for
-	// a Scan or a ReverseScan request, so the caller should just skip over such
-	// a response.
+	// Note that it is possible that MoreKVs is true when neither KVs,
+	// BatchResponse, nor ColBatch is set. This can occur when there was nothing
+	// to fetch for a Scan or a ReverseScan request, so the caller should just
+	// skip over such a response.
 	MoreKVs bool
-	// Only one of KVs and BatchResponse will be set. Which one is set depends
-	// on the request type (KVs is used for Gets and BatchResponse for Scans and
-	// ReverseScans). Both must be handled by calling code.
+	// Only one of KVs, BatchResponse, and ColBatch will be set. Which one is
+	// set depends on the request type (KVs is used for Gets and BatchResponse /
+	// ColBatch for Scans and ReverseScans). All must be handled by calling
+	// code.
 	//
 	// KVs, if set, is a slice of roachpb.KeyValue, the deserialized kv pairs
 	// that were fetched.
 	KVs []roachpb.KeyValue
-	// BatchResponse, if set, is a packed byte slice containing the keys and
-	// values. An empty BatchResponse indicates that nothing was fetched for the
+	// BatchResponse, if set, is either a packed byte slice containing the keys
+	// and values (for BATCH_RESPONSE scan format) or serialized representation
+	// of a coldata.Batch (for COL_BATCH_RESPONSE scan format). An empty
+	// BatchResponse and nil ColBatch indicate that nothing was fetched for the
 	// corresponding ScanRequest, and the caller is expected to skip over the
 	// response.
 	BatchResponse []byte
+	// ColBatch is used for COL_BATCH_RESPONSE scan format when the request was
+	// evaluated locally. An empty BatchResponse and nil ColBatch indicate that
+	// nothing was fetched for the corresponding ScanRequest, and the caller is
+	// expected to skip over the response.
+	//
+	// Note that this batch will be accounted for by the txnKVFetcher, and the
+	// memory reservation is only released when the fetcher performs another
+	// BatchRequest.
+	//
+	// Note that the datum-backed vectors in this batch are "incomplete" in a
+	// sense they are missing the eval.Context. It is the caller's
+	// responsibility to update all datum-backed vectors with the eval context.
+	ColBatch coldata.Batch
 	// spanID is the ID associated with the span that generated this response.
 	spanID int
 }
@@ -563,7 +581,7 @@ func (rf *Fetcher) StartInconsistentScan(
 		log.Infof(ctx, "starting inconsistent scan at timestamp %v", txnTimestamp)
 	}
 
-	sendFn := func(ctx context.Context, ba *roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
+	sendFn := func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
 		if now := timeutil.Now(); now.Sub(txnTimestamp.GoTime()) >= maxTimestampAge {
 			// Time to bump the transaction. First commit the old one (should be a no-op).
 			if err := txn.Commit(ctx); err != nil {
@@ -646,37 +664,14 @@ func (rf *Fetcher) startScan(ctx context.Context) error {
 	return err
 }
 
-// setNextKV sets the next KV to process to the input KV. needsCopy, if true,
-// causes the input kv to be deep copied. needsCopy should be set to true if
-// the input KV is pointing to the last KV of a batch, so that the batch can
-// be garbage collected before fetching the next one.
-// gcassert:inline
-func (rf *Fetcher) setNextKV(kv roachpb.KeyValue, needsCopy bool) {
-	if !needsCopy {
-		rf.kv = kv
-		return
-	}
-
-	// If we've made it to the very last key in the batch, copy out the key
-	// so that the GC can reclaim the large backing slice before we call
-	// NextKV() again.
-	kvCopy := roachpb.KeyValue{}
-	kvCopy.Key = make(roachpb.Key, len(kv.Key))
-	copy(kvCopy.Key, kv.Key)
-	kvCopy.Value.RawBytes = make([]byte, len(kv.Value.RawBytes))
-	copy(kvCopy.Value.RawBytes, kv.Value.RawBytes)
-	kvCopy.Value.Timestamp = kv.Value.Timestamp
-	rf.kv = kvCopy
-}
-
 // nextKey retrieves the next key/value and sets kv/kvEnd. Returns whether the
 // key indicates a new row (as opposed to another family for the current row).
 func (rf *Fetcher) nextKey(ctx context.Context) (newRow bool, spanID int, _ error) {
-	ok, kv, spanID, needsCopy, err := rf.kvFetcher.nextKV(ctx, rf.mvccDecodeStrategy)
+	ok, kv, spanID, err := rf.kvFetcher.nextKV(ctx, rf.mvccDecodeStrategy)
 	if err != nil {
 		return false, 0, ConvertFetchError(&rf.table.spec, err)
 	}
-	rf.setNextKV(kv, needsCopy)
+	rf.kv = kv
 
 	if !ok {
 		// No more keys in the scan.

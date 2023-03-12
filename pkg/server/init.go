@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -448,7 +448,7 @@ func (s *initServer) startJoinLoop(ctx context.Context, stopper *stop.Stopper) (
 // attemptJoinTo attempts to join to the node running at the given address.
 func (s *initServer) attemptJoinTo(
 	ctx context.Context, addr string,
-) (*roachpb.JoinNodeResponse, error) {
+) (*kvpb.JoinNodeResponse, error) {
 	dialOpts, err := s.config.getDialOpts(ctx, addr, rpc.SystemClass)
 	if err != nil {
 		return nil, err
@@ -463,22 +463,16 @@ func (s *initServer) attemptJoinTo(
 	}()
 
 	binaryVersion := s.config.binaryVersion
-	req := &roachpb.JoinNodeRequest{
+	req := &kvpb.JoinNodeRequest{
 		BinaryVersion: &binaryVersion,
 	}
 
-	initClient := roachpb.NewInternalClient(conn)
+	initClient := kvpb.NewInternalClient(conn)
 	resp, err := initClient.Join(ctx, req)
 	if err != nil {
-		// If the target node does not implement the Join RPC, or explicitly
-		// returns errJoinRPCUnsupported (because the cluster version
-		// introducing its usage is not yet active), we error out so the init
-		// server knows to fall back on the gossip-based discovery mechanism for
-		// the clusterID.
-
 		status, ok := grpcstatus.FromError(errors.UnwrapAll(err))
 		if !ok {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to join cluster")
 		}
 
 		// TODO(irfansharif): Here we're logging the error and also returning
@@ -510,7 +504,7 @@ func (s *initServer) tryBootstrap(ctx context.Context) (*initState, error) {
 
 	// We use our binary version to bootstrap the cluster.
 	cv := clusterversion.ClusterVersion{Version: s.config.binaryVersion}
-	if err := kvserver.WriteClusterVersionToEngines(ctx, s.inspectedDiskState.uninitializedEngines, cv); err != nil {
+	if err := kvstorage.WriteClusterVersionToEngines(ctx, s.inspectedDiskState.uninitializedEngines, cv); err != nil {
 		return nil, err
 	}
 
@@ -528,7 +522,7 @@ func (s *initServer) DiskClusterVersion() clusterversion.ClusterVersion {
 // and persists the appropriate cluster version to disk. After having done so,
 // it returns an initState that captures the newly initialized store.
 func (s *initServer) initializeFirstStoreAfterJoin(
-	ctx context.Context, resp *roachpb.JoinNodeResponse,
+	ctx context.Context, resp *kvpb.JoinNodeResponse,
 ) (*initState, error) {
 	// We expect all the stores to be empty at this point, except for
 	// the store cluster version key. Assert so.
@@ -542,7 +536,7 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 
 	firstEngine := s.inspectedDiskState.uninitializedEngines[0]
 	clusterVersion := clusterversion.ClusterVersion{Version: *resp.ActiveVersion}
-	if err := kvserver.WriteClusterVersion(ctx, firstEngine, clusterVersion); err != nil {
+	if err := kvstorage.WriteClusterVersion(ctx, firstEngine, clusterVersion); err != nil {
 		return nil, err
 	}
 
@@ -550,7 +544,7 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 	if err != nil {
 		return nil, err
 	}
-	if err := kvserver.InitEngine(ctx, firstEngine, sIdent); err != nil {
+	if err := kvstorage.InitEngine(ctx, firstEngine, sIdent); err != nil {
 		return nil, err
 	}
 
@@ -561,7 +555,7 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 }
 
 func assertEnginesEmpty(engines []storage.Engine) error {
-	storeClusterVersionKey := keys.StoreClusterVersionKey()
+	storeClusterVersionKey := keys.DeprecatedStoreClusterVersionKey()
 
 	for _, engine := range engines {
 		err := func() error {
@@ -702,7 +696,7 @@ func inspectEngines(
 
 		initializedEngines = append(initializedEngines, eng)
 	}
-	clusterVersion, err := kvserver.SynthesizeClusterVersionFromEngines(
+	clusterVersion, err := kvstorage.SynthesizeClusterVersionFromEngines(
 		ctx, initializedEngines, binaryVersion, binaryMinSupportedVersion,
 	)
 	if err != nil {

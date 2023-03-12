@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
@@ -57,13 +58,16 @@ var (
 
 	// reference error used when cluster creation fails for a test
 	errClusterProvisioningFailed = fmt.Errorf("cluster could not be created")
+
+	prometheusNameSpace = "roachtest"
+	// prometheusScrapeInterval should be consistent with the scrape interval defined in
+	// https://grafana.testeng.crdb.io/prometheus/config
+	prometheusScrapeInterval = time.Second * 15
 )
 
 // testRunner runs tests.
 type testRunner struct {
 	stopper *stop.Stopper
-	// buildVersion is the version of the Cockroach binary that tests will run against.
-	buildVersion version.Version
 
 	config struct {
 		// skipClusterValidationOnAttach skips validation on existing clusters that
@@ -75,6 +79,10 @@ type testRunner struct {
 		skipClusterWipeOnAttach bool
 		// disableIssue disables posting GitHub issues for test failures.
 		disableIssue bool
+		// overrideShutdownPromScrapeInterval overrides the default time a test runner waits to
+		// shut down, normally used to ensure a remote prometheus server has scraped the roachtest
+		// endpoint.
+		overrideShutdownPromScrapeInterval time.Duration
 	}
 
 	status struct {
@@ -113,19 +121,21 @@ type testRunner struct {
 //
 //	caller provides this as the caller needs to be able to shut clusters down
 //	on Ctrl+C.
-//
-// buildVersion: The version of the Cockroach binary against which tests will run.
-func newTestRunner(
-	cr *clusterRegistry, stopper *stop.Stopper, buildVersion version.Version,
-) *testRunner {
+func newTestRunner(cr *clusterRegistry, stopper *stop.Stopper) *testRunner {
 	r := &testRunner{
-		stopper:      stopper,
-		cr:           cr,
-		buildVersion: buildVersion,
+		stopper: stopper,
+		cr:      cr,
 	}
 	r.config.skipClusterWipeOnAttach = !clusterWipe
 	r.config.disableIssue = disableIssue
 	r.workersMu.workers = make(map[string]*workerStatus)
+	return r
+}
+
+func newUnitTestRunner(cr *clusterRegistry, stopper *stop.Stopper) *testRunner {
+	r := newTestRunner(cr, stopper)
+	// To speed up unit tests, reduce test runner shutdown time.
+	r.config.overrideShutdownPromScrapeInterval = time.Millisecond
 	return r
 }
 
@@ -322,6 +332,7 @@ func (r *testRunner) Run(
 
 	// Wait for all the workers to finish.
 	wg.Wait()
+	shutdownStart := timeutil.Now()
 	r.cr.destroyAllClusters(ctx, l)
 
 	if errs.Err() != nil {
@@ -338,6 +349,18 @@ func (r *testRunner) Run(
 
 	if len(r.status.fail) > 0 {
 		return errTestsFailed
+	}
+	// To ensure all prometheus metrics have been scraped, ensure shutdown takes
+	// at least one scrapeInterval, unless the roachtest fails or gets cancelled.
+	requiredShutDownTime := prometheusScrapeInterval
+	if r.config.overrideShutdownPromScrapeInterval > 0 {
+		requiredShutDownTime = r.config.overrideShutdownPromScrapeInterval
+	}
+	if shutdownSleep := requiredShutDownTime - timeutil.Since(shutdownStart); shutdownSleep > 0 {
+		select {
+		case <-r.stopper.ShouldQuiesce():
+		case <-time.After(shutdownSleep):
+		}
 	}
 	return nil
 }
@@ -622,12 +645,16 @@ func (r *testRunner) runWorker(
 		if err != nil {
 			return err
 		}
+		binaryVersion, err := version.Parse(build.BinaryVersion())
+		if err != nil {
+			return err
+		}
 		t := &testImpl{
 			spec:                   &testToRun.spec,
 			cockroach:              cockroach,
 			cockroachShort:         cockroachShort,
 			deprecatedWorkload:     workload,
-			buildVersion:           r.buildVersion,
+			buildVersion:           binaryVersion,
 			artifactsDir:           artifactsDir,
 			artifactsSpec:          artifactsSpec,
 			l:                      testL,
@@ -638,7 +665,7 @@ func (r *testRunner) runWorker(
 		// Now run the test.
 		l.PrintfCtx(ctx, "starting test: %s:%d", testToRun.spec.Name, testToRun.runNum)
 
-		github := newGithubIssues(r.config.disableIssue, c, vmCreateOpts, l)
+		github := newGithubIssues(r.config.disableIssue, c, vmCreateOpts)
 
 		if clusterCreateErr != nil {
 			// N.B. cluster creation must have failed...
@@ -648,12 +675,17 @@ func (r *testRunner) runWorker(
 			// Generate failure reason and mark the test failed to preclude fetching (cluster) artifacts.
 			t.Error(clusterCreateErr)
 			// N.B. issue title is of the form "roachtest: ${t.spec.Name} failed" (see UnitTestFormatter).
-			if err := github.MaybePost(t, t.failureMsg()); err != nil {
+			if err := github.MaybePost(t, l, t.failureMsg()); err != nil {
 				shout(ctx, l, stdout, "failed to post issue: %s", err)
 			}
 		} else {
 			c.setTest(t)
-			err = c.PutLibraries(ctx, "./lib", t.spec.NativeLibs)
+			if c.spec.NodeCount > 0 { // skip during tests
+				err = c.PutDefaultCockroach(ctx, l, t.Cockroach())
+			}
+			if err == nil {
+				err = c.PutLibraries(ctx, "./lib", t.spec.NativeLibs)
+			}
 
 			if err == nil {
 				// Tell the cluster that, from now on, it will be run "on behalf of this
@@ -841,7 +873,7 @@ func (r *testRunner) runTest(
 
 			shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", runID, durationStr, output)
 
-			if err := github.MaybePost(t, output); err != nil {
+			if err := github.MaybePost(t, l, output); err != nil {
 				shout(ctx, l, stdout, "failed to post issue: %s", err)
 			}
 		} else {
@@ -953,10 +985,9 @@ func (r *testRunner) runTest(
 		}
 		t.L().Printf("tearing down after %s; see teardown.log", s)
 	case <-time.After(timeout):
-		// NB: we're intentionally not failing the test if it hasn't
-		// already. This will be done at the very end of this method,
-		// after we've collected artifacts.
-		t.L().Printf("test timed out after %s; check __stacks.log and CRDB logs for goroutine dumps", timeout)
+		// NB: We're adding the timeout failure intentionally without cancelling the context
+		// to capture as much state as possible during artifact collection.
+		t.addFailure(0, "test timed out (%s)", timeout)
 		timedOut = true
 	}
 
@@ -1038,9 +1069,6 @@ func (r *testRunner) teardownTest(
 		// monitor).
 		c.assertNoDeadNode(ctx, t)
 
-		// Detect replica divergence (i.e. ranges in which replicas have arrived
-		// at the same log position with different states).
-		//
 		// We avoid trying to do this when t.Failed() (and in particular when there
 		// are dead nodes) because for reasons @tbg does not understand this gets
 		// stuck occasionally, which really ruins the roachtest run. The method
@@ -1049,7 +1077,17 @@ func (r *testRunner) teardownTest(
 		//
 		// TODO(testinfra): figure out why this can still get stuck despite the
 		// above.
-		c.FailOnReplicaDivergence(ctx, t)
+		db, node := c.ConnectToLiveNode(ctx, t)
+		if db != nil {
+			defer db.Close()
+			t.L().Printf("running validation checks on node %d (<10m)", node)
+			c.FailOnInvalidDescriptors(ctx, db, t)
+			// Detect replica divergence (i.e. ranges in which replicas have arrived
+			// at the same log position with different states).
+			c.FailOnReplicaDivergence(ctx, db, t)
+		} else {
+			t.L().Printf("no live node found, skipping validation checks")
+		}
 
 		if timedOut || t.Failed() {
 			r.collectClusterArtifacts(ctx, c, t.L())
@@ -1073,10 +1111,11 @@ func (r *testRunner) teardownTest(
 		// around so someone can poke at it.
 		_ = c.StopE(ctx, t.L(), option.DefaultStopOpts(), c.All())
 
-		// The hung test may, against all odds, still not have reported an error.
-		// We delayed it to improve artifacts collection, and now we ensure the test
-		// is marked as failing.
-		t.Errorf("test timed out (%s)", t.Spec().(*registry.TestSpec).Timeout)
+		// We previously added a timeout failure without cancellation, so we cancel here.
+		if t.mu.cancel != nil {
+			t.mu.cancel()
+		}
+		t.L().Printf("test timed out; check __stacks.log and CRDB logs for goroutine dumps")
 	}
 	return nil
 }
@@ -1089,9 +1128,7 @@ func (r *testRunner) collectClusterArtifacts(
 	// We only save artifacts for failed tests in CI, so this
 	// duplication is acceptable.
 	// NB: fetch the logs *first* in case one of the other steps
-	// below has problems. For example, `debug zip` is known to
-	// hang sometimes at the time of writing, see:
-	// https://github.com/cockroachdb/cockroach/issues/39620
+	// below has problems.
 	l.PrintfCtx(ctx, "collecting cluster logs")
 	// Do this before collecting logs to make sure the file gets
 	// downloaded below.

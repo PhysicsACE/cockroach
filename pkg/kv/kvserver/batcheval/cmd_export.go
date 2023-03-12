@@ -11,11 +11,14 @@
 package batcheval
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -62,13 +65,13 @@ var ExportRequestMaxAllowedFileSizeOverage = settings.RegisterByteSizeSetting(
 ).WithPublic()
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.Export, declareKeysExport, evalExport)
+	RegisterReadOnlyCommand(kvpb.Export, declareKeysExport, evalExport)
 }
 
 func declareKeysExport(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
-	req roachpb.Request,
+	header *kvpb.Header,
+	req kvpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 	maxOffset time.Duration,
 ) {
@@ -84,11 +87,11 @@ func declareKeysExport(
 // evalExport dumps the requested keys into files of non-overlapping key ranges
 // in a format suitable for bulk ingest.
 func evalExport(
-	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.ExportRequest)
+	args := cArgs.Args.(*kvpb.ExportRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.ExportResponse)
+	reply := resp.(*kvpb.ExportResponse)
 
 	ctx, evalExportSpan := tracing.ChildSpan(ctx, "evalExport")
 	defer evalExportSpan.Finish()
@@ -116,7 +119,7 @@ func evalExport(
 	// NOTE: Since export requests may not be holding latches during evaluation,
 	// this `GetGCThreshold()` call is going to potentially return a higher GC
 	// threshold than the pebble state we're evaluating over. This is copacetic.
-	if args.MVCCFilter == roachpb.MVCCFilter_All {
+	if args.MVCCFilter == kvpb.MVCCFilter_All {
 		reply.StartTime = args.StartTime
 		if args.StartTime.IsEmpty() {
 			reply.StartTime = cArgs.EvalCtx.GetGCThreshold()
@@ -125,9 +128,9 @@ func evalExport(
 
 	var exportAllRevisions bool
 	switch args.MVCCFilter {
-	case roachpb.MVCCFilter_Latest:
+	case kvpb.MVCCFilter_Latest:
 		exportAllRevisions = false
-	case roachpb.MVCCFilter_All:
+	case kvpb.MVCCFilter_All:
 		exportAllRevisions = true
 	default:
 		return result.Result{}, errors.Errorf("unknown MVCC filter: %s", args.MVCCFilter)
@@ -160,9 +163,17 @@ func evalExport(
 		resumeKeyTS = args.ResumeKeyTS
 	}
 
+	maybeAnnotateExceedMaxSizeError := func(err error) error {
+		if errors.HasType(err, (*storage.ExceedMaxSizeError)(nil)) {
+			return errors.WithHintf(err,
+				"consider increasing cluster setting %q", MaxExportOverageSetting)
+		}
+		return err
+	}
+
 	var curSizeOfExportedSSTs int64
 	for start := args.Key; start != nil; {
-		destFile := &storage.MemFile{}
+		var destFile bytes.Buffer
 		opts := storage.MVCCExportOptions{
 			StartKey:           storage.MVCCKey{Key: start, Timestamp: resumeKeyTS},
 			EndKey:             args.EndKey,
@@ -174,8 +185,8 @@ func evalExport(
 			MaxIntents:         maxIntents,
 			StopMidKey:         args.SplitMidKey,
 		}
-		var summary roachpb.BulkOpSummary
-		var resume storage.MVCCKey
+		var summary kvpb.BulkOpSummary
+		var resumeInfo storage.ExportRequestResumeInfo
 		var fingerprint uint64
 		var err error
 		if args.ExportFingerprint {
@@ -186,18 +197,28 @@ func evalExport(
 				StripTenantPrefix:  true,
 				StripValueChecksum: true,
 			}
-			summary, resume, fingerprint, err = storage.MVCCExportFingerprint(ctx, cArgs.EvalCtx.ClusterSettings(), reader, opts, destFile)
-		} else {
-			summary, resume, err = storage.MVCCExportToSST(ctx, cArgs.EvalCtx.ClusterSettings(), reader, opts, destFile)
-		}
-		if err != nil {
-			if errors.HasType(err, (*storage.ExceedMaxSizeError)(nil)) {
-				err = errors.WithHintf(err,
-					"consider increasing cluster setting %q", MaxExportOverageSetting)
+			var hasRangeKeys bool
+			summary, resumeInfo, fingerprint, hasRangeKeys, err = storage.MVCCExportFingerprint(ctx,
+				cArgs.EvalCtx.ClusterSettings(), reader, opts, &destFile)
+			if err != nil {
+				return result.Result{}, maybeAnnotateExceedMaxSizeError(err)
 			}
-			return result.Result{}, err
+
+			// If no range keys were encountered during fingerprinting then we zero
+			// out the underlying SST file as there is no use in sending an empty file
+			// part of the ExportResponse. This frees up the memory used by the empty
+			// SST file.
+			if !hasRangeKeys {
+				destFile = bytes.Buffer{}
+			}
+		} else {
+			summary, resumeInfo, err = storage.MVCCExportToSST(ctx, cArgs.EvalCtx.ClusterSettings(), reader,
+				opts, &destFile)
+			if err != nil {
+				return result.Result{}, maybeAnnotateExceedMaxSizeError(err)
+			}
 		}
-		data := destFile.Data()
+		data := destFile.Bytes()
 
 		// NB: This should only happen in two cases:
 		//
@@ -207,31 +228,95 @@ func evalExport(
 		//    early exit and thus have a resume key despite
 		//    not having data.
 		if summary.DataSize == 0 {
-			if resume.Key != nil {
-				start = resume.Key
-				resumeKeyTS = resume.Timestamp
-				continue
-			} else {
-				break
+			hasResumeKey := resumeInfo.ResumeKey.Key != nil
+
+			// If we have a resumeKey, it means that we must have hit a resource
+			// constraint before exporting any data.
+			if hasResumeKey {
+				// If we hit our CPU limit we must return the response to the client
+				// instead of retrying immediately. This will give the scheduler a
+				// chance to move the goroutine off CPU allowing other processes to make
+				// progress. The client is responsible for handling pagination of
+				// ExportRequests.
+				if resumeInfo.CPUOverlimit && h.ReturnElasticCPUResumeSpans {
+					// Note, since we have not exported any data we do not populate the
+					// `Files` field of the ExportResponse.
+					reply.ResumeSpan = &roachpb.Span{
+						Key:    resumeInfo.ResumeKey.Key,
+						EndKey: args.EndKey,
+					}
+					reply.ResumeReason = kvpb.RESUME_ELASTIC_CPU_LIMIT
+					break
+				} else {
+					if !resumeInfo.CPUOverlimit {
+						// We should never come here. There should be no condition aside from
+						// resource constraints that results in an early exit without
+						// exporting any data. Regardless, if we have a resumeKey we
+						// immediately retry the ExportRequest from that key and timestamp
+						// onwards.
+						if !build.IsRelease() {
+							return result.Result{}, errors.AssertionFailedf("ExportRequest exited without " +
+								"exporting any data for an unknown reason; programming error")
+						} else {
+							log.Warningf(ctx, "unexpected resume span from ExportRequest without exporting any data for an unknown reason: %v", resumeInfo)
+						}
+					}
+					start = resumeInfo.ResumeKey.Key
+					resumeKeyTS = resumeInfo.ResumeKey.Timestamp
+					continue
+				}
 			}
+			// If we do not have a resumeKey it indicates that there is no data to be
+			// exported in this span.
+			break
 		}
 
 		span := roachpb.Span{Key: start}
-		if resume.Key != nil {
-			span.EndKey = resume.Key
+		if resumeInfo.ResumeKey.Key != nil {
+			span.EndKey = resumeInfo.ResumeKey.Key
 		} else {
 			span.EndKey = args.EndKey
 		}
-		exported := roachpb.ExportResponse_File{
-			Span:        span,
-			EndKeyTS:    resume.Timestamp,
-			Exported:    summary,
-			SST:         data,
-			Fingerprint: fingerprint,
+
+		var exported kvpb.ExportResponse_File
+		if args.ExportFingerprint {
+			// A fingerprinting ExportRequest does not need to return the
+			// BulkOpSummary or the exported Span. This is because we do not expect
+			// the sender of a fingerprint ExportRequest to use anything but the
+			// `Fingerprint` for point-keys and the SST file that contains the
+			// rangekeys we encountered during ExportRequest evaluation.
+			exported = kvpb.ExportResponse_File{
+				EndKeyTS:    resumeInfo.ResumeKey.Timestamp,
+				SST:         data,
+				Fingerprint: fingerprint,
+			}
+		} else {
+			exported = kvpb.ExportResponse_File{
+				Span:     span,
+				EndKeyTS: resumeInfo.ResumeKey.Timestamp,
+				Exported: summary,
+				SST:      data,
+			}
 		}
 		reply.Files = append(reply.Files, exported)
-		start = resume.Key
-		resumeKeyTS = resume.Timestamp
+		start = resumeInfo.ResumeKey.Key
+		resumeKeyTS = resumeInfo.ResumeKey.Timestamp
+
+		// If we paginated because we are over our allotted CPU limit, we must break
+		// from command evaluation and return a response to the client before
+		// resuming our export from the resume key. This gives the scheduler a
+		// chance to take the current goroutine off CPU and allow other processes to
+		// progress.
+		if resumeInfo.CPUOverlimit && h.ReturnElasticCPUResumeSpans {
+			if resumeInfo.ResumeKey.Key != nil {
+				reply.ResumeSpan = &roachpb.Span{
+					Key:    resumeInfo.ResumeKey.Key,
+					EndKey: args.EndKey,
+				}
+				reply.ResumeReason = kvpb.RESUME_ELASTIC_CPU_LIMIT
+			}
+			break
+		}
 
 		if h.TargetBytes > 0 {
 			curSizeOfExportedSSTs += summary.DataSize
@@ -262,12 +347,12 @@ func evalExport(
 			// the next SST. In the worst case this could lead to us exceeding our
 			// TargetBytes by SST target size + overage.
 			if reply.NumBytes == h.TargetBytes {
-				if resume.Key != nil {
+				if resumeInfo.ResumeKey.Key != nil {
 					reply.ResumeSpan = &roachpb.Span{
-						Key:    resume.Key,
+						Key:    resumeInfo.ResumeKey.Key,
 						EndKey: args.EndKey,
 					}
-					reply.ResumeReason = roachpb.RESUME_BYTE_LIMIT
+					reply.ResumeReason = kvpb.RESUME_BYTE_LIMIT
 				}
 				break
 			}

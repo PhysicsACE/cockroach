@@ -20,6 +20,8 @@ import {
 import {
   selectAppName,
   selectRecentTransactions,
+  selectExecutionStatus,
+  selectClusterLocksMaxApiSizeReached,
 } from "src/selectors/recentExecutions.selectors";
 import { actions as localStorageActions } from "src/store/localStorage";
 import { actions as sessionsActions } from "src/store/sessions";
@@ -50,12 +52,14 @@ export const mapStateToRecentTransactionsPageProps = (
   state: AppState,
 ): RecentTransactionsViewStateProps => ({
   transactions: selectRecentTransactions(state),
-  sessionsError: state.adminUI.sessions.lastError,
+  sessionsError: state.adminUI?.sessions.lastError,
   selectedColumns: selectColumns(state),
   sortSetting: selectSortSetting(state),
   filters: selectFilters(state),
+  executionStatus: selectExecutionStatus(),
   internalAppNamePrefix: selectAppName(state),
   isTenant: selectIsTenant(state),
+  maxSizeApiReached: selectClusterLocksMaxApiSizeReached(state),
 });
 
 export const mapDispatchToRecentTransactionsPageProps = (

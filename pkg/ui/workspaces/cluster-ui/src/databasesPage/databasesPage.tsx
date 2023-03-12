@@ -17,7 +17,7 @@ import classnames from "classnames/bind";
 
 import { Anchor } from "src/anchor";
 import { StackIcon } from "src/icon/stackIcon";
-import { Pagination, ResultsPerPageLabel } from "src/pagination";
+import { Pagination } from "src/pagination";
 import { BooleanSetting } from "src/settings/booleanSetting";
 import { PageConfig, PageConfigItem } from "src/pageConfig";
 import {
@@ -28,13 +28,11 @@ import {
   SortSetting,
 } from "src/sortedtable";
 import * as format from "src/util/format";
+import { EncodeDatabaseUri } from "src/util/format";
 
 import styles from "./databasesPage.module.scss";
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
-import {
-  baseHeadingClasses,
-  statisticsClasses,
-} from "src/transactionsPage/transactionsPageClasses";
+import { baseHeadingClasses } from "src/transactionsPage/transactionsPageClasses";
 import { syncHistory, tableStatsClusterSetting, unique } from "src/util";
 import booleanSettingStyles from "../settings/booleanSetting.module.scss";
 import { CircleFilled } from "../icon";
@@ -43,9 +41,9 @@ import { Loading } from "../loading";
 import { Search } from "../search";
 import {
   calculateActiveFilters,
+  defaultFilters,
   Filter,
   Filters,
-  defaultFilters,
   handleFiltersFromQueryString,
 } from "../queryFilter";
 import { merge } from "lodash";
@@ -180,6 +178,9 @@ function filterBySearchQuery(
     .every(val => matchString.includes(val));
 }
 
+const tablePageSize = 20;
+const disableTableSortSize = tablePageSize * 2;
+
 export class DatabasesPage extends React.Component<
   DatabasesPageProps,
   DatabasesPageState
@@ -191,7 +192,7 @@ export class DatabasesPage extends React.Component<
       filters: defaultFilters,
       pagination: {
         current: 1,
-        pageSize: 20,
+        pageSize: tablePageSize,
       },
       lastDetailsError: null,
     };
@@ -295,22 +296,51 @@ export class DatabasesPage extends React.Component<
     }
 
     let lastDetailsError: Error;
-    this.props.databases.forEach(database => {
+
+    // load everything by default
+    let filteredDbs = this.props.databases;
+
+    // Loading only the first page if there are more than
+    // 40 dbs. If there is more than 40 dbs sort will be disabled.
+    if (this.props.databases.length > disableTableSortSize) {
+      const startIndex =
+        this.state.pagination.pageSize * (this.state.pagination.current - 1);
+      // Result maybe filtered so get db names from filtered results
+      if (this.props.search && this.props.search.length > 0) {
+        filteredDbs = this.filteredDatabasesData();
+      }
+
+      if (!filteredDbs || filteredDbs.length === 0) {
+        return;
+      }
+
+      // Only load the first page
+      filteredDbs = filteredDbs.slice(
+        startIndex,
+        startIndex + this.state.pagination.pageSize,
+      );
+    }
+
+    filteredDbs.forEach(database => {
       if (database.lastError !== undefined) {
         lastDetailsError = database.lastError;
       }
+
       if (
         lastDetailsError &&
         this.state.lastDetailsError?.name != lastDetailsError?.name
       ) {
         this.setState({ lastDetailsError: lastDetailsError });
       }
+
       if (
         !database.loaded &&
         !database.loading &&
-        database.lastError === undefined
+        (database.lastError === undefined ||
+          database.lastError?.name === "GetDatabaseInfoError")
       ) {
-        return this.props.refreshDatabaseDetails(database.name);
+        this.props.refreshDatabaseDetails(database.name);
+        return;
       }
 
       database.missingTables.forEach(table => {
@@ -480,7 +510,10 @@ export class DatabasesPage extends React.Component<
     database: DatabasesPageDataDatabase,
     cell: React.ReactNode,
   ): React.ReactNode => {
-    if (database.lastError) {
+    if (
+      database.lastError &&
+      database.lastError.name !== "GetDatabaseInfoError"
+    ) {
       return "(unavailable)";
     }
     return cell;
@@ -495,7 +528,7 @@ export class DatabasesPage extends React.Component<
       ),
       cell: database => (
         <Link
-          to={`/database/${database.name}`}
+          to={EncodeDatabaseUri(database.name)}
           className={cx("icon__container")}
         >
           <StackIcon className={cx("icon--s", "icon--primary")} />
@@ -603,6 +636,27 @@ export class DatabasesPage extends React.Component<
 
     const regions = unique(Object.values(nodeRegions));
     const showNodes = !isTenant && nodes.length > 1;
+    const showRegions = regions.length > 1;
+
+    // Only show the databases filter if at least one drop-down is shown.
+    const databasesFilter =
+      showNodes || showRegions ? (
+        <PageConfigItem>
+          <Filter
+            hideAppNames={true}
+            regions={regions}
+            hideTimeLabel={true}
+            nodes={nodes.map(n => "n" + n.toString())}
+            activeFilters={activeFilters}
+            filters={defaultFilters}
+            onSubmitFilters={this.onSubmitFilters}
+            showNodes={showNodes}
+            showRegions={showRegions}
+          />
+        </PageConfigItem>
+      ) : (
+        <></>
+      );
 
     return (
       <div>
@@ -640,19 +694,7 @@ export class DatabasesPage extends React.Component<
                 placeholder={"Search Databases"}
               />
             </PageConfigItem>
-            <PageConfigItem>
-              <Filter
-                hideAppNames={true}
-                regions={regions}
-                hideTimeLabel={true}
-                nodes={nodes.map(n => "n" + n.toString())}
-                activeFilters={activeFilters}
-                filters={defaultFilters}
-                onSubmitFilters={this.onSubmitFilters}
-                showNodes={showNodes}
-                showRegions={regions.length > 1}
-              />
-            </PageConfigItem>
+            {databasesFilter}
           </PageConfig>
           <TableStatistics
             pagination={pagination}
@@ -674,6 +716,7 @@ export class DatabasesPage extends React.Component<
                 onChangeSortSetting={this.changeSortSetting}
                 pagination={this.state.pagination}
                 loading={this.props.loading}
+                disableSortSizeLimit={disableTableSortSize}
                 renderNoResult={
                   <div
                     className={cx(
@@ -708,6 +751,7 @@ export class DatabasesPage extends React.Component<
                   timeout: this.state.lastDetailsError?.name
                     ?.toLowerCase()
                     .includes("timeout"),
+                  error: this.state.lastDetailsError,
                 })
               }
             />

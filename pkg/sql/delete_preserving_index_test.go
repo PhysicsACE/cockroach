@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/rowencpb"
@@ -45,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -128,10 +130,21 @@ func TestDeletePreservingIndexEncoding(t *testing.T) {
 		prefix := rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, tableDesc.GetID(), index.ID)
 		prefixEnd := append(prefix, []byte("\xff")...)
 
-		revisions, err := kvclient.GetAllRevisions(context.Background(), kvDB, prefix, prefixEnd, now, end)
-		if err != nil {
-			return nil, nil, err
-		}
+		revisionsCh := make(chan []kvclient.VersionedValues)
+		g := ctxgroup.WithContext(ctx)
+		g.GoCtx(func(ctx context.Context) error {
+			defer close(revisionsCh)
+			return kvclient.GetAllRevisions(context.Background(), kvDB, prefix, prefixEnd, now, end, revisionsCh)
+		})
+
+		var revisions []kvclient.VersionedValues
+		g.GoCtx(func(ctx context.Context) error {
+			for r := range revisionsCh {
+				revisions = append(revisions, r...)
+			}
+			return nil
+		})
+		require.NoError(t, g.Wait())
 
 		completeSchemaChange <- struct{}{}
 		finishedSchemaChange.Wait()
@@ -279,7 +292,7 @@ CREATE UNIQUE INDEX test_index_to_mutate ON t.test (b);
 	_, err = sqlDB.Exec(`DELETE FROM t.test WHERE a = 2`)
 	require.NoError(t, err)
 
-	idx, err := tableDesc.FindIndexWithName("test_index_to_mutate")
+	idx, err := catalog.MustFindIndexByName(tableDesc, "test_index_to_mutate")
 	require.NoError(t, err)
 
 	span := tableDesc.IndexSpan(codec, idx.GetID())
@@ -344,7 +357,7 @@ func mutateIndexByName(
 	fn func(*descpb.IndexDescriptor) error,
 	state descpb.DescriptorMutation_State,
 ) error {
-	idx, err := tableDesc.FindIndexWithName(index)
+	idx, err := catalog.MustFindIndexByName(tableDesc, index)
 	if err != nil {
 		return err
 	}
@@ -618,7 +631,7 @@ func TestMergeProcessor(t *testing.T) {
 		mm := mon.NewUnlimitedMonitor(ctx, "MemoryMonitor", mon.MemoryResource, nil, nil, math.MaxInt64, settings)
 		flowCtx := execinfra.FlowCtx{
 			Cfg: &execinfra.ServerConfig{
-				DB:                kvDB,
+				DB:                execCfg.InternalDB,
 				Settings:          settings,
 				Codec:             codec,
 				BackfillerMonitor: mm,
@@ -665,25 +678,25 @@ func TestMergeProcessor(t *testing.T) {
 
 		tableDesc = desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, codec, "d", "t")
 
-		dstIndex, err := tableDesc.FindIndexWithName(test.dstIndex)
+		dstIndex, err := catalog.MustFindIndexByName(tableDesc, test.dstIndex)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		srcIndex, err := tableDesc.FindIndexWithName(test.srcIndex)
+		srcIndex, err := catalog.MustFindIndexByName(tableDesc, test.srcIndex)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
-			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error {
-			mut, err := descriptors.MutableByID(txn).Table(ctx, tableDesc.GetID())
+			ctx context.Context, txn isql.Txn, descriptors *descs.Collection) error {
+			mut, err := descriptors.MutableByID(txn.KV()).Table(ctx, tableDesc.GetID())
 			if err != nil {
 				return err
 			}
 
 			require.Equal(t, test.dstContentsBeforeMerge,
-				datumSliceToStrMatrix(fetchIndex(ctx, t, txn, mut, test.dstIndex)))
+				datumSliceToStrMatrix(fetchIndex(ctx, t, txn.KV(), mut, test.dstIndex)))
 
 			return nil
 		}))
@@ -709,14 +722,14 @@ func TestMergeProcessor(t *testing.T) {
 		}
 
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
-			ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error {
-			mut, err := descriptors.MutableByID(txn).Table(ctx, tableDesc.GetID())
+			ctx context.Context, txn isql.Txn, descriptors *descs.Collection) error {
+			mut, err := descriptors.MutableByID(txn.KV()).Table(ctx, tableDesc.GetID())
 			if err != nil {
 				return err
 			}
 
 			require.Equal(t, test.dstContentsAfterMerge,
-				datumSliceToStrMatrix(fetchIndex(ctx, t, txn, mut, test.dstIndex)))
+				datumSliceToStrMatrix(fetchIndex(ctx, t, txn.KV(), mut, test.dstIndex)))
 			return nil
 		}))
 	}
@@ -739,7 +752,7 @@ func fetchIndex(
 	var alloc tree.DatumAlloc
 
 	mm := mon.NewStandaloneBudget(1 << 30)
-	idx, err := table.FindIndexWithName(indexName)
+	idx, err := catalog.MustFindIndexByName(table, indexName)
 	require.NoError(t, err)
 	colIdxMap := catalog.ColumnIDToOrdinalMap(table.PublicColumns())
 	var valsNeeded intsets.Fast

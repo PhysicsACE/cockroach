@@ -28,11 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -175,7 +177,7 @@ func startReplication(
 	conn, err := pgx.ConnectConfig(queryCtx, pgxConfig)
 	require.NoError(t, err)
 
-	rows, err := conn.Query(queryCtx, `SET enable_experimental_stream_replication = true`)
+	rows, err := conn.Query(queryCtx, `SET CLUSTER SETTING cross_cluster_replication.enabled = true;`)
 	require.NoError(t, err)
 	rows.Close()
 
@@ -363,8 +365,8 @@ USE d;
 		// Send a ClearRange to trigger rows cursor to return internal error from rangefeed.
 		// Choose 't2' so that it doesn't trigger error on other registered span in rangefeeds,
 		// affecting other tests.
-		_, err := kv.SendWrapped(ctx, h.SysServer.DB().NonTransactionalSender(), &roachpb.ClearRangeRequest{
-			RequestHeader: roachpb.RequestHeader{
+		_, err := kv.SendWrapped(ctx, h.SysServer.DB().NonTransactionalSender(), &kvpb.ClearRangeRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    subscribedSpan.Key,
 				EndKey: subscribedSpan.EndKey,
 			},
@@ -610,9 +612,9 @@ func TestCompleteStreamReplication(t *testing.T) {
 		pj, err := jr.LoadJob(ctx, jobspb.JobID(streamID))
 		require.NoError(t, err)
 		payload := pj.Payload()
-		require.ErrorIs(t, h.SysServer.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			ptp := h.SysServer.DistSQLServer().(*distsql.ServerImpl).ServerConfig.ProtectedTimestampProvider
-			_, err = ptp.GetRecord(ctx, txn, payload.GetStreamReplication().ProtectedTimestampRecordID)
+		ptp := h.SysServer.DistSQLServer().(*distsql.ServerImpl).ServerConfig.ProtectedTimestampProvider
+		require.ErrorIs(t, h.SysServer.InternalDB().(isql.DB).Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			_, err = ptp.WithTxn(txn).GetRecord(ctx, payload.GetStreamReplication().ProtectedTimestampRecordID)
 			return err
 		}), protectedts.ErrNotExists)
 	}
@@ -630,7 +632,7 @@ func TestCompleteStreamReplication(t *testing.T) {
 	}
 }
 
-func sortDelRanges(receivedDelRanges []roachpb.RangeFeedDeleteRange) {
+func sortDelRanges(receivedDelRanges []kvpb.RangeFeedDeleteRange) {
 	sort.Slice(receivedDelRanges, func(i, j int) bool {
 		if !receivedDelRanges[i].Timestamp.Equal(receivedDelRanges[j].Timestamp) {
 			return receivedDelRanges[i].Timestamp.Compare(receivedDelRanges[j].Timestamp) < 0
@@ -698,7 +700,7 @@ USE d;
 	expectedDelRangeSpan3 := roachpb.Span{Key: t2Span.Key, EndKey: t2Span.Key.Next()}
 
 	codec := source.mu.codec.(*partitionStreamDecoder)
-	receivedDelRanges := make([]roachpb.RangeFeedDeleteRange, 0, 3)
+	receivedDelRanges := make([]kvpb.RangeFeedDeleteRange, 0, 3)
 	for {
 		source.mu.Lock()
 		require.True(t, source.mu.rows.Next())
@@ -732,8 +734,8 @@ USE d;
 		// Delete range for t3s - t3e, emitting nothing.
 		storageutils.RangeKV(string(t3Span.Key), string(t3Span.EndKey), ts, ""),
 	})
-	expectedDelRange1 := roachpb.RangeFeedDeleteRange{Span: t1Span, Timestamp: batchHLCTime}
-	expectedDelRange2 := roachpb.RangeFeedDeleteRange{Span: t2Span, Timestamp: batchHLCTime}
+	expectedDelRange1 := kvpb.RangeFeedDeleteRange{Span: t1Span, Timestamp: batchHLCTime}
+	expectedDelRange2 := kvpb.RangeFeedDeleteRange{Span: t2Span, Timestamp: batchHLCTime}
 	require.Equal(t, t1Span.Key, start)
 	require.Equal(t, t3Span.EndKey, end)
 

@@ -363,8 +363,11 @@ func (opc *optPlanningCtx) reset(ctx context.Context) {
 		// descriptor versions are bumped at most once per transaction, even if there
 		// are multiple DDL operations; and transactions can be aborted leading to
 		// potential reuse of versions. To avoid these issues, we prevent saving a
-		// memo (for prepare) or reusing a saved memo (for execute).
-		opc.allowMemoReuse = !p.Descriptors().HasUncommittedTables()
+		// memo (for prepare) or reusing a saved memo (for execute). If
+		// RemoteRegions is set in the eval context we're building a memo for the
+		// purposes of generating the proper error message, and memo reuse or
+		// caching should not be done.
+		opc.allowMemoReuse = !p.Descriptors().HasUncommittedTables() && len(p.EvalContext().RemoteRegions) == 0
 		opc.useCache = opc.allowMemoReuse && queryCacheEnabled.Get(&p.execCfg.Settings.SV)
 
 		if _, isCanned := p.stmt.AST.(*tree.CannedOptPlan); isCanned {
@@ -760,7 +763,7 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (er
 	// Walk through the fully normalized memo to determine index candidates and
 	// create hypothetical tables.
 	indexCandidates := indexrec.FindIndexCandidateSet(f.Memo().RootExpr(), f.Metadata())
-	optTables, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
+	optTables, hypTables := indexrec.BuildOptAndHypTableMaps(opc.catalog, indexCandidates)
 
 	// Optimize with the saved memo and hypothetical tables. Walk through the
 	// optimal plan to determine index recommendations.
@@ -775,7 +778,10 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (er
 		return err
 	}
 
-	opc.p.instrumentation.indexRecs = indexrec.FindRecs(f.Memo().RootExpr(), f.Metadata())
+	opc.p.instrumentation.indexRecs, err = indexrec.FindRecs(ctx, f.Memo().RootExpr(), f.Metadata())
+	if err != nil {
+		return err
+	}
 
 	// Re-initialize the optimizer (which also re-initializes the factory) and
 	// update the saved memo's metadata with the original table information.

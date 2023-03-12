@@ -28,18 +28,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsauth"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
@@ -53,10 +57,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
+	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -124,6 +129,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalClusterContentionEventsTableID:     crdbInternalClusterContentionEventsTable,
 		catconstants.CrdbInternalClusterDistSQLFlowsTableID:         crdbInternalClusterDistSQLFlowsTable,
 		catconstants.CrdbInternalClusterExecutionInsightsTableID:    crdbInternalClusterExecutionInsightsTable,
+		catconstants.CrdbInternalClusterTxnExecutionInsightsTableID: crdbInternalClusterTxnExecutionInsightsTable,
 		catconstants.CrdbInternalClusterLocksTableID:                crdbInternalClusterLocksTable,
 		catconstants.CrdbInternalClusterQueriesTableID:              crdbInternalClusterQueriesTable,
 		catconstants.CrdbInternalClusterTransactionsTableID:         crdbInternalClusterTxnsTable,
@@ -135,6 +141,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalCreateStmtsTableID:                 crdbInternalCreateStmtsTable,
 		catconstants.CrdbInternalCreateTypeStmtsTableID:             crdbInternalCreateTypeStmtsTable,
 		catconstants.CrdbInternalDatabasesTableID:                   crdbInternalDatabasesTable,
+		catconstants.CrdbInternalDroppedRelationsViewID:             crdbInternalDroppedRelationsView,
 		catconstants.CrdbInternalSuperRegions:                       crdbInternalSuperRegions,
 		catconstants.CrdbInternalFeatureUsageID:                     crdbInternalFeatureUsage,
 		catconstants.CrdbInternalForwardDependenciesTableID:         crdbInternalForwardDependenciesTable,
@@ -160,7 +167,9 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalLocalSessionsTableID:               crdbInternalLocalSessionsTable,
 		catconstants.CrdbInternalLocalMetricsTableID:                crdbInternalLocalMetricsTable,
 		catconstants.CrdbInternalNodeExecutionInsightsTableID:       crdbInternalNodeExecutionInsightsTable,
+		catconstants.CrdbInternalNodeMemoryMonitorsTableID:          crdbInternalNodeMemoryMonitors,
 		catconstants.CrdbInternalNodeStmtStatsTableID:               crdbInternalNodeStmtStatsTable,
+		catconstants.CrdbInternalNodeTxnExecutionInsightsTableID:    crdbInternalNodeTxnExecutionInsightsTable,
 		catconstants.CrdbInternalNodeTxnStatsTableID:                crdbInternalNodeTxnStatsTable,
 		catconstants.CrdbInternalPartitionsTableID:                  crdbInternalPartitionsTable,
 		catconstants.CrdbInternalRangesNoLeasesTableID:              crdbInternalRangesNoLeasesTable,
@@ -189,6 +198,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalActiveRangeFeedsTable:              crdbInternalActiveRangeFeedsTable,
 		catconstants.CrdbInternalTenantUsageDetailsViewID:           crdbInternalTenantUsageDetailsView,
 		catconstants.CrdbInternalPgCatalogTableIsImplementedTableID: crdbInternalPgCatalogTableIsImplementedTable,
+		catconstants.CrdbInternalShowTenantCapabilitiesCacheTableID: crdbInternalShowTenantCapabilitiesCache,
 	},
 	validWithNoDatabaseContext: true,
 }
@@ -302,10 +312,10 @@ CREATE TABLE crdb_internal.databases (
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, nil /* all databases */, true, /* requiresPrivileges */
 			func(db catalog.DatabaseDescriptor) error {
-				var survivalGoal tree.Datum = tree.DNull
-				var primaryRegion tree.Datum = tree.DNull
-				var secondaryRegion tree.Datum = tree.DNull
-				var placement tree.Datum = tree.DNull
+				var survivalGoal = tree.DNull
+				var primaryRegion = tree.DNull
+				var secondaryRegion = tree.DNull
+				var placement = tree.DNull
 				regions := tree.NewDArray(types.String)
 
 				createNode := tree.CreateDatabase{}
@@ -398,29 +408,26 @@ CREATE TABLE crdb_internal.super_regions (
 				if err != nil {
 					return err
 				}
-
-				superRegions, err := typeDesc.SuperRegions()
-				if err != nil {
-					return err
+				regionDesc := typeDesc.AsRegionEnumTypeDescriptor()
+				if regionDesc == nil {
+					return errors.AssertionFailedf("expected region enum type, not %s for type %q (%d)",
+						typeDesc.GetKind(), typeDesc.GetName(), typeDesc.GetID())
 				}
-				for _, superRegion := range superRegions {
-					regionList := tree.NewDArray(types.String)
-					for _, region := range superRegion.Regions {
-						if err := regionList.Append(tree.NewDString(region.String())); err != nil {
-							return err
-						}
-					}
 
-					if err := addRow(
-						tree.NewDInt(tree.DInt(db.GetID())),          // id
-						tree.NewDString(db.GetName()),                // database_name
-						tree.NewDString(superRegion.SuperRegionName), // super_region_name
-						regionList, // regions
-					); err != nil {
+				return regionDesc.ForEachSuperRegion(func(superRegion string) error {
+					regionList := tree.NewDArray(types.String)
+					if err := regionDesc.ForEachRegionInSuperRegion(superRegion, func(region catpb.RegionName) error {
+						return regionList.Append(tree.NewDString(region.String()))
+					}); err != nil {
 						return err
 					}
-				}
-				return nil
+					return addRow(
+						tree.NewDInt(tree.DInt(db.GetID())), // id
+						tree.NewDString(db.GetName()),       // database_name
+						tree.NewDString(superRegion),        // super_region_name
+						regionList,                          // regions
+					)
+				})
 			})
 	},
 }
@@ -542,8 +549,13 @@ CREATE TABLE crdb_internal.tables (
 		// Note: we do not use forEachTableDesc() here because we want to
 		// include added and dropped descriptors.
 		for _, desc := range descs {
-			table, ok := desc.(catalog.TableDescriptor)
-			if !ok || p.CheckAnyPrivilege(ctx, table) != nil {
+			table, isTable := desc.(catalog.TableDescriptor)
+			if !isTable {
+				continue
+			}
+			if ok, err := p.HasAnyPrivilege(ctx, table); err != nil {
+				return err
+			} else if !ok {
 				continue
 			}
 			dbName := dbNames[table.GetParentID()]
@@ -614,8 +626,13 @@ func crdbInternalTablesDatabaseLookupFunc(
 		if desc.GetParentID() != dbID {
 			return nil
 		}
-		table, ok := desc.(catalog.TableDescriptor)
-		if !ok || p.CheckAnyPrivilege(ctx, table) != nil {
+		table, isTable := desc.(catalog.TableDescriptor)
+		if !isTable {
+			return nil
+		}
+		if ok, err := p.HasAnyPrivilege(ctx, table); err != nil {
+			return err
+		} else if !ok {
 			return nil
 		}
 		seenAny = true
@@ -698,7 +715,7 @@ CREATE TABLE crdb_internal.table_row_statistics (
                   ) AS l ON l."tableID" = s."tableID" AND l.last_dt = s."createdAt"
             AS OF SYSTEM TIME '%s'
             GROUP BY s."tableID"`, statsAsOfTimeClusterMode.String(&p.ExecCfg().Settings.SV))
-		statRows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBufferedEx(
+		statRows, err := p.ExtendedEvalContext().ExecCfg.InternalDB.Executor().QueryBufferedEx(
 			ctx, "crdb-internal-statistics-table", nil,
 			sessiondata.RootUserSessionDataOverride,
 			query)
@@ -765,8 +782,13 @@ CREATE TABLE crdb_internal.schema_changes (
 		// Note: we do not use forEachTableDesc() here because we want to
 		// include added and dropped descriptors.
 		for _, desc := range descs {
-			table, ok := desc.(catalog.TableDescriptor)
-			if !ok || p.CheckAnyPrivilege(ctx, table) != nil {
+			table, isTable := desc.(catalog.TableDescriptor)
+			if !isTable {
+				continue
+			}
+			if ok, err := p.HasAnyPrivilege(ctx, table); err != nil {
+				return err
+			} else if !ok {
 				continue
 			}
 			tableID := tree.NewDInt(tree.DInt(int64(table.GetID())))
@@ -821,25 +843,31 @@ CREATE TABLE crdb_internal.leases (
 )`,
 	populate: func(
 		ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
-	) (err error) {
+	) error {
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
+		var iterErr error
 		p.LeaseMgr().VisitLeases(func(desc catalog.Descriptor, takenOffline bool, _ int, expiration tree.DTimestamp) (wantMore bool) {
-			if p.CheckAnyPrivilege(ctx, desc) != nil {
-				// TODO(ajwerner): inspect what type of error got returned.
+			if ok, err := p.HasAnyPrivilege(ctx, desc); err != nil {
+				iterErr = err
+				return false
+			} else if !ok {
 				return true
 			}
 
-			err = addRow(
+			if err := addRow(
 				tree.NewDInt(tree.DInt(nodeID)),
 				tree.NewDInt(tree.DInt(int64(desc.GetID()))),
 				tree.NewDString(desc.GetName()),
 				tree.NewDInt(tree.DInt(int64(desc.GetParentID()))),
 				&expiration,
 				tree.MakeDBool(tree.DBool(takenOffline)),
-			)
-			return err == nil
+			); err != nil {
+				iterErr = err
+				return false
+			}
+			return true
 		})
-		return err
+		return iterErr
 	},
 }
 
@@ -884,19 +912,19 @@ func getInternalSystemJobsQueryFromClusterVersion(
 var crdbInternalSystemJobsTable = virtualSchemaTable{
 	schema: `
 CREATE TABLE crdb_internal.system_jobs (
-	id                INT8      NOT NULL,      
-	status            STRING    NOT NULL,
-	created           TIMESTAMP NOT NULL,
-	payload           BYTES     NOT NULL,
-	progress          BYTES,
-	created_by_type   STRING,
-	created_by_id     INT,
-	claim_session_id  BYTES,
-	claim_instance_id INT8,
-	num_runs          INT8,
-	last_run          TIMESTAMP,
-	job_type          STRING,
-	INDEX (id),
+  id                INT8      NOT NULL,
+  status            STRING    NOT NULL,
+  created           TIMESTAMP NOT NULL,
+  payload           BYTES     NOT NULL,
+  progress          BYTES,
+  created_by_type   STRING,
+  created_by_id     INT,
+  claim_session_id  BYTES,
+  claim_instance_id INT8,
+  num_runs          INT8,
+  last_run          TIMESTAMP,
+  job_type          STRING,
+  INDEX (id),
   INDEX (job_type),
   INDEX (status)
 )`,
@@ -939,24 +967,14 @@ func populateSystemJobsTableRows(
 	addRow func(...tree.Datum) error,
 	query string,
 	params ...interface{},
-) (bool, error) {
+) (result bool, retErr error) {
 	const jobIdIdx = 0
 	const jobPayloadIdx = 3
 
 	matched := false
 
-	user := p.User()
-	userIsAdmin, err := p.UserHasAdminRole(ctx, user)
-	if err != nil {
-		return matched, err
-	}
-	userHasControlJobRoleOption, err := p.HasRoleOption(ctx, roleoption.CONTROLJOB)
-	if err != nil {
-		return matched, err
-	}
-
 	// Note: we query system.jobs as root, so we must be careful about which rows we return.
-	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(ctx,
+	it, err := p.InternalSQLTxn().QueryIteratorEx(ctx,
 		"system-jobs-scan",
 		p.Txn(),
 		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
@@ -969,14 +987,7 @@ func populateSystemJobsTableRows(
 
 	cleanup := func(ctx context.Context) {
 		if err := it.Close(); err != nil {
-			// TODO(yuzefovich): this error should be propagated further up
-			// and not simply being logged. Fix it (#61123).
-			//
-			// Doing that as a return parameter would require changes to
-			// `planNode.Close` signature which is a bit annoying. One other
-			// possible solution is to panic here and catch the error
-			// somewhere.
-			log.Warningf(ctx, "error closin3g an iterator: %v", err)
+			retErr = errors.CombineErrors(retErr, err)
 		}
 	}
 	defer cleanup(ctx)
@@ -988,25 +999,22 @@ func populateSystemJobsTableRows(
 		}
 
 		currentRow := it.Cur()
+		jobID, err := strconv.Atoi(currentRow[jobIdIdx].String())
+		if err != nil {
+			return matched, err
+		}
 		payloadBytes := currentRow[jobPayloadIdx]
 		payload, err := jobs.UnmarshalPayload(payloadBytes)
 		if err != nil {
 			return matched, wrapPayloadUnMarshalError(err, currentRow[jobIdIdx])
 		}
-		jobOwnerUser := payload.UsernameProto.Decode()
-		jobOwnerIsAdmin, err := p.UserHasAdminRole(ctx, jobOwnerUser)
-		if err != nil {
-			return matched, err
-		}
 
-		// The user can access the row if the meet one of the conditions:
-		//  1. The user is an admin.
-		//  2. The job is owned by the user.
-		//  3. The user has CONTROLJOB privilege and the job is not owned by
-		//     an admin.
-		if canAccess := userIsAdmin || (!jobOwnerIsAdmin &&
-			userHasControlJobRoleOption) || user == jobOwnerUser; !canAccess {
-			continue
+		if err := jobsauth.Authorize(ctx, p, jobspb.JobID(jobID), payload, jobsauth.ViewAccess); err != nil {
+			// Filter out jobs which the user is not allowed to see.
+			if IsInsufficientPrivilegeError(err) {
+				continue
+			}
+			return matched, err
 		}
 
 		if err := addRow(currentRow...); err != nil {
@@ -1088,7 +1096,7 @@ func makeJobsTableRows(
 	// instead of using InternalExecutor.QueryIterator because
 	// the latter is being deprecated for sometimes executing
 	// the query as the root user.
-	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
+	it, err := p.InternalSQLTxn().QueryIteratorEx(
 		ctx, "crdb-internal-jobs-table", p.txn,
 		sessiondata.InternalExecutorOverride{User: p.User()},
 		query, params...)
@@ -1110,14 +1118,17 @@ func makeJobsTableRows(
 	}
 	defer cleanup(ctx)
 
-	sessionJobs := make([]*jobs.Record, 0, len(p.extendedEvalCtx.SchemaChangeJobRecords))
+	sessionJobs := make([]*jobs.Record, 0, p.extendedEvalCtx.jobs.numToCreate())
 	uniqueJobs := make(map[*jobs.Record]struct{})
-	for _, job := range p.extendedEvalCtx.SchemaChangeJobRecords {
+	if err := p.extendedEvalCtx.jobs.forEachToCreate(func(job *jobs.Record) error {
 		if _, ok := uniqueJobs[job]; ok {
-			continue
+			return nil
 		}
 		sessionJobs = append(sessionJobs, job)
 		uniqueJobs[job] = struct{}{}
+		return nil
+	}); err != nil {
+		return matched, err
 	}
 
 	// Loop while we need to skip a row.
@@ -1287,7 +1298,7 @@ func makeJobsTableRows(
 
 // execStatAvg is a helper for execution stats shown in virtual tables. Returns
 // NULL when the count is 0, or the mean of the given NumericStat.
-func execStatAvg(count int64, n roachpb.NumericStat) tree.Datum {
+func execStatAvg(count int64, n appstatspb.NumericStat) tree.Datum {
 	if count == 0 {
 		return tree.DNull
 	}
@@ -1296,7 +1307,7 @@ func execStatAvg(count int64, n roachpb.NumericStat) tree.Datum {
 
 // execStatVar is a helper for execution stats shown in virtual tables. Returns
 // NULL when the count is 0, or the variance of the given NumericStat.
-func execStatVar(count int64, n roachpb.NumericStat) tree.Datum {
+func execStatVar(count int64, n appstatspb.NumericStat) tree.Datum {
 	if count == 0 {
 		return tree.DNull
 	}
@@ -1331,6 +1342,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   first_attempt_count INT NOT NULL,
   max_retries         INT NOT NULL,
   last_error          STRING,
+  last_error_code     STRING,
   rows_avg            FLOAT NOT NULL,
   rows_var            FLOAT NOT NULL,
   idle_lat_avg        FLOAT NOT NULL,
@@ -1361,13 +1373,46 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   max_disk_usage_var  FLOAT,
   contention_time_avg FLOAT,
   contention_time_var FLOAT,
+  cpu_sql_nanos_avg       FLOAT,
+  cpu_sql_nanos_var       FLOAT,
+  mvcc_step_avg       FLOAT,
+  mvcc_step_var       FLOAT,
+  mvcc_step_internal_avg FLOAT,
+  mvcc_step_internal_var FLOAT,
+  mvcc_seek_avg       FLOAT,
+  mvcc_seek_var       FLOAT,
+  mvcc_seek_internal_avg FLOAT,
+  mvcc_seek_internal_var FLOAT,
+  mvcc_block_bytes_avg       FLOAT,
+  mvcc_block_bytes_var       FLOAT,
+  mvcc_block_bytes_in_cache_avg FLOAT,
+  mvcc_block_bytes_in_cache_var FLOAT,
+  mvcc_key_bytes_avg FLOAT,
+  mvcc_key_bytes_var FLOAT,
+  mvcc_value_bytes_avg       FLOAT,
+  mvcc_value_bytes_var       FLOAT,
+  mvcc_point_count_avg       FLOAT,
+  mvcc_point_count_var       FLOAT,
+  mvcc_points_covered_by_range_tombstones_avg FLOAT,
+  mvcc_points_covered_by_range_tombstones_var FLOAT,
+  mvcc_range_key_count_avg FLOAT,
+  mvcc_range_key_count_var FLOAT,
+  mvcc_range_key_contained_points_avg       FLOAT,
+  mvcc_range_key_contained_points_var       FLOAT,
+  mvcc_range_key_skipped_points_avg      FLOAT,
+  mvcc_range_key_skipped_points_var      FLOAT,
   implicit_txn        BOOL NOT NULL,
   full_scan           BOOL NOT NULL,
   sample_plan         JSONB,
   database_name       STRING NOT NULL,
   exec_node_ids       INT[] NOT NULL,
   txn_fingerprint_id  STRING,
-  index_recommendations STRING[] NOT NULL
+  index_recommendations STRING[] NOT NULL,
+  latency_seconds_min FLOAT,
+  latency_seconds_max FLOAT,
+  latency_seconds_p50 FLOAT,
+  latency_seconds_p90 FLOAT,
+  latency_seconds_p99 FLOAT
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		hasViewActivityOrViewActivityRedacted, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
@@ -1375,8 +1420,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			return err
 		}
 		if !hasViewActivityOrViewActivityRedacted {
-			return pgerror.Newf(pgcode.InsufficientPrivilege,
-				"user %s does not have %s or %s privilege", p.User(), roleoption.VIEWACTIVITY, roleoption.VIEWACTIVITYREDACTED)
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
 		sqlStats, err := getSQLStats(p, "crdb_internal.node_statement_statistics")
@@ -1386,7 +1430,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
 
-		statementVisitor := func(_ context.Context, stats *roachpb.CollectedStatementStatistics) error {
+		statementVisitor := func(_ context.Context, stats *appstatspb.CollectedStatementStatistics) error {
 			anonymized := tree.DNull
 			anonStr, ok := scrubStmtStatKey(p.getVirtualTabler(), stats.Key.Query)
 			if ok {
@@ -1397,6 +1441,12 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			if stats.Stats.SensitiveInfo.LastErr != "" {
 				errString = tree.NewDString(stats.Stats.SensitiveInfo.LastErr)
 			}
+
+			errCode := tree.DNull
+			if stats.Stats.LastErrorCode != "" {
+				errCode = tree.NewDString(stats.Stats.LastErrorCode)
+			}
+
 			var flags string
 			if stats.Key.DistSQL {
 				flags = "+"
@@ -1415,7 +1465,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			}
 
 			txnFingerprintID := tree.DNull
-			if stats.Key.TransactionFingerprintID != roachpb.InvalidTransactionFingerprintID {
+			if stats.Key.TransactionFingerprintID != appstatspb.InvalidTransactionFingerprintID {
 				txnFingerprintID = tree.NewDString(strconv.FormatUint(uint64(stats.Key.TransactionFingerprintID), 10))
 
 			}
@@ -1438,43 +1488,77 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				tree.NewDInt(tree.DInt(stats.Stats.FirstAttemptCount)),    // first_attempt_count
 				tree.NewDInt(tree.DInt(stats.Stats.MaxRetries)),           // max_retries
 				errString, // last_error
-				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                               // rows_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),     // rows_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.Mean)),                               // idle_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.GetVariance(stats.Stats.Count))),     // idle_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.ParseLat.Mean)),                              // parse_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.ParseLat.GetVariance(stats.Stats.Count))),    // parse_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.PlanLat.Mean)),                               // plan_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.PlanLat.GetVariance(stats.Stats.Count))),     // plan_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.RunLat.Mean)),                                // run_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.RunLat.GetVariance(stats.Stats.Count))),      // run_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.Mean)),                            // service_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.GetVariance(stats.Stats.Count))),  // service_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.OverheadLat.Mean)),                           // overhead_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.OverheadLat.GetVariance(stats.Stats.Count))), // overhead_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.BytesRead.Mean)),                             // bytes_read_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.BytesRead.GetVariance(stats.Stats.Count))),   // bytes_read_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.RowsRead.Mean)),                              // rows_read_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.RowsRead.GetVariance(stats.Stats.Count))),    // rows_read_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.RowsWritten.Mean)),                           // rows_written_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.RowsWritten.GetVariance(stats.Stats.Count))), // rows_written_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),        // network_bytes_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),        // network_bytes_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),     // network_msgs_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),     // network_msgs_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),         // max_mem_usage_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),         // max_mem_usage_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),        // max_disk_usage_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),        // max_disk_usage_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),      // contention_time_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),      // contention_time_var
-				tree.MakeDBool(tree.DBool(stats.Key.ImplicitTxn)),                                   // implicit_txn
-				tree.MakeDBool(tree.DBool(stats.Key.FullScan)),                                      // full_scan
+				errCode,   // last_error_code
+				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                                                            // rows_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),                                  // rows_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.Mean)),                                                            // idle_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.GetVariance(stats.Stats.Count))),                                  // idle_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.ParseLat.Mean)),                                                           // parse_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.ParseLat.GetVariance(stats.Stats.Count))),                                 // parse_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.PlanLat.Mean)),                                                            // plan_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.PlanLat.GetVariance(stats.Stats.Count))),                                  // plan_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.RunLat.Mean)),                                                             // run_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.RunLat.GetVariance(stats.Stats.Count))),                                   // run_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.Mean)),                                                         // service_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.GetVariance(stats.Stats.Count))),                               // service_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.OverheadLat.Mean)),                                                        // overhead_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.OverheadLat.GetVariance(stats.Stats.Count))),                              // overhead_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.BytesRead.Mean)),                                                          // bytes_read_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.BytesRead.GetVariance(stats.Stats.Count))),                                // bytes_read_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.RowsRead.Mean)),                                                           // rows_read_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.RowsRead.GetVariance(stats.Stats.Count))),                                 // rows_read_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.RowsWritten.Mean)),                                                        // rows_written_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.RowsWritten.GetVariance(stats.Stats.Count))),                              // rows_written_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),                                     // network_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),                                     // network_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),                                  // network_msgs_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),                                  // network_msgs_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),                                      // max_mem_usage_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),                                      // max_mem_usage_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),                                     // max_disk_usage_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),                                     // max_disk_usage_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),                                   // contention_time_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),                                   // contention_time_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUSQLNanos),                                      // cpu_sql_nanos_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUSQLNanos),                                      // cpu_sql_nanos_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.StepCount),                      // mvcc_step_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.StepCount),                      // mvcc_step_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.StepCountInternal),              // mvcc_step_internal_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.StepCountInternal),              // mvcc_step_internal_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.SeekCount),                      // mvcc_seek_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.SeekCount),                      // mvcc_seek_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.SeekCountInternal),              // mvcc_seek_internal_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.SeekCountInternal),              // mvcc_seek_internal_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.BlockBytes),                     // mvcc_block_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.BlockBytes),                     // mvcc_block_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.BlockBytesInCache),              // mvcc_block_bytes_in_cache_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.BlockBytesInCache),              // mvcc_block_bytes_in_cache_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.KeyBytes),                       // mvcc_key_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.KeyBytes),                       // mvcc_key_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.ValueBytes),                     // mvcc_value_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.ValueBytes),                     // mvcc_value_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.PointCount),                     // mvcc_point_count_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.PointCount),                     // mvcc_point_count_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.PointsCoveredByRangeTombstones), // mvcc_points_covered_by_range_tombstones_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.PointsCoveredByRangeTombstones), // mvcc_points_covered_by_range_tombstones_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeyCount),                  // mvcc_range_key_count_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeyCount),                  // mvcc_range_key_count_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeyContainedPoints),        // mvcc_range_key_contained_points_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeyContainedPoints),        // mvcc_range_key_contained_points_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeySkippedPoints),          // mvcc_range_key_skipped_points_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeySkippedPoints),          // mvcc_range_key_skipped_points_var
+				tree.MakeDBool(tree.DBool(stats.Key.ImplicitTxn)),                                                                // implicit_txn
+				tree.MakeDBool(tree.DBool(stats.Key.FullScan)),                                                                   // full_scan
 				tree.NewDJSON(samplePlan),           // sample_plan
 				tree.NewDString(stats.Key.Database), // database_name
 				execNodeIDs,                         // exec_node_ids
 				txnFingerprintID,                    // txn_fingerprint_id
 				indexRecommendations,                // index_recommendations
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.Min)), // latency_seconds_min
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.Max)), // latency_seconds_max
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P50)), // latency_seconds_p50
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P90)), // latency_seconds_p90
+				tree.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P99)), // latency_seconds_p99
 			)
 			if err != nil {
 				return err
@@ -1524,7 +1608,35 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
   max_disk_usage_avg  FLOAT,
   max_disk_usage_var  FLOAT,
   contention_time_avg FLOAT,
-  contention_time_var FLOAT
+  contention_time_var FLOAT,
+  cpu_sql_nanos_avg       FLOAT,
+  cpu_sql_nanos_var       FLOAT,
+  mvcc_step_avg       FLOAT,
+  mvcc_step_var       FLOAT,
+  mvcc_step_internal_avg FLOAT,
+  mvcc_step_internal_var FLOAT,
+  mvcc_seek_avg       FLOAT,
+  mvcc_seek_var       FLOAT,
+  mvcc_seek_internal_avg FLOAT,
+  mvcc_seek_internal_var FLOAT,
+  mvcc_block_bytes_avg       FLOAT,
+  mvcc_block_bytes_var       FLOAT,
+  mvcc_block_bytes_in_cache_avg FLOAT,
+  mvcc_block_bytes_in_cache_var FLOAT,
+  mvcc_key_bytes_avg FLOAT,
+  mvcc_key_bytes_var FLOAT,
+  mvcc_value_bytes_avg       FLOAT,
+  mvcc_value_bytes_var       FLOAT,
+  mvcc_point_count_avg       FLOAT,
+  mvcc_point_count_var       FLOAT,
+  mvcc_points_covered_by_range_tombstones_avg FLOAT,
+  mvcc_points_covered_by_range_tombstones_var FLOAT,
+  mvcc_range_key_count_avg FLOAT,
+  mvcc_range_key_count_var FLOAT,
+  mvcc_range_key_contained_points_avg       FLOAT,
+  mvcc_range_key_contained_points_var       FLOAT,
+  mvcc_range_key_skipped_points_avg      FLOAT,
+  mvcc_range_key_skipped_points_var      FLOAT
 )
 `,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -1533,8 +1645,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 			return err
 		}
 		if !hasViewActivityOrhasViewActivityRedacted {
-			return pgerror.Newf(pgcode.InsufficientPrivilege,
-				"user %s does not have %s or %s privilege", p.User(), roleoption.VIEWACTIVITY, roleoption.VIEWACTIVITYREDACTED)
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
 		sqlStats, err := getSQLStats(p, "crdb_internal.node_transaction_statistics")
@@ -1544,7 +1655,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
 
-		transactionVisitor := func(_ context.Context, stats *roachpb.CollectedTransactionStatistics) error {
+		transactionVisitor := func(_ context.Context, stats *appstatspb.CollectedTransactionStatistics) error {
 			stmtFingerprintIDsDatum := tree.NewDArray(types.String)
 			for _, stmtFingerprintID := range stats.StatementFingerprintIDs {
 				if err := stmtFingerprintIDsDatum.Append(tree.NewDString(strconv.FormatUint(uint64(stmtFingerprintID), 10))); err != nil {
@@ -1556,29 +1667,57 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 				tree.NewDInt(tree.DInt(nodeID)), // node_id
 				tree.NewDString(stats.App),      // application_name
 				tree.NewDString(strconv.FormatUint(uint64(stats.TransactionFingerprintID), 10)), // key
-				stmtFingerprintIDsDatum,                                                            // statement_ids
-				tree.NewDInt(tree.DInt(stats.Stats.Count)),                                         // count
-				tree.NewDInt(tree.DInt(stats.Stats.MaxRetries)),                                    // max_retries
-				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.Mean)),                           // service_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.GetVariance(stats.Stats.Count))), // service_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.RetryLat.Mean)),                             // retry_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.RetryLat.GetVariance(stats.Stats.Count))),   // retry_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.CommitLat.Mean)),                            // commit_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.CommitLat.GetVariance(stats.Stats.Count))),  // commit_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.Mean)),                              // idle_lat_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.GetVariance(stats.Stats.Count))),    // idle_lat_var
-				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                              // rows_read_avg
-				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),    // rows_read_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),       // network_bytes_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),       // network_bytes_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),    // network_msgs_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),    // network_msgs_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),        // max_mem_usage_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),        // max_mem_usage_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),       // max_disk_usage_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),       // max_disk_usage_var
-				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),     // contention_time_avg
-				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),     // contention_time_var
+				stmtFingerprintIDsDatum,                                                                                          // statement_ids
+				tree.NewDInt(tree.DInt(stats.Stats.Count)),                                                                       // count
+				tree.NewDInt(tree.DInt(stats.Stats.MaxRetries)),                                                                  // max_retries
+				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.Mean)),                                                         // service_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.ServiceLat.GetVariance(stats.Stats.Count))),                               // service_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.RetryLat.Mean)),                                                           // retry_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.RetryLat.GetVariance(stats.Stats.Count))),                                 // retry_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.CommitLat.Mean)),                                                          // commit_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.CommitLat.GetVariance(stats.Stats.Count))),                                // commit_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.Mean)),                                                            // idle_lat_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.IdleLat.GetVariance(stats.Stats.Count))),                                  // idle_lat_var
+				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.Mean)),                                                            // rows_read_avg
+				tree.NewDFloat(tree.DFloat(stats.Stats.NumRows.GetVariance(stats.Stats.Count))),                                  // rows_read_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),                                     // network_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkBytes),                                     // network_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),                                  // network_msgs_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.NetworkMessages),                                  // network_msgs_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),                                      // max_mem_usage_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxMemUsage),                                      // max_mem_usage_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),                                     // max_disk_usage_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),                                     // max_disk_usage_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),                                   // contention_time_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),                                   // contention_time_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUSQLNanos),                                      // cpu_sql_nanos_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUSQLNanos),                                      // cpu_sql_nanos_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.StepCount),                      // mvcc_step_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.StepCount),                      // mvcc_step_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.StepCountInternal),              // mvcc_step_internal_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.StepCountInternal),              // mvcc_step_internal_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.SeekCount),                      // mvcc_seek_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.SeekCount),                      // mvcc_seek_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.SeekCountInternal),              // mvcc_seek_internal_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.SeekCountInternal),              // mvcc_seek_internal_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.BlockBytes),                     // mvcc_block_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.BlockBytes),                     // mvcc_block_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.BlockBytesInCache),              // mvcc_block_bytes_in_cache_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.BlockBytesInCache),              // mvcc_block_bytes_in_cache_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.KeyBytes),                       // mvcc_key_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.KeyBytes),                       // mvcc_key_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.ValueBytes),                     // mvcc_value_bytes_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.ValueBytes),                     // mvcc_value_bytes_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.PointCount),                     // mvcc_point_count_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.PointCount),                     // mvcc_point_count_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.PointsCoveredByRangeTombstones), // mvcc_points_covered_by_range_tombstones_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.PointsCoveredByRangeTombstones), // mvcc_points_covered_by_range_tombstones_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeyCount),                  // mvcc_range_key_count_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeyCount),                  // mvcc_range_key_count_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeyContainedPoints),        // mvcc_range_key_contained_points_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeyContainedPoints),        // mvcc_range_key_contained_points_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeySkippedPoints),          // mvcc_range_key_skipped_points_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MVCCIteratorStats.RangeKeySkippedPoints),          // mvcc_range_key_skipped_points_var
 			)
 
 			if err != nil {
@@ -1620,7 +1759,7 @@ CREATE TABLE crdb_internal.node_txn_stats (
 
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
 
-		appTxnStatsVisitor := func(appName string, stats *roachpb.TxnStats) error {
+		appTxnStatsVisitor := func(appName string, stats *appstatspb.TxnStats) error {
 			return addRow(
 				tree.NewDInt(tree.DInt(nodeID)),
 				tree.NewDString(appName),
@@ -1832,34 +1971,47 @@ CREATE TABLE crdb_internal.cluster_settings (
   description   STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		hasAdmin, err := p.HasAdminRole(ctx)
-		if err != nil {
-			return err
-		}
-		if !hasAdmin {
-			hasModify := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING) == nil
-			hasView := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING) == nil
-
-			if !hasModify && !hasView {
-				hasModify, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING)
-				if err != nil {
-					return err
-				}
-				hasView, err := p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING)
-				if err != nil {
-					return err
-				}
-				if !hasModify && !hasView {
-					return pgerror.Newf(pgcode.InsufficientPrivilege,
-						"only users with either %s or %s system privileges are allowed to read "+
-							"crdb_internal.cluster_settings", privilege.MODIFYCLUSTERSETTING, privilege.VIEWCLUSTERSETTING)
-				}
+		if hasPriv, err := func() (bool, error) {
+			if hasAdmin, err := p.HasAdminRole(ctx); err != nil {
+				return false, err
+			} else if hasAdmin {
+				return true, nil
 			}
+			if hasModify, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING, p.User()); err != nil {
+				return false, err
+			} else if hasModify {
+				return true, nil
+			}
+			if hasSqlModify, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYSQLCLUSTERSETTING, p.User()); err != nil {
+				return false, err
+			} else if hasSqlModify {
+				return true, nil
+			}
+			if hasView, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING, p.User()); err != nil {
+				return false, err
+			} else if hasView {
+				return true, nil
+			}
+			if hasModify, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING); err != nil {
+				return false, err
+			} else if hasModify {
+				return true, nil
+			}
+			if hasView, err := p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING); err != nil {
+				return false, err
+			} else if hasView {
+				return true, nil
+			}
+			return false, nil
+		}(); err != nil {
+			return err
+		} else if !hasPriv {
+			return pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with %s, %s or %s system privileges are allowed to read "+
+					"crdb_internal.cluster_settings", privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, privilege.VIEWCLUSTERSETTING)
 		}
 		for _, k := range settings.Keys(p.ExecCfg().Codec.ForSystemTenant()) {
-			setting, _ := settings.Lookup(
-				k, settings.LookupForLocalAccess, p.ExecCfg().Codec.ForSystemTenant(),
-			)
+			setting, _ := settings.LookupForLocalAccess(k, p.ExecCfg().Codec.ForSystemTenant())
 			strVal := setting.String(&p.ExecCfg().Settings.SV)
 			isPublic := setting.Visibility() == settings.Public
 			desc := setting.Description()
@@ -2729,9 +2881,13 @@ CREATE TABLE crdb_internal.builtin_functions (
 			props, overloads := builtinsregistry.GetBuiltinProperties(name)
 			schema := catconstants.PgCatalogName
 			const crdbInternal = catconstants.CRDBInternalSchemaName + "."
+			const infoSchema = catconstants.InformationSchemaName + "."
 			if strings.HasPrefix(name, crdbInternal) {
 				name = name[len(crdbInternal):]
 				schema = catconstants.CRDBInternalSchemaName
+			} else if strings.HasPrefix(name, infoSchema) {
+				name = name[len(infoSchema):]
+				schema = catconstants.InformationSchemaName
 			}
 			for _, f := range overloads {
 				if err := addRow(
@@ -2757,18 +2913,27 @@ func writeCreateTypeDescRow(
 	typeDesc catalog.TypeDescriptor,
 	addRow func(...tree.Datum) error,
 ) (written bool, err error) {
-	switch typeDesc.GetKind() {
-	case descpb.TypeDescriptor_ENUM:
+	if typeDesc.AsAliasTypeDescriptor() != nil {
+		// Alias types are created implicitly, so we don't have create
+		// statements for them.
+		return false, nil
+	}
+	if e := typeDesc.AsEnumTypeDescriptor(); e != nil {
+		if e.AsRegionEnumTypeDescriptor() != nil {
+			// Multi-region enums are created implicitly, so we don't have create
+			// statements for them.
+			return false, nil
+		}
 		var enumLabels tree.EnumValueList
 		enumLabelsDatum := tree.NewDArray(types.String)
-		for i := 0; i < typeDesc.NumEnumMembers(); i++ {
-			rep := typeDesc.GetMemberLogicalRepresentation(i)
+		for i := 0; i < e.NumEnumMembers(); i++ {
+			rep := e.GetMemberLogicalRepresentation(i)
 			enumLabels = append(enumLabels, tree.EnumValue(rep))
 			if err := enumLabelsDatum.Append(tree.NewDString(rep)); err != nil {
 				return false, err
 			}
 		}
-		name, err := tree.NewUnresolvedObjectName(2, [3]string{typeDesc.GetName(), sc.GetName()}, 0)
+		name, err := tree.NewUnresolvedObjectName(2, [3]string{e.GetName(), sc.GetName()}, 0)
 		if err != nil {
 			return false, err
 		}
@@ -2778,33 +2943,30 @@ func writeCreateTypeDescRow(
 			EnumLabels: enumLabels,
 		}
 		return true, addRow(
-			tree.NewDInt(tree.DInt(db.GetID())),       // database_id
-			tree.NewDString(db.GetName()),             // database_name
-			tree.NewDString(sc.GetName()),             // schema_name
-			tree.NewDInt(tree.DInt(typeDesc.GetID())), // descriptor_id
-			tree.NewDString(typeDesc.GetName()),       // descriptor_name
-			tree.NewDString(tree.AsString(node)),      // create_statement
+			tree.NewDInt(tree.DInt(db.GetID())),  // database_id
+			tree.NewDString(db.GetName()),        // database_name
+			tree.NewDString(sc.GetName()),        // schema_name
+			tree.NewDInt(tree.DInt(e.GetID())),   // descriptor_id
+			tree.NewDString(e.GetName()),         // descriptor_name
+			tree.NewDString(tree.AsString(node)), // create_statement
 			enumLabelsDatum,
 		)
-	case descpb.TypeDescriptor_MULTIREGION_ENUM:
-		// Multi-region enums are created implicitly, so we don't have create
-		// statements for them.
-		return false, nil
-	case descpb.TypeDescriptor_COMPOSITE:
-		name, err := tree.NewUnresolvedObjectName(2, [3]string{typeDesc.GetName(), sc.GetName()}, 0)
+	}
+	if c := typeDesc.AsCompositeTypeDescriptor(); c != nil {
+		name, err := tree.NewUnresolvedObjectName(2, [3]string{c.GetName(), sc.GetName()}, 0)
 		if err != nil {
 			return false, err
 		}
-		composite := typeDesc.TypeDesc().Composite
-		typeList := make([]tree.CompositeTypeElem, len(composite.Elements))
-		for i := range composite.Elements {
+		typeList := make([]tree.CompositeTypeElem, c.NumElements())
+		for i := 0; i < c.NumElements(); i++ {
+			t := c.GetElementType(i)
 			if err := typedesc.EnsureTypeIsHydrated(
-				ctx, composite.Elements[i].ElementType, resolver.(catalog.TypeDescriptorResolver),
+				ctx, t, resolver.(catalog.TypeDescriptorResolver),
 			); err != nil {
 				return false, err
 			}
-			typeList[i].Type = composite.Elements[i].ElementType
-			typeList[i].Label = tree.Name(composite.Elements[i].ElementLabel)
+			typeList[i].Type = t
+			typeList[i].Label = tree.Name(c.GetElementLabel(i))
 		}
 		node := &tree.CreateType{
 			Variety:           tree.Composite,
@@ -2812,21 +2974,16 @@ func writeCreateTypeDescRow(
 			CompositeTypeList: typeList,
 		}
 		return true, addRow(
-			tree.NewDInt(tree.DInt(db.GetID())),       // database_id
-			tree.NewDString(db.GetName()),             // database_name
-			tree.NewDString(sc.GetName()),             // schema_name
-			tree.NewDInt(tree.DInt(typeDesc.GetID())), // descriptor_id
-			tree.NewDString(typeDesc.GetName()),       // descriptor_name
-			tree.NewDString(tree.AsString(node)),      // create_statement
-			tree.DNull,                                // enum_members
+			tree.NewDInt(tree.DInt(db.GetID())),  // database_id
+			tree.NewDString(db.GetName()),        // database_name
+			tree.NewDString(sc.GetName()),        // schema_name
+			tree.NewDInt(tree.DInt(c.GetID())),   // descriptor_id
+			tree.NewDString(c.GetName()),         // descriptor_name
+			tree.NewDString(tree.AsString(node)), // create_statement
+			tree.DNull,                           // enum_members
 		)
-	case descpb.TypeDescriptor_ALIAS:
-		// Alias types are created implicitly, so we don't have create
-		// statements for them.
-		return false, nil
-	default:
-		return false, errors.AssertionFailedf("unknown type descriptor kind %s", typeDesc.GetKind().String())
 	}
+	return false, errors.AssertionFailedf("unknown type descriptor kind %s", typeDesc.GetKind())
 }
 
 var crdbInternalCreateTypeStmtsTable = virtualSchemaTable{
@@ -2949,12 +3106,12 @@ CREATE TABLE crdb_internal.create_function_statements (
 		fnIDToDBID := make(map[descpb.ID]descpb.ID)
 		for _, curDB := range dbDescs {
 			err := forEachSchema(ctx, p, curDB, true /* requiresPrivileges */, func(sc catalog.SchemaDescriptor) error {
-				return sc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-					fnIDs = append(fnIDs, overload.ID)
-					fnIDToScName[overload.ID] = sc.GetName()
-					fnIDToScID[overload.ID] = sc.GetID()
-					fnIDToDBName[overload.ID] = curDB.GetName()
-					fnIDToDBID[overload.ID] = curDB.GetID()
+				return sc.ForEachFunctionSignature(func(sig descpb.SchemaDescriptor_FunctionSignature) error {
+					fnIDs = append(fnIDs, sig.ID)
+					fnIDToScName[sig.ID] = sc.GetName()
+					fnIDToScID[sig.ID] = sc.GetID()
+					fnIDToDBName[sig.ID] = curDB.GetName()
+					fnIDToDBID[sig.ID] = curDB.GetID()
 					return nil
 				})
 			})
@@ -3483,7 +3640,7 @@ CREATE TABLE crdb_internal.backward_dependencies (
 				if err != nil {
 					return err
 				}
-				refConstraint, err := tabledesc.FindFKReferencedUniqueConstraint(refTbl, fk)
+				refConstraint, err := catalog.FindFKReferencedUniqueConstraint(refTbl, fk)
 				if err != nil {
 					return err
 				}
@@ -3674,6 +3831,7 @@ CREATE VIEW crdb_internal.ranges AS SELECT ` +
 		colinfo.RangesExtraRenders +
 		`FROM crdb_internal.ranges_no_leases`,
 	resultColumns: colinfo.Ranges,
+	comment:       "ranges is a view which queries ranges_no_leases for system ranges",
 }
 
 // descriptorsByType is a utility function that iterates through a slice of
@@ -3684,7 +3842,7 @@ CREATE VIEW crdb_internal.ranges AS SELECT ` +
 // table). It also returns maps of table descriptor IDs to the parent schema ID
 // and the parent (database) descriptor ID, to aid in necessary lookups.
 func descriptorsByType(
-	descs []catalog.Descriptor, privCheckerFunc func(desc catalog.Descriptor) bool,
+	descs []catalog.Descriptor, privCheckerFunc func(desc catalog.Descriptor) (bool, error),
 ) (
 	hasPermission bool,
 	dbNames map[uint32]string,
@@ -3693,6 +3851,7 @@ func descriptorsByType(
 	indexNames map[uint32]map[uint32]string,
 	schemaParents map[uint32]uint32,
 	parents map[uint32]uint32,
+	retErr error,
 ) {
 	// TODO(knz): maybe this could use internalLookupCtx.
 	dbNames = make(map[uint32]string)
@@ -3704,7 +3863,10 @@ func descriptorsByType(
 	hasPermission = false
 	for _, desc := range descs {
 		id := uint32(desc.GetID())
-		if !privCheckerFunc(desc) {
+		if ok, err := privCheckerFunc(desc); err != nil {
+			retErr = err
+			return
+		} else if !ok {
 			continue
 		}
 		hasPermission = true
@@ -3724,7 +3886,7 @@ func descriptorsByType(
 		}
 	}
 
-	return hasPermission, dbNames, tableNames, schemaNames, indexNames, schemaParents, parents
+	return hasPermission, dbNames, tableNames, schemaNames, indexNames, schemaParents, parents, nil
 }
 
 // lookupNamesByKey is a utility function that, given a key, utilizes the maps
@@ -3800,17 +3962,18 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 		}
 		descs := all.OrderedDescriptors()
 
-		privCheckerFunc := func(desc catalog.Descriptor) bool {
+		privCheckerFunc := func(desc catalog.Descriptor) (bool, error) {
 			if hasAdmin {
-				return true
+				return true, nil
 			}
-
-			return p.CheckPrivilege(ctx, desc, privilege.ZONECONFIG) == nil
+			return p.HasPrivilege(ctx, desc, privilege.ZONECONFIG, p.User())
 		}
 
 		hasPermission := false
 		for _, desc := range descs {
-			if privCheckerFunc(desc) {
+			if ok, err := privCheckerFunc(desc); err != nil {
+				return nil, nil, err
+			} else if ok {
 				hasPermission = true
 				break
 			}
@@ -3915,24 +4078,21 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 // getAllNames returns a map from ID to namespaceKey for every entry in
 // system.namespace.
 func (p *planner) getAllNames(ctx context.Context) (map[descpb.ID]catalog.NameKey, error) {
-	return getAllNames(ctx, p.txn, p.ExtendedEvalContext().ExecCfg.InternalExecutor)
+	return getAllNames(ctx, p.InternalSQLTxn())
 }
 
 // TestingGetAllNames is a wrapper for getAllNames.
-func TestingGetAllNames(
-	ctx context.Context, txn *kv.Txn, executor *InternalExecutor,
-) (map[descpb.ID]catalog.NameKey, error) {
-	return getAllNames(ctx, txn, executor)
+func TestingGetAllNames(ctx context.Context, txn isql.Txn) (map[descpb.ID]catalog.NameKey, error) {
+	return getAllNames(ctx, txn)
 }
 
 // getAllNames is the testable implementation of getAllNames.
 // It is public so that it can be tested outside the sql package.
-func getAllNames(
-	ctx context.Context, txn *kv.Txn, executor *InternalExecutor,
-) (map[descpb.ID]catalog.NameKey, error) {
+func getAllNames(ctx context.Context, txn isql.Txn) (map[descpb.ID]catalog.NameKey, error) {
 	namespace := map[descpb.ID]catalog.NameKey{}
-	it, err := executor.QueryIterator(
-		ctx, "get-all-names", txn,
+	it, err := txn.QueryIteratorEx(
+		ctx, "get-all-names", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		`SELECT id, "parentID", "parentSchemaID", name FROM system.namespace`,
 	)
 	if err != nil {
@@ -3999,8 +4159,10 @@ CREATE TABLE crdb_internal.zones (
 
 		// For some reason, if we use the iterator API here, "concurrent txn use
 		// detected" error might occur, so we buffer up all zones first.
-		rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBuffered(
-			ctx, "crdb-internal-zones-table", p.txn, `SELECT id, config FROM system.zones`)
+		rows, err := p.InternalSQLTxn().QueryBufferedEx(
+			ctx, "crdb-internal-zones-table", p.txn, sessiondata.NodeUserSessionDataOverride,
+			`SELECT id, config FROM system.zones`,
+		)
 		if err != nil {
 			return err
 		}
@@ -4041,7 +4203,9 @@ CREATE TABLE crdb_internal.zones (
 				if err != nil {
 					return err
 				}
-				if p.CheckAnyPrivilege(ctx, database) != nil {
+				if ok, err := p.HasAnyPrivilege(ctx, database); err != nil {
+					return err
+				} else if !ok {
 					continue
 				}
 			} else if zoneSpecifier.TableOrIndex.Table.ObjectName != "" {
@@ -4049,7 +4213,9 @@ CREATE TABLE crdb_internal.zones (
 				if err != nil {
 					return err
 				}
-				if p.CheckAnyPrivilege(ctx, tableEntry) != nil {
+				if ok, err := p.HasAnyPrivilege(ctx, tableEntry); err != nil {
+					return err
+				} else if !ok {
 					continue
 				}
 				table = tableEntry
@@ -5014,7 +5180,9 @@ CREATE TABLE crdb_internal.kv_catalog_descriptor (
 		// Delegate privilege check to system table.
 		{
 			sysTable := all.LookupDescriptor(systemschema.DescriptorTable.GetID())
-			if p.CheckPrivilege(ctx, sysTable, privilege.SELECT) != nil {
+			if ok, err := p.HasPrivilege(ctx, sysTable, privilege.SELECT, p.User()); err != nil {
+				return err
+			} else if !ok {
 				return nil
 			}
 		}
@@ -5048,7 +5216,9 @@ CREATE TABLE crdb_internal.kv_catalog_zones (
 		// Delegate privilege check to system table.
 		{
 			sysTable := all.LookupDescriptor(systemschema.ZonesTable.GetID())
-			if p.CheckPrivilege(ctx, sysTable, privilege.SELECT) != nil {
+			if ok, err := p.HasPrivilege(ctx, sysTable, privilege.SELECT, p.User()); err != nil {
+				return err
+			} else if !ok {
 				return nil
 			}
 		}
@@ -5085,7 +5255,9 @@ CREATE TABLE crdb_internal.kv_catalog_namespace (
 		// Delegate privilege check to system table.
 		{
 			sysTable := all.LookupDescriptor(systemschema.NamespaceTable.GetID())
-			if p.CheckPrivilege(ctx, sysTable, privilege.SELECT) != nil {
+			if ok, err := p.HasPrivilege(ctx, sysTable, privilege.SELECT, p.User()); err != nil {
+				return err
+			} else if !ok {
 				return nil
 			}
 		}
@@ -5120,7 +5292,9 @@ CREATE TABLE crdb_internal.kv_catalog_comments (
 		// Delegate privilege check to system table.
 		{
 			sysTable := all.LookupDescriptor(systemschema.CommentsTable.GetID())
-			if p.CheckPrivilege(ctx, sysTable, privilege.SELECT) != nil {
+			if ok, err := p.HasPrivilege(ctx, sysTable, privilege.SELECT, p.User()); err != nil {
+				return err
+			} else if !ok {
 				return nil
 			}
 		}
@@ -5230,7 +5404,7 @@ func collectMarshaledJobMetadataMap(
 	// Build job map with referenced job IDs.
 	m := make(marshaledJobMetadataMap)
 	query := `SELECT id, status, payload, progress FROM system.jobs`
-	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
+	it, err := p.InternalSQLTxn().QueryIteratorEx(
 		ctx, "crdb-internal-jobs-table", p.Txn(),
 		sessiondata.RootUserSessionDataOverride,
 		query)
@@ -5264,10 +5438,10 @@ func collectMarshaledJobMetadataMap(
 	if err := it.Close(); err != nil {
 		return nil, err
 	}
-	for _, record := range p.ExtendedEvalContext().SchemaChangeJobRecords {
+	if err := p.ExtendedEvalContext().jobs.forEachToCreate(func(record *jobs.Record) error {
 		progressBytes, payloadBytes, err := getPayloadAndProgressFromJobsRecord(p, record)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		mj := marshaledJobMetadata{
 			status:        tree.NewDString(string(record.RunningStatus)),
@@ -5275,6 +5449,9 @@ func collectMarshaledJobMetadataMap(
 			progressBytes: progressBytes,
 		}
 		m[record.JobID] = mj
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return m, nil
 }
@@ -5697,8 +5874,8 @@ CREATE TABLE crdb_internal.lost_descriptors_with_data (
 			endPrefix := p.extendedEvalCtx.Codec.TablePrefix(uint32(endID - 1)).PrefixEnd()
 			var b kv.Batch
 			b.Header.MaxSpanRequestKeys = 1
-			scanRequest := roachpb.NewScan(startPrefix, endPrefix, false).(*roachpb.ScanRequest)
-			scanRequest.ScanFormat = roachpb.BATCH_RESPONSE
+			scanRequest := kvpb.NewScan(startPrefix, endPrefix, false).(*kvpb.ScanRequest)
+			scanRequest.ScanFormat = kvpb.BATCH_RESPONSE
 			b.AddRawRequest(scanRequest)
 			err = p.execCfg.DB.Run(ctx, &b)
 			if err != nil {
@@ -5973,7 +6150,7 @@ CREATE TABLE crdb_internal.cluster_statement_statistics (
 			return memSQLStats.IterateStatementStats(ctx, &sqlstats.IteratorOptions{
 				SortedAppNames: true,
 				SortedKey:      true,
-			}, func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+			}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 
 				aggregatedTs, err := tree.MakeDTimestampTZ(curAggTs, time.Microsecond)
 				if err != nil {
@@ -6048,7 +6225,7 @@ SELECT
   crdb_internal.merge_statement_stats(array_agg(DISTINCT statistics)),
   max(sampled_plan),
   aggregation_interval,
-  array_remove(array_agg(index_rec), NULL) AS index_recommendations
+  array_remove(array_cat_agg(index_recommendations), NULL) AS index_recommendations
 FROM (
   SELECT
       aggregated_ts,
@@ -6078,7 +6255,6 @@ FROM (
       FROM
           system.statement_statistics
 )
-LEFT JOIN LATERAL unnest(index_recommendations) AS index_rec ON true
 GROUP BY
   aggregated_ts,
   fingerprint_id,
@@ -6208,7 +6384,7 @@ CREATE TABLE crdb_internal.cluster_transaction_statistics (
 				SortedKey:      true,
 			}, func(
 				ctx context.Context,
-				statistics *roachpb.CollectedTransactionStatistics) error {
+				statistics *appstatspb.CollectedTransactionStatistics) error {
 
 				aggregatedTs, err := tree.MakeDTimestampTZ(curAggTs, time.Microsecond)
 				if err != nil {
@@ -6298,6 +6474,59 @@ GROUP BY
 	},
 }
 
+var crdbInternalDroppedRelationsView = virtualSchemaView{
+	schema: `
+CREATE VIEW crdb_internal.kv_dropped_relations AS
+WITH
+	dropped_relations
+		AS (
+			SELECT
+				id,
+				(descriptor->'table'->>'name') AS name,
+				(descriptor->'table'->'parentId')::INT8 AS parent_id,
+				(descriptor->'table'->'unexposedParentSchemaId')::INT8
+					AS parent_schema_id,
+				to_timestamp(
+					((descriptor->'table'->>'dropTime')::DECIMAL * 0.000000001)::FLOAT8
+				)
+					AS drop_time
+			FROM
+				crdb_internal.kv_catalog_descriptor
+			WHERE
+				descriptor->'table'->>'state' = 'DROP'
+		),
+	gc_ttl
+		AS (
+			SELECT
+				id, (config->'gc'->'ttlSeconds')::INT8 AS ttl
+			FROM
+				crdb_internal.kv_catalog_zones
+		)
+SELECT
+	dr.parent_id,
+	dr.parent_schema_id,
+	dr.name,
+	dr.id,
+	dr.drop_time,
+	COALESCE(gc.ttl, db_gc.ttl, root_gc.ttl) * '1 second'::INTERVAL AS ttl
+FROM
+	dropped_relations AS dr
+	LEFT JOIN gc_ttl AS gc ON gc.id = dr.id
+	LEFT JOIN gc_ttl AS db_gc ON db_gc.id = dr.parent_id
+	LEFT JOIN gc_ttl AS root_gc ON root_gc.id = 0
+ORDER BY
+	parent_id, parent_schema_id, id`,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "parent_id", Typ: types.Int},
+		{Name: "parent_schema_id", Typ: types.Int},
+		{Name: "name", Typ: types.String},
+		{Name: "id", Typ: types.Int},
+		{Name: "drop_time", Typ: types.Timestamp},
+		{Name: "ttl", Typ: types.Interval},
+	},
+	comment: "kv_dropped_relations contains all dropped relations waiting for garbage collection",
+}
+
 // crdbInternalTenantUsageDetailsView, exposes system ranges.
 var crdbInternalTenantUsageDetailsView = virtualSchemaView{
 	schema: `
@@ -6352,7 +6581,16 @@ CREATE TABLE crdb_internal.transaction_contention_events (
     waiting_txn_fingerprint_id   BYTES NOT NULL,
 
     contention_duration          INTERVAL NOT NULL,
-    contending_key               BYTES NOT NULL
+    contending_key               BYTES NOT NULL,
+    contending_pretty_key     	 STRING NOT NULL,
+		    
+    waiting_stmt_id              string NOT NULL,
+    waiting_stmt_fingerprint_id  BYTES NOT NULL,
+    
+    database_name       				 STRING NOT NULL,
+    schema_name         				 STRING NOT NULL,
+    table_name          				 STRING NOT NULL,
+    index_name          				 STRING
 );`,
 	generator: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		// Check permission first before making RPC fanout.
@@ -6361,8 +6599,7 @@ CREATE TABLE crdb_internal.transaction_contention_events (
 			return nil, nil, err
 		}
 		if !hasPermission {
-			return nil, nil, errors.New("crdb_internal.transaction_contention_events " +
-				"requires VIEWACTIVITY or VIEWACTIVITYREDACTED role option")
+			return nil, nil, noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
 		// If a user has VIEWACTIVITYREDACTED role option but the user does not
@@ -6418,10 +6655,23 @@ CREATE TABLE crdb_internal.transaction_contention_events (
 					types.DefaultIntervalTypeMetadata,
 				)
 
+				contendingPrettyKey := tree.NewDString("")
 				contendingKey := tree.NewDBytes("")
 				if !shouldRedactContendingKey {
+					decodedKey, _, _ := keys.DecodeTenantPrefix(resp.Events[i].BlockingEvent.Key)
+					contendingPrettyKey = tree.NewDString(keys.PrettyPrint(nil /* valDirs */, decodedKey))
 					contendingKey = tree.NewDBytes(
-						tree.DBytes(resp.Events[i].BlockingEvent.Key))
+						tree.DBytes(decodedKey))
+				}
+
+				waitingStmtFingerprintID := tree.NewDBytes(
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(resp.Events[i].WaitingStmtFingerprintID))))
+
+				waitingStmtId := tree.NewDString(hex.EncodeToString(resp.Events[i].WaitingStmtID.GetBytes()))
+
+				schemaName, dbName, tableName, indexName, err := getContentionEventInfo(ctx, p, resp.Events[i])
+				if err != nil {
+					return err
 				}
 
 				row = row[:0]
@@ -6430,9 +6680,16 @@ CREATE TABLE crdb_internal.transaction_contention_events (
 					tree.NewDUuid(tree.DUuid{UUID: resp.Events[i].BlockingEvent.TxnMeta.ID}), // blocking_txn_id
 					blockingFingerprintID, // blocking_fingerprint_id
 					tree.NewDUuid(tree.DUuid{UUID: resp.Events[i].WaitingTxnID}), // waiting_txn_id
-					waitingFingerprintID, // waiting_fingerprint_id
-					contentionDuration,   // contention_duration
-					contendingKey,        // contending_key
+					waitingFingerprintID,        // waiting_fingerprint_id
+					contentionDuration,          // contention_duration
+					contendingKey,               // contending_key,
+					contendingPrettyKey,         // contending_pretty_key
+					waitingStmtId,               // waiting_stmt_id
+					waitingStmtFingerprintID,    // waiting_stmt_fingerprint_id
+					tree.NewDString(dbName),     // database_name
+					tree.NewDString(schemaName), // schema_name
+					tree.NewDString(tableName),  // table_name
+					tree.NewDString(indexName),  // index_name
 				)
 
 				if err = pusher.pushRow(row...); err != nil {
@@ -6626,8 +6883,7 @@ func genClusterLocksGenerator(
 			return nil, nil, err
 		}
 		if !hasViewActivityOrViewActivityRedacted {
-			return nil, nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-				"user %s does not have %s or %s privilege", p.User(), roleoption.VIEWACTIVITY, roleoption.VIEWACTIVITYREDACTED)
+			return nil, nil, noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 		shouldRedactKeys := false
 		if !hasAdmin {
@@ -6643,19 +6899,24 @@ func genClusterLocksGenerator(
 		}
 		descs := all.OrderedDescriptors()
 
-		privCheckerFunc := func(desc catalog.Descriptor) bool {
+		privCheckerFunc := func(desc catalog.Descriptor) (bool, error) {
 			if hasAdmin {
-				return true
+				return true, nil
 			}
-			return p.CheckAnyPrivilege(ctx, desc) == nil
+			return p.HasAnyPrivilege(ctx, desc)
 		}
 
-		_, dbNames, tableNames, schemaNames, indexNames, schemaParents, parents :=
+		_, dbNames, tableNames, schemaNames, indexNames, schemaParents, parents, err :=
 			descriptorsByType(descs, privCheckerFunc)
+		if err != nil {
+			return nil, nil, err
+		}
 
 		var spansToQuery roachpb.Spans
 		for _, desc := range descs {
-			if !privCheckerFunc(desc) {
+			if ok, err := privCheckerFunc(desc); err != nil {
+				return nil, nil, err
+			} else if !ok {
 				continue
 			}
 			switch desc := desc.(type) {
@@ -6687,14 +6948,14 @@ func genClusterLocksGenerator(
 			return &nextSpan
 		}
 
-		var resp *roachpb.QueryLocksResponse
+		var resp *kvpb.QueryLocksResponse
 		var locks []roachpb.LockStateInfo
 		var resumeSpan *roachpb.Span
 
 		fetchLocks := func(key, endKey roachpb.Key) error {
 			b := kv.Batch{}
-			queryLocksRequest := &roachpb.QueryLocksRequest{
-				RequestHeader: roachpb.RequestHeader{
+			queryLocksRequest := &kvpb.QueryLocksRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key:    key,
 					EndKey: endKey,
 				},
@@ -6886,7 +7147,168 @@ func populateClusterLocksWithFilter(
 	return matched, err
 }
 
+// This is the table structure for both {cluster,node}_txn_execution_insights.
+const txnExecutionInsightsSchemaPattern = `
+CREATE TABLE crdb_internal.%s (
+  txn_id                     UUID NOT NULL,
+  txn_fingerprint_id         BYTES NOT NULL,
+  query                      STRING NOT NULL,
+  implicit_txn               BOOL NOT NULL,
+  session_id                 STRING NOT NULL,
+  start_time                 TIMESTAMP NOT NULL,
+  end_time                   TIMESTAMP NOT NULL,
+  user_name                  STRING NOT NULL,
+  app_name                   STRING NOT NULL,
+  rows_read                  INT8 NOT NULL,
+  rows_written               INT8 NOT NULL,
+  priority                   STRING NOT NULL,
+  retries                    INT8 NOT NULL,
+  last_retry_reason          STRING,
+  contention                 INTERVAL,
+  problems                   STRING[] NOT NULL,
+  causes                     STRING[] NOT NULL,
+  stmt_execution_ids         STRING[] NOT NULL,
+  cpu_sql_nanos              INT8,
+  last_error_code            STRING
+)`
+
+var crdbInternalClusterTxnExecutionInsightsTable = virtualSchemaTable{
+	schema:  fmt.Sprintf(txnExecutionInsightsSchemaPattern, "cluster_txn_execution_insights"),
+	comment: `Cluster transaction execution insights`,
+	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
+		return populateTxnExecutionInsights(ctx, p, addRow, &serverpb.ListExecutionInsightsRequest{})
+	},
+}
+
+var crdbInternalNodeTxnExecutionInsightsTable = virtualSchemaTable{
+	schema:  fmt.Sprintf(txnExecutionInsightsSchemaPattern, "node_txn_execution_insights"),
+	comment: `Node transaction execution insights`,
+	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
+		return populateTxnExecutionInsights(ctx, p, addRow, &serverpb.ListExecutionInsightsRequest{NodeID: "local"})
+	},
+}
+
+func populateTxnExecutionInsights(
+	ctx context.Context,
+	p *planner,
+	addRow func(...tree.Datum) error,
+	request *serverpb.ListExecutionInsightsRequest,
+) (err error) {
+	hasRoleOption, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+	if err != nil {
+		return err
+	}
+	if !hasRoleOption {
+		return noViewActivityOrViewActivityRedactedRoleError(p.User())
+	}
+
+	response, err := p.extendedEvalCtx.SQLStatusServer.ListExecutionInsights(ctx, request)
+	if err != nil {
+		return err
+	}
+
+	// We should truncate the query if it surpasses some absurd limit.
+	queryMax := 5000
+	for _, insight := range response.Insights {
+		var errorCode string
+		var queryBuilder strings.Builder
+		for i := range insight.Statements {
+			// Build query string.
+			remaining := queryMax - queryBuilder.Len()
+			if len(insight.Statements[i].Query) > remaining {
+				if remaining > 0 {
+					queryBuilder.WriteString(insight.Statements[i].Query[:remaining] + "...")
+				}
+				break
+			}
+			if i > 0 {
+				queryBuilder.WriteString(" ; ")
+			}
+			queryBuilder.WriteString(insight.Statements[i].Query)
+
+			if insight.Statements[i].ErrorCode != "" {
+				errorCode = insight.Statements[i].ErrorCode
+			}
+		}
+
+		problems := tree.NewDArray(types.String)
+		for i := range insight.Transaction.Problems {
+			if err = problems.Append(tree.NewDString(insight.Transaction.Problems[i].String())); err != nil {
+				return err
+			}
+		}
+
+		causes := tree.NewDArray(types.String)
+		for i := range insight.Transaction.Causes {
+			if err = causes.Append(tree.NewDString(insight.Transaction.Causes[i].String())); err != nil {
+				return err
+			}
+		}
+
+		var startTimestamp *tree.DTimestamp
+		startTimestamp, err = tree.MakeDTimestamp(insight.Transaction.StartTime, time.Nanosecond)
+		if err != nil {
+			return err
+		}
+
+		var endTimestamp *tree.DTimestamp
+		endTimestamp, err = tree.MakeDTimestamp(insight.Transaction.EndTime, time.Nanosecond)
+		if err != nil {
+			return err
+		}
+
+		autoRetryReason := tree.DNull
+		if insight.Transaction.AutoRetryReason != "" {
+			autoRetryReason = tree.NewDString(insight.Transaction.AutoRetryReason)
+		}
+
+		contentionTime := tree.DNull
+		if insight.Transaction.Contention != nil {
+			contentionTime = tree.NewDInterval(
+				duration.MakeDuration(insight.Transaction.Contention.Nanoseconds(), 0, 0),
+				types.DefaultIntervalTypeMetadata,
+			)
+		}
+
+		stmtIDs := tree.NewDArray(types.String)
+		for _, id := range insight.Transaction.StmtExecutionIDs {
+			if err = stmtIDs.Append(tree.NewDString(hex.EncodeToString(id.GetBytes()))); err != nil {
+				return err
+			}
+		}
+
+		err = errors.CombineErrors(err, addRow(
+			tree.NewDUuid(tree.DUuid{UUID: insight.Transaction.ID}),
+			tree.NewDBytes(tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(insight.Transaction.FingerprintID)))),
+			tree.NewDString(queryBuilder.String()),
+			tree.MakeDBool(tree.DBool(insight.Transaction.ImplicitTxn)),
+			tree.NewDString(hex.EncodeToString(insight.Session.ID.GetBytes())),
+			startTimestamp,
+			endTimestamp,
+			tree.NewDString(insight.Transaction.User),
+			tree.NewDString(insight.Transaction.ApplicationName),
+			tree.NewDInt(tree.DInt(insight.Transaction.RowsRead)),
+			tree.NewDInt(tree.DInt(insight.Transaction.RowsWritten)),
+			tree.NewDString(insight.Transaction.UserPriority),
+			tree.NewDInt(tree.DInt(insight.Transaction.RetryCount)),
+			autoRetryReason,
+			contentionTime,
+			problems,
+			causes,
+			stmtIDs,
+			tree.NewDInt(tree.DInt(insight.Transaction.CPUSQLNanos)),
+			tree.NewDString(errorCode),
+		))
+
+		if err != nil {
+			return err
+		}
+	}
+	return
+}
+
 // This is the table structure for both cluster_execution_insights and node_execution_insights.
+// Both contain statement execution insights.
 const executionInsightsSchemaPattern = `
 CREATE TABLE crdb_internal.%s (
 	session_id                 STRING NOT NULL,
@@ -6912,26 +7334,39 @@ CREATE TABLE crdb_internal.%s (
 	last_retry_reason          STRING,
 	exec_node_ids              INT[] NOT NULL,
 	contention                 INTERVAL,
-	contention_events          JSONB,
 	index_recommendations      STRING[] NOT NULL,
-	implicit_txn               BOOL NOT NULL
+	implicit_txn               BOOL NOT NULL,
+	cpu_sql_nanos              INT8,
+    error_code                 STRING
 )`
 
 var crdbInternalClusterExecutionInsightsTable = virtualSchemaTable{
-	schema: fmt.Sprintf(executionInsightsSchemaPattern, "cluster_execution_insights"),
+	schema:  fmt.Sprintf(executionInsightsSchemaPattern, "cluster_execution_insights"),
+	comment: `Cluster-wide statement execution insights`,
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
-		return populateExecutionInsights(ctx, p, addRow, &serverpb.ListExecutionInsightsRequest{})
+		return populateStmtInsights(ctx, p, addRow, &serverpb.ListExecutionInsightsRequest{})
 	},
 }
 
 var crdbInternalNodeExecutionInsightsTable = virtualSchemaTable{
-	schema: fmt.Sprintf(executionInsightsSchemaPattern, "node_execution_insights"),
+	schema:  fmt.Sprintf(executionInsightsSchemaPattern, "node_execution_insights"),
+	comment: `Node statement execution insights`,
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
-		return populateExecutionInsights(ctx, p, addRow, &serverpb.ListExecutionInsightsRequest{NodeID: "local"})
+		return populateStmtInsights(ctx, p, addRow, &serverpb.ListExecutionInsightsRequest{NodeID: "local"})
 	},
 }
 
-func populateExecutionInsights(
+func noViewActivityOrViewActivityRedactedRoleError(user username.SQLUsername) error {
+	return pgerror.Newf(
+		pgcode.InsufficientPrivilege,
+		"user %s does not have %s or %s privilege",
+		user,
+		roleoption.VIEWACTIVITY,
+		roleoption.VIEWACTIVITYREDACTED,
+	)
+}
+
+func populateStmtInsights(
 	ctx context.Context,
 	p *planner,
 	addRow func(...tree.Datum) error,
@@ -6942,13 +7377,7 @@ func populateExecutionInsights(
 		return err
 	}
 	if !hasRoleOption {
-		return pgerror.Newf(
-			pgcode.InsufficientPrivilege,
-			"user %s does not have %s or %s privilege",
-			p.User(),
-			roleoption.VIEWACTIVITY,
-			roleoption.VIEWACTIVITYREDACTED,
-		)
+		return noViewActivityOrViewActivityRedactedRoleError(p.User())
 	}
 
 	response, err := p.extendedEvalCtx.SQLStatusServer.ListExecutionInsights(ctx, request)
@@ -6997,17 +7426,6 @@ func populateExecutionInsights(
 				)
 			}
 
-			contentionEvents := tree.DNull
-			if len(s.ContentionEvents) > 0 {
-				var contentionEventsJSON json.JSON
-				contentionEventsJSON, err = convertContentionEventsToJSON(ctx, p, s.ContentionEvents)
-				if err != nil {
-					return err
-				}
-
-				contentionEvents = tree.NewDJSON(contentionEventsJSON)
-			}
-
 			indexRecommendations := tree.NewDArray(types.String)
 			for _, recommendation := range s.IndexRecommendations {
 				if err = indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
@@ -7039,66 +7457,154 @@ func populateExecutionInsights(
 				autoRetryReason,
 				execNodeIDs,
 				contentionTime,
-				contentionEvents,
 				indexRecommendations,
 				tree.MakeDBool(tree.DBool(insight.Transaction.ImplicitTxn)),
+				tree.NewDInt(tree.DInt(s.CPUSQLNanos)),
+				tree.NewDString(s.ErrorCode),
 			))
 		}
 	}
 	return
 }
 
-func convertContentionEventsToJSON(
-	ctx context.Context, p *planner, contentionEvents []roachpb.ContentionEvent,
-) (json json.JSON, err error) {
+func getContentionEventInfo(
+	ctx context.Context, p *planner, contentionEvent contentionpb.ExtendedContentionEvent,
+) (schemaName, dbName, tableName, indexName string, err error) {
 
-	eventWithNames := make([]sqlstatsutil.ContentionEventWithNames, len(contentionEvents))
-	for i, contentionEvent := range contentionEvents {
-		_, tableID, err := p.ExecCfg().Codec.DecodeTablePrefix(contentionEvent.Key)
-		if err != nil {
-			return nil, err
-		}
-		_, _, indexID, err := p.ExecCfg().Codec.DecodeIndexPrefix(contentionEvent.Key)
-		if err != nil {
-			return nil, err
-		}
-
-		desc := p.Descriptors()
-		var tableDesc catalog.TableDescriptor
-		tableDesc, err = desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
-		if err != nil {
-			return nil, err
-		}
-
-		idxDesc, err := tableDesc.FindIndexWithID(descpb.IndexID(indexID))
-		if err != nil {
-			return nil, err
-		}
-
-		dbDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Database(ctx, tableDesc.GetParentID())
-		if err != nil {
-			return nil, err
-		}
-
-		schemaDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, tableDesc.GetParentSchemaID())
-		if err != nil {
-			return nil, err
-		}
-
-		var idxName string
-		if idxDesc != nil {
-			idxName = idxDesc.GetName()
-		}
-
-		eventWithNames[i] = sqlstatsutil.ContentionEventWithNames{
-			BlockingTransactionID: contentionEvent.TxnMeta.ID.String(),
-			SchemaName:            schemaDesc.GetName(),
-			DatabaseName:          dbDesc.GetName(),
-			TableName:             tableDesc.GetName(),
-			IndexName:             idxName,
-			DurationInMs:          float64(contentionEvent.Duration) / float64(time.Millisecond),
-		}
+	_, tableID, err := p.ExecCfg().Codec.DecodeTablePrefix(contentionEvent.BlockingEvent.Key)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	_, _, indexID, err := p.ExecCfg().Codec.DecodeIndexPrefix(contentionEvent.BlockingEvent.Key)
+	if err != nil {
+		return "", "", "", "", err
 	}
 
-	return sqlstatsutil.BuildContentionEventsJSON(eventWithNames)
+	desc := p.Descriptors()
+	var tableDesc catalog.TableDescriptor
+	tableDesc, err = desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
+	if err != nil {
+		return "", "", fmt.Sprintf("[dropped table id: %d]", tableID), "[dropped index]", nil //nolint:returnerrcheck
+	}
+
+	var idxName string
+	idxDesc, err := catalog.MustFindIndexByID(tableDesc, descpb.IndexID(indexID))
+	if err != nil {
+		idxName = fmt.Sprintf("[dropped index id: %d]", indexID)
+	}
+	if idxDesc != nil {
+		idxName = idxDesc.GetName()
+	}
+
+	var databaseName string
+	dbDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Database(ctx, tableDesc.GetParentID())
+	if err != nil {
+		databaseName = "[dropped database]"
+	}
+	if dbDesc != nil {
+		databaseName = dbDesc.GetName()
+	}
+
+	var schName string
+	schemaDesc, err := desc.ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, tableDesc.GetParentSchemaID())
+	if err != nil {
+		schName = "[dropped schema]"
+	}
+	if dbDesc != nil {
+		schName = schemaDesc.GetName()
+	}
+
+	return schName, databaseName, tableDesc.GetName(), idxName, nil
+}
+
+var crdbInternalNodeMemoryMonitors = virtualSchemaTable{
+	comment: `node-level table listing all currently active memory monitors`,
+	schema: `
+CREATE TABLE crdb_internal.node_memory_monitors (
+  level             INT8,
+  name              STRING,
+  id                INT8,
+  parent_id         INT8,
+  used              INT8,
+  reserved_used     INT8,
+  reserved_reserved INT8
+);`,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		// The memory monitors' names can expose some information about the
+		// activity on the node, so we require VIEWACTIVITY or
+		// VIEWACTIVITYREDACTED permissions.
+		hasRoleOption, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+		if err != nil {
+			return err
+		}
+		if !hasRoleOption {
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
+		}
+
+		monitorStateCb := func(monitor mon.MonitorState) error {
+			return addRow(
+				tree.NewDInt(tree.DInt(monitor.Level)),
+				tree.NewDString(monitor.Name),
+				tree.NewDInt(tree.DInt(monitor.ID)),
+				tree.NewDInt(tree.DInt(monitor.ParentID)),
+				tree.NewDInt(tree.DInt(monitor.Used)),
+				tree.NewDInt(tree.DInt(monitor.ReservedUsed)),
+				tree.NewDInt(tree.DInt(monitor.ReservedReserved)),
+			)
+		}
+		return p.extendedEvalCtx.ExecCfg.RootMemoryMonitor.TraverseTree(monitorStateCb)
+	},
+}
+
+var crdbInternalShowTenantCapabilitiesCache = virtualSchemaTable{
+	comment: `eventually consistent in-memory tenant capability cache for this node`,
+	schema: `
+CREATE TABLE crdb_internal.node_tenant_capabilities_cache (
+  tenant_id        INT,
+  capability_id    STRING,
+  capability_value STRING
+);`,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		const op = "node_tenant_capabilities_cache"
+		if err := p.RequireAdminRole(ctx, op); err != nil {
+			return err
+		}
+		tenantCapabilitiesReader, err := p.ExecCfg().TenantCapabilitiesReader.Get(op)
+		if err != nil {
+			return err
+		}
+		type tenantCapabilitiesEntry struct {
+			tenantID           roachpb.TenantID
+			tenantCapabilities tenantcapabilities.TenantCapabilities
+		}
+		tenantCapabilitiesMap := tenantCapabilitiesReader.GetCapabilitiesMap()
+		tenantCapabilitiesEntries := make([]tenantCapabilitiesEntry, 0, len(tenantCapabilitiesMap))
+		for tenantID, tenantCapabilities := range tenantCapabilitiesMap {
+			tenantCapabilitiesEntries = append(
+				tenantCapabilitiesEntries,
+				tenantCapabilitiesEntry{
+					tenantID:           tenantID,
+					tenantCapabilities: tenantCapabilities,
+				},
+			)
+		}
+		// Sort by tenant ID.
+		sort.Slice(tenantCapabilitiesEntries, func(i, j int) bool {
+			return tenantCapabilitiesEntries[i].tenantID.ToUint64() < tenantCapabilitiesEntries[j].tenantID.ToUint64()
+		})
+		for _, tenantCapabilitiesEntry := range tenantCapabilitiesEntries {
+			tenantID := tree.NewDInt(tree.DInt(tenantCapabilitiesEntry.tenantID.ToUint64()))
+			for _, capabilityID := range tenantcapabilities.CapabilityIDs {
+				capabilityValue := tenantCapabilitiesEntry.tenantCapabilities.Cap(capabilityID).Get().String()
+				if err := addRow(
+					tenantID,
+					tree.NewDString(capabilityID.String()),
+					tree.NewDString(capabilityValue),
+				); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	},
 }

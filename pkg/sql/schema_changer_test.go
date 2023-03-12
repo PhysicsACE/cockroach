@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -44,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -98,9 +100,8 @@ func TestSchemaChangeProcess(t *testing.T) {
 	leaseMgr := lease.NewLeaseManager(
 		s.AmbientCtx(),
 		execCfg.NodeInfo.NodeID,
-		execCfg.DB,
+		s.InternalDB().(isql.DB),
 		execCfg.Clock,
-		execCfg.InternalExecutor,
 		execCfg.Settings,
 		execCfg.Codec,
 		lease.ManagerTestingKnobs{},
@@ -121,7 +122,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	tableID := descpb.ID(sqlutils.QueryTableID(t, sqlDB, "t", "public", "test"))
 
 	changer := sql.NewSchemaChangerForTesting(
-		tableID, 0, instance, kvDB, leaseMgr, jobRegistry, &execCfg, cluster.MakeTestingClusterSettings())
+		tableID, 0, instance, execCfg.InternalDB, leaseMgr, jobRegistry, &execCfg, cluster.MakeTestingClusterSettings())
 
 	// Read table descriptor for version.
 	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
@@ -148,7 +149,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	index.ID = tableDesc.NextIndexID
 	tableDesc.NextIndexID++
 	changer = sql.NewSchemaChangerForTesting(
-		tableID, tableDesc.NextMutationID, instance, kvDB, leaseMgr, jobRegistry,
+		tableID, tableDesc.NextMutationID, instance, execCfg.InternalDB, leaseMgr, jobRegistry,
 		&execCfg, cluster.MakeTestingClusterSettings(),
 	)
 	tableDesc.TableDesc().Mutations = append(tableDesc.TableDesc().Mutations, descpb.DescriptorMutation{
@@ -1335,8 +1336,8 @@ func TestSchemaChangeRetry(t *testing.T) {
 			if rand.Intn(2) == 0 {
 				return context.DeadlineExceeded
 			} else {
-				errAmbiguous := &roachpb.AmbiguousResultError{}
-				return roachpb.NewError(errAmbiguous).GoError()
+				errAmbiguous := &kvpb.AmbiguousResultError{}
+				return kvpb.NewError(errAmbiguous).GoError()
 			}
 		}
 		if sp.Key != nil && seenSpan.Key != nil {
@@ -1457,8 +1458,8 @@ func TestSchemaChangeRetryOnVersionChange(t *testing.T) {
 					// version and retry the backfill. Since, the new index backfiller
 					// does not repeat this DistSQL setup step unless retried, we must
 					// force a retry.
-					errAmbiguous := &roachpb.AmbiguousResultError{}
-					return roachpb.NewError(errAmbiguous).GoError()
+					errAmbiguous := &kvpb.AmbiguousResultError{}
+					return kvpb.NewError(errAmbiguous).GoError()
 				}
 				if seenSpan.Key != nil {
 					if !seenSpan.EndKey.Equal(sp.EndKey) {
@@ -1502,13 +1503,13 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		// just waiting for the lease to expire.
 		timeoutCtx, cancel := context.WithTimeout(ctx, base.DefaultDescriptorLeaseDuration/2)
 		defer cancel()
-		if err := sql.TestingDescsTxn(timeoutCtx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-			tbl, err := col.MutableByID(txn).Table(ctx, tableDesc.GetID())
+		if err := sql.TestingDescsTxn(timeoutCtx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			tbl, err := col.MutableByID(txn.KV()).Table(ctx, tableDesc.GetID())
 			if err != nil {
 				return err
 			}
 			tbl.Version++
-			ba := txn.NewBatch()
+			ba := txn.KV().NewBatch()
 			if err := col.WriteDescToBatch(ctx, false /* kvTrace */, tbl, ba); err != nil {
 				return err
 			}
@@ -1522,7 +1523,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 			// to exist on the object passed to descs.Txn, but, we have it, and it's
 			// effective, so, let's use it.
 			defer col.ReleaseAll(ctx)
-			return txn.Run(ctx, ba)
+			return txn.KV().Run(ctx, ba)
 		}); err != nil {
 			t.Error(err)
 		}
@@ -4534,8 +4535,8 @@ func TestIndexBackfillAfterGC(t *testing.T) {
 			return nil
 		}
 		gcAt = tc.Server(0).Clock().Now()
-		gcr := roachpb.GCRequest{
-			RequestHeader: roachpb.RequestHeaderFromSpan(sp),
+		gcr := kvpb.GCRequest{
+			RequestHeader: kvpb.RequestHeaderFromSpan(sp),
 			Threshold:     gcAt,
 		}
 		_, err := kv.SendWrapped(ctx, tc.Server(0).DistSenderI().(*kvcoord.DistSender), &gcr)
@@ -6478,7 +6479,7 @@ CREATE INDEX i ON t.test (a) WHERE b > 2
 	}
 
 	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	index, err := tableDesc.FindIndexWithName("i")
+	index, err := catalog.MustFindIndexByName(tableDesc, "i")
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}

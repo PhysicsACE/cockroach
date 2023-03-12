@@ -427,20 +427,23 @@ vectorized: true
         │       │           │   └── • virtual table
         │       │           │         table: pg_namespace@primary
         │       │           │
-        │       │           └── • hash join (left outer)
+        │       │           └── • merge join (left outer)
         │       │               │ equality: (oid) = (objoid)
         │       │               │
         │       │               ├── • filter
         │       │               │   │ filter: relkind IN ('S', 'm', 'r', 'v')
         │       │               │   │
         │       │               │   └── • virtual table
-        │       │               │         table: pg_class@primary
+        │       │               │         table: pg_class@pg_class_oid_idx
         │       │               │
-        │       │               └── • filter
-        │       │                   │ filter: objsubid = 0
+        │       │               └── • sort
+        │       │                   │ order: +objoid
         │       │                   │
-        │       │                   └── • virtual table
-        │       │                         table: pg_description@primary
+        │       │                   └── • filter
+        │       │                       │ filter: (objsubid = 0) AND (classoid = 4294967112)
+        │       │                       │
+        │       │                       └── • virtual table
+        │       │                             table: pg_description@primary
         │       │
         │       └── • virtual table
         │             table: table_row_statistics@primary
@@ -595,11 +598,37 @@ vectorized: true
 │
 └── • render
     │
-    └── • filter
-        │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+    └── • virtual table lookup join
+        │ table: pg_namespace@pg_namespace_oid_idx
+        │ equality: (relnamespace) = (oid)
+        │ pred: nspname = index_schema
         │
-        └── • virtual table
-              table: statistics@primary
+        └── • hash join
+            │ equality: (indexrelid, indrelid) = (oid, oid)
+            │
+            ├── • virtual table
+            │     table: pg_index@primary
+            │
+            └── • hash join
+                │ equality: (relname, relnamespace) = (index_name, relnamespace)
+                │
+                ├── • virtual table
+                │     table: pg_class@primary
+                │
+                └── • merge join
+                    │ equality: (relname) = (table_name)
+                    │
+                    ├── • filter
+                    │   │ filter: relname = 'foo'
+                    │   │
+                    │   └── • virtual table
+                    │         table: pg_class@primary
+                    │
+                    └── • filter
+                        │ filter: ((table_name = 'foo') AND (table_catalog = 'test')) AND (table_schema = 'public')
+                        │
+                        └── • virtual table
+                              table: statistics@primary
 
 query T
 EXPLAIN SHOW CONSTRAINTS FROM foo
@@ -1035,7 +1064,7 @@ vectorized: true
 ·
 index recommendations: 1
 1. type: index creation
-   SQL command: CREATE INDEX ON t (v);
+   SQL command: CREATE INDEX ON test.public.t (v);
 
 query T
 EXPLAIN (TYPES) VALUES (1, 2, 3), (4, 5, 6)
@@ -1095,7 +1124,7 @@ vectorized: true
 ·
 index recommendations: 1
 1. type: index creation
-   SQL command: CREATE INDEX ON t (v);
+   SQL command: CREATE INDEX ON test.public.t (v);
 
 query T
 EXPLAIN (TYPES) UPDATE t SET v = k + 1 WHERE v > 123
@@ -1129,7 +1158,7 @@ vectorized: true
 ·
 index recommendations: 1
 1. type: index creation
-   SQL command: CREATE INDEX ON t (v);
+   SQL command: CREATE INDEX ON test.public.t (v);
 
 query T
 EXPLAIN (TYPES) VALUES (1) UNION VALUES (2)
@@ -1183,7 +1212,7 @@ vectorized: true
 ·
 index recommendations: 1
 1. type: index creation
-   SQL command: CREATE INDEX ON t (v);
+   SQL command: CREATE INDEX ON test.public.t (v);
 
 query T
 EXPLAIN (TYPES) SELECT v FROM t LIMIT 1
@@ -1220,7 +1249,39 @@ vectorized: true
 ·
 index recommendations: 1
 1. type: index replacement
-   SQL commands: CREATE INDEX ON tt (x) STORING (y); DROP INDEX tt@a;
+   SQL commands: CREATE INDEX ON test.public.tt (x) STORING (y); DROP INDEX test.public.tt@a;
+
+statement ok
+CREATE DATABASE another_db;
+USE another_db;
+CREATE SCHEMA sc;
+
+statement ok
+CREATE TABLE another_db.sc.t (
+  k INT PRIMARY KEY,
+  a INT
+)
+
+query T
+EXPLAIN SELECT * FROM another_db.sc.t WHERE a = 1
+----
+distribution: local
+vectorized: true
+·
+• filter
+│ filter: a = 1
+│
+└── • scan
+      missing stats
+      table: t@t_pkey
+      spans: FULL SCAN
+·
+index recommendations: 1
+1. type: index creation
+   SQL command: CREATE INDEX ON another_db.sc.t (a);
+
+statement ok
+USE test;
 
 # TODO(radu): we don't support placeholders with no values.
 #query TTTTT

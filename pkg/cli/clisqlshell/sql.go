@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
 	"github.com/knz/bubbline/editline"
+	"github.com/knz/bubbline/history"
 )
 
 const (
@@ -80,13 +81,25 @@ Input/Output
   \qecho [STRING]   write the provided string to the query output stream (see \o).
 
 Informational
-  \l                list all databases in the CockroachDB cluster.
-  \dt               show the tables of the current schema in the current database.
-  \dT               show the user defined types of the current database.
-  \du [USER]        list the specified user, or list the users for all databases if no user is specified.
-  \d [TABLE]        show details about columns in the specified table, or alias for '\dt' if no table is specified.
-  \dd TABLE         show details about constraints on the specified table.
-  \df               show the functions that are defined in the current database.
+  \d[tivms][S+] [PATTERN] list stored objects [only tables/indexes/views/matviews/sequences].
+  \dC[S+] [PATTERN] list casts.
+  \dd[S+] [PATTERN] list object descriptions not displayed elsewhere.
+  \df[anptw][S+] [PATTERN] list [only agg/normal/procedures/trigger/window] functions.
+  \dg[S+] [PATTERN] list users and roles.
+  \di[S+] [PATTERN] list only indexes.
+  \dm[S+] [PATTERN] list only materialized views.
+  \dn[S+] [PATTERN] list schemas.
+  \dp [PATTERN]     list table, view, and sequence access privileges.
+  \ds[S+] [PATTERN] list only sequences.
+  \dt[S+] [PATTERN] list only tables.
+  \dT[S+] [PATTERN] list data types.
+  \du[S+] [PATTERN] same as \dg.
+  \dv[S+] [PATTERN] list only views.
+  \l[+] [PATTERN]   list databases.
+  \s                list command history.
+  \sf[+] FUNCNAME   show a function's definition.
+  \sv[+] VIEWNAME   show a view's definition.
+  \z [PATTERN]      same as \dp.
 
 Formatting
   \x [on|off]       toggle records display format.
@@ -266,6 +279,33 @@ func (c *cliState) printCliHelp() {
 		docs.URL("use-the-built-in-sql-client.html"),
 	)
 	fmt.Fprintln(c.iCtx.stdout)
+}
+
+// printCommandHistory prints the recorded command history.
+func (c *cliState) printCommandHistory() {
+	// As long as we preserve compatibility with go-libedit, we cannot
+	// ask the line editor directly for a copy of the history; instead
+	// we need to load it from file.
+
+	// To do so, first we must save it to file: by default, it is
+	// not saved on every input.
+	if err := c.ins.saveHistory(); err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: cannot save history: %v", err)
+		return
+	}
+
+	// Then, we load it back from file. We can use the bubbline loader,
+	// because both bubbline and libedit use the same file format.
+	h, err := history.LoadHistory(c.iCtx.histFile)
+	if err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: cannot load history: %v", err)
+		return
+	}
+
+	// Finally, we can print the entries.
+	for _, entry := range h {
+		fmt.Fprintln(c.iCtx.stdout, entry)
+	}
 }
 
 // addHistory persists a line of input to the readline history file.
@@ -1230,6 +1270,75 @@ func (c *cliState) setupChangefeedOutput() (undo func(), err error) {
 
 }
 
+func (c *cliState) handleDescribe(cmd []string, loopState, errState cliStateEnum) cliStateEnum {
+	var title, sql string
+	var qargs []interface{}
+	var foreach func([]string) []describeStage
+	title, sql, qargs, foreach, c.exitErr = pgInspect(cmd)
+	if c.exitErr != nil {
+		clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+		return errState
+	}
+
+	if title != "" {
+		fmt.Fprintf(c.iCtx.stdout, "%s:\n", title)
+	}
+	var toRun []describeStage
+
+	if foreach == nil {
+		// A single stage.
+		toRun = []describeStage{{sql: sql, qargs: qargs}}
+	} else {
+		// There's N stages, each produced by the foreach function
+		// applied on the result of the original SQL. Used mainly by \d.
+		var rows [][]string
+		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
+			q := clisqlclient.MakeQuery(fmt.Sprintf(sql, qargs...))
+			var err error
+			_, rows, err = c.sqlExecCtx.RunQuery(
+				ctx, c.conn, q,
+				true, /* showMoreChars */
+			)
+			return err
+		})
+		if c.exitErr != nil {
+			if !c.singleStatement {
+				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+			}
+			return errState
+		}
+
+		for _, row := range rows {
+			extraStages := foreach(row)
+			toRun = append(toRun, extraStages...)
+		}
+	}
+
+	for _, st := range toRun {
+		if st.title != "" {
+			fmt.Fprintln(c.iCtx.queryOutput, st.title)
+		}
+		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
+			q := clisqlclient.MakeQuery(fmt.Sprintf(st.sql, st.qargs...))
+			return c.sqlExecCtx.RunQueryAndFormatResults(
+				ctx,
+				c.conn,
+				c.iCtx.queryOutput, // query output.
+				io.Discard,         // we hide timings for describe commands.
+				c.iCtx.stderr,
+				q,
+			)
+		})
+		if c.exitErr != nil {
+			if !c.singleStatement {
+				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+			}
+			return errState
+		}
+	}
+	return loopState
+}
+
 func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnum {
 	if len(c.lastInputLine) == 0 || c.lastInputLine[0] != '\\' {
 		return nextState
@@ -1251,6 +1360,17 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	line := strings.TrimRight(c.lastInputLine, "; ")
 
 	cmd := strings.Fields(line)
+	if cmd[0] == `\z` {
+		// psql compatibility.
+		cmd[0] = `\dp`
+	}
+	if cmd[0] == `\sf` || cmd[0] == `\sf+` ||
+		cmd[0] == `\sv` || cmd[0] == `\sv+` ||
+		cmd[0] == `\l` || cmd[0] == `\l+` ||
+		(strings.HasPrefix(cmd[0], `\d`) && cmd[0] != `\demo`) {
+		return c.handleDescribe(cmd, loopState, errState)
+	}
+
 	switch cmd[0] {
 	case `\q`, `\quit`, `\exit`:
 		return cliStop
@@ -1301,6 +1421,9 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		// got confused with string delimiters and multi-line input.
 		return cliStartLine
 
+	case `\s`:
+		c.printCommandHistory()
+
 	case `\show`:
 		if c.ins.multilineEdit() {
 			fmt.Fprintln(c.iCtx.stderr, `warning: \show is ineffective with this editor`)
@@ -1346,18 +1469,6 @@ ORDER BY 1`
 		}
 		return c.handleFunctionHelp(cmd[1:], loopState, errState)
 
-	case `\l`:
-		c.concatLines = `SHOW DATABASES`
-		return cliRunStatement
-
-	case `\dt`:
-		c.concatLines = `SHOW TABLES`
-		return cliRunStatement
-
-	case `\df`:
-		c.concatLines = `SHOW FUNCTIONS`
-		return cliRunStatement
-
 	case `\copy`:
 		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
 			// Strip out the starting \ in \copy.
@@ -1381,35 +1492,6 @@ ORDER BY 1`
 		}
 		return c.invalidSyntax(errState)
 
-	case `\dT`:
-		c.concatLines = `SHOW TYPES`
-		return cliRunStatement
-
-	case `\du`:
-		if len(cmd) == 1 {
-			c.concatLines = `SHOW USERS`
-			return cliRunStatement
-		} else if len(cmd) == 2 {
-			c.concatLines = fmt.Sprintf(`SELECT * FROM [SHOW USERS] WHERE username = %s`, lexbase.EscapeSQLString(cmd[1]))
-			return cliRunStatement
-		}
-		return c.invalidSyntax(errState)
-
-	case `\d`:
-		if len(cmd) == 1 {
-			c.concatLines = `SHOW TABLES`
-			return cliRunStatement
-		} else if len(cmd) == 2 {
-			c.concatLines = `SHOW COLUMNS FROM ` + cmd[1]
-			return cliRunStatement
-		}
-		return c.invalidSyntax(errState)
-	case `\dd`:
-		if len(cmd) == 2 {
-			c.concatLines = `SHOW CONSTRAINTS FROM ` + cmd[1] + ` WITH COMMENT`
-			return cliRunStatement
-		}
-		return c.invalidSyntax(errState)
 	case `\connect`, `\c`:
 		return c.handleConnect(cmd[1:], loopState, errState)
 
@@ -1445,10 +1527,6 @@ ORDER BY 1`
 		return c.handleStatementDiag(cmd[1:], loopState, errState)
 
 	default:
-		if strings.HasPrefix(cmd[0], `\d`) {
-			// Unrecognized command for now, but we want to be helpful.
-			fmt.Fprint(c.iCtx.stderr, "Suggestion: use the SQL SHOW statement to inspect your schema.\n")
-		}
 		return c.invalidSyntax(errState)
 	}
 
@@ -1679,7 +1757,7 @@ func (c *cliState) switchToURL(newURL *pgurl.URL) error {
 	}
 	c.conn.SetURL(newURL.ToPQ().String())
 	c.conn.SetMissingPassword(!usePw || !pwSet)
-	return nil
+	return c.conn.EnsureConn(context.Background())
 }
 
 const maxRecursionLevels = 10
@@ -1925,6 +2003,8 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 	return nextState
 }
 
+var copyToRe = regexp.MustCompile(`(?i)COPY.*TO\s+STDOUT`)
+
 // doRunStatements runs all the statements that have been accumulated by
 // concatLines.
 func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
@@ -1968,6 +2048,16 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 	// Now run the statement/query.
 	c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
 		if scanner.FirstLexicalToken(c.concatLines) == lexbase.COPY {
+			// Ideally this is parsed using the parser, but we've avoided doing so
+			// for clisqlshell to be small.
+			if copyToRe.MatchString(c.concatLines) {
+				defer c.maybeFlushOutput()
+				// We don't print the tag, following psql.
+				if _, err := clisqlclient.BeginCopyTo(ctx, c.conn, c.iCtx.queryOutput, c.concatLines); err != nil {
+					return err
+				}
+				return nil
+			}
 			return c.beginCopyFrom(ctx, c.concatLines)
 		}
 		q := clisqlclient.MakeQuery(c.concatLines)
@@ -2239,17 +2329,16 @@ func (c *cliState) configurePreShellDefaults(
 	// all), to prevent abnormal situation where a history runs into
 	// megabytes and starts slowing down the shell.
 	const maxHistEntries = 10000
-	var histFile string
 	if useEditor {
 		homeDir, err := envutil.HomeDir()
 		if err != nil {
 			fmt.Fprintf(c.iCtx.stderr, "warning: cannot retrieve user information: %v\nwarning: history will not be saved\n", err)
 		} else {
-			histFile = filepath.Join(homeDir, cmdHistFile)
+			c.iCtx.histFile = filepath.Join(homeDir, cmdHistFile)
 		}
 	}
 
-	cleanupFn, c.exitErr = c.ins.init(cmdIn, c.iCtx.stdout, c.iCtx.stderr, c, maxHistEntries, histFile)
+	cleanupFn, c.exitErr = c.ins.init(cmdIn, c.iCtx.stdout, c.iCtx.stderr, c, maxHistEntries, c.iCtx.histFile)
 	if c.exitErr != nil {
 		return cleanupFn, c.exitErr
 	}

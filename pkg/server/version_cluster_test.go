@@ -192,11 +192,8 @@ func TestClusterVersionPersistedOnJoin(t *testing.T) {
 
 	for i := 0; i < len(tc.TestCluster.Servers); i++ {
 		for _, engine := range tc.TestCluster.Servers[i].Engines() {
-			cv, err := kvserver.ReadClusterVersion(ctx, engine)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cv.Version != newVersion {
+			cv := engine.MinVersion()
+			if cv != newVersion {
 				t.Fatalf("n%d: expected version %v, got %v", i+1, newVersion, cv)
 			}
 		}
@@ -323,11 +320,8 @@ func TestClusterVersionUpgrade(t *testing.T) {
 	// Since the wrapped version setting exposes the new versions, it must
 	// definitely be present on all stores on the first try.
 	if err := tc.Servers[1].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
-		cv, err := kvserver.ReadClusterVersion(ctx, s.Engine())
-		if err != nil {
-			return err
-		}
-		if act := cv.Version.String(); act != exp {
+		cv := s.TODOEngine().MinVersion()
+		if act := cv.String(); act != exp {
 			t.Fatalf("%s: %s persisted, but should be %s", s, act, exp)
 		}
 		return nil

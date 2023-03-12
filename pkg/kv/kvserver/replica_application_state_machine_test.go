@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
@@ -145,7 +146,7 @@ func TestReplicaStateMachineChangeReplicas(t *testing.T) {
 			require.NoError(t, err)
 		} else {
 			require.Error(t, err)
-			require.IsType(t, &roachpb.RangeNotFoundError{}, err)
+			require.IsType(t, &kvpb.RangeNotFoundError{}, err)
 		}
 		// Set a destroyStatus to make sure there won't be any raft processing once
 		// we release raftMu. We applied a command but not one from the raft log, so
@@ -271,7 +272,7 @@ func TestReplicaStateMachineRaftLogTruncationLooselyCoupled(t *testing.T) {
 		looselyCoupledTruncationEnabled.Override(ctx, &st.SV, true)
 		// Remove the flush completed callback since we don't want a
 		// non-deterministic flush to cause the test to fail.
-		tc.store.engine.RegisterFlushCompletedCallback(func() {})
+		tc.store.TODOEngine().RegisterFlushCompletedCallback(func() {})
 		r := tc.repl
 
 		{
@@ -366,7 +367,7 @@ func TestReplicaStateMachineRaftLogTruncationLooselyCoupled(t *testing.T) {
 			require.True(t, trunc.isDeltaTrusted)
 			return raftLogSize, truncatedIndex
 		}()
-		require.NoError(t, tc.store.Engine().Flush())
+		require.NoError(t, tc.store.TODOEngine().Flush())
 		// Asynchronous call to advance durability.
 		tc.store.raftTruncator.durabilityAdvancedCallback()
 		expectedSize := raftLogSize - 1
@@ -425,8 +426,8 @@ func TestReplicaStateMachineEphemeralAppBatchRejection(t *testing.T) {
 	raftAppliedIndex := r.mu.state.RaftAppliedIndex
 	r.mu.Unlock()
 
-	descWriteRepr := func(v string) (roachpb.Request, []byte) {
-		b := tc.store.Engine().NewBatch()
+	descWriteRepr := func(v string) (kvpb.Request, []byte) {
+		b := tc.store.TODOEngine().NewBatch()
 		defer b.Close()
 		key := keys.LocalMax
 		val := roachpb.MakeValueFromString("hello")
@@ -436,7 +437,7 @@ func TestReplicaStateMachineEphemeralAppBatchRejection(t *testing.T) {
 		}, storage.MVCCValue{
 			Value: val,
 		}))
-		return roachpb.NewPut(key, val), b.Repr()
+		return kvpb.NewPut(key, val), b.Repr()
 	}
 
 	// Make two commands that have the same MaxLeaseIndex. They'll go
@@ -457,7 +458,7 @@ func TestReplicaStateMachineEphemeralAppBatchRejection(t *testing.T) {
 				WriteBatch:            &kvserverpb.WriteBatch{Data: repr},
 			},
 		}
-		var ba roachpb.BatchRequest
+		var ba kvpb.BatchRequest
 		ba.Add(req)
 		cmd := &replicatedCmd{
 			ctx:           ctx,

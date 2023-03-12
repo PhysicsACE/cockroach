@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
@@ -78,7 +79,7 @@ func TestStmtStatsBulkIngestWithRandomMetadata(t *testing.T) {
 			&sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
-				statistics *roachpb.CollectedStatementStatistics,
+				statistics *appstatspb.CollectedStatementStatistics,
 			) error {
 				var found bool
 				for i := range testData {
@@ -97,73 +98,73 @@ func TestSQLStatsStmtStatsBulkIngest(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testData := []struct {
-		id    roachpb.StmtFingerprintID
-		key   roachpb.StatementStatisticsKey
-		stats roachpb.StatementStatistics
+		id    appstatspb.StmtFingerprintID
+		key   appstatspb.StatementStatisticsKey
+		stats appstatspb.StatementStatistics
 	}{
 		{
 			id: 0,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app1",
 				Query:    "SELECT 1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 7,
 			},
 		},
 		{
 			id: 0,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app0",
 				Query:    "SELECT 1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 2,
 			},
 		},
 		{
 			id: 1,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app100",
 				Query:    "SELECT 1,1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 31,
 			},
 		},
 		{
 			id: 1,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app0",
 				Query:    "SELECT 1,1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 32,
 			},
 		},
 		{
 			id: 0,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app1",
 				Query:    "SELECT 1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 33,
 			},
 		},
 		{
 			id: 1,
-			key: roachpb.StatementStatisticsKey{
+			key: appstatspb.StatementStatisticsKey{
 				App:      "app100",
 				Query:    "SELECT 1,1",
 				Database: "testdb",
 			},
-			stats: roachpb.StatementStatistics{
+			stats: appstatspb.StatementStatistics{
 				Count: 2,
 			},
 		},
@@ -197,7 +198,7 @@ func TestSQLStatsStmtStatsBulkIngest(t *testing.T) {
 			&sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
-				statistics *roachpb.CollectedStatementStatistics,
+				statistics *appstatspb.CollectedStatementStatistics,
 			) error {
 				require.Equal(t, "testdb", statistics.Key.Database)
 				foundStats[statistics.Key.App+statistics.Key.Query] = statistics.Stats.Count
@@ -212,65 +213,65 @@ func TestSQLStatsTxnStatsBulkIngest(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testData := []struct {
-		stats roachpb.CollectedTransactionStatistics
+		stats appstatspb.CollectedTransactionStatistics
 	}{
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(0),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(0),
 				App:                      "app1",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 7,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(0),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(0),
 				App:                      "app0",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 2,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(1),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(1),
 				App:                      "app100",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 31,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(1),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(1),
 				App:                      "app0",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 32,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(0),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(0),
 				App:                      "app1",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 33,
 				},
 			},
 		},
 		{
-			stats: roachpb.CollectedTransactionStatistics{
-				TransactionFingerprintID: roachpb.TransactionFingerprintID(1),
+			stats: appstatspb.CollectedTransactionStatistics{
+				TransactionFingerprintID: appstatspb.TransactionFingerprintID(1),
 				App:                      "app100",
-				Stats: roachpb.TransactionStatistics{
+				Stats: appstatspb.TransactionStatistics{
 					Count: 2,
 				},
 			},
 		},
 	}
 
-	expectedCount := make(map[roachpb.TransactionFingerprintID]int64)
+	expectedCount := make(map[appstatspb.TransactionFingerprintID]int64)
 	input :=
 		make([]serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics, 0, len(testData))
 
@@ -288,14 +289,14 @@ func TestSQLStatsTxnStatsBulkIngest(t *testing.T) {
 	sqlStats, err := sslocal.NewTempSQLStatsFromExistingTxnStats(input)
 	require.NoError(t, err)
 
-	foundStats := make(map[roachpb.TransactionFingerprintID]int64)
+	foundStats := make(map[appstatspb.TransactionFingerprintID]int64)
 	require.NoError(t,
 		sqlStats.IterateTransactionStats(
 			context.Background(),
 			&sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
-				statistics *roachpb.CollectedTransactionStatistics,
+				statistics *appstatspb.CollectedTransactionStatistics,
 			) error {
 				foundStats[statistics.TransactionFingerprintID] = statistics.Stats.Count
 				return nil
@@ -446,16 +447,18 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		nil /* curCount */, nil /* maxHist */, math.MaxInt64, st,
 	)
 
+	insightsProvider := insights.New(st, insights.NewMetrics())
 	sqlStats := sslocal.New(
 		st,
 		sqlstats.MaxMemSQLStatsStmtFingerprints,
 		sqlstats.MaxMemSQLStatsTxnFingerprints,
 		nil, /* curMemoryBytesCount */
 		nil, /* maxMemoryBytesHist */
-		insights.New(st, insights.NewMetrics()).Writer,
+		insightsProvider.Writer,
 		monitor,
 		nil, /* reportingSink */
 		nil, /* knobs */
+		insightsProvider.LatencyInformation(),
 	)
 
 	appStats := sqlStats.GetApplicationStats("" /* appName */, false /* internal */)
@@ -467,7 +470,7 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 	)
 
 	recordStats := func(testCase *tc) {
-		var txnFingerprintID roachpb.TransactionFingerprintID
+		var txnFingerprintID appstatspb.TransactionFingerprintID
 		txnFingerprintIDHash := util.MakeFNV64()
 		statsCollector.StartTransaction()
 		defer func() {
@@ -487,7 +490,7 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		for _, fingerprint := range testCase.fingerprints {
 			stmtFingerprintID, err := statsCollector.RecordStatement(
 				ctx,
-				roachpb.StatementStatisticsKey{
+				appstatspb.StatementStatisticsKey{
 					Query:       fingerprint,
 					ImplicitTxn: testCase.implicit,
 				},
@@ -496,7 +499,7 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 			require.NoError(t, err)
 			txnFingerprintIDHash.Add(uint64(stmtFingerprintID))
 		}
-		txnFingerprintID = roachpb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
+		txnFingerprintID = appstatspb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
 	}
 
 	for _, tc := range testCases {
@@ -564,16 +567,18 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 		require.NoError(t, err)
 
 		// Construct the SQL Stats machinery.
+		insightsProvider := insights.New(st, insights.NewMetrics())
 		sqlStats := sslocal.New(
 			st,
 			sqlstats.MaxMemSQLStatsStmtFingerprints,
 			sqlstats.MaxMemSQLStatsTxnFingerprints,
 			nil,
 			nil,
-			insights.New(st, insights.NewMetrics()).Writer,
+			insightsProvider.Writer,
 			monitor,
 			nil,
 			nil,
+			insightsProvider.LatencyInformation(),
 		)
 		appStats := sqlStats.GetApplicationStats("" /* appName */, false /* internal */)
 		statsCollector := sslocal.NewStatsCollector(
@@ -591,14 +596,14 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 			for _, fingerprint := range txn.stmtFingerprints {
 				stmtFingerprintID, err := statsCollector.RecordStatement(
 					ctx,
-					roachpb.StatementStatisticsKey{Query: fingerprint},
+					appstatspb.StatementStatisticsKey{Query: fingerprint},
 					sqlstats.RecordedStmtStats{},
 				)
 				require.NoError(t, err)
 				txnFingerprintIDHash.Add(uint64(stmtFingerprintID))
 			}
 
-			transactionFingerprintID := roachpb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
+			transactionFingerprintID := appstatspb.TransactionFingerprintID(txnFingerprintIDHash.Sum())
 			statsCollector.EndTransaction(ctx, transactionFingerprintID)
 			err := statsCollector.RecordTransaction(ctx, transactionFingerprintID, sqlstats.RecordedTxnStats{
 				SessionData: &sessiondata.SessionData{
@@ -612,11 +617,11 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 			require.NoError(t, err)
 
 			// Gather the collected stats so that we can assert on them.
-			var stats []*roachpb.CollectedStatementStatistics
+			var stats []*appstatspb.CollectedStatementStatistics
 			err = statsCollector.IterateStatementStats(
 				ctx,
 				&sqlstats.IteratorOptions{},
-				func(_ context.Context, s *roachpb.CollectedStatementStatistics) error {
+				func(_ context.Context, s *appstatspb.CollectedStatementStatistics) error {
 					stats = append(stats, s)
 					return nil
 				},
@@ -1440,4 +1445,122 @@ func convertIDsToNames(t *testing.T, testConn *sqlutils.SQLRunner, indexes []str
 		return indexesInfo[i].name < indexesInfo[j].name
 	})
 	return indexesInfo
+}
+
+func TestSQLStatsLatencyInfo(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	testServer, sqlConn, _ := serverutils.StartServer(t, params)
+	defer func() {
+		require.NoError(t, sqlConn.Close())
+		testServer.Stopper().Stop(ctx)
+	}()
+	testConn := sqlutils.MakeSQLRunner(sqlConn)
+	appName := "latency-info"
+	testConn.Exec(t, "SET application_name = $1", appName)
+	testConn.Exec(t, "CREATE TABLE t1 (k INT)")
+
+	testCases := []struct {
+		name        string
+		statement   string
+		fingerprint string
+		latencyMax  float64
+	}{
+		{
+			name:        "select on table",
+			statement:   "SELECT * FROM t1",
+			fingerprint: "SELECT * FROM t1",
+			latencyMax:  1,
+		},
+		{
+			name:        "select sleep",
+			statement:   "SELECT pg_sleep(0.06)",
+			fingerprint: "SELECT pg_sleep(_)",
+			latencyMax:  0.2,
+		},
+		{
+			name:        "select sleep",
+			statement:   "SELECT pg_sleep(0.1)",
+			fingerprint: "SELECT pg_sleep(_)",
+			latencyMax:  0.2,
+		},
+		{
+			name:        "select sleep",
+			statement:   "SELECT pg_sleep(0.07)",
+			fingerprint: "SELECT pg_sleep(_)",
+			latencyMax:  0.2,
+		},
+	}
+
+	var min float64
+	var max float64
+	var p50 float64
+	var p90 float64
+	var p99 float64
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testConn.Exec(t, tc.statement)
+
+			rows := testConn.QueryRow(t, "SELECT statistics -> 'statistics' -> 'latencyInfo' ->> 'min',"+
+				"statistics -> 'statistics' -> 'latencyInfo' ->> 'max',"+
+				"statistics -> 'statistics' -> 'latencyInfo' ->> 'p50',"+
+				"statistics -> 'statistics' -> 'latencyInfo' ->> 'p90',"+
+				"statistics -> 'statistics' -> 'latencyInfo' ->> 'p99' "+
+				"FROM CRDB_INTERNAL.STATEMENT_STATISTICS WHERE app_name = $1 "+
+				"AND metadata ->> 'query'=$2", appName, "SELECT * FROM t1")
+			rows.Scan(&min, &max, &p50, &p90, &p99)
+
+			require.Positive(t, min)
+			require.Positive(t, max)
+			require.GreaterOrEqual(t, max, min)
+			require.LessOrEqual(t, max, tc.latencyMax)
+			require.GreaterOrEqual(t, p99, p90)
+			require.GreaterOrEqual(t, p90, p50)
+			require.LessOrEqual(t, p99, max)
+		})
+	}
+}
+
+func TestSQLStatsRegions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		name     string
+		locality roachpb.Locality
+		expected string
+	}{{
+		name:     "locality not set",
+		locality: roachpb.Locality{},
+		expected: `[]`,
+	}, {
+		name:     "locality set",
+		locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "us-east1"}}},
+		expected: `["us-east1"]`,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			params, _ := tests.CreateTestServerParams()
+			params.Locality = tc.locality
+			s, conn, _ := serverutils.StartServer(t, params)
+			defer s.Stopper().Stop(ctx)
+
+			db := sqlutils.MakeSQLRunner(conn)
+			db.Exec(t, "SET application_name = $1", t.Name())
+			db.Exec(t, "SELECT 1")
+
+			row := db.QueryRow(t, `
+				SELECT statistics->'statistics'->>'regions'
+				  FROM crdb_internal.statement_statistics
+				 WHERE app_name = $1`, t.Name())
+			var actual string
+			row.Scan(&actual)
+			require.Equal(t, tc.expected, actual)
+		})
+	}
 }

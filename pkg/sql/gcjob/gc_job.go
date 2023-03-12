@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -132,8 +134,8 @@ func deleteTableData(
 	}
 	for _, droppedTable := range progress.Tables {
 		var table catalog.TableDescriptor
-		if err := sql.DescsTxn(ctx, cfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-			table, err = col.ByID(txn).Get().Table(ctx, droppedTable.ID)
+		if err := sql.DescsTxn(ctx, cfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
+			table, err = col.ByID(txn.KV()).Get().Table(ctx, droppedTable.ID)
 			return err
 		}); err != nil {
 			if errors.Is(err, catalog.ErrDescriptorNotFound) {
@@ -407,8 +409,8 @@ func waitForEmptyPrefix(
 func checkForEmptySpan(ctx context.Context, db *kv.DB, from, to roachpb.Key) (empty bool, _ error) {
 	var ba kv.Batch
 	ba.Header.MaxSpanRequestKeys = 1
-	ba.AddRawRequest(&roachpb.IsSpanEmptyRequest{
-		RequestHeader: roachpb.RequestHeader{
+	ba.AddRawRequest(&kvpb.IsSpanEmptyRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: from, EndKey: to,
 		},
 	})
@@ -506,7 +508,7 @@ func shouldUseDelRange(
 ) bool {
 	// TODO(ajwerner): Adopt the DeleteRange protocol for tenant GC.
 	return details.Tenant == nil &&
-		s.Version.IsActive(ctx, clusterversion.V22_2UseDelRangeInGCJob) &&
+		s.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob) &&
 		(storage.CanUseMVCCRangeTombstones(ctx, s) ||
 			// Allow this testing knob to override the storage setting, for convenience.
 			knobs.SkipWaitingForMVCCGC)

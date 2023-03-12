@@ -20,12 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	kvstorage "github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -76,7 +77,7 @@ func TestKVWriterMatchesIEWriter(t *testing.T) {
 	lease1ID := makeTable("lease1")
 	lease2ID := makeTable("lease2")
 
-	ie := s.InternalExecutor().(sqlutil.InternalExecutor)
+	ie := s.InternalExecutor().(isql.Executor)
 	codec := s.LeaseManager().(*Manager).Codec()
 	w := teeWriter{
 		a: newInternalExecutorWriter(ie, "defaultdb.public.lease1"),
@@ -124,14 +125,14 @@ func getRawHistoryKVs(
 	start hlc.Timestamp,
 	codec keys.SQLCodec,
 ) []roachpb.KeyValue {
-	var b roachpb.BatchRequest
+	var b kvpb.BatchRequest
 	b.Header.Timestamp = kvDB.Clock().Now()
-	b.Add(&roachpb.ExportRequest{
-		RequestHeader: roachpb.RequestHeader{
+	b.Add(&kvpb.ExportRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    codec.TablePrefix(uint32(tabID)),
 			EndKey: codec.TablePrefix(uint32(tabID)).PrefixEnd(),
 		},
-		MVCCFilter: roachpb.MVCCFilter_All,
+		MVCCFilter: kvpb.MVCCFilter_All,
 		StartTime:  start,
 	})
 	br, err := kvDB.NonTransactionalSender().Send(ctx, &b)

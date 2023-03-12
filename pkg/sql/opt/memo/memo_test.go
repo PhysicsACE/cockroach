@@ -312,6 +312,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = false
 	notStale()
 
+	// Stale use improved split disjunction for joins.
+	evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = false
+	notStale()
+
 	// Stale testing_optimizer_random_seed.
 	evalCtx.SessionData().TestingOptimizerRandomSeed = 100
 	stale()
@@ -340,6 +346,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
 	stale()
 	evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = false
+	notStale()
+
+	// Stale optimizer_always_use_histograms.
+	evalCtx.SessionData().OptimizerAlwaysUseHistograms = true
+	stale()
+	evalCtx.SessionData().OptimizerAlwaysUseHistograms = false
 	notStale()
 
 	// Stale data sources and schema. Create new catalog so that data sources are

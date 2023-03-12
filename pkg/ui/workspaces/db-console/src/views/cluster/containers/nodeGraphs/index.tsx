@@ -64,6 +64,7 @@ import hardwareDashboard from "./dashboards/hardware";
 import changefeedsDashboard from "./dashboards/changefeeds";
 import overloadDashboard from "./dashboards/overload";
 import ttlDashboard from "./dashboards/ttl";
+import crossClusterReplicationDashboard from "./dashboards/crossClusterReplication";
 import { getMatchParamByName } from "src/util/query";
 import { PayloadAction } from "src/interfaces/action";
 import {
@@ -84,25 +85,70 @@ import moment from "moment";
 import {
   selectResolution10sStorageTTL,
   selectResolution30mStorageTTL,
+  selectCrossClusterReplicationEnabled,
 } from "src/redux/clusterSettings";
+import { getDataFromServer } from "src/util/dataFromServer";
+
 interface GraphDashboard {
   label: string;
   component: (props: GraphDashboardProps) => React.ReactElement<any>[];
+  isKvDashboard: boolean;
 }
 
 const dashboards: { [key: string]: GraphDashboard } = {
-  overview: { label: "Overview", component: overviewDashboard },
-  hardware: { label: "Hardware", component: hardwareDashboard },
-  runtime: { label: "Runtime", component: runtimeDashboard },
-  sql: { label: "SQL", component: sqlDashboard },
-  storage: { label: "Storage", component: storageDashboard },
-  replication: { label: "Replication", component: replicationDashboard },
-  distributed: { label: "Distributed", component: distributedDashboard },
-  queues: { label: "Queues", component: queuesDashboard },
-  requests: { label: "Slow Requests", component: requestsDashboard },
-  changefeeds: { label: "Changefeeds", component: changefeedsDashboard },
-  overload: { label: "Overload", component: overloadDashboard },
-  ttl: { label: "TTL", component: ttlDashboard },
+  overview: {
+    label: "Overview",
+    component: overviewDashboard,
+    isKvDashboard: false,
+  },
+  hardware: {
+    label: "Hardware",
+    component: hardwareDashboard,
+    isKvDashboard: true,
+  },
+  runtime: {
+    label: "Runtime",
+    component: runtimeDashboard,
+    isKvDashboard: true,
+  },
+  sql: { label: "SQL", component: sqlDashboard, isKvDashboard: false },
+  storage: {
+    label: "Storage",
+    component: storageDashboard,
+    isKvDashboard: true,
+  },
+  replication: {
+    label: "Replication",
+    component: replicationDashboard,
+    isKvDashboard: true,
+  },
+  distributed: {
+    label: "Distributed",
+    component: distributedDashboard,
+    isKvDashboard: true,
+  },
+  queues: { label: "Queues", component: queuesDashboard, isKvDashboard: true },
+  requests: {
+    label: "Slow Requests",
+    component: requestsDashboard,
+    isKvDashboard: true,
+  },
+  changefeeds: {
+    label: "Changefeeds",
+    component: changefeedsDashboard,
+    isKvDashboard: false,
+  },
+  overload: {
+    label: "Overload",
+    component: overloadDashboard,
+    isKvDashboard: true,
+  },
+  ttl: { label: "TTL", component: ttlDashboard, isKvDashboard: false },
+  crossClusterReplication: {
+    label: "Cross-Cluster Replication",
+    component: crossClusterReplicationDashboard,
+    isKvDashboard: true,
+  },
 };
 
 const defaultDashboard = "overview";
@@ -111,6 +157,7 @@ const dashboardDropdownOptions = _.map(dashboards, (dashboard, key) => {
   return {
     value: key,
     label: dashboard.label,
+    isKvDashboard: dashboard.isKvDashboard,
   };
 });
 
@@ -127,6 +174,7 @@ type MapStateToProps = {
   nodeDisplayNameByID: ReturnType<
     typeof nodeDisplayNameByIDSelector.resultFunc
   >;
+  crossClusterReplicationEnabled: boolean;
 };
 
 type MapDispatchToProps = {
@@ -166,6 +214,7 @@ export class NodeGraphs extends React.Component<
   refresh = () => {
     this.props.refreshNodes();
     this.props.refreshLiveness();
+    this.props.refreshNodeSettings();
   };
 
   setClusterPath(nodeID: string, dashboardName: string) {
@@ -244,8 +293,13 @@ export class NodeGraphs extends React.Component<
       nodeDisplayNameByID,
       nodeIds,
     } = this.props;
+    const canViewKvGraphs =
+      getDataFromServer().FeatureFlags.can_view_kv_metric_dashboards;
     const { showLowResolutionAlert, showDeletedDataAlert } = this.state;
-    const selectedDashboard = getMatchParamByName(match, dashboardNameAttr);
+    let selectedDashboard = getMatchParamByName(match, dashboardNameAttr);
+    if (dashboards[selectedDashboard].isKvDashboard && !canViewKvGraphs) {
+      selectedDashboard = defaultDashboard;
+    }
     const dashboard = _.has(dashboards, selectedDashboard)
       ? selectedDashboard
       : defaultDashboard;
@@ -291,7 +345,9 @@ export class NodeGraphs extends React.Component<
 
     // Generate graphs for the current dashboard, wrapping each one in a
     // MetricsDataProvider with a unique key.
-    const graphs = dashboards[dashboard].component(dashboardProps);
+    const graphs = dashboards[dashboard]
+      .component(dashboardProps)
+      .filter(d => canViewKvGraphs || !d.props.isKvGraph);
     const graphComponents = _.map(graphs, (graph, idx) => {
       const key = `nodes.${dashboard}.${idx}`;
       return (
@@ -316,6 +372,15 @@ export class NodeGraphs extends React.Component<
     // as we have 3 columns, we divide node amount on 3
     const paddingBottom =
       nodeIDs.length > 8 ? 90 + Math.ceil(nodeIDs.length / 3) * 10 : 50;
+    const filteredDropdownOptions = dashboardDropdownOptions
+      // Don't show KV dashboards if the logged-in user doesn't have permission to view them.
+      .filter(option => canViewKvGraphs || !option.isKvDashboard)
+      // Don't show the replication dashboard if not enabled.
+      .filter(
+        option =>
+          this.props.crossClusterReplicationEnabled ||
+          option.label !== "Cross-Cluster Replication",
+      );
 
     return (
       <div style={{ paddingBottom }}>
@@ -333,7 +398,7 @@ export class NodeGraphs extends React.Component<
           <PageConfigItem>
             <Dropdown
               title="Dashboard"
-              options={dashboardDropdownOptions}
+              options={filteredDropdownOptions}
               selected={dashboard}
               onChange={this.dashChange}
               className="full-size"
@@ -440,6 +505,7 @@ const mapStateToProps = (state: AdminUIState): MapStateToProps => ({
   storeIDsByNodeID: selectStoreIDsByNodeID(state),
   nodeDropdownOptions: nodeDropdownOptionsSelector(state),
   nodeDisplayNameByID: nodeDisplayNameByIDSelector(state),
+  crossClusterReplicationEnabled: selectCrossClusterReplicationEnabled(state),
 });
 
 const mapDispatchToProps: MapDispatchToProps = {

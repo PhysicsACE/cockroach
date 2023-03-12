@@ -224,8 +224,9 @@ func CachedClusters(l *logger.Logger, fn func(clusterName string, numVMs int)) {
 	}
 }
 
-// acquireFilesystemLock acquires a filesystem lock so that two concurrent
-// synchronizations of roachprod state don't clobber each other.
+// acquireFilesystemLock acquires a filesystem lock in order that concurrent
+// operations or roachprod processes that access shared system resources do
+// not conflict.
 func acquireFilesystemLock() (unlockFn func(), _ error) {
 	lockFile := os.ExpandEnv("$HOME/.roachprod/LOCK")
 	f, err := os.Create(lockFile)
@@ -419,9 +420,21 @@ func RunWithDetails(
 	return c.RunWithDetails(ctx, l, c.Nodes, title, cmd)
 }
 
-// SQL runs `cockroach sql` on a remote cluster.
+// SQL runs `cockroach sql` on a remote cluster. If a single node is passed,
+// an interactive session may start.
+//
+// NOTE: When querying a single-node in a cluster, a pseudo-terminal is attached
+// to ssh which may result in an _interactive_ ssh session.
+//
+// CAUTION: this function should not be used by roachtest writers. Use syncedCluser.ExecSQL()
+// instead.
 func SQL(
-	ctx context.Context, l *logger.Logger, clusterName string, secure bool, cmdArray []string,
+	ctx context.Context,
+	l *logger.Logger,
+	clusterName string,
+	secure bool,
+	tenantName string,
+	cmdArray []string,
 ) error {
 	if err := LoadClusters(); err != nil {
 		return err
@@ -430,7 +443,10 @@ func SQL(
 	if err != nil {
 		return err
 	}
-	return c.SQL(ctx, l, cmdArray)
+	if len(c.Nodes) == 1 {
+		return c.ExecOrInteractiveSQL(ctx, l, tenantName, cmdArray)
+	}
+	return c.ExecSQL(ctx, l, tenantName, cmdArray)
 }
 
 // IP gets the ip addresses of the nodes in a cluster.
@@ -457,10 +473,10 @@ func IP(
 		if err := c.Parallel(l, "", len(nodes), 0, func(i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
-			res.Stdout, res.Err = c.GetInternalIP(ctx, node)
+			res.Stdout, res.Err = c.GetInternalIP(l, ctx, node)
 			ips[i] = res.Stdout
 			return res, err
-		}); err != nil {
+		}, install.DefaultSSHRetryOpts); err != nil {
 			return nil, err
 		}
 	}
@@ -562,6 +578,11 @@ func SetupSSH(ctx context.Context, l *logger.Logger, clusterName string) error {
 
 	// Configure SSH for machines in the zones we operate on.
 	if err := vm.ProvidersSequential(providers, func(p vm.Provider) error {
+		unlock, lockErr := acquireFilesystemLock()
+		if lockErr != nil {
+			return lockErr
+		}
+		defer unlock()
 		return p.ConfigSSH(zones[p.Name()])
 	}); err != nil {
 		return err
@@ -681,7 +702,7 @@ func Monitor(
 	if err != nil {
 		return nil, err
 	}
-	return c.Monitor(ctx, opts), nil
+	return c.Monitor(l, ctx, opts), nil
 }
 
 // StopOpts is used to pass options to Stop.
@@ -849,21 +870,27 @@ func Get(l *logger.Logger, clusterName, src, dest string) error {
 	return c.Get(l, c.Nodes, src, dest)
 }
 
+type PGURLOptions struct {
+	Secure     bool
+	External   bool
+	TenantName string
+}
+
 // PgURL generates pgurls for the nodes in a cluster.
 func PgURL(
-	ctx context.Context, l *logger.Logger, clusterName, certsDir string, external, secure bool,
+	ctx context.Context, l *logger.Logger, clusterName, certsDir string, opts PGURLOptions,
 ) ([]string, error) {
 	if err := LoadClusters(); err != nil {
 		return nil, err
 	}
-	c, err := newCluster(l, clusterName, install.SecureOption(secure), install.PGUrlCertsDirOption(certsDir))
+	c, err := newCluster(l, clusterName, install.SecureOption(opts.Secure), install.PGUrlCertsDirOption(certsDir))
 	if err != nil {
 		return nil, err
 	}
 	nodes := c.TargetNodes()
 	ips := make([]string, len(nodes))
 
-	if external {
+	if opts.External {
 		for i := 0; i < len(nodes); i++ {
 			ips[i] = c.VMs[nodes[i]-1].PublicIP
 		}
@@ -872,10 +899,10 @@ func PgURL(
 		if err := c.Parallel(l, "", len(nodes), 0, func(i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
-			res.Stdout, res.Err = c.GetInternalIP(ctx, node)
+			res.Stdout, res.Err = c.GetInternalIP(l, ctx, node)
 			ips[i] = res.Stdout
 			return res, err
-		}); err != nil {
+		}, install.DefaultSSHRetryOpts); err != nil {
 			return nil, err
 		}
 	}
@@ -885,7 +912,7 @@ func PgURL(
 		if ip == "" {
 			return nil, errors.Errorf("empty ip: %v", ips)
 		}
-		urls = append(urls, c.NodeURL(ip, c.NodePort(nodes[i])))
+		urls = append(urls, c.NodeURL(ip, c.NodePort(nodes[i]), opts.TenantName))
 	}
 	if len(urls) != len(nodes) {
 		return nil, errors.Errorf("have nodes %v, but urls %v from ips %v", nodes, urls, ips)
@@ -1063,7 +1090,7 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 		outputFiles = append(outputFiles, outputFile)
 		mu.Unlock()
 		return res, nil
-	})
+	}, install.DefaultSSHRetryOpts)
 
 	for _, s := range outputFiles {
 		l.Printf("Created %s", s)
@@ -1329,7 +1356,7 @@ func Logs(l *logger.Logger, clusterName, dest, username string, logsOpts LogsOpt
 		return err
 	}
 	return c.Logs(
-		logsOpts.Dir, dest, username, logsOpts.Filter, logsOpts.ProgramFilter,
+		l, logsOpts.Dir, dest, username, logsOpts.Filter, logsOpts.ProgramFilter,
 		logsOpts.Interval, logsOpts.From, logsOpts.To, logsOpts.Out,
 	)
 }
@@ -1386,10 +1413,11 @@ func StartGrafana(
 	l *logger.Logger,
 	clusterName string,
 	grafanaURL string,
+	grafanaJSON []string,
 	promCfg *prometheus.Config, // passed iff grafanaURL is empty
 ) error {
-	if grafanaURL != "" && promCfg != nil {
-		return errors.New("cannot pass grafanaURL and a non empty promCfg")
+	if (grafanaURL != "" || len(grafanaJSON) > 0) && promCfg != nil {
+		return errors.New("cannot pass grafanaURL or grafanaJSON and a non empty promCfg")
 	}
 	if err := LoadClusters(); err != nil {
 		return err
@@ -1420,6 +1448,9 @@ func StartGrafana(
 		promCfg.Grafana.Enabled = true
 		if grafanaURL != "" {
 			promCfg.WithGrafanaDashboard(grafanaURL)
+		}
+		for _, str := range grafanaJSON {
+			promCfg.WithGrafanaDashboardJSON(str)
 		}
 	}
 	_, err = prometheus.Init(ctx, l, c, *promCfg)
@@ -1724,7 +1755,7 @@ func sendCaptureCommand(
 				}
 			}
 			return res, res.Err
-		})
+		}, install.DefaultSSHRetryOpts)
 	return err
 }
 

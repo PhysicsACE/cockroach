@@ -527,13 +527,22 @@ function makeStats(): Required<StatementStatistics> {
       nanos: 111613000,
     },
     nodes: [Long.fromInt(1), Long.fromInt(2), Long.fromInt(3)],
+    regions: ["gcp-us-east1"],
     plan_gists: ["Ais="],
     index_recommendations: [],
     indexes: ["123@456"],
+    latency_info: {
+      min: 0.01,
+      max: 1.2,
+      p50: 0.4,
+      p90: 0.7,
+      p99: 1.1,
+    },
+    last_error_code: "",
   };
 }
 
-function makeExecStats(): Required<ExecStats> {
+function makeExecStats(): ExecStats {
   return {
     count: Long.fromNumber(10),
     network_bytes: makeStat(),
@@ -541,6 +550,7 @@ function makeExecStats(): Required<ExecStats> {
     contention_time: makeStat(),
     network_messages: makeStat(),
     max_disk_usage: makeStat(),
+    cpu_sql_nanos: makeStat(),
   };
 }
 

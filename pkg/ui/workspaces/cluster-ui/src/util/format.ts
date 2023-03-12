@@ -156,6 +156,19 @@ export function Duration(nanoseconds: number): string {
 }
 
 /**
+ * Duration creates a string representation for a duration. The expectation is
+ * that units are passed in nanoseconds; for larger durations, the value will
+ * be converted into larger units.
+ * If the value is 0, return "no samples".
+ */
+export function DurationCheckSample(nanoseconds: number): string {
+  if (nanoseconds == 0) {
+    return "no samples";
+  }
+  return Duration(nanoseconds);
+}
+
+/**
  * Cast nanoseconds to provided scale units
  */
 // tslint:disable-next-line: variable-name
@@ -216,6 +229,9 @@ export function Count(count: number): string {
 
 // limitText returns a shortened form of text that surpasses a given limit
 export const limitText = (text: string, limit: number): string => {
+  if (!text) {
+    return "";
+  }
   return text?.length > limit ? text.slice(0, limit - 3).concat("...") : text;
 };
 
@@ -225,7 +241,13 @@ export const limitStringArray = (arr: string[], limit: number): string => {
     return "";
   }
 
-  if (arr.length == 1 || arr[0].length > limit) {
+  // Remove null and undefined entries in the array.
+  arr = arr.filter(n => n);
+  if (arr.length == 0) {
+    return "";
+  }
+
+  if (arr.length == 1 || arr[0]?.length > limit) {
     return limitText(arr[0], limit);
   }
 
@@ -289,4 +311,44 @@ export function FixFingerprintHexValue(s: string): string {
 export function capitalize(str: string): string {
   if (!str) return str;
   return str[0].toUpperCase() + str.substring(1);
+}
+
+export function EncodeUriName(name: string): string {
+  // When a string has a '%' on it, the URI needs to have '%2525' instead, so this
+  // function replaces '%25' with '%252525' because when the link is created
+  // we have [%25]2525 -> %2525 (which is then used as the URI)
+  return encodeURIComponent(name).replace(/%25/g, "%252525");
+}
+
+export function EncodeDatabasesUri(db: string): string {
+  return `/databases/${EncodeUriName(db)}`;
+}
+
+export function EncodeDatabasesToIndexUri(
+  db: string,
+  schema: string,
+  table: string,
+  indexName: string,
+): string {
+  return `${EncodeDatabasesUri(db)}/${EncodeUriName(schema)}/${EncodeUriName(
+    table,
+  )}/${EncodeUriName(indexName)}`;
+}
+
+export function EncodeDatabaseTableUri(db: string, table: string): string {
+  return `${EncodeDatabaseUri(db)}/table/${EncodeUriName(table)}`;
+}
+
+export function EncodeDatabaseTableIndexUri(
+  db: string,
+  table: string,
+  indexName: string,
+): string {
+  return `${EncodeDatabaseTableUri(db, table)}/index/${EncodeUriName(
+    indexName,
+  )}`;
+}
+
+export function EncodeDatabaseUri(db: string): string {
+  return `/database/${EncodeUriName(db)}`;
 }

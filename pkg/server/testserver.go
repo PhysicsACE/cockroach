@@ -13,6 +13,7 @@ package server
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"net"
 	"net/http"
@@ -33,10 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security/certnames"
@@ -50,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -61,6 +62,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	addrutil "github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -275,11 +277,15 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 			if cfg.InflightTraceDirName == "" {
 				cfg.InflightTraceDirName = filepath.Join(storeSpec.Path, "logs", base.InflightTraceDir)
 			}
+			if cfg.CPUProfileDirName == "" {
+				cfg.CPUProfileDirName = filepath.Join(storeSpec.Path, "logs", base.CPUProfileDir)
+			}
 		}
 	}
 	cfg.Stores = base.StoreSpecList{Specs: params.StoreSpecs}
 	if params.TempStorageConfig.InMemory || params.TempStorageConfig.Path != "" {
 		cfg.TempStorageConfig = params.TempStorageConfig
+		cfg.TempStorageConfig.Settings = st
 	}
 
 	cfg.DisableDefaultTestTenant = params.DisableDefaultTestTenant
@@ -296,6 +302,8 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.Knobs.AdmissionControl == nil {
 		cfg.TestingKnobs.AdmissionControl = &admission.Options{}
 	}
+
+	cfg.ObsServiceAddr = params.ObsServiceAddr
 
 	return cfg
 }
@@ -547,6 +555,7 @@ func (ts *TestServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 		SSLCertsDir:               ts.params.SSLCertsDir,
 		TestingKnobs:              ts.params.Knobs,
 		StartDiagnosticsReporting: ts.params.StartDiagnosticsReporting,
+		Settings:                  ts.params.Settings,
 	}
 
 	// Since we're creating a tenant, it doesn't make sense to pass through the
@@ -593,9 +602,22 @@ func (ts *TestServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 // Use TestServer.Stopper().Stop() to shutdown the server after the test
 // completes.
 func (ts *TestServer) Start(ctx context.Context) error {
-	if err := ts.Server.Start(ctx); err != nil {
+	if err := ts.Server.PreStart(ctx); err != nil {
 		return err
 	}
+	if err := ts.Server.AcceptInternalClients(ctx); err != nil {
+		return err
+	}
+	// In tests we need some, but not all of RunInitialSQL functionality.
+	if err := ts.Server.RunInitialSQL(
+		ctx, false /* startSingleNode */, "" /* adminUser */, "", /* adminPassword */
+	); err != nil {
+		return err
+	}
+	if err := ts.Server.AcceptClients(ctx); err != nil {
+		return err
+	}
+
 	if err := ts.maybeStartDefaultTestTenant(ctx); err != nil {
 		// We're failing the call to this function but we've already started
 		// the TestServer above. Stop it here to avoid leaking the server.
@@ -612,17 +634,6 @@ func (ts *TestServer) Start(ctx context.Context) error {
 		}
 	}()
 	return nil
-}
-
-type tenantProtectedTSProvider struct {
-	protectedts.Provider
-	st *cluster.Settings
-}
-
-func (d tenantProtectedTSProvider) Protect(
-	ctx context.Context, txn *kv.Txn, rec *ptpb.Record,
-) error {
-	return d.Provider.Protect(ctx, txn, rec)
 }
 
 // TestTenant is an in-memory instantiation of the SQL-only process created for
@@ -804,7 +815,136 @@ func (t *TestTenant) Tracer() *tracing.Tracer {
 	return t.SQLServer.ambientCtx.Tracer
 }
 
-// StartTenant starts a SQL tenant communicating with this TestServer.
+// SettingsWatcher is part of the TestTenantInterface.
+func (t *TestTenant) SettingsWatcher() interface{} {
+	return t.SQLServer.settingsWatcher
+}
+
+// WaitForTenantEndKeySplit is part of the TestTenantInterface.
+func (t *TestTenant) WaitForTenantEndKeySplit(ctx context.Context) error {
+	// Wait until the tenant end key split happens.
+	return testutils.SucceedsWithinError(func() error {
+		factory := t.RangeDescIteratorFactory().(rangedesc.IteratorFactory)
+
+		iterator, err := factory.NewIterator(ctx, t.Codec().TenantSpan())
+		if err != nil {
+			return err
+		}
+		if !iterator.Valid() {
+			return errors.New("range iterator has no ranges")
+		}
+
+		for iterator.Valid() {
+			rangeDesc := iterator.CurRangeDescriptor()
+			if rangeDesc.EndKey.Compare(roachpb.RKeyMax) == 0 {
+				return errors.Newf("range ID %d end key not split", rangeDesc.RangeID)
+			}
+			iterator.Next()
+		}
+		return nil
+	}, 10*time.Second)
+}
+
+// StartSharedProcessTenant is part of TestServerInterface.
+func (ts *TestServer) StartSharedProcessTenant(
+	ctx context.Context, args base.TestSharedProcessTenantArgs,
+) (serverutils.TestTenantInterface, *gosql.DB, error) {
+	if err := args.TenantName.IsValid(); err != nil {
+		return nil, nil, err
+	}
+
+	// Save the args for use if the server needs to be created.
+	ts.Server.serverController.testArgs[args.TenantName] = args
+
+	tenantRow, err := ts.InternalExecutor().(*sql.InternalExecutor).QueryRow(
+		ctx, "testserver-check-tenant-active", nil, /* txn */
+		"SELECT id FROM system.tenants WHERE name=$1 AND active=true",
+		args.TenantName,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	tenantExists := tenantRow != nil
+
+	if tenantExists {
+		// A tenant with the given name already exists; let's check that
+		// it matches the ID that this call wants (if any).
+		id := uint64(*tenantRow[0].(*tree.DInt))
+		if args.TenantID.IsSet() && args.TenantID.ToUint64() != id {
+			return nil, nil, errors.Newf("a tenant with name %q exists, but its ID is %d instead of %d",
+				args.TenantName, id, args.TenantID)
+		}
+	} else {
+		// The tenant doesn't exist; let's create it.
+		if args.TenantID.IsSet() {
+			// Create with name and ID.
+			_, err := ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
+				ctx,
+				"create-tenant",
+				nil, /* txn */
+				sessiondata.NodeUserSessionDataOverride,
+				"SELECT crdb_internal.create_tenant($1,$2)",
+				args.TenantID.ToUint64(), args.TenantName,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+		} else {
+			// Create with name alone; allocate an ID automatically.
+			_, err := ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
+				ctx,
+				"create-tenant",
+				nil, /* txn */
+				sessiondata.NodeUserSessionDataOverride,
+				"SELECT crdb_internal.create_tenant($1)",
+				args.TenantName,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		// Also mark it for shared-process execution.
+		_, err := ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
+			ctx,
+			"start-tenant-shared-service",
+			nil, /* txn */
+			sessiondata.NodeUserSessionDataOverride,
+			"ALTER TENANT $1 START SERVICE SHARED",
+			args.TenantName,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// Instantiate the tenant server.
+	s, err := ts.Server.serverController.startAndWaitForRunningServer(ctx, args.TenantName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sqlServerWrapper := s.(*tenantServerWrapper).server
+	sqlServer := sqlServerWrapper.sqlServer
+	hts := &httpTestServer{}
+	hts.t.authentication = sqlServerWrapper.authentication
+	hts.t.sqlServer = sqlServer
+	testTenant := &TestTenant{
+		SQLServer:      sqlServer,
+		Cfg:            sqlServer.cfg,
+		pgPreServer:    sqlServerWrapper.pgPreServer,
+		httpTestServer: hts,
+		drain:          sqlServerWrapper.drainServer,
+	}
+
+	sqlDB, err := serverutils.OpenDBConnE(
+		ts.SQLAddr(), "cluster:"+string(args.TenantName)+"/"+args.UseDatabase, false /* insecure */, ts.stopper)
+	if err != nil {
+		return nil, nil, err
+	}
+	return testTenant, sqlDB, err
+}
+
+// StartTenant is part of TestServerInterface.
 func (ts *TestServer) StartTenant(
 	ctx context.Context, params base.TestTenantArgs,
 ) (serverutils.TestTenantInterface, error) {
@@ -828,56 +968,54 @@ func (ts *TestServer) StartTenant(
 			}
 		} else if params.TenantName != "" {
 			_, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(ctx, "rename-test-tenant", nil,
-				`SELECT crdb_internal.rename_tenant($1, $2)`, params.TenantID.ToUint64(), params.TenantName)
+				`ALTER TENANT [$1] RENAME TO $2`,
+				params.TenantID.ToUint64(), params.TenantName)
 			if err != nil {
 				return nil, err
 			}
 		}
 	} else if !params.SkipTenantCheck {
-		row, err := ts.InternalExecutor().(*sql.InternalExecutor).QueryRow(
+		requestedID := uint64(0)
+		if params.TenantID.IsSet() {
+			requestedID = params.TenantID.ToUint64()
+		}
+		rows, err := ts.InternalExecutor().(*sql.InternalExecutor).QueryBuffered(
 			ctx, "testserver-check-tenant-active", nil,
-			"SELECT name FROM system.tenants WHERE id=$1 AND active=true",
-			params.TenantID.ToUint64(),
+			"SELECT id, name FROM system.tenants WHERE ($1 <> 0 AND id=$1) OR ($2 <> '' AND name = $2) AND active=true",
+			requestedID, string(params.TenantName),
 		)
 		if err != nil {
 			return nil, err
 		}
-		if row == nil {
-			return nil, errors.New("not found")
+		if len(rows) == 0 {
+			return nil, errors.Newf("no tenant found with ID %d or name %q",
+				requestedID, params.TenantName)
 		}
+		if len(rows) > 1 {
+			return nil, errors.Newf("ambiguous tenant spec: found separate entries for tenant ID %d and name %q\n%+v",
+				requestedID, params.TenantName, rows)
+		}
+		row := rows[0]
 		// Check that the name passed in via params matches the name persisted in
 		// the system.tenants table.
-		if row[0] != tree.DNull {
-			actualName := (*string)(row[0].(*tree.DString))
-			if *actualName != string(params.TenantName) {
-				return nil, errors.Newf("name mismatch; tenant %d has name %s, but params specifies name %s",
-					params.TenantID.ToUint64(), *actualName, params.TenantName)
+		if params.TenantName != "" {
+			if row[1] == tree.DNull || string(params.TenantName) != string(tree.MustBeDString(row[1])) {
+				return nil, errors.Newf("name mismatch; tenant %d has name %q, but params specifies name %q",
+					row[0], row[1], params.TenantName)
 			}
-		} else if params.TenantName != "" {
-			return nil, errors.Newf("name mismatch; tenant %d has no name, but params specifies name %s",
-				params.TenantID.ToUint64(), params.TenantName)
 		}
-	}
-
-	if params.UseServerController {
-		onDemandServer, err := ts.serverController.getOrCreateServer(ctx, params.TenantName)
-		if err != nil {
-			return nil, err
+		if params.TenantID.IsSet() {
+			if params.TenantID.ToUint64() != uint64(tree.MustBeDInt(row[0])) {
+				return nil, errors.Newf("ID mismatch; tenant %q has ID %d, but params specifies ID %d",
+					row[1], row[0], params.TenantID.ToUint64())
+			}
 		}
-		sw := onDemandServer.(*tenantServerWrapper)
-
-		hts := &httpTestServer{}
-		hts.t.authentication = sw.server.authentication
-		hts.t.sqlServer = sw.server.sqlServer
-		hts.t.tenantName = params.TenantName
-
-		return &TestTenant{
-			SQLServer:      sw.server.sqlServer,
-			Cfg:            sw.server.sqlServer.cfg,
-			pgPreServer:    sw.server.pgPreServer,
-			httpTestServer: hts,
-			drain:          sw.server.drainServer,
-		}, err
+		if row[1] != tree.DNull {
+			params.TenantName = roachpb.TenantName(tree.MustBeDString(row[1]))
+		}
+		if row[0] != tree.DNull {
+			params.TenantID = roachpb.MustMakeTenantID(uint64(tree.MustBeDInt(row[0])))
+		}
 	}
 
 	st := params.Settings
@@ -986,11 +1124,12 @@ func (ts *TestServer) StartTenant(
 		baseCfg.SQLAddr, baseCfg.SQLAdvertiseAddr,
 		baseCfg.HTTPAddr, baseCfg.HTTPAdvertiseAddr,
 	)
-	sw, err := NewTenantServer(
+	sw, err := NewSeparateProcessTenantServer(
 		ctx,
 		stopper,
 		baseCfg,
 		sqlCfg,
+		roachpb.NewTenantNameContainer(params.TenantName),
 	)
 	if err != nil {
 		return nil, err
@@ -1059,6 +1198,11 @@ func (ts *TestServer) GetStores() interface{} {
 // ClusterSettings returns the ClusterSettings.
 func (ts *TestServer) ClusterSettings() *cluster.Settings {
 	return ts.Cfg.Settings
+}
+
+// SettingsWatcher is part of the TestTenantInterface.
+func (ts *TestServer) SettingsWatcher() interface{} {
+	return ts.sqlServer.settingsWatcher
 }
 
 // Engines returns the TestServer's engines.
@@ -1206,9 +1350,9 @@ func (ts *TestServer) InternalExecutor() interface{} {
 	return ts.sqlServer.internalExecutor
 }
 
-// InternalExecutorFactory is part of TestServerInterface.
-func (ts *TestServer) InternalExecutorFactory() interface{} {
-	return ts.sqlServer.internalExecutorFactory
+// InternalDB is part of TestServerInterface.
+func (ts *TestServer) InternalDB() interface{} {
+	return ts.sqlServer.internalDB
 }
 
 // GetNode exposes the Server's Node.
@@ -1299,7 +1443,7 @@ func (ts *TestServer) GetFirstStoreID() roachpb.StoreID {
 // LookupRange returns the descriptor of the range containing key.
 func (ts *TestServer) LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, error) {
 	rs, _, err := kv.RangeLookup(context.Background(), ts.DB().NonTransactionalSender(),
-		key, roachpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
+		key, kvpb.CONSISTENT, 0 /* prefetchNum */, false /* reverse */)
 	if err != nil {
 		return roachpb.RangeDescriptor{}, errors.Wrapf(
 			err, "%q: lookup range unexpected error", key)
@@ -1311,8 +1455,8 @@ func (ts *TestServer) LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, err
 func (ts *TestServer) MergeRanges(leftKey roachpb.Key) (roachpb.RangeDescriptor, error) {
 
 	ctx := context.Background()
-	mergeReq := roachpb.AdminMergeRequest{
-		RequestHeader: roachpb.RequestHeader{
+	mergeReq := kvpb.AdminMergeRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: leftKey,
 		},
 	}
@@ -1337,8 +1481,8 @@ func (ts *TestServer) SplitRangeWithExpiration(
 	splitKey roachpb.Key, expirationTime hlc.Timestamp,
 ) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
 	ctx := context.Background()
-	splitReq := roachpb.AdminSplitRequest{
-		RequestHeader: roachpb.RequestHeader{
+	splitReq := kvpb.AdminSplitRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: splitKey,
 		},
 		SplitKey:       splitKey,
@@ -1373,7 +1517,7 @@ func (ts *TestServer) SplitRangeWithExpiration(
 		// i.e. looking up key `c` will match range [a,c), not [c, d).
 		// The result will be the right descriptor, and the first prefetched result will
 		// be the left neighbor, i.e. the resulting left hand side of the split.
-		rs, more, err := kv.RangeLookup(ctx, txn, splitKey.Next(), roachpb.CONSISTENT, 1, true /* reverse */)
+		rs, more, err := kv.RangeLookup(ctx, txn, splitKey.Next(), kvpb.CONSISTENT, 1, true /* reverse */)
 		if err != nil {
 			return err
 		}
@@ -1451,21 +1595,21 @@ const (
 func (ts *TestServer) GetRangeLease(
 	ctx context.Context, key roachpb.Key, queryPolicy LeaseInfoOpt,
 ) (_ LeaseInfo, now hlc.ClockTimestamp, _ error) {
-	leaseReq := roachpb.LeaseInfoRequest{
-		RequestHeader: roachpb.RequestHeader{
+	leaseReq := kvpb.LeaseInfoRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: key,
 		},
 	}
 	leaseResp, pErr := kv.SendWrappedWith(
 		ctx,
 		ts.DB().NonTransactionalSender(),
-		roachpb.Header{
+		kvpb.Header{
 			// INCONSISTENT read with a NEAREST routing policy, since we want to make
 			// sure that the node used to send this is the one that processes the
 			// command, regardless of whether it is the leaseholder, for the hint to
 			// matter.
-			ReadConsistency: roachpb.INCONSISTENT,
-			RoutingPolicy:   roachpb.RoutingPolicy_NEAREST,
+			ReadConsistency: kvpb.INCONSISTENT,
+			RoutingPolicy:   kvpb.RoutingPolicy_NEAREST,
 		},
 		&leaseReq,
 	)
@@ -1473,7 +1617,7 @@ func (ts *TestServer) GetRangeLease(
 		return LeaseInfo{}, hlc.ClockTimestamp{}, pErr.GoError()
 	}
 	// Adapt the LeaseInfoResponse format to LeaseInfo.
-	resp := leaseResp.(*roachpb.LeaseInfoResponse)
+	resp := leaseResp.(*kvpb.LeaseInfoResponse)
 	if queryPolicy == QueryLocalNodeOnly && resp.EvaluatedBy != ts.GetFirstStoreID() {
 		// TODO(andrei): Figure out how to deal with nodes with multiple stores.
 		// This API should permit addressing the query to a particular store.
@@ -1506,6 +1650,12 @@ func (ts *TestServer) Tracer() *tracing.Tracer {
 	return ts.node.storeCfg.AmbientCtx.Tracer
 }
 
+// WaitForTenantEndKeySplit is part of the TestTenantInterface.
+func (ts *TestServer) WaitForTenantEndKeySplit(context.Context) error {
+	// Does not apply to system tenant.
+	return nil
+}
+
 // ForceTableGC is part of TestServerInterface.
 func (ts *TestServer) ForceTableGC(
 	ctx context.Context, database, table string, timestamp hlc.Timestamp,
@@ -1530,8 +1680,8 @@ func (ts *TestServer) ForceTableGC(
 	}
 	tableID := uint32(*row[0].(*tree.DInt))
 	tblKey := keys.SystemSQLCodec.TablePrefix(tableID)
-	gcr := roachpb.GCRequest{
-		RequestHeader: roachpb.RequestHeader{
+	gcr := kvpb.GCRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    tblKey,
 			EndKey: tblKey.PrefixEnd(),
 		},

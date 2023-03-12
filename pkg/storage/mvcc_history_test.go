@@ -11,6 +11,7 @@
 package storage_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -21,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
@@ -184,9 +186,8 @@ func TestMVCCHistories(t *testing.T) {
 		disableSeparateEngineBlocks := strings.Contains(path, "_disable_separate_engine_blocks")
 
 		// We start from a clean slate in every test file.
-		engine, err := storage.Open(ctx, storage.InMemory(),
+		engine, err := storage.Open(ctx, storage.InMemory(), st,
 			storage.CacheSize(1<<20 /* 1 MiB */),
-			storage.Settings(st),
 			storage.If(separateEngineBlocks && !disableSeparateEngineBlocks, storage.BlockSize(1)),
 		)
 		require.NoError(t, err)
@@ -1107,7 +1108,7 @@ func cmdDelete(e *evalCtx) error {
 	resolve, resolveStatus := e.getResolve()
 	return e.withWriter("del", func(rw storage.ReadWriter) error {
 		foundKey, err := storage.MVCCDelete(e.ctx, rw, e.ms, key, ts, localTs, txn)
-		if err == nil || errors.HasType(err, &roachpb.WriteTooOldError{}) {
+		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
 			// We want to output foundKey even if a WriteTooOldError is returned,
 			// since the error may be swallowed/deferred during evaluation.
 			e.results.buf.Printf("del: %v: found key %v\n", key, foundKey)
@@ -1196,7 +1197,7 @@ func cmdDeleteRangePredicate(e *evalCtx) error {
 	if e.hasArg("maxBytes") {
 		e.scanArg("maxBytes", &maxBytes)
 	}
-	predicates := roachpb.DeleteRangePredicates{
+	predicates := kvpb.DeleteRangePredicates{
 		StartTime: e.getTsWithName("startTime"),
 	}
 	rangeThreshold := 64
@@ -1383,36 +1384,44 @@ func cmdExport(e *evalCtx) error {
 	r := e.newReader()
 	defer r.Close()
 
-	sstFile := &storage.MemFile{}
+	var sstFile bytes.Buffer
 
-	var summary roachpb.BulkOpSummary
-	var resume storage.MVCCKey
+	var summary kvpb.BulkOpSummary
+	var resumeInfo storage.ExportRequestResumeInfo
 	var fingerprint uint64
+	var hasRangeKeys bool
 	var err error
 	if shouldFingerprint {
-		summary, resume, fingerprint, err = storage.MVCCExportFingerprint(e.ctx, e.st, r, opts, sstFile)
+		summary, resumeInfo, fingerprint, hasRangeKeys, err = storage.MVCCExportFingerprint(e.ctx, e.st, r,
+			opts, &sstFile)
 		if err != nil {
 			return err
+		}
+		if !hasRangeKeys {
+			sstFile.Reset()
 		}
 		e.results.buf.Printf("export: %s", &summary)
 		e.results.buf.Print(" fingerprint=true")
 	} else {
-		summary, resume, err = storage.MVCCExportToSST(e.ctx, e.st, r, opts, sstFile)
+		summary, resumeInfo, err = storage.MVCCExportToSST(e.ctx, e.st, r, opts, &sstFile)
 		if err != nil {
 			return err
 		}
 		e.results.buf.Printf("export: %s", &summary)
 	}
 
-	if resume.Key != nil {
-		e.results.buf.Printf(" resume=%s", resume)
+	if resumeInfo.ResumeKey.Key != nil {
+		e.results.buf.Printf(" resume=%s", resumeInfo.ResumeKey)
 	}
 	e.results.buf.Printf("\n")
 
 	if shouldFingerprint {
+		var ssts [][]byte
+		if sstFile.Len() != 0 {
+			ssts = append(ssts, sstFile.Bytes())
+		}
 		// Fingerprint the rangekeys returned as a pebble SST.
-		rangekeyFingerprint, err := storage.FingerprintRangekeys(e.ctx, e.st, opts.FingerprintOptions,
-			[][]byte{sstFile.Bytes()})
+		rangekeyFingerprint, err := storage.FingerprintRangekeys(e.ctx, e.st, opts.FingerprintOptions, ssts)
 		if err != nil {
 			return err
 		}
@@ -1974,9 +1983,18 @@ func printIter(e *evalCtx) {
 	}
 }
 
+func rangeKeysIfExist(it storage.SimpleMVCCIterator) storage.MVCCRangeKeyStack {
+	if valid, err := it.Valid(); !valid || err != nil {
+		return storage.MVCCRangeKeyStack{}
+	} else if _, hasRange := it.HasPointAndRange(); !hasRange {
+		return storage.MVCCRangeKeyStack{}
+	}
+	return it.RangeKeys()
+}
+
 func checkAndUpdateRangeKeyChanged(e *evalCtx) bool {
 	rangeKeyChanged := e.iter.RangeKeyChanged()
-	rangeKeys := e.iter.RangeKeys()
+	rangeKeys := rangeKeysIfExist(e.iter)
 
 	if incrIter := e.tryMVCCIncrementalIter(); incrIter != nil {
 		// For MVCCIncrementalIterator, make sure RangeKeyChangedIgnoringTime() fires
@@ -2071,7 +2089,7 @@ type evalCtx struct {
 	locks             map[string]*roachpb.Transaction
 	ms                *enginepb.MVCCStats
 	sstWriter         *storage.SSTWriter
-	sstFile           *storage.MemFile
+	sstFile           *storage.MemObject
 	ssts              [][]byte
 }
 
@@ -2246,7 +2264,7 @@ func (e *evalCtx) withWriter(cmd string, fn func(_ storage.ReadWriter) error) er
 	if batch != nil {
 		// WriteTooOldError is sometimes expected to leave behind a provisional
 		// value at a higher timestamp. We commit this for parity with the engine.
-		if err == nil || errors.HasType(err, &roachpb.WriteTooOldError{}) {
+		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
 			if err := batch.Commit(true); err != nil {
 				return err
 			}
@@ -2324,7 +2342,7 @@ func (e *evalCtx) newTxn(
 
 func (e *evalCtx) sst() *storage.SSTWriter {
 	if e.sstWriter == nil {
-		e.sstFile = &storage.MemFile{}
+		e.sstFile = &storage.MemObject{}
 		w := storage.MakeIngestionSSTWriter(e.ctx, e.st, e.sstFile)
 		e.sstWriter = &w
 	}

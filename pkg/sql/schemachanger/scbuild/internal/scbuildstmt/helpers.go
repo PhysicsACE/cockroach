@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -24,12 +25,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
 
 func qualifiedName(b BuildCtx, id catid.DescID) string {
 	_, _, ns := scpb.FindNamespace(b.QueryByID(id))
+	if ns == nil {
+		// Function descriptors don't have namespace. So we need to handle this
+		// special case here.
+		return qualifiedFunctionName(b, id)
+	}
 	_, _, sc := scpb.FindNamespace(b.QueryByID(ns.SchemaID))
 	_, _, db := scpb.FindNamespace(b.QueryByID(ns.DatabaseID))
 	if db == nil {
@@ -39,6 +46,16 @@ func qualifiedName(b BuildCtx, id catid.DescID) string {
 		return db.Name + "." + ns.Name
 	}
 	return db.Name + "." + sc.Name + "." + ns.Name
+}
+
+func qualifiedFunctionName(b BuildCtx, id catid.DescID) string {
+	elts := b.QueryByID(id)
+	_, _, fnName := scpb.FindFunctionName(elts)
+	_, _, objParent := scpb.FindSchemaChild(elts)
+	_, _, scName := scpb.FindNamespace(b.QueryByID(objParent.SchemaID))
+	_, _, scParent := scpb.FindSchemaParent(b.QueryByID(objParent.SchemaID))
+	_, _, dbName := scpb.FindNamespace(b.QueryByID(scParent.ParentDatabaseID))
+	return dbName.Name + "." + scName.Name + "." + fnName.Name
 }
 
 func simpleName(b BuildCtx, id catid.DescID) string {
@@ -192,8 +209,8 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 		switch t := e.(type) {
 		case *scpb.SchemaParent:
 			dropCascadeDescriptor(next, t.SchemaID)
-		case *scpb.ObjectParent:
-			dropCascadeDescriptor(next, t.ObjectID)
+		case *scpb.SchemaChild:
+			dropCascadeDescriptor(next, t.ChildObjectID)
 		case *scpb.View:
 			dropCascadeDescriptor(next, t.ViewID)
 		case *scpb.Sequence:
@@ -204,17 +221,28 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			dropCascadeDescriptor(next, t.TypeID)
 		case *scpb.CompositeType:
 			dropCascadeDescriptor(next, t.TypeID)
+		case *scpb.FunctionBody:
+			dropCascadeDescriptor(next, t.FunctionID)
 		case *scpb.Column, *scpb.ColumnType, *scpb.SecondaryIndexPartial:
 			// These only have type references.
 			break
+		case *scpb.Namespace, *scpb.Function, *scpb.SecondaryIndex, *scpb.PrimaryIndex,
+			*scpb.TableLocalitySecondaryRegion:
+			// These can be safely skipped and will be cleaned up on their own because
+			// of dependents cleaned up above.
 		case
 			*scpb.ColumnDefaultExpression,
 			*scpb.ColumnOnUpdateExpression,
 			*scpb.CheckConstraint,
+			*scpb.CheckConstraintUnvalidated,
 			*scpb.ForeignKeyConstraint,
+			*scpb.ForeignKeyConstraintUnvalidated,
 			*scpb.SequenceOwner,
 			*scpb.DatabaseRegionConfig:
 			b.Drop(e)
+		default:
+			panic(errors.AssertionFailedf("un-dropped backref %T (%v) should be either be"+
+				"dropped or skipped", e, target))
 		}
 	})
 }
@@ -401,6 +429,15 @@ func hasColumnIDAttrFilter(
 	return func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) (included bool) {
 		idI, _ := screl.Schema.GetAttribute(screl.ColumnID, e)
 		return idI != nil && idI.(catid.ColumnID) == columnID
+	}
+}
+
+func hasConstraintIDAttrFilter(
+	constraintID catid.ConstraintID,
+) func(_ scpb.Status, _ scpb.TargetStatus, _ scpb.Element) bool {
+	return func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) (included bool) {
+		idI, _ := screl.Schema.GetAttribute(screl.ConstraintID, e)
+		return idI != nil && idI.(catid.ConstraintID) == constraintID
 	}
 }
 
@@ -797,4 +834,72 @@ func ExtractColumnIDsInExpr(
 	})
 
 	return colIDs, err
+}
+
+func isColNotNull(b BuildCtx, tableID catid.DescID, columnID catid.ColumnID) (ret bool) {
+	// A column is NOT NULL iff there is a ColumnNotNull element on this columnID
+	scpb.ForEachColumnNotNull(b.QueryByID(tableID), func(
+		current scpb.Status, target scpb.TargetStatus, e *scpb.ColumnNotNull,
+	) {
+		if e.ColumnID == columnID {
+			ret = true
+		}
+	})
+	return ret
+}
+
+func maybeFailOnCrossDBTypeReference(b BuildCtx, typeID descpb.ID, parentDBID descpb.ID) {
+	_, _, typeNamespace := scpb.FindNamespace(b.QueryByID(typeID))
+	if typeNamespace.DatabaseID != parentDBID {
+		typeName := tree.MakeTypeNameWithPrefix(b.NamePrefix(typeNamespace), typeNamespace.Name)
+		panic(pgerror.Newf(
+			pgcode.FeatureNotSupported,
+			"cross database type references are not supported: %s",
+			typeName.String()))
+	}
+}
+
+// shouldSkipValidatingConstraint determines whether we should
+// skip validating this constraint.
+//
+// We skip validating the constraint if it's already validated.
+// We return non-nil error if the constraint is being dropped.
+func shouldSkipValidatingConstraint(
+	b BuildCtx, tableID catid.DescID, constraintID catid.ConstraintID,
+) (skip bool, err error) {
+	// Retrieve constraint and table name for potential error messages.
+	constraintElems := constraintElements(b, tableID, constraintID)
+	_, _, tableNameElem := scpb.FindNamespace(b.QueryByID(tableID))
+	_, _, constraintNameElem := scpb.FindConstraintWithoutIndexName(constraintElems)
+
+	constraintElems.ForEachElementStatus(func(
+		current scpb.Status, target scpb.TargetStatus, e scpb.Element,
+	) {
+		switch e.(type) {
+		case *scpb.CheckConstraint, *scpb.UniqueWithoutIndexConstraint,
+			*scpb.ForeignKeyConstraint:
+			if current == scpb.Status_PUBLIC && target == scpb.ToPublic {
+				skip = true
+			} else if current == scpb.Status_ABSENT && target == scpb.ToPublic {
+				err = pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+					"constraint %q in the middle of being added, try again later", constraintNameElem.Name)
+			} else {
+				err = sqlerrors.NewUndefinedConstraintError(constraintNameElem.Name, tableNameElem.Name)
+			}
+		case *scpb.CheckConstraintUnvalidated, *scpb.UniqueWithoutIndexConstraintUnvalidated,
+			*scpb.ForeignKeyConstraintUnvalidated:
+			if current == scpb.Status_PUBLIC && target == scpb.ToPublic {
+				skip = false
+			} else if current == scpb.Status_ABSENT && target == scpb.ToPublic {
+				// TODO (xiang): Allow this by allowing VALIDATE CONSTRAINT to perform
+				// validation in statement phase. This condition occurs when we do thing
+				// like `ALTER TABLE .. ADD CONSTRAINT .. NOT VALID; VALIDATE CONSTRAINT ..`,
+				// or, validating a constraint created in the same transaction earlier.
+				err = scerrors.NotImplementedErrorf(nil, "validate constraint created in same txn")
+			} else {
+				err = sqlerrors.NewUndefinedConstraintError(constraintNameElem.Name, tableNameElem.Name)
+			}
+		}
+	})
+	return skip, err
 }

@@ -13,7 +13,7 @@ package norm
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -348,14 +348,21 @@ func (c *CustomFuncs) foldOIDFamilyCast(
 			if err != nil {
 				return nil, false, err
 			}
-			dOid = tree.MustBeDOid(cDatum)
+			oid, ok := tree.AsDOid(cDatum)
+			if !ok {
+				return nil, false, nil
+			}
+			dOid = oid
 		default:
 			return nil, false, nil
 		}
 	case oid.T_regclass:
 		switch inputFamily {
 		case types.StringFamily:
-			s := tree.MustBeDString(datum)
+			s, ok := tree.AsDString(datum)
+			if !ok {
+				return nil, false, nil
+			}
 			tn, err := parser.ParseQualifiedTableName(string(s))
 			if err != nil {
 				return nil, true, err
@@ -409,7 +416,7 @@ func (c *CustomFuncs) FoldCast(input opt.ScalarExpr, typ *types.T) (_ opt.Scalar
 		// TODO(mgartner): Ideally, casts that can error and cause adverse
 		// side-effects would be marked as volatile so that they are not folded.
 		// That would eliminate the need for this special error handling.
-		if errors.HasInterface(err, (*roachpb.ErrorDetailInterface)(nil)) {
+		if errors.HasInterface(err, (*kvpb.ErrorDetailInterface)(nil)) {
 			panic(err)
 		}
 		return nil, false
@@ -444,7 +451,7 @@ func (c *CustomFuncs) FoldAssignmentCast(
 		// TODO(mgartner): Ideally, casts that can error and cause adverse
 		// side-effects would be marked as volatile so that they are not folded.
 		// That would eliminate the need for this special error handling.
-		if errors.HasInterface(err, (*roachpb.ErrorDetailInterface)(nil)) {
+		if errors.HasInterface(err, (*kvpb.ErrorDetailInterface)(nil)) {
 			panic(err)
 		}
 		return nil, false
@@ -621,7 +628,7 @@ func (c *CustomFuncs) FoldColumnAccess(
 // See FoldFunctionWithNullArg for more details.
 func (c *CustomFuncs) CanFoldFunctionWithNullArg(private *memo.FunctionPrivate) bool {
 	return !private.Overload.CalledOnNullInput &&
-		private.Properties.Class == tree.NormalClass
+		private.Overload.Class == tree.NormalClass
 }
 
 // HasNullArg returns true if one of args is Null.
@@ -647,7 +654,7 @@ func (c *CustomFuncs) FoldFunction(
 ) (_ opt.ScalarExpr, ok bool) {
 	// Non-normal function classes (aggregate, window, generator) cannot be
 	// folded into a single constant.
-	if private.Properties.Class != tree.NormalClass {
+	if private.Overload.Class != tree.NormalClass {
 		return nil, false
 	}
 

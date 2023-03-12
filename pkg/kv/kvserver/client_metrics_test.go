@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -177,6 +179,8 @@ func TestStoreResolveMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.WithIssue(t, 98404)
+
 	// First prevent rot that would result from adding fields without handling
 	// them everywhere.
 	{
@@ -204,7 +208,7 @@ func TestStoreResolveMetrics(t *testing.T) {
 	const resolveAbortCount = int64(800)
 	const resolvePoisonCount = int64(2400)
 
-	ba := &roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	{
 		repl := store.LookupReplica(keys.MustAddr(span.Key))
 		var err error
@@ -219,7 +223,7 @@ func TestStoreResolveMetrics(t *testing.T) {
 			key := span.Key
 			endKey := span.EndKey
 			if i > n/2 {
-				req := &roachpb.ResolveIntentRangeRequest{
+				req := &kvpb.ResolveIntentRangeRequest{
 					IntentTxn: txn.TxnMeta,
 					Status:    status,
 					Poison:    poison,
@@ -228,7 +232,7 @@ func TestStoreResolveMetrics(t *testing.T) {
 				ba.Add(req)
 				continue
 			}
-			req := &roachpb.ResolveIntentRequest{
+			req := &kvpb.ResolveIntentRequest{
 				IntentTxn: txn.TxnMeta,
 				Status:    status,
 				Poison:    poison,
@@ -301,7 +305,7 @@ func TestStoreMetrics(t *testing.T) {
 	// This is useful, because most of the stats we track don't apply to
 	// memtables.
 	for i := range tc.Servers {
-		if err := tc.GetFirstStoreFromServer(t, i).Engine().Flush(); err != nil {
+		if err := tc.GetFirstStoreFromServer(t, i).TODOEngine().Flush(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -358,7 +362,7 @@ func TestStoreMetrics(t *testing.T) {
 		_, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
 		if err == nil {
 			return fmt.Errorf("replica still exists on dest 0")
-		} else if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+		} else if errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 			return nil
 		}
 		return err

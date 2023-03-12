@@ -28,25 +28,34 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvispb"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvissubscriber"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/spanstatskvaccessor"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangestats"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvprober"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptreconcile"
 	serverrangefeed "github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangelog"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/reports"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitieswatcher"
 	"github.com/cockroachdb/cockroach/pkg/obs"
-	"github.com/cockroachdb/cockroach/pkg/obsservice/obspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -78,6 +87,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/ttl/ttljob"      // register jobs declared outside of pkg/sql
 	_ "github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlschedule" // register schedules declared outside of pkg/sql
@@ -91,6 +101,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/schedulerlatency"
@@ -100,6 +111,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	sentry "github.com/getsentry/sentry-go"
 	"google.golang.org/grpc/codes"
@@ -143,12 +155,17 @@ type Server struct {
 	migrationServer *migrationServer
 	tsDB            *ts.DB
 	tsServer        *ts.Server
+
+	// keyVisualizerServer implements `keyvispb.KeyVisualizerServer`
+	keyVisualizerServer *KeyVisualizerServer
+
 	// The Observability Server, used by the Observability Service to subscribe to
 	// CRDB data.
-	eventsServer  *obs.EventsServer
-	raftTransport *kvserver.RaftTransport
-	stopper       *stop.Stopper
-	stopTrigger   *stopTrigger
+	eventsExporter obs.EventsExporterInterface
+	recoveryServer *loqrecovery.Server
+	raftTransport  *kvserver.RaftTransport
+	stopper        *stop.Stopper
+	stopTrigger    *stopTrigger
 
 	debug    *debug.Server
 	kvProber *kvprober.Prober
@@ -157,9 +174,14 @@ type Server struct {
 	protectedtsProvider protectedts.Provider
 
 	spanConfigSubscriber spanconfig.KVSubscriber
+	spanConfigReporter   spanconfig.Reporter
 
-	// pgL is the SQL listener.
+	tenantCapabilitiesWatcher tenantcapabilities.Watcher
+
+	// pgL is the SQL listener for pgwire connections coming over the network.
 	pgL net.Listener
+	// loopbackPgL is the SQL listener for internal pgwire connections.
+	loopbackPgL *netutil.LoopbackListener
 
 	// pgPreServer handles SQL connections prior to routing them to a
 	// specific tenant.
@@ -190,7 +212,9 @@ type Server struct {
 // The caller is responsible for listening on the server's ShutdownRequested()
 // channel and calling stopper.Stop().
 func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
-	if err := cfg.ValidateAddrs(context.Background()); err != nil {
+	ctx := cfg.AmbientCtx.AnnotateCtx(context.Background())
+
+	if err := cfg.ValidateAddrs(ctx); err != nil {
 		return nil, err
 	}
 
@@ -200,19 +224,21 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		panic(errors.New("no tracer set in AmbientCtx"))
 	}
 
+	maxOffset := time.Duration(cfg.MaxOffset)
+	toleratedOffset := cfg.ToleratedOffset()
 	var clock *hlc.Clock
 	if cfg.ClockDevicePath != "" {
-		ptpClock, err := ptp.MakeClock(context.Background(), cfg.ClockDevicePath)
+		ptpClock, err := ptp.MakeClock(ctx, cfg.ClockDevicePath)
 		if err != nil {
 			return nil, errors.Wrap(err, "instantiating clock source")
 		}
-		clock = hlc.NewClock(ptpClock, time.Duration(cfg.MaxOffset))
+		clock = hlc.NewClock(ptpClock, maxOffset, toleratedOffset)
 	} else if cfg.TestingKnobs.Server != nil &&
 		cfg.TestingKnobs.Server.(*TestingKnobs).WallClock != nil {
 		clock = hlc.NewClock(cfg.TestingKnobs.Server.(*TestingKnobs).WallClock,
-			time.Duration(cfg.MaxOffset))
+			maxOffset, toleratedOffset)
 	} else {
-		clock = hlc.NewClockWithSystemTimeSource(time.Duration(cfg.MaxOffset))
+		clock = hlc.NewClockWithSystemTimeSource(maxOffset, toleratedOffset)
 	}
 	registry := metric.NewRegistry()
 	ruleRegistry := metric.NewRuleRegistry()
@@ -235,18 +261,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	nodeIDContainer := cfg.IDContainer
 	idContainer := base.NewSQLIDContainerForNode(nodeIDContainer)
 
-	ctx := cfg.AmbientCtx.AnnotateCtx(context.Background())
-
 	admissionOptions := admission.DefaultOptions
 	if opts, ok := cfg.TestingKnobs.AdmissionControl.(*admission.Options); ok {
 		admissionOptions.Override(opts)
 	}
 	gcoords := admission.NewGrantCoordinators(cfg.AmbientCtx, st, admissionOptions, registry)
-	ssg, err := admission.MakeSoftSlotGranter(gcoords.Regular)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to soft slot granter")
-	}
-	cfg.SoftSlotGranter = ssg
 
 	engines, err := cfg.CreateEngines(ctx)
 	if err != nil {
@@ -254,15 +273,39 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 	stopper.AddCloser(&engines)
 
+	// Loss of quorum recovery store is created and pending plan is applied to
+	// engines as soon as engines are created and before any data is read in a
+	// way similar to offline engine content patching.
+	planStore, err := newPlanStore(cfg)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create loss of quorum plan store")
+	}
+	if err := loqrecovery.MaybeApplyPendingRecoveryPlan(ctx, planStore, engines, timeutil.DefaultTimeSource{}); err != nil {
+		return nil, errors.Wrap(err, "failed to apply loss of quorum recovery plan")
+	}
+
 	nodeTombStorage, checkPingFor := getPingCheckDecommissionFn(engines)
 
+	g := gossip.New(
+		cfg.AmbientCtx,
+		cfg.ClusterIDContainer,
+		nodeIDContainer,
+		stopper,
+		registry,
+		cfg.Locality,
+		&cfg.DefaultZoneConfig,
+	)
+
+	tenantCapabilitiesTestingKnobs, _ := cfg.TestingKnobs.TenantCapabilitiesTestingKnobs.(*tenantcapabilities.TestingKnobs)
+	authorizer := tenantcapabilitiesauthorizer.New(cfg.Settings, tenantCapabilitiesTestingKnobs)
 	rpcCtxOpts := rpc.ContextOptions{
 		TenantID:         roachpb.SystemTenantID,
+		UseNodeAuth:      true,
 		NodeID:           cfg.IDContainer,
 		StorageClusterID: cfg.ClusterIDContainer,
 		Config:           cfg.Config,
 		Clock:            clock.WallClock(),
-		MaxOffset:        clock.MaxOffset(),
+		ToleratedOffset:  clock.ToleratedOffset(),
 		Stopper:          stopper,
 		Settings:         cfg.Settings,
 		OnOutgoingPing: func(ctx context.Context, req *rpc.PingRequest) error {
@@ -271,23 +314,29 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// still be tried as caller node is valid, but not the destination.
 			return checkPingFor(ctx, req.TargetNodeID, codes.FailedPrecondition)
 		},
-		OnIncomingPing: func(ctx context.Context, req *rpc.PingRequest) error {
-			// Decommission state is only tracked for the system tenant.
-			if tenantID, isTenant := roachpb.TenantFromContext(ctx); isTenant &&
-				!roachpb.IsSystemTenantID(tenantID.ToUint64()) {
-				return nil
-			}
-			// Incoming ping will reject requests with codes.PermissionDenied to
-			// signal remote node that it is not considered valid anymore and
-			// operations should fail immediately.
-			return checkPingFor(ctx, req.OriginNodeID, codes.PermissionDenied)
-		},
+		TenantRPCAuthorizer: authorizer,
+		NeedsDialback:       true,
 	}
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
 		serverKnobs := knobs.(*TestingKnobs)
 		rpcCtxOpts.Knobs = serverKnobs.ContextTestingKnobs
 	}
 	rpcContext := rpc.NewContext(ctx, rpcCtxOpts)
+
+	rpcContext.OnIncomingPing = func(ctx context.Context, req *rpc.PingRequest, resp *rpc.PingResponse) error {
+		// Decommission state is only tracked for the system tenant.
+		if tenantID, isTenant := roachpb.ClientTenantFromContext(ctx); isTenant &&
+			!roachpb.IsSystemTenantID(tenantID.ToUint64()) {
+			return nil
+		}
+		if err := rpcContext.VerifyDialback(ctx, req, resp, cfg.Locality); err != nil {
+			return err
+		}
+		// Incoming ping will reject requests with codes.PermissionDenied to
+		// signal remote node that it is not considered valid anymore and
+		// operations should fail immediately.
+		return checkPingFor(ctx, req.OriginNodeID, codes.PermissionDenied)
+	}
 
 	rpcContext.HeartbeatCB = func() {
 		if err := rpcContext.RemoteClocks.VerifyClockOffset(ctx); err != nil {
@@ -313,7 +362,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
-		cm.RegisterSignalHandler(stopper)
+		// Expose cert expirations in metrics.
 		registry.AddMetricStruct(cm.Metrics())
 	}
 
@@ -324,19 +373,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// and after ValidateAddrs().
 	rpcContext.CheckCertificateAddrs(ctx)
 
-	grpcServer := newGRPCServer(rpcContext)
-
-	g := gossip.New(
-		cfg.AmbientCtx,
-		rpcContext.StorageClusterID,
-		nodeIDContainer,
-		rpcContext,
-		grpcServer.Server,
-		stopper,
-		registry,
-		cfg.Locality,
-		&cfg.DefaultZoneConfig,
-	)
+	grpcServer, err := newGRPCServer(rpcContext)
+	if err != nil {
+		return nil, err
+	}
+	gossip.RegisterGossipServer(grpcServer.Server, g)
 
 	var dialerKnobs nodedialer.DialerTestingKnobs
 	if dk := cfg.TestingKnobs.DialerKnobs; dk != nil {
@@ -346,15 +387,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	nodeDialer := nodedialer.NewWithOpt(rpcContext, gossip.AddressResolver(g),
 		nodedialer.DialerOpt{TestingKnobs: dialerKnobs})
 
-	runtimeSampler := status.NewRuntimeStatSampler(ctx, clock)
+	runtimeSampler := status.NewRuntimeStatSampler(ctx, clock.WallClock())
 	registry.AddMetricStruct(runtimeSampler)
+	// Save a reference to this sampler for use by additional servers
+	// started via the server controller.
+	cfg.RuntimeStatSampler = runtimeSampler
 
 	registry.AddMetric(base.LicenseTTL)
-
-	clusterVersionMetrics := clusterversion.MakeMetrics()
-	registry.AddMetricStruct(clusterVersionMetrics)
-	clusterversion.RegisterOnVersionChangeCallback(&st.SV)
-
 	err = base.UpdateMetricOnLicenseChange(ctx, cfg.Settings, base.LicenseTTL, timeutil.DefaultTimeSource{}, stopper)
 	if err != nil {
 		log.Errorf(ctx, "unable to initialize periodic license metric update: %v", err)
@@ -499,13 +538,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	ctSender := sidetransport.NewSender(stopper, st, clock, nodeDialer)
 	ctReceiver := sidetransport.NewReceiver(nodeIDContainer, stopper, stores, nil /* testingKnobs */)
 
-	// The InternalExecutor will be further initialized later, as we create more
+	// The Executor will be further initialized later, as we create more
 	// of the server's components. There's a circular dependency - many things
-	// need an InternalExecutor, but the InternalExecutor needs an executorConfig,
+	// need an Executor, but the Executor needs an executorConfig,
 	// which in turn needs many things. That's why everybody that needs an
-	// InternalExecutor uses this one instance.
+	// Executor uses this one instance.
 	internalExecutor := &sql.InternalExecutor{}
-	internalExecutorFactory := &sql.InternalExecutorFactory{}
+	insqlDB := sql.NewShimInternalDB(db)
 	jobRegistry := &jobs.Registry{} // ditto
 
 	// Create an ExternalStorageBuilder. This is only usable after Start() where
@@ -516,15 +555,16 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	protectedtsKnobs, _ := cfg.TestingKnobs.ProtectedTS.(*protectedts.TestingKnobs)
 	protectedtsProvider, err := ptprovider.New(ptprovider.Config{
-		DB:               db,
-		InternalExecutor: internalExecutor,
-		Settings:         st,
-		Knobs:            protectedtsKnobs,
+		DB:       insqlDB,
+		Settings: st,
+		Knobs:    protectedtsKnobs,
 		ReconcileStatusFuncs: ptreconcile.StatusFuncs{
 			jobsprotectedts.GetMetaType(jobsprotectedts.Jobs): jobsprotectedts.MakeStatusFunc(
-				jobRegistry, internalExecutor, jobsprotectedts.Jobs),
-			jobsprotectedts.GetMetaType(jobsprotectedts.Schedules): jobsprotectedts.MakeStatusFunc(jobRegistry,
-				internalExecutor, jobsprotectedts.Schedules),
+				jobRegistry, jobsprotectedts.Jobs,
+			),
+			jobsprotectedts.GetMetaType(jobsprotectedts.Schedules): jobsprotectedts.MakeStatusFunc(
+				jobRegistry, jobsprotectedts.Schedules,
+			),
 		},
 	})
 	if err != nil {
@@ -717,7 +757,16 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		storeCfg.TestingKnobs = *storeTestingKnobs.(*kvserver.StoreTestingKnobs)
 	}
 
-	recorder := status.NewMetricsRecorder(clock, nodeLiveness, rpcContext, g, st)
+	systemTenantNameContainer := roachpb.NewTenantNameContainer(catconstants.SystemTenantName)
+
+	recorder := status.NewMetricsRecorder(
+		rpcContext.TenantID,
+		systemTenantNameContainer,
+		nodeLiveness,
+		rpcContext.RemoteClocks,
+		clock.WallClock(),
+		st,
+	)
 	registry.AddMetricStruct(rpcContext.RemoteClocks.Metrics())
 
 	updates := &diagnostics.UpdateChecker{
@@ -735,11 +784,20 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		updates.TestingKnobs = &cfg.TestingKnobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
 	}
 
-	tenantUsage := NewTenantUsageServer(st, db, internalExecutorFactory)
+	tenantUsage := NewTenantUsageServer(st, db, insqlDB)
 	registry.AddMetricStruct(tenantUsage.Metrics())
 
 	tenantSettingsWatcher := tenantsettingswatcher.New(
 		clock, rangeFeedFactory, stopper, st,
+	)
+
+	tenantCapabilitiesWatcher := tenantcapabilitieswatcher.New(
+		clock,
+		rangeFeedFactory,
+		keys.TenantsTableID,
+		stopper,
+		1<<20, /* 1 MB */
+		tenantCapabilitiesTestingKnobs,
 	)
 
 	node := NewNode(
@@ -758,7 +816,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		spanConfig.kvAccessor,
 		spanConfig.reporter,
 	)
-	roachpb.RegisterInternalServer(grpcServer.Server, node)
+	kvpb.RegisterInternalServer(grpcServer.Server, node)
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
 	kvserver.RegisterPerStoreServer(grpcServer.Server, node.perReplicaServer)
 	ctpb.RegisterSideTransportServer(grpcServer.Server, ctReceiver)
@@ -841,7 +899,19 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		serverIterator,
 		spanConfig.reporter,
 		clock,
+		distSender,
+		rangestats.NewFetcher(db),
+		node,
 	)
+
+	keyVisualizerServer := &KeyVisualizerServer{
+		ie:         internalExecutor,
+		settings:   st,
+		nodeDialer: nodeDialer,
+		status:     sStatus,
+		node:       node,
+	}
+	keyVisServerAccessor := spanstatskvaccessor.New(keyVisualizerServer)
 
 	// Instantiate the KV prober.
 	kvProber := kvprober.NewProber(kvprober.Opts{
@@ -852,19 +922,52 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	})
 	registry.AddMetricStruct(kvProber.Metrics())
 
-	// Create the Obs Server. We'll call SetResourceInfo() on it and register it
-	// with gRPC later.
-	eventsServer := obs.NewEventServer(
-		cfg.AmbientCtx,
-		timeutil.DefaultTimeSource{},
-		stopper,
-		5*time.Second, // maxStaleness
-		1<<20,         // triggerSizeBytes - 1MB
-		10*1<<20,      // maxBufferSizeBytes - 10MB
-		sqlMonitorAndMetrics.rootSQLMemoryMonitor, // memMonitor - this is not "SQL" usage, but we don't have another memory pool,
-	)
-	if knobs := cfg.TestingKnobs.EventExporter; knobs != nil {
-		eventsServer.TestingKnobs = knobs.(obs.EventServerTestingKnobs)
+	flushInterval := 5 * time.Second
+	flushTriggerBytesSize := uint64(1 << 20) // 1MB
+	if cfg.TestingKnobs.EventExporter != nil {
+		knobs := cfg.TestingKnobs.EventExporter.(*obs.EventExporterTestingKnobs)
+		if knobs.FlushInterval != time.Duration(0) {
+			flushInterval = knobs.FlushInterval
+		}
+		if knobs.FlushTriggerByteSize != 0 {
+			flushTriggerBytesSize = knobs.FlushTriggerByteSize
+		}
+	}
+
+	// Create the EventExporter, which will export events to the Obs Service.
+	// We'll start it later, once we know our node ID.
+	var eventsExporter obs.EventsExporterInterface
+	if cfg.ObsServiceAddr != "" {
+		if cfg.ObsServiceAddr == base.ObsServiceEmbedFlagValue {
+			ee := obs.NewEventsExporter(
+				"", // targetAddr - we'll configure a custom dialer connecting to the local node later
+				timeutil.DefaultTimeSource{},
+				cfg.Tracer,
+				flushInterval,
+				flushTriggerBytesSize,
+				10*1<<20, // maxBufferSizeBytes - 10MB
+				sqlMonitorAndMetrics.rootSQLMemoryMonitor, // memMonitor - this is not "SQL" usage, but we don't have another memory pool
+			)
+			eventsExporter = ee
+		} else {
+			targetAddr, err := obs.ValidateOTLPTargetAddr(cfg.ObsServiceAddr)
+			if err != nil {
+				return nil, err
+			}
+			ee := obs.NewEventsExporter(
+				targetAddr,
+				timeutil.DefaultTimeSource{},
+				cfg.Tracer,
+				flushInterval,
+				flushTriggerBytesSize,
+				10*1<<20, // maxBufferSizeBytes - 10MB
+				sqlMonitorAndMetrics.rootSQLMemoryMonitor, // memMonitor - this is not "SQL" usage, but we don't have another memory pool
+			)
+			log.Infof(ctx, "will export events over OTLP to: %s", cfg.ObsServiceAddr)
+			eventsExporter = ee
+		}
+	} else {
+		eventsExporter = &obs.NoopEventsExporter{}
 	}
 
 	// The settings cache writer is responsible for persisting the
@@ -874,7 +977,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	// Initialize the pgwire pre-server, which initializes connections,
 	// sets up TLS and reads client status parameters.
-	pgPreServer := pgwire.MakePreServeConnHandler(
+	pgPreServer := pgwire.NewPreServeConnHandler(
 		cfg.AmbientCtx,
 		cfg.Config,
 		cfg.Settings,
@@ -912,6 +1015,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		nodeDescs:                g,
 		systemConfigWatcher:      systemConfigWatcher,
 		spanConfigAccessor:       spanConfig.kvAccessor,
+		keyVisServerAccessor:     keyVisServerAccessor,
 		nodeDialer:               nodeDialer,
 		distSender:               distSender,
 		db:                       db,
@@ -921,7 +1025,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		closedSessionCache:       closedSessionCache,
 		remoteFlowRunner:         remoteFlowRunner,
 		circularInternalExecutor: internalExecutor,
-		internalExecutorFactory:  internalExecutorFactory,
+		internalDB:               insqlDB,
 		circularJobRegistry:      jobRegistry,
 		protectedtsProvider:      protectedtsProvider,
 		rangeFeedFactory:         rangeFeedFactory,
@@ -930,9 +1034,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		tenantUsageServer:        tenantUsage,
 		monitorAndMetrics:        sqlMonitorAndMetrics,
 		settingsStorage:          settingsWriter,
-		eventsServer:             eventsServer,
+		eventsExporter:           eventsExporter,
 		admissionPacerFactory:    gcoords.Elastic,
 		rangeDescIteratorFactory: rangedesc.NewIteratorFactory(db),
+		tenantCapabilitiesReader: sql.MakeSystemTenantOnly[tenantcapabilities.Reader](tenantCapabilitiesWatcher),
 	})
 	if err != nil {
 		return nil, err
@@ -996,8 +1101,14 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	sStatus.baseStatusServer.sqlServer = sqlServer
 
 	// Create a server controller.
-	sc := newServerController(ctx, stopper, st,
-		lateBoundServer.newServerForTenant, &systemServerWrapper{server: lateBoundServer})
+	sc := newServerController(ctx,
+		node, cfg.BaseConfig.IDContainer,
+		stopper, st,
+		lateBoundServer,
+		&systemServerWrapper{server: lateBoundServer},
+		systemTenantNameContainer,
+		pgPreServer.SendRoutingError,
+	)
 
 	// Create the debug API server.
 	debugServer := debug.NewServer(
@@ -1009,7 +1120,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		// https://github.com/cockroachdb/cockroach/issues/84585 is
 		// implemented.
 		func(ctx context.Context, name roachpb.TenantName) error {
-			d, err := sc.getOrCreateServer(ctx, name)
+			d, err := sc.getServer(ctx, name)
 			if err != nil {
 				return err
 			}
@@ -1017,53 +1128,71 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		},
 	)
 
+	recoveryServer := loqrecovery.NewServer(
+		nodeIDContainer,
+		st,
+		stores,
+		planStore,
+		g,
+		cfg.Locality,
+		rpcContext,
+		cfg.TestingKnobs.LOQRecovery,
+		func(ctx context.Context, id roachpb.NodeID) error {
+			return nodeTombStorage.SetDecommissioned(ctx, id, timeutil.Now())
+		},
+	)
+
 	*lateBoundServer = Server{
-		nodeIDContainer:        nodeIDContainer,
-		cfg:                    cfg,
-		st:                     st,
-		clock:                  clock,
-		rpcContext:             rpcContext,
-		engines:                engines,
-		grpc:                   grpcServer,
-		gossip:                 g,
-		nodeDialer:             nodeDialer,
-		nodeLiveness:           nodeLiveness,
-		storePool:              storePool,
-		tcsFactory:             tcsFactory,
-		distSender:             distSender,
-		db:                     db,
-		node:                   node,
-		registry:               registry,
-		recorder:               recorder,
-		ruleRegistry:           ruleRegistry,
-		promRuleExporter:       promRuleExporter,
-		updates:                updates,
-		ctSender:               ctSender,
-		runtime:                runtimeSampler,
-		http:                   sHTTP,
-		adminAuthzCheck:        adminAuthzCheck,
-		admin:                  sAdmin,
-		status:                 sStatus,
-		drain:                  drain,
-		decomNodeMap:           decomNodeMap,
-		authentication:         sAuth,
-		tsDB:                   tsDB,
-		tsServer:               &sTS,
-		eventsServer:           eventsServer,
-		raftTransport:          raftTransport,
-		stopper:                stopper,
-		stopTrigger:            stopTrigger,
-		debug:                  debugServer,
-		kvProber:               kvProber,
-		replicationReporter:    replicationReporter,
-		protectedtsProvider:    protectedtsProvider,
-		spanConfigSubscriber:   spanConfig.subscriber,
-		pgPreServer:            &pgPreServer,
-		sqlServer:              sqlServer,
-		serverController:       sc,
-		externalStorageBuilder: externalStorageBuilder,
-		storeGrantCoords:       gcoords.Stores,
-		kvMemoryMonitor:        kvMemoryMonitor,
+		nodeIDContainer:           nodeIDContainer,
+		cfg:                       cfg,
+		st:                        st,
+		clock:                     clock,
+		rpcContext:                rpcContext,
+		engines:                   engines,
+		grpc:                      grpcServer,
+		gossip:                    g,
+		nodeDialer:                nodeDialer,
+		nodeLiveness:              nodeLiveness,
+		storePool:                 storePool,
+		tcsFactory:                tcsFactory,
+		distSender:                distSender,
+		db:                        db,
+		node:                      node,
+		registry:                  registry,
+		recorder:                  recorder,
+		ruleRegistry:              ruleRegistry,
+		promRuleExporter:          promRuleExporter,
+		updates:                   updates,
+		ctSender:                  ctSender,
+		runtime:                   runtimeSampler,
+		http:                      sHTTP,
+		adminAuthzCheck:           adminAuthzCheck,
+		admin:                     sAdmin,
+		status:                    sStatus,
+		drain:                     drain,
+		decomNodeMap:              decomNodeMap,
+		authentication:            sAuth,
+		tsDB:                      tsDB,
+		tsServer:                  &sTS,
+		eventsExporter:            eventsExporter,
+		recoveryServer:            recoveryServer,
+		raftTransport:             raftTransport,
+		stopper:                   stopper,
+		stopTrigger:               stopTrigger,
+		debug:                     debugServer,
+		kvProber:                  kvProber,
+		replicationReporter:       replicationReporter,
+		protectedtsProvider:       protectedtsProvider,
+		spanConfigSubscriber:      spanConfig.subscriber,
+		spanConfigReporter:        spanConfig.reporter,
+		tenantCapabilitiesWatcher: tenantCapabilitiesWatcher,
+		pgPreServer:               pgPreServer,
+		sqlServer:                 sqlServer,
+		serverController:          sc,
+		externalStorageBuilder:    externalStorageBuilder,
+		storeGrantCoords:          gcoords.Stores,
+		kvMemoryMonitor:           kvMemoryMonitor,
+		keyVisualizerServer:       keyVisualizerServer,
 	}
 
 	return lateBoundServer, err
@@ -1126,17 +1255,6 @@ func (li listenerInfo) Iter() map[string]string {
 	}
 }
 
-// Start calls PreStart() and AcceptClient() in sequence.
-// This is suitable for use e.g. in tests.
-// This mirrors the implementation of (*SQLServerWrapper).Start.
-// TODO(knz): Find a way to implement this method only once for both.
-func (s *Server) Start(ctx context.Context) error {
-	if err := s.PreStart(ctx); err != nil {
-		return err
-	}
-	return s.AcceptClients(ctx)
-}
-
 // PreStart starts the server on the specified port, starts gossip and
 // initializes the node using the engines from the server's context.
 //
@@ -1172,6 +1290,18 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// Start a context for the asynchronous network workers.
 	workersCtx := s.AnnotateCtx(context.Background())
 
+	if !s.cfg.Insecure {
+		cm, err := s.rpcContext.GetCertificateManager()
+		if err != nil {
+			return err
+		}
+		// Ensure that SIGHUP will make this cert manager reload its certs
+		// from disk.
+		if err := cm.RegisterSignalHandler(workersCtx, s.stopper); err != nil {
+			return err
+		}
+	}
+
 	// Start the time sanity checker.
 	s.startTime = timeutil.Now()
 	if err := s.startMonitoringForwardClockJumps(workersCtx); err != nil {
@@ -1180,7 +1310,9 @@ func (s *Server) PreStart(ctx context.Context) error {
 
 	// Connect the node as loopback handler for RPC requests to the
 	// local node.
-	s.rpcContext.SetLocalInternalServer(s.node, s.grpc.serverInterceptorsInfo, s.rpcContext.ClientInterceptors())
+	s.rpcContext.SetLocalInternalServer(
+		s.node,
+		s.grpc.serverInterceptorsInfo, s.rpcContext.ClientInterceptors())
 
 	// Load the TLS configuration for the HTTP server.
 	uiTLSConfig, err := s.rpcContext.GetUIServerTLSConfig()
@@ -1202,7 +1334,6 @@ func (s *Server) PreStart(ctx context.Context) error {
 	ieMon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
 	ieMon.StartNoReserved(ctx, s.PGServer().SQLServer.GetBytesMonitor())
 	s.stopper.AddCloser(stop.CloserFn(func() { ieMon.Stop(ctx) }))
-	fileTableInternalExecutor := sql.MakeInternalExecutor(s.PGServer().SQLServer, sql.MemoryMetrics{}, ieMon)
 	s.externalStorageBuilder.init(
 		ctx,
 		s.cfg.ExternalIODirConfig,
@@ -1210,9 +1341,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		s.nodeIDContainer,
 		s.nodeDialer,
 		s.cfg.TestingKnobs,
-		&fileTableInternalExecutor,
-		s.sqlServer.execCfg.InternalExecutorFactory,
-		s.db,
+		s.sqlServer.execCfg.InternalDB.CloneWithMemoryMonitor(sql.MemoryMetrics{}, ieMon),
 		nil, /* TenantExternalIORecorder */
 		s.registry,
 	)
@@ -1258,7 +1387,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		// now, or if the process crashed earlier half-way through the callback,
 		// that version won't be on all engines. For that reason, we backfill
 		// once.
-		if err := kvserver.WriteClusterVersionToEngines(
+		if err := kvstorage.WriteClusterVersionToEngines(
 			ctx, s.engines, initialDiskClusterVersion,
 		); err != nil {
 			return err
@@ -1291,20 +1420,20 @@ func (s *Server) PreStart(ctx context.Context) error {
 	serverpb.RegisterMigrationServer(s.grpc.Server, migrationServer)
 	s.migrationServer = migrationServer // only for testing via TestServer
 
-	// Register the Observability Server, used by the Observability Service to
-	// subscribe to CRDB data. Note that the server will reject RPCs until
-	// SetResourceInfo is called later.
-	obspb.RegisterObsServer(s.grpc.Server, s.eventsServer)
+	// Register the KeyVisualizer Server
+	keyvispb.RegisterKeyVisualizerServer(s.grpc.Server, s.keyVisualizerServer)
 
 	// Start the RPC server. This opens the RPC/SQL listen socket,
 	// and dispatches the server worker for the RPC.
 	// The SQL listener is returned, to start the SQL server later
 	// below when the server has initialized.
-	pgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, s.cfg.BaseConfig, s.stopper, s.grpc, true /* enableSQLListener */)
+	pgL, loopbackPgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(
+		ctx, workersCtx, s.cfg.BaseConfig, s.stopper, s.grpc, true /* enableSQLListener */)
 	if err != nil {
 		return err
 	}
 	s.pgL = pgL
+	s.loopbackPgL = loopbackPgL
 
 	// Tell the RPC context how to connect in-memory.
 	s.rpcContext.SetLoopbackDialer(rpcLoopbackDialFn)
@@ -1461,7 +1590,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		// Either way, we'll do so by first persisting the cluster version
 		// itself, and then informing the version setting about it (an invariant
 		// we must up hold whenever setting a new active version).
-		if err := kvserver.WriteClusterVersionToEngines(
+		if err := kvstorage.WriteClusterVersionToEngines(
 			ctx, s.engines, state.clusterVersion,
 		); err != nil {
 			return err
@@ -1558,7 +1687,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 	advAddrU := util.NewUnresolvedAddr("tcp", s.cfg.AdvertiseAddr)
 
 	// We're going to need to start gossip before we spin up Node below.
-	s.gossip.Start(advAddrU, filtered)
+	s.gossip.Start(advAddrU, filtered, s.rpcContext)
 	log.Event(ctx, "started gossip")
 
 	// Now that we have a monotonic HLC wrt previous incarnations of the process,
@@ -1616,6 +1745,7 @@ func (s *Server) PreStart(ctx context.Context) error {
 		s.stopper,
 		s.cfg.GoroutineDumpDirName,
 		s.cfg.HeapProfileDirName,
+		s.cfg.CPUProfileDirName,
 		s.runtime,
 		s.status.sessionRegistry,
 	); err != nil {
@@ -1738,6 +1868,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 			sqlServer:        s.sqlServer,
 			db:               s.db,
 		}), /* apiServer */
+		serverpb.FeatureFlags{
+			CanViewKvMetricDashboards:   s.rpcContext.TenantID.Equal(roachpb.SystemTenantID),
+			DisableKvLevelAdvancedDebug: false,
+		},
 	); err != nil {
 		return err
 	}
@@ -1777,8 +1911,16 @@ func (s *Server) PreStart(ctx context.Context) error {
 		s.startDiagnostics(workersCtx)
 	}
 
-	// Enable the Obs Server.
-	s.eventsServer.SetResourceInfo(state.clusterID, int32(state.nodeID), build.BinaryVersion())
+	s.eventsExporter.SetNodeInfo(obs.NodeInfo{
+		ClusterID:     state.clusterID,
+		NodeID:        int32(state.nodeID),
+		BinaryVersion: build.BinaryVersion(),
+	})
+	if s.cfg.ObsServiceAddr != base.ObsServiceEmbedFlagValue {
+		if err := s.eventsExporter.Start(ctx, s.stopper); err != nil {
+			return errors.Wrapf(err, "failed to start events exporter")
+		}
+	}
 
 	// Connect the engines to the disk stats map constructor.
 	if err := s.node.registerEnginesForDiskStatsMap(s.cfg.Stores.Specs, s.engines); err != nil {
@@ -1813,21 +1955,52 @@ func (s *Server) PreStart(ctx context.Context) error {
 		return errors.Wrap(err, "cannot start upgrade task")
 	}
 
+	// Initialize the key visualizer boundary subscriber rangefeed,
+	// and start the rangefeed to broadcast updates to the collector.
+	if err := keyvissubscriber.Start(
+		ctx,
+		s.stopper,
+		s.db,
+		s.ClusterSettings(),
+		s.sqlServer.execCfg.SystemTableIDResolver,
+		s.clock.Now(),
+		func(update *keyvispb.UpdateBoundariesRequest) {
+			s.node.spanStatsCollector.SaveBoundaries(update.Boundaries, update.Time)
+		}); err != nil {
+		return err
+	}
+
 	if err := s.node.tenantSettingsWatcher.Start(workersCtx, s.sqlServer.execCfg.SystemTableIDResolver); err != nil {
 		return errors.Wrap(err, "failed to initialize the tenant settings watcher")
 	}
+	if err := s.tenantCapabilitiesWatcher.Start(ctx); err != nil {
+		return errors.Wrap(err, "initializing tenant capabilities")
+	}
+	// Now that we've got the tenant capabilities subsystem all started, we bind
+	// the Reader to the TenantRPCAuthorizer, so that it has a handle into the
+	// global tenant capabilities state.
+	s.rpcContext.TenantRPCAuthorizer.BindReader(s.tenantCapabilitiesWatcher)
 
 	if err := s.kvProber.Start(workersCtx, s.stopper); err != nil {
 		return errors.Wrapf(err, "failed to start KV prober")
 	}
 
-	// As final stage of loss of quorum recovery, write events into corresponding
-	// range logs. We do it as a separate stage to log events early just in case
-	// startup fails, and write to range log once the server is running as we need
-	// to run sql statements to update rangelog.
-	publishPendingLossOfQuorumRecoveryEvents(
-		workersCtx, s.node.execCfg.InternalExecutor, s.node.stores, s.stopper,
-	)
+	// Perform loss of quorum recovery cleanup if any actions were scheduled.
+	// Cleanup actions rely on node being connected to the cluster and hopefully
+	// in a healthy or healthier stats to update node liveness records.
+	maybeRunLossOfQuorumRecoveryCleanup(
+		ctx,
+		s.node.execCfg.InternalDB.Executor(),
+		s.node.stores,
+		s,
+		s.stopper)
+
+	// Let the server controller start watching tenant service mode changes.
+	if err := s.serverController.start(workersCtx,
+		s.node.execCfg.InternalDB.Executor(),
+	); err != nil {
+		return errors.Wrap(err, "failed to start the server controller")
+	}
 
 	log.Event(ctx, "server initialized")
 
@@ -1864,6 +2037,32 @@ func (s *Server) AcceptClients(ctx context.Context) error {
 	return nil
 }
 
+// AcceptInternalClients starts listening for incoming SQL connections on the
+// internal loopback interface.
+func (s *Server) AcceptInternalClients(ctx context.Context) error {
+	connManager := netutil.MakeTCPServer(ctx, s.stopper)
+
+	return s.stopper.RunAsyncTaskEx(ctx,
+		stop.TaskOpts{TaskName: "sql-internal-listener", SpanOpt: stop.SterileRootSpan},
+		func(ctx context.Context) {
+			err := connManager.ServeWith(ctx, s.loopbackPgL, func(ctx context.Context, conn net.Conn) {
+				connCtx := s.pgPreServer.AnnotateCtxForIncomingConn(ctx, conn)
+				connCtx = logtags.AddTag(connCtx, "internal-conn", nil)
+
+				conn, status, err := s.pgPreServer.PreServe(connCtx, conn, pgwire.SocketInternalLoopback)
+				if err != nil {
+					log.Ops.Errorf(connCtx, "serving SQL client conn: %v", err)
+					return
+				}
+
+				if err := s.serverController.sqlMux(connCtx, conn, status); err != nil {
+					log.Ops.Errorf(connCtx, "serving internal SQL client conn: %s", err)
+				}
+			})
+			netutil.FatalIfUnexpected(err)
+		})
+}
+
 // Stop shuts down this server instance. Note that this method exists
 // solely for the benefit of the `\demo shutdown` command in
 // `cockroach demo`. It is not called as part of the regular server
@@ -1890,6 +2089,11 @@ func (s *Server) PGServer() *pgwire.Server {
 	return s.sqlServer.pgServer
 }
 
+// SpanConfigReporter returns the spanconfig.Reporter. Used by tests.
+func (s *Server) SpanConfigReporter() spanconfig.Reporter {
+	return s.spanConfigReporter
+}
+
 // LogicalClusterID implements cli.serverStartupInterface. This
 // implementation exports the logical cluster ID of the system tenant.
 func (s *Server) LogicalClusterID() uuid.UUID {
@@ -1909,6 +2113,11 @@ func init() {
 // Insecure returns true iff the server has security disabled.
 func (s *Server) Insecure() bool {
 	return s.cfg.Insecure
+}
+
+// TenantCapabilitiesReader returns the Server's tenantcapabilities.Reader.
+func (s *Server) TenantCapabilitiesReader() tenantcapabilities.Reader {
+	return s.tenantCapabilitiesWatcher
 }
 
 // Drain idempotently activates the draining mode.

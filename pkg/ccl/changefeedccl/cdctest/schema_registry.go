@@ -25,8 +25,9 @@ import (
 
 // SchemaRegistry is the kafka schema registry used in tests.
 type SchemaRegistry struct {
-	server *httptest.Server
-	mu     struct {
+	server     *httptest.Server
+	statusCode int
+	mu         struct {
 		syncutil.Mutex
 		idAlloc  int32
 		schemas  map[int32]string
@@ -42,14 +43,28 @@ func StartTestSchemaRegistry() *SchemaRegistry {
 	return r
 }
 
+// StartErrorTestSchemaRegistry creates and starts schema registry for
+// tests which will return the supplied statusCode on each request.
+func StartErrorTestSchemaRegistry(statusCode int) *SchemaRegistry {
+	r := makeTestSchemaRegistry()
+	r.statusCode = statusCode
+	r.server.Start()
+	return r
+}
+
 // StartTestSchemaRegistryWithTLS creates and starts schema registry
 // for tests with TLS enabled.
-func StartTestSchemaRegistryWithTLS(certificate *tls.Certificate) (*SchemaRegistry, error) {
+func StartTestSchemaRegistryWithTLS(
+	certificate *tls.Certificate, requireClientCert bool,
+) (*SchemaRegistry, error) {
 	r := makeTestSchemaRegistry()
 	if certificate != nil {
 		r.server.TLS = &tls.Config{
 			Certificates: []tls.Certificate{*certificate},
 		}
+	}
+	if requireClientCert {
+		r.server.TLS.ClientAuth = tls.RequireAnyClientCert
 	}
 	r.server.StartTLS()
 	return r, nil
@@ -109,6 +124,11 @@ var (
 
 // requestHandler routes requests based on the Method and Path of the request.
 func (r *SchemaRegistry) requestHandler(hw http.ResponseWriter, hr *http.Request) {
+	if r.statusCode != 0 {
+		hw.WriteHeader(r.statusCode)
+		return
+	}
+
 	path := hr.URL.Path
 	method := hr.Method
 

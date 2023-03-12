@@ -25,8 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -740,7 +742,7 @@ func (tc *TestCluster) changeReplicas(
 		}
 		var err error
 		desc, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, startKey.AsRawKey(), beforeDesc, roachpb.MakeReplicationChanges(changeType, targets...),
+			ctx, startKey.AsRawKey(), beforeDesc, kvpb.MakeReplicationChanges(changeType, targets...),
 		)
 		if kvserver.IsRetriableReplicationChangeError(err) {
 			tc.t.Logf("encountered retriable replication change error: %v", err)
@@ -962,7 +964,7 @@ func (tc *TestCluster) SwapVoterWithNonVoter(
 	); err != nil {
 		return nil, errors.Wrap(err, "range descriptor lookup error")
 	}
-	changes := []roachpb.ReplicationChange{
+	changes := []kvpb.ReplicationChange{
 		{ChangeType: roachpb.ADD_VOTER, Target: nonVoterTarget},
 		{ChangeType: roachpb.REMOVE_NON_VOTER, Target: nonVoterTarget},
 		{ChangeType: roachpb.ADD_NON_VOTER, Target: voterTarget},
@@ -1001,7 +1003,7 @@ func (tc *TestCluster) RebalanceVoter(
 	); err != nil {
 		return nil, errors.Wrap(err, "range descriptor lookup error")
 	}
-	changes := []roachpb.ReplicationChange{
+	changes := []kvpb.ReplicationChange{
 		{ChangeType: roachpb.REMOVE_VOTER, Target: src},
 		{ChangeType: roachpb.ADD_VOTER, Target: dest},
 	}
@@ -1152,7 +1154,7 @@ func (tc *TestCluster) MoveRangeLeaseNonCooperatively(
 		ls, err := r.TestingAcquireLease(ctx)
 		if err != nil {
 			log.Infof(ctx, "TestingAcquireLease failed: %s", err)
-			if lErr := (*roachpb.NotLeaseHolderError)(nil); errors.As(err, &lErr) && lErr.Lease != nil {
+			if lErr := (*kvpb.NotLeaseHolderError)(nil); errors.As(err, &lErr) && lErr.Lease != nil {
 				newLease = lErr.Lease
 			} else {
 				return err
@@ -1473,7 +1475,7 @@ func (tc *TestCluster) ReadIntFromStores(key roachpb.Key) []int64 {
 	results := make([]int64, len(tc.Servers))
 	for i, server := range tc.Servers {
 		err := server.Stores().VisitStores(func(s *kvserver.Store) error {
-			valRes, err := storage.MVCCGet(context.Background(), s.Engine(), key,
+			valRes, err := storage.MVCCGet(context.Background(), s.TODOEngine(), key,
 				server.Clock().Now(), storage.MVCCGetOptions{})
 			if err != nil {
 				log.VEventf(context.Background(), 1, "store %d: error reading from key %s: %s", s.StoreID(), key, err)
@@ -1546,21 +1548,23 @@ func (tc *TestCluster) RestartServerWithInspect(idx int, inspect func(s *server.
 	}
 	serverArgs := tc.serverArgs[idx]
 
-	if idx == 0 {
-		// If it's the first server, then we need to restart the RPC listener by hand.
-		// Look at NewTestCluster for more details.
-		listener, err := net.Listen("tcp", serverArgs.Listener.Addr().String())
-		if err != nil {
-			return err
-		}
-		serverArgs.Listener = listener
-		serverArgs.Knobs.Server.(*server.TestingKnobs).RPCListener = serverArgs.Listener
-	} else {
-		serverArgs.Addr = ""
-		// Try and point the server to a live server in the cluster to join.
-		for i := range tc.Servers {
-			if !tc.ServerStopped(i) {
-				serverArgs.JoinAddr = tc.Servers[i].ServingRPCAddr()
+	if !tc.clusterArgs.ReusableListeners {
+		if idx == 0 {
+			// If it's the first server, then we need to restart the RPC listener by hand.
+			// Look at NewTestCluster for more details.
+			listener, err := net.Listen("tcp", serverArgs.Listener.Addr().String())
+			if err != nil {
+				return err
+			}
+			serverArgs.Listener = listener
+			serverArgs.Knobs.Server.(*server.TestingKnobs).RPCListener = serverArgs.Listener
+		} else {
+			serverArgs.Addr = ""
+			// Try and point the server to a live server in the cluster to join.
+			for i := range tc.Servers {
+				if !tc.ServerStopped(i) {
+					serverArgs.JoinAddr = tc.Servers[i].ServingRPCAddr()
+				}
 			}
 		}
 	}
@@ -1769,6 +1773,39 @@ func (tc *TestCluster) SplitTable(
 				t.Fatal(err)
 			}
 		}
+	}
+}
+
+// WaitForTenantCapabilities implements TestClusterInterface.
+func (tc *TestCluster) WaitForTenantCapabilities(
+	t *testing.T, tenID roachpb.TenantID, capIDs ...tenantcapabilities.CapabilityID,
+) {
+	for i, ts := range tc.Servers {
+		testutils.SucceedsSoon(t, func() error {
+			if tenID.IsSystem() {
+				return nil
+			}
+
+			if len(capIDs) > 0 {
+				missingCapabilityError := func(capID tenantcapabilities.CapabilityID) error {
+					return errors.Newf("server=%d tenant %s does not have capability %q", i, tenID, capID)
+				}
+				capabilities, found := ts.Server.TenantCapabilitiesReader().GetCapabilities(tenID)
+				if !found {
+					return missingCapabilityError(capIDs[0])
+				}
+
+				for _, capID := range capIDs {
+					if capID.CapabilityType() != tenantcapabilities.Bool {
+						return errors.AssertionFailedf("WaitForTenantCapabilities only supports boolean capabilities")
+					}
+					if !capabilities.GetBool(capID) {
+						return missingCapabilityError(capID)
+					}
+				}
+			}
+			return nil
+		})
 	}
 }
 

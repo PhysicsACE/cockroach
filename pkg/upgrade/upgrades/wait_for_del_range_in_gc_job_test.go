@@ -33,14 +33,14 @@ func TestWaitForDelRangeInGCJob(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var (
-		v0 = clusterversion.ByKey(clusterversion.V22_2UseDelRangeInGCJob - 1)
-		v1 = clusterversion.ByKey(clusterversion.V22_2WaitedForDelRangeInGCJob)
+		v0 = clusterversion.ByKey(clusterversion.TODODelete_V22_2UseDelRangeInGCJob - 1)
+		v1 = clusterversion.ByKey(clusterversion.TODODelete_V22_2WaitedForDelRangeInGCJob)
 	)
 
 	ctx := context.Background()
 	settings := cluster.MakeTestingClusterSettingsWithVersions(v1, v0, false /* initializeVersion */)
 	require.NoError(t, clusterversion.Initialize(ctx, v0, &settings.SV))
-	storage.MVCCRangeTombstonesEnabled.Override(ctx, &settings.SV, true)
+	storage.MVCCRangeTombstonesEnabledInMixedClusters.Override(ctx, &settings.SV, true)
 	testServer, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		Settings: settings,
 		Knobs: base.TestingKnobs{

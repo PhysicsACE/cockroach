@@ -15,16 +15,22 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"io"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -90,32 +96,81 @@ func TestWrappedServerStream(t *testing.T) {
 	require.Equal(t, 3, recv)
 }
 
-func TestTenantFromCert(t *testing.T) {
+func TestAuthenticateTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	correctOU := []string{security.TenantsOU}
+	stid := roachpb.SystemTenantID
+	tenTen := roachpb.MustMakeTenantID(10)
 	for _, tc := range []struct {
-		ous         []string
-		commonName  string
-		expTenID    roachpb.TenantID
-		expErr      string
-		tenantScope uint64
+		systemID         roachpb.TenantID
+		ous              []string
+		commonName       string
+		expTenID         roachpb.TenantID
+		expErr           string
+		tenantScope      uint64
+		clientTenantInMD string
 	}{
-		{ous: correctOU, commonName: "10", expTenID: roachpb.MustMakeTenantID(10)},
-		{ous: correctOU, commonName: roachpb.MinTenantID.String(), expTenID: roachpb.MinTenantID},
-		{ous: correctOU, commonName: roachpb.MaxTenantID.String(), expTenID: roachpb.MaxTenantID},
-		{ous: correctOU, commonName: roachpb.SystemTenantID.String() /* "system" */, expErr: `could not parse tenant ID from Common Name \(CN\)`},
-		{ous: correctOU, commonName: "-1", expErr: `could not parse tenant ID from Common Name \(CN\)`},
-		{ous: correctOU, commonName: "0", expErr: `invalid tenant ID 0 in Common Name \(CN\)`},
-		{ous: correctOU, commonName: "1", expErr: `invalid tenant ID 1 in Common Name \(CN\)`},
-		{ous: correctOU, commonName: "root", expErr: `could not parse tenant ID from Common Name \(CN\)`},
-		{ous: correctOU, commonName: "other", expErr: `could not parse tenant ID from Common Name \(CN\)`},
-		{ous: []string{"foo"}, commonName: "other", expErr: `client certificate CN=other,OU=foo cannot be used to perform RPC on tenant {1}`},
-		{ous: nil, commonName: "other", expErr: `client certificate CN=other cannot be used to perform RPC on tenant {1}`},
-		{ous: append([]string{"foo"}, correctOU...), commonName: "other", expErr: `could not parse tenant ID from Common Name`},
-		{ous: nil, commonName: "root"},
-		{ous: nil, commonName: "root", tenantScope: 10, expErr: "client certificate CN=root cannot be used to perform RPC on tenant {1}"},
+		{systemID: stid, ous: correctOU, commonName: "10", expTenID: tenTen},
+		{systemID: stid, ous: correctOU, commonName: roachpb.MinTenantID.String(), expTenID: roachpb.MinTenantID},
+		{systemID: stid, ous: correctOU, commonName: roachpb.MaxTenantID.String(), expTenID: roachpb.MaxTenantID},
+		{systemID: stid, ous: correctOU, commonName: roachpb.SystemTenantID.String() /* "system" */, expErr: `could not parse tenant ID from Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "-1", expErr: `could not parse tenant ID from Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "0", expErr: `invalid tenant ID 0 in Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "1", expErr: `invalid tenant ID 1 in Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "root", expErr: `could not parse tenant ID from Common Name \(CN\)`},
+		{systemID: stid, ous: correctOU, commonName: "other", expErr: `could not parse tenant ID from Common Name \(CN\)`},
+		{systemID: stid, ous: []string{"foo"}, commonName: "other",
+			expErr: `need root or node client cert to perform RPCs on this server \(this is tenant system; cert is valid for "other" on all tenants\)`},
+		{systemID: stid, ous: nil, commonName: "other",
+			expErr: `need root or node client cert to perform RPCs on this server \(this is tenant system; cert is valid for "other" on all tenants\)`},
+		{systemID: stid, ous: append([]string{"foo"}, correctOU...), commonName: "other", expErr: `could not parse tenant ID from Common Name`},
+		{systemID: stid, ous: nil, commonName: "root"},
+		{systemID: stid, ous: nil, commonName: "node"},
+		{systemID: stid, ous: nil, commonName: "root", tenantScope: 10,
+			expErr: `need root or node client cert to perform RPCs on this server \(this is tenant system; cert is valid for "root" on tenant 10\)`},
+		{systemID: tenTen, ous: correctOU, commonName: "10", expTenID: roachpb.TenantID{}},
+		{systemID: tenTen, ous: correctOU, commonName: "123", expErr: `client tenant identity \(123\) does not match server`},
+		{systemID: tenTen, ous: correctOU, commonName: "1", expErr: `invalid tenant ID 1 in Common Name \(CN\)`},
+		{systemID: tenTen, ous: nil, commonName: "root"},
+		{systemID: tenTen, ous: nil, commonName: "node"},
+
+		// Passing a client ID in metadata instead of relying only on the TLS cert.
+		{clientTenantInMD: "invalid", expErr: `could not parse tenant ID from gRPC metadata`},
+		{clientTenantInMD: "1", expErr: `invalid tenant ID 1 in gRPC metadata`},
+		{clientTenantInMD: "-1", expErr: `could not parse tenant ID from gRPC metadata`},
+
+		// tenant ID in MD matches that in client cert.
+		// Server is KV node: expect tenant authorization.
+		{clientTenantInMD: "10",
+			systemID: stid, ous: correctOU, commonName: "10", expTenID: tenTen},
+		// tenant ID in MD doesn't match that in client cert.
+		{clientTenantInMD: "10",
+			systemID: stid, ous: correctOU, commonName: "123",
+			expErr: `client wants to authenticate as tenant 10, but is using TLS cert for tenant 123`},
+		// tenant ID present in MD, but not in client cert. However,
+		// client cert is valid. Use MD tenant ID.
+		// Server is KV node: expect tenant authorization.
+		{clientTenantInMD: "10",
+			systemID: stid, ous: nil, commonName: "root", expTenID: tenTen},
+		// tenant ID present in MD, but not in client cert. However,
+		// client cert is valid. Use MD tenant ID.
+		// Server is KV node: expect tenant authorization.
+		{clientTenantInMD: "10",
+			systemID: stid, ous: nil, commonName: "node", expTenID: tenTen},
+		// tenant ID present in MD, but not in client cert. However,
+		// client cert is valid. Use MD tenant ID.
+		// Server is secondary tenant: do not do additional tenant authorization.
+		{clientTenantInMD: "10",
+			systemID: tenTen, ous: nil, commonName: "root", expTenID: roachpb.TenantID{}},
+		{clientTenantInMD: "10",
+			systemID: tenTen, ous: nil, commonName: "node", expTenID: roachpb.TenantID{}},
+		// tenant ID present in MD, but not in client cert. Use MD tenant ID.
+		// Server tenant ID does not match client tenant ID.
+		{clientTenantInMD: "123",
+			systemID: tenTen, ous: nil, commonName: "root",
+			expErr: `client tenant identity \(123\) does not match server`},
 	} {
-		t.Run(tc.commonName, func(t *testing.T) {
+		t.Run(fmt.Sprintf("from %v to %v (md %q)", tc.commonName, tc.systemID, tc.clientTenantInMD), func(t *testing.T) {
 			cert := &x509.Certificate{
 				Subject: pkix.Name{
 					CommonName:         tc.commonName,
@@ -123,7 +178,9 @@ func TestTenantFromCert(t *testing.T) {
 				},
 			}
 			if tc.tenantScope > 0 {
-				tenantSANs, err := security.MakeTenantURISANs(username.MakeSQLUsernameFromPreNormalizedString(tc.commonName), []roachpb.TenantID{roachpb.MustMakeTenantID(tc.tenantScope)})
+				tenantSANs, err := security.MakeTenantURISANs(
+					username.MakeSQLUsernameFromPreNormalizedString(tc.commonName),
+					[]roachpb.TenantID{roachpb.MustMakeTenantID(tc.tenantScope)})
 				require.NoError(t, err)
 				cert.URIs = append(cert.URIs, tenantSANs...)
 			}
@@ -135,7 +192,12 @@ func TestTenantFromCert(t *testing.T) {
 			p := peer.Peer{AuthInfo: tlsInfo}
 			ctx := peer.NewContext(context.Background(), &p)
 
-			tenID, err := rpc.TestingAuthenticateTenant(ctx)
+			if tc.clientTenantInMD != "" {
+				md := metadata.MD{"client-tid": []string{tc.clientTenantInMD}}
+				ctx = metadata.NewIncomingContext(ctx, md)
+			}
+
+			tenID, err := rpc.TestingAuthenticateTenant(ctx, tc.systemID)
 
 			if tc.expErr == "" {
 				require.Equal(t, tc.expTenID, tenID)
@@ -150,48 +212,53 @@ func TestTenantFromCert(t *testing.T) {
 	}
 }
 
+func prefix(tenID uint64, key string) string {
+	tenPrefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenID))
+	return string(append(tenPrefix, []byte(key)...))
+}
+
+func makeSpanShared(t *testing.T, key string, endKey ...string) roachpb.Span {
+	s := roachpb.Span{Key: roachpb.Key(key)}
+	if len(endKey) > 1 {
+		t.Fatalf("unexpected endKey vararg %v", endKey)
+	} else if len(endKey) == 1 {
+		s.EndKey = roachpb.Key(endKey[0])
+	}
+	return s
+}
+
+func makeReqShared(t *testing.T, key string, endKey ...string) kvpb.Request {
+	s := makeSpanShared(t, key, endKey...)
+	h := kvpb.RequestHeaderFromSpan(s)
+	return &kvpb.ScanRequest{RequestHeader: h}
+}
+
+func makeReqs(reqs ...kvpb.Request) []kvpb.RequestUnion {
+	ru := make([]kvpb.RequestUnion, len(reqs))
+	for i, r := range reqs {
+		ru[i].MustSetInner(r)
+	}
+	return ru
+}
+
 func TestTenantAuthRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tenID := roachpb.MustMakeTenantID(10)
-	prefix := func(tenID uint64, key string) string {
-		tenPrefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenID))
-		return string(append(tenPrefix, []byte(key)...))
-	}
 	makeSpan := func(key string, endKey ...string) roachpb.Span {
-		s := roachpb.Span{Key: roachpb.Key(key)}
-		if len(endKey) > 1 {
-			t.Fatalf("unexpected endKey vararg %v", endKey)
-		} else if len(endKey) == 1 {
-			s.EndKey = roachpb.Key(endKey[0])
-		}
-		return s
+		return makeSpanShared(t, key, endKey...)
 	}
-	makeReq := func(key string, endKey ...string) roachpb.Request {
-		s := makeSpan(key, endKey...)
-		h := roachpb.RequestHeaderFromSpan(s)
-		return &roachpb.ScanRequest{RequestHeader: h}
+	makeReq := func(key string, endKey ...string) kvpb.Request {
+		return makeReqShared(t, key, endKey...)
 	}
-	makeDisallowedAdminReq := func(key string) roachpb.Request {
+	makeAdminSplitReq := func(key string) kvpb.Request {
 		s := makeSpan(key)
-		h := roachpb.RequestHeader{Key: s.Key}
-		return &roachpb.AdminMergeRequest{RequestHeader: h}
+		h := kvpb.RequestHeaderFromSpan(s)
+		return &kvpb.AdminSplitRequest{RequestHeader: h, SplitKey: s.Key}
 	}
-	makeAdminSplitReq := func(key string) roachpb.Request {
+	makeAdminScatterReq := func(key string) kvpb.Request {
 		s := makeSpan(key)
-		h := roachpb.RequestHeaderFromSpan(s)
-		return &roachpb.AdminSplitRequest{RequestHeader: h, SplitKey: s.Key}
-	}
-	makeAdminScatterReq := func(key string) roachpb.Request {
-		s := makeSpan(key)
-		h := roachpb.RequestHeaderFromSpan(s)
-		return &roachpb.AdminScatterRequest{RequestHeader: h}
-	}
-	makeReqs := func(reqs ...roachpb.Request) []roachpb.RequestUnion {
-		ru := make([]roachpb.RequestUnion, len(reqs))
-		for i, r := range reqs {
-			ru[i].MustSetInner(r)
-		}
-		return ru
+		h := kvpb.RequestHeaderFromSpan(s)
+		return &kvpb.AdminScatterRequest{RequestHeader: h}
 	}
 	makeSystemSpanConfigTarget := func(source, target uint64) roachpb.SpanConfigTarget {
 		return roachpb.SpanConfigTarget{
@@ -227,8 +294,8 @@ func TestTenantAuthRequest(t *testing.T) {
 		return &roachpb.SpanConfigConformanceRequest{Spans: []roachpb.Span{span}}
 	}
 
-	makeGetRangeDescriptorsReq := func(span roachpb.Span) *roachpb.GetRangeDescriptorsRequest {
-		return &roachpb.GetRangeDescriptorsRequest{
+	makeGetRangeDescriptorsReq := func(span roachpb.Span) *kvpb.GetRangeDescriptorsRequest {
+		return &kvpb.GetRangeDescriptorsRequest{
 			Span: span,
 		}
 	}
@@ -240,258 +307,217 @@ func TestTenantAuthRequest(t *testing.T) {
 	}{
 		"/cockroach.roachpb.Internal/Batch": {
 			{
-				req:    &roachpb.BatchRequest{},
+				req:    &kvpb.BatchRequest{},
 				expErr: `requested key span /Max not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq("a", "b"),
 				)},
 				expErr: `requested key span {a-b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq(prefix(5, "a"), prefix(5, "b")),
 				)},
 				expErr: `requested key span /Tenant/5{a-b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq(prefix(10, "a"), prefix(10, "b")),
 				)},
 				expErr: noError,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq(prefix(50, "a"), prefix(50, "b")),
 				)},
 				expErr: `requested key span /Tenant/50{a-b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq("a", "b"),
 					makeReq(prefix(5, "a"), prefix(5, "b")),
 				)},
 				expErr: `requested key span {a-/Tenant/5b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq(prefix(5, "a"), prefix(5, "b")),
 					makeReq(prefix(10, "a"), prefix(10, "b")),
 				)},
 				expErr: `requested key span /Tenant/{5a-10b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq("a", prefix(10, "b")),
 				)},
 				expErr: `requested key span {a-/Tenant/10b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq(prefix(10, "a"), prefix(20, "b")),
 				)},
 				expErr: `requested key span /Tenant/{10a-20b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
-					makeDisallowedAdminReq("a"),
-				)},
-				expErr: `request \[1 AdmMerge\] not permitted`,
-			},
-			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
-					makeDisallowedAdminReq(prefix(10, "a")),
-				)},
-				expErr: `request \[1 AdmMerge\] not permitted`,
-			},
-			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
-					makeDisallowedAdminReq(prefix(50, "a")),
-				)},
-				expErr: `request \[1 AdmMerge\] not permitted`,
-			},
-			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
-					makeDisallowedAdminReq(prefix(10, "a")),
-					makeReq(prefix(10, "a"), prefix(10, "b")),
-				)},
-				expErr: `request \[1 Scan, 1 AdmMerge\] not permitted`,
-			},
-			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
-					makeReq(prefix(10, "a"), prefix(10, "b")),
-					makeDisallowedAdminReq(prefix(10, "a")),
-				)},
-				expErr: `request \[1 Scan, 1 AdmMerge\] not permitted`,
-			},
-			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeAdminSplitReq("a"),
 				)},
 				expErr: `requested key span a{-\\x00} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeAdminSplitReq(prefix(10, "a")),
 				)},
 				expErr: noError,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeAdminSplitReq(prefix(50, "a")),
 				)},
 				expErr: `requested key span /Tenant/50a{-\\x00} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeAdminSplitReq(prefix(10, "a")),
 					makeReq(prefix(10, "a"), prefix(10, "b")),
 				)},
 				expErr: noError,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq(prefix(10, "a"), prefix(10, "b")),
 					makeAdminSplitReq(prefix(10, "a")),
 				)},
 				expErr: noError,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeAdminScatterReq("a"),
 				)},
 				expErr: `requested key span a{-\\x00} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeAdminScatterReq(prefix(10, "a")),
 				)},
 				expErr: noError,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeAdminScatterReq(prefix(50, "a")),
 				)},
 				expErr: `requested key span /Tenant/50a{-\\x00} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeAdminScatterReq(prefix(10, "a")),
 					makeReq(prefix(10, "a"), prefix(10, "b")),
 				)},
 				expErr: noError,
 			},
 			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
+				req: &kvpb.BatchRequest{Requests: makeReqs(
 					makeReq(prefix(10, "a"), prefix(10, "b")),
 					makeAdminScatterReq(prefix(10, "a")),
 				)},
 				expErr: noError,
-			},
-			{
-				req: &roachpb.BatchRequest{Requests: makeReqs(
-					func() roachpb.Request {
-						h := roachpb.RequestHeaderFromSpan(makeSpan("a"))
-						return &roachpb.SubsumeRequest{RequestHeader: h}
-					}(),
-				)},
-				expErr: `request \[1 Subsume\] not permitted`,
 			},
 		},
 		"/cockroach.roachpb.Internal/RangeLookup": {
 			{
-				req:    &roachpb.RangeLookupRequest{},
+				req:    &kvpb.RangeLookupRequest{},
 				expErr: `requested key /Min not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req:    &roachpb.RangeLookupRequest{Key: roachpb.RKey("a")},
+				req:    &kvpb.RangeLookupRequest{Key: roachpb.RKey("a")},
 				expErr: `requested key "a" not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req:    &roachpb.RangeLookupRequest{Key: roachpb.RKey(prefix(5, "a"))},
+				req:    &kvpb.RangeLookupRequest{Key: roachpb.RKey(prefix(5, "a"))},
 				expErr: `requested key /Tenant/5"a" not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req:    &roachpb.RangeLookupRequest{Key: roachpb.RKey(prefix(10, "a"))},
+				req:    &kvpb.RangeLookupRequest{Key: roachpb.RKey(prefix(10, "a"))},
 				expErr: noError,
 			},
 			{
-				req:    &roachpb.RangeLookupRequest{Key: roachpb.RKey(prefix(50, "a"))},
+				req:    &kvpb.RangeLookupRequest{Key: roachpb.RKey(prefix(50, "a"))},
 				expErr: `requested key /Tenant/50"a" not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 		},
 		"/cockroach.roachpb.Internal/RangeFeed": {
 			{
-				req:    &roachpb.RangeFeedRequest{},
+				req:    &kvpb.RangeFeedRequest{},
 				expErr: `requested key span /Min not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req:    &roachpb.RangeFeedRequest{Span: makeSpan("a", "b")},
+				req:    &kvpb.RangeFeedRequest{Span: makeSpan("a", "b")},
 				expErr: `requested key span {a-b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req:    &roachpb.RangeFeedRequest{Span: makeSpan(prefix(5, "a"), prefix(5, "b"))},
+				req:    &kvpb.RangeFeedRequest{Span: makeSpan(prefix(5, "a"), prefix(5, "b"))},
 				expErr: `requested key span /Tenant/5{a-b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req:    &roachpb.RangeFeedRequest{Span: makeSpan(prefix(10, "a"), prefix(10, "b"))},
+				req:    &kvpb.RangeFeedRequest{Span: makeSpan(prefix(10, "a"), prefix(10, "b"))},
 				expErr: noError,
 			},
 			{
-				req:    &roachpb.RangeFeedRequest{Span: makeSpan(prefix(50, "a"), prefix(50, "b"))},
+				req:    &kvpb.RangeFeedRequest{Span: makeSpan(prefix(50, "a"), prefix(50, "b"))},
 				expErr: `requested key span /Tenant/50{a-b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req:    &roachpb.RangeFeedRequest{Span: makeSpan("a", prefix(10, "b"))},
+				req:    &kvpb.RangeFeedRequest{Span: makeSpan("a", prefix(10, "b"))},
 				expErr: `requested key span {a-/Tenant/10b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 			{
-				req:    &roachpb.RangeFeedRequest{Span: makeSpan(prefix(10, "a"), prefix(20, "b"))},
+				req:    &kvpb.RangeFeedRequest{Span: makeSpan(prefix(10, "a"), prefix(20, "b"))},
 				expErr: `requested key span /Tenant/{10a-20b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 		},
 		"/cockroach.roachpb.Internal/GossipSubscription": {
 			{
-				req:    &roachpb.GossipSubscriptionRequest{},
+				req:    &kvpb.GossipSubscriptionRequest{},
 				expErr: noError,
 			},
 			{
-				req:    &roachpb.GossipSubscriptionRequest{Patterns: []string{"node:.*"}},
+				req:    &kvpb.GossipSubscriptionRequest{Patterns: []string{"node:.*"}},
 				expErr: noError,
 			},
 			{
-				req:    &roachpb.GossipSubscriptionRequest{Patterns: []string{"system-db"}},
+				req:    &kvpb.GossipSubscriptionRequest{Patterns: []string{"system-db"}},
 				expErr: noError,
 			},
 			{
-				req:    &roachpb.GossipSubscriptionRequest{Patterns: []string{"table-stat-added"}},
+				req:    &kvpb.GossipSubscriptionRequest{Patterns: []string{"table-stat-added"}},
 				expErr: `requested pattern "table-stat-added" not permitted`,
 			},
 			{
-				req:    &roachpb.GossipSubscriptionRequest{Patterns: []string{"node:.*", "system-db"}},
+				req:    &kvpb.GossipSubscriptionRequest{Patterns: []string{"node:.*", "system-db"}},
 				expErr: noError,
 			},
 			{
-				req:    &roachpb.GossipSubscriptionRequest{Patterns: []string{"node:.*", "system-db", "table-stat-added"}},
+				req:    &kvpb.GossipSubscriptionRequest{Patterns: []string{"node:.*", "system-db", "table-stat-added"}},
 				expErr: `requested pattern "table-stat-added" not permitted`,
 			},
 		},
 		"/cockroach.roachpb.Internal/TokenBucket": {
 			{
-				req:    &roachpb.TokenBucketRequest{TenantID: tenID.ToUint64()},
+				req:    &kvpb.TokenBucketRequest{TenantID: tenID.ToUint64()},
 				expErr: noError,
 			},
 			{
-				req:    &roachpb.TokenBucketRequest{TenantID: roachpb.SystemTenantID.ToUint64()},
+				req:    &kvpb.TokenBucketRequest{TenantID: roachpb.SystemTenantID.ToUint64()},
 				expErr: `token bucket request for tenant system not permitted`,
 			},
 			{
-				req:    &roachpb.TokenBucketRequest{TenantID: 13},
+				req:    &kvpb.TokenBucketRequest{TenantID: 13},
 				expErr: `token bucket request for tenant 13 not permitted`,
 			},
 			{
-				req:    &roachpb.TokenBucketRequest{},
+				req:    &kvpb.TokenBucketRequest{},
 				expErr: `token bucket request with unspecified tenant not permitted`,
 			},
 		},
@@ -800,9 +826,12 @@ func TestTenantAuthRequest(t *testing.T) {
 		},
 	} {
 		t.Run(method, func(t *testing.T) {
+			ctx := context.Background()
 			for _, tc := range tests {
 				t.Run("", func(t *testing.T) {
-					err := rpc.TestingAuthorizeTenantRequest(tenID, method, tc.req)
+					err := rpc.TestingAuthorizeTenantRequest(
+						ctx, &settings.Values{}, tenID, method, tc.req, tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+					)
 					if tc.expErr == noError {
 						require.NoError(t, err)
 					} else {
@@ -814,4 +843,91 @@ func TestTenantAuthRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTenantAuthCapabilityChecks ensures capability checks are performed
+// correctly by the tenant authorizer.
+func TestTenantAuthCapabilityChecks(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	tenID := roachpb.MustMakeTenantID(10)
+	for method, tests := range map[string][]struct {
+		req                 interface{}
+		configureAuthorizer func(authorizer *mockAuthorizer)
+		expErr              string
+	}{
+		"/cockroach.roachpb.Internal/Batch": {
+			{
+				req: &kvpb.BatchRequest{Requests: makeReqs(
+					makeReqShared(t, prefix(10, "a"), prefix(10, "b")),
+				)},
+				configureAuthorizer: func(authorizer *mockAuthorizer) {
+					authorizer.hasCapabilityForBatch = true
+				},
+				expErr: "",
+			},
+			{
+				req: &kvpb.BatchRequest{Requests: makeReqs(
+					makeReqShared(t, prefix(10, "a"), prefix(10, "b")),
+				)},
+				configureAuthorizer: func(authorizer *mockAuthorizer) {
+					authorizer.hasCapabilityForBatch = false
+				},
+				expErr: "tenant does not have capability",
+			},
+		},
+	} {
+		ctx := context.Background()
+		for _, tc := range tests {
+			authorizer := mockAuthorizer{}
+			tc.configureAuthorizer(&authorizer)
+			err := rpc.TestingAuthorizeTenantRequest(
+				ctx, &settings.Values{}, tenID, method, tc.req, authorizer,
+			)
+			if tc.expErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				require.Equal(t, codes.Unauthenticated, status.Code(err))
+				require.Regexp(t, tc.expErr, err)
+			}
+		}
+	}
+}
+
+type mockAuthorizer struct {
+	hasCapabilityForBatch   bool
+	hasNodestatusCapability bool
+	hasTSDBQueryCapability  bool
+}
+
+var _ tenantcapabilities.Authorizer = &mockAuthorizer{}
+
+// HasCapabilityForBatch implements the tenantcapabilities.Authorizer interface.
+func (m mockAuthorizer) HasCapabilityForBatch(
+	context.Context, roachpb.TenantID, *kvpb.BatchRequest,
+) error {
+	if m.hasCapabilityForBatch {
+		return nil
+	}
+	return errors.New("tenant does not have capability")
+}
+
+// BindReader implements the tenantcapabilities.Authorizer interface.
+func (m mockAuthorizer) BindReader(tenantcapabilities.Reader) {
+	panic("unimplemented")
+}
+
+func (m mockAuthorizer) HasNodeStatusCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	if m.hasNodestatusCapability {
+		return nil
+	}
+	return errors.New("tenant does not have capability")
+}
+
+func (m mockAuthorizer) HasTSDBQueryCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	if m.hasTSDBQueryCapability {
+		return nil
+	}
+	return errors.New("tenant does not have capability")
 }

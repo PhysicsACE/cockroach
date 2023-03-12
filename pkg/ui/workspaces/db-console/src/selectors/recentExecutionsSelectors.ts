@@ -15,6 +15,7 @@ import {
   getRecentTransaction,
   getContentionDetailsFromLocksAndTxns,
   selectExecutionID,
+  ExecutionStatus,
 } from "@cockroachlabs/cluster-ui";
 import { createSelector } from "reselect";
 import { CachedDataReducerState } from "src/redux/apiReducers";
@@ -24,7 +25,13 @@ import { SessionsResponseMessage } from "src/util/api";
 const selectSessions = (state: AdminUIState) => state.cachedData.sessions?.data;
 
 const selectClusterLocks = (state: AdminUIState) =>
-  state.cachedData.clusterLocks?.data;
+  state.cachedData.clusterLocks?.data?.results;
+
+export const selectClusterLocksMaxApiSizeReached = (
+  state: AdminUIState,
+): boolean => {
+  return !!state.cachedData.clusterLocks?.data?.maxSizeReached;
+};
 
 export const selectRecentExecutions = createSelector(
   selectSessions,
@@ -36,6 +43,14 @@ export const selectRecentStatements = createSelector(
   selectRecentExecutions,
   (executions: RecentExecutions) => executions.statements,
 );
+
+export const selectExecutionStatus = () => {
+  const execStatuses: string[] = [];
+  for (const execStatus in ExecutionStatus) {
+    execStatuses.push(execStatus);
+  }
+  return execStatuses;
+};
 
 export const selectRecentStatement = createSelector(
   selectRecentStatements,

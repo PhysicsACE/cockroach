@@ -25,12 +25,14 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// startListenRPCAndSQL starts the RPC and SQL listeners.
-// It returns the SQL listener, which can be used
-// to start the SQL server when initialization has completed.
-// It also returns a function that starts the RPC server,
-// when the cluster is known to have bootstrapped or
-// when waiting for init().
+// startListenRPCAndSQL starts the RPC and SQL listeners. It returns:
+//   - The listener for pgwire connections coming over the network. This will be used
+//     to start the SQL server when initialization has completed.
+//   - The listener for internal sql connections running over our pipes interface.
+//   - A dialer function that can be used to open a connection to the RPC loopback interface.
+//   - A function that starts the RPC server, when the cluster is known to have
+//     bootstrapped or when waiting for init().
+//
 // This does not start *accepting* connections just yet.
 func startListenRPCAndSQL(
 	ctx, workersCtx context.Context,
@@ -40,6 +42,7 @@ func startListenRPCAndSQL(
 	enableSQLListener bool,
 ) (
 	sqlListener net.Listener,
+	pgLoopbackListener *netutil.LoopbackListener,
 	rpcLoopbackDial func(context.Context) (net.Conn, error),
 	startRPCServer func(ctx context.Context),
 	err error,
@@ -57,7 +60,7 @@ func startListenRPCAndSQL(
 		var err error
 		ln, err = ListenAndUpdateAddrs(ctx, &cfg.Addr, &cfg.AdvertiseAddr, rpcChanName)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		log.Eventf(ctx, "listening on port %s", cfg.Addr)
 	}
@@ -66,7 +69,7 @@ func startListenRPCAndSQL(
 	if cfg.SplitListenSQL && enableSQLListener {
 		pgL, err = ListenAndUpdateAddrs(ctx, &cfg.SQLAddr, &cfg.SQLAdvertiseAddr, "sql")
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		// The SQL listener shutdown worker, which closes everything under
 		// the SQL port when the stopper indicates we are shutting down.
@@ -82,7 +85,7 @@ func startListenRPCAndSQL(
 		}
 		if err := stopper.RunAsyncTask(workersCtx, "wait-quiesce", waitQuiesce); err != nil {
 			waitQuiesce(workersCtx)
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		log.Eventf(ctx, "listening on sql port %s", cfg.SQLAddr)
 	}
@@ -92,6 +95,17 @@ func startListenRPCAndSQL(
 	var serveOnMux sync.Once
 
 	m := cmux.New(ln)
+	// cmux auto-retries Accept() by default. Tell it
+	// to stop doing work if we see a request to shut down.
+	m.HandleError(func(err error) bool {
+		select {
+		case <-stopper.ShouldQuiesce():
+			log.Infof(workersCtx, "server shutting down: instructing cmux to stop accepting")
+			return false
+		default:
+			return true
+		}
+	})
 
 	if !cfg.SplitListenSQL && enableSQLListener {
 		// If the pg port is split, it will be opened above. Otherwise,
@@ -105,7 +119,7 @@ func startListenRPCAndSQL(
 		// Then we update the advertised addr with the right port, if
 		// the port had been auto-allocated.
 		if err := UpdateAddrs(ctx, &cfg.SQLAddr, &cfg.SQLAdvertiseAddr, ln.Addr()); err != nil {
-			return nil, nil, nil, errors.Wrapf(err, "internal error")
+			return nil, nil, nil, nil, errors.Wrapf(err, "internal error")
 		}
 	}
 
@@ -116,16 +130,20 @@ func startListenRPCAndSQL(
 		}
 	}
 
-	loopbackL := netutil.NewLoopbackListener(ctx, stopper)
+	rpcLoopbackL := netutil.NewLoopbackListener(ctx, stopper)
+	sqlLoopbackL := netutil.NewLoopbackListener(ctx, stopper)
 
 	// The remainder shutdown worker.
 	waitForQuiesce := func(context.Context) {
 		<-stopper.ShouldQuiesce()
 		// TODO(bdarnell): Do we need to also close the other listeners?
 		netutil.FatalIfUnexpected(anyL.Close())
-		netutil.FatalIfUnexpected(loopbackL.Close())
+		netutil.FatalIfUnexpected(rpcLoopbackL.Close())
+		netutil.FatalIfUnexpected(sqlLoopbackL.Close())
+		netutil.FatalIfUnexpected(ln.Close())
 	}
-	stopper.AddCloser(stop.CloserFn(func() {
+
+	stopGRPC := func() {
 		grpc.Stop()
 		serveOnMux.Do(func() {
 			// The cmux matches don't shut down properly unless serve is called on the
@@ -133,12 +151,16 @@ func startListenRPCAndSQL(
 			// if we wouldn't otherwise reach the point where we start serving on it.
 			netutil.FatalIfUnexpected(m.Serve())
 		})
-	}))
+	}
+
 	if err := stopper.RunAsyncTask(
 		workersCtx, "grpc-quiesce", waitForQuiesce,
 	); err != nil {
-		return nil, nil, nil, err
+		waitForQuiesce(ctx)
+		stopGRPC()
+		return nil, nil, nil, nil, err
 	}
+	stopper.AddCloser(stop.CloserFn(stopGRPC))
 
 	// startRPCServer starts the RPC server. We do not do this
 	// immediately because we want the cluster to be ready (or ready to
@@ -150,7 +172,7 @@ func startListenRPCAndSQL(
 			netutil.FatalIfUnexpected(grpc.Serve(anyL))
 		})
 		_ = stopper.RunAsyncTask(workersCtx, "serve-loopback-grpc", func(context.Context) {
-			netutil.FatalIfUnexpected(grpc.Serve(loopbackL))
+			netutil.FatalIfUnexpected(grpc.Serve(rpcLoopbackL))
 		})
 
 		_ = stopper.RunAsyncTask(ctx, "serve-mux", func(context.Context) {
@@ -160,5 +182,5 @@ func startListenRPCAndSQL(
 		})
 	}
 
-	return pgL, loopbackL.Connect, startRPCServer, nil
+	return pgL, sqlLoopbackL, rpcLoopbackL.Connect, startRPCServer, nil
 }

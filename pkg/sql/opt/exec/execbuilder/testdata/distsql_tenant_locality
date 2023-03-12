@@ -1,5 +1,6 @@
 # LogicTest: 3node-tenant-multiregion
-# tenant-cluster-setting-override-opt: allow-split-at-for-secondary-tenants allow-zone-configs-for-secondary-tenants allow-multi-region-abstractions-for-secondary-tenants
+# tenant-cluster-setting-override-opt: sql.split_at.allow_for_secondary_tenant.enabled=true sql.zone_configs.allow_for_secondary_tenant.enabled=true sql.multi_region.allow_abstractions_for_secondary_tenants.enabled=true
+# cluster-opt: can-admin-split
 
 # Create a table on the secondary tenant.
 statement ok
@@ -133,7 +134,7 @@ vectorized: true
 ·
 index recommendations: 1
 1. type: index creation
-   SQL command: CREATE INDEX ON t93887 (y);
+   SQL command: CREATE INDEX ON test.public.t93887 (y);
 
 statement ok
 RESET index_recommendations_enabled;

@@ -87,6 +87,9 @@ func runExecBuildLogicTest(t *testing.T, file string) {
 	skip.UnderDeadlock(t, "times out and/or hangs")
 	serverArgs := logictest.TestServerArgs{
 		DisableWorkmemRandomization: true,
+		// Disable the direct scans in order to keep the output of EXPLAIN (VEC)
+		// deterministic.
+		DisableDirectColumnarScans: true,
 	}
 	logictest.RunLogicTest(t, serverArgs, configIdx, filepath.Join(execBuildLogicTestDir, file))
 }
@@ -299,6 +302,13 @@ func TestTenantLogic_as_of(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "as_of")
+}
+
+func TestTenantLogic_asyncpg(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "asyncpg")
 }
 
 func TestTenantLogic_auto_span_config_reconciliation_job(
@@ -1442,6 +1452,13 @@ func TestTenantLogic_reset(
 	runLogicTest(t, "reset")
 }
 
+func TestTenantLogic_retry(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "retry")
+}
+
 func TestTenantLogic_returning(
 	t *testing.T,
 ) {
@@ -1482,6 +1499,13 @@ func TestTenantLogic_save_table(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "save_table")
+}
+
+func TestTenantLogic_savepoints(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "savepoints")
 }
 
 func TestTenantLogic_scale(
@@ -1736,11 +1760,25 @@ func TestTenantLogic_show_indexes(
 	runLogicTest(t, "show_indexes")
 }
 
+func TestTenantLogic_show_var(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_var")
+}
+
 func TestTenantLogic_span_builtins(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "span_builtins")
+}
+
+func TestTenantLogic_sql_keys(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "sql_keys")
 }
 
 func TestTenantLogic_sqllite(
@@ -1776,6 +1814,13 @@ func TestTenantLogic_statement_statistics(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "statement_statistics")
+}
+
+func TestTenantLogic_statement_statistics_errors(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "statement_statistics_errors")
 }
 
 func TestTenantLogic_stats(
@@ -1890,6 +1935,13 @@ func TestTenantLogic_tenant_slow_repro(
 	runLogicTest(t, "tenant_slow_repro")
 }
 
+func TestTenantLogic_tenant_span_stats(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "tenant_span_stats")
+}
+
 func TestTenantLogic_time(
 	t *testing.T,
 ) {
@@ -1993,6 +2045,55 @@ func TestTenantLogic_udf(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf")
+}
+
+func TestTenantLogic_udf_in_column_defaults(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_in_column_defaults")
+}
+
+func TestTenantLogic_udf_in_constraints(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_in_constraints")
+}
+
+func TestTenantLogic_udf_oid_ref(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_oid_ref")
+}
+
+func TestTenantLogic_udf_record(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_record")
+}
+
+func TestTenantLogic_udf_setof(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_setof")
+}
+
+func TestTenantLogic_udf_star(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_star")
+}
+
+func TestTenantLogic_udf_volatility_check(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_volatility_check")
 }
 
 func TestTenantLogic_union(

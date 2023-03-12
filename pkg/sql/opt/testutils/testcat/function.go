@@ -51,8 +51,8 @@ func (tc *Catalog) ResolveFunction(
 // ResolveFunctionByOID part of the tree.FunctionReferenceResolver interface.
 func (tc *Catalog) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (string, *tree.Overload, error) {
-	return "", nil, errors.AssertionFailedf("ResolveFunctionByOID not supported in test catalog")
+) (*tree.FunctionName, *tree.Overload, error) {
+	return nil, nil, errors.AssertionFailedf("ResolveFunctionByOID not supported in test catalog")
 }
 
 // CreateFunction handles the CREATE FUNCTION statement.
@@ -62,6 +62,8 @@ func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
 		panic(fmt.Errorf("built-in function with name %q already exists", name))
 	}
 	if _, ok := tc.udfs[name]; ok {
+		// TODO(mgartner): The test catalog should support multiple overloads
+		// with the same name if their arguments are different.
 		panic(fmt.Errorf("user-defined function with name %q already exists", name))
 	}
 	if c.RoutineBody != nil {
@@ -99,6 +101,9 @@ func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
 		Body:              body,
 		Volatility:        v,
 		CalledOnNullInput: calledOnNullInput,
+	}
+	if c.ReturnType.IsSet {
+		overload.Class = tree.GeneratorClass
 	}
 	prefixedOverload := tree.MakeQualifiedOverload("public", overload)
 	def := &tree.ResolvedFunctionDefinition{
@@ -146,8 +151,8 @@ func collectFuncOptions(
 			}
 
 		case tree.FunctionLanguage:
-			if t != tree.FunctionLangSQL {
-				panic(fmt.Errorf("LANGUAGE must be SQL"))
+			if t != tree.FunctionLangSQL && t != tree.FunctionLangPlPgSQL {
+				panic(fmt.Errorf("LANGUAGE must be SQL or plpgsql"))
 			}
 
 		default:

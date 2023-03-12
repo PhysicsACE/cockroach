@@ -21,6 +21,7 @@ import (
 
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -140,7 +141,9 @@ func TestConnHealth(t *testing.T) {
 	// After dialing the node, ConnHealth should return nil.
 	_, err := nd.Dial(ctx, staticNodeID, rpc.DefaultClass)
 	require.NoError(t, err)
-	require.NoError(t, nd.ConnHealth(staticNodeID, rpc.DefaultClass))
+	require.Eventually(t, func() bool {
+		return nd.ConnHealth(staticNodeID, rpc.DefaultClass) == nil
+	}, time.Second, 10*time.Millisecond)
 
 	// ConnHealth should still error for other node ID and class.
 	require.Error(t, nd.ConnHealth(9, rpc.DefaultClass))
@@ -166,7 +169,9 @@ func TestConnHealth(t *testing.T) {
 			_, err := nd.DialNoBreaker(ctx, staticNodeID, rpc.DefaultClass)
 			return err == nil
 		}, 10*time.Second, time.Millisecond)
-		require.NoError(t, nd.ConnHealth(staticNodeID, rpc.DefaultClass))
+		require.Eventually(t, func() bool {
+			return nd.ConnHealth(staticNodeID, rpc.DefaultClass) == nil
+		}, time.Second, 10*time.Millisecond)
 	}
 
 	// Tripping the breaker should return ErrBreakerOpen.
@@ -251,7 +256,9 @@ func TestConnHealthInternal(t *testing.T) {
 	// Set up an internal server and relevant configuration. The RPC connection
 	// will then be considered internal, and we don't have to dial it.
 	rpcCtx := newTestContext(clock, maxOffset, stopper)
-	rpcCtx.SetLocalInternalServer(&internalServer{}, rpc.ServerInterceptorInfo{}, rpc.ClientInterceptorInfo{})
+	rpcCtx.SetLocalInternalServer(
+		&internalServer{},
+		rpc.ServerInterceptorInfo{}, rpc.ClientInterceptorInfo{})
 	rpcCtx.NodeID.Set(ctx, staticNodeID)
 	rpcCtx.Config.AdvertiseAddr = localAddr.String()
 
@@ -466,12 +473,12 @@ func newTestContext(
 	cfg.RPCHeartbeatTimeout = 100 * time.Millisecond
 	ctx := context.Background()
 	rctx := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:  roachpb.SystemTenantID,
-		Config:    cfg,
-		Clock:     clock,
-		MaxOffset: maxOffset,
-		Stopper:   stopper,
-		Settings:  cluster.MakeTestingClusterSettings(),
+		TenantID:        roachpb.SystemTenantID,
+		Config:          cfg,
+		Clock:           clock,
+		ToleratedOffset: maxOffset,
+		Stopper:         stopper,
+		Settings:        cluster.MakeTestingClusterSettings(),
 	})
 	// Ensure that tests using this test context and restart/shut down
 	// their servers do not inadvertently start talking to servers from
@@ -562,53 +569,49 @@ func (hb *heartbeatService) Ping(
 	}, nil
 }
 
-var _ roachpb.InternalServer = &internalServer{}
+var _ kvpb.InternalServer = &internalServer{}
 
 type internalServer struct{}
 
-func (*internalServer) Batch(
-	context.Context, *roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+func (*internalServer) Batch(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
 	return nil, nil
 }
 
 func (*internalServer) RangeLookup(
-	context.Context, *roachpb.RangeLookupRequest,
-) (*roachpb.RangeLookupResponse, error) {
+	context.Context, *kvpb.RangeLookupRequest,
+) (*kvpb.RangeLookupResponse, error) {
 	panic("unimplemented")
 }
 
-func (*internalServer) RangeFeed(
-	*roachpb.RangeFeedRequest, roachpb.Internal_RangeFeedServer,
-) error {
+func (*internalServer) RangeFeed(*kvpb.RangeFeedRequest, kvpb.Internal_RangeFeedServer) error {
 	panic("unimplemented")
 }
 
-func (s *internalServer) MuxRangeFeed(server roachpb.Internal_MuxRangeFeedServer) error {
+func (s *internalServer) MuxRangeFeed(server kvpb.Internal_MuxRangeFeedServer) error {
 	panic("implement me")
 }
 
 func (*internalServer) GossipSubscription(
-	*roachpb.GossipSubscriptionRequest, roachpb.Internal_GossipSubscriptionServer,
+	*kvpb.GossipSubscriptionRequest, kvpb.Internal_GossipSubscriptionServer,
 ) error {
 	panic("unimplemented")
 }
 
 func (*internalServer) ResetQuorum(
-	context.Context, *roachpb.ResetQuorumRequest,
-) (*roachpb.ResetQuorumResponse, error) {
+	context.Context, *kvpb.ResetQuorumRequest,
+) (*kvpb.ResetQuorumResponse, error) {
 	panic("unimplemented")
 }
 
 func (*internalServer) Join(
-	context.Context, *roachpb.JoinNodeRequest,
-) (*roachpb.JoinNodeResponse, error) {
+	context.Context, *kvpb.JoinNodeRequest,
+) (*kvpb.JoinNodeResponse, error) {
 	panic("unimplemented")
 }
 
 func (*internalServer) TokenBucket(
-	ctx context.Context, in *roachpb.TokenBucketRequest,
-) (*roachpb.TokenBucketResponse, error) {
+	ctx context.Context, in *kvpb.TokenBucketRequest,
+) (*kvpb.TokenBucketResponse, error) {
 	panic("unimplemented")
 }
 
@@ -637,13 +640,13 @@ func (s *internalServer) SpanConfigConformance(
 }
 
 func (*internalServer) TenantSettings(
-	*roachpb.TenantSettingsRequest, roachpb.Internal_TenantSettingsServer,
+	*kvpb.TenantSettingsRequest, kvpb.Internal_TenantSettingsServer,
 ) error {
 	panic("unimplemented")
 }
 
 func (*internalServer) GetRangeDescriptors(
-	*roachpb.GetRangeDescriptorsRequest, roachpb.Internal_GetRangeDescriptorsServer,
+	*kvpb.GetRangeDescriptorsRequest, kvpb.Internal_GetRangeDescriptorsServer,
 ) error {
 	panic("unimplemented")
 }

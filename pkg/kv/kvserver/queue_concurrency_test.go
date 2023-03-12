@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -70,7 +71,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 	// replicaInQueue, but this isn't an ideal world. Deal with it.
 	store := &Store{
 		cfg: StoreConfig{
-			Clock:             hlc.NewClockWithSystemTimeSource(time.Second /* maxOffset */),
+			Clock:             hlc.NewClockForTesting(nil),
 			AmbientCtx:        log.MakeTestingAmbientContext(tr),
 			DefaultSpanConfig: roachpb.TestingDefaultSpanConfig(),
 		},
@@ -181,7 +182,7 @@ func (fr *fakeReplica) Desc() *roachpb.RangeDescriptor {
 func (fr *fakeReplica) maybeInitializeRaftGroup(context.Context) {}
 func (fr *fakeReplica) redirectOnOrAcquireLease(
 	context.Context,
-) (kvserverpb.LeaseStatus, *roachpb.Error) {
+) (kvserverpb.LeaseStatus, *kvpb.Error) {
 	// baseQueue only checks that the returned error is nil.
 	return kvserverpb.LeaseStatus{}, nil
 }

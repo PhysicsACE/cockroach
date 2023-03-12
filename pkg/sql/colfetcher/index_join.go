@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -400,8 +401,15 @@ func (s *ColIndexJoin) GetBatchRequestsIssued() int64 {
 	return s.cf.getBatchRequestsIssued()
 }
 
+// GetKVCPUTime is part of the colexecop.KVReader interface.
+func (s *ColIndexJoin) GetKVCPUTime() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cf.getKVCPUTime()
+}
+
 // GetContentionInfo is part of the colexecop.KVReader interface.
-func (s *ColIndexJoin) GetContentionInfo() (time.Duration, []roachpb.ContentionEvent) {
+func (s *ColIndexJoin) GetContentionInfo() (time.Duration, []kvpb.ContentionEvent) {
 	return execstats.GetCumulativeContentionTime(s.Ctx, nil /* recording */)
 }
 
@@ -497,7 +505,7 @@ func NewColIndexJoin(
 		return nil, errors.AssertionFailedf("non-empty ON expressions are not supported for index joins")
 	}
 
-	tableArgs, err := populateTableArgs(ctx, &spec.FetchSpec, typeResolver)
+	tableArgs, err := populateTableArgs(ctx, &spec.FetchSpec, typeResolver, false /* allowUnhydratedEnums */)
 	if err != nil {
 		return nil, err
 	}
@@ -561,6 +569,8 @@ func NewColIndexJoin(
 		0, /* estimatedRowCount */
 		flowCtx.TraceKV,
 		false, /* singleUse */
+		execstats.ShouldCollectStats(ctx, flowCtx.CollectStats),
+		false, /* alwaysReallocate */
 	}
 	if err = fetcher.Init(
 		fetcherAllocator, kvFetcher, tableArgs,

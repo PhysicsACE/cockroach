@@ -21,8 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -164,7 +166,7 @@ func (f *Factory) New(
 }
 
 // OnValue is called for each rangefeed value.
-type OnValue func(ctx context.Context, value *roachpb.RangeFeedValue)
+type OnValue func(ctx context.Context, value *kvpb.RangeFeedValue)
 
 // RangeFeed represents a running RangeFeed.
 type RangeFeed struct {
@@ -266,6 +268,8 @@ func (f *RangeFeed) Close() {
 // will be reset.
 const resetThreshold = 30 * time.Second
 
+var useMuxRangeFeed = util.ConstantWithMetamorphicTestBool("use-mux-rangefeed", false)
+
 // run will run the RangeFeed until the context is canceled or if the client
 // indicates that an initial scan error is non-recoverable.
 func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
@@ -292,6 +296,9 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 	if f.scanConfig.overSystemTable {
 		rangefeedOpts = append(rangefeedOpts, kvcoord.WithSystemTablePriority())
 	}
+	if useMuxRangeFeed {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithMuxRangeFeed())
+	}
 
 	for i := 0; r.Next(); i++ {
 		ts := frontier.Frontier()
@@ -309,8 +316,8 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 		}
 
 		err := ctxgroup.GoAndWait(ctx, rangeFeedTask, processEventsTask)
-		if errors.HasType(err, &roachpb.BatchTimestampBeforeGCError{}) ||
-			errors.HasType(err, &roachpb.MVCCHistoryMutationError{}) {
+		if errors.HasType(err, &kvpb.BatchTimestampBeforeGCError{}) ||
+			errors.HasType(err, &kvpb.MVCCHistoryMutationError{}) {
 			if errCallback := f.onUnrecoverableError; errCallback != nil {
 				errCallback(ctx, err)
 			}

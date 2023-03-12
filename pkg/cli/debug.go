@@ -170,11 +170,12 @@ func OpenEngine(
 	if err != nil {
 		return nil, err
 	}
-	db, err := storage.Open(context.Background(),
+	db, err := storage.Open(
+		context.Background(),
 		storage.Filesystem(dir),
+		serverCfg.Settings,
 		storage.MaxOpenFiles(int(maxOpenFiles)),
 		storage.CacheSize(server.DefaultCacheSize),
-		storage.Settings(serverCfg.Settings),
 		storage.Hook(PopulateStorageConfigHook),
 		storage.CombineOptions(opts...))
 	if err != nil {
@@ -1407,6 +1408,7 @@ func init() {
 	DebugCmd.AddCommand(debugDoctorCmd)
 
 	DebugCmd.AddCommand(declarativeValidateCorpus)
+	DebugCmd.AddCommand(declarativePrintRules)
 
 	debugStatementBundleCmd.AddCommand(statementBundleRecreateCmd)
 	DebugCmd.AddCommand(debugStatementBundleCmd)
@@ -1432,17 +1434,23 @@ func init() {
 	f.StringVarP(&debugRecoverPlanOpts.outputFileName, "plan", "o", "",
 		"filename to write plan to")
 	f.IntSliceVar(&debugRecoverPlanOpts.deadStoreIDs, "dead-store-ids", nil,
-		"list of dead store IDs")
+		"list of dead store IDs (can't be used together with dead-node-ids)")
+	f.IntSliceVar(&debugRecoverPlanOpts.deadNodeIDs, "dead-node-ids", nil,
+		"list of dead node IDs (can't be used together with dead-store-ids)")
 	f.VarP(&debugRecoverPlanOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
 		cliflags.ConfirmActions.Usage())
 	f.BoolVar(&debugRecoverPlanOpts.force, "force", false,
 		"force creation of plan even when problems were encountered; applying this plan may "+
 			"result in additional problems and should be done only with care and as a last resort")
+	f.UintVar(&formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Name,
+		formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Usage())
 
 	f = debugRecoverExecuteCmd.Flags()
 	f.VarP(&debugRecoverExecuteOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
 	f.VarP(&debugRecoverExecuteOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
 		cliflags.ConfirmActions.Usage())
+	f.UintVar(&formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Name,
+		formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Usage())
 
 	f = debugMergeLogsCmd.Flags()
 	f.Var(flagutil.Time(&debugMergeLogsOpts.from), "from",
@@ -1529,17 +1537,14 @@ func pebbleCryptoInitializer() error {
 		}
 	}
 
-	cfg := storage.PebbleConfig{
-		StorageConfig: storageConfig,
-		Opts:          storage.DefaultPebbleOptions(),
-	}
-
-	// This has the side effect of storing the encrypted FS into cfg.Opts.FS.
-	_, _, err := storage.ResolveEncryptedEnvOptions(&cfg)
+	_, encryptedEnv, err := storage.ResolveEncryptedEnvOptions(&storageConfig, vfs.Default, false /* readOnly */)
 	if err != nil {
 		return err
 	}
-
-	pebbleToolFS.set(cfg.Opts.FS)
+	if encryptedEnv != nil {
+		pebbleToolFS.set(encryptedEnv.FS)
+	} else {
+		pebbleToolFS.set(vfs.Default)
+	}
 	return nil
 }

@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -33,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -122,7 +122,7 @@ func assertExpectErr(
 	}
 
 	_, err := iter.Valid()
-	if intentErr := (*roachpb.WriteIntentError)(nil); errors.As(err, &intentErr) {
+	if intentErr := (*kvpb.WriteIntentError)(nil); errors.As(err, &intentErr) {
 		if !expectedIntent.Key.Equal(intentErr.Intents[0].Key) {
 			t.Fatalf("Expected intent key %v, but got %v", expectedIntent.Key, intentErr.Intents[0].Key)
 		}
@@ -163,7 +163,7 @@ func assertExpectErrs(
 		t.Fatalf("Expected %d intents but found %d", len(expectedIntents), iter.NumCollectedIntents())
 	}
 	err := iter.TryGetIntentError()
-	if intentErr := (*roachpb.WriteIntentError)(nil); errors.As(err, &intentErr) {
+	if intentErr := (*kvpb.WriteIntentError)(nil); errors.As(err, &intentErr) {
 		for i := range expectedIntents {
 			if !expectedIntents[i].Key.Equal(intentErr.Intents[i].Key) {
 				t.Fatalf("%d intent key: got %v, expected %v", i, intentErr.Intents[i].Key, expectedIntents[i].Key)
@@ -173,7 +173,7 @@ func assertExpectErrs(
 			}
 		}
 	} else {
-		t.Fatalf("Expected roachpb.WriteIntentError, found %T", err)
+		t.Fatalf("Expected kvpb.WriteIntentError, found %T", err)
 	}
 }
 
@@ -186,7 +186,6 @@ func assertExportedErrs(
 	expectedIntents []roachpb.Intent,
 ) {
 	const big = 1 << 30
-	sstFile := &MemFile{}
 	st := cluster.MakeTestingClusterSettings()
 	_, _, err := MVCCExportToSST(context.Background(), st, e, MVCCExportOptions{
 		StartKey:           MVCCKey{Key: startKey},
@@ -198,10 +197,10 @@ func assertExportedErrs(
 		MaxSize:            big,
 		MaxIntents:         uint64(MaxIntentsPerWriteIntentError.Default()),
 		StopMidKey:         false,
-	}, sstFile)
+	}, &bytes.Buffer{})
 	require.Error(t, err)
 
-	if intentErr := (*roachpb.WriteIntentError)(nil); errors.As(err, &intentErr) {
+	if intentErr := (*kvpb.WriteIntentError)(nil); errors.As(err, &intentErr) {
 		for i := range expectedIntents {
 			if !expectedIntents[i].Key.Equal(intentErr.Intents[i].Key) {
 				t.Fatalf("%d intent key: got %v, expected %v", i, intentErr.Intents[i].Key, expectedIntents[i].Key)
@@ -211,7 +210,7 @@ func assertExportedErrs(
 			}
 		}
 	} else {
-		t.Fatalf("Expected roachpb.WriteIntentError, found %T", err)
+		t.Fatalf("Expected kvpb.WriteIntentError, found %T", err)
 	}
 }
 
@@ -224,7 +223,7 @@ func assertExportedKVs(
 	expected []MVCCKeyValue,
 ) {
 	const big = 1 << 30
-	sstFile := &MemFile{}
+	var sstFile bytes.Buffer
 	st := cluster.MakeTestingClusterSettings()
 	_, _, err := MVCCExportToSST(context.Background(), st, e, MVCCExportOptions{
 		StartKey:           MVCCKey{Key: startKey},
@@ -235,9 +234,9 @@ func assertExportedKVs(
 		TargetSize:         big,
 		MaxSize:            big,
 		StopMidKey:         false,
-	}, sstFile)
+	}, &sstFile)
 	require.NoError(t, err)
-	data := sstFile.Data()
+	data := sstFile.Bytes()
 	if data == nil {
 		require.Nil(t, expected)
 		return
@@ -788,7 +787,7 @@ func TestMVCCIncrementalIteratorIntentPolicy(t *testing.T) {
 	kv2_2_2 := makeKVT(testKey2, testValue2, ts2)
 	txn, intent2_2_2 := makeKVTxn(testKey2, ts2)
 
-	intentErr := &roachpb.WriteIntentError{Intents: []roachpb.Intent{intent2_2_2}}
+	intentErr := &kvpb.WriteIntentError{Intents: []roachpb.Intent{intent2_2_2}}
 
 	e := NewDefaultInMemForTesting()
 	defer e.Close()
@@ -1309,7 +1308,7 @@ func TestMVCCIncrementalIteratorIntentStraddlesSStables(t *testing.T) {
 	// regular MVCCPut operation to generate these keys, which we'll later be
 	// copying into manually created sstables.
 	ctx := context.Background()
-	db1, err := Open(ctx, InMemory(), ForTesting)
+	db1, err := Open(ctx, InMemory(), cluster.MakeClusterSettings(), ForTesting)
 	require.NoError(t, err)
 	defer db1.Close()
 
@@ -1342,12 +1341,12 @@ func TestMVCCIncrementalIteratorIntentStraddlesSStables(t *testing.T) {
 	//   SSTable 2:
 	//     a@2
 	//     b@1
-	db2, err := Open(ctx, InMemory(), ForTesting)
+	db2, err := Open(ctx, InMemory(), cluster.MakeTestingClusterSettings(), ForTesting)
 	require.NoError(t, err)
 	defer db2.Close()
 
 	ingest := func(it EngineIterator, valid bool, err error, count int) {
-		memFile := &MemFile{}
+		memFile := &MemObject{}
 		sst := MakeIngestionSSTWriter(ctx, db2.settings, memFile)
 		defer sst.Close()
 
@@ -1402,7 +1401,7 @@ func TestMVCCIncrementalIteratorIntentStraddlesSStables(t *testing.T) {
 		for it.SeekGE(MVCCKey{Key: keys.LocalMax}); ; it.Next() {
 			ok, err := it.Valid()
 			if err != nil {
-				if errors.HasType(err, (*roachpb.WriteIntentError)(nil)) {
+				if errors.HasType(err, (*kvpb.WriteIntentError)(nil)) {
 					// This is the write intent error we were expecting.
 					return
 				}
@@ -1568,18 +1567,16 @@ func BenchmarkMVCCIncrementalIteratorForOldData(b *testing.B) {
 	// day of keys. The old keys are uniformly distributed in the key space,
 	// which is the worst case for block property filters.
 	keyAgeInterval := 400
-	setupMVCCPebbleWithBlockProperties := func(b *testing.B) Engine {
+	setupMVCCPebble := func(b *testing.B) Engine {
 		eng, err := Open(
 			context.Background(),
 			InMemory(),
+			cluster.MakeClusterSettings(),
 			// Use a small cache size. Scanning large tables with mostly cold data
 			// will mostly miss the cache (especially since the block cache is meant
 			// to be scan resistant).
 			CacheSize(1<<10),
-			func(cfg *engineConfig) error {
-				cfg.Opts.FormatMajorVersion = pebble.FormatBlockPropertyCollector
-				return nil
-			})
+		)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1617,7 +1614,7 @@ func BenchmarkMVCCIncrementalIteratorForOldData(b *testing.B) {
 	}
 
 	for _, valueSize := range []int{100, 500, 1000, 2000} {
-		eng := setupMVCCPebbleWithBlockProperties(b)
+		eng := setupMVCCPebble(b)
 		setupData(b, eng, valueSize)
 		b.Run(fmt.Sprintf("valueSize=%d", valueSize), func(b *testing.B) {
 			startKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(0)))

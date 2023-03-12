@@ -51,9 +51,10 @@ func TestOperationsFormat(t *testing.T) {
 	sstValueHeader.KVNemesisSeq.Set(1)
 	sstSpan := roachpb.Span{Key: roachpb.Key(k1), EndKey: roachpb.Key(k4)}
 	sstTS := hlc.Timestamp{WallTime: 1}
-	sstFile := &storage.MemFile{}
+	sstFile := &storage.MemObject{}
 	{
 		st := cluster.MakeTestingClusterSettings()
+		storage.ValueBlocksEnabled.Override(ctx, &st.SV, false)
 		w := storage.MakeIngestionSSTWriter(ctx, st, sstFile)
 		defer w.Close()
 

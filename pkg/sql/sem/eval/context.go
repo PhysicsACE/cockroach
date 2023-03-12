@@ -20,10 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
@@ -91,8 +93,13 @@ type Context struct {
 	// are no tiers, then the node's location is not known. Example:
 	//
 	//   [region=us,dc=east]
-	//
+	// The region entry in this variable is the gateway region.
 	Locality roachpb.Locality
+
+	// OriginalLocality is the initial Locality at the time the connection was
+	// established. Since Locality may be overridden in some paths, this provides
+	// a means of restoring the original Locality.
+	OriginalLocality roachpb.Locality
 
 	Tracer *tracing.Tracer
 
@@ -249,6 +256,11 @@ type Context struct {
 
 	// ParseHelper makes date parsing more efficient.
 	ParseHelper pgdate.ParseHelper
+
+	// RemoteRegions contains the slice of remote regions in a multiregion
+	// database which owns a table accessed by the current SQL request.
+	// This slice is only populated during the optbuild stage.
+	RemoteRegions catpb.RegionNames
 }
 
 // DescIDGenerator generates unique descriptor IDs.
@@ -272,17 +284,17 @@ type DescIDGenerator interface {
 type RangeStatsFetcher interface {
 
 	// RangeStats fetches the stats for the ranges which contain the passed keys.
-	RangeStats(ctx context.Context, keys ...roachpb.Key) ([]*roachpb.RangeStatsResponse, error)
+	RangeStats(ctx context.Context, keys ...roachpb.Key) ([]*kvpb.RangeStatsResponse, error)
 }
 
-var _ tree.ParseTimeContext = &Context{}
+var _ tree.ParseContext = &Context{}
 
 // ConsistencyCheckRunner is an interface embedded in eval.Context used by
 // crdb_internal.check_consistency.
 type ConsistencyCheckRunner interface {
 	CheckConsistency(
-		ctx context.Context, from, to roachpb.Key, mode roachpb.ChecksumMode,
-	) (*roachpb.CheckConsistencyResponse, error)
+		ctx context.Context, from, to roachpb.Key, mode kvpb.ChecksumMode,
+	) (*kvpb.CheckConsistencyResponse, error)
 }
 
 // RangeProber is an interface embedded in eval.Context used by
@@ -374,6 +386,16 @@ func (p *fakePlannerWithMonitor) Mon() *mon.BytesMonitor {
 	return p.monitor
 }
 
+// IsANSIDML is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) IsANSIDML() bool {
+	return false
+}
+
+// EnforceHomeRegion is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) EnforceHomeRegion() bool {
+	return false
+}
+
 type fakeStreamManagerFactory struct {
 	StreamManagerFactory
 }
@@ -446,15 +468,17 @@ func (ec *Context) Stop(c context.Context) {
 
 // FmtCtx creates a FmtCtx with the given options as well as the EvalContext's session data.
 func (ec *Context) FmtCtx(f tree.FmtFlags, opts ...tree.FmtCtxOption) *tree.FmtCtx {
+	applyOpts := make([]tree.FmtCtxOption, 0, 2+len(opts))
+	applyOpts = append(applyOpts, tree.FmtLocation(ec.GetLocation()))
 	if ec.SessionData() != nil {
-		opts = append(
-			[]tree.FmtCtxOption{tree.FmtDataConversionConfig(ec.SessionData().DataConversionConfig)},
-			opts...,
+		applyOpts = append(
+			applyOpts,
+			tree.FmtDataConversionConfig(ec.SessionData().DataConversionConfig),
 		)
 	}
 	return tree.NewFmtCtx(
 		f,
-		opts...,
+		append(applyOpts, opts...)...,
 	)
 }
 
@@ -570,7 +594,7 @@ func TimestampToInexactDTimestamp(ts hlc.Timestamp) *tree.DTimestamp {
 	return tree.MustMakeDTimestamp(timeutil.Unix(0, ts.WallTime), time.Microsecond)
 }
 
-// GetRelativeParseTime implements ParseTimeContext.
+// GetRelativeParseTime implements ParseContext.
 func (ec *Context) GetRelativeParseTime() time.Time {
 	ret := ec.TxnTimestamp
 	if ret.IsZero() {
@@ -655,6 +679,11 @@ func (ec *Context) GetIntervalStyle() duration.IntervalStyle {
 		return duration.IntervalStyle_POSTGRES
 	}
 	return ec.SessionData().GetIntervalStyle()
+}
+
+// GetCollationEnv returns the collation env.
+func (ec *Context) GetCollationEnv() *tree.CollationEnvironment {
+	return &ec.CollationEnv
 }
 
 // GetDateStyle returns the session date style.
@@ -775,4 +804,9 @@ type StreamIngestManager interface {
 		streamIngestionDetails jobspb.StreamIngestionDetails,
 		jobProgress jobspb.Progress,
 	) (*streampb.StreamIngestionStats, error)
+
+	GetReplicationStatsAndStatus(
+		ctx context.Context,
+		ingestionJobID jobspb.JobID,
+	) (*streampb.StreamIngestionStats, string, error)
 }

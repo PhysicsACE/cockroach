@@ -21,11 +21,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -382,7 +383,7 @@ func TestTenantStreamingCancelIngestion(t *testing.T) {
 			[][]string{{"1"}})
 
 		// Check if we can successfully GC the tenant.
-		c.DestSysSQL.Exec(t, "SELECT crdb_internal.destroy_tenant($1, true)",
+		c.DestSysSQL.Exec(t, "DROP TENANT [$1] IMMEDIATE",
 			args.DestTenantID.ToUint64())
 		rows, err = c.DestCluster.Server(0).DB().
 			Scan(ctx, destTenantPrefix, destTenantPrefix.PrefixEnd(), 10)
@@ -428,7 +429,7 @@ func TestTenantStreamingDropTenantCancelsStream(t *testing.T) {
 		}
 
 		// Set GC TTL low, so that the GC job completes quickly in the test.
-		c.DestSysSQL.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.Ttlseconds = 1;")
+		c.DestSysSQL.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1;")
 		c.DestSysSQL.Exec(t, fmt.Sprintf("DROP TENANT %s", c.Args.DestTenantName))
 		jobutils.WaitForJobToCancel(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 		jobutils.WaitForJobToCancel(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
@@ -590,9 +591,6 @@ func TestTenantStreamingCutoverOnSourceFailure(t *testing.T) {
 	cutoverOutput := replicationtestutils.DecimalTimeToHLC(t, cutoverStr)
 	require.Equal(c.T, cutoverTime, cutoverOutput)
 
-	// Resume ingestion.
-	c.DestSysSQL.Exec(t, fmt.Sprintf("RESUME JOB %d", ingestionJobID))
-
 	// Ingestion job should succeed despite source failure due to the successful cutover
 	jobutils.WaitForJobToSucceed(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 }
@@ -687,6 +685,9 @@ func TestTenantStreamingMultipleNodes(t *testing.T) {
 			clientAddresses[addr] = struct{}{}
 		},
 	}
+	args.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
+		AuthorizerSkipAdminSplitCapabilityChecks: true,
+	}
 
 	c, cleanup := replicationtestutils.CreateTenantStreamingClusters(ctx, t, args)
 	defer cleanup()
@@ -771,12 +772,13 @@ func TestTenantReplicationProtectedTimestampManagement(t *testing.T) {
 		// protecting the destination tenant.
 		checkNoDestinationProtection := func(c *replicationtestutils.TenantStreamingClusters, replicationJobID int) {
 			execCfg := c.DestSysServer.ExecutorConfig().(sql.ExecutorConfig)
-			require.NoError(t, c.DestCluster.Server(0).DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			require.NoError(t, c.DestCluster.Server(0).InternalDB().(isql.DB).Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 				j, err := execCfg.JobRegistry.LoadJobWithTxn(ctx, jobspb.JobID(replicationJobID), txn)
 				require.NoError(t, err)
 				payload := j.Payload()
 				replicationDetails := payload.GetStreamIngestion()
-				_, err = execCfg.ProtectedTimestampProvider.GetRecord(ctx, txn, *replicationDetails.ProtectedTimestampRecordID)
+				ptp := execCfg.ProtectedTimestampProvider.WithTxn(txn)
+				_, err = ptp.GetRecord(ctx, *replicationDetails.ProtectedTimestampRecordID)
 				require.EqualError(t, err, protectedts.ErrNotExists.Error())
 				return nil
 			}))
@@ -784,7 +786,7 @@ func TestTenantReplicationProtectedTimestampManagement(t *testing.T) {
 		checkDestinationProtection := func(c *replicationtestutils.TenantStreamingClusters, frontier hlc.Timestamp, replicationJobID int) {
 			execCfg := c.DestSysServer.ExecutorConfig().(sql.ExecutorConfig)
 			ptp := execCfg.ProtectedTimestampProvider
-			require.NoError(t, c.DestCluster.Server(0).DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			require.NoError(t, c.DestCluster.Server(0).InternalDB().(isql.DB).Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 				j, err := execCfg.JobRegistry.LoadJobWithTxn(ctx, jobspb.JobID(replicationJobID), txn)
 				if err != nil {
 					return err
@@ -794,7 +796,7 @@ func TestTenantReplicationProtectedTimestampManagement(t *testing.T) {
 				replicationDetails := payload.GetStreamIngestion()
 
 				require.NotNil(t, replicationDetails.ProtectedTimestampRecordID)
-				rec, err := ptp.GetRecord(ctx, txn, *replicationDetails.ProtectedTimestampRecordID)
+				rec, err := ptp.WithTxn(txn).GetRecord(ctx, *replicationDetails.ProtectedTimestampRecordID)
 				if err != nil {
 					return err
 				}
@@ -853,7 +855,7 @@ func TestTenantReplicationProtectedTimestampManagement(t *testing.T) {
 		}
 
 		// Set GC TTL low, so that the GC job completes quickly in the test.
-		c.DestSysSQL.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.Ttlseconds = 1;")
+		c.DestSysSQL.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1;")
 		c.DestSysSQL.Exec(t, fmt.Sprintf("DROP TENANT %s", c.Args.DestTenantName))
 
 		if !completeReplication {
@@ -908,7 +910,7 @@ func TestTenantStreamingShowTenant(t *testing.T) {
 	require.Equal(t, "destination", rowStr[0][1])
 	if rowStr[0][3] == "NULL" {
 		// There is no source yet, therefore the replication is not fully initialized.
-		require.Equal(t, "INITIALIZING REPLICATION", rowStr[0][2])
+		require.Equal(t, "initializing replication", rowStr[0][2])
 	}
 
 	jobutils.WaitForJobToRun(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
@@ -924,6 +926,7 @@ func TestTenantStreamingShowTenant(t *testing.T) {
 		id            int
 		dest          string
 		status        string
+		serviceMode   string
 		source        string
 		sourceUri     string
 		jobId         int
@@ -932,12 +935,15 @@ func TestTenantStreamingShowTenant(t *testing.T) {
 		cutoverTime   []byte // should be nil
 	)
 	row := c.DestSysSQL.QueryRow(t, fmt.Sprintf("SHOW TENANT %s WITH REPLICATION STATUS", args.DestTenantName))
-	row.Scan(&id, &dest, &status, &source, &sourceUri, &jobId, &maxReplTime, &protectedTime, &cutoverTime)
+	row.Scan(&id, &dest, &status, &serviceMode, &source, &sourceUri, &jobId, &maxReplTime, &protectedTime, &cutoverTime)
 	require.Equal(t, 2, id)
 	require.Equal(t, "destination", dest)
-	require.Equal(t, "REPLICATING", status)
+	require.Equal(t, "replicating", status)
+	require.Equal(t, "none", serviceMode)
 	require.Equal(t, "source", source)
-	require.Equal(t, c.SrcURL.String(), sourceUri)
+	expectedURI, err := redactSourceURI(c.SrcURL.String())
+	require.NoError(t, err)
+	require.Equal(t, expectedURI, sourceUri)
 	require.Equal(t, ingestionJobID, jobId)
 	require.Less(t, maxReplTime, timeutil.Now())
 	require.Less(t, protectedTime, timeutil.Now())
@@ -945,11 +951,12 @@ func TestTenantStreamingShowTenant(t *testing.T) {
 	require.GreaterOrEqual(t, protectedTime, replicationDetails.ReplicationStartTime.GoTime())
 	require.Nil(t, cutoverTime)
 
-	// Verify the SHOW command prints the right cutover timestamp.
-	futureTime := c.DestSysServer.Clock().Now().Add(24*time.Hour.Nanoseconds(), 0)
+	// Verify the SHOW command prints the right cutover timestamp. Adding some
+	// logical component to make sure we handle it correctly.
+	futureTime := c.DestSysServer.Clock().Now().Add(24*time.Hour.Nanoseconds(), 7)
 	var cutoverStr string
 	c.DestSysSQL.QueryRow(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`,
-		c.Args.DestTenantName, futureTime.GoTime()).Scan(&cutoverStr)
+		c.Args.DestTenantName, futureTime.AsOfSystemTime()).Scan(&cutoverStr)
 	var showCutover string
 	c.DestSysSQL.QueryRow(c.T, fmt.Sprintf("SELECT cutover_time FROM [SHOW TENANT %s WITH REPLICATION STATUS]",
 		c.Args.DestTenantName)).Scan(&showCutover)

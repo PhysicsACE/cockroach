@@ -76,6 +76,11 @@ build:crosslinux '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-p
 build:crosslinux --config=crosslinuxbase
 build:crosslinuxbase --platforms=//build/toolchains:cross_linux
 build:crosslinuxbase --config=cross
+build:crosslinuxfips '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-pc-linux-gnu'
+build:crosslinuxfips --config=crosslinuxfipsbase
+build:crosslinuxfipsbase --platforms=//build/toolchains:cross_linux
+build:crosslinuxfipsbase --config=cross
+build:crosslinuxfipsbase --@io_bazel_rules_go//go/toolchain:sdk_version=1.19.5fips
 build:crosswindows '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-w64-mingw32'
 build:crosswindows --config=crosswindowsbase
 build:crosswindowsbase --platforms=//build/toolchains:cross_windows
@@ -99,7 +104,6 @@ build:crosslinuxs390xbase --config=cross
 
 # devdarwinx86_64 is a legacy setting that implies `--config=dev`.
 build:devdarwinx86_64 --config=dev
-build:dev --config=simplestamp
 build:macos --action_env=PATH=/opt/homebrew/bin:/opt/local/bin:/usr/local/bin:/usr/bin:/bin
 build:macos --host_action_env=PATH=/opt/homebrew/bin:/opt/local/bin:/usr/local/bin:/usr/bin:/bin
 

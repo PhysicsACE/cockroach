@@ -13,6 +13,7 @@ package schemaexpr
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -45,16 +46,18 @@ func ValidatePartialIndexPredicate(
 	e tree.Expr,
 	tn *tree.TableName,
 	semaCtx *tree.SemaContext,
+	version clusterversion.ClusterVersion,
 ) (string, error) {
 	expr, _, cols, err := DequalifyAndValidateExpr(
 		ctx,
 		desc,
 		e,
 		types.Bool,
-		"index predicate",
+		tree.IndexPredicateExpr,
 		semaCtx,
 		volatility.Immutable,
 		tn,
+		version,
 	)
 	if err != nil {
 		return "", err
@@ -75,7 +78,7 @@ func validatePartialIndexExprColsArePublic(
 			return
 		}
 		var col catalog.Column
-		col, err = desc.FindColumnWithID(colID)
+		col, err = catalog.MustFindColumnByID(desc, colID)
 		if err != nil {
 			return
 		}

@@ -25,12 +25,22 @@ func (d *delegator) delegateShowClusterSettingList(
 
 	// First check system privileges.
 	hasModify := false
+	hasSqlModify := false
 	hasView := false
 	if err := d.catalog.CheckPrivilege(d.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING); err == nil {
 		hasModify = true
+		hasSqlModify = true
 		hasView = true
 	} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
 		return nil, err
+	}
+	if !hasSqlModify {
+		if err := d.catalog.CheckPrivilege(d.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYSQLCLUSTERSETTING); err == nil {
+			hasSqlModify = true
+			hasView = true
+		} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
+			return nil, err
+		}
 	}
 	if !hasView {
 		if err := d.catalog.CheckPrivilege(d.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING); err == nil {
@@ -59,10 +69,10 @@ func (d *delegator) delegateShowClusterSettingList(
 	}
 
 	// If user is not admin and has neither privilege, return an error.
-	if !hasView && !hasModify {
+	if !hasView && !hasModify && !hasSqlModify {
 		return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-			"only users with either %s or %s privileges are allowed to SHOW CLUSTER SETTINGS",
-			privilege.MODIFYCLUSTERSETTING, privilege.VIEWCLUSTERSETTING)
+			"only users with %s, %s or %s privileges are allowed to SHOW CLUSTER SETTINGS",
+			privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, privilege.VIEWCLUSTERSETTING)
 	}
 
 	if stmt.All {
@@ -109,16 +119,12 @@ func (d *delegator) delegateShowTenantClusterSettingList(
 	// cannot evaluate it in the go code.
 	return parse(`
 WITH
-  tenant_id AS (SELECT (` + stmt.TenantID.String() + `):::INT AS tenant_id),
+  tenant_id AS (SELECT id AS tenant_id FROM [SHOW TENANT ` + stmt.TenantSpec.String() + `]),
   isvalid AS (
     SELECT
       CASE
-       WHEN tenant_id=0 THEN
-         crdb_internal.force_error('22023', 'tenant ID must be non-zero')
        WHEN tenant_id=1 THEN
          crdb_internal.force_error('22023', 'use SHOW CLUSTER SETTINGS to display settings for the system tenant')
-       WHEN st.id IS NULL THEN
-         crdb_internal.force_error('22023', 'no tenant found with ID '||tenant_id)
        ELSE 0
       END AS ok
     FROM      tenant_id

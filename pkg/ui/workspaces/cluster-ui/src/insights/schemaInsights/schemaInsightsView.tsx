@@ -38,8 +38,13 @@ import { InsightsError } from "../insightsErrorComponent";
 import { Pagination } from "../../pagination";
 import { EmptySchemaInsightsTablePlaceholder } from "./emptySchemaInsightsTablePlaceholder";
 import { CockroachCloudContext } from "../../contexts";
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import { insights } from "src/util";
+import { Anchor } from "src/anchor";
+import insightTableStyles from "../../insightsTable/insightsTable.module.scss";
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
+const insightTableCx = classNames.bind(insightTableStyles);
 
 export type SchemaInsightsViewStateProps = {
   schemaInsights: InsightRecommendation[];
@@ -48,12 +53,15 @@ export type SchemaInsightsViewStateProps = {
   schemaInsightsError: Error | null;
   filters: SchemaInsightEventFilters;
   sortSetting: SortSetting;
+  hasAdminRole: boolean;
+  maxSizeApiReached?: boolean;
 };
 
 export type SchemaInsightsViewDispatchProps = {
   onFiltersChange: (filters: SchemaInsightEventFilters) => void;
   onSortChange: (ss: SortSetting) => void;
   refreshSchemaInsights: () => void;
+  refreshUserSQLRoles: () => void;
 };
 
 export type SchemaInsightsViewProps = SchemaInsightsViewStateProps &
@@ -68,9 +76,12 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
   schemaInsightsTypes,
   schemaInsightsError,
   filters,
+  hasAdminRole,
   refreshSchemaInsights,
+  refreshUserSQLRoles,
   onFiltersChange,
   onSortChange,
+  maxSizeApiReached,
 }: SchemaInsightsViewProps) => {
   const isCockroachCloud = useContext(CockroachCloudContext);
   const [pagination, setPagination] = useState<ISortedTablePagination>({
@@ -90,6 +101,15 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
       clearInterval(interval);
     };
   }, [refreshSchemaInsights]);
+
+  useEffect(() => {
+    // Refresh every 5 minutes.
+    refreshUserSQLRoles();
+    const interval = setInterval(refreshUserSQLRoles, 60 * 5000);
+    return () => {
+      clearInterval(interval);
+    };
+  }, [refreshUserSQLRoles]);
 
   useEffect(() => {
     // We use this effect to sync settings defined on the URL (sort, filters),
@@ -205,7 +225,7 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
           loading={schemaInsights === null}
           page="schema insights"
           error={schemaInsightsError}
-          renderError={() => InsightsError()}
+          renderError={() => InsightsError(schemaInsightsError?.message)}
         >
           <div>
             <section className={sortableTableCx("cl-table-container")}>
@@ -220,10 +240,15 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
                 />
               </div>
               <InsightsSortedTable
-                columns={makeInsightsColumns(isCockroachCloud)}
+                columns={makeInsightsColumns(
+                  isCockroachCloud,
+                  hasAdminRole,
+                  false,
+                )}
                 data={filteredSchemaInsights}
                 sortSetting={sortSetting}
                 onChangeSortSetting={onChangeSortSetting}
+                pagination={pagination}
                 renderNoResult={
                   <EmptySchemaInsightsTablePlaceholder
                     isEmptySearchResults={
@@ -231,6 +256,7 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
                     }
                   />
                 }
+                tableWrapperClassName={insightTableCx("sorted-table")}
               />
             </section>
             <Pagination
@@ -239,6 +265,20 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
               total={filteredSchemaInsights?.length}
               onChange={onChangePage}
             />
+            {maxSizeApiReached && (
+              <InlineAlert
+                intent="info"
+                title={
+                  <>
+                    Not all insights are displayed because the maximum number of
+                    insights was reached in the console.&nbsp;
+                    <Anchor href={insights} target="_blank">
+                      Learn more
+                    </Anchor>
+                  </>
+                }
+              />
+            )}
           </div>
         </Loading>
       </div>

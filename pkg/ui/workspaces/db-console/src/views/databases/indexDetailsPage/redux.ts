@@ -26,13 +26,19 @@ import {
   generateTableID,
   refreshIndexStats,
   refreshNodes,
+  refreshUserSQLRoles,
 } from "src/redux/apiReducers";
 import { resetIndexUsageStatsAction } from "src/redux/indexUsageStats";
 import { longToInt } from "src/util/fixLong";
 import { cockroach } from "src/js/protos";
 import TableIndexStatsRequest = cockroach.server.serverpb.TableIndexStatsRequest;
-import { selectHasViewActivityRedactedRole } from "src/redux/user";
+import {
+  selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
+} from "src/redux/user";
 import { nodeRegionsByIDSelector } from "src/redux/nodes";
+import { setGlobalTimeScaleAction } from "src/redux/statements";
+import { selectTimeScale } from "src/redux/timeScale";
 const { RecommendationType } = cockroach.sql.IndexRecommendation;
 
 export const mapStateToProps = createSelector(
@@ -45,6 +51,8 @@ export const mapStateToProps = createSelector(
   state => state.cachedData.indexStats,
   state => selectHasViewActivityRedactedRole(state),
   state => nodeRegionsByIDSelector(state),
+  state => selectHasAdminRole(state),
+  state => selectTimeScale(state),
   (
     database,
     table,
@@ -52,6 +60,8 @@ export const mapStateToProps = createSelector(
     indexStats,
     hasViewActivityRedactedRole,
     nodeRegions,
+    hasAdminRole,
+    timeScale,
   ): IndexDetailsPageData => {
     const stats = indexStats[generateTableID(database, table)];
     const details = stats?.data?.statistics.filter(
@@ -59,7 +69,7 @@ export const mapStateToProps = createSelector(
     )[0];
     const filteredIndexRecommendations =
       stats?.data?.index_recommendations.filter(
-        indexRec => indexRec.index_id === details.statistics.key.index_id,
+        indexRec => indexRec.index_id === details?.statistics.key.index_id,
       ) || [];
     const indexRecommendations = filteredIndexRecommendations.map(indexRec => {
       let type: RecType = "Unknown";
@@ -80,7 +90,9 @@ export const mapStateToProps = createSelector(
       indexName: index,
       isTenant: false,
       hasViewActivityRedactedRole: hasViewActivityRedactedRole,
+      hasAdminRole: hasAdminRole,
       nodeRegions: nodeRegions,
+      timeScale: timeScale,
       details: {
         loading: !!stats?.inFlight,
         loaded: !!stats?.valid,
@@ -104,4 +116,6 @@ export const mapDispatchToProps = {
   },
   resetIndexUsageStats: resetIndexUsageStatsAction,
   refreshNodes,
+  refreshUserSQLRoles,
+  onTimeScaleChange: setGlobalTimeScaleAction,
 };

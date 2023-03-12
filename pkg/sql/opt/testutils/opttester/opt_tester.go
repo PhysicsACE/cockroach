@@ -294,6 +294,7 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
 	ot.evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
 	ot.evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
+	ot.evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = true
 
 	return ot
 }
@@ -567,6 +568,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 
 	ot.evalCtx.TestingKnobs.OptimizerCostPerturbation = ot.Flags.PerturbCost
 	ot.evalCtx.Locality = ot.Flags.Locality
+	ot.evalCtx.OriginalLocality = ot.Flags.Locality
 	ot.evalCtx.Placeholders = nil
 
 	switch d.Cmd {
@@ -2178,14 +2180,17 @@ func (ot *OptTester) IndexRecommendations() (string, error) {
 	}
 	md := normExpr.(memo.RelExpr).Memo().Metadata()
 	indexCandidates := indexrec.FindIndexCandidateSet(normExpr, md)
-	_, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
+	_, hypTables := indexrec.BuildOptAndHypTableMaps(ot.catalog, indexCandidates)
 
 	optExpr, err := ot.OptimizeWithTables(hypTables)
 	if err != nil {
 		return "", err
 	}
 	md = optExpr.(memo.RelExpr).Memo().Metadata()
-	recs := indexrec.FindRecs(optExpr, md)
+	recs, err := indexrec.FindRecs(ot.ctx, optExpr, md)
+	if err != nil {
+		return "", err
+	}
 	if len(recs) == 0 {
 		return fmt.Sprintf("no index recommendations\n--\noptimal plan:\n%s", ot.FormatExpr(optExpr)), nil
 	}
@@ -2302,7 +2307,7 @@ func (ot *OptTester) ExecBuild(f exec.Factory, mem *memo.Memo, expr opt.Expr) (e
 	if opt.IsDDLOp(expr) {
 		ot.evalCtx.Codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 		factory := kv.MockTxnSenderFactory{}
-		clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+		clock := hlc.NewClockForTesting(nil)
 		stopper := stop.NewStopper()
 		db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 		ot.evalCtx.Txn = kv.NewTxn(context.Background(), db, 1)

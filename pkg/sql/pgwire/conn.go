@@ -340,7 +340,11 @@ func (c *conn) serveImpl(
 	logAuthn := !inTestWithoutSQL && c.authLogEnabled()
 
 	// We'll build an authPipe to communicate with the authentication process.
-	authPipe := newAuthPipe(c, logAuthn, authOpt, c.sessionArgs.User)
+	systemIdentity := c.sessionArgs.SystemIdentity
+	if systemIdentity.Undefined() {
+		systemIdentity = c.sessionArgs.User
+	}
+	authPipe := newAuthPipe(c, logAuthn, authOpt, systemIdentity)
 	var authenticator authenticatorIO = authPipe
 
 	// procCh is the channel on which we'll receive the termination signal from
@@ -875,6 +879,34 @@ func (c *conn) handleSimpleQuery(
 			copyDone.Wait()
 			return nil
 		}
+		if cp, ok := stmts[i].AST.(*tree.CopyTo); ok {
+			if len(stmts) != 1 {
+				// NOTE(andrei): I don't know if Postgres supports receiving a COPY
+				// together with other statements in the "simple" protocol, but I'd
+				// rather not worry about it since execution of COPY is special - it
+				// takes control over the connection.
+				return c.stmtBuf.Push(
+					ctx,
+					sql.SendError{
+						Err: pgwirebase.NewProtocolViolationErrorf(
+							"COPY together with other statements in a query string is not supported"),
+					})
+			}
+			if err := c.stmtBuf.Push(
+				ctx,
+				sql.CopyOut{
+					Conn:         c,
+					ParsedStmt:   stmts[i],
+					Stmt:         cp,
+					TimeReceived: timeReceived,
+					ParseStart:   startParse,
+					ParseEnd:     endParse,
+				},
+			); err != nil {
+				return err
+			}
+			return nil
+		}
 
 		// Determine whether there is only SHOW COMMIT TIMESTAMP after this
 		// statement in the batch. That case should be treated as though it
@@ -969,11 +1001,16 @@ func (c *conn) handleParse(
 				sqlTypeHints[i] = nil
 				continue
 			}
+			// This special case for json, json[] is here so we can support decoding
+			// parameters with oid=json/json[] without adding full support for these
+			// type.
+			// TODO(sql-exp): Remove this if we support JSON.
 			if t == oid.T_json {
-				// This special case is here so we can support decoding parameters
-				// with oid=json without adding full support for the JSON type.
-				// TODO(sql-exp): Remove this if we support JSON.
 				sqlTypeHints[i] = types.Json
+				continue
+			}
+			if t == oid.T__json {
+				sqlTypeHints[i] = types.JSONArrayForDecodingOnly
 				continue
 			}
 			v, ok := types.OidToType[t]
@@ -1222,6 +1259,34 @@ func (c *conn) BeginCopyIn(
 	return c.msgBuilder.finishMsg(c.conn)
 }
 
+// BeginCopyOut is part of the pgwirebase.Conn interface.
+func (c *conn) BeginCopyOut(
+	ctx context.Context, columns []colinfo.ResultColumn, format pgwirebase.FormatCode,
+) error {
+	c.msgBuilder.initMsg(pgwirebase.ServerMsgCopyOutResponse)
+	c.msgBuilder.writeByte(byte(format))
+	c.msgBuilder.putInt16(int16(len(columns)))
+	for range columns {
+		c.msgBuilder.putInt16(int16(format))
+	}
+	return c.msgBuilder.finishMsg(c.conn)
+}
+
+// SendCopyData is part of the pgwirebase.Conn interface.
+func (c *conn) SendCopyData(ctx context.Context, copyData []byte) error {
+	c.msgBuilder.initMsg(pgwirebase.ServerMsgCopyDataCommand)
+	if _, err := c.msgBuilder.Write(copyData); err != nil {
+		return err
+	}
+	return c.msgBuilder.finishMsg(c.conn)
+}
+
+// SendCopyDone is part of the pgwirebase.Conn interface.
+func (c *conn) SendCopyDone(ctx context.Context) error {
+	c.msgBuilder.initMsg(pgwirebase.ServerMsgCopyDoneCommand)
+	return c.msgBuilder.finishMsg(c.conn)
+}
+
 // SendCommandComplete is part of the pgwirebase.Conn interface.
 func (c *conn) SendCommandComplete(tag []byte) error {
 	c.bufferCommandComplete(tag)
@@ -1291,9 +1356,9 @@ func cookTag(
 			tag = strconv.AppendInt(tag, int64(rowsAffected), 10)
 		}
 
-	case tree.CopyIn:
+	case tree.CopyIn, tree.CopyOut:
 		// Nothing to do. The CommandComplete message has been sent elsewhere.
-		panic(errors.AssertionFailedf("CopyIn statements should have been handled elsewhere " +
+		panic(errors.AssertionFailedf("Copy statements should have been handled elsewhere " +
 			"and not produce results"))
 	default:
 		panic(errors.AssertionFailedf("unexpected result type %v", stmtType))
@@ -1433,7 +1498,7 @@ func (c *tenantEgressCounter) GetBatchNetworkEgress(
 			// Use the default values for the DataConversionConfig and location.
 			// See the comment in getRowNetworkEgress for why the writeText variant
 			// is used here instead of writeBinary.
-			c.buf.writeTextColumnarElement(ctx, &c.vecs, vecIdx, rowIdx, conv, nil /* sessionLoc */)
+			c.buf.writeTextColumnarElement(ctx, &c.vecs, vecIdx, rowIdx, conv, time.UTC)
 			egress += int64(c.buf.Len())
 			c.buf.reset()
 		}
@@ -1782,6 +1847,11 @@ func (c *conn) CreateErrorResult(pos sql.CmdPos) sql.ErrorResult {
 
 // CreateCopyInResult is part of the sql.ClientComm interface.
 func (c *conn) CreateCopyInResult(pos sql.CmdPos) sql.CopyInResult {
+	return c.newMiscResult(pos, noCompletionMsg)
+}
+
+// CreateCopyOutResult is part of the sql.ClientComm interface.
+func (c *conn) CreateCopyOutResult(pos sql.CmdPos) sql.CopyOutResult {
 	return c.newMiscResult(pos, noCompletionMsg)
 }
 

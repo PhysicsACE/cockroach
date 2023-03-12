@@ -31,7 +31,13 @@ import {
   SummaryCardItemBoolSetting,
 } from "src/summaryCard";
 import * as format from "src/util/format";
-import { DATE_FORMAT, DATE_FORMAT_24_UTC } from "src/util/format";
+import {
+  DATE_FORMAT,
+  DATE_FORMAT_24_UTC,
+  EncodeDatabaseTableUri,
+  EncodeDatabaseUri,
+  EncodeUriName,
+} from "src/util/format";
 import {
   ascendingAttr,
   columnTitleAttr,
@@ -53,6 +59,7 @@ import IdxRecAction from "../insights/indexActionBtn";
 import { RecommendationType } from "../indexDetailsPage";
 import LoadingError from "../sqlActivity/errorComponent";
 import { Loading } from "../loading";
+import { UIConfigState } from "../store";
 
 const cx = classNames.bind(styles);
 const booleanSettingCx = classnames.bind(booleanSettingStyles);
@@ -108,6 +115,7 @@ export interface DatabaseTablePageData {
   indexStats: DatabaseTablePageIndexStats;
   showNodeRegionsSection?: boolean;
   automaticStatsCollectionEnabled?: boolean;
+  hasAdminRole?: UIConfigState["hasAdminRole"];
 }
 
 export interface DatabaseTablePageDataDetails {
@@ -166,6 +174,7 @@ export interface DatabaseTablePageActions {
   refreshIndexStats?: (database: string, table: string) => void;
   resetIndexUsageStats?: (database: string, table: string) => void;
   refreshNodes?: () => void;
+  refreshUserSQLRoles: () => void;
 }
 
 export type DatabaseTablePageProps = DatabaseTablePageData &
@@ -247,6 +256,7 @@ export class DatabaseTablePage extends React.Component<
   }
 
   private refresh() {
+    this.props.refreshUserSQLRoles();
     if (this.props.refreshNodes != null) {
       this.props.refreshNodes();
     }
@@ -408,7 +418,7 @@ export class DatabaseTablePage extends React.Component<
       className: cx("index-stats-table__col-indexes"),
       cell: indexStat => (
         <Link
-          to={`${this.props.name}/index/${indexStat.indexName}`}
+          to={`${this.props.name}/index/${EncodeUriName(indexStat.indexName)}`}
           className={cx("icon__container")}
         >
           <IndexIcon className={cx("icon--s", "icon--primary")} />
@@ -493,15 +503,22 @@ export class DatabaseTablePage extends React.Component<
   };
 
   render(): React.ReactElement {
+    const { hasAdminRole } = this.props;
     return (
       <div className="root table-area">
         <section className={baseHeadingClasses.wrapper}>
           <Breadcrumbs
             items={[
               { link: "/databases", name: "Databases" },
-              { link: `/database/${this.props.databaseName}`, name: "Tables" },
               {
-                link: `/database/${this.props.databaseName}/table/${this.props.name}`,
+                link: EncodeDatabaseUri(this.props.databaseName),
+                name: "Tables",
+              },
+              {
+                link: EncodeDatabaseTableUri(
+                  this.props.databaseName,
+                  this.props.name,
+                ),
                 name: `Table: ${this.props.name}`,
               },
             ]}
@@ -644,23 +661,25 @@ export class DatabaseTablePage extends React.Component<
                                 {this.getLastResetString()}
                               </div>
                             </Tooltip>
-                            <div>
-                              <a
-                                className={cx(
-                                  "action",
-                                  "separator",
-                                  "index-stats__reset-btn",
-                                )}
-                                onClick={() =>
-                                  this.props.resetIndexUsageStats(
-                                    this.props.databaseName,
-                                    this.props.name,
-                                  )
-                                }
-                              >
-                                Reset all index stats
-                              </a>
-                            </div>
+                            {hasAdminRole && (
+                              <div>
+                                <a
+                                  className={cx(
+                                    "action",
+                                    "separator",
+                                    "index-stats__reset-btn",
+                                  )}
+                                  onClick={() =>
+                                    this.props.resetIndexUsageStats(
+                                      this.props.databaseName,
+                                      this.props.name,
+                                    )
+                                  }
+                                >
+                                  Reset all index stats
+                                </a>
+                              </div>
+                            )}
                           </div>
                         </div>
                         <IndexUsageStatsTable

@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -98,7 +99,7 @@ func importBankDataSplit(
 
 	// NB: starting the cluster creates the logs dir as a side effect,
 	// needed below.
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+	c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
 	runImportBankDataSplit(ctx, rows, ranges, t, c)
 	return dest
 }
@@ -448,13 +449,10 @@ func registerBackupMixedVersion(r registry.Registry) {
 			if c.IsLocal() && runtime.GOARCH == "arm64" {
 				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
 			}
-			// An empty string means that the cockroach binary specified by flag
-			// `cockroach` will be used.
-			const mainVersion = ""
 			roachNodes := c.All()
 			upgradedNodes := c.Nodes(1, 2)
 			oldNodes := c.Nodes(3, 4)
-			predV, err := PredecessorVersion(*t.BuildVersion())
+			predV, err := version.PredecessorVersion(*t.BuildVersion())
 			require.NoError(t, err)
 			c.Put(ctx, t.DeprecatedWorkload(), "./workload")
 
@@ -469,7 +467,7 @@ func registerBackupMixedVersion(r registry.Registry) {
 				setShortJobIntervalsStep(1),
 				loadBackupDataStep(c),
 				// Upgrade some nodes.
-				binaryUpgradeStep(upgradedNodes, mainVersion),
+				binaryUpgradeStep(upgradedNodes, clusterupgrade.MainVersion),
 
 				// Let us first test planning and executing a backup on different node
 				// versions.
@@ -561,7 +559,7 @@ func registerBackupMixedVersion(r registry.Registry) {
 				enableJobAdoptionStep(c, upgradedNodes),
 
 				// Allow all the nodes to now finalize their cluster version.
-				binaryUpgradeStep(oldNodes, mainVersion),
+				binaryUpgradeStep(oldNodes, clusterupgrade.MainVersion),
 				allowAutoUpgradeStep(1),
 				waitForUpgradeStep(roachNodes),
 
@@ -908,7 +906,7 @@ func registerBackup(r registry.Registry) {
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			c.Put(ctx, t.Cockroach(), "./cockroach")
 			c.Put(ctx, t.DeprecatedWorkload(), "./workload")
-			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+			c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
 			conn := c.Conn(ctx, t.L(), 1)
 
 			duration := 5 * time.Minute
@@ -1137,7 +1135,7 @@ func registerBackup(r registry.Registry) {
 func runBackupMVCCRangeTombstones(ctx context.Context, t test.Test, c cluster.Cluster) {
 	c.Put(ctx, t.Cockroach(), "./cockroach")
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload") // required for tpch
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+	c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
 	t.Status("starting csv servers")
 	c.Run(ctx, c.All(), `./cockroach workload csv-server --port=8081 &> logs/workload-csv-server.log < /dev/null &`)
 

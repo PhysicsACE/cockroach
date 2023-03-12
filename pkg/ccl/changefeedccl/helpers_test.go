@@ -41,12 +41,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -92,6 +94,10 @@ func readNextMessages(
 	for len(actual) < numMessages {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if log.V(1) {
+			log.Infof(context.Background(), "About to read a message (%d out of %d) from %v (%T)",
+				len(actual), numMessages, f, f)
 		}
 		m, err := f.Next()
 		if log.V(1) {
@@ -184,12 +190,12 @@ func assertPayloadsBase(
 	timeout := assertPayloadsTimeout()
 	if len(expected) > 100 {
 		// Webhook sink is very slow; We have few tests that read 1000 messages.
-		timeout += 5 * time.Minute
+		timeout += time.Duration(math.Log(float64(len(expected)))) * time.Minute
 	}
 
 	require.NoError(t,
 		withTimeout(f, timeout,
-			func(ctx context.Context) error {
+			func(ctx context.Context) (err error) {
 				return assertPayloadsBaseErr(ctx, f, expected, stripTs, perKeyOrdered)
 			},
 		))
@@ -247,10 +253,17 @@ func assertPayloadsTimeout() time.Duration {
 func withTimeout(
 	f cdctest.TestFeed, timeout time.Duration, fn func(ctx context.Context) error,
 ) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	defer stopFeedWhenDone(ctx, f)()
-	return fn(ctx)
+	var jobID jobspb.JobID
+	if jobFeed, ok := f.(cdctest.EnterpriseTestFeed); ok {
+		jobID = jobFeed.JobID()
+	}
+	return contextutil.RunWithTimeout(context.Background(),
+		fmt.Sprintf("withTimeout-%d", jobID), timeout,
+		func(ctx context.Context) error {
+			defer stopFeedWhenDone(ctx, f)()
+			return fn(ctx)
+		},
+	)
 }
 
 func assertPayloads(t testing.TB, f cdctest.TestFeed, expected []string) {
@@ -383,12 +396,12 @@ func startTestFullServer(
 		DisableDefaultTestTenant: true,
 		UseDatabase:              `d`,
 		ExternalIODir:            options.externalIODir,
+		Settings:                 options.settings,
 	}
 
 	if options.argsFn != nil {
 		options.argsFn(&args)
 	}
-
 	resetRetry := testingUseFastRetry()
 	resetFlushFrequency := changefeedbase.TestingSetDefaultMinCheckpointFrequency(testSinkFlushFrequency)
 	s, db, _ := serverutils.StartServer(t, args)
@@ -493,6 +506,7 @@ func startTestTenant(
 		UseDatabase:   `d`,
 		TestingKnobs:  knobs,
 		ExternalIODir: options.externalIODir,
+		Settings:      options.settings,
 	}
 
 	tenantServer, tenantDB := serverutils.StartTenant(t, systemServer, tenantArgs)
@@ -514,13 +528,15 @@ type updateArgsFn func(args *base.TestServerArgs)
 type updateKnobsFn func(knobs *base.TestingKnobs)
 
 type feedTestOptions struct {
-	useTenant                  bool
-	argsFn                     updateArgsFn
-	knobsFn                    updateKnobsFn
-	externalIODir              string
-	allowedSinkTypes           []string
-	disabledSinkTypes          []string
-	disableSyntheticTimestamps bool
+	useTenant                    bool
+	forceNoExternalConnectionURI bool
+	argsFn                       updateArgsFn
+	knobsFn                      updateKnobsFn
+	externalIODir                string
+	allowedSinkTypes             []string
+	disabledSinkTypes            []string
+	disableSyntheticTimestamps   bool
+	settings                     *cluster.Settings
 }
 
 type feedTestOption func(opts *feedTestOptions)
@@ -528,6 +544,11 @@ type feedTestOption func(opts *feedTestOptions)
 // feedTestNoTenants is a feedTestOption that will prohibit this tests
 // from randomly running on a tenant.
 var feedTestNoTenants = func(opts *feedTestOptions) { opts.useTenant = false }
+
+// feedTestNoExternalConnection is a feedTestOption that will prohibit this test
+// from randomly creating an external connection URI and providing that as the sink
+// rather than directly specifying it. (Feed tests never actually connect to anything external.)
+var feedTestNoExternalConnection = func(opts *feedTestOptions) { opts.forceNoExternalConnectionURI = true }
 
 // feedTestNoForcedSyntheticTimestamps is a feedTestOption that will prevent
 // the test from randomly forcing timestamps to be synthetic and offset five seconds into the future from
@@ -563,6 +584,14 @@ func (opts feedTestOptions) omitSinks(sinks ...string) feedTestOptions {
 // and not the sqlServer.
 func withArgsFn(fn updateArgsFn) feedTestOption {
 	return func(opts *feedTestOptions) { opts.argsFn = fn }
+}
+
+// withSettingsFn arranges for a feed option to set the settings for
+// both system and test tenant.
+func withSettings(st *cluster.Settings) feedTestOption {
+	return func(opts *feedTestOptions) {
+		opts.settings = st
+	}
 }
 
 // withKnobsFn is a feedTestOption that allows the caller to modify
@@ -654,7 +683,9 @@ func feed(
 	return feed
 }
 
-func asUser(t testing.TB, f cdctest.TestFeedFactory, user string, fn func()) {
+func asUser(
+	t testing.TB, f cdctest.TestFeedFactory, user string, fn func(runner *sqlutils.SQLRunner),
+) {
 	t.Helper()
 	require.NoError(t, f.AsUser(user, fn))
 }
@@ -685,6 +716,18 @@ func closeFeed(t testing.TB, f cdctest.TestFeed) {
 	t.Helper()
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func closeFeedIgnoreError(t testing.TB, f cdctest.TestFeed) {
+	defer func() {
+		if e := recover(); e != nil {
+			t.Log(e)
+		}
+	}()
+	t.Helper()
+	if err := f.Close(); err != nil {
+		t.Log(err)
 	}
 }
 
@@ -946,12 +989,39 @@ func cdcTestNamedWithSystem(
 	t.Run(testLabel, func(t *testing.T) {
 		testServer, cleanupServer := makeServerWithOptions(t, options)
 		feedFactory, cleanupSink := makeFeedFactoryWithOptions(t, sinkType, testServer.Server, testServer.DB, options)
+		feedFactory = maybeUseExternalConnection(feedFactory, testServer.DB, sinkType, options, t)
 		defer cleanupServer()
 		defer cleanupSink()
 		defer cleanupCloudStorage()
-
 		testFn(t, testServer, feedFactory)
 	})
+}
+
+// TODO (zinger): These sometimes error when using external connections,
+// with either an ordering constraint violation or an unexpected null -> null message.
+// This is likely due to the notifyFlushSink being set up in a subtly wrong way.
+// Fix and remove this constant.
+const flakyWhenExternalConnection = `webhook, pubsub`
+
+func maybeUseExternalConnection(
+	factory cdctest.TestFeedFactory,
+	db *gosql.DB,
+	sinkType string,
+	options feedTestOptions,
+	logger *testing.T,
+) cdctest.TestFeedFactory {
+	// percentExternal is the chance of randomly running a test using an `external://` uri.
+	// Set to 1 to always do this.
+	const percentExternal = 0.5
+	if sinkType == `sinkless` || sinkType == `enterprise` || strings.Contains(flakyWhenExternalConnection, sinkType) ||
+		options.forceNoExternalConnectionURI || rand.Float32() > percentExternal {
+		return factory
+	}
+	return &externalConnectionFeedFactory{
+		TestFeedFactory: factory,
+		db:              db,
+		logger:          logger,
+	}
 }
 
 func forceTableGC(
@@ -1001,6 +1071,55 @@ func checkStructuredLogs(t *testing.T, eventType string, startTime int64) []stri
 	})
 
 	return matchingEntries
+}
+
+func checkContinuousChangefeedLogs(t *testing.T, startTime int64) []eventpb.ChangefeedEmittedBytes {
+	logs := checkStructuredLogs(t, "changefeed_emitted_bytes", startTime)
+	matchingEntries := make([]eventpb.ChangefeedEmittedBytes, len(logs))
+
+	for i, m := range logs {
+		jsonPayload := []byte(m)
+		var event eventpb.ChangefeedEmittedBytes
+		if err := gojson.Unmarshal(jsonPayload, &event); err != nil {
+			t.Errorf("unmarshalling %q: %v", m, err)
+		}
+		matchingEntries[i] = event
+	}
+
+	return matchingEntries
+}
+
+// verifyLogsWithEmittedBytes fetches changefeed_emitted_bytes telemetry logs produced
+// after startTime for a particular job and asserts that at least one message has positive emitted bytes.
+// This function also asserts the LoggingInterval and Closing fields of
+// each message.
+func verifyLogsWithEmittedBytes(
+	t *testing.T, jobID jobspb.JobID, startTime int64, interval int64, closing bool,
+) {
+	testutils.SucceedsSoon(t, func() error {
+		emittedBytesLogs := checkContinuousChangefeedLogs(t, startTime)
+		if len(emittedBytesLogs) == 0 {
+			return errors.New("no logs found")
+		}
+		emittedBytes := false
+		for _, msg := range emittedBytesLogs {
+			if msg.JobId != int64(jobID) {
+				continue
+			}
+
+			if msg.EmittedBytes > 0 {
+				emittedBytes = true
+			}
+			require.Equal(t, interval, msg.LoggingInterval)
+			if closing {
+				require.Equal(t, true, msg.Closing)
+			}
+		}
+		if !emittedBytes {
+			return errors.New("expected emitted bytes in log messages, but found 0")
+		}
+		return nil
+	})
 }
 
 func checkCreateChangefeedLogs(t *testing.T, startTime int64) []eventpb.CreateChangefeed {
@@ -1072,4 +1191,48 @@ func TestingSetIncludeParquetMetadata() func() {
 	return func() {
 		includeParquetTestMetadata = false
 	}
+}
+
+// ChangefeedJobPermissionsTestSetup creates entities and users with various permissions
+// for tests which test access control for changefeed jobs.
+//
+// This helper creates the following:
+//
+//	UDT type_a
+//	TABLE table_a (with column type_a)
+//	TABLE table_b (with column type_a)
+//	USER adminUser (with admin privs)
+//	USER feedCreator (with CHANGEFEED priv on table_a and table_b)
+//	USER jobController (with the CONTROLJOB role option)
+//	USER userWithAllGrants (with CHANGEFEED on table_a and table b)
+//	USER userWithSomeGrants (with CHANGEFEED on table_a only)
+//	USER regularUser (with no privs)
+func ChangefeedJobPermissionsTestSetup(t *testing.T, s TestServer) {
+	rootDB := sqlutils.MakeSQLRunner(s.DB)
+
+	rootDB.ExecMultiple(t,
+		`CREATE TYPE type_a as enum ('a')`,
+		`CREATE TABLE table_a (id int, type type_a)`,
+		`CREATE TABLE table_b (id int, type type_a)`,
+		`INSERT INTO table_a(id) values (0)`,
+		`INSERT INTO table_b(id) values (0)`,
+
+		`CREATE USER adminUser`,
+		`GRANT ADMIN TO adminUser`,
+
+		`CREATE USER feedCreator`,
+		`GRANT CHANGEFEED ON table_a TO feedCreator`,
+		`GRANT CHANGEFEED ON table_b TO feedCreator`,
+
+		`CREATE USER jobController with CONTROLJOB`,
+
+		`CREATE USER userWithAllGrants`,
+		`GRANT CHANGEFEED ON table_a TO userWithAllGrants`,
+		`GRANT CHANGEFEED ON table_b TO userWithAllGrants`,
+
+		`CREATE USER userWithSomeGrants`,
+		`GRANT CHANGEFEED ON table_a TO userWithSomeGrants`,
+
+		`CREATE USER regularUser`,
+	)
 }

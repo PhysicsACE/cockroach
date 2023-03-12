@@ -501,6 +501,11 @@ func (c *RestoreDataSpec) summary() (string, []string) {
 }
 
 // summary implements the diagramCellType interface.
+func (c *CloudStorageTestSpec) summary() (string, []string) {
+	return "CloudStorageTestSpec", []string{}
+}
+
+// summary implements the diagramCellType interface.
 func (c *SplitAndScatterSpec) summary() (string, []string) {
 	detail := fmt.Sprintf("%d chunks", len(c.Chunks))
 	return "SplitAndScatterSpec", []string{detail}
@@ -607,6 +612,12 @@ func (s *HashGroupJoinerSpec) summary() (string, []string) {
 	}
 	details = append(details, aggDetails...)
 	return "HashGroupJoiner", details
+}
+
+// summary implements the diagramCellType interface.
+func (g *GenerativeSplitAndScatterSpec) summary() (string, []string) {
+	detail := fmt.Sprintf("%d import spans", g.NumEntries)
+	return "GenerativeSplitAndScatterSpec", []string{detail}
 }
 
 type diagramCell struct {

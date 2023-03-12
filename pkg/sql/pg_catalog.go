@@ -52,13 +52,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
+	"github.com/cockroachdb/cockroach/pkg/util/collatedstring"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
-	"golang.org/x/text/collate"
 )
 
 var (
@@ -515,11 +515,17 @@ https://www.postgresql.org/docs/9.6/catalog-pg-cast.html`,
 			if ctxOrigin == cast.ContextOriginPgCast {
 				castCtx := cCtx.PGString()
 
+				castFunc := tree.DNull
+				if srcTyp, ok := types.OidToType[src]; ok {
+					if v, ok := builtins.CastBuiltinOIDs[tgt][srcTyp.Family()]; ok {
+						castFunc = tree.NewDOid(v)
+					}
+				}
 				_ = addRow(
 					h.CastOid(src, tgt),      // oid
 					tree.NewDOid(src),        // cast source
 					tree.NewDOid(tgt),        // casttarget
-					tree.DNull,               // castfunc
+					castFunc,                 // castfunc
 					tree.NewDString(castCtx), // castcontext
 					tree.DNull,               // castmethod
 				)
@@ -595,7 +601,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-auth-members.html`,
 	schema: vtable.PGCatalogAuthMembers,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		h := makeOidHasher()
-		return forEachRoleMembership(ctx, p.ExecCfg().InternalExecutor, p.Txn(),
+		return forEachRoleMembership(ctx, p.InternalSQLTxn(),
 			func(roleName, memberName username.SQLUsername, isAdmin bool) error {
 				return addRow(
 					h.UserOid(roleName),                 // roleid
@@ -815,12 +821,8 @@ https://www.postgresql.org/docs/9.5/catalog-pg-collation.html`,
 					tree.DNull, // collisdeterministic
 				)
 			}
-			if err := add(tree.DefaultCollationTag); err != nil {
-				return err
-			}
-			for _, tag := range collate.Supported() {
-				collName := tag.String()
-				if err := add(collName); err != nil {
+			for _, tag := range collatedstring.Supported() {
+				if err := add(tag); err != nil {
 					return err
 				}
 			}
@@ -945,7 +947,7 @@ func populateTableConstraints(
 			if err != nil {
 				return err
 			}
-			if refConstraint, err := tabledesc.FindFKReferencedUniqueConstraint(referencedTable, fk); err != nil {
+			if refConstraint, err := catalog.FindFKReferencedUniqueConstraint(referencedTable, fk); err != nil {
 				// We couldn't find a unique constraint that matched. This shouldn't
 				// happen.
 				log.Warningf(ctx, "broken fk reference: %v", err)
@@ -985,7 +987,7 @@ func populateTableConstraints(
 				db.GetID(), sc.GetID(), table.GetID(), uwoi,
 			)
 			f.WriteString("UNIQUE WITHOUT INDEX (")
-			colNames, err := table.NamesForColumnIDs(uwoi.UniqueWithoutIndexDesc().ColumnIDs)
+			colNames, err := catalog.ColumnNamesForIDs(table, uwoi.UniqueWithoutIndexDesc().ColumnIDs)
 			if err != nil {
 				return err
 			}
@@ -1146,9 +1148,26 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 					}
 					h := makeOidHasher()
 					scResolver := oneAtATimeSchemaResolver{p: p, ctx: ctx}
-					sc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, table.GetParentSchemaID())
-					if err != nil {
-						return false, err
+					var sc catalog.SchemaDescriptor
+					if table.IsTemporary() {
+						// Temp tables from other sessions should still be visible here.
+						// Ideally, the catalog API would be able to return the temporary
+						// schemas from other sessions, but it cannot right now. See
+						// https://github.com/cockroachdb/cockroach/issues/97822.
+						if err := forEachSchema(ctx, p, db, false /* requiresPrivileges*/, func(schema catalog.SchemaDescriptor) error {
+							if schema.GetID() == table.GetParentSchemaID() {
+								sc = schema
+							}
+							return nil
+						}); err != nil {
+							return false, err
+						}
+					}
+					if sc == nil {
+						sc, err = p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, table.GetParentSchemaID())
+						if err != nil {
+							return false, err
+						}
 					}
 					if err := populateFromTable(ctx, p, h, db, sc, table, scResolver,
 						addRow); err != nil {
@@ -1505,7 +1524,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-depend.html`,
 					return err
 				}
 				refObjID := oidZero
-				if refConstraint, err := tabledesc.FindFKReferencedUniqueConstraint(referencedTable, fk); err != nil {
+				if refConstraint, err := catalog.FindFKReferencedUniqueConstraint(referencedTable, fk); err != nil {
 					// We couldn't find a unique constraint that matched. This shouldn't
 					// happen.
 					log.Warningf(ctx, "broken fk reference: %v", err)
@@ -1535,10 +1554,11 @@ https://www.postgresql.org/docs/9.5/catalog-pg-depend.html`,
 // as a datum row, containing object id, sub id (column id in the case of
 // columns), comment text, and comment type (keys.FooCommentType).
 func getComments(ctx context.Context, p *planner) ([]tree.Datums, error) {
-	return p.extendedEvalCtx.ExecCfg.InternalExecutor.QueryBuffered(
+	return p.InternalSQLTxn().QueryBufferedEx(
 		ctx,
 		"select-comments",
 		p.Txn(),
+		sessiondata.NodeUserSessionDataOverride,
 		`SELECT
 	object_id,
 	sub_id,
@@ -1606,7 +1626,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-description.html`,
 				if err != nil {
 					return err
 				}
-				c, err := tableDesc.FindConstraintWithID(descpb.ConstraintID(tree.MustBeDInt(objSubID)))
+				c, err := catalog.MustFindConstraintByID(tableDesc, descpb.ConstraintID(tree.MustBeDInt(objSubID)))
 				if err != nil {
 					return err
 				}
@@ -1628,6 +1648,22 @@ https://www.postgresql.org/docs/9.5/catalog-pg-description.html`,
 				return err
 			}
 		}
+
+		// Also add all built-in comments.
+		for _, name := range builtins.AllBuiltinNames() {
+			_, overloads := builtinsregistry.GetBuiltinProperties(name)
+			for _, builtin := range overloads {
+				if err := addRow(
+					tree.NewDOid(builtin.Oid),
+					tree.NewDOid(catconstants.PgCatalogProcTableID),
+					tree.DZero,
+					tree.NewDString(builtin.Info),
+				); err != nil {
+					return err
+				}
+			}
+		}
+
 		return nil
 	},
 }
@@ -1716,22 +1752,21 @@ https://www.postgresql.org/docs/9.5/catalog-pg-enum.html`,
 		h := makeOidHasher()
 
 		return forEachTypeDesc(ctx, p, dbContext, func(_ catalog.DatabaseDescriptor, _ catalog.SchemaDescriptor, typDesc catalog.TypeDescriptor) error {
-			switch typDesc.GetKind() {
-			case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
-			// We only want to iterate over ENUM types and multi-region enums.
-			default:
+			e := typDesc.AsEnumTypeDescriptor()
+			if e == nil {
+				// We only want to iterate over ENUM types and multi-region enums.
 				return nil
 			}
 			// Generate a row for each member of the enum. We don't represent enums
 			// internally using floats for ordering like Postgres, so just pick a
 			// float entry for the rows.
-			typOID := tree.NewDOid(catid.TypeIDToOID(typDesc.GetID()))
-			for i := 0; i < typDesc.NumEnumMembers(); i++ {
+			typOID := tree.NewDOid(catid.TypeIDToOID(e.GetID()))
+			for i := 0; i < e.NumEnumMembers(); i++ {
 				if err := addRow(
-					h.EnumEntryOid(typOID, typDesc.GetMemberPhysicalRepresentation(i)),
+					h.EnumEntryOid(typOID, e.GetMemberPhysicalRepresentation(i)),
 					typOID,
 					tree.NewDFloat(tree.DFloat(float64(i))),
-					tree.NewDString(typDesc.GetMemberLogicalRepresentation(i)),
+					tree.NewDString(e.GetMemberLogicalRepresentation(i)),
 				); err != nil {
 					return err
 				}
@@ -1831,7 +1866,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 					exprs := make([]string, 0, index.NumKeyColumns())
 					for i := index.IndexDesc().ExplicitColumnStartIdx(); i < index.NumKeyColumns(); i++ {
 						columnID := index.GetKeyColumnID(i)
-						col, err := table.FindColumnWithID(columnID)
+						col, err := catalog.MustFindColumnByID(table, columnID)
 						if err != nil {
 							return err
 						}
@@ -1895,7 +1930,16 @@ https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 					}
 					indexprs := tree.DNull
 					if len(exprs) > 0 {
-						indexprs = tree.NewDString(strings.Join(exprs, " "))
+						// The column contains multiple elements, but must be stored as a
+						// string. Similar to Postgres, this is a list with one element for
+						// each zero entry in indkey.
+						arr := tree.NewDArray(types.String)
+						for _, expr := range exprs {
+							if err := arr.Append(tree.NewDString(expr)); err != nil {
+								return err
+							}
+						}
+						indexprs = tree.NewDString(tree.AsStringWithFlags(arr, tree.FmtPgwireText))
 					}
 					return addRow(
 						h.IndexOid(table.GetID(), index.GetID()),     // indexrelid
@@ -2329,19 +2373,33 @@ https://www.postgresql.org/docs/9.6/view-pg-prepared-statements.html`,
 }
 
 func addPgProcBuiltinRow(name string, addRow func(...tree.Datum) error) error {
-	props, overloads := builtinsregistry.GetBuiltinProperties(name)
-	isAggregate := props.Class == tree.AggregateClass
-	isWindow := props.Class == tree.WindowClass
+	_, overloads := builtinsregistry.GetBuiltinProperties(name)
 	nspOid := tree.NewDOid(catconstants.PgCatalogID)
 	const crdbInternal = catconstants.CRDBInternalSchemaName + "."
+	const infoSchema = catconstants.InformationSchemaName + "."
 	if strings.HasPrefix(name, crdbInternal) {
 		nspOid = tree.NewDOid(catconstants.CrdbInternalID)
 		name = name[len(crdbInternal):]
+	} else if strings.HasPrefix(name, infoSchema) {
+		nspOid = tree.NewDOid(catconstants.InformationSchemaID)
+		name = name[len(infoSchema):]
 	}
 
 	for _, builtin := range overloads {
 		dName := tree.NewDName(name)
 		dSrc := tree.NewDString(name)
+
+		isAggregate := builtin.Class == tree.AggregateClass
+		isWindow := builtin.Class == tree.WindowClass
+		var kind tree.Datum
+		switch {
+		case isAggregate:
+			kind = tree.NewDString("a")
+		case isWindow:
+			kind = tree.NewDString("w")
+		default:
+			kind = tree.NewDString("f")
+		}
 
 		var retType tree.Datum
 		isRetSet := false
@@ -2435,8 +2493,8 @@ func addPgProcBuiltinRow(name string, addRow func(...tree.Datum) error) error {
 			tree.DNull,                                      // probin
 			tree.DNull,                                      // proconfig
 			tree.DNull,                                      // proacl
+			kind,                                            // prokind
 			// These columns were automatically created by pg_catalog_test's missing column generator.
-			tree.DNull, // prokind
 			tree.DNull, // prosupport
 		)
 		if err != nil {
@@ -2511,8 +2569,8 @@ func addPgProcUDFRow(
 		tree.DNull,                                       // probin
 		tree.DNull,                                       // proconfig
 		tree.DNull,                                       // proacl
+		tree.NewDString("f"),                             // prokind
 		// These columns were automatically created by pg_catalog_test's missing column generator.
-		tree.DNull, // prokind
 		tree.DNull, // prosupport
 	)
 }
@@ -2555,8 +2613,8 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 		return forEachDatabaseDesc(ctx, p, dbContext, false, /* requiresPrivileges */
 			func(dbDesc catalog.DatabaseDescriptor) error {
 				return forEachSchema(ctx, p, dbDesc, true /* requiresPrivileges */, func(scDesc catalog.SchemaDescriptor) error {
-					return scDesc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-						fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, overload.ID)
+					return scDesc.ForEachFunctionSignature(func(sig descpb.SchemaDescriptor_FunctionSignature) error {
+						fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, sig.ID)
 						if err != nil {
 							return err
 						}
@@ -2575,21 +2633,16 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 				coid := tree.MustBeDOid(unwrappedConstraint)
 				ooid := coid.Oid
 
-				name, overload, err := p.ResolveFunctionByOID(ctx, ooid)
-				if err != nil {
-					if errors.Is(err, tree.ErrFunctionUndefined) {
-						return false, nil //nolint:returnerrcheck
-					}
-					return false, err
-				}
-
 				if funcdesc.IsOIDUserDefinedFunc(ooid) {
-					fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, descpb.ID(overload.Oid))
+					fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, funcdesc.UserDefinedFunctionOIDToID(ooid))
 					if err != nil {
+						if errors.Is(err, tree.ErrFunctionUndefined) {
+							return false, nil //nolint:returnerrcheck
+						}
 						return false, err
 					}
 
-					scDesc, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Schema(ctx, descpb.ID(ooid))
+					scDesc, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Schema(ctx, fnDesc.GetParentSchemaID())
 					if err != nil {
 						return false, err
 					}
@@ -2604,7 +2657,15 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 					return true, nil
 
 				} else {
-					err := addPgProcBuiltinRow(name, addRow)
+					name, _, err := p.ResolveFunctionByOID(ctx, ooid)
+					if err != nil {
+						if errors.Is(err, tree.ErrFunctionUndefined) {
+							return false, nil //nolint:returnerrcheck
+						}
+						return false, err
+					}
+
+					err = addPgProcBuiltinRow(name.Object(), addRow)
 					if err != nil {
 						return false, err
 					}
@@ -3300,7 +3361,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-type.html`,
 
 				// It's an entry for the implicit record type created on behalf of each
 				// table. We have special logic for this case.
-				if typDesc.GetKind() == descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE {
+				if typDesc.AsTableImplicitRecordTypeDescriptor() != nil {
 					table, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, id)
 					if err != nil {
 						if errors.Is(err, catalog.ErrDescriptorNotFound) ||
@@ -3441,7 +3502,7 @@ var pgCatalogDbRoleSettingTable = virtualSchemaTable{
 https://www.postgresql.org/docs/13/catalog-pg-db-role-setting.html`,
 	schema: vtable.PgCatalogDbRoleSetting,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		rows, err := p.extendedEvalCtx.ExecCfg.InternalExecutor.QueryBufferedEx(
+		rows, err := p.InternalSQLTxn().QueryBufferedEx(
 			ctx,
 			"select-db-role-settings",
 			p.Txn(),
@@ -3526,8 +3587,10 @@ https://www.postgresql.org/docs/13/catalog-pg-statistic-ext.html`,
 		//  statistics.
 		query := `SELECT "tableID", name, "columnIDs", "statisticID", '{d}'::"char"[] FROM system.table_statistics;`
 
-		rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryBuffered(
-			ctx, "read-statistics-objects", p.txn, query,
+		rows, err := p.InternalSQLTxn().QueryBufferedEx(
+			ctx, "read-statistics-objects", p.txn,
+			sessiondata.NodeUserSessionDataOverride,
+			query,
 		)
 		if err != nil {
 			return err
@@ -4339,10 +4402,7 @@ func typOid(typ *types.T) tree.Datum {
 }
 
 func typLen(typ *types.T) *tree.DInt {
-	if sz, variable := tree.DatumTypeSize(typ); !variable {
-		return tree.NewDInt(tree.DInt(sz))
-	}
-	return negOneVal
+	return tree.NewDInt(tree.DInt(tree.PGWireTypeSize(typ)))
 }
 
 func typByVal(typ *types.T) tree.Datum {
@@ -4358,13 +4418,13 @@ func typColl(typ *types.T, h oidHasher) tree.Datum {
 	case types.AnyFamily:
 		return oidZero
 	case types.StringFamily:
-		return h.CollationOid(tree.DefaultCollationTag)
+		return h.CollationOid(collatedstring.DefaultCollationTag)
 	case types.CollatedStringFamily:
 		return h.CollationOid(typ.Locale())
 	}
 
 	if typ.Equivalent(types.StringArray) {
-		return h.CollationOid(tree.DefaultCollationTag)
+		return h.CollationOid(collatedstring.DefaultCollationTag)
 	}
 	return oidZero
 }

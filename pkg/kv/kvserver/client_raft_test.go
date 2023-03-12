@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -115,11 +116,11 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 
 	get := func(store *kvserver.Store, key roachpb.Key) int64 {
 		args := getArgs(key)
-		resp, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, args)
+		resp, err := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, args)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return mustGetInt(resp.(*roachpb.GetResponse).Value)
+		return mustGetInt(resp.(*kvpb.GetResponse).Value)
 	}
 	validate := func(store *kvserver.Store) {
 		if val := get(store, key1); val != 13 {
@@ -134,10 +135,10 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 	// that both predate and postdate the split.
 	func() {
 		store := tc.GetFirstStoreFromServer(t, 0)
-		increment := func(key roachpb.Key, value int64) (*roachpb.IncrementResponse, *roachpb.Error) {
+		increment := func(key roachpb.Key, value int64) (*kvpb.IncrementResponse, *kvpb.Error) {
 			args := incrementArgs(key, value)
-			resp, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, args)
-			incResp, _ := resp.(*roachpb.IncrementResponse)
+			resp, err := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, args)
+			incResp, _ := resp.(*kvpb.IncrementResponse)
 			return incResp, err
 		}
 
@@ -179,7 +180,7 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 	incArgs = incrementArgs(key2, 0)
-	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, incArgs); err != nil {
+	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, incArgs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -209,8 +210,8 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 					},
 					Store: &kvserver.StoreTestingKnobs{
 						EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-							TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-								_, ok := filterArgs.Req.(*roachpb.IncrementRequest)
+							TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+								_, ok := filterArgs.Req.(*kvpb.IncrementRequest)
 								if ok && filterArgs.Req.Header().Key.Equal(keyA) {
 									numIncrements++
 								}
@@ -292,7 +293,7 @@ func TestReplicateRange(t *testing.T) {
 	// Verify no intent remains on range descriptor key.
 	key := keys.RangeDescriptorKey(rhsDesc.StartKey)
 	desc := roachpb.RangeDescriptor{}
-	if ok, err := storage.MVCCGetProto(ctx, store.Engine(), key,
+	if ok, err := storage.MVCCGetProto(ctx, store.TODOEngine(), key,
 		store.Clock().Now(), &desc, storage.MVCCGetOptions{}); err != nil {
 		t.Fatal(err)
 	} else if !ok {
@@ -305,7 +306,7 @@ func TestReplicateRange(t *testing.T) {
 		meta1 := keys.RangeMetaKey(meta2)
 		for _, key := range []roachpb.RKey{meta2, meta1} {
 			metaDesc := roachpb.RangeDescriptor{}
-			if ok, err := storage.MVCCGetProto(ctx, store.Engine(), key.AsRawKey(),
+			if ok, err := storage.MVCCGetProto(ctx, store.TODOEngine(), key.AsRawKey(),
 				store.Clock().Now(), &metaDesc, storage.MVCCGetOptions{}); err != nil {
 				return err
 			} else if !ok {
@@ -318,11 +319,11 @@ func TestReplicateRange(t *testing.T) {
 	// Verify that the same data is available on the replica.
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs(keyA)
-		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(5), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(5), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -388,7 +389,7 @@ func TestRestoreReplicas(t *testing.T) {
 	for i := 0; i < len(tc.Servers); i++ {
 		if _, pErr := kv.SendWrapped(ctx, tc.GetFirstStoreFromServer(t, i).TestSender(), incArgs); pErr != nil {
 			failures++
-			if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); !ok {
+			if _, ok := pErr.GetDetail().(*kvpb.NotLeaseHolderError); !ok {
 				t.Fatalf("expected not lease holder error; got %s", pErr)
 			}
 			followerStore = tc.GetFirstStoreFromServer(t, i)
@@ -401,11 +402,11 @@ func TestRestoreReplicas(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs([]byte("a"))
-		if reply, err := kv.SendWrappedWith(ctx, followerStore.TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, followerStore.TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(28), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(28), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -440,11 +441,11 @@ func TestFailedReplicaChange(t *testing.T) {
 	var runFilter atomic.Value
 	runFilter.Store(true)
 
-	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
+	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
 		if runFilter.Load().(bool) {
-			if et, ok := filterArgs.Req.(*roachpb.EndTxnRequest); ok && et.Commit &&
+			if et, ok := filterArgs.Req.(*kvpb.EndTxnRequest); ok && et.Commit &&
 				et.InternalCommitTrigger != nil && et.InternalCommitTrigger.ChangeReplicasTrigger != nil {
-				return roachpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
+				return kvpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
 			}
 		}
 		return nil
@@ -542,11 +543,11 @@ func TestReplicateAfterTruncation(t *testing.T) {
 	// Once it catches up, the effects of both commands can be seen.
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs([]byte("a"))
-		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(16), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(16), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -570,11 +571,11 @@ func TestReplicateAfterTruncation(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs([]byte("a"))
-		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(39), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(39), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -611,7 +612,7 @@ func TestRaftLogSizeAfterTruncation(t *testing.T) {
 		// compute its size.
 		repl.RaftLock()
 		realSize, err := kvserver.ComputeRaftLogSize(
-			ctx, repl.RangeID, repl.Engine(), repl.SideloadedRaftMuLocked(),
+			ctx, repl.RangeID, repl.Store().TODOEngine(), repl.SideloadedRaftMuLocked(),
 		)
 		size, _ := repl.GetRaftLogSize()
 		repl.RaftUnlock()
@@ -828,7 +829,7 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 func waitForTruncationForTesting(t *testing.T, r *kvserver.Replica, newFirstIndex uint64) {
 	testutils.SucceedsSoon(t, func() error {
 		// Flush the engine to advance durability, which triggers truncation.
-		require.NoError(t, r.Engine().Flush())
+		require.NoError(t, r.Store().TODOEngine().Flush())
 		// FirstIndex has changed.
 		firstIndex := r.GetFirstIndex()
 		if firstIndex != newFirstIndex {
@@ -979,7 +980,7 @@ func TestSnapshotAfterTruncationWithUncommittedTail(t *testing.T) {
 		i++
 		sender := nonPartitionedSenders[i%2]
 		_, pErr := kv.SendWrapped(ctx, sender, incArgs)
-		if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); ok {
+		if _, ok := pErr.GetDetail().(*kvpb.NotLeaseHolderError); ok {
 			return pErr.GoError()
 		} else if pErr != nil {
 			t.Fatal(pErr)
@@ -1005,8 +1006,8 @@ func TestSnapshotAfterTruncationWithUncommittedTail(t *testing.T) {
 	truncArgs.Key = partRepl.Desc().StartKey.AsRawKey()
 	testutils.SucceedsSoon(t, func() error {
 		manualClock.Increment(store.GetStoreConfig().LeaseExpiration())
-		_, pErr := kv.SendWrappedWith(ctx, newLeaderReplSender, roachpb.Header{RangeID: partRepl.RangeID}, truncArgs)
-		if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); ok {
+		_, pErr := kv.SendWrappedWith(ctx, newLeaderReplSender, kvpb.Header{RangeID: partRepl.RangeID}, truncArgs)
+		if _, ok := pErr.GetDetail().(*kvpb.NotLeaseHolderError); ok {
 			return pErr.GoError()
 		} else if pErr != nil {
 			t.Fatal(pErr)
@@ -1228,8 +1229,8 @@ func TestRequestsOnLaggingReplica(t *testing.T) {
 	// the increment). This means that the partitioned replica will need a
 	// snapshot to catch up.
 	log.Infof(ctx, "test: truncating log...")
-	truncArgs := &roachpb.TruncateLogRequest{
-		RequestHeader: roachpb.RequestHeader{
+	truncArgs := &kvpb.TruncateLogRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: key,
 		},
 		Index:   index,
@@ -1280,7 +1281,7 @@ func TestRequestsOnLaggingReplica(t *testing.T) {
 	getRequest := getArgs(key)
 	_, pErr := kv.SendWrapped(timeoutCtx, partitionedStoreSender, getRequest)
 	require.NotNil(t, pErr, "unexpected success")
-	nlhe := pErr.GetDetail().(*roachpb.NotLeaseHolderError)
+	nlhe := pErr.GetDetail().(*kvpb.NotLeaseHolderError)
 	require.NotNil(t, nlhe, "expected NotLeaseholderError, got: %s", pErr)
 	require.False(t, nlhe.Lease.Empty())
 	require.NotNil(t, nlhe.Lease.Replica, "expected NotLeaseholderError with a known leaseholder, got: %s", pErr)
@@ -1304,12 +1305,12 @@ func TestRequestsOnFollowerWithNonLiveLeaseholder(t *testing.T) {
 	ctx := context.Background()
 
 	var installPartition int32
-	partitionFilter := func(_ context.Context, ba *roachpb.BatchRequest) *roachpb.Error {
+	partitionFilter := func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if atomic.LoadInt32(&installPartition) == 0 {
 			return nil
 		}
 		if ba.GatewayNodeID == 1 && ba.Replica.NodeID == 4 {
-			return roachpb.NewError(context.Canceled)
+			return kvpb.NewError(context.Canceled)
 		}
 		return nil
 	}
@@ -1637,7 +1638,7 @@ func TestReplicateAfterRemoveAndSplit(t *testing.T) {
 	// returned to us.
 	if _, err := tc.Servers[0].DB().AdminChangeReplicas(
 		ctx, splitKey, tc.LookupRangeOrFatal(t, splitKey),
-		roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(3)),
+		kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(3)),
 	); !kvserver.IsRetriableReplicationChangeError(err) {
 		t.Fatalf("unexpected error %v", err)
 	}
@@ -1771,7 +1772,7 @@ func TestLogGrowthWhenRefreshingPendingCommands(t *testing.T) {
 		initLogSize, _ := leaderRepl.GetRaftLogSize()
 
 		// While a majority nodes are down, write some data.
-		putRes := make(chan *roachpb.Error)
+		putRes := make(chan *kvpb.Error)
 		go func() {
 			putArgs := putArgs([]byte("b"), make([]byte, raftConfig.RaftMaxUncommittedEntriesSize/8))
 			_, err := kv.SendWrapped(ctx, propNode, putArgs)
@@ -1923,7 +1924,7 @@ func TestChangeReplicasDescriptorInvariant(t *testing.T) {
 	require.NotNil(t, repl)
 
 	addReplica := func(storeNum int, desc *roachpb.RangeDescriptor) error {
-		chgs := roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(storeNum))
+		chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(storeNum))
 		_, err := repl.ChangeReplicas(ctx, desc, kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
 		return err
 	}
@@ -2156,7 +2157,7 @@ func runReplicateRestartAfterTruncation(t *testing.T, removeBeforeTruncateAndReA
 		testutils.SucceedsSoon(t, func() error {
 			tc.GetFirstStoreFromServer(t, 1).MustForceReplicaGCScanAndProcess()
 			_, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
-			if !errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+			if !errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 				// NB: errors.Wrapf(nil, ...) returns nil.
 				// nolint:errwrap
 				return errors.Errorf("expected replica to be garbage collected, got %v %T", err, err)
@@ -2366,7 +2367,7 @@ func TestQuotaPool(t *testing.T) {
 	// We block the third replica effectively causing acquisition of quota
 	// without subsequent release.
 	raftLockReplica(followerRepl)
-	ch := make(chan *roachpb.Error, 1)
+	ch := make(chan *kvpb.Error, 1)
 
 	func() {
 		defer followerRepl.RaftUnlock()
@@ -2384,7 +2385,7 @@ func TestQuotaPool(t *testing.T) {
 		// to be the same as what we started with.
 		keyToWrite := key.Next()
 		value := bytes.Repeat([]byte("v"), (3*quota)/4)
-		ba := &roachpb.BatchRequest{}
+		ba := &kvpb.BatchRequest{}
 		ba.Add(putArgs(keyToWrite, value))
 		if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
 			t.Fatal(err)
@@ -2405,10 +2406,10 @@ func TestQuotaPool(t *testing.T) {
 		})
 
 		go func() {
-			ba := &roachpb.BatchRequest{}
+			ba := &kvpb.BatchRequest{}
 			ba.Add(putArgs(keyToWrite, value))
 			if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
-				ch <- roachpb.NewError(err)
+				ch <- kvpb.NewError(err)
 				return
 			}
 			_, pErr := leaderRepl.Send(ctx, ba)
@@ -2495,7 +2496,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 	// Send a request to the leader replica. followerRepl is locked so it will
 	// not respond.
 	value := []byte("value")
-	ba := &roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.Add(putArgs(key, value))
 	if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
 		t.Fatal(err)
@@ -2740,7 +2741,7 @@ func TestReplicateAfterSplit(t *testing.T) {
 	// Issue an increment for later check.
 	incArgs := incrementArgs(key, 11)
 	if _, err := kv.SendWrappedWith(ctx, store0.TestSender(),
-		roachpb.Header{}, incArgs); err != nil {
+		kvpb.Header{}, incArgs); err != nil {
 		t.Fatal(err)
 	}
 	// Now add the second replica.
@@ -2753,11 +2754,11 @@ func TestReplicateAfterSplit(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs(key)
 		// Reading on non-lease holder replica should use inconsistent read
-		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(11), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(11), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -2805,7 +2806,7 @@ func TestReplicaRemovalCampaign(t *testing.T) {
 			replica2 := store0.LookupReplica(roachpb.RKey(key2))
 
 			rg2 := func(s *kvserver.Store) kv.Sender {
-				return kv.Wrap(s, func(ba *roachpb.BatchRequest) *roachpb.BatchRequest {
+				return kv.Wrap(s, func(ba *kvpb.BatchRequest) *kvpb.BatchRequest {
 					if ba.RangeID == 0 {
 						ba.RangeID = replica2.RangeID
 					}
@@ -2886,7 +2887,7 @@ func TestRaftAfterRemoveRange(t *testing.T) {
 		for i := range tc.Servers[1:] {
 			store := tc.GetFirstStoreFromServer(t, i)
 			_, err := store.GetReplica(desc.RangeID)
-			if !errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+			if !errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 				return errors.Wrapf(err, "range %d not yet removed from %s", desc.RangeID, store)
 			}
 		}
@@ -2966,7 +2967,7 @@ func TestRaftRemoveRace(t *testing.T) {
 		tombstoneKey := keys.RangeTombstoneKey(desc.RangeID)
 		var tombstone roachpb.RangeTombstone
 		if ok, err := storage.MVCCGetProto(
-			ctx, tc.GetFirstStoreFromServer(t, 2).Engine(), tombstoneKey,
+			ctx, tc.GetFirstStoreFromServer(t, 2).TODOEngine(), tombstoneKey,
 			hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
 		); err != nil {
 			t.Fatal(err)
@@ -3000,13 +3001,13 @@ func TestRemovePlaceholderRace(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		for _, action := range []roachpb.ReplicaChangeType{roachpb.REMOVE_VOTER, roachpb.ADD_VOTER} {
 			for {
-				chgs := roachpb.MakeReplicationChanges(action, tc.Target(1))
+				chgs := kvpb.MakeReplicationChanges(action, tc.Target(1))
 				if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonUnknown, "", chgs); err != nil {
-					if kvserver.IsRetriableReplicationChangeError(err) {
+					if kvserver.IsRetriableReplicationChangeError(err) ||
+						kvserver.IsReplicationChangeInProgressError(err) {
 						continue
-					} else {
-						t.Fatal(err)
 					}
+					t.Fatal(err)
 				}
 				break
 			}
@@ -3023,7 +3024,7 @@ func (ncc *noConfChangeTestHandler) HandleRaftRequest(
 	ctx context.Context,
 	req *kvserverpb.RaftMessageRequest,
 	respStream kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	for i, e := range req.Message.Entries {
 		if e.Type == raftpb.EntryConfChange {
 			var cc raftpb.ConfChange
@@ -3054,9 +3055,9 @@ func (ncc *noConfChangeTestHandler) HandleRaftResponse(
 	ctx context.Context, resp *kvserverpb.RaftMessageResponse,
 ) error {
 	switch val := resp.Union.GetValue().(type) {
-	case *roachpb.Error:
+	case *kvpb.Error:
 		switch val.GetDetail().(type) {
-		case *roachpb.ReplicaTooOldError:
+		case *kvpb.ReplicaTooOldError:
 			// We're going to manually GC the replica, so ignore these errors.
 			return nil
 		}
@@ -3099,7 +3100,7 @@ func TestReplicaGCRace(t *testing.T) {
 	// Add the victim replica. Note that it will receive a snapshot and raft log
 	// replays, but will not process the configuration change containing the new
 	// range descriptor, preventing it from learning of the new NextReplicaID.
-	chgs := roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, roachpb.ReplicationTarget{
+	chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, roachpb.ReplicationTarget{
 		NodeID:  toStore.Ident.NodeID,
 		StoreID: toStore.Ident.StoreID,
 	})
@@ -3179,7 +3180,7 @@ func TestReplicaGCRace(t *testing.T) {
 		nil, /* grpcServer */
 		tc.Servers[0].Stopper(),
 	)
-	errChan := errorChannelTestHandler(make(chan *roachpb.Error, 1))
+	errChan := errorChannelTestHandler(make(chan *kvpb.Error, 1))
 	fromTransport.Listen(fromStore.StoreID(), errChan)
 
 	// Send the heartbeat. Boom. See #11591.
@@ -3200,7 +3201,7 @@ func TestReplicaGCRace(t *testing.T) {
 	select {
 	case pErr := <-errChan:
 		switch pErr.GetDetail().(type) {
-		case *roachpb.RaftGroupDeletedError:
+		case *kvpb.RaftGroupDeletedError:
 		default:
 			t.Fatalf("unexpected error type %T: %s", pErr.GetDetail(), pErr)
 		}
@@ -3481,16 +3482,16 @@ func TestReplicateRogueRemovedNode(t *testing.T) {
 		_, pErr := kv.SendWrappedWith(
 			context.Background(),
 			tc.GetFirstStoreFromServer(t, 2).TestSender(),
-			roachpb.Header{
+			kvpb.Header{
 				Replica:   replicaDesc,
 				Timestamp: tc.Servers[2].Clock().Now(),
 			}, incArgs,
 		)
 		detail := pErr.GetDetail()
 		switch detail.(type) {
-		case *roachpb.RangeNotFoundError:
+		case *kvpb.RangeNotFoundError:
 			// The typical case.
-		case *roachpb.NotLeaseHolderError:
+		case *kvpb.NotLeaseHolderError:
 			// The atypical case - the lease may have expired and the
 			// lease acquisition may be refused.
 		default:
@@ -3546,11 +3547,11 @@ func TestReplicateRogueRemovedNode(t *testing.T) {
 	finishWG.Wait()
 }
 
-type errorChannelTestHandler chan *roachpb.Error
+type errorChannelTestHandler chan *kvpb.Error
 
 func (errorChannelTestHandler) HandleRaftRequest(
 	_ context.Context, _ *kvserverpb.RaftMessageRequest, _ kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	panic("unimplemented")
 }
 
@@ -3558,7 +3559,7 @@ func (d errorChannelTestHandler) HandleRaftResponse(
 	ctx context.Context, resp *kvserverpb.RaftMessageResponse,
 ) error {
 	switch val := resp.Union.GetValue().(type) {
-	case *roachpb.Error:
+	case *kvpb.Error:
 		d <- val
 	default:
 		log.Fatalf(ctx, "unexpected response type %T", val)
@@ -3573,10 +3574,8 @@ func (errorChannelTestHandler) HandleSnapshot(
 }
 
 func (errorChannelTestHandler) HandleDelegatedSnapshot(
-	ctx context.Context,
-	req *kvserverpb.DelegateSnapshotRequest,
-	stream kvserver.DelegateSnapshotResponseStream,
-) error {
+	_ context.Context, _ *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
 	panic("unimplemented")
 }
 
@@ -3678,7 +3677,7 @@ func TestReplicateRemovedNodeDisruptiveElection(t *testing.T) {
 		nil, /* grpcServer */
 		tc.Servers[0].Stopper(),
 	)
-	errChan := errorChannelTestHandler(make(chan *roachpb.Error, 1))
+	errChan := errorChannelTestHandler(make(chan *kvpb.Error, 1))
 	transport0.Listen(target0.StoreID, errChan)
 
 	// Simulate the removed node asking to trigger an election. Try and try again
@@ -3701,7 +3700,7 @@ func TestReplicateRemovedNodeDisruptiveElection(t *testing.T) {
 	select {
 	case pErr := <-errChan:
 		switch pErr.GetDetail().(type) {
-		case *roachpb.ReplicaTooOldError:
+		case *kvpb.ReplicaTooOldError:
 		default:
 			t.Fatalf("unexpected error type %T: %s", pErr.GetDetail(), pErr)
 		}
@@ -3804,7 +3803,7 @@ func TestReplicaTooOldGC(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		replica, err := tc.GetFirstStoreFromServer(t, 3).GetReplica(desc.RangeID)
 		if err != nil {
-			if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+			if errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 				return nil
 			}
 			return err
@@ -3983,7 +3982,7 @@ func TestLeaseHolderRemoveSelf(t *testing.T) {
 
 	// Expect that we can still successfully do a get on the range.
 	getArgs := getArgs(key)
-	_, pErr := kv.SendWrappedWith(ctx, leaseHolder.TestSender(), roachpb.Header{}, getArgs)
+	_, pErr := kv.SendWrappedWith(ctx, leaseHolder.TestSender(), kvpb.Header{}, getArgs)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -4032,13 +4031,13 @@ func TestRemovedReplicaError(t *testing.T) {
 	// start seeing the RangeNotFoundError after a little bit of time has passed.
 	getArgs := getArgs(key)
 	testutils.SucceedsSoon(t, func() error {
-		_, pErr := kv.SendWrappedWith(ctx, store, roachpb.Header{}, getArgs)
+		_, pErr := kv.SendWrappedWith(ctx, store, kvpb.Header{}, getArgs)
 		switch pErr.GetDetail().(type) {
-		case *roachpb.AmbiguousResultError:
+		case *kvpb.AmbiguousResultError:
 			return pErr.GoError()
-		case *roachpb.NotLeaseHolderError:
+		case *kvpb.NotLeaseHolderError:
 			return pErr.GoError()
-		case *roachpb.RangeNotFoundError:
+		case *kvpb.RangeNotFoundError:
 			return nil
 		default:
 		}
@@ -4093,7 +4092,7 @@ func TestTransferRaftLeadership(t *testing.T) {
 
 	getArgs := getArgs(key)
 	if _, pErr := kv.SendWrappedWith(
-		context.Background(), store0, roachpb.Header{RangeID: repl0.RangeID}, getArgs,
+		context.Background(), store0, kvpb.Header{RangeID: repl0.RangeID}, getArgs,
 	); pErr != nil {
 		t.Fatalf("expect get nil, actual get %v ", pErr)
 	}
@@ -4107,7 +4106,7 @@ func TestTransferRaftLeadership(t *testing.T) {
 	// Transfer the lease. We'll then check that the leadership follows
 	// automatically.
 	transferLeaseArgs := adminTransferLeaseArgs(key, store1.StoreID())
-	_, pErr := kv.SendWrappedWith(ctx, store0, roachpb.Header{RangeID: repl0.RangeID}, transferLeaseArgs)
+	_, pErr := kv.SendWrappedWith(ctx, store0, kvpb.Header{RangeID: repl0.RangeID}, transferLeaseArgs)
 	require.NoError(t, pErr.GoError())
 
 	// Verify leadership is transferred.
@@ -4401,9 +4400,9 @@ func TestFailedConfChange(t *testing.T) {
 	// Trigger errors at apply time so they happen on both leaders and
 	// followers.
 	var filterActive int32
-	testingApplyFilter := func(filterArgs kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+	testingApplyFilter := func(filterArgs kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 		if atomic.LoadInt32(&filterActive) == 1 && filterArgs.ChangeReplicas != nil {
-			return 0, roachpb.NewErrorf("boom")
+			return 0, kvpb.NewErrorf("boom")
 		}
 		return 0, nil
 	}
@@ -4489,15 +4488,15 @@ func TestStoreRangeWaitForApplication(t *testing.T) {
 	var filterRangeIDAtomic int64
 
 	ctx := context.Background()
-	testingRequestFilter := func(_ context.Context, ba *roachpb.BatchRequest) (retErr *roachpb.Error) {
+	testingRequestFilter := func(_ context.Context, ba *kvpb.BatchRequest) (retErr *kvpb.Error) {
 		if rangeID := roachpb.RangeID(atomic.LoadInt64(&filterRangeIDAtomic)); rangeID != ba.RangeID {
 			return nil
 		}
-		pErr := roachpb.NewErrorf("blocking %s in this test", ba.Summary())
+		pErr := kvpb.NewErrorf("blocking %s in this test", ba.Summary())
 		if len(ba.Requests) != 1 {
 			return pErr
 		}
-		_, ok := ba.Requests[0].GetInner().(*roachpb.PutRequest)
+		_, ok := ba.Requests[0].GetInner().(*kvpb.PutRequest)
 		if !ok {
 			return pErr
 		}
@@ -4976,7 +4975,7 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 			var magicTS hlc.Timestamp
 			blockPreApplication, blockPostApplication := make(chan struct{}), make(chan struct{})
 			applyFilterFn := func(ch chan struct{}) kvserverbase.ReplicaApplyFilter {
-				return func(filterArgs kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+				return func(filterArgs kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 					if atomic.LoadInt32(&filterActive) == 1 && filterArgs.WriteTimestamp == magicTS {
 						<-ch
 					}
@@ -5009,10 +5008,10 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 			// Begin peforming a write on the Range.
 			magicTS = tc.Servers[0].Clock().Now()
 			atomic.StoreInt32(&filterActive, 1)
-			ch := make(chan *roachpb.Error, 1)
+			ch := make(chan *kvpb.Error, 1)
 			go func() {
 				put := putArgs(key, []byte("val"))
-				_, pErr := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 0).TestSender(), roachpb.Header{
+				_, pErr := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 0).TestSender(), kvpb.Header{
 					Timestamp: magicTS,
 				}, put)
 				ch <- pErr
@@ -5130,12 +5129,12 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	noopProposalFilter := kvserverbase.ReplicaProposalFilter(func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+	noopProposalFilter := kvserverbase.ReplicaProposalFilter(func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 		return nil
 	})
 	var proposalFilter atomic.Value
 	proposalFilter.Store(noopProposalFilter)
-	testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+	testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 		return proposalFilter.Load().(kvserverbase.ReplicaProposalFilter)(args)
 	}
 
@@ -5149,7 +5148,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		var tombstone roachpb.RangeTombstone
 		tombstoneKey := keys.RangeTombstoneKey(rangeID)
 		ok, err := storage.MVCCGetProto(
-			ctx, store.Engine(), tombstoneKey, hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
+			ctx, store.TODOEngine(), tombstoneKey, hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
 		)
 		require.NoError(t, err)
 		require.False(t, ok)
@@ -5157,7 +5156,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 	getHardState := func(
 		t *testing.T, store *kvserver.Store, rangeID roachpb.RangeID,
 	) raftpb.HardState {
-		hs, err := stateloader.Make(rangeID).LoadHardState(ctx, store.Engine())
+		hs, err := stateloader.Make(rangeID).LoadHardState(ctx, store.TODOEngine())
 		require.NoError(t, err)
 		return hs
 	}
@@ -5165,12 +5164,12 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		// Set up a hook to partition the RHS range at its initial range ID
 		// before proposing the split trigger.
 		var setupOnce sync.Once
-		f := kvserverbase.ReplicaProposalFilter(func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
-			req, ok := args.Req.GetArg(roachpb.EndTxn)
+		f := kvserverbase.ReplicaProposalFilter(func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+			req, ok := args.Req.GetArg(kvpb.EndTxn)
 			if !ok {
 				return nil
 			}
-			endTxn := req.(*roachpb.EndTxnRequest)
+			endTxn := req.(*kvpb.EndTxnRequest)
 			if endTxn.InternalCommitTrigger == nil || endTxn.InternalCommitTrigger.SplitTrigger == nil {
 				return nil
 			}
@@ -5315,7 +5314,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		// has been removed at the old replica ID.
 		_, err = tc.Servers[0].DB().AdminChangeReplicas(
 			ctx, keyB, tc.LookupRangeOrFatal(t, keyB),
-			roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
+			kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
 		)
 		require.True(t, kvserver.IsRetriableReplicationChangeError(err), err)
 
@@ -5324,7 +5323,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		// raft message when the other nodes split and then after the above call
 		// it will find out about its new replica ID and write a tombstone for the
 		// old one.
-		waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).Engine(), rhsID)
+		waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).TODOEngine(), rhsID)
 		lhsPartition.deactivate()
 		tc.WaitForValues(t, keyA, []int64{8, 8, 8})
 		hs := getHardState(t, tc.GetFirstStoreFromServer(t, 0), rhsID)
@@ -5368,7 +5367,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		// has been removed at the old replica ID.
 		_, err = tc.Servers[0].DB().AdminChangeReplicas(
 			ctx, keyB, tc.LookupRangeOrFatal(t, keyB),
-			roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
+			kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
 		)
 		require.True(t, kvserver.IsRetriableReplicationChangeError(err), err)
 
@@ -5377,7 +5376,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		// raft message when the other nodes split and then after the above call
 		// it will find out about its new replica ID and write a tombstone for the
 		// old one.
-		waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).Engine(), rhsID)
+		waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).TODOEngine(), rhsID)
 
 		// We do all of this incrementing to ensure that nobody will ever
 		// succeed in sending a message the new RHS replica after we restart
@@ -5444,7 +5443,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		// retriable-looking situation here that will persist.
 		_, err = tc.Servers[0].DB().AdminChangeReplicas(
 			ctx, keyB, tc.LookupRangeOrFatal(t, keyB),
-			roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
+			kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
 		)
 		require.True(t, kvserver.IsRetriableReplicationChangeError(err), err)
 		// Ensure that the replica exists with the higher replica ID.
@@ -5508,7 +5507,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		// would be retried internally.
 		_, err = tc.Servers[0].DB().AdminChangeReplicas(
 			ctx, keyB, tc.LookupRangeOrFatal(t, keyB),
-			roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
+			kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
 		)
 		require.True(t, kvserver.IsRetriableReplicationChangeError(err), err)
 		// Ensure that there's no tombstone.
@@ -5574,6 +5573,7 @@ func TestReplicaRemovalClosesProposalQuota(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
+	skip.WithIssue(t, 98412)
 	// These variables track the request count to make sure that all of the
 	// requests have made it to the Replica.
 	var (
@@ -5584,9 +5584,9 @@ func TestReplicaRemovalClosesProposalQuota(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 				DisableReplicaGCQueue: true,
-				TestingRequestFilter: func(_ context.Context, r *roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(_ context.Context, r *kvpb.BatchRequest) *kvpb.Error {
 					if r.RangeID == roachpb.RangeID(atomic.LoadInt64(&rangeID)) {
-						if _, isPut := r.GetArg(roachpb.Put); isPut {
+						if _, isPut := r.GetArg(kvpb.Put); isPut {
 							atomic.AddInt64(&putRequestCount, 1)
 						}
 					}
@@ -5636,7 +5636,7 @@ func TestReplicaRemovalClosesProposalQuota(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			k := append(key[0:len(key):len(key)], strconv.Itoa(i)...)
-			_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
+			_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{
 				RangeID: desc.RangeID,
 			}, putArgs(k, bytes.Repeat([]byte{'a'}, 1000)))
 			require.Regexp(t,
@@ -5664,7 +5664,7 @@ func TestReplicaRemovalClosesProposalQuota(t *testing.T) {
 		ToReplica:     newReplDesc,
 		Message:       raftpb.Message{Type: raftpb.MsgVote, Term: 2},
 	}, noopRaftMessageResponseStream{}))
-	ts := waitForTombstone(t, store.Engine(), desc.RangeID)
+	ts := waitForTombstone(t, store.TODOEngine(), desc.RangeID)
 	require.Equal(t, ts.NextReplicaID, desc.NextReplicaID)
 	wg.Wait()
 	_, err = repl.GetProposalQuota().Acquire(ctx, 1)
@@ -5805,7 +5805,7 @@ func TestElectionAfterRestart(t *testing.T) {
 		})
 		for _, srv := range tc.Servers {
 			require.NoError(t, srv.Stores().VisitStores(func(s *kvserver.Store) error {
-				return s.Engine().Flush()
+				return s.TODOEngine().Flush()
 			}))
 		}
 		t.Log("waited for all followers to be caught up")
@@ -5875,10 +5875,10 @@ func TestRaftSnapshotsWithMVCCRangeKeys(t *testing.T) {
 	// Write a couple of overlapping MVCC range tombstones across [a-d) and [b-e), and
 	// record their timestamps.
 	ts1 := ts.Clock().Now()
-	_, pErr := kv.SendWrappedWith(ctx, sender, roachpb.Header{
+	_, pErr := kv.SendWrappedWith(ctx, sender, kvpb.Header{
 		Timestamp: ts1,
-	}, &roachpb.DeleteRangeRequest{
-		RequestHeader: roachpb.RequestHeader{
+	}, &kvpb.DeleteRangeRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    roachpb.Key("a"),
 			EndKey: roachpb.Key("d"),
 		},
@@ -5887,10 +5887,10 @@ func TestRaftSnapshotsWithMVCCRangeKeys(t *testing.T) {
 	require.NoError(t, pErr.GoError())
 
 	ts2 := ts.Clock().Now()
-	_, pErr = kv.SendWrappedWith(ctx, sender, roachpb.Header{
+	_, pErr = kv.SendWrappedWith(ctx, sender, kvpb.Header{
 		Timestamp: ts2,
-	}, &roachpb.DeleteRangeRequest{
-		RequestHeader: roachpb.RequestHeader{
+	}, &kvpb.DeleteRangeRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    roachpb.Key("b"),
 			EndKey: roachpb.Key("e"),
 		},
@@ -5916,12 +5916,12 @@ func TestRaftSnapshotsWithMVCCRangeKeys(t *testing.T) {
 			rangeKVWithTS("a", "b", ts1, storage.MVCCValue{}),
 			rangeKVWithTS("b", "c", ts2, storage.MVCCValue{}),
 			rangeKVWithTS("b", "c", ts1, storage.MVCCValue{}),
-		}, storageutils.ScanRange(t, store.Engine(), descA))
+		}, storageutils.ScanRange(t, store.TODOEngine(), descA))
 		require.Equal(t, kvs{
 			rangeKVWithTS("c", "d", ts2, storage.MVCCValue{}),
 			rangeKVWithTS("c", "d", ts1, storage.MVCCValue{}),
 			rangeKVWithTS("d", "e", ts2, storage.MVCCValue{}),
-		}, storageutils.ScanRange(t, store.Engine(), descC))
+		}, storageutils.ScanRange(t, store.TODOEngine(), descC))
 	}
 
 	// Quick check of MVCC stats.
@@ -5939,11 +5939,11 @@ func TestRaftSnapshotsWithMVCCRangeKeys(t *testing.T) {
 	checkConsistency := func(desc roachpb.RangeDescriptor) {
 		resp, pErr := kv.SendWrapped(ctx, sender, checkConsistencyArgs(&desc))
 		require.NoError(t, pErr.GoError())
-		ccResp := resp.(*roachpb.CheckConsistencyResponse)
+		ccResp := resp.(*kvpb.CheckConsistencyResponse)
 		require.Len(t, ccResp.Result, 1)
 		result := ccResp.Result[0]
 		require.Equal(t, desc.RangeID, result.RangeID)
-		require.Equal(t, roachpb.CheckConsistencyResponse_RANGE_CONSISTENT, result.Status, "%+v", result)
+		require.Equal(t, kvpb.CheckConsistencyResponse_RANGE_CONSISTENT, result.Status, "%+v", result)
 	}
 
 	checkConsistency(descA)
@@ -5964,7 +5964,7 @@ func TestRaftSnapshotsWithMVCCRangeKeysEverywhere(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	srv := tc.Server(0)
 	store := tc.GetFirstStoreFromServer(t, 0)
-	engine := store.Engine()
+	engine := store.TODOEngine()
 	sender := srv.DB().NonTransactionalSender()
 
 	// Split off ranges at "a" and "b".
@@ -5999,8 +5999,8 @@ func TestRaftSnapshotsWithMVCCRangeKeysEverywhere(t *testing.T) {
 	// this so that we can run a consistency check, since the stats may or may not
 	// pick up the range keys in different key ranges.
 	for _, desc := range descs {
-		_, pErr := kv.SendWrapped(ctx, sender, &roachpb.RecomputeStatsRequest{
-			RequestHeader: roachpb.RequestHeader{
+		_, pErr := kv.SendWrapped(ctx, sender, &kvpb.RecomputeStatsRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key: desc.StartKey.AsRawKey(),
 			},
 		})
@@ -6015,7 +6015,7 @@ func TestRaftSnapshotsWithMVCCRangeKeysEverywhere(t *testing.T) {
 
 	// Look for the range keys on the other servers.
 	for _, srvIdx := range []int{1, 2} {
-		e := tc.GetFirstStoreFromServer(t, srvIdx).Engine()
+		e := tc.GetFirstStoreFromServer(t, srvIdx).TODOEngine()
 		for _, desc := range descs {
 			for _, span := range rditer.MakeReplicatedKeySpans(&desc) {
 				prefix := append(span.Key.Clone(), ':')
@@ -6052,10 +6052,10 @@ func TestRaftSnapshotsWithMVCCRangeKeysEverywhere(t *testing.T) {
 	for _, desc := range descs {
 		resp, pErr := kv.SendWrapped(ctx, sender, checkConsistencyArgs(&desc))
 		require.NoError(t, pErr.GoError())
-		ccResp := resp.(*roachpb.CheckConsistencyResponse)
+		ccResp := resp.(*kvpb.CheckConsistencyResponse)
 		require.Len(t, ccResp.Result, 1)
 		result := ccResp.Result[0]
 		require.Equal(t, desc.RangeID, result.RangeID)
-		require.Equal(t, roachpb.CheckConsistencyResponse_RANGE_CONSISTENT, result.Status, "%+v", result)
+		require.Equal(t, kvpb.CheckConsistencyResponse_RANGE_CONSISTENT, result.Status, "%+v", result)
 	}
 }

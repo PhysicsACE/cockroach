@@ -112,6 +112,11 @@ type PlanGistFactory struct {
 
 var _ exec.Factory = &PlanGistFactory{}
 
+// Ctx implements the Factory interface.
+func (f *PlanGistFactory) Ctx() context.Context {
+	return f.wrappedFactory.Ctx()
+}
+
 // writeAndHash writes an arbitrary slice of bytes to the buffer and hashes each
 // byte.
 func (f *PlanGistFactory) writeAndHash(data []byte) int {
@@ -171,7 +176,7 @@ func DecodePlanGistToRows(gist string, catalog cat.Catalog) (_ []string, retErr 
 		}
 	}()
 
-	flags := Flags{HideValues: true, Redact: RedactAll, OnlyShape: true}
+	flags := Flags{HideValues: true, Deflake: DeflakeAll, OnlyShape: true}
 	ob := NewOutputBuilder(flags)
 	explainPlan, err := DecodePlanGistToPlan(gist, catalog)
 	if err != nil {

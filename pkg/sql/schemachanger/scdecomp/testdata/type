@@ -1,4 +1,5 @@
 setup
+SET experimental_enable_unique_without_index_constraints = true;
 CREATE TYPE greeting AS ENUM('hello', 'hi');
 CREATE TYPE salutation AS ENUM('bonjour', 'hi');
 CREATE TABLE tbl (
@@ -8,6 +9,7 @@ CREATE TABLE tbl (
   other greeting[],
   name STRING NOT NULL,
   CONSTRAINT mycheck CHECK (s::STRING = name),
+  CONSTRAINT myuwi UNIQUE WITHOUT INDEX (name) WHERE ('hi'::greeting::STRING = 'hi'),
   INDEX partial (g) WHERE (g::STRING = 'hi')
 );
 ----
@@ -37,20 +39,23 @@ ElementState:
     descriptorId: 104
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
     privileges: "512"
     userName: public
+    withGrantOption: "0"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 104
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 104
+    schemaId: 101
   Status: PUBLIC
 - EnumTypeValue:
     logicalRepresentation: hello
@@ -163,6 +168,7 @@ ElementState:
   Status: PUBLIC
 - SecondaryIndex:
     constraintId: 0
+    expr: g::STRING = 'hi':::STRING
     geoConfig: null
     indexId: 2
     isConcurrently: false
@@ -170,10 +176,30 @@ ElementState:
     isInverted: false
     isNotVisible: false
     isUnique: false
+    referencedColumnIds:
+    - 2
     sharding: null
     sourceIndexId: 0
     tableId: 108
     temporaryIndexId: 0
+    usesFunctionIds: []
+    usesSequenceIds: []
+    usesTypeIds: []
+  Status: PUBLIC
+- UniqueWithoutIndexConstraint:
+    columnIds:
+    - 5
+    constraintId: 3
+    indexIdForValidation: 0
+    predicate:
+      expr: x'80':::@100104::STRING = 'hi':::STRING
+      referencedColumnIds: []
+      usesFunctionIds: []
+      usesSequenceIds: []
+      usesTypeIds:
+      - 104
+      - 105
+    tableId: 108
   Status: PUBLIC
 - CheckConstraint:
     columnIds:
@@ -187,6 +213,7 @@ ElementState:
     - 3
     - 5
     tableId: 108
+    usesFunctionIds: []
     usesSequenceIds: []
     usesTypeIds: []
   Status: PUBLIC
@@ -237,10 +264,13 @@ ElementState:
     computeExpr:
       expr: x'80':::@100104
       referencedColumnIds: []
+      usesFunctionIds: []
       usesSequenceIds: []
       usesTypeIds:
       - 104
       - 105
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -269,6 +299,8 @@ ElementState:
     - 105
     columnId: 4
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -314,10 +346,13 @@ ElementState:
     computeExpr:
       expr: x'80':::@100106
       referencedColumnIds: []
+      usesFunctionIds: []
       usesSequenceIds: []
       usesTypeIds:
       - 106
       - 107
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: true
@@ -344,6 +379,8 @@ ElementState:
     closedTypeIds: []
     columnId: 1
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: false
     isVirtual: false
@@ -369,6 +406,8 @@ ElementState:
     closedTypeIds: []
     columnId: 4.294967294e+09
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -394,6 +433,8 @@ ElementState:
     closedTypeIds: []
     columnId: 4.294967295e+09
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -419,6 +460,8 @@ ElementState:
     closedTypeIds: []
     columnId: 5
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: false
     isVirtual: false
@@ -440,6 +483,16 @@ ElementState:
       visibleType: 0
       width: 0
   Status: PUBLIC
+- ColumnNotNull:
+    columnId: 1
+    indexIdForValidation: 0
+    tableId: 108
+  Status: PUBLIC
+- ColumnNotNull:
+    columnId: 5
+    indexIdForValidation: 0
+    tableId: 108
+  Status: PUBLIC
 - IndexName:
     indexId: 1
     name: tbl_pkey
@@ -449,15 +502,6 @@ ElementState:
     indexId: 2
     name: partial
     tableId: 108
-  Status: PUBLIC
-- SecondaryIndexPartial:
-    expr: g::STRING = 'hi':::STRING
-    indexId: 2
-    referencedColumnIds:
-    - 2
-    tableId: 108
-    usesSequenceIds: []
-    usesTypeIds: []
   Status: PUBLIC
 - IndexColumn:
     columnId: 1
@@ -532,6 +576,11 @@ ElementState:
     name: mycheck
     tableId: 108
   Status: PUBLIC
+- ConstraintWithoutIndexName:
+    constraintId: 3
+    name: myuwi
+    tableId: 108
+  Status: PUBLIC
 - Namespace:
     databaseId: 100
     descriptorId: 108
@@ -546,15 +595,17 @@ ElementState:
     descriptorId: 108
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 108
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 108
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 108
+    schemaId: 101
   Status: PUBLIC
 
 setup
@@ -595,20 +646,23 @@ ElementState:
     descriptorId: 109
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 109
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 109
     privileges: "512"
     userName: public
+    withGrantOption: "0"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 109
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 109
+    schemaId: 101
   Status: PUBLIC
 - CompositeTypeAttrType:
     closedTypeIds: []
@@ -779,6 +833,7 @@ ElementState:
   Status: PUBLIC
 - SecondaryIndex:
     constraintId: 0
+    expr: (c).a = 3:::INT8
     geoConfig: null
     indexId: 2
     isConcurrently: false
@@ -786,10 +841,15 @@ ElementState:
     isInverted: false
     isNotVisible: false
     isUnique: false
+    referencedColumnIds:
+    - 2
     sharding: null
     sourceIndexId: 0
     tableId: 111
     temporaryIndexId: 0
+    usesFunctionIds: []
+    usesSequenceIds: []
+    usesTypeIds: []
   Status: PUBLIC
 - CheckConstraint:
     columnIds:
@@ -801,6 +861,7 @@ ElementState:
     referencedColumnIds:
     - 2
     tableId: 111
+    usesFunctionIds: []
     usesSequenceIds: []
     usesTypeIds: []
   Status: PUBLIC
@@ -859,6 +920,8 @@ ElementState:
     - 110
     columnId: 3
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -933,6 +996,8 @@ ElementState:
     - 109
     columnId: 2
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -994,8 +1059,11 @@ ElementState:
     computeExpr:
       expr: (3:::INT8, 'foo':::STRING)
       referencedColumnIds: []
+      usesFunctionIds: []
       usesSequenceIds: []
       usesTypeIds: []
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -1057,8 +1125,11 @@ ElementState:
     computeExpr:
       expr: (4:::INT8, 'foo':::STRING)
       referencedColumnIds: []
+      usesFunctionIds: []
       usesSequenceIds: []
       usesTypeIds: []
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: true
@@ -1117,6 +1188,8 @@ ElementState:
     closedTypeIds: []
     columnId: 1
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: false
     isVirtual: false
@@ -1142,6 +1215,8 @@ ElementState:
     closedTypeIds: []
     columnId: 4.294967294e+09
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -1167,6 +1242,8 @@ ElementState:
     closedTypeIds: []
     columnId: 4.294967295e+09
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -1192,6 +1269,8 @@ ElementState:
     closedTypeIds: []
     columnId: 6
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: false
     isVirtual: false
@@ -1220,8 +1299,11 @@ ElementState:
       expr: (c).a
       referencedColumnIds:
       - 2
+      usesFunctionIds: []
       usesSequenceIds: []
       usesTypeIds: []
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: true
@@ -1243,6 +1325,16 @@ ElementState:
       visibleType: 0
       width: 64
   Status: PUBLIC
+- ColumnNotNull:
+    columnId: 1
+    indexIdForValidation: 0
+    tableId: 111
+  Status: PUBLIC
+- ColumnNotNull:
+    columnId: 6
+    indexIdForValidation: 0
+    tableId: 111
+  Status: PUBLIC
 - IndexName:
     indexId: 1
     name: tbl2_pkey
@@ -1252,15 +1344,6 @@ ElementState:
     indexId: 2
     name: comppartial
     tableId: 111
-  Status: PUBLIC
-- SecondaryIndexPartial:
-    expr: (c).a = 3:::INT8
-    indexId: 2
-    referencedColumnIds:
-    - 2
-    tableId: 111
-    usesSequenceIds: []
-    usesTypeIds: []
   Status: PUBLIC
 - IndexColumn:
     columnId: 1
@@ -1359,13 +1442,15 @@ ElementState:
     descriptorId: 111
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 111
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 111
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 111
+    schemaId: 101
   Status: PUBLIC

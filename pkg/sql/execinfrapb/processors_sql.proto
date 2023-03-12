@@ -17,7 +17,7 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
 import "gogoproto/gogo.proto";
 import "roachpb/data.proto";
@@ -397,6 +397,11 @@ message JoinReaderSpec {
   // a prefix of input columns followed by index (lookup) columns without
   // requiring a (buffered) sort.
   optional bool maintain_lookup_ordering = 22 [(gogoproto.nullable) = false];
+
+  // RemoteOnlyLookups is true when this join is defined with only lookups
+  // that read into remote regions, though the lookups are defined in
+  // LookupExpr, not RemoteLookupExpr.
+  optional bool remote_only_lookups = 23 [(gogoproto.nullable) = false];
 }
 
 // SorterSpec is the specification for a "sorting aggregator". A sorting
@@ -852,6 +857,7 @@ message AggregatorSpec {
     FINAL_COVAR_SAMP = 58;
     FINAL_CORR = 59;
     FINAL_SQRDIFF = 60;
+    ARRAY_CAT_AGG = 61;
   }
 
   enum Type {

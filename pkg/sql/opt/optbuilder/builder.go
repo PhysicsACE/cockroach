@@ -14,6 +14,7 @@ import (
 	"context"
 	"strconv"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -152,6 +153,10 @@ type Builder struct {
 	// (without ON CONFLICT) or false otherwise. All mutated tables will have an
 	// entry in the map.
 	areAllTableMutationsSimpleInserts map[cat.StableID]bool
+
+	// subqueryNameIdx helps generate unique subquery names during star
+	// expansion.
+	subqueryNameIdx int
 }
 
 // New creates a new Builder structure initialized with the given
@@ -479,13 +484,9 @@ func (b *Builder) maybeTrackRegclassDependenciesForViews(texpr tree.TypedExpr) {
 func (b *Builder) maybeTrackUserDefinedTypeDepsForViews(texpr tree.TypedExpr) {
 	if b.trackSchemaDeps {
 		if texpr.ResolvedType().UserDefined() {
-			children, err := typedesc.GetTypeDescriptorClosure(texpr.ResolvedType())
-			if err != nil {
-				panic(err)
-			}
-			for id := range children {
+			typedesc.GetTypeDescriptorClosure(texpr.ResolvedType()).ForEach(func(id descpb.ID) {
 				b.schemaTypeDeps.Add(int(id))
-			}
+			})
 		}
 	}
 }

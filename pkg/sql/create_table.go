@@ -394,6 +394,7 @@ func (n *createTableNode) startExec(params runParams) error {
 		if desc.Adding() {
 			// if this table and all its references are created in the same
 			// transaction it can be made PUBLIC.
+			// TODO(chengxiong): do we need to do something here? Like. add logic to find all references.
 			refs, err := desc.FindAllReferences()
 			if err != nil {
 				return err
@@ -410,6 +411,21 @@ func (n *createTableNode) startExec(params runParams) error {
 			if !foundExternalReference {
 				desc.State = descpb.DescriptorState_PUBLIC
 			}
+		}
+	}
+
+	// Replace all UDF names with OIDs in check constraints and update back
+	// references in functions used.
+	for _, ck := range desc.CheckConstraints() {
+		if err := params.p.updateFunctionReferencesForCheck(params.ctx, desc, ck.CheckDesc()); err != nil {
+			return err
+		}
+	}
+
+	// Update cross-references between functions and columns.
+	for i := range desc.Columns {
+		if err := params.p.maybeUpdateFunctionReferencesForColumn(params.ctx, desc, &desc.Columns[i]); err != nil {
+			return err
 		}
 	}
 
@@ -455,7 +471,7 @@ func (n *createTableNode) startExec(params runParams) error {
 
 		if err := ApplyZoneConfigForMultiRegionTable(
 			params.ctx,
-			params.p.txn,
+			params.p.Txn(),
 			params.p.ExecCfg(),
 			params.p.extendedEvalCtx.Tracing.KVTracingEnabled(),
 			params.p.Descriptors(),
@@ -699,7 +715,7 @@ func addUniqueWithoutIndexTableDef(
 	if d.Predicate != nil {
 		var err error
 		predicate, err = schemaexpr.ValidateUniqueWithoutIndexPredicate(
-			ctx, tn, desc, d.Predicate, semaCtx,
+			ctx, tn, desc, d.Predicate, semaCtx, evalCtx.Settings.Version.ActiveVersionOrEmpty(ctx),
 		)
 		if err != nil {
 			return err
@@ -756,12 +772,11 @@ func ResolveUniqueWithoutIndexConstraint(
 		constraintName = tabledesc.GenerateUniqueName(
 			fmt.Sprintf("unique_%s", strings.Join(colNames, "_")),
 			func(p string) bool {
-				c, _ := tbl.FindConstraintWithName(p)
-				return c != nil
+				return catalog.FindConstraintByName(tbl, p) != nil
 			},
 		)
 	} else {
-		if c, _ := tbl.FindConstraintWithName(constraintName); c != nil {
+		if c := catalog.FindConstraintByName(tbl, constraintName); c != nil {
 			return pgerror.Newf(pgcode.DuplicateObject, "duplicate constraint name: %q", constraintName)
 		}
 	}
@@ -920,7 +935,7 @@ func ResolveFK(
 		}
 	}
 
-	referencedCols, err := tabledesc.FindPublicColumnsWithNames(target, referencedColNames)
+	referencedCols, err := catalog.MustFindPublicColumnsByNameList(target, referencedColNames)
 	if err != nil {
 		return err
 	}
@@ -963,12 +978,11 @@ func ResolveFK(
 		constraintName = tabledesc.GenerateUniqueName(
 			tabledesc.ForeignKeyConstraintName(tbl.GetName(), d.FromCols.ToStrings()),
 			func(p string) bool {
-				c, _ := tbl.FindConstraintWithName(p)
-				return c != nil
+				return catalog.FindConstraintByName(tbl, p) != nil
 			},
 		)
 	} else {
-		if c, _ := tbl.FindConstraintWithName(constraintName); c != nil {
+		if c := catalog.FindConstraintByName(tbl, constraintName); c != nil {
 			return pgerror.Newf(pgcode.DuplicateObject, "duplicate constraint name: %q", constraintName)
 		}
 	}
@@ -1041,12 +1055,12 @@ func ResolveFK(
 		tbl.AddForeignKeyMutation(&ref, descpb.DescriptorMutation_ADD)
 	}
 
-	c, err := tbl.FindConstraintWithID(ref.ConstraintID)
+	c, err := catalog.MustFindConstraintByID(tbl, ref.ConstraintID)
 	if err != nil {
 		return errors.HandleAsAssertionFailure(err)
 	}
 	// Ensure that there is a unique constraint on the referenced side to use.
-	_, err = tabledesc.FindFKReferencedUniqueConstraint(target, c.(catalog.ForeignKeyConstraint))
+	_, err = catalog.FindFKReferencedUniqueConstraint(target, c.(catalog.ForeignKeyConstraint))
 	return err
 }
 
@@ -1078,7 +1092,9 @@ func CreatePartitioning(
 		ctx,
 		st,
 		evalCtx,
-		tableDesc.FindColumnWithName,
+		func(name tree.Name) (catalog.Column, error) {
+			return catalog.MustFindColumnByTreeName(tableDesc, name)
+		},
 		int(indexDesc.Partitioning.NumImplicitColumns),
 		indexDesc.KeyColumnNames,
 		partBy,
@@ -1285,6 +1301,8 @@ func NewTableDesc(
 	persistence tree.Persistence,
 	inOpts ...NewTableDescOption,
 ) (*tabledesc.Mutable, error) {
+
+	version := st.Version.ActiveVersionOrEmpty(ctx)
 	// Used to delay establishing Column/Sequence dependency until ColumnIDs have
 	// been populated.
 	cdd := make([]*tabledesc.ColumnDefDescs, len(n.Defs))
@@ -1569,7 +1587,7 @@ func NewTableDesc(
 				return nil, pgerror.Newf(pgcode.Syntax, "virtual columns cannot have family specifications")
 			}
 
-			cdd[i], err = tabledesc.MakeColumnDefDescs(ctx, d, semaCtx, evalCtx)
+			cdd[i], err = tabledesc.MakeColumnDefDescs(ctx, d, semaCtx, evalCtx, tree.ColumnDefaultExprInNewTable)
 			if err != nil {
 				return nil, err
 			}
@@ -1689,18 +1707,17 @@ func NewTableDesc(
 		if err != nil {
 			return nil, err
 		}
-
 		// If there is an equivalent check constraint from the CREATE TABLE (should
 		// be rare since we hide the constraint of shard column), we don't create a
 		// duplicate one.
 		ckBuilder := schemaexpr.MakeCheckConstraintBuilder(ctx, n.Table, &desc, semaCtx)
-		checkConstraintDesc, err := ckBuilder.Build(checkConstraint)
+		checkConstraintDesc, err := ckBuilder.Build(checkConstraint, version)
 		if err != nil {
 			return nil, err
 		}
 		for _, def := range n.Defs {
 			if inputCheckConstraint, ok := def.(*tree.CheckConstraintTableDef); ok {
-				inputCheckConstraintDesc, err := ckBuilder.Build(inputCheckConstraint)
+				inputCheckConstraintDesc, err := ckBuilder.Build(inputCheckConstraint, version)
 				if err != nil {
 					return nil, err
 				}
@@ -1723,12 +1740,12 @@ func NewTableDesc(
 		case *tree.ColumnTableDef:
 			if d.IsComputed() {
 				serializedExpr, _, err := schemaexpr.ValidateComputedColumnExpression(
-					ctx, &desc, d, &n.Table, "computed column", semaCtx,
+					ctx, &desc, d, &n.Table, tree.ComputedColumnExprContext(d.IsVirtual()), semaCtx, version,
 				)
 				if err != nil {
 					return nil, err
 				}
-				col, err := desc.FindColumnWithName(d.Name)
+				col, err := catalog.MustFindColumnByTreeName(&desc, d.Name)
 				if err != nil {
 					return nil, err
 				}
@@ -1747,7 +1764,7 @@ func NewTableDesc(
 			// indexes will be given a unique auto-generated name later on when
 			// AllocateIDs is called.
 			if d.Name != "" {
-				if idx, _ := desc.FindIndexWithName(d.Name.String()); idx != nil {
+				if idx := catalog.FindIndexByName(&desc, d.Name.String()); idx != nil {
 					return nil, pgerror.Newf(pgcode.DuplicateRelation, "duplicate index name: %q", d.Name)
 				}
 			}
@@ -1762,6 +1779,7 @@ func NewTableDesc(
 				d.Inverted,
 				true, /* isNewTable */
 				semaCtx,
+				version,
 			); err != nil {
 				return nil, err
 			}
@@ -1789,7 +1807,7 @@ func NewTableDesc(
 				return nil, err
 			}
 			if d.Inverted {
-				column, err := desc.FindColumnWithName(tree.Name(idx.InvertedColumnName()))
+				column, err := catalog.MustFindColumnByName(&desc, idx.InvertedColumnName())
 				if err != nil {
 					return nil, err
 				}
@@ -1831,7 +1849,7 @@ func NewTableDesc(
 
 			if d.Predicate != nil {
 				expr, err := schemaexpr.ValidatePartialIndexPredicate(
-					ctx, &desc, d.Predicate, &n.Table, semaCtx,
+					ctx, &desc, d.Predicate, &n.Table, semaCtx, version,
 				)
 				if err != nil {
 					return nil, err
@@ -1860,7 +1878,7 @@ func NewTableDesc(
 			// indexes will be given a unique auto-generated name later on when
 			// AllocateIDs is called.
 			if d.Name != "" {
-				if idx, _ := desc.FindIndexWithName(d.Name.String()); idx != nil {
+				if idx := catalog.FindIndexByName(&desc, d.Name.String()); idx != nil {
 					return nil, pgerror.Newf(pgcode.DuplicateRelation, "duplicate index name: %q", d.Name)
 				}
 			}
@@ -1875,6 +1893,7 @@ func NewTableDesc(
 				false, /* isInverted */
 				true,  /* isNewTable */
 				semaCtx,
+				version,
 			); err != nil {
 				return nil, err
 			}
@@ -1946,7 +1965,7 @@ func NewTableDesc(
 			}
 			if d.Predicate != nil {
 				expr, err := schemaexpr.ValidatePartialIndexPredicate(
-					ctx, &desc, d.Predicate, &n.Table, semaCtx,
+					ctx, &desc, d.Predicate, &n.Table, semaCtx, version,
 				)
 				if err != nil {
 					return nil, err
@@ -1997,7 +2016,6 @@ func NewTableDesc(
 			})
 		}
 	}
-	version := st.Version.ActiveVersionOrEmpty(ctx)
 	if err := desc.AllocateIDs(ctx, version); err != nil {
 		return nil, err
 	}
@@ -2138,7 +2156,7 @@ func NewTableDesc(
 			// Pass, handled above.
 
 		case *tree.CheckConstraintTableDef:
-			ck, err := ckBuilder.Build(d)
+			ck, err := ckBuilder.Build(d, version)
 			if err != nil {
 				return nil, err
 			}
@@ -2335,14 +2353,17 @@ func newTableDesc(
 	// Row level TTL tables require a scheduled job to be created as well.
 	if ret.HasRowLevelTTL() {
 		ttl := ret.GetRowLevelTTL()
-		if err := schemaexpr.ValidateTTLExpirationExpression(params.ctx, ret, params.p.SemaCtx(), &n.Table, ttl); err != nil {
+		if err := schemaexpr.ValidateTTLExpirationExpression(
+			params.ctx, ret, params.p.SemaCtx(), &n.Table, ttl, params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx),
+		); err != nil {
 			return nil, err
 		}
 
+		params.p.Txn()
 		j, err := CreateRowLevelTTLScheduledJob(
 			params.ctx,
-			params.ExecCfg(),
-			params.p.txn,
+			params.ExecCfg().JobsKnobs(),
+			jobs.ScheduledJobTxn(params.p.InternalSQLTxn()),
 			params.p.User(),
 			ret.GetID(),
 			ttl,
@@ -2392,19 +2413,19 @@ func newRowLevelTTLScheduledJob(
 // CreateRowLevelTTLScheduledJob creates a new row-level TTL schedule.
 func CreateRowLevelTTLScheduledJob(
 	ctx context.Context,
-	execCfg *ExecutorConfig,
-	txn *kv.Txn,
+	knobs *jobs.TestingKnobs,
+	s jobs.ScheduledJobStorage,
 	owner username.SQLUsername,
 	tblID descpb.ID,
 	ttl *catpb.RowLevelTTL,
 ) (*jobs.ScheduledJob, error) {
 	telemetry.Inc(sqltelemetry.RowLevelTTLCreated)
-	env := JobSchedulerEnv(execCfg)
+	env := JobSchedulerEnv(knobs)
 	j, err := newRowLevelTTLScheduledJob(env, owner, tblID, ttl)
 	if err != nil {
 		return nil, err
 	}
-	if err := j.Create(ctx, execCfg.InternalExecutor, txn); err != nil {
+	if err := s.Create(ctx, j); err != nil {
 		return nil, err
 	}
 	return j, nil
@@ -2556,7 +2577,7 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 					},
 					WithoutIndex: true,
 				}
-				colNames, err := td.NamesForColumnIDs(c.ColumnIDs)
+				colNames, err := catalog.ColumnNamesForIDs(td, c.ColumnIDs)
 				if err != nil {
 					return nil, err
 				}
@@ -2602,7 +2623,7 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 						Column:    tree.Name(name),
 						Direction: tree.Ascending,
 					}
-					col, err := td.FindColumnWithID(idx.GetKeyColumnID(j))
+					col, err := catalog.MustFindColumnByID(td, idx.GetKeyColumnID(j))
 					if err != nil {
 						return nil, err
 					}
@@ -2733,7 +2754,7 @@ func setSequenceOwner(
 		return errors.Errorf("%s is not a sequence", seqDesc.Name)
 	}
 
-	col, err := table.FindColumnWithName(colName)
+	col, err := catalog.MustFindColumnByTreeName(table, colName)
 	if err != nil {
 		return err
 	}
@@ -2816,7 +2837,7 @@ func isImplicitlyCreatedBySystem(td *tabledesc.Mutable, c *descpb.ColumnDescript
 	if td.IsPrimaryIndexDefaultRowID() && c.ID == td.GetPrimaryIndex().GetKeyColumnID(0) {
 		return true, nil
 	}
-	col, err := td.FindColumnWithID(c.ID)
+	col, err := catalog.MustFindColumnByID(td, c.ID)
 	if err != nil {
 		return false, err
 	}

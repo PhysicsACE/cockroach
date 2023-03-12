@@ -22,12 +22,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -234,14 +236,14 @@ func TestSettingsWatcherWithOverrides(t *testing.T) {
 
 	expect := func(setting, value string) {
 		t.Helper()
-		s, ok := settings.Lookup(setting, settings.LookupForLocalAccess, settings.ForSystemTenant)
+		s, ok := settings.LookupForLocalAccess(setting, settings.ForSystemTenant)
 		require.True(t, ok)
 		require.Equal(t, value, s.String(&st.SV))
 	}
 
 	expectSoon := func(setting, value string) {
 		t.Helper()
-		s, ok := settings.Lookup(setting, settings.LookupForLocalAccess, settings.ForSystemTenant)
+		s, ok := settings.LookupForLocalAccess(setting, settings.ForSystemTenant)
 		require.True(t, ok)
 		testutils.SucceedsSoon(t, func() error {
 			if actual := s.String(&st.SV); actual != value {
@@ -290,7 +292,7 @@ func TestSettingsWatcherWithOverrides(t *testing.T) {
 	expectSoon("i1", "10")
 
 	// Verify that version cannot be overridden.
-	version, ok := settings.Lookup("version", settings.LookupForLocalAccess, settings.ForSystemTenant)
+	version, ok := settings.LookupForLocalAccess("version", settings.ForSystemTenant)
 	require.True(t, ok)
 	versionValue := version.String(&st.SV)
 
@@ -421,7 +423,7 @@ func TestOverflowRestart(t *testing.T) {
 // two settings do not match. It generally gets used with SucceeedsSoon.
 func CheckSettingsValuesMatch(t *testing.T, a, b *cluster.Settings) error {
 	for _, k := range settings.Keys(false /* forSystemTenant */) {
-		s, ok := settings.Lookup(k, settings.LookupForLocalAccess, false /* forSystemTenant */)
+		s, ok := settings.LookupForLocalAccess(k, false /* forSystemTenant */)
 		require.True(t, ok)
 		if s.Class() == settings.SystemOnly {
 			continue
@@ -446,12 +448,12 @@ func TestStaleRowsDoNotCauseSettingsToRegress(t *testing.T) {
 	bogusTenantID := roachpb.MustMakeTenantID(42)
 	bogusCodec := keys.MakeSQLCodec(bogusTenantID)
 	settingsStart := bogusCodec.TablePrefix(keys.SettingsTableID)
-	interceptedStreamCh := make(chan roachpb.RangeFeedEventSink)
+	interceptedStreamCh := make(chan kvpb.RangeFeedEventSink)
 	cancelCtx, cancel := context.WithCancel(ctx)
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRangefeedFilter: func(args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink) *roachpb.Error {
+				TestingRangefeedFilter: func(args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink) *kvpb.Error {
 					if !args.Span.ContainsKey(settingsStart) {
 						return nil
 					}
@@ -488,12 +490,13 @@ func TestStaleRowsDoNotCauseSettingsToRegress(t *testing.T) {
 		rows, err := s.DB().Scan(ctx, k, k.PrefixEnd(), 0 /* maxRows */)
 		require.NoError(t, err)
 		dec := settingswatcher.MakeRowDecoder(codec)
+		var alloc tree.DatumAlloc
 		for _, r := range rows {
 			rkv := roachpb.KeyValue{Key: r.Key}
 			if r.Value != nil {
 				rkv.Value = *r.Value
 			}
-			name, _, _, err := dec.DecodeRow(rkv)
+			name, _, _, err := dec.DecodeRow(rkv, &alloc)
 			require.NoError(t, err)
 			if name == fakeSettingName {
 				rkv.Key, err = codec.StripTenantPrefix(rkv.Key)
@@ -509,13 +512,13 @@ func TestStaleRowsDoNotCauseSettingsToRegress(t *testing.T) {
 
 	// newRangeFeedEvent creates a RangeFeedEvent for the bogus tenant using a KV
 	// which has a stripped prefix. It also sets the timestamp.
-	newRangeFeedEvent := func(kv roachpb.KeyValue, ts hlc.Timestamp) *roachpb.RangeFeedEvent {
+	newRangeFeedEvent := func(kv roachpb.KeyValue, ts hlc.Timestamp) *kvpb.RangeFeedEvent {
 		kv.Key = append(bogusCodec.TenantPrefix(), kv.Key...)
 		kv.Value.Timestamp = ts
 		kv.Value.ClearChecksum()
 		kv.Value.InitChecksum(kv.Key)
-		return &roachpb.RangeFeedEvent{
-			Val: &roachpb.RangeFeedValue{Key: kv.Key, Value: kv.Value},
+		return &kvpb.RangeFeedEvent{
+			Val: &kvpb.RangeFeedValue{Key: kv.Key, Value: kv.Value},
 		}
 	}
 	sideSettings := cluster.MakeTestingClusterSettings()

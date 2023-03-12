@@ -930,6 +930,18 @@ func (node *Exprs) Format(ctx *FmtCtx) {
 // because it's not parenthesized.
 type TypedExprs []TypedExpr
 
+var _ NodeFormatter = &TypedExprs{}
+
+// Format implements the NodeFormatter interface.
+func (node *TypedExprs) Format(ctx *FmtCtx) {
+	for i, n := range *node {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatNode(n)
+	}
+}
+
 func (node *TypedExprs) String() string {
 	var prefix string
 	var buf bytes.Buffer
@@ -1146,6 +1158,12 @@ func (o UnaryOperator) String() string {
 // Operator implements tree.Operator.
 func (UnaryOperator) Operator() {}
 
+// IsUnaryComplement returns whether op is a unary complement operator.
+func IsUnaryComplement(op Operator) bool {
+	u, ok := op.(UnaryOperator)
+	return ok && u.Symbol == UnaryComplement
+}
+
 // UnaryOperatorSymbol represents a unary operator.
 type UnaryOperatorSymbol uint8
 
@@ -1289,15 +1307,8 @@ func (node *FuncExpr) ResolvedOverload() *Overload {
 
 // IsGeneratorClass returns true if the resolved overload metadata is of
 // the GeneratorClass.
-//
-// TODO(ajwerner): Figure out how this differs from IsGeneratorApplication.
 func (node *FuncExpr) IsGeneratorClass() bool {
-	return node.fnProps != nil && node.fnProps.Class == GeneratorClass
-}
-
-// IsGeneratorApplication returns true iff the function applied is a generator (SRF).
-func (node *FuncExpr) IsGeneratorApplication() bool {
-	return node.fn != nil && (node.fn.Generator != nil || node.fn.GeneratorWithExprs != nil)
+	return node.ResolvedOverload() != nil && node.ResolvedOverload().Class == GeneratorClass
 }
 
 // IsWindowFunctionApplication returns true iff the function is being applied as a window function.
@@ -1584,6 +1595,13 @@ func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
 	switch node.SyntaxMode {
 	case AnnotateShort:
 		exprFmtWithParen(ctx, node.Expr)
+		// The Array format function handles adding type annotations for this case.
+		// We short circuit here to prevent double type annotation.
+		if arrayExpr, ok := node.Expr.(*Array); ok {
+			if ctx.HasFlags(FmtParsable) && arrayExpr.typ != nil {
+				return
+			}
+		}
 		ctx.WriteString(":::")
 		ctx.FormatTypeReference(node.Type)
 

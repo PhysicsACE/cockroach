@@ -1,0 +1,129 @@
+# Test basic tenant capability watcher functionality.
+
+start
+----
+ok
+
+updates
+----
+
+upsert ten=10 can_admin_split=true
+----
+ok
+
+upsert ten=11 can_admin_split=false
+----
+ok
+
+updates
+----
+Incremental Update
+update: ten=10 cap={can_admin_scatter:false can_admin_split:true can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+update: ten=11 cap={can_admin_scatter:false can_admin_split:false can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+flush-state
+----
+ten=10 cap={can_admin_scatter:false can_admin_split:true can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+ten=11 cap={can_admin_scatter:false can_admin_split:false can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+upsert ten=11 can_admin_split=true
+----
+ok
+
+updates
+----
+Incremental Update
+update: ten=11 cap={can_admin_scatter:false can_admin_split:true can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+get-capabilities ten=11
+----
+{can_admin_scatter:false can_admin_split:true can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+delete ten=10
+----
+ok
+
+updates
+----
+Incremental Update
+delete: ten=10
+
+get-capabilities ten=10
+----
+not-found
+
+# No-op update.
+delete ten=15
+----
+ok
+
+updates
+----
+
+# Check that the internal state after a few incremental updates corresponds to
+# what we'd expect.
+flush-state
+----
+ten=11 cap={can_admin_scatter:false can_admin_split:true can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+upsert ten=15 can_admin_split=true
+----
+ok
+
+updates
+----
+Incremental Update
+update: ten=15 cap={can_admin_scatter:false can_admin_split:true can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+# Ensure only the last update is applied, even when there are multiple updates
+# to a single key.
+upsert ten=11 can_admin_split=false
+----
+ok
+
+upsert ten=11 can_admin_split=true
+----
+ok
+
+delete ten=11
+----
+ok
+
+updates
+----
+Incremental Update
+delete: ten=11
+
+get-capabilities ten=11
+----
+not-found
+
+flush-state
+----
+ten=15 cap={can_admin_scatter:false can_admin_split:true can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+# Same thing, but this time instead of deleting the key, leave it behind.
+delete ten=15
+----
+ok
+
+upsert ten=15 can_admin_split=true
+----
+ok
+
+upsert ten=15 can_admin_split=false
+----
+ok
+
+updates
+----
+Incremental Update
+update: ten=15 cap={can_admin_scatter:false can_admin_split:false can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+flush-state
+----
+ten=15 cap={can_admin_scatter:false can_admin_split:false can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}
+
+get-capabilities ten=15
+----
+{can_admin_scatter:false can_admin_split:false can_admin_unsplit:false can_view_node_info:false can_view_tsdb_metrics:false}

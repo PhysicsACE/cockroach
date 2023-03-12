@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -48,8 +50,8 @@ func gcTables(
 		}
 
 		var table catalog.TableDescriptor
-		if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-			table, err = col.ByID(txn).Get().Table(ctx, droppedTable.ID)
+		if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
+			table, err = col.ByID(txn.KV()).Get().Table(ctx, droppedTable.ID)
 			return err
 		}); err != nil {
 			if errors.Is(err, catalog.ErrDescriptorNotFound) {
@@ -159,8 +161,8 @@ func clearSpanData(
 				endKey = span.EndKey
 			}
 			var b kv.Batch
-			b.AddRawRequest(&roachpb.ClearRangeRequest{
-				RequestHeader: roachpb.RequestHeader{
+			b.AddRawRequest(&kvpb.ClearRangeRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key:    lastKey.AsRawKey(),
 					EndKey: endKey.AsRawKey(),
 				},
@@ -241,14 +243,14 @@ func deleteAllSpanData(
 				endKey = span.EndKey
 			}
 			var b kv.Batch
-			b.AdmissionHeader = roachpb.AdmissionHeader{
+			b.AdmissionHeader = kvpb.AdmissionHeader{
 				Priority:                 int32(admissionpb.BulkNormalPri),
 				CreateTime:               timeutil.Now().UnixNano(),
-				Source:                   roachpb.AdmissionHeader_FROM_SQL,
+				Source:                   kvpb.AdmissionHeader_FROM_SQL,
 				NoMemoryReservedAtSource: true,
 			}
-			b.AddRawRequest(&roachpb.DeleteRangeRequest{
-				RequestHeader: roachpb.RequestHeader{
+			b.AddRawRequest(&kvpb.DeleteRangeRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key:    lastKey.AsRawKey(),
 					EndKey: endKey.AsRawKey(),
 				},
@@ -287,8 +289,8 @@ func deleteTableDescriptorsAfterGC(
 		}
 
 		var table catalog.TableDescriptor
-		if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-			table, err = col.ByID(txn).Get().Table(ctx, droppedTable.ID)
+		if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
+			table, err = col.ByID(txn.KV()).Get().Table(ctx, droppedTable.ID)
 			return err
 		}); err != nil {
 			if errors.Is(err, catalog.ErrDescriptorNotFound) {

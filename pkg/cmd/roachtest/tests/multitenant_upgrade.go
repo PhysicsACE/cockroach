@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -68,10 +69,10 @@ func registerMultiTenantUpgrade(r registry.Registry) {
 //   - Tenant14{Binary: Cur, Cluster: Cur}: Create tenant 14 and verify it works.
 //   - Tenant12{Binary: Cur, Cluster: Cur}: Restart tenant 14 and make sure it still works.
 func runMultiTenantUpgrade(ctx context.Context, t test.Test, c cluster.Cluster, v version.Version) {
-	predecessor, err := PredecessorVersion(v)
+	predecessor, err := version.PredecessorVersion(v)
 	require.NoError(t, err)
 
-	currentBinary := uploadVersion(ctx, t, c, c.All(), "")
+	currentBinary := uploadVersion(ctx, t, c, c.All(), clusterupgrade.MainVersion)
 	predecessorBinary := uploadVersion(ctx, t, c, c.All(), predecessor)
 
 	kvNodes := c.Node(1)
@@ -126,7 +127,9 @@ func runMultiTenantUpgrade(ctx context.Context, t test.Test, c cluster.Cluster, 
 	t.Status("upgrading system tenant binary")
 	c.Stop(ctx, t.L(), option.DefaultStopOpts(), kvNodes)
 	settings.Binary = currentBinary
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, kvNodes)
+	// TODO (msbutler): investigate why the scheduled backup command fails due to a `Is the Server
+	// running?` error.
+	c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), settings, kvNodes)
 	time.Sleep(time.Second)
 
 	t.Status("checking the pre-upgrade sql server still works after the system tenant binary upgrade")

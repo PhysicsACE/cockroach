@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -29,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -73,6 +75,15 @@ type Connector interface {
 	// range reports.
 	serverpb.TenantStatusServer
 
+	// TenantAdminServer is the subset of the serverpb.AdminInterface that is
+	// used by the SQL system to query for debug information, such as cluster-wide
+	// observability.
+	serverpb.TenantAdminServer
+
+	// TenantTimeSeriesServer is the subset of the tspb.TimeSeriesServer that is
+	// used by the SQL system to query for timeseries data.
+	tspb.TenantTimeSeriesServer
+
 	// TokenBucketProvider provides access to the tenant cost control token
 	// bucket.
 	TokenBucketProvider
@@ -100,8 +111,8 @@ type Connector interface {
 // token bucket.
 type TokenBucketProvider interface {
 	TokenBucket(
-		ctx context.Context, in *roachpb.TokenBucketRequest,
-	) (*roachpb.TokenBucketResponse, error)
+		ctx context.Context, in *kvpb.TokenBucketRequest,
+	) (*kvpb.TokenBucketResponse, error)
 }
 
 // ConnectorConfig encompasses the configuration required to create a Connector.

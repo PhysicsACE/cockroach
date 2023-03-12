@@ -657,7 +657,7 @@ func TestProxyRefuseConn(t *testing.T) {
 	require.Equal(t, int64(0), s.metrics.AuthFailedCount.Count())
 }
 
-func TestDenylistUpdate(t *testing.T) {
+func TestProxyHandler_handle(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -665,7 +665,32 @@ func TestDenylistUpdate(t *testing.T) {
 	te := newTester()
 	defer te.Close()
 
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	proxy, _, _ := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{})
+
+	p1, p2 := net.Pipe()
+	require.NoError(t, p1.Close())
+
+	// Check that handle does not return any error if the incoming connection
+	// has no data packets.
+	require.Nil(t, proxy.handler.handle(ctx, p2))
+}
+
+func TestDenylistUpdate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	// Create an empty denylist file.
 	denyList, err := os.CreateTemp("", "*_denylist.yml")
+	require.NoError(t, err)
+	defer func() { _ = os.Remove(denyList.Name()) }()
+	dlf := denylist.File{Seq: 0}
+	bytes, err := dlf.Serialize()
+	require.NoError(t, err)
+	_, err = denyList.Write(bytes)
 	require.NoError(t, err)
 
 	sql, sqlDB, _ := serverutils.StartServer(t,
@@ -689,52 +714,77 @@ func TestDenylistUpdate(t *testing.T) {
 	proxyOutgoingTLSConfig := outgoingTLSConfig.Clone()
 	proxyOutgoingTLSConfig.InsecureSkipVerify = true
 
-	// We wish the proxy to work even without providing a valid TLS client cert to the SQL server.
+	// We wish the proxy to work even without providing a valid TLS client cert
+	// to the SQL server.
 	proxyOutgoingTLSConfig.Certificates = nil
+
+	// Register one SQL pod in the directory server.
+	tenantID := serverutils.TestTenantID()
+	tds := tenantdirsvr.NewTestStaticDirectoryServer(sql.Stopper(), nil /* timeSource */)
+	tds.CreateTenant(tenantID, "tenant-cluster")
+	tds.AddPod(tenantID, &tenant.Pod{
+		TenantID:       tenantID.ToUint64(),
+		Addr:           sql.ServingSQLAddr(),
+		State:          tenant.RUNNING,
+		StateTimestamp: timeutil.Now(),
+	})
+	require.NoError(t, tds.Start(ctx))
 
 	originalBackendDial := BackendDial
 	defer testutils.TestingHook(&BackendDial, func(
 		msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
 	) (net.Conn, error) {
-		time.AfterFunc(100*time.Millisecond, func() {
-			dlf := denylist.File{
-				Denylist: []*denylist.DenyEntry{
-					{
-						Entity:     denylist.DenyEntity{Type: denylist.IPAddrType, Item: "127.0.0.1"},
-						Expiration: timeutil.Now().Add(time.Minute),
-						Reason:     "test-denied",
-					},
-				},
-			}
-
-			bytes, err := dlf.Serialize()
-			require.NoError(t, err)
-			_, err = denyList.Write(bytes)
-			require.NoError(t, err)
-		})
 		return originalBackendDial(msg, sql.ServingSQLAddr(), proxyOutgoingTLSConfig)
 	})()
 
-	s, addr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), &ProxyOptions{
+	opts := &ProxyOptions{
 		Denylist:           denyList.Name(),
 		PollConfigInterval: 10 * time.Millisecond,
-	})
-	defer func() { _ = os.Remove(denyList.Name()) }()
+	}
+	opts.testingKnobs.directoryServer = tds
+	s, addr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), opts)
 
-	url := fmt.Sprintf("postgres://testuser:foo123@%s/defaultdb_29?sslmode=require&options=--cluster=tenant-cluster-28&sslmode=require", addr)
-	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
-		require.Eventuallyf(
-			t,
-			func() bool {
-				_, err = conn.Exec(context.Background(), "SELECT 1")
-				return err != nil
-			},
-			time.Second, 5*time.Millisecond,
-			"Expected the connection to eventually fail",
-		)
-		require.Regexp(t, "unexpected EOF|connection reset by peer", err.Error())
-		require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
-	})
+	// Establish a connection.
+	url := fmt.Sprintf("postgres://testuser:foo123@%s/defaultdb?sslmode=require&options=--cluster=tenant-cluster-%s&sslmode=require", addr, tenantID)
+	db, err := gosql.Open("postgres", url)
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	require.NoError(t, err)
+
+	// Use a single connection so that we don't reopen when the connection
+	// is closed.
+	conn, err := db.Conn(ctx)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, "SELECT 1")
+	require.NoError(t, err)
+
+	// Once connection has been established, attempt to update denylist.
+	dlf.Seq++
+	dlf.Denylist = []*denylist.DenyEntry{
+		{
+			Entity:     denylist.DenyEntity{Type: denylist.IPAddrType, Item: "127.0.0.1"},
+			Expiration: timeutil.Now().Add(time.Minute),
+			Reason:     "test-denied",
+		},
+	}
+	bytes, err = dlf.Serialize()
+	require.NoError(t, err)
+	_, err = denyList.Write(bytes)
+	require.NoError(t, err)
+
+	// Subsequent Exec calls will eventually fail.
+	require.Eventuallyf(
+		t,
+		func() bool {
+			_, err = conn.ExecContext(ctx, "SELECT 1")
+			return err != nil
+		},
+		time.Second, 5*time.Millisecond,
+		"Expected the connection to eventually fail",
+	)
+	require.Regexp(t, "closed|bad connection", err.Error())
+	require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
 }
 
 func TestDirectoryConnect(t *testing.T) {
@@ -1762,6 +1812,91 @@ func TestConnectionMigration(t *testing.T) {
 		connsMap := proxy.handler.balancer.GetTracker().GetConnsMap(tenantID)
 		return len(connsMap) == 0
 	}, 10*time.Second, 100*time.Millisecond)
+}
+
+// Ensures that the metric is incremented regardless of connection type
+// (both failed and successful ones).
+func TestAcceptedConnCountMetric(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	// Start KV server.
+	params, _ := tests.CreateTestServerParams()
+	s, _, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	// Start a single SQL pod.
+	tenantID := serverutils.TestTenantID()
+	tenants := startTestTenantPods(ctx, t, s, tenantID, 1, base.TestingKnobs{})
+
+	// Register the SQL pod in the directory server.
+	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
+	tds.CreateTenant(tenantID, "tenant-cluster")
+	tds.AddPod(tenantID, &tenant.Pod{
+		TenantID:       tenantID.ToUint64(),
+		Addr:           tenants[0].SQLAddr(),
+		State:          tenant.RUNNING,
+		StateTimestamp: timeutil.Now(),
+	})
+	require.NoError(t, tds.Start(ctx))
+
+	opts := &ProxyOptions{SkipVerify: true, DisableConnectionRebalancing: true}
+	opts.testingKnobs.directoryServer = tds
+	proxy, addr, _ := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+
+	goodConnStr := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addr, tenantID)
+	badConnStr := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=nocluster", addr)
+
+	const (
+		numGood = 5
+		numBad  = 6
+		numTCP  = 7
+	)
+	numConns := numGood + numBad + numTCP
+	var wg sync.WaitGroup
+	wg.Add(numConns)
+
+	makeConn := func(connStr string) {
+		defer wg.Done()
+
+		// Opens a new connection, runs SELECT 1, and closes it right away.
+		// Ignore all connection errors.
+		conn, err := pgx.Connect(ctx, connStr)
+		if err != nil {
+			return
+		}
+		_ = conn.Ping(ctx)
+		_ = conn.Close(ctx)
+	}
+
+	for i := 0; i < numGood; i++ {
+		go makeConn(goodConnStr)
+	}
+	for i := 0; i < numBad; i++ {
+		go makeConn(badConnStr)
+	}
+	var dialErr int64
+	for i := 0; i < numTCP; i++ {
+		go func() {
+			defer wg.Done()
+
+			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+			defer func() {
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}()
+			if err != nil {
+				atomic.AddInt64(&dialErr, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int64(0), atomic.LoadInt64(&dialErr))
+	require.Equal(t, int64(numConns), proxy.metrics.AcceptedConnCount.Count())
 }
 
 // TestCurConnCountMetric ensures that the CurConnCount metric is accurate.

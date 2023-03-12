@@ -106,7 +106,6 @@ export const aggregateStatements = (
         label: s.statement,
         summary: s.statement_summary,
         aggregatedTs: s.aggregated_ts,
-        aggregationInterval: s.aggregation_interval,
         implicitTxn: s.implicit_txn,
         database: s.database,
         applicationName: s.app,
@@ -401,11 +400,12 @@ function combineTransactionStats(
 // and returns a copy of the first element with its `stats_data.stats` object replaced with a
 // merged stats object that aggregates statistics from every copy of the fingerprint in the list
 // provided
+// This function SHOULD NOT mutate any objects in the provided txns array.
 const mergeTransactionStats = function (txns: Transaction[]): Transaction {
   if (txns.length === 0) {
     return null;
   }
-  const txn = { ...txns[0] };
+  const txn = _.cloneDeep(txns[0]);
   txn.stats_data.stats = combineTransactionStats(
     txns.map(t => t.stats_data.stats),
   );
@@ -427,13 +427,7 @@ export const aggregateAcrossNodeIDs = function (
 ): Transaction[] {
   return _.chain(t)
     .map(t => withFingerprint(t, stmts))
-    .groupBy(
-      t =>
-        t.fingerprint +
-        t.stats_data.app +
-        TimestampToNumber(t.stats_data.aggregated_ts) +
-        DurationToNumber(t.stats_data.aggregation_interval),
-    )
+    .groupBy(t => t.fingerprint)
     .mapValues(mergeTransactionStats)
     .values()
     .value();

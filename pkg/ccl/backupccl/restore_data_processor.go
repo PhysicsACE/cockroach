@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -172,7 +173,7 @@ func (rd *restoreDataProcessor) Start(ctx context.Context) {
 		_ = rd.phaseGroup.Wait()
 	}
 	rd.phaseGroup = ctxgroup.WithContext(ctx)
-	log.Infof(ctx, "starting restore data")
+	log.Infof(ctx, "starting restore data processor")
 
 	entries := make(chan execinfrapb.RestoreSpanEntry, rd.numWorkers)
 	rd.sstCh = make(chan mergedSST, rd.numWorkers)
@@ -319,7 +320,7 @@ func (rd *restoreDataProcessor) openSSTs(
 
 	log.VEventf(ctx, 1 /* level */, "ingesting span [%s-%s)", entry.Span.Key, entry.Span.EndKey)
 
-	storeFiles := make([]storageccl.StoreFile, 0, len(EntryFiles{}))
+	storeFiles := make([]storageccl.StoreFile, 0, len(entry.Files))
 	for _, file := range entry.Files {
 		log.VEventf(ctx, 2, "import file %s which starts at %s", file.Path, entry.Span.Key)
 
@@ -391,10 +392,10 @@ func (rd *restoreDataProcessor) runRestoreWorkers(ctx context.Context, ssts chan
 
 func (rd *restoreDataProcessor) processRestoreSpanEntry(
 	ctx context.Context, kr *KeyRewriter, sst mergedSST,
-) (roachpb.BulkOpSummary, error) {
+) (kvpb.BulkOpSummary, error) {
 	db := rd.flowCtx.Cfg.DB
 	evalCtx := rd.EvalCtx
-	var summary roachpb.BulkOpSummary
+	var summary kvpb.BulkOpSummary
 
 	entry := sst.entry
 	iter := sst.iter
@@ -444,7 +445,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		var err error
 		batcher, err = bulk.MakeSSTBatcher(ctx,
 			"restore",
-			db,
+			db.KV(),
 			evalCtx.Settings,
 			disallowShadowingBelow,
 			writeAtBatchTS,
@@ -457,6 +458,9 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		}
 	}
 	defer batcher.Close(ctx)
+
+	// Read log.V once first to avoid the vmodule mutex in the tight loop below.
+	verbose := log.V(5)
 
 	var keyScratch, valueScratch []byte
 
@@ -498,7 +502,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		if !ok {
 			// If the key rewriter didn't match this key, it's not data for the
 			// table(s) we're interested in.
-			if log.V(5) {
+			if verbose {
 				log.Infof(ctx, "skipping %s %s", key.Key, value.PrettyPrint())
 			}
 			continue
@@ -508,7 +512,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		value.ClearChecksum()
 		value.InitChecksum(key.Key)
 
-		if log.V(5) {
+		if verbose {
 			log.Infof(ctx, "Put %s -> %s", key.Key, value.PrettyPrint())
 		}
 		if err := batcher.AddMVCCKey(ctx, key, value.RawBytes); err != nil {
@@ -530,7 +534,7 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 }
 
 func makeProgressUpdate(
-	summary roachpb.BulkOpSummary, entry execinfrapb.RestoreSpanEntry, pkIDs map[uint64]bool,
+	summary kvpb.BulkOpSummary, entry execinfrapb.RestoreSpanEntry, pkIDs map[uint64]bool,
 ) (progDetails backuppb.RestoreProgress) {
 	progDetails.Summary = countRows(summary, pkIDs)
 	progDetails.ProgressIdx = entry.ProgressIdx
@@ -594,7 +598,7 @@ type SSTBatcherExecutor interface {
 	Reset(ctx context.Context) error
 	Flush(ctx context.Context) error
 	Close(ctx context.Context)
-	GetSummary() roachpb.BulkOpSummary
+	GetSummary() kvpb.BulkOpSummary
 }
 
 type sstBatcherNoop struct {
@@ -624,7 +628,7 @@ func (b *sstBatcherNoop) Close(ctx context.Context) {
 }
 
 // GetSummary returns this batcher's total added rows/bytes/etc.
-func (b *sstBatcherNoop) GetSummary() roachpb.BulkOpSummary {
+func (b *sstBatcherNoop) GetSummary() kvpb.BulkOpSummary {
 	return b.totalRows.BulkOpSummary
 }
 

@@ -620,6 +620,7 @@ func (b *Builder) buildUDF(
 ) (out opt.ScalarExpr) {
 	o := f.ResolvedOverload()
 
+<<<<<<< HEAD
 	// argTypes, ok := o.Types.(tree.ParamTypes)
 	// if !ok {
 	// 	panic(unimplemented.NewWithIssue(88947,
@@ -646,6 +647,24 @@ func (b *Builder) buildUDF(
 	// 	}
 	// }
 	
+=======
+	// Validate that the return types match the original return types defined in
+	// the function. Return types like user defined return types may change since
+	// the function was first created.
+	rtyp := f.ResolvedType()
+	if rtyp.UserDefined() {
+		funcReturnType, err := tree.ResolveType(b.ctx,
+			&tree.OIDTypeReference{OID: rtyp.Oid()}, b.semaCtx.TypeResolver)
+		if err != nil {
+			panic(err)
+		}
+		if !funcReturnType.Equivalent(rtyp) {
+			panic(pgerror.Newf(
+				pgcode.InvalidFunctionDefinition,
+				"return type mismatch in function declared to return %s", rtyp.Name()))
+		}
+	}
+>>>>>>> 2f2e85df45bff060fe8cc0783989e9c8cc182ef0
 
 	// Build the argument expressions.
 	var args memo.ScalarListExpr
@@ -696,28 +715,48 @@ func (b *Builder) buildUDF(
 
 	// Build an expression for each statement in the function body.
 	rels := make(memo.RelListExpr, len(stmts))
+	isSetReturning := o.Class == tree.GeneratorClass
 	for i := range stmts {
 		stmtScope := b.buildStmt(stmts[i].AST, nil /* desiredTypes */, bodyScope)
 		expr := stmtScope.expr
 		physProps := stmtScope.makePhysicalProps()
 
-		// Add a LIMIT 1 to the last statement. This is valid because any other
-		// rows after the first can simply be ignored. The limit could be
-		// beneficial because it could allow additional optimization.
+		// The last statement produces the output of the UDF.
 		if i == len(stmts)-1 {
-			b.buildLimit(&tree.Limit{Count: tree.NewDInt(1)}, b.allocScope(), stmtScope)
-			expr = stmtScope.expr
-			// The limit expression will maintain the desired ordering, if any,
-			// so the physical props ordering can be cleared. The presentation
-			// must remain.
-			// TODO(mgartner): For SETOF functions, we may need to maintain the
-			// ordering without the LIMIT. Make sure to account for this in
-			// ConvertUDFToSubquery.
-			physProps.Ordering = props.OrderingChoice{}
+			// Add a LIMIT 1 to the last statement if the UDF is not
+			// set-returning. This is valid because any other rows after the
+			// first can simply be ignored. The limit could be beneficial
+			// because it could allow additional optimization.
+			if !isSetReturning {
+				b.buildLimit(&tree.Limit{Count: tree.NewDInt(1)}, b.allocScope(), stmtScope)
+				expr = stmtScope.expr
+				// The limit expression will maintain the desired ordering, if any,
+				// so the physical props ordering can be cleared. The presentation
+				// must remain.
+				physProps.Ordering = props.OrderingChoice{}
+			}
 
-			// If there are multiple output columns, we must combine them into a
-			// tuple - only a single column can be returned from a UDF.
-			if cols := physProps.Presentation; len(cols) > 1 {
+			// Replace the tuple contents of RECORD return types from Any to the
+			// result columns of the last statement. If the result column is a tuple,
+			// then use its tuple contents for the return instead.
+			isSingleTupleResult := len(stmtScope.cols) == 1 && stmtScope.cols[0].typ.Family() == types.TupleFamily
+			if types.IsRecordType(f.ResolvedType()) {
+				if isSingleTupleResult {
+					f.ResolvedType().InternalType.TupleContents = stmtScope.cols[0].typ.TupleContents()
+				} else {
+					tc := make([]*types.T, len(stmtScope.cols))
+					for i, col := range stmtScope.cols {
+						tc[i] = col.typ
+					}
+					f.ResolvedType().InternalType.TupleContents = tc
+				}
+			}
+
+			// If there are multiple output columns or the output type is a record and
+			// the output column is not a tuple, we must combine them into a tuple -
+			// only a single column can be returned from a UDF.
+			cols := physProps.Presentation
+			if len(cols) > 1 || (types.IsRecordType(f.ResolvedType()) && !isSingleTupleResult) {
 				elems := make(memo.ScalarListExpr, len(cols))
 				for i := range cols {
 					elems[i] = b.factory.ConstructVariable(cols[i].ID)
@@ -729,11 +768,15 @@ func (b *Builder) buildUDF(
 				physProps = stmtScope.makePhysicalProps()
 			}
 
-			// If necessary, add an assignment cast to the result column so that
-			// its type matches the function return type.
+			// We must preserve the presentation of columns as physical
+			// properties to prevent the optimizer from pruning the output
+			// column. If necessary, we add an assignment cast to the result
+			// column so that its type matches the function return type. Record return
+			// types do not need an assignment cast, since at this point the return
+			// column is already a tuple.
 			returnCol := physProps.Presentation[0].ID
 			returnColMeta := b.factory.Metadata().ColumnMeta(returnCol)
-			if !returnColMeta.Type.Identical(f.ResolvedType()) {
+			if !types.IsRecordType(f.ResolvedType()) && !returnColMeta.Type.Identical(f.ResolvedType()) {
 				if !cast.ValidCast(returnColMeta.Type, f.ResolvedType(), cast.ContextAssignment) {
 					panic(sqlerrors.NewInvalidAssignmentCastError(
 						returnColMeta.Type, f.ResolvedType(), returnColMeta.Alias))
@@ -758,14 +801,57 @@ func (b *Builder) buildUDF(
 	out = b.factory.ConstructUDF(
 		args,
 		&memo.UDFPrivate{
-			Name:              def.Name,
-			Params:            params,
-			Body:              rels,
-			Typ:               f.ResolvedType(),
-			Volatility:        o.Volatility,
-			CalledOnNullInput: o.CalledOnNullInput,
+			Name:         def.Name,
+			Params:       params,
+			Body:         rels,
+			Typ:          f.ResolvedType(),
+			SetReturning: isSetReturning,
+			Volatility:   o.Volatility,
 		},
 	)
+
+	// If the UDF is strict and non-set-returning, it should not be invoked when
+	// any of the arguments are NULL. To achieve this, we wrap the UDF in a CASE
+	// expression like:
+	//
+	//   CASE WHEN arg1 IS NULL OR arg2 IS NULL OR ... THEN NULL ELSE udf() END
+	//
+	// For strict, set-returning UDFs, the evaluation logic achieves this
+	// behavior.
+	if !isSetReturning && !o.CalledOnNullInput && len(args) > 0 {
+		var anyArgIsNull opt.ScalarExpr
+		for i := range args {
+			// Note: We do NOT use a TupleIsNullExpr here if the argument is a
+			// tuple because a strict UDF will be called if an argument, T, is a
+			// tuple with all NULL elements, even though T IS NULL evaluates to
+			// true. For example:
+			//
+			//   SELECT strict_fn(1, (NULL, NULL)) -- the UDF will be called
+			//   SELECT (NULL, NULL) IS NULL       -- returns true
+			//
+			argIsNull := b.factory.ConstructIs(args[i], memo.NullSingleton)
+			if anyArgIsNull == nil {
+				anyArgIsNull = argIsNull
+				continue
+			}
+			anyArgIsNull = b.factory.ConstructOr(argIsNull, anyArgIsNull)
+		}
+		out = b.factory.ConstructCase(
+			memo.TrueSingleton,
+			memo.ScalarListExpr{
+				b.factory.ConstructWhen(
+					anyArgIsNull,
+					b.factory.ConstructNull(f.ResolvedType()),
+				),
+			},
+			out,
+		)
+	}
+
+	// Synthesize an output column for set-returning UDFs.
+	if isSetReturning && outCol == nil {
+		outCol = b.synthesizeColumn(outScope, scopeColName(""), f.ResolvedType(), nil /* expr */, out)
+	}
 	return b.finishBuildScalar(f, out, inScope, outScope, outCol)
 }
 

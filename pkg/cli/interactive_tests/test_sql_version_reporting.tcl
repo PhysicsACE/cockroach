@@ -55,10 +55,9 @@ system "mv logs/db logs/db-bak"
 start_server $argv
 send "select 1;\r"
 eexpect "opening new connection"
-eexpect "error"
 eexpect "the cluster ID has changed!"
 eexpect "Previous ID:"
-eexpect "New ID:"
+eexpect "New Cluster ID:"
 eexpect root@
 end_test
 
@@ -68,9 +67,9 @@ eexpect eof
 stop_server $argv
 
 start_test "Check that the client picks up a new server version, and warns about lower versions."
-set env(COCKROACH_TESTING_VERSION_TAG) "v0.1.0-fakever"
+set env(COCKROACH_TESTING_VERSION_OVERRIDE) "v0.1.0-fakever"
 start_server $argv
-set env(COCKROACH_TESTING_VERSION_TAG) "v0.2.0-fakever"
+set env(COCKROACH_TESTING_VERSION_OVERRIDE) "v0.2.0-fakever"
 spawn $argv sql --no-line-editor
 send "select 1;\r"
 eexpect "# Client version: CockroachDB"

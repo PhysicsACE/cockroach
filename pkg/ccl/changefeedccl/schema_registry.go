@@ -53,64 +53,105 @@ type confluentSchemaRegistry struct {
 	// The current defaults for httputil.Client sets
 	// DisableKeepAlive's true so we don't have persistent
 	// connections to clean up on teardown.
-	client    *httputil.Client
-	retryOpts retry.Options
+	client     *httputil.Client
+	retryOpts  retry.Options
+	sliMetrics *sliMetrics
 }
 
 var _ schemaRegistry = (*confluentSchemaRegistry)(nil)
 
-func newConfluentSchemaRegistry(baseURL string) (*confluentSchemaRegistry, error) {
+type schemaRegistryParams map[string][]byte
+
+func (s schemaRegistryParams) caCert() []byte {
+	return s[changefeedbase.RegistryParamCACert]
+}
+
+func (s schemaRegistryParams) clientCert() []byte {
+	return s[changefeedbase.RegistryParamClientCert]
+}
+
+func (s schemaRegistryParams) clientKey() []byte {
+	return s[changefeedbase.RegistryParamClientKey]
+}
+
+func getAndDeleteParams(u *url.URL) (schemaRegistryParams, error) {
+	query := u.Query()
+	s := make(schemaRegistryParams, 3)
+	for _, k := range []string{
+		changefeedbase.RegistryParamCACert,
+		changefeedbase.RegistryParamClientCert,
+		changefeedbase.RegistryParamClientKey} {
+		if stringParam := query.Get(k); stringParam != "" {
+			var decoded []byte
+			err := decodeBase64FromString(stringParam, &decoded)
+			if err != nil {
+				return nil, errors.Wrapf(err, "param %s must be base 64 encoded", k)
+			}
+			s[k] = decoded
+			query.Del(k)
+		}
+	}
+	// remove crdb query params to ensure compatibility with schema
+	// registry implementation
+	u.RawQuery = query.Encode()
+	return s, nil
+}
+
+func newConfluentSchemaRegistry(
+	baseURL string, p externalConnectionProvider, sliMetrics *sliMetrics,
+) (*confluentSchemaRegistry, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, errors.Wrap(err, "malformed schema registry url")
+	}
+
+	if u.Scheme == changefeedbase.SinkSchemeExternalConnection {
+		actual, err := p.lookup(u.Host)
+		if err != nil {
+			return nil, err
+		}
+		return newConfluentSchemaRegistry(actual, p, sliMetrics)
 	}
 
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, errors.Errorf("unsupported scheme: %q", u.Scheme)
 	}
 
-	query := u.Query()
-	var caCert []byte
-	if caCertString := query.Get(changefeedbase.RegistryParamCACert); caCertString != "" {
-		err := decodeBase64FromString(caCertString, &caCert)
-		if err != nil {
-			return nil, errors.Wrapf(err, "param %s must be base 64 encoded", changefeedbase.RegistryParamCACert)
-		}
+	s, err := getAndDeleteParams(u)
+	if err != nil {
+		return nil, err
 	}
-	// remove query param to ensure compatibility with schema
-	// registry implementation
-	query.Del(changefeedbase.RegistryParamCACert)
-	u.RawQuery = query.Encode()
 
-	httpClient, err := setupHTTPClient(u, caCert)
+	httpClient, err := setupHTTPClient(u, s)
 	if err != nil {
 		return nil, err
 	}
 
 	retryOpts := base.DefaultRetryOptions()
-	retryOpts.MaxRetries = 2
+	retryOpts.MaxRetries = 5
 	return &confluentSchemaRegistry{
-		baseURL:   u,
-		client:    httpClient,
-		retryOpts: retryOpts,
+		baseURL:    u,
+		client:     httpClient,
+		retryOpts:  retryOpts,
+		sliMetrics: sliMetrics,
 	}, nil
 }
 
 // Setup the httputil.Client to use when dialing Confluent schema registry. If `ca_cert`
 // is set as a query param in the registry URL, client should trust the corresponding
 // cert while dialing. Otherwise, use the DefaultClient.
-func setupHTTPClient(baseURL *url.URL, caCert []byte) (*httputil.Client, error) {
-	if caCert != nil {
-		httpClient, err := newClientFromTLSKeyPair(caCert)
-		if err != nil {
-			return nil, err
-		}
-		if baseURL.Scheme == "http" {
-			log.Warningf(context.Background(), "CA certificate provided but schema registry %s uses HTTP", baseURL)
-		}
-		return httpClient, nil
+func setupHTTPClient(baseURL *url.URL, s schemaRegistryParams) (*httputil.Client, error) {
+	if len(s) == 0 {
+		return httputil.DefaultClient, nil
 	}
-	return httputil.DefaultClient, nil
+	httpClient, err := newClientFromTLSKeyPair(s.caCert(), s.clientCert(), s.clientKey())
+	if err != nil {
+		return nil, err
+	}
+	if baseURL.Scheme == "http" {
+		log.Warningf(context.Background(), "TLS configuration provided but schema registry %s uses HTTP", baseURL)
+	}
+	return httpClient, nil
 }
 
 // Ping checks connectivity to the schema registry using the /mode
@@ -156,8 +197,8 @@ func (r *confluentSchemaRegistry) RegisterSchemaForSubject(
 	}
 
 	var id int32
-	err := r.doWithRetry(ctx, func() error {
-		resp, err := r.client.Post(ctx, u, confluentSchemaContentType, &buf)
+	err := r.doWithRetry(ctx, func() (e error) {
+		resp, err := r.client.Post(ctx, u, confluentSchemaContentType, bytes.NewReader(buf.Bytes()))
 		if err != nil {
 			return errors.Wrap(err, "contacting confluent schema registry")
 		}
@@ -197,7 +238,10 @@ func (r *confluentSchemaRegistry) doWithRetry(ctx context.Context, fn func() err
 		if err == nil {
 			return nil
 		}
-		log.VInfof(ctx, 2, "retrying schema registry operation: %s", err.Error())
+		if r.sliMetrics != nil {
+			r.sliMetrics.SchemaRegistryRetries.Inc(1)
+		}
+		log.VInfof(ctx, 1, "retrying schema registry operation: %s", err.Error())
 	}
 	return changefeedbase.MarkRetryableError(err)
 }

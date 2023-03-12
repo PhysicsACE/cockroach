@@ -10,7 +10,7 @@
 
 syntax = "proto3";
 package cockroach.sql.sessiondatapb;
-option go_package = "sessiondatapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb";
 
 import "gogoproto/gogo.proto";
 
@@ -323,6 +323,29 @@ message LocalOnlySessionData {
   // interesting ordering to require from the input to the group-by expression.
   // This can potentially eliminate a top-k operation.
   bool optimizer_use_limit_ordering_for_streaming_group_by = 88;
+  // CopyFromRetriesEnabled controls whether retries should be internally
+  // attempted for retriable errors.
+  bool copy_from_retries_enabled = 89;
+  // DeclareCursorStatementTimeoutEnabled controls whether statement timeouts
+  // apply during DECLARE CURSOR.
+  bool declare_cursor_statement_timeout_enabled = 90;
+  // OptimizerUseImprovedSplitDisjunctionForJoins enables the optimizer to split
+  // disjunctions (OR expressions) in more cases in join conditions by building a
+  // UNION of two join expressions. If this setting is true, all disjunctions in
+  // inner, semi, and anti joins will be split. If false, only disjunctions
+  // potentially containing an equijoin condition will be split.
+  bool optimizer_use_improved_split_disjunction_for_joins = 91;
+  // InjectRetryErrorsOnCommitEnabled causes statements inside an explicit
+  // transaction to return a transaction retry error just before transcation commit.
+  // It is intended for developers to test their app's retry logic.
+  bool inject_retry_errors_on_commit_enabled = 92;
+  // EnforceHomeRegionFollowerReadsEnabled, when true, allows the use of
+  // follower reads to dynamically detect and report a query's home region
+  // when the enforce_home_region session setting is also true.
+  bool enforce_home_region_follower_reads_enabled = 93;
+  // OptimizerAlwaysUseHistograms, when true, ensures that the optimizer
+  // always uses histograms to calculate statistics if available.
+  bool optimizer_always_use_histograms = 94;
 
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //

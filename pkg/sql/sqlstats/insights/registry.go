@@ -97,28 +97,45 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 	delete(r.statements, sessionID)
 	defer statements.release()
 
-	var slowStatements intsets.Fast
+	// Mark statements which are detected as slow or have a failed status.
+	var slowOrFailedStatements intsets.Fast
 	for i, s := range *statements {
-		if r.detector.isSlow(s) {
-			slowStatements.Add(i)
+		if r.detector.isSlow(s) || isFailed(s) {
+			slowOrFailedStatements.Add(i)
 		}
 	}
-	if slowStatements.Empty() {
+
+	// So far this is the only case when a transaction is considered slow.
+	// In the future, we may want to make a detector for transactions if there
+	// are more cases.
+	highContention := false
+	if transaction.Contention != nil {
+		highContention = transaction.Contention.Seconds() >= LatencyThreshold.Get(&r.causes.st.SV).Seconds()
+	}
+
+	if slowOrFailedStatements.Empty() && !highContention {
+		// We only record an insight if we have slow or failed statements or high txn contention.
 		return
 	}
+
 	// Note that we'll record insights for every statement, not just for
 	// the slow ones.
 	insight := makeInsight(sessionID, transaction)
 
+	if highContention {
+		insight.Transaction.Problems = addProblem(insight.Transaction.Problems, Problem_SlowExecution)
+		insight.Transaction.Causes = addCause(insight.Transaction.Causes, Cause_HighContention)
+	}
+
+	var lastErrorCode string
 	for i, s := range *statements {
-		if slowStatements.Contains(i) {
+		if slowOrFailedStatements.Contains(i) {
 			switch s.Status {
 			case Statement_Completed:
 				s.Problem = Problem_SlowExecution
 				s.Causes = r.causes.examine(s.Causes, s)
 			case Statement_Failed:
-				// Note that we'll be building better failure support for 23.1.
-				// For now, we only mark failed statements that were also slow.
+				lastErrorCode = s.ErrorCode
 				s.Problem = Problem_FailedExecution
 			}
 
@@ -129,9 +146,11 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 			insight.Transaction.Problems = addProblem(insight.Transaction.Problems, s.Problem)
 		}
 
+		insight.Transaction.StmtExecutionIDs = append(insight.Transaction.StmtExecutionIDs, s.ID)
 		insight.Statements = append(insight.Statements, s)
 	}
 
+	insight.Transaction.LastErrorCode = lastErrorCode
 	r.sink.AddInsight(insight)
 }
 

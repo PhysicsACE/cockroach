@@ -9,7 +9,11 @@
 // licenses/APL.txt.
 
 import { createSelector } from "reselect";
-import { RecentExecutions } from "src/recentExecutions/types";
+import {
+  RecentExecutions,
+  RecentTransaction,
+  ExecutionStatus,
+} from "src/recentExecutions/types";
 import { AppState } from "src/store";
 import { selectRecentExecutionsCombiner } from "src/selectors/recentExecutionsCommon.selectors";
 import { selectExecutionID } from "src/selectors/common";
@@ -23,10 +27,13 @@ import {
 // pages that are specific to cluster-ui.
 // They should NOT be exported with the cluster-ui package.
 
-const selectSessions = (state: AppState) => state.adminUI.sessions?.data;
+const selectSessions = (state: AppState) => state.adminUI?.sessions?.data;
 
 const selectClusterLocks = (state: AppState) =>
-  state.adminUI.clusterLocks?.data;
+  state.adminUI?.clusterLocks?.data?.results;
+
+export const selectClusterLocksMaxApiSizeReached = (state: AppState) =>
+  !!state.adminUI?.clusterLocks?.data?.maxSizeReached;
 
 export const selectRecentExecutions = createSelector(
   selectSessions,
@@ -38,6 +45,14 @@ export const selectRecentStatements = createSelector(
   selectRecentExecutions,
   (executions: RecentExecutions) => executions.statements,
 );
+
+export const selectExecutionStatus = () => {
+  const execStatuses: string[] = [];
+  for (const execStatus in ExecutionStatus) {
+    execStatuses.push(execStatus);
+  }
+  return execStatuses;
+};
 
 export const selecteRecentStatement = createSelector(
   selectRecentStatements,
@@ -79,7 +94,7 @@ export const selectContentionDetailsForStatement = createSelector(
 );
 
 export const selectAppName = createSelector(
-  (state: AppState) => state.adminUI.sessions,
+  (state: AppState) => state.adminUI?.sessions,
   response => {
     if (!response.data) return null;
     return response.data.internal_app_name_prefix;

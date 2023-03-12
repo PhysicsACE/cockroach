@@ -37,15 +37,17 @@ ElementState:
     descriptorId: 104
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 104
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 104
+    schemaId: 101
   Status: PUBLIC
 
 setup
@@ -80,15 +82,17 @@ ElementState:
     descriptorId: 106
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 106
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 106
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 106
+    schemaId: 101
   Status: PUBLIC
 
 decompose
@@ -191,6 +195,8 @@ ElementState:
     closedTypeIds: []
     columnId: 1
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: false
     isVirtual: false
@@ -216,6 +222,8 @@ ElementState:
     closedTypeIds: []
     columnId: 2
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -241,6 +249,8 @@ ElementState:
     closedTypeIds: []
     columnId: 4.294967294e+09
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -266,6 +276,8 @@ ElementState:
     closedTypeIds: []
     columnId: 4.294967295e+09
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -292,6 +304,7 @@ ElementState:
     expr: nextval(104:::REGCLASS)
     referencedColumnIds: []
     tableId: 105
+    usesFunctionIds: []
     usesSequenceIds:
     - 104
     usesTypeIds: []
@@ -301,6 +314,7 @@ ElementState:
     expr: 123:::INT8
     referencedColumnIds: []
     tableId: 105
+    usesFunctionIds: []
     usesSequenceIds: []
     usesTypeIds: []
   Status: PUBLIC
@@ -313,6 +327,11 @@ ElementState:
     columnId: 1
     comment: id is a identifier
     pgAttributeNum: 1
+    tableId: 105
+  Status: PUBLIC
+- ColumnNotNull:
+    columnId: 1
+    indexIdForValidation: 0
     tableId: 105
   Status: PUBLIC
 - IndexName:
@@ -363,15 +382,17 @@ ElementState:
     descriptorId: 105
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 105
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 105
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 105
+    schemaId: 101
   Status: PUBLIC
 
 setup
@@ -480,6 +501,8 @@ ElementState:
     closedTypeIds: []
     columnId: 1
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: false
     isVirtual: false
@@ -505,6 +528,8 @@ ElementState:
     closedTypeIds: []
     columnId: 2
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -530,6 +555,8 @@ ElementState:
     closedTypeIds: []
     columnId: 4.294967294e+09
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -555,6 +582,8 @@ ElementState:
     closedTypeIds: []
     columnId: 4.294967295e+09
     computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
     isNullable: true
     isVirtual: false
@@ -580,6 +609,11 @@ ElementState:
     columnId: 1
     comment: id is a identifier
     pgAttributeNum: 1
+    tableId: 105
+  Status: PUBLIC
+- ColumnNotNull:
+    columnId: 1
+    indexIdForValidation: 0
     tableId: 105
   Status: PUBLIC
 - IndexName:
@@ -630,15 +664,17 @@ ElementState:
     descriptorId: 105
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 105
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 105
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 105
+    schemaId: 101
   Status: PUBLIC
 
 decompose
@@ -668,13 +704,15 @@ ElementState:
     descriptorId: 104
     privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
     privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 104
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 104
+    schemaId: 101
   Status: PUBLIC

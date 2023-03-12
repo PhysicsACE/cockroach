@@ -39,7 +39,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -51,14 +52,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -74,10 +76,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v4"
 	"github.com/linkedin/goavro/v2"
 	"github.com/stretchr/testify/assert"
@@ -410,6 +414,16 @@ ORDER BY table_name
 			data:   "$foo$\tnormal",
 			query: map[string][][]string{
 				`SELECT * from t`: {{"foo", "normal"}},
+			},
+		},
+		{
+			name:   "unescaped newline in quoted field",
+			create: `a string, b string`,
+			with:   `WITH fields_enclosed_by = '$'`,
+			typ:    "DELIMITED",
+			data:   "foo\t$foo\nbar$\nfoo\tbar",
+			query: map[string][][]string{
+				`SELECT * FROM t`: {{"foo", "foo\nbar"}, {"foo", "bar"}},
 			},
 		},
 		{
@@ -1684,6 +1698,23 @@ func TestImportRowLimit(t *testing.T) {
 	conn := tc.ServerConn(0)
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
+	// Also create a pgx connection so we can check notices.
+	pgURL, cleanup := sqlutils.PGUrl(
+		t,
+		tc.Server(0).ServingSQLAddr(),
+		"TestImportRowLimit",
+		url.User(username.RootUser),
+	)
+	defer cleanup()
+	config, err := pgx.ParseConfig(pgURL.String())
+	require.NoError(t, err)
+	var noticeMsg string
+	config.OnNotice = func(_ *pgconn.PgConn, notice *pgconn.Notice) {
+		noticeMsg = notice.Message
+	}
+	pgxConn, err := pgx.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+
 	avroField := []map[string]interface{}{
 		{
 			"name": "a",
@@ -1864,14 +1895,25 @@ func TestImportRowLimit(t *testing.T) {
 
 					// Import table from dump format.
 					importDumpQuery := fmt.Sprintf(`IMPORT TABLE t FROM %s ($1) %s`, test.typ, test.with)
-					sqlDB.Exec(t, importDumpQuery, srv.URL)
+					_, err := pgxConn.Exec(ctx, importDumpQuery, srv.URL)
+					require.NoError(t, err)
+					require.Regexp(t, fmt.Sprintf(
+						"IMPORT %s has been deprecated in 23.1.*See https://www.cockroachlabs.com/docs/.*/migration-overview for alternatives.",
+						test.typ,
+					), noticeMsg)
+
 					sqlDB.CheckQueryResults(t, test.verifyQuery, test.expected)
 
 					sqlDB.Exec(t, `DROP TABLE t`)
 
 					// Import dump format directly.
 					importDumpQuery = fmt.Sprintf(`IMPORT %s ($1) %s`, test.typ, test.with)
-					sqlDB.Exec(t, importDumpQuery, srv.URL)
+					_, err = pgxConn.Exec(ctx, importDumpQuery, srv.URL)
+					require.NoError(t, err)
+					require.Regexp(t, fmt.Sprintf(
+						"IMPORT %s has been deprecated in 23.1.*See https://www.cockroachlabs.com/docs/.*/migration-overview for alternatives.",
+						test.typ,
+					), noticeMsg)
 					sqlDB.CheckQueryResults(t, test.verifyQuery, test.expected)
 
 					sqlDB.Exec(t, `DROP TABLE t`)
@@ -2060,8 +2102,8 @@ func TestFailedImportGC(t *testing.T) {
 	dbID := sqlutils.QueryDatabaseID(t, sqlDB.DB, "failedimport")
 	tableID := descpb.ID(dbID + 2)
 	var td catalog.TableDescriptor
-	if err := sql.TestingDescsTxn(ctx, tc.Server(0), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) (err error) {
-		td, err = col.ByID(txn).Get().Table(ctx, tableID)
+	if err := sql.TestingDescsTxn(ctx, tc.Server(0), func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
+		td, err = col.ByID(txn.KV()).Get().Table(ctx, tableID)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -2120,7 +2162,7 @@ func TestImportIntoCSVCancel(t *testing.T) {
 		tc.Server(i).JobRegistry().(*jobs.Registry).TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
 			jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
 				r := raw.(*importResumer)
-				r.testingKnobs.onSetupFinish = func() {
+				r.testingKnobs.onSetupFinish = func(flowinfra.Flow) {
 					close(setupDoneCh)
 				}
 				return r
@@ -2766,11 +2808,12 @@ func TestImportObjectLevelRBAC(t *testing.T) {
 
 	writeToUserfile := func(filename, data string) {
 		// Write to userfile storage now that testuser has CREATE privileges.
-		ie := tc.Server(0).InternalExecutor().(*sql.InternalExecutor)
-		ief := tc.Server(0).InternalExecutorFactory().(sqlutil.InternalExecutorFactory)
-		fileTableSystem1, err := cloud.ExternalStorageFromURI(ctx, dest, base.ExternalIODirConfig{},
-			cluster.NoSettings, blobs.TestEmptyBlobClientFactory, username.TestUserName(), ie, ief,
-			tc.Server(0).DB(), nil, cloud.NilMetrics)
+		ief := tc.Server(0).InternalDB().(isql.DB)
+		fileTableSystem1, err := cloud.ExternalStorageFromURI(
+			ctx, dest, base.ExternalIODirConfig{},
+			cluster.NoSettings, blobs.TestEmptyBlobClientFactory,
+			username.TestUserName(), ief, nil, cloud.NilMetrics,
+		)
 		require.NoError(t, err)
 		require.NoError(t, cloud.WriteFile(ctx, fileTableSystem1, filename, bytes.NewReader([]byte(data))))
 	}
@@ -5199,7 +5242,9 @@ func TestImportControlJobRBAC(t *testing.T) {
 	}, jobs.UsesTenantCostControl)
 
 	startLeasedJob := func(t *testing.T, record jobs.Record) *jobs.StartableJob {
-		job, err := jobs.TestingCreateAndStartJob(ctx, registry, tc.Server(0).DB(), record)
+		job, err := jobs.TestingCreateAndStartJob(
+			ctx, registry, tc.Server(0).InternalDB().(isql.DB), record,
+		)
 		require.NoError(t, err)
 		return job
 	}
@@ -5994,9 +6039,7 @@ func TestImportPgDumpIgnoredStmts(t *testing.T) {
 			tc.Server(0).ClusterSettings(),
 			blobs.TestEmptyBlobClientFactory,
 			username.RootUserName(),
-			tc.Server(0).InternalExecutor().(*sql.InternalExecutor),
-			tc.Server(0).InternalExecutorFactory().(sqlutil.InternalExecutorFactory),
-			tc.Server(0).DB(),
+			tc.Server(0).InternalDB().(isql.DB),
 			nil,
 			cloud.NilMetrics,
 		)
@@ -6230,10 +6273,15 @@ func TestImportPgDumpSchemas(t *testing.T) {
 	baseDir := datapathutils.TestDataPath(t, "pgdump")
 	mkArgs := func() base.TestServerArgs {
 		s := cluster.MakeTestingClusterSettings()
-		storage.MVCCRangeTombstonesEnabled.Override(ctx, &s.SV, true)
+		storage.MVCCRangeTombstonesEnabledInMixedClusters.Override(ctx, &s.SV, true)
 		return base.TestServerArgs{
 			Settings:      s,
 			ExternalIODir: baseDir,
+			Knobs: base.TestingKnobs{
+				KeyVisualizer: &keyvisualizer.TestingKnobs{
+					SkipJobBootstrap: true,
+				},
+			},
 		}
 	}
 
@@ -6411,8 +6459,8 @@ func TestImportPgDumpSchemas(t *testing.T) {
 
 		for _, schemaID := range schemaIDs {
 			// Expect that the schema descriptor is deleted.
-			if err := sql.TestingDescsTxn(ctx, tc.Server(0), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-				_, err := col.ByID(txn).Get().Schema(ctx, schemaID)
+			if err := sql.TestingDescsTxn(ctx, tc.Server(0), func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+				_, err := col.ByID(txn.KV()).Get().Schema(ctx, schemaID)
 				if pgerror.GetPGCode(err) == pgcode.InvalidSchemaName {
 					return nil
 				}
@@ -6427,8 +6475,8 @@ func TestImportPgDumpSchemas(t *testing.T) {
 
 		for _, tableID := range tableIDs {
 			// Expect that the table descriptor is deleted.
-			if err := sql.TestingDescsTxn(ctx, tc.Server(0), func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-				_, err := col.ByID(txn).Get().Table(ctx, tableID)
+			if err := sql.TestingDescsTxn(ctx, tc.Server(0), func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+				_, err := col.ByID(txn.KV()).Get().Table(ctx, tableID)
 				if !testutils.IsError(err, "descriptor not found") {
 					return err
 				}
@@ -7014,7 +7062,11 @@ func TestImportJobEventLogging(t *testing.T) {
 		&unused)
 
 	expectedStatus := []string{string(jobs.StatusSucceeded), string(jobs.StatusRunning)}
-	jobstest.CheckEmittedEvents(t, expectedStatus, beforeImport.UnixNano(), jobID, "import", "IMPORT")
+	expectedRecoveryEvent := eventpb.RecoveryEvent{
+		RecoveryType: importJobRecoveryEventType,
+		NumRows:      int64(1000),
+	}
+	jobstest.CheckEmittedEvents(t, expectedStatus, beforeImport.UnixNano(), jobID, "import", "IMPORT", expectedRecoveryEvent)
 
 	sqlDB.Exec(t, `DROP TABLE simple`)
 
@@ -7031,7 +7083,17 @@ func TestImportJobEventLogging(t *testing.T) {
 		string(jobs.StatusFailed), string(jobs.StatusReverting),
 		string(jobs.StatusRunning),
 	}
-	jobstest.CheckEmittedEvents(t, expectedStatus, beforeSecondImport.UnixNano(), jobID, "import", "IMPORT")
+	expectedRecoveryEvent = eventpb.RecoveryEvent{
+		RecoveryType: importJobRecoveryEventType,
+		NumRows:      int64(1000),
+	}
+	// Note that different from RESTORE, for canceled or failed job, recovery
+	// events for IMPORT still shows the changed number of rows (hence we're not
+	// resetting the NumRows in expectedRecoveryEvent to 0 here). It's because
+	// we record the count of inserted rows prior to executing testingKnobs.afterImport
+	// (see `importResumer.Resume()`) so that we can test on resuming the interrupted
+	// import process (such as TestCSVImportCanBeResumed).
+	jobstest.CheckEmittedEvents(t, expectedStatus, beforeSecondImport.UnixNano(), jobID, "import", "IMPORT", expectedRecoveryEvent)
 }
 
 func TestImportDefautIntSizeSetting(t *testing.T) {
@@ -7188,10 +7250,10 @@ func TestUDTChangeDuringImport(t *testing.T) {
 						JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 						Store: &kvserver.StoreTestingKnobs{
 							TestingResponseFilter: jobutils.BulkOpResponseFilter(&allowResponse),
-							TestingRequestFilter: func(ctx context.Context, br *roachpb.BatchRequest) *roachpb.Error {
+							TestingRequestFilter: func(ctx context.Context, br *kvpb.BatchRequest) *kvpb.Error {
 								for _, ru := range br.Requests {
 									switch ru.GetInner().(type) {
-									case *roachpb.AddSSTableRequest:
+									case *kvpb.AddSSTableRequest:
 										<-requestReceived
 									}
 								}
@@ -7277,7 +7339,8 @@ CREATE TABLE a (
     FAMILY (c)
 )`)
 		data = "1,1,1\n1,2,1" // 1,1,1 is unindexed, 1,2,1 is indexed
-		sqlDB.Exec(t, fmt.Sprintf(`IMPORT INTO a CSV DATA ('%s')`, srv.URL))
+		importQuery := fmt.Sprintf(`IMPORT INTO a CSV DATA ('%s')`, srv.URL)
+		sqlDB.Exec(t, importQuery)
 		sqlDB.CheckQueryResults(t, `SELECT * FROM a@idx_c_b_gt_1 WHERE b > 1`, [][]string{
 			{"1", "2", "1"},
 		})

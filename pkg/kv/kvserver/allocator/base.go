@@ -23,12 +23,6 @@ import (
 )
 
 const (
-	// MaxFractionUsedThreshold controls the point at which the store cedes having
-	// room for new replicas. If the fraction used of a store descriptor capacity
-	// is greater than this value, it will never be used as a rebalance or
-	// allocate target and we will actively try to move replicas off of it.
-	MaxFractionUsedThreshold = 0.95
-
 	// MinQPSThresholdDifference is the minimum QPS difference from the cluster
 	// mean that this system should care about. In other words, we won't worry
 	// about rebalancing for QPS reasons if a store's QPS differs from the mean by
@@ -36,6 +30,30 @@ const (
 	// threshold. This avoids too many lease transfers / range rebalances in
 	// lightly loaded clusters.
 	MinQPSThresholdDifference = 100
+
+	// MinCPUThresholdDifference is the minimum CPU difference from the cluster
+	// mean that this system should care about. The system won't attempt to
+	// take action if a store's CPU differs from the mean by less than this
+	// amount even if it is greater than the percentage threshold. This
+	// prevents too many lease transfers or range rebalances in lightly loaded
+	// clusters.
+	//
+	// NB: This represents 5% (1/20) utilization of 1 cpu on average.  This
+	// number was arrived at from testing to minimize thrashing. This number is
+	// set independent of processor speed and assumes identical value of cpu
+	// time across all stores. i.e. all cpu's are identical.
+	MinCPUThresholdDifference = float64(50 * time.Millisecond)
+
+	// MinCPUDifferenceForTransfers is the minimum CPU difference that a
+	// store rebalncer would care about to reconcile (via lease or replica
+	// rebalancing) between any two stores.
+	//
+	// NB: This is set to be two times the minimum threshold that a store needs
+	// to be above or below the mean to be considered overfull or underfull
+	// respectively. This is to make lease transfers and replica rebalances
+	// less sensistive to jitters in any given workload by introducing
+	// additional friction before taking these actions.
+	MinCPUDifferenceForTransfers = 2 * MinCPUThresholdDifference
 
 	// defaultLoadBasedRebalancingInterval is how frequently to check the store-level
 	// balance of the cluster.
@@ -47,11 +65,6 @@ const (
 type AllocationError interface {
 	error
 	AllocationErrorMarker() // dummy method for unique interface
-}
-
-// MaxCapacityCheck returns true if the store has room for a new replica.
-func MaxCapacityCheck(store roachpb.StoreDescriptor) bool {
-	return store.Capacity.FractionUsed() < MaxFractionUsedThreshold
 }
 
 // IsStoreValid returns true iff the provided store would be a valid in a
@@ -99,6 +112,27 @@ var QPSRebalanceThreshold = func() *settings.FloatSetting {
 		func(f float64) error {
 			if f < 0.01 {
 				return errors.Errorf("cannot set kv.allocator.qps_rebalance_threshold to less than 0.01")
+			}
+			return nil
+		},
+	)
+	s.SetVisibility(settings.Public)
+	return s
+}()
+
+// CPURebalanceThreshold is the minimum ratio of a store's cpu time to the mean
+// cpu time at which that store is considered overfull or underfull of cpu
+// usage.
+var CPURebalanceThreshold = func() *settings.FloatSetting {
+	s := settings.RegisterFloatSetting(
+		settings.SystemOnly,
+		"kv.allocator.store_cpu_rebalance_threshold",
+		"minimum fraction away from the mean a store's cpu usage can be before it is considered overfull or underfull",
+		0.10,
+		settings.NonNegativeFloat,
+		func(f float64) error {
+			if f < 0.01 {
+				return errors.Errorf("cannot set kv.allocator.store_cpu_rebalance_threshold to less than 0.01")
 			}
 			return nil
 		},
