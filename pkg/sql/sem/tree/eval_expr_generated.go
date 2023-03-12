@@ -58,6 +58,7 @@ type ExprEvaluator interface {
 	EvalUnaryExpr(context.Context, *UnaryExpr) (Datum, error)
 	EvalUnqualifiedStar(context.Context, UnqualifiedStar) (Datum, error)
 	EvalUnresolvedName(context.Context, *UnresolvedName) (Datum, error)
+	EvalNamedArgExpr(context.Context, *NamedArgExpr) (Datum, error)
 }
 
 
@@ -119,6 +120,11 @@ func (node *ColumnItem) Eval(ctx context.Context, v ExprEvaluator) (Datum, error
 // Eval is part of the TypedExpr interface.
 func (node *ComparisonExpr) Eval(ctx context.Context, v ExprEvaluator) (Datum, error) {
 	return v.EvalComparisonExpr(ctx, node)
+}
+
+// Eval is part of the TypedExpr interface.
+func (node *NamedArgExpr) Eval(ctx context.Context, v ExprEvaluator) (Datum, error) {
+	return v.EvalNamedArgExpr(ctx, node)
 }
 
 // Eval is part of the TypedExpr interface.

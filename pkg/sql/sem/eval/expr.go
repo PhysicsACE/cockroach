@@ -688,4 +688,8 @@ func (e *evaluator) EvalUnqualifiedStar(
 	return nil, errors.AssertionFailedf("unhandled type %T", star)
 }
 
+func (e *evaluator) EvalNamedArgExpr(ctx context.Context, expr *tree.NamedArgExpr) (tree.Datum, error) {
+	return nil, errors.AssertionFailedf("named arg should not be seen by the evaluator")
+}
+
 var _ tree.ExprEvaluator = (*evaluator)(nil)

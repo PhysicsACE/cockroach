@@ -1,2 +1,2 @@
 values_clause ::=
-	'VALUES' '(' a_expr ( ( ',' a_expr ) )* ')' ( ( ',' '(' ( ( a_expr ) ( ( ',' a_expr ) )* ) ')' ) )*
+	'VALUES' '(' a_expr ( ( ',' a_expr | ',' named_param ) )* ')' ( ( ',' '(' ( ( a_expr ) ( ( ',' a_expr | ',' named_param ) )* ) ')' ) )*

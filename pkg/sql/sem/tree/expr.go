@@ -1681,6 +1681,45 @@ func (node *ColumnAccessExpr) Format(ctx *FmtCtx) {
 	}
 }
 
+// NamedArgExpr represents arguments passed in function calls
+// of the form name => value which can be used to pass
+// specific arguments to function calls and fill in the rest
+// with their predefined default values at function creation
+type NamedArgExpr struct {
+
+	// Name of the argument being referenced
+	ArgName Name
+
+	// The expression being passed to the argument name
+	ArgValue Expr
+
+	typeAnnotation
+
+}
+
+// NewNamedArgExpr returns a new NamedArgExpr that is verified to be well-typed.
+func NewTypedNamedArgExpr(argName Name, expr TypedExpr, typ *types.T) *NamedArgExpr {
+	node := &NamedArgExpr{
+		ArgName:        argName,
+		ArgValue: expr,
+	}
+	node.typ = typ
+	return node
+}
+
+func (node *NamedArgExpr) Format(ctx *FmtCtx) {
+	ctx.FormatNode(&node.ArgName)
+	ctx.WriteString("NAMEDARG ")
+	ctx.FormatNode(node.ArgValue)
+}
+
+func (node *NamedArgExpr) ResolvedType() *types.T {
+	if node.typ == nil {
+		return types.Any
+	}
+	return node.typ
+}
+
 func (node *AliasedTableExpr) String() string { return AsString(node) }
 func (node *ParenTableExpr) String() string   { return AsString(node) }
 func (node *JoinTableExpr) String() string    { return AsString(node) }
@@ -1751,3 +1790,4 @@ func (node PartitionMinVal) String() string   { return AsString(node) }
 func (node *Placeholder) String() string      { return AsString(node) }
 func (node dNull) String() string             { return AsString(node) }
 func (list *NameList) String() string         { return AsString(list) }
+func (node *NamedArgExpr) String() string     { return AsString(node) }

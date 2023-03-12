@@ -829,6 +829,19 @@ func (expr *ColumnAccessExpr) TypeCheck(
 	return expr, nil
 }
 
+func (expr *NamedArgExpr) TypeCheck(
+	ctx context.Context, semaCtx *SemaContext, desired *types.T,
+) (TypedExpr, error) {
+	subExpr, err := expr.ArgValue.TypeCheck(ctx, semaCtx, types.Any)
+	if err != nil {
+		return nil, err
+	}
+
+	resolvedType := subExpr.ResolvedType()
+	node := NewTypedNamedArgExpr(expr.ArgName, subExpr, resolvedType)
+	return node, nil
+}
+
 // TypeCheck implements the Expr interface.
 func (expr *CoalesceExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
@@ -1219,6 +1232,11 @@ func (expr *FuncExpr) TypeCheck(
 	for i, subExpr := range s.typedExprs {
 		expr.Exprs[i] = subExpr
 	}
+
+	// Generate a new exprs list with the positions mapped with their named argument or subed in with 
+	// the positional arguments respective default argument by using parser.parseExpr on the serialized
+	// form of the default value provided during CREATE FUNCTION ...
+	
 	expr.fn = overloadImpl
 	expr.fnProps = &overloadImpl.FunctionProperties
 	expr.typ = overloadImpl.returnType()(s.typedExprs)
@@ -2399,7 +2417,7 @@ func typeCheckSameTypedExprs(
 	// TODO(nvanbenschoten): Look into reducing allocations here.
 	typedExprs := make([]TypedExpr, len(exprs))
 
-	constIdxs, placeholderIdxs, resolvableIdxs := typeCheckSplitExprs(exprs)
+	constIdxs, placeholderIdxs, resolvableIdxs, _ := typeCheckSplitExprs(exprs)
 
 	s := typeCheckExprsState{
 		ctx:             ctx,
@@ -2593,24 +2611,31 @@ func typeCheckConstsAndPlaceholdersWithDesired(
 	return s.typedExprs, typ, nil
 }
 
+func isNamedArgExpr(expr Expr) bool {
+	_, ok := expr.(*NamedArgExpr)
+	return ok
+}
+
 // typeCheckSplitExprs splits the expressions into three groups of indexes:
 // - Constants
 // - Placeholders
 // - All other Exprs
 func typeCheckSplitExprs(
 	exprs []Expr,
-) (constIdxs intsets.Fast, placeholderIdxs intsets.Fast, resolvableIdxs intsets.Fast) {
+) (constIdxs intsets.Fast, placeholderIdxs intsets.Fast, resolvableIdxs intsets.Fast, namedArgIdxs intsets.Fast) {
 	for i, expr := range exprs {
 		switch {
 		case isConstant(expr):
 			constIdxs.Add(i)
 		case isPlaceholder(expr):
 			placeholderIdxs.Add(i)
+		case isNamedArgExpr(expr):
+			namedArgIdxs.Add(i)
 		default:
 			resolvableIdxs.Add(i)
 		}
 	}
-	return constIdxs, placeholderIdxs, resolvableIdxs
+	return constIdxs, placeholderIdxs, resolvableIdxs, namedArgIdxs
 }
 
 // typeCheckTupleComparison type checks a comparison between two tuples,

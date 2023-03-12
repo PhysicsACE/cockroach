@@ -1000,7 +1000,7 @@ standalone_index_name ::=
 	db_object_name
 
 expr_list ::=
-	( a_expr ) ( ( ',' a_expr ) )*
+	( a_expr ) ( ( ',' a_expr | ',' named_param ) )*
 
 unreserved_keyword ::=
 	'ABORT'
@@ -2020,6 +2020,9 @@ unrestricted_name ::=
 	| col_name_keyword
 	| type_func_name_keyword
 	| reserved_keyword
+
+named_param ::=
+	unrestricted_name 'NAMEDARG' a_expr
 
 function_with_paramtypes ::=
 	db_object_name func_params

@@ -918,7 +918,7 @@ func (u *sqlSymUnion) showRangesOpts() *tree.ShowRangesOptions {
 %token <str> MULTIPOINT MULTIPOINTM MULTIPOINTZ MULTIPOINTZM
 %token <str> MULTIPOLYGON MULTIPOLYGONM MULTIPOLYGONZ MULTIPOLYGONZM
 
-%token <str> NAN NAME NAMES NATURAL NEVER NEW_DB_NAME NEW_KMS NEXT NO NOCANCELQUERY NOCONTROLCHANGEFEED
+%token <str> NAN NAME NAMEDARG NAMES NATURAL NEVER NEW_DB_NAME NEW_KMS NEXT NO NOCANCELQUERY NOCONTROLCHANGEFEED
 %token <str> NOCONTROLJOB NOCREATEDB NOCREATELOGIN NOCREATEROLE NOLOGIN NOMODIFYCLUSTERSETTING
 %token <str> NOSQLLOGIN NO_INDEX_JOIN NO_ZIGZAG_JOIN NO_FULL_SCAN NONE NONVOTERS NORMAL NOT
 %token <str> NOTHING NOTHING_AFTER_RETURNING
@@ -1448,7 +1448,7 @@ func (u *sqlSymUnion) showRangesOpts() *tree.ShowRangesOptions {
 %type <*tree.IndexFlags> opt_index_flags
 %type <*tree.IndexFlags> index_flags_param
 %type <*tree.IndexFlags> index_flags_param_list
-%type <tree.Expr> a_expr b_expr c_expr d_expr typed_literal
+%type <tree.Expr> a_expr b_expr c_expr d_expr typed_literal named_param
 %type <tree.Expr> substr_from substr_for
 %type <tree.Expr> in_expr
 %type <tree.Expr> having_clause
@@ -1606,7 +1606,6 @@ func (u *sqlSymUnion) showRangesOpts() *tree.ShowRangesOptions {
 %type <*tree.RoutineBody> opt_routine_body
 %type <tree.FuncObj> function_with_paramtypes
 %type <tree.FuncObjs> function_with_paramtypes_list
-
 %type <*tree.LabelSpec> label_spec
 
 %type <*tree.ShowRangesOptions> opt_show_ranges_options show_ranges_options
@@ -14857,6 +14856,17 @@ expr_list:
 | expr_list ',' a_expr
   {
     $$.val = append($1.exprs(), $3.expr())
+  }
+| expr_list ',' named_param
+  {
+    $$.val = append($1.exprs(), $3.expr())
+  }
+
+
+named_param:
+  unrestricted_name NAMEDARG a_expr
+  {
+    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), ArgValue: $3.expr() }
   }
 
 type_list:

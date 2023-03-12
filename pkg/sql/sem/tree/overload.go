@@ -296,6 +296,9 @@ type TypeList interface {
 	Types() []*types.T
 	// String returns a human readable signature
 	String() string
+	// MatchNames sees if overload parameter names can be satisfied by the provided 
+	// named arguments
+	MatchNames(ctx context.Context, semaCtx *SemaContext, arr []*NamedArgExpr) bool
 }
 
 var _ TypeList = ParamTypes{}
@@ -381,6 +384,49 @@ func (p ParamTypes) String() string {
 	return s.String()
 }
 
+func (p ParamTypes) MatchNames(ctx context.Context, semaCtx *SemaContext, arr []*NamedArgExpr) bool {
+
+	if len(arr) == 0 {
+		return true
+	}
+
+	paramDict := make(map[string]int)
+	for i, param := range p {
+		paramDict[param.Name] = i
+	}
+
+	// check if all the names used in the function call are present in the 
+	// candidate parameters list
+	for _, n := range arr {
+		if idx, ok := paramDict[string(n.ArgName)]; ok {
+			typ, err := n.ArgValue.TypeCheck(ctx, semaCtx, types.Any)
+			if err != nil {
+				return false
+			}
+			if !(p.MatchAt(typ.ResolvedType(), idx)) {
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+
+	// named arguments are unordered positional aruguments assuming they are 
+	// correct. We can apply the same cases that applied to the positional
+	// args and check if they satisfy the heuristics. For each named argument
+	// we split it into the cases where NamedArgExpr.Expr is either a constant
+	// expression, a placeholder or a resolvable expression. We typecheck 
+	// each named expression with respect to its corresponding parameter type
+	// as at this point, we know that the current ParamTypes has the potential 
+	// to be a match for the current function resolution. In the case of default
+	// args, we check to see that the missing arguments not provided in the 
+	// expression list all at default values that were provided where the 
+	// UDF was defined and stored into the schema. 
+
+
+	return true
+}
+
 // HomogeneousType is a TypeList implementation that accepts any arguments, as
 // long as all are the same type or NULL. The homogeneous constraint is enforced
 // in typeCheckOverloadedExprs.
@@ -418,6 +464,10 @@ func (HomogeneousType) Types() []*types.T {
 
 func (HomogeneousType) String() string {
 	return "anyelement..."
+}
+
+func (HomogeneousType) MatchNames(ctx context.Context, semaCtx *SemaContext, arr []*NamedArgExpr) bool {
+	return len(arr) == 0
 }
 
 // VariadicType is a TypeList implementation which accepts a fixed number of
@@ -485,6 +535,10 @@ func (v VariadicType) String() string {
 	}
 	fmt.Fprintf(&s, "%s...", v.VarType)
 	return s.String()
+}
+
+func (v VariadicType) MatchNames(ctx context.Context, semaCtx *SemaContext, arr []*NamedArgExpr) bool {
+	return len(arr) == 0
 }
 
 // UnknownReturnType is returned from ReturnTypers when the arguments provided are
@@ -567,6 +621,7 @@ type overloadTypeChecker struct {
 	resolvableIdxs  intsets.Fast // index into exprs/typedExprs
 	constIdxs       intsets.Fast // index into exprs/typedExprs
 	placeholderIdxs intsets.Fast // index into exprs/typedExprs
+	namedArgIdxs    intsets.Fast // index into exprs/typedExprs
 	overloadsIdxArr [16]uint8
 }
 
@@ -648,6 +703,27 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 		return errors.AssertionFailedf("too many overloads (%d > 255)", numOverloads)
 	}
 
+	// hasNamed := false
+	var argNames []*NamedArgExpr
+	namedSeen := false
+	for _, pexpr := range s.exprs {
+		if namedExpr, ok := pexpr.(*NamedArgExpr); ok {
+			// hasNamed = true
+			// argNames[string(namedExpr.ArgName)] = i
+			argNames = append(argNames, namedExpr)
+			namedSeen = true
+			continue
+		}
+
+		if namedSeen {
+			return errors.AssertionFailedf("positional argument cannot come after named argument")
+		}
+	}
+
+	if len(argNames) > 0 {
+		return errors.AssertionFailedf("named args not supported")
+	}
+
 	// Special-case the HomogeneousType overload. We determine its return type by checking that
 	// all parameters have the same type.
 	for i := range s.params {
@@ -673,7 +749,7 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 	} else {
 		s.typedExprs = make([]TypedExpr, len(s.exprs))
 	}
-	s.constIdxs, s.placeholderIdxs, s.resolvableIdxs = typeCheckSplitExprs(s.exprs)
+	s.constIdxs, s.placeholderIdxs, s.resolvableIdxs, s.namedArgIdxs = typeCheckSplitExprs(s.exprs)
 
 	// If no overloads are provided, just type check parameters and return.
 	if numOverloads == 0 {
@@ -713,6 +789,9 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 		}
 		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, filter)
 	}
+
+	matchArgnames := func(params TypeList) bool {return params.MatchNames(ctx , semaCtx, argNames)}
+	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchArgnames)
 
 	// TODO(nvanbenschoten): We should add a filtering step here to filter
 	// out impossible candidates based on identical parameters. For instance,
@@ -762,6 +841,19 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 		})
 	}
 
+	var namedConstantIdxs intsets.Fast
+	for i, ok := s.namedArgIdxs.Next(0); ok; i, ok = s.namedArgIdxs.Next(i + 1) {
+		argExpr := s.exprs[i].(*NamedArgExpr)
+		if isConstant(argExpr.ArgValue) {
+			namedArgIdxs.Add(i)
+		}
+		typ, err := s.exprs[i].TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			return err
+		}
+		s.typedExprs[i] = typ
+	}
+
 	// At this point, all remaining overload candidates accept the argument list,
 	// so we begin checking for a single remainig candidate implementation to choose.
 	// In case there is more than one candidate remaining, the following code uses
@@ -800,6 +892,20 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 				break
 			}
 		}
+	}
+
+	if !s.namedArgIdxs.Empty() {
+		for i, ok := s.namedArgIdxs.Next(0); ok; i, ok = s.namedArgIdxs.Next(i + 1) {
+			argExpr := s.exprs[i].(*NamedArgExpr)
+			typ, err := argExpr.TypeCheck(ctx, semaCtx, types.Any)
+			if err != nil {
+				return err
+			}
+			s.typedExprs[i] = typ
+			if !homogeneousTyp.Equivalent(s.typedExprs[i].ResolvedType()) {
+				homogeneousTyp = nil
+				break
+			}
 	}
 
 	if !s.constIdxs.Empty() {

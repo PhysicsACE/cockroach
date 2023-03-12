@@ -620,6 +620,33 @@ func (b *Builder) buildUDF(
 ) (out opt.ScalarExpr) {
 	o := f.ResolvedOverload()
 
+	// argTypes, ok := o.Types.(tree.ParamTypes)
+	// if !ok {
+	// 	panic(unimplemented.NewWithIssue(88947,
+	// 		"variadiac user-defined functions are not yet supported"))
+	// }
+
+	// posDict := make(map[string]int)
+	// for i := range argTypes {
+	// 	paramType := &argTypes[i]
+	// 	posDict[paramType.Name] = i
+	// }
+
+	// resolvedExprs := make(tree.Exprs, len(argTypes))
+	// for i, pexpr := range f.Exprs {
+	// 	if namedArg, ok := pexpr.(*tree.NamedArgExpr); ok {
+	// 		argPos, ok := posDict[namedArg.Argname]
+	// 		if !ok {
+	// 			// raise invalid name error for named argument
+	// 		}
+
+	// 		resolvedExprs[argPos] = pexpr.ArgValue
+	// 	} else {
+	// 		resolvedExprs[i] = pexpr
+	// 	}
+	// }
+	
+
 	// Build the argument expressions.
 	var args memo.ScalarListExpr
 	if len(f.Exprs) > 0 {
