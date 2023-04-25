@@ -748,7 +748,16 @@ func (node *CoalesceExpr) GetWhenCondition(i int) (whenCond Expr) {
 }
 
 // DefaultVal represents the DEFAULT expression.
-type DefaultVal struct{}
+type DefaultVal struct{
+
+	// DefaultVal accepts an optional field which is a serialized expr
+	// which can be parsed and typed during building. This is needed 
+	// to execute default values to UDFs as the parsing of serialized 
+	// exprs cannot be done in TypeCheck due to cyclic dependencies between 
+	// the tree package and the parser package. It will still work the same 
+	// for its uses to represent default options SQL statements. 
+	stringExpr string
+}
 
 // Format implements the NodeFormatter interface.
 func (node DefaultVal) Format(ctx *FmtCtx) {
@@ -757,6 +766,12 @@ func (node DefaultVal) Format(ctx *FmtCtx) {
 
 // ResolvedType implements the TypedExpr interface.
 func (DefaultVal) ResolvedType() *types.T { return nil }
+
+func (DefaultVal) NewTypedDefaultVal(serialized string) *DefaultVal {
+	return &DefaultVal{
+		stringExpr: serialized,
+	}
+}
 
 // PartitionMaxVal represents the MAXVALUE expression.
 type PartitionMaxVal struct{}
@@ -1270,6 +1285,9 @@ type FuncExpr struct {
 	typeAnnotation
 	fnProps *FunctionProperties
 	fn      *Overload
+
+	// IsVariadic signifies if a variadic argument was passed as a expr
+	IsVariadic bool
 }
 
 // NewTypedFuncExpr returns a FuncExpr that is already well-typed and resolved.
@@ -1282,6 +1300,7 @@ func NewTypedFuncExpr(
 	typ *types.T,
 	props *FunctionProperties,
 	overload *Overload,
+	variable bool,
 ) *FuncExpr {
 	f := &FuncExpr{
 		Func:           ref,
@@ -1292,6 +1311,7 @@ func NewTypedFuncExpr(
 		typeAnnotation: typeAnnotation{typ: typ},
 		fn:             overload,
 		fnProps:        props,
+		IsVariadic: variable,
 	}
 	for i, e := range exprs {
 		f.Exprs[i] = e
@@ -1711,21 +1731,30 @@ type NamedArgExpr struct {
 	// The expression being passed to the argument name
 	ArgValue Expr
 
+	// Used to signify if the variadic identifier was attached to this named arg
+	// Named arg referencing a variadic mode argument does not match if it does
+	// not have the variadic identifier as well. 
+	IsVariadic bool
+
 	typeAnnotation
 
 }
 
 // NewNamedArgExpr returns a new NamedArgExpr that is verified to be well-typed.
-func NewTypedNamedArgExpr(argName Name, expr TypedExpr, typ *types.T) *NamedArgExpr {
+func NewTypedNamedArgExpr(argName Name, expr TypedExpr, typ *types.T, variable bool) *NamedArgExpr {
 	node := &NamedArgExpr{
 		ArgName:        argName,
 		ArgValue: expr,
+		IsVariadic: variable,
 	}
 	node.typ = typ
 	return node
 }
 
 func (node *NamedArgExpr) Format(ctx *FmtCtx) {
+	if (node.IsVariadic) {
+		ctx.WriteString("VARIADIC")
+	}
 	ctx.FormatNode(&node.ArgName)
 	ctx.WriteString("NAMEDARG ")
 	ctx.FormatNode(node.ArgValue)
@@ -1736,6 +1765,39 @@ func (node *NamedArgExpr) ResolvedType() *types.T {
 		return types.Any
 	}
 	return node.typ
+}
+
+
+// SerializedExpr is used as a container to hold serialized expressions to be 
+// parsed and executed
+type SerializedExpr struct{
+
+	// stringExpr is a serialized expr which can be parsed and typed during building. 
+	// This is needed to execute default values to UDFs as the parsing of serialized 
+	// exprs cannot be done in TypeCheck due to cyclic dependencies between 
+	// the tree package and the parser package. It will still work the same 
+	// for its uses to represent default options SQL statements. 
+	StringExpr string
+
+	typeAnnotation
+}
+
+// Format implements the NodeFormatter interface.
+func (node SerializedExpr) Format(ctx *FmtCtx) {
+	ctx.WriteString(node.StringExpr)
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (node SerializedExpr) ResolvedType() *types.T { 
+	return types.Any
+ }
+
+func NewTypedSerializedExpr(serialized string) *SerializedExpr {
+	node := &SerializedExpr{
+		StringExpr: serialized,
+	}
+	node.typ = nil
+	return node
 }
 
 func (node *AliasedTableExpr) String() string { return AsString(node) }
@@ -1809,3 +1871,4 @@ func (node *Placeholder) String() string      { return AsString(node) }
 func (node dNull) String() string             { return AsString(node) }
 func (list *NameList) String() string         { return AsString(list) }
 func (node *NamedArgExpr) String() string     { return AsString(node) }
+func (node *SerializedExpr) String() string   { return AsString(node) }

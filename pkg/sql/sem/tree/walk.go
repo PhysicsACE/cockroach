@@ -157,6 +157,16 @@ func (expr *ColumnAccessExpr) Walk(v Visitor) Expr {
 }
 
 func (expr *NamedArgExpr) Walk(v Visitor) Expr {
+	e, changed := WalkExpr(v, expr.ArgValue)
+	if changed {
+		exprCopy := *expr
+		exprCopy.ArgValue = e
+		return &exprCopy
+	}
+	return expr
+}
+
+func (expr *SerializedExpr) Walk(v Visitor) Expr {
 	exprCopy := *expr
 	return &exprCopy
 }

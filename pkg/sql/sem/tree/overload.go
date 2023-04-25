@@ -333,12 +333,411 @@ type TypeList interface {
 	String() string
 	// MatchNames sees if overload parameter names can be satisfied by the provided 
 	// named arguments
-	MatchNames(ctx context.Context, semaCtx *SemaContext, arr []*NamedArgExpr) bool
+	MatchNames(ctx context.Context, semaCtx *SemaContext, namedArr intsets.Fast, constantArr intsets.Fast, resolvableArr intsets.Fast, exprs []Expr, lastVariadic bool) bool
+
+	MatchIdenticalInput(exprs []TypedExpr) bool
+
+	getNames() map[string]int
+
+	getTyps() map[string]*types.T
+
+	inputSig(exprs []TypedExpr) []*types.T
+
+	acceptsVariadic() bool
+
+	variadicType() *types.T
+
+	numExact(exprs []TypedExpr) int
+
+	getDefaults() map[int]string
 }
 
 var _ TypeList = ParamTypes{}
 var _ TypeList = HomogeneousType{}
 var _ TypeList = VariadicType{}
+var _ TypeList = ParamTypesWithModes{}
+
+type ParamTypesWithModes []ParamTypeWithModes
+
+type ParamTypeWithModes struct {
+	Name string
+	Typ *types.T 
+	Default string 	
+	IsVariadic bool
+}
+
+func (p ParamTypesWithModes) Match(types []*types.T) bool {
+
+	var seenIdxs intsets.Fast
+	seenIdxs.AddRange(0, len(p) - 1)
+
+	for i, t := range types {
+		if !p.MatchAt(t, i) {
+			return false
+		}
+		seenIdxs.Remove(i)
+	}
+
+	for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
+	
+		if p[i].Default == "" {
+			return false
+		}
+	}
+
+	return true
+
+}
+
+func (p ParamTypesWithModes) MatchIdentical(types []*types.T) bool {
+
+	if len(types) != len(p) {
+		return false
+	}
+	for i := range types {
+		if !p.MatchAtIdentical(types[i], i) {
+			return false
+		}
+	}
+	return true
+
+}
+
+func (p ParamTypesWithModes) MatchIdenticalInput(exprs []TypedExpr) bool {
+
+	paramDict := p.getTyps()
+
+	for i, expr := range exprs {
+		if namedExpr, ok := expr.(*NamedArgExpr); ok {
+			typ := paramDict[string(namedExpr.ArgName)]
+			if !(typ.Identical(expr.ResolvedType())) {
+				return false
+			}
+			continue
+		}
+
+		if !(p[i].Typ.Identical(expr.ResolvedType())) {
+			return false
+		}
+	}
+
+	return true
+
+}
+
+// MatchAt is part of the TypeList interface.
+func (p ParamTypesWithModes) MatchAt(typ *types.T, i int) bool {
+	// The parameterized types for Tuples are checked in the type checking
+	// routines before getting here, so we only need to check if the parameter
+	// type is p types.TUPLE below. This allows us to avoid defining overloads
+	// for types.Tuple{}, types.Tuple{types.Any}, types.Tuple{types.Any, types.Any},
+	// etc. for Tuple operators.
+	if typ.Family() == types.TupleFamily {
+		typ = types.AnyTuple
+	}
+	return i < len(p) && (typ.Family() == types.UnknownFamily || p[i].Typ.Equivalent(typ))
+}
+
+// MatchAtIdentical is part of the TypeList interface.
+func (p ParamTypesWithModes) MatchAtIdentical(typ *types.T, i int) bool {
+	if typ.Family() == types.TupleFamily {
+		typ = types.AnyTuple
+	}
+	return i < len(p) && (typ.Family() == types.UnknownFamily || p[i].Typ.Identical(typ))
+}
+
+// MatchLen is part of the TypeList interface.
+func (p ParamTypesWithModes) MatchLen(l int) bool {
+	return len(p) >= l
+}
+
+// GetAt is part of the TypeList interface.
+func (p ParamTypesWithModes) GetAt(i int) *types.T {
+	return p[i].Typ
+}
+
+// SetAt is part of the TypeList interface.
+func (p ParamTypesWithModes) SetAt(i int, name string, t *types.T) {
+	p[i].Name = name
+	p[i].Typ = t
+}
+
+// Length is part of the TypeList interface.
+func (p ParamTypesWithModes) Length() int {
+	return len(p)
+}
+
+// Types is part of the TypeList interface.
+func (p ParamTypesWithModes) Types() []*types.T {
+	n := len(p)
+	ret := make([]*types.T, n)
+	for i, s := range p {
+		ret[i] = s.Typ
+	}
+	return ret
+}
+
+func (p ParamTypesWithModes) String() string {
+	var s strings.Builder
+	for i, param := range p {
+		if i > 0 {
+			s.WriteString(", ")
+		}
+		s.WriteString(param.Name)
+		s.WriteString(": ")
+		s.WriteString(param.Typ.String())
+	}
+	return s.String()
+}
+
+func (p ParamTypesWithModes) getNames() map[string]int {
+	paramDict := make(map[string]int)
+	for i, param := range p {
+		paramDict[param.Name] = i
+	}
+	return paramDict
+}
+
+func (p ParamTypesWithModes) getTyps() map[string]*types.T {
+	paramDict := make(map[string]*types.T)
+	for _, param := range p {
+		paramDict[param.Name] = param.Typ
+	}
+	return paramDict
+}
+
+func (p ParamTypesWithModes) MatchNames(ctx context.Context, semaCtx *SemaContext, namedArr intsets.Fast, constantArr intsets.Fast, resolvableArr intsets.Fast, exprs []Expr, lastVariadic bool) bool {
+
+	paramDict := p.getNames()
+	acceptsVariadic := p.acceptsVariadic()
+	var variadicTyp *types.T
+	var variadicName string
+	if (acceptsVariadic) {
+		variadicTyp = p.variadicType()
+		variadicName = p[len(p) - 1].Name
+	}
+
+	var seenIdxs intsets.Fast
+	seenIdxs.AddRange(0, len(p) - 1)
+	seenVariadic := false
+
+	if (namedArr.Len() > 0) {
+		for i, ok := constantArr.Next(0); ok; i, ok = constantArr.Next(i + 1) {
+			constExpr := exprs[i].(Constant)
+			if !(canConstantBecome(constExpr, p.GetAt(i))) {
+				return false
+			}
+	
+			seenIdxs.Remove(i)
+		}
+	
+		for i, ok := resolvableArr.Next(0); ok; i, ok = resolvableArr.Next(i + 1) {
+			typ, err := exprs[i].TypeCheck(ctx, semaCtx, types.Any)
+			if err != nil {
+				return false
+			}
+			rt := typ.ResolvedType()
+			if !(p.MatchAt(rt, i)) {
+				return false
+			}
+	
+			seenIdxs.Remove(i)
+		}
+
+		for i, ok := namedArr.Next(0); ok; i, ok = namedArr.Next(i + 1) {
+			argExpr := exprs[i].(*NamedArgExpr)
+			if idx, ok := paramDict[string(argExpr.ArgName)]; ok {
+	
+				if !(seenIdxs.Contains(idx)) {
+					return false
+				}
+				seenIdxs.Remove(idx)
+	
+				if (argExpr.IsVariadic) {
+					if (seenVariadic || !(acceptsVariadic) || !(string(argExpr.ArgName) == variadicName)) {
+						return false
+					}
+	
+					if variadicExprs, ok := argExpr.ArgValue.(*Array); ok {
+						_, _, err := typeCheckSameTypedExprs(ctx, semaCtx, variadicTyp, variadicExprs.Exprs...)
+						if err != nil {
+							return false
+						}
+		
+						seenVariadic = true
+						continue
+					}
+
+					return false
+					
+				}
+	
+				typ, err := argExpr.ArgValue.TypeCheck(ctx, semaCtx, types.Any)
+				if err != nil {
+					return false
+				}
+	
+				if !(p.MatchAt(typ.ResolvedType(), idx)) {
+					return false
+				}
+
+				continue
+	
+			}
+
+			return false
+		}
+
+		for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
+
+			if (isPlaceholder(exprs[i])) {
+				continue
+			}
+	
+			if p[i].Default == "" {
+				return false
+			}
+		}
+
+		return true
+
+	}
+
+	iterator := 0
+
+	for (len(exprs) > p.Length()) {
+
+		if !(acceptsVariadic) {
+			return false
+		}
+
+		variadicSubArray := exprs[p.Length() - 1:]
+		_, _, err := typeCheckSameTypedExprs(ctx, semaCtx, variadicTyp, variadicSubArray...)
+		if err != nil {
+			return false
+		}
+
+		seenVariadic = true
+		iterator = 1
+
+	}
+
+	if (lastVariadic) {
+
+		if (!(acceptsVariadic) || seenVariadic || !(p.Length() == len(exprs))) {
+			return false
+		}
+
+	}
+
+	for i, expr := range exprs[:p.Length() - iterator] {
+		seenIdxs.Remove(i)
+		if constantArr.Contains(i) {
+			constExpr := expr.(Constant)
+			if !(canConstantBecome(constExpr, p.GetAt(i))) {
+				return false
+			}
+			continue
+		} else if (resolvableArr.Contains(i)) {
+			typ, err := expr.TypeCheck(ctx, semaCtx, types.Any)
+			if err != nil {
+				return false
+			}
+			rt := typ.ResolvedType()
+			if !(p.MatchAt(rt, i)) {
+				return false
+			}
+			continue
+		} else {
+			if (isPlaceholder(expr)) {
+				continue
+			}
+			return false
+		}
+	}
+
+	for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
+
+		if p[i].Default == "" {
+			return false
+		}
+	}
+
+	return true
+
+}
+
+func (p ParamTypesWithModes) inputSig(exprs []TypedExpr) []*types.T {
+	
+	paramDict := p.getTyps()
+	sig := make([]*types.T, 0)
+	iterator := 0
+
+	for (len(exprs) > p.Length()) {
+		iterator = 1
+	}
+
+	for i, expr := range exprs[:p.Length() - iterator] {
+		if argExpr, ok := expr.(*NamedArgExpr); ok {
+			typ := paramDict[string(argExpr.ArgName)]
+			sig = append(sig, typ)
+			continue
+		}
+
+		sig = append(sig, p[i].Typ)
+	}
+
+	if (iterator == 1) {
+		sig = append(sig, p.GetAt(p.Length() - 1))
+	}
+
+	return sig
+}
+
+func (p ParamTypesWithModes) acceptsVariadic() bool {
+	return p[len(p) - 1].IsVariadic
+}
+
+func (p ParamTypesWithModes) variadicType() *types.T {
+	return p[len(p) - 1].Typ.ArrayContents()
+}
+
+func (p ParamTypesWithModes) numExact(exprs []TypedExpr) int {
+
+	count := 0
+	paramDict := p.getNames()
+
+	iterator := 0
+
+	for (len(exprs) > p.Length()) {
+		iterator = 1
+	}
+
+	for i, expr := range exprs[:p.Length() - iterator] {
+		if argExpr, ok := expr.(*NamedArgExpr); ok {
+			idx := paramDict[string(argExpr.ArgName)]
+			if p.MatchAtIdentical(expr.ResolvedType(), idx) {
+				count++
+			}
+			continue
+		}
+
+		if p.MatchAtIdentical(expr.ResolvedType(), i) {
+			count++
+		}
+	}
+
+	return count + iterator
+}
+
+func (p ParamTypesWithModes) getDefaults() map[int]string {
+	
+	paramDict := make(map[int]string)
+	for i, param := range p {
+		paramDict[i] = param.Default
+	}
+	return paramDict
+}
 
 // ParamTypes is a list of function parameter names and their types.
 type ParamTypes []ParamType
@@ -362,6 +761,22 @@ func (p ParamTypes) Match(types []*types.T) bool {
 	return true
 }
 
+func (p ParamTypes) getNames() map[string]int {
+	paramDict := make(map[string]int)
+	for i, param := range p {
+		paramDict[param.Name] = i
+	}
+	return paramDict
+}
+
+func (p ParamTypes) getTyps() map[string]*types.T {
+	paramDict := make(map[string]*types.T)
+	for _, param := range p {
+		paramDict[param.Name] = param.Typ
+	}
+	return paramDict
+}
+
 // MatchIdentical is part of the TypeList interface.
 func (p ParamTypes) MatchIdentical(types []*types.T) bool {
 	if len(types) != len(p) {
@@ -372,6 +787,25 @@ func (p ParamTypes) MatchIdentical(types []*types.T) bool {
 			return false
 		}
 	}
+	return true
+}
+
+func (p ParamTypes) MatchIdenticalInput(exprs []TypedExpr) bool {
+	paramDict := p.getTyps()
+	for i, expr := range exprs {
+		if namedExpr, ok := expr.(*NamedArgExpr); ok {
+			typ := paramDict[string(namedExpr.ArgName)]
+			if !(typ.Identical(expr.ResolvedType())) {
+				return false
+			}
+			continue
+		}
+
+		if !p.MatchAtIdentical(expr.ResolvedType(), i) {
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -440,47 +874,136 @@ func (p ParamTypes) String() string {
 	return s.String()
 }
 
-func (p ParamTypes) MatchNames(ctx context.Context, semaCtx *SemaContext, arr []*NamedArgExpr) bool {
+func (p ParamTypes) MatchNames(ctx context.Context, semaCtx *SemaContext, namedArr intsets.Fast, constantArr intsets.Fast, resolvableArr intsets.Fast, exprs []Expr, lastVariadic bool) bool {
 
-	if len(arr) == 0 {
+	if (len(exprs) != p.Length() || lastVariadic) {
+		return false
+	}
+
+	if (p.Length() == 0) {
 		return true
 	}
 
-	paramDict := make(map[string]int)
-	for i, param := range p {
-		paramDict[param.Name] = i
-	}
+	paramDict := p.getNames()
+
+	var seenIdxs intsets.Fast
+	seenIdxs.AddRange(0, len(p) - 1)
 
 	// check if all the names used in the function call are present in the 
 	// candidate parameters list
-	for _, n := range arr {
-		if idx, ok := paramDict[string(n.ArgName)]; ok {
-			typ, err := n.ArgValue.TypeCheck(ctx, semaCtx, types.Any)
+
+	for i, ok := constantArr.Next(0); ok; i, ok = constantArr.Next(i + 1) {
+		constExpr := exprs[i].(Constant)
+		if !(canConstantBecome(constExpr, p.GetAt(i))) {
+			return false
+		}
+
+		seenIdxs.Remove(i)
+	}
+
+	for i, ok := resolvableArr.Next(0); ok; i, ok = resolvableArr.Next(i + 1) {
+		typ, err := exprs[i].TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			return false
+		}
+		rt := typ.ResolvedType()
+		if !(p.MatchAt(rt, i)) {
+			return false
+		}
+
+		seenIdxs.Remove(i)
+	}
+
+	for i, ok := namedArr.Next(0); ok; i, ok = namedArr.Next(i + 1) {
+		argExpr := exprs[i].(*NamedArgExpr)
+		if idx, ok := paramDict[string(argExpr.ArgName)]; ok {
+
+			if !(seenIdxs.Contains(idx)) {
+				return false
+			}
+			seenIdxs.Remove(idx)
+
+			if (argExpr.IsVariadic) {
+				return false
+			}
+
+			typ, err := argExpr.ArgValue.TypeCheck(ctx, semaCtx, types.Any)
 			if err != nil {
 				return false
 			}
+
 			if !(p.MatchAt(typ.ResolvedType(), idx)) {
 				return false
 			}
+
 		} else {
 			return false
 		}
 	}
 
-	// named arguments are unordered positional aruguments assuming they are 
-	// correct. We can apply the same cases that applied to the positional
-	// args and check if they satisfy the heuristics. For each named argument
-	// we split it into the cases where NamedArgExpr.Expr is either a constant
-	// expression, a placeholder or a resolvable expression. We typecheck 
-	// each named expression with respect to its corresponding parameter type
-	// as at this point, we know that the current ParamTypes has the potential 
-	// to be a match for the current function resolution. In the case of default
-	// args, we check to see that the missing arguments not provided in the 
-	// expression list all at default values that were provided where the 
-	// UDF was defined and stored into the schema. 
+	for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
 
+		if !(isPlaceholder(exprs[i])) {
+			return false
+		}
+	}
 
 	return true
+
+}
+
+func (p ParamTypes) acceptsVariadic() bool {
+	return false
+}
+
+func (p ParamTypes) variadicType() *types.T {
+	return types.Unknown
+}
+
+func (p ParamTypes) numExact(exprs []TypedExpr) int {
+
+	count := 0
+	paramDict := p.getNames()
+
+	for i, expr := range exprs {
+		if namedArg, ok := expr.(*NamedArgExpr); ok {
+			idx := paramDict[string(namedArg.ArgName)]
+			if p.MatchAtIdentical(expr.ResolvedType(), idx) {
+				count++
+			}
+			continue
+		}
+
+		if p.MatchAtIdentical(expr.ResolvedType(), i) {
+			count ++
+		}
+	}
+
+	return count
+}
+
+func (p ParamTypes) inputSig(exprs []TypedExpr) []*types.T {
+	
+	paramDict := p.getTyps()
+	sig := make([]*types.T, 0)
+
+	for i, expr := range exprs {
+		if namedArg, ok := expr.(*NamedArgExpr); ok {
+			typ := paramDict[string(namedArg.ArgName)]
+			sig = append(sig, typ)
+			continue
+		}
+
+		sig = append(sig, p[i].Typ)
+	}
+
+	return sig
+}
+
+func (p ParamTypes) getDefaults() map[int]string {
+	
+	paramDict := make(map[int]string)
+	return paramDict
 }
 
 // HomogeneousType is a TypeList implementation that accepts any arguments, as
@@ -532,8 +1055,45 @@ func (HomogeneousType) String() string {
 	return "anyelement..."
 }
 
-func (HomogeneousType) MatchNames(ctx context.Context, semaCtx *SemaContext, arr []*NamedArgExpr) bool {
-	return len(arr) == 0
+func (HomogeneousType) MatchNames(ctx context.Context, semaCtx *SemaContext, namedArr intsets.Fast, constantArr intsets.Fast, resolvableArr intsets.Fast, exprs []Expr, lastVariadic bool) bool {
+	return namedArr.Len() == 0
+}
+
+func (HomogeneousType) MatchIdenticalInput(exprs []TypedExpr) bool {
+	return true
+}
+
+func (HomogeneousType) getNames() map[string]int {
+	paramDict := make(map[string]int)
+	return paramDict
+}
+
+func (HomogeneousType) getTyps() map[string]*types.T {
+	paramDict := make(map[string]*types.T)
+	return paramDict
+}
+
+func (HomogeneousType) inputSig(exprs []TypedExpr) []*types.T {
+	sig := make([]*types.T, 0)
+	return sig
+}
+
+func (HomogeneousType) acceptsVariadic() bool {
+	return false
+}
+
+func (HomogeneousType) variadicType() *types.T {
+	return types.Unknown
+}
+
+func (HomogeneousType) numExact(exprs []TypedExpr) int {
+	return 1
+}
+
+func (HomogeneousType) getDefaults() map[int]string {
+	
+	paramDict := make(map[int]string)
+	return paramDict
 }
 
 // VariadicType is a TypeList implementation which accepts a fixed number of
@@ -614,8 +1174,67 @@ func (v VariadicType) String() string {
 	return s.String()
 }
 
-func (v VariadicType) MatchNames(ctx context.Context, semaCtx *SemaContext, arr []*NamedArgExpr) bool {
-	return len(arr) == 0
+func (v VariadicType) MatchNames(ctx context.Context, semaCtx *SemaContext, namedArr intsets.Fast, constantArr intsets.Fast, resolvableArr intsets.Fast, exprs []Expr, lastVariadic bool) bool {
+	if (namedArr.Len() > 0 || lastVariadic) {
+		return false
+	}
+
+	for i, ok := constantArr.Next(0); ok; i, ok = constantArr.Next(i + 1) {
+		constExpr := exprs[i].(Constant)
+		if !(canConstantBecome(constExpr, v.GetAt(i))) {
+			return false
+		}
+	}
+
+	for i, ok := resolvableArr.Next(0); ok; i, ok = resolvableArr.Next(i + 1) {
+		typ, err := exprs[i].TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			return false
+		}
+		rt := typ.ResolvedType()
+		if !(v.MatchAt(rt, i)) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (v VariadicType) MatchIdenticalInput(exprs []TypedExpr) bool {
+	return true
+}
+
+func (v VariadicType) getNames() map[string]int {
+	paramDict := make(map[string]int)
+	return paramDict
+}
+
+func (v VariadicType) getTyps() map[string]*types.T {
+	paramDict := make(map[string]*types.T)
+	return paramDict
+}
+
+func (v VariadicType) inputSig(exprs []TypedExpr) []*types.T {
+	sig := make([]*types.T, 0)
+	return sig
+}
+
+func (v VariadicType) acceptsVariadic() bool {
+	return false
+}
+
+func (v VariadicType) variadicType() *types.T {
+	return types.Unknown
+}
+
+func (v VariadicType) numExact(exprs []TypedExpr) int {
+	return 0
+}
+
+func (v VariadicType) getDefaults() map[int]string {
+	
+	paramDict := make(map[int]string)
+	return paramDict
 }
 
 // UnknownReturnType is returned from ReturnTypers when the arguments provided are
@@ -700,6 +1319,7 @@ type overloadTypeChecker struct {
 	placeholderIdxs intsets.Fast // index into exprs/typedExprs
 	namedArgIdxs    intsets.Fast // index into exprs/typedExprs
 	overloadsIdxArr [16]uint8
+	variadic        bool
 }
 
 var overloadTypeCheckerPool = sync.Pool{
@@ -752,6 +1372,8 @@ func (s *overloadTypeChecker) release() {
 	s.resolvableIdxs = intsets.Fast{}
 	s.constIdxs = intsets.Fast{}
 	s.placeholderIdxs = intsets.Fast{}
+	s.namedArgIdxs = intsets.Fast{}
+	s.variadic = false
 	overloadTypeCheckerPool.Put(s)
 }
 
@@ -780,14 +1402,9 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 		return errors.AssertionFailedf("too many overloads (%d > 255)", numOverloads)
 	}
 
-	// hasNamed := false
-	var argNames []*NamedArgExpr
 	namedSeen := false
 	for _, pexpr := range s.exprs {
-		if namedExpr, ok := pexpr.(*NamedArgExpr); ok {
-			// hasNamed = true
-			// argNames[string(namedExpr.ArgName)] = i
-			argNames = append(argNames, namedExpr)
+		if _, ok := pexpr.(*NamedArgExpr); ok {
 			namedSeen = true
 			continue
 		}
@@ -795,10 +1412,6 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 		if namedSeen {
 			return errors.AssertionFailedf("positional argument cannot come after named argument")
 		}
-	}
-
-	if len(argNames) > 0 {
-		return errors.AssertionFailedf("named args not supported")
 	}
 
 	// Special-case the HomogeneousType overload. We determine its return type by checking that
@@ -859,16 +1472,15 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchLen)
 
 	// Filter out overloads which constants cannot become.
-	for i, ok := s.constIdxs.Next(0); ok; i, ok = s.constIdxs.Next(i + 1) {
-		constExpr := s.exprs[i].(Constant)
-		filter := func(params TypeList) bool {
-			return canConstantBecome(constExpr, params.GetAt(i))
-		}
-		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, filter)
-	}
+	// for i, ok := s.constIdxs.Next(0); ok; i, ok = s.constIdxs.Next(i + 1) {
+	// 	constExpr := s.exprs[i].(Constant)
+	// 	filter := func(params TypeList) bool {
+	// 		return canConstantBecome(constExpr, params.GetAt(i))
+	// 	}
+	// 	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, filter)
+	// }
 
-	matchArgnames := func(params TypeList) bool {return params.MatchNames(ctx , semaCtx, argNames)}
-	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchArgnames)
+	
 
 	// TODO(nvanbenschoten): We should add a filtering step here to filter
 	// out impossible candidates based on identical parameters. For instance,
@@ -910,19 +1522,22 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 			return err
 		}
 		s.typedExprs[i] = typ
-		rt := typ.ResolvedType()
-		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, func(
-			params TypeList,
-		) bool {
-			return params.MatchAt(rt, i)
-		})
+		// rt := typ.ResolvedType()
+		// s.overloadIdxs = filterParams(s.overloadIdxs, s.params, func(
+		// 	params TypeList,
+		// ) bool {
+		// 	return params.MatchAt(rt, i)
+		// })
 	}
+
+	matchArgnames := func(params TypeList) bool {return params.MatchNames(ctx , semaCtx, s.namedArgIdxs, s.constIdxs, typeableIdxs, s.exprs, s.variadic)}
+	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchArgnames)
 
 	var namedConstantIdxs intsets.Fast
 	for i, ok := s.namedArgIdxs.Next(0); ok; i, ok = s.namedArgIdxs.Next(i + 1) {
 		argExpr := s.exprs[i].(*NamedArgExpr)
 		if isConstant(argExpr.ArgValue) {
-			namedArgIdxs.Add(i)
+			namedConstantIdxs.Add(i)
 		}
 		typ, err := s.exprs[i].TypeCheck(ctx, semaCtx, types.Any)
 		if err != nil {
@@ -983,6 +1598,7 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 				homogeneousTyp = nil
 				break
 			}
+		}
 	}
 
 	if !s.constIdxs.Empty() {

@@ -3127,6 +3127,7 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 			overload.FixedReturnType(),
 			props,
 			overload,
+			false,
 		)
 	}
 

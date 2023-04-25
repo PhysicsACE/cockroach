@@ -620,34 +620,6 @@ func (b *Builder) buildUDF(
 ) (out opt.ScalarExpr) {
 	o := f.ResolvedOverload()
 
-<<<<<<< HEAD
-	// argTypes, ok := o.Types.(tree.ParamTypes)
-	// if !ok {
-	// 	panic(unimplemented.NewWithIssue(88947,
-	// 		"variadiac user-defined functions are not yet supported"))
-	// }
-
-	// posDict := make(map[string]int)
-	// for i := range argTypes {
-	// 	paramType := &argTypes[i]
-	// 	posDict[paramType.Name] = i
-	// }
-
-	// resolvedExprs := make(tree.Exprs, len(argTypes))
-	// for i, pexpr := range f.Exprs {
-	// 	if namedArg, ok := pexpr.(*tree.NamedArgExpr); ok {
-	// 		argPos, ok := posDict[namedArg.Argname]
-	// 		if !ok {
-	// 			// raise invalid name error for named argument
-	// 		}
-
-	// 		resolvedExprs[argPos] = pexpr.ArgValue
-	// 	} else {
-	// 		resolvedExprs[i] = pexpr
-	// 	}
-	// }
-	
-=======
 	// Validate that the return types match the original return types defined in
 	// the function. Return types like user defined return types may change since
 	// the function was first created.
@@ -664,13 +636,35 @@ func (b *Builder) buildUDF(
 				"return type mismatch in function declared to return %s", rtyp.Name()))
 		}
 	}
->>>>>>> 2f2e85df45bff060fe8cc0783989e9c8cc182ef0
 
 	// Build the argument expressions.
 	var args memo.ScalarListExpr
 	if len(f.Exprs) > 0 {
 		args = make(memo.ScalarListExpr, len(f.Exprs))
 		for i, pexpr := range f.Exprs {
+			if defaultExpr, ok := pexpr.(*tree.SerializedExpr); ok {
+				defaultStr := defaultExpr.StringExpr
+				parsedDefault, err := parser.ParseExpr(defaultStr)
+				if err != nil {
+					panic(err)
+				}
+
+				typ, err := parsedDefault.TypeCheck(b.ctx, b.semaCtx, types.Any)
+				if err != nil {
+					panic(err)
+				}
+
+				args[i] = b.buildScalar(
+					typ,
+					inScope,
+					nil, /* outScope */
+					nil, /* outCol */
+					colRefs,
+				)
+
+				continue
+			}
+
 			args[i] = b.buildScalar(
 				pexpr.(tree.TypedExpr),
 				inScope,

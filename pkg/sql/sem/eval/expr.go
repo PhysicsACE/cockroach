@@ -697,7 +697,11 @@ func (e *evaluator) EvalUnqualifiedStar(
 }
 
 func (e *evaluator) EvalNamedArgExpr(ctx context.Context, expr *tree.NamedArgExpr) (tree.Datum, error) {
-	return nil, errors.AssertionFailedf("named arg should not be seen by the evaluator")
+	return nil, errors.AssertionFailedf("named argument should not be seen during execution")
+}
+
+func (e *evaluator) EvalSerializedExpr(ctx context.Context, expr *tree.SerializedExpr) (tree.Datum, error) {
+	return nil, errors.AssertionFailedf("serialized expr should not be seen by executor")
 }
 
 var _ tree.ExprEvaluator = (*evaluator)(nil)

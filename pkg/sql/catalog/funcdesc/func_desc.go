@@ -687,14 +687,14 @@ func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 		IsUDF:      true,
 	}
 
-	argTypes := make(tree.ParamTypes, 0, len(desc.Params))
+	paramTypes := make(tree.ParamTypesWithModes, 0, len(desc.Params))
 	for _, param := range desc.Params {
-		argTypes = append(
-			argTypes,
-			tree.ParamType{Name: param.Name, Typ: param.Type},
+		 paramTypes = append(
+			paramTypes,
+			tree.ParamTypeWithModes{Name: param.Name, Typ: param.Type, Default: param.DefaultExpr, IsVariadic: (param.Class == catpb.Function_Param_VARIADIC),},
 		)
 	}
-	ret.Types = argTypes
+	ret.Types = paramTypes
 	ret.Volatility, err = desc.getOverloadVolatility()
 	if err != nil {
 		return nil, err
@@ -761,8 +761,8 @@ func (desc *immutable) ToCreateExpr() (ret *tree.CreateFunction, err error) {
 			Type:  desc.Params[i].Type,
 			Class: toTreeNodeParamClass(desc.Params[i].Class),
 		}
-		if desc.Params[i].DefaultExpr != nil {
-			ret.Params[i].DefaultVal, err = parser.ParseExpr(*desc.Params[i].DefaultExpr)
+		if desc.Params[i].DefaultExpr != "" {
+			ret.Params[i].DefaultVal, err = parser.ParseExpr(desc.Params[i].DefaultExpr)
 			if err != nil {
 				return nil, err
 			}

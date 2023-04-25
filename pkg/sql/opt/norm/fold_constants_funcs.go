@@ -689,6 +689,7 @@ func (c *CustomFuncs) FoldFunction(
 		private.Typ,
 		private.Properties,
 		private.Overload,
+		false,
 	)
 
 	result, err := eval.Expr(c.f.ctx, c.f.evalCtx, fn)

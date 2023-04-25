@@ -302,6 +302,7 @@ func (b *Builder) buildFunction(
 		fn.Typ,
 		fn.Properties,
 		fn.Overload,
+		false,
 	), nil
 }
 
@@ -384,6 +385,7 @@ func (b *Builder) buildAssignmentCast(
 		cast.Typ,
 		props,
 		&overloads[0],
+		false,
 	), nil
 }
 

@@ -4547,7 +4547,7 @@ func_param_class:
 | OUT { return unimplemented(sqllex, "create function with 'OUT' argument class") }
 | INOUT { return unimplemented(sqllex, "create function with 'INOUT' argument class") }
 | IN OUT { return unimplemented(sqllex, "create function with 'IN OUT' argument class") }
-| VARIADIC { return unimplementedWithIssueDetail(sqllex, 88947, "variadic user-defined functions") }
+| VARIADIC { $$.val = tree.FunctionParamVariadic }
 
 func_param_type:
   typename
@@ -14560,8 +14560,14 @@ func_application:
   {
     $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRef(), Exprs: $3.exprs(), OrderBy: $4.orderBy(), AggType: tree.GeneralAgg}
   }
-| func_application_name '(' VARIADIC a_expr opt_sort_clause ')' { return unimplemented(sqllex, "variadic") }
-| func_application_name '(' expr_list ',' VARIADIC a_expr opt_sort_clause ')' { return unimplemented(sqllex, "variadic") }
+| func_application_name '(' VARIADIC a_expr opt_sort_clause ')' 
+  { 
+    $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRef(), Exprs: $4.exprs(), IsVariadic: true}
+  }
+| func_application_name '(' expr_list ',' VARIADIC a_expr opt_sort_clause ')' 
+  { 
+    $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRef(), Exprs: append($3.exprs(), $6.expr()), IsVariadic: true, OrderBy: $7.orderBy() }
+  }
 | func_application_name '(' ALL expr_list opt_sort_clause ')'
   {
     $$.val = &tree.FuncExpr{Func: $1.resolvableFuncRef(), Type: tree.AllFuncType, Exprs: $4.exprs(), OrderBy: $5.orderBy(), AggType: tree.GeneralAgg}
@@ -15335,7 +15341,11 @@ expr_list:
 named_param:
   unrestricted_name NAMEDARG a_expr
   {
-    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), ArgValue: $3.expr() }
+    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), ArgValue: $3.expr(), IsVariadic: false }
+  }
+| VARIADIC unrestricted_name NAMEDARG array_expr 
+  {
+    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($2), ArgValue: $4.expr(), IsVariadic: true}
   }
 
 type_list:
