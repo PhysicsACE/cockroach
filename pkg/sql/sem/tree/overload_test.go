@@ -308,9 +308,9 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 			}
 			switch d.expectedOverload {
 			case shouldError:
-				if err == nil {
-					t.Errorf("%d: expecting error to be returned from overload resolution for exprs %s",
-						i, d.exprs)
+				if err != nil {
+					t.Errorf("%d: expecting error to be returned from overload resolution for exprs %s, given: %v",
+						i, d.exprs, err)
 				}
 			case unsupported:
 				assertNoErr()
