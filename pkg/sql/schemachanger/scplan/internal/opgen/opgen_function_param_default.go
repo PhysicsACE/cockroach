@@ -13,6 +13,7 @@ package opgen
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
 func init() {
@@ -21,8 +22,10 @@ func init() {
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
 				// TODO(chengxiong): add operations when default value is supported.
-				emit(func(this *scpb.FunctionParamDefaultExpression) *scop.NotImplementedForPublicObjects {
-					return notImplementedForPublicObjects(this)
+				emit(func(this *scpb.FunctionParamDefaultExpression) *scop.SetFunctionParamDefaultExpr {
+					return &scop.SetFunctionParamDefaultExpr{
+						Expr: *protoutil.Clone(this).(*scpb.FunctionParamDefaultExpression),
+					}
 				}),
 			),
 		),
@@ -30,8 +33,8 @@ func init() {
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
 				// TODO(chengxiong): add operations when default value is supported.
-				emit(func(this *scpb.FunctionParamDefaultExpression) *scop.NotImplemented {
-					return notImplemented(this)
+				emit(func(this *scpb.FunctionParamDefaultExpression) *scop.NotImplementedForPublicObjects {
+					return notImplementedForPublicObjects(this)
 				}),
 			),
 		),

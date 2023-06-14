@@ -2514,8 +2514,12 @@ func addPgProcUDFRow(
 	argTypes := tree.NewDArray(types.Oid)
 	argModes := tree.NewDArray(types.String)
 	var argNames tree.Datum
+	var argDefaults tree.Datum
+	var defaultCount int
 	argNamesArray := tree.NewDArray(types.String)
+	argDefaultsArray := tree.NewDArray(types.String)
 	foundAnyArgNames := false
+	foundArgDefault := false
 	for _, param := range fnDesc.GetParams() {
 		if err := argTypes.Append(tree.NewDOid(param.Type.Oid())); err != nil {
 			return err
@@ -2527,13 +2531,24 @@ func addPgProcUDFRow(
 		if len(param.Name) > 0 {
 			foundAnyArgNames = true
 		}
+		if len(param.DefaultExpr) > 0 {
+			foundArgDefault = true
+			defaultCount++
+		}
 		if err := argNamesArray.Append(tree.NewDString(param.Name)); err != nil {
+			return err
+		}
+		if err := argDefaultsArray.Append(tree.NewDString(param.DefaultExpr)); err != nil {
 			return err
 		}
 	}
 	argNames = tree.DNull
 	if foundAnyArgNames {
 		argNames = argNamesArray
+	}
+	argDefaults = tree.DNull
+	if foundArgDefault {
+		argDefaults = argDefaultsArray
 	}
 
 	return addRow(
@@ -2557,13 +2572,13 @@ func addPgProcUDFRow(
 		tree.NewDString(funcVolatility(fnDesc.GetVolatility())),      // provolatile
 		tree.DNull, // proparallel
 		tree.NewDInt(tree.DInt(len(fnDesc.GetParams()))), // pronargs
-		tree.NewDInt(tree.DInt(0)),                       // pronargdefaults
+		tree.NewDInt(tree.DInt(defaultCount)),                       // pronargdefaults
 		tree.NewDOid(fnDesc.GetReturnType().Type.Oid()),  // prorettype
 		tree.NewDOidVectorFromDArray(argTypes),           // proargtypes
 		tree.DNull,                                       // proallargtypes
 		argModes,                                         // proargmodes
 		argNames,                                         // proargnames
-		tree.DNull,                                       // proargdefaults
+		argDefaults,                                       // proargdefaults
 		tree.DNull,                                       // protrftypes
 		tree.NewDString(fnDesc.GetFunctionBody()),        // prosrc
 		tree.DNull,                                       // probin

@@ -131,6 +131,7 @@ func (b *Builder) buildScalar(
 		els := make(memo.ScalarListExpr, len(t.Exprs))
 		arrayType := t.ResolvedType()
 		elementType := arrayType.ArrayContents()
+		fmt.Print("Suspect typeeeeeeeeeee: (", arrayType, ":", elementType, ")")
 		if err := types.CheckArrayElementType(elementType); err != nil {
 			panic(err)
 		}
@@ -639,9 +640,9 @@ func (b *Builder) buildUDF(
 
 	// Build the argument expressions.
 	var args memo.ScalarListExpr
-	if len(f.Exprs) > 0 {
-		args = make(memo.ScalarListExpr, len(f.Exprs))
-		for i, pexpr := range f.Exprs {
+	if len(f.ResExprs) > 0 {
+		args = make(memo.ScalarListExpr, len(f.ResExprs))
+		for i, pexpr := range f.ResExprs {
 			if defaultExpr, ok := pexpr.(*tree.SerializedExpr); ok {
 				defaultStr := defaultExpr.StringExpr
 				parsedDefault, err := parser.ParseExpr(defaultStr)
@@ -666,7 +667,7 @@ func (b *Builder) buildUDF(
 			}
 
 			args[i] = b.buildScalar(
-				pexpr.(tree.TypedExpr),
+				pexpr,
 				inScope,
 				nil, /* outScope */
 				nil, /* outCol */
@@ -686,16 +687,24 @@ func (b *Builder) buildUDF(
 	bodyScope := b.allocScope()
 	var params opt.ColList
 	if o.Types.Length() > 0 {
-		paramTypes, ok := o.Types.(tree.ParamTypes)
+		paramTypes, ok := o.Types.(tree.ParamTypesWithModes)
 		if !ok {
 			panic(unimplemented.NewWithIssue(88947,
 				"variadiac user-defined functions are not yet supported"))
 		}
+
+		conditionalType := func(t *types.T, variadic bool) *types.T {
+			if variadic {
+				return types.MakeArray(t)
+			}
+			return t
+		}
+
 		params = make(opt.ColList, len(paramTypes))
 		for i := range paramTypes {
 			paramType := &paramTypes[i]
 			argColName := funcParamColName(tree.Name(paramType.Name), i)
-			col := b.synthesizeColumn(bodyScope, argColName, paramType.Typ, nil /* expr */, nil /* scalar */)
+			col := b.synthesizeColumn(bodyScope, argColName, conditionalType(paramType.Typ, paramType.IsVariadic), nil /* expr */, nil /* scalar */)
 			col.setParamOrd(i)
 			params[i] = col.id
 		}

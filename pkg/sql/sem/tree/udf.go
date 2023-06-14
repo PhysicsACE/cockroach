@@ -85,6 +85,7 @@ type CreateFunction struct {
 	Replace     bool
 	FuncName    FunctionName
 	Params      FuncParams
+	OutParams   FuncParams
 	ReturnType  FuncReturnType
 	Options     FunctionOptions
 	RoutineBody *RoutineBody

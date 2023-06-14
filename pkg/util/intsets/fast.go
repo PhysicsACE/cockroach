@@ -93,6 +93,16 @@ func (s *Fast) Remove(i int) {
 	}
 }
 
+func (s *Fast) RemoveRange(from, to int) {
+	if to < from {
+		panic("invalid range when removing range from Fast")
+	}
+
+	for i := from; i <= to; i++ {
+		s.Remove(i)
+	}
+}
+
 // Contains returns true if the set contains the value.
 func (s Fast) Contains(i int) bool {
 	if i >= 0 && i < smallCutoff {

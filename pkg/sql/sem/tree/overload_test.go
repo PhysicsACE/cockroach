@@ -137,6 +137,50 @@ func makeTestOverload(retType *types.T, params ...*types.T) *testOverload {
 	}
 }
 
+type UDFtestOverload struct {
+	paramTypes ParamTypesWithModes
+	retType    *types.T
+	pref       bool
+}
+
+func (to *UDFtestOverload) params() TypeList {
+	return to.paramTypes
+}
+
+func (to *UDFtestOverload) returnType() ReturnTyper {
+	return FixedReturnType(to.retType)
+}
+
+func (to UDFtestOverload) preferred() bool {
+	return to.pref
+}
+
+func (to UDFtestOverload) withPreferred(pref bool) *UDFtestOverload {
+	to.pref = pref
+	return &to
+}
+
+func (to *UDFtestOverload) String() string {
+	typeNames := make([]string, len(to.paramTypes))
+	for i, param := range to.paramTypes {
+		typeNames[i] = param.Typ.String()
+	}
+	return fmt.Sprintf("func(%s) %s", strings.Join(typeNames, ","), to.retType)
+}
+
+func makeUdfOverload(retType *types.T, params []*types.T, defaults []string, names []string) *UDFtestOverload {
+	t := make(ParamTypesWithModes, len(params))
+	for i := range params {
+		t[i].Typ = params[i]
+		t[i].Default = defaults[i]
+		t[i].Name = names[i]
+	}
+	return &UDFtestOverload{
+		paramTypes: t,
+		retType:    retType,
+	}
+}
+
 // overloadImpls implements overloadSet
 type overloadImpls []overloadImpl
 
@@ -161,6 +205,9 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 	placeholder := func(id int) *Placeholder {
 		return &Placeholder{Idx: PlaceholderIdx(id)}
 	}
+	// named := func(name string, val Expr) Expr {
+	// 	return &NamedArgExpr{ArgName: (Name)(name), ArgValue: val}
+	// }
 
 	unaryIntFn := makeTestOverload(types.Int, types.Int)
 	unaryIntFnPref := makeTestOverload(types.Int, types.Int).withPreferred(true)
@@ -179,6 +226,14 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 	binaryStringFloatFn2 := makeTestOverload(types.Float, types.String, types.Float)
 	binaryIntDateFn := makeTestOverload(types.Date, types.Int, types.Date)
 	binaryArrayIntFn := makeTestOverload(types.Int, types.AnyArray, types.Int)
+	intarr := []*types.T{types.Int, types.Int}
+	defarr := []string{"", "ghg"}
+	namearr := []string{"first", "second"}
+	intfn := makeUdfOverload(types.Int, intarr, defarr, namearr)
+	// intarr2 := []*types.T{types.String, types.Int}
+	// defarr2 := []string{"", "intval"}
+	// namearr2 := []string{"first", "second"}
+	// intfn2 := makeUdfOverload(types.Int, intarr2, defarr2, namearr2)
 
 	// Out-of-band values used below to distinguish error cases.
 	unsupported := &testOverload{}
@@ -270,6 +325,7 @@ func TestTypeCheckOverloadedExprs(t *testing.T) {
 		// array_length where the array argument is a placeholder (#36153).
 		{nil, []Expr{placeholder(0), intConst("1")}, []overloadImpl{binaryArrayIntFn}, unsupported, false},
 		{nil, []Expr{placeholder(0), intConst("1")}, []overloadImpl{binaryArrayIntFn}, unsupported, true},
+		{nil, []Expr{NewDInt(1)}, []overloadImpl{intfn}, intfn, false},
 	}
 	ctx := context.Background()
 	for i, d := range testData {

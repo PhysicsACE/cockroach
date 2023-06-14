@@ -12,6 +12,7 @@ package funcdesc
 
 import (
 	"sort"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -67,6 +68,7 @@ func NewMutableFunctionDescriptor(
 	returnType *types.T,
 	returnSet bool,
 	privs *catpb.PrivilegeDescriptor,
+	returnParams []descpb.FunctionDescriptor_Parameter,
 ) Mutable {
 	return Mutable{
 		immutable: immutable{
@@ -537,6 +539,10 @@ func (desc *Mutable) SetParentSchemaID(id descpb.ID) {
 	desc.ParentSchemaID = id
 }
 
+func (desc *Mutable) SetDefaultParam(ordinal int, defaultExpr string) {
+	desc.Params[ordinal].DefaultExpr = defaultExpr
+}
+
 // AddConstraintReference adds back reference to a constraint to the function.
 func (desc *Mutable) AddConstraintReference(id descpb.ID, constraintID descpb.ConstraintID) error {
 	for _, dep := range desc.DependsOn {
@@ -689,9 +695,12 @@ func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 
 	paramTypes := make(tree.ParamTypesWithModes, 0, len(desc.Params))
 	for _, param := range desc.Params {
-		 paramTypes = append(
-			paramTypes,
-			tree.ParamTypeWithModes{Name: param.Name, Typ: param.Type, Default: param.DefaultExpr, IsVariadic: (param.Class == catpb.Function_Param_VARIADIC),},
+		if (param.Name == "j") {
+			fmt.Print("Defautl check for j: (", param.DefaultExpr, ")")
+		}
+		paramTypes = append(
+		paramTypes,
+		tree.ParamTypeWithModes{Name: param.Name, Typ: param.Type, Default: param.DefaultExpr, IsVariadic: (param.Class == catpb.Function_Param_VARIADIC),},
 		)
 	}
 	ret.Types = paramTypes

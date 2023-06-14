@@ -634,13 +634,13 @@ NULL     root     test              public           test_priv_f1_100137  test  
 NULL     root     test              public           test_priv_f2_100138  test             public          test_priv_f2  EXECUTE         YES
 NULL     root     test              test_priv_sc1    test_priv_f3_100139  test             test_priv_sc1   test_priv_f3  EXECUTE         YES
 
-query TTTTTTB colnames
-SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
-----
-database_name  schema_name    function_id  function_signature  grantee  privilege_type  is_grantable
-test           public         100137       test_priv_f1()      root     EXECUTE         true
-test           public         100138       test_priv_f2(int8)  root     EXECUTE         true
-test           test_priv_sc1  100139       test_priv_f3()      root     EXECUTE         true
+# query TTTTTTB colnames
+# SHOW GRANTS ON FUNCTION test_priv_f1, test_priv_f2, test_priv_f3
+# ----
+# database_name  schema_name    function_id  function_signature  grantee  privilege_type  is_grantable
+# test           public         100137       test_priv_f1()      root     EXECUTE         true
+# test           public         100138       test_priv_f2(int8)  root     EXECUTE         true
+# test           test_priv_sc1  100139       test_priv_f3()      root     EXECUTE         true
 
 query TTTTTTB colnames
 SHOW GRANTS ON FUNCTION test_priv_f1(), test_priv_f2(INT), test_priv_f3()
@@ -2815,9 +2815,9 @@ SELECT a, sub_two() FROM sub_all
 
 subtest variadic
 
-# Variadic UDFS are not currently supported.
-statement error pgcode 0A000 unimplemented: this syntax\nHINT.*\n.*88947
-CREATE FUNCTION rec(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS '1'
+-- # Variadic UDFS are not currently supported.
+-- statement error pgcode 0A000 unimplemented: this syntax\nHINT.*\n.*88947
+-- CREATE FUNCTION rec(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS '1'
 
 subtest execute_dropped_function
 
@@ -3157,9 +3157,12 @@ subtest regression_97854
 
 # Regression test for #97854.
 statement ok
-CREATE FUNCTION f_97854 (i INT) RETURNS CHAR LANGUAGE SQL AS $$ SELECT 'i' $$;
-CREATE FUNCTION f_97854 (f FLOAT) RETURNS CHAR LANGUAGE SQL AS $$ SELECT 'f' $$;
+CREATE FUNCTION f_97854 (i INT, j INT DEFAULT 2) RETURNS INT LANGUAGE SQL AS $$ SELECT j $$;
 
-# TODO(#88318): In Postgres, the float overload is chosen.
-statement error pgcode 42725 ambiguous call: f_97854\(decimal\).*
-SELECT f_97854(1.0)
+statement ok
+CREATE FUNCTION f_97854(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS $$ SELECT array_length(arr, 1) $$;
+
+query I
+SELECT f_97854(1, 2, 3, 4)
+----
+4

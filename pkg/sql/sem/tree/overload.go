@@ -334,21 +334,21 @@ type TypeList interface {
 	// MatchNames sees if overload parameter names can be satisfied by the provided 
 	// named arguments
 	MatchNames(ctx context.Context, semaCtx *SemaContext, namedArr intsets.Fast, constantArr intsets.Fast, resolvableArr intsets.Fast, exprs []Expr, lastVariadic bool) bool
-
+	// See if the input matches identically with respect to TypedExprs for named arguments
 	MatchIdenticalInput(exprs []TypedExpr) bool
-
+	// Return a map between the names of the overload parameters and their respective ordinal positions
 	getNames() map[string]int
-
+	// Return a map between the names of the overload parameters and their respective types
 	getTyps() map[string]*types.T
-
+	// Given a list of arguments, generate a function signature with respect to this specific overload typelist
 	inputSig(exprs []TypedExpr) []*types.T
-
+	// Returns whether this typelist takes a variable number of arguments
 	acceptsVariadic() bool
-
+	// Returns the type of variadic element
 	variadicType() *types.T
-
+	// Returns the number of exact matches for a given argument list
 	numExact(exprs []TypedExpr) int
-
+	// Returns a map between the names of the overload parameters and their respective default serialized expressions
 	getDefaults() map[int]string
 }
 
@@ -435,7 +435,11 @@ func (p ParamTypesWithModes) MatchAt(typ *types.T, i int) bool {
 	if typ.Family() == types.TupleFamily {
 		typ = types.AnyTuple
 	}
-	return i < len(p) && (typ.Family() == types.UnknownFamily || p[i].Typ.Equivalent(typ))
+	if i < len(p) - 1 {
+		return (typ.Family() == types.UnknownFamily || p[i].Typ.Equivalent(typ))
+	}
+
+	return (p.acceptsVariadic() && typ.Family() == types.UnknownFamily || p.variadicType().Equivalent(typ))
 }
 
 // MatchAtIdentical is part of the TypeList interface.
@@ -448,12 +452,28 @@ func (p ParamTypesWithModes) MatchAtIdentical(typ *types.T, i int) bool {
 
 // MatchLen is part of the TypeList interface.
 func (p ParamTypesWithModes) MatchLen(l int) bool {
-	return len(p) >= l
+	if (l > len(p) && !p.acceptsVariadic()) {
+		return false
+	}
+
+	if (l < len(p)) {
+		for i := l; i < len(p); i++ {
+			if p[i].Default == "" {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // GetAt is part of the TypeList interface.
 func (p ParamTypesWithModes) GetAt(i int) *types.T {
-	return p[i].Typ
+	if (i < len(p)) {
+		return p[i].Typ
+	}
+
+	return p.variadicType()
 }
 
 // SetAt is part of the TypeList interface.
@@ -522,26 +542,10 @@ func (p ParamTypesWithModes) MatchNames(ctx context.Context, semaCtx *SemaContex
 	seenVariadic := false
 
 	if (namedArr.Len() > 0) {
-		for i, ok := constantArr.Next(0); ok; i, ok = constantArr.Next(i + 1) {
-			constExpr := exprs[i].(Constant)
-			if !(canConstantBecome(constExpr, p.GetAt(i))) {
-				return false
+		if firstIdx, ok := namedArr.Next(0); ok {
+			if (firstIdx > 0) {
+				seenIdxs.RemoveRange(0, firstIdx - 1)
 			}
-	
-			seenIdxs.Remove(i)
-		}
-	
-		for i, ok := resolvableArr.Next(0); ok; i, ok = resolvableArr.Next(i + 1) {
-			typ, err := exprs[i].TypeCheck(ctx, semaCtx, types.Any)
-			if err != nil {
-				return false
-			}
-			rt := typ.ResolvedType()
-			if !(p.MatchAt(rt, i)) {
-				return false
-			}
-	
-			seenIdxs.Remove(i)
 		}
 
 		for i, ok := namedArr.Next(0); ok; i, ok = namedArr.Next(i + 1) {
@@ -590,10 +594,12 @@ func (p ParamTypesWithModes) MatchNames(ctx context.Context, semaCtx *SemaContex
 
 		for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
 
-			if (isPlaceholder(exprs[i])) {
-				continue
+			if (i < len(exprs)) {
+				if (isPlaceholder(exprs[i])) {
+					continue
+				}
 			}
-	
+			
 			if p[i].Default == "" {
 				return false
 			}
@@ -603,65 +609,67 @@ func (p ParamTypesWithModes) MatchNames(ctx context.Context, semaCtx *SemaContex
 
 	}
 
-	iterator := 0
 
-	for (len(exprs) > p.Length()) {
 
-		if !(acceptsVariadic) {
-			return false
-		}
+	// iterator := 0
 
-		variadicSubArray := exprs[p.Length() - 1:]
-		_, _, err := typeCheckSameTypedExprs(ctx, semaCtx, variadicTyp, variadicSubArray...)
-		if err != nil {
-			return false
-		}
+	// for (len(exprs) > p.Length()) {
 
-		seenVariadic = true
-		iterator = 1
+	// 	if !(acceptsVariadic) {
+	// 		return false
+	// 	}
 
-	}
+	// 	variadicSubArray := exprs[p.Length() - 1:]
+	// 	_, _, err := typeCheckSameTypedExprs(ctx, semaCtx, variadicTyp, variadicSubArray...)
+	// 	if err != nil {
+	// 		return false
+	// 	}
 
-	if (lastVariadic) {
+	// 	seenVariadic = true
+	// 	iterator = 1
 
-		if (!(acceptsVariadic) || seenVariadic || !(p.Length() == len(exprs))) {
-			return false
-		}
+	// }
 
-	}
+	// if (lastVariadic) {
 
-	for i, expr := range exprs[:p.Length() - iterator] {
-		seenIdxs.Remove(i)
-		if constantArr.Contains(i) {
-			constExpr := expr.(Constant)
-			if !(canConstantBecome(constExpr, p.GetAt(i))) {
-				return false
-			}
-			continue
-		} else if (resolvableArr.Contains(i)) {
-			typ, err := expr.TypeCheck(ctx, semaCtx, types.Any)
-			if err != nil {
-				return false
-			}
-			rt := typ.ResolvedType()
-			if !(p.MatchAt(rt, i)) {
-				return false
-			}
-			continue
-		} else {
-			if (isPlaceholder(expr)) {
-				continue
-			}
-			return false
-		}
-	}
+	// 	if (!(acceptsVariadic) || seenVariadic || !(p.Length() == len(exprs))) {
+	// 		return false
+	// 	}
 
-	for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
+	// }
 
-		if p[i].Default == "" {
-			return false
-		}
-	}
+	// for i, expr := range exprs[:p.Length() - iterator] {
+	// 	seenIdxs.Remove(i)
+	// 	if constantArr.Contains(i) {
+	// 		constExpr := expr.(Constant)
+	// 		if !(canConstantBecome(constExpr, p.GetAt(i))) {
+	// 			return false
+	// 		}
+	// 		continue
+	// 	} else if (resolvableArr.Contains(i)) {
+	// 		typ, err := expr.TypeCheck(ctx, semaCtx, types.Any)
+	// 		if err != nil {
+	// 			return false
+	// 		}
+	// 		rt := typ.ResolvedType()
+	// 		if !(p.MatchAt(rt, i)) {
+	// 			return false
+	// 		}
+	// 		continue
+	// 	} else {
+	// 		if (isPlaceholder(expr)) {
+	// 			continue
+	// 		}
+	// 		return false
+	// 	}
+	// }
+
+	// for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
+
+	// 	if p[i].Default == "" {
+	// 		return false
+	// 	}
+	// }
 
 	return true
 
@@ -695,11 +703,11 @@ func (p ParamTypesWithModes) inputSig(exprs []TypedExpr) []*types.T {
 }
 
 func (p ParamTypesWithModes) acceptsVariadic() bool {
-	return p[len(p) - 1].IsVariadic
+	return (len(p) > 0 && p[len(p) - 1].IsVariadic)
 }
 
 func (p ParamTypesWithModes) variadicType() *types.T {
-	return p[len(p) - 1].Typ.ArrayContents()
+	return p[len(p) - 1].Typ
 }
 
 func (p ParamTypesWithModes) numExact(exprs []TypedExpr) int {
@@ -892,59 +900,45 @@ func (p ParamTypes) MatchNames(ctx context.Context, semaCtx *SemaContext, namedA
 	// check if all the names used in the function call are present in the 
 	// candidate parameters list
 
-	for i, ok := constantArr.Next(0); ok; i, ok = constantArr.Next(i + 1) {
-		constExpr := exprs[i].(Constant)
-		if !(canConstantBecome(constExpr, p.GetAt(i))) {
-			return false
+	if (namedArr.Len() > 0) {
+		if firstIdx, ok := namedArr.Next(0); ok {
+			if (firstIdx > 0) {
+				seenIdxs.RemoveRange(0, firstIdx - 1)
+			}
 		}
 
-		seenIdxs.Remove(i)
-	}
-
-	for i, ok := resolvableArr.Next(0); ok; i, ok = resolvableArr.Next(i + 1) {
-		typ, err := exprs[i].TypeCheck(ctx, semaCtx, types.Any)
-		if err != nil {
-			return false
+		for i, ok := namedArr.Next(0); ok; i, ok = namedArr.Next(i + 1) {
+			argExpr := exprs[i].(*NamedArgExpr)
+			if idx, ok := paramDict[string(argExpr.ArgName)]; ok {
+	
+				if !(seenIdxs.Contains(idx)) {
+					return false
+				}
+				seenIdxs.Remove(idx)
+	
+				if (argExpr.IsVariadic) {
+					return false
+				}
+	
+				typ, err := argExpr.ArgValue.TypeCheck(ctx, semaCtx, types.Any)
+				if err != nil {
+					return false
+				}
+	
+				if !(p.MatchAt(typ.ResolvedType(), idx)) {
+					return false
+				}
+	
+			} else {
+				return false
+			}
 		}
-		rt := typ.ResolvedType()
-		if !(p.MatchAt(rt, i)) {
-			return false
-		}
-
-		seenIdxs.Remove(i)
-	}
-
-	for i, ok := namedArr.Next(0); ok; i, ok = namedArr.Next(i + 1) {
-		argExpr := exprs[i].(*NamedArgExpr)
-		if idx, ok := paramDict[string(argExpr.ArgName)]; ok {
-
-			if !(seenIdxs.Contains(idx)) {
+	
+		for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
+	
+			if !(isPlaceholder(exprs[i])) {
 				return false
 			}
-			seenIdxs.Remove(idx)
-
-			if (argExpr.IsVariadic) {
-				return false
-			}
-
-			typ, err := argExpr.ArgValue.TypeCheck(ctx, semaCtx, types.Any)
-			if err != nil {
-				return false
-			}
-
-			if !(p.MatchAt(typ.ResolvedType(), idx)) {
-				return false
-			}
-
-		} else {
-			return false
-		}
-	}
-
-	for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
-
-		if !(isPlaceholder(exprs[i])) {
-			return false
 		}
 	}
 
@@ -1056,7 +1050,7 @@ func (HomogeneousType) String() string {
 }
 
 func (HomogeneousType) MatchNames(ctx context.Context, semaCtx *SemaContext, namedArr intsets.Fast, constantArr intsets.Fast, resolvableArr intsets.Fast, exprs []Expr, lastVariadic bool) bool {
-	return namedArr.Len() == 0
+	return (namedArr.Len() == 0 && !lastVariadic)
 }
 
 func (HomogeneousType) MatchIdenticalInput(exprs []TypedExpr) bool {
@@ -1175,29 +1169,7 @@ func (v VariadicType) String() string {
 }
 
 func (v VariadicType) MatchNames(ctx context.Context, semaCtx *SemaContext, namedArr intsets.Fast, constantArr intsets.Fast, resolvableArr intsets.Fast, exprs []Expr, lastVariadic bool) bool {
-	if (namedArr.Len() > 0 || lastVariadic) {
-		return false
-	}
-
-	for i, ok := constantArr.Next(0); ok; i, ok = constantArr.Next(i + 1) {
-		constExpr := exprs[i].(Constant)
-		if !(canConstantBecome(constExpr, v.GetAt(i))) {
-			return false
-		}
-	}
-
-	for i, ok := resolvableArr.Next(0); ok; i, ok = resolvableArr.Next(i + 1) {
-		typ, err := exprs[i].TypeCheck(ctx, semaCtx, types.Any)
-		if err != nil {
-			return false
-		}
-		rt := typ.ResolvedType()
-		if !(v.MatchAt(rt, i)) {
-			return false
-		}
-	}
-
-	return true
+	return (namedArr.Len() == 0 && !lastVariadic)
 }
 
 func (v VariadicType) MatchIdenticalInput(exprs []TypedExpr) bool {
@@ -1441,8 +1413,10 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 	}
 	s.constIdxs, s.placeholderIdxs, s.resolvableIdxs, s.namedArgIdxs = typeCheckSplitExprs(s.exprs)
 
+
 	// If no overloads are provided, just type check parameters and return.
 	if numOverloads == 0 {
+		fmt.Print("After Len Check : (", s.exprs, ")")
 		for i, ok := s.resolvableIdxs.Next(0); ok; i, ok = s.resolvableIdxs.Next(i + 1) {
 			typ, err := s.exprs[i].TypeCheck(ctx, semaCtx, types.Any)
 			if err != nil {
@@ -1471,16 +1445,42 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 	matchLen := func(params TypeList) bool { return params.MatchLen(exprsLen) }
 	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchLen)
 
-	// Filter out overloads which constants cannot become.
-	// for i, ok := s.constIdxs.Next(0); ok; i, ok = s.constIdxs.Next(i + 1) {
-	// 	constExpr := s.exprs[i].(Constant)
-	// 	filter := func(params TypeList) bool {
-	// 		return canConstantBecome(constExpr, params.GetAt(i))
-	// 	}
-	// 	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, filter)
-	// }
+	if (len(s.overloadIdxs) == 0 && len(s.exprs) == 1) {
+		plist := s.overloads[0].params()
+		if e, ok := plist.(ParamTypesWithModes); ok {
+			fmt.Print("HOORAYYYYYYYYYYYYYYYY")
+			fmt.Print("Default Valueeee: (", e.getDefaults())
+		}
 
-	
+		if _, ok := plist.(ParamTypes); ok {
+			fmt.Print("BOOOOOOOOOOOOOOOOOOOOO")
+		}
+
+		fmt.Print("checkingnnnnnnn, ", s.exprs, " overload params ()", s.overloads[0].params(), ") ")
+	}
+
+	if (s.variadic) {
+		matchVariadic := func(params TypeList) bool { return params.acceptsVariadic() }
+		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchVariadic)
+	}
+
+	if (len(s.overloadIdxs) == 0) {
+		fmt.Print("After variadic Check : (", s.exprs, ")")
+	}
+
+
+	// Filter out overloads which constants cannot become.
+	for i, ok := s.constIdxs.Next(0); ok; i, ok = s.constIdxs.Next(i + 1) {
+		constExpr := s.exprs[i].(Constant)
+		filter := func(params TypeList) bool {
+			return canConstantBecome(constExpr, params.GetAt(i))
+		}
+		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, filter)
+	}
+
+	if (len(s.overloadIdxs) == 0) {
+		fmt.Print("After const Check : (", s.exprs, "overloadparams: (", s.overloads[0].params(), "))")
+	}
 
 	// TODO(nvanbenschoten): We should add a filtering step here to filter
 	// out impossible candidates based on identical parameters. For instance,
@@ -1522,16 +1522,20 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 			return err
 		}
 		s.typedExprs[i] = typ
-		// rt := typ.ResolvedType()
-		// s.overloadIdxs = filterParams(s.overloadIdxs, s.params, func(
-		// 	params TypeList,
-		// ) bool {
-		// 	return params.MatchAt(rt, i)
-		// })
+		rt := typ.ResolvedType()
+		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, func(
+			params TypeList,
+		) bool {
+			if (s.variadic && i == params.Length() - 1) {
+				return params.MatchAt(rt.ArrayContents(), i)
+			}
+			return params.MatchAt(rt, i)
+		})
 	}
 
-	matchArgnames := func(params TypeList) bool {return params.MatchNames(ctx , semaCtx, s.namedArgIdxs, s.constIdxs, typeableIdxs, s.exprs, s.variadic)}
-	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchArgnames)
+	if (len(s.overloadIdxs) == 0) {
+		fmt.Print("After resolvable Check : (", s.exprs, ")")
+	}
 
 	var namedConstantIdxs intsets.Fast
 	for i, ok := s.namedArgIdxs.Next(0); ok; i, ok = s.namedArgIdxs.Next(i + 1) {
@@ -1544,6 +1548,15 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 			return err
 		}
 		s.typedExprs[i] = typ
+	}
+
+	if (s.namedArgIdxs.Len() > 0) {
+		matchArgnames := func(params TypeList) bool {return params.MatchNames(ctx , semaCtx, s.namedArgIdxs, s.constIdxs, typeableIdxs, s.exprs, s.variadic)}
+		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchArgnames)
+	}
+
+	if (len(s.overloadIdxs) == 0) {
+		fmt.Print("After named Check : (", s.exprs, ")")
 	}
 
 	// At this point, all remaining overload candidates accept the argument list,
@@ -1587,18 +1600,15 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 	}
 
 	if !s.namedArgIdxs.Empty() {
-		for i, ok := s.namedArgIdxs.Next(0); ok; i, ok = s.namedArgIdxs.Next(i + 1) {
-			argExpr := s.exprs[i].(*NamedArgExpr)
-			typ, err := argExpr.TypeCheck(ctx, semaCtx, types.Any)
-			if err != nil {
-				return err
-			}
-			s.typedExprs[i] = typ
-			if !homogeneousTyp.Equivalent(s.typedExprs[i].ResolvedType()) {
-				homogeneousTyp = nil
-				break
+		if homogeneousTyp != nil {
+			for i, ok := s.namedArgIdxs.Next(0); ok; i, ok = s.namedArgIdxs.Next(i + 1) {
+				if !homogeneousTyp.Equivalent(s.typedExprs[i].ResolvedType()) {
+					homogeneousTyp = nil
+					break
+				}
 			}
 		}
+		
 	}
 
 	if !s.constIdxs.Empty() {

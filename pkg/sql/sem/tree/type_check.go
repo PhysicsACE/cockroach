@@ -1220,6 +1220,7 @@ func (expr *FuncExpr) TypeCheck(
 		}
 	}
 
+	// var checkedFilter TypedExpr
 	if expr.Filter != nil {
 		if funcCls != AggregateClass {
 			// Same error message as Postgres. If we have a window function, only
@@ -1233,6 +1234,7 @@ func (expr *FuncExpr) TypeCheck(
 			return nil, err
 		}
 		expr.Filter = typedFilter
+		// checkedFilter = typedFilter
 	}
 
 	if expr.OrderBy != nil {
@@ -1256,15 +1258,14 @@ func (expr *FuncExpr) TypeCheck(
 	}
 
 	if (srcParams.Length() < len(s.typedExprs)) {
-		variadicArray := NewTypedArray(s.typedExprs[srcParams.Length() - 1:], srcParams.variadicType())
+		variadicArray := NewTypedArray(s.typedExprs[srcParams.Length() - 1:], types.MakeArray(srcParams.variadicType()))
+		fmt.Print("Variable array: ", variadicArray)
 		typeNames[len(typeNames) - 1] = variadicArray
-		variableSeen = 1
+		variableSeen = len(s.typedExprs) - srcParams.Length() + 1
 		seenIdxs.Remove(srcParams.Length() - 1)
 	}
 
 	for idx, expr := range s.typedExprs[:len(s.typedExprs) - variableSeen] {
-
-		seenIdxs.Remove(idx)
 
 		if namedExpr, ok := expr.(*NamedArgExpr); ok {
 			position := paramDict[string(namedExpr.ArgName)]
@@ -1273,9 +1274,11 @@ func (expr *FuncExpr) TypeCheck(
 				return nil, err
 			}
 			typeNames[position] = typ
+			seenIdxs.Remove(position)
 			continue
 		}
 
+		seenIdxs.Remove(idx)
 		typeNames[idx] = expr
 	}
 
@@ -1294,9 +1297,17 @@ func (expr *FuncExpr) TypeCheck(
 			"Default value does not exist for param")
 	}
 
-	for i, exp := range typeNames {
-		expr.Exprs[i] = exp
-	}
+	// tmp := make([]Expr, len(typeNames))
+	// for i, exp := range typeNames {
+	// 	tmp[i] = exp
+	// }
+
+	// for i, subExpr := range s.typedExprs {
+	// 	expr.Exprs[i] = subExpr
+	// }
+
+	// fmt.Print(tmp)
+	// expr.Exprs = tmp
 
 	expr.Func.FunctionReference = def
 	expr.fn = overloadImpl
@@ -1320,7 +1331,44 @@ func (expr *FuncExpr) TypeCheck(
 	if overloadImpl.OnTypeCheck != nil && *overloadImpl.OnTypeCheck != nil {
 		(*overloadImpl.OnTypeCheck)()
 	}
+
+	// fmt.Print("Hellooooooooo")
+
+	// argsList := make([]Expr, len(typeNames))
+	// for i, e := range typeNames {
+	// 	argsList[i] = e
+	// }
+
+	// ex := &FuncExpr{
+	// 	Func: expr.Func,
+	// 	Type: expr.Type,
+	// 	Exprs: make([]Expr, len(typeNames)),
+	// 	Filter: expr.Filter,
+	// 	WindowDef: expr.WindowDef,
+	// 	AggType: expr.AggType,
+	// 	OrderBy: expr.OrderBy,
+	// 	fn: overloadImpl,
+	// 	fnProps: &overloadImpl.FunctionProperties,
+	// 	IsVariadic: expr.IsVariadic,
+	// }
+
+	// *ex = *expr
+	// ex.typ = expr.typ
+
+	for i, subExpr := range s.typedExprs {
+		expr.Exprs[i] = subExpr
+	}
+
+	expr.ResExprs = typeNames
+
 	return expr, nil
+
+	// fmt.Print(ex)
+	// for i, exp := range typeNames {
+	// 	expr.Exprs[i] = exp
+	// }
+
+	// return expr, nil
 }
 
 // TypeCheck implements the Expr interface.
@@ -3214,6 +3262,11 @@ func getMostSignificantOverload(
 	}
 
 	preferentialOverload := func(oImpls []uint8) (QualifiedOverload, error) {
+
+		if len(oImpls) == 1 {
+			return qualifiedOverloads[oImpls[0]], nil
+		}
+
 		found := false
 		var ret QualifiedOverload
 		for _, idx := range filter {

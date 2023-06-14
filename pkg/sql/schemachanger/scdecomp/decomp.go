@@ -748,7 +748,7 @@ func (w *walkCtx) walkFunction(fnDesc catalog.FunctionDescriptor) {
 			Type:  *typeT,
 		}
 		if param.DefaultExpr != "" {
-			expr, err := w.newExpression(param.DefaultExpr)
+			expr, err := w.newFunctionalExpression(param.DefaultExpr)
 			if err != nil {
 				panic(err)
 			}

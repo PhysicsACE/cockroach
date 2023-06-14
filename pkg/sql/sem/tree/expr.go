@@ -1288,6 +1288,10 @@ type FuncExpr struct {
 
 	// IsVariadic signifies if a variadic argument was passed as a expr
 	IsVariadic bool
+	// Resulting Expression List
+	ResExprs TypedExprs
+	// test bool
+	Random bool
 }
 
 // NewTypedFuncExpr returns a FuncExpr that is already well-typed and resolved.

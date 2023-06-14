@@ -23,6 +23,7 @@ func (i *immediateVisitor) CreateFunctionDescriptor(
 	ctx context.Context, op scop.CreateFunctionDescriptor,
 ) error {
 	params := make([]descpb.FunctionDescriptor_Parameter, len(op.Function.Params))
+	outputParams := make([]descpb.FunctionDescriptor_Parameter, 0)
 	for i, param := range op.Function.Params {
 
 		params[i] = descpb.FunctionDescriptor_Parameter{
@@ -41,6 +42,7 @@ func (i *immediateVisitor) CreateFunctionDescriptor(
 		op.Function.ReturnType.Type,
 		op.Function.ReturnSet,
 		&catpb.PrivilegeDescriptor{Version: catpb.Version21_2},
+		outputParams,
 	)
 	mut.State = descpb.DescriptorState_ADD
 	i.CreateDescriptor(&mut)
@@ -106,5 +108,10 @@ func (i *immediateVisitor) SetFunctionParamDefaultExpr(
 	// TODO(chengxiong): when default parameter value is supported, we need to
 	// address references here because functions, types and sequences can be used
 	// with a default value expression.
+	fn, err := i.checkOutFunction(ctx, op.Expr.FunctionID)
+	if err != nil {
+		return err
+	}
+	fn.SetDefaultParam(int(op.Expr.Ordinal), string(op.Expr.Expression.Expr))
 	return nil
 }

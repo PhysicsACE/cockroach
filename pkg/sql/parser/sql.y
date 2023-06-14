@@ -15339,11 +15339,11 @@ expr_list:
 
 
 named_param:
-  unrestricted_name NAMEDARG a_expr
+  param_name NAMEDARG a_expr
   {
     $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), ArgValue: $3.expr(), IsVariadic: false }
   }
-| VARIADIC unrestricted_name NAMEDARG array_expr 
+| VARIADIC param_name NAMEDARG array_expr 
   {
     $$.val = &tree.NamedArgExpr{ArgName: tree.Name($2), ArgValue: $4.expr(), IsVariadic: true}
   }

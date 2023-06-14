@@ -662,7 +662,7 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ParamTypes{
+				Types: tree.ParamTypesWithModes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType: tree.FixedReturnType(types.Int),
@@ -686,7 +686,7 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ParamTypes{
+				Types: tree.ParamTypesWithModes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType: tree.FixedReturnType(types.Int),
@@ -709,7 +709,7 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ParamTypes{
+				Types: tree.ParamTypesWithModes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType: tree.FixedReturnType(types.Int),
@@ -733,7 +733,7 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ParamTypes{
+				Types: tree.ParamTypesWithModes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType:        tree.FixedReturnType(types.Int),
@@ -758,7 +758,7 @@ func TestToOverload(t *testing.T) {
 			},
 			expected: tree.Overload{
 				Oid: oid.Oid(100001),
-				Types: tree.ParamTypes{
+				Types: tree.ParamTypesWithModes{
 					{Name: "arg1", Typ: types.Int},
 				},
 				ReturnType: tree.FixedReturnType(types.Int),

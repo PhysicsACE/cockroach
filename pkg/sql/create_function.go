@@ -224,9 +224,11 @@ func (n *createFunctionNode) getMutableFuncDesc(
 	// Resolve parameter types.
 	paramTypes := make([]*types.T, len(n.cf.Params))
 	pbParams := make([]descpb.FunctionDescriptor_Parameter, len(n.cf.Params))
+	outputParams := make([]descpb.FunctionDescriptor_Parameter, 0)
 	paramNameSeen := make(map[tree.Name]struct{})
 	variadicSeen := false
 	defaultSeen := false
+	outSeen := false
 	for i, param := range n.cf.Params {
 
 		if param.Name != "" {
@@ -243,6 +245,25 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		if err != nil {
 			return nil, false, err
 		}
+		if pbParam.Name == "j" {
+			fmt.Print("Testing created descriptor param: (", pbParam, ")")
+		}
+
+		if (pbParam.Class == catpb.Function_Param_OUT) {
+			outSeen = true
+			outputParams = append(outputParams, pbParam)
+			continue
+		}
+
+		if (outSeen) {
+			return nil, false, pgerror.Newf(
+				pgcode.InvalidFunctionDefinition, "OUT parameters must be the last parameters",
+			)
+		}
+
+		if (pbParam.Class == catpb.Function_Param_IN_OUT) {
+			outputParams = append(outputParams, pbParam)
+		}
 		
 		if (pbParam.Class == catpb.Function_Param_VARIADIC) {
 			if (variadicSeen) {
@@ -251,12 +272,23 @@ func (n *createFunctionNode) getMutableFuncDesc(
 				)
 			}
 
-			if (i != len(n.cf.Params) - 1) {
+			if !(pbParam.Type.Family() == types.ArrayFamily) {
 				return nil, false, pgerror.Newf(
-					pgcode.InvalidFunctionDefinition, "VARIADIC parameter must be the last parameter in defined list", param.Name,
+					pgcode.InvalidFunctionDefinition, "VARIADIC parameter must be an array type",
 				)
 			}
+
+			arrType := pbParam.Type.ArrayContents()
+			pbParam.Type = arrType
+
 			variadicSeen = true
+			continue
+		}
+
+		if (variadicSeen) {
+			return nil, false, pgerror.Newf(
+				pgcode.InvalidFunctionDefinition, "VARIADIC parameter must be the last parameter in defined list", param.Name,
+			)
 		}
 
 		if (defaultSeen) {
@@ -329,6 +361,7 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		returnType,
 		n.cf.ReturnType.IsSet,
 		privileges,
+		outputParams,
 	)
 
 	return &newUdfDesc, true, nil
