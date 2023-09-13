@@ -1259,7 +1259,6 @@ func (expr *FuncExpr) TypeCheck(
 
 	if (srcParams.Length() < len(s.typedExprs)) {
 		variadicArray := NewTypedArray(s.typedExprs[srcParams.Length() - 1:], types.MakeArray(srcParams.variadicType()))
-		fmt.Print("Variable array: ", variadicArray)
 		typeNames[len(typeNames) - 1] = variadicArray
 		variableSeen = len(s.typedExprs) - srcParams.Length() + 1
 		seenIdxs.Remove(srcParams.Length() - 1)
@@ -3213,7 +3212,11 @@ func getMostSignificantOverload(
 		)
 	}
 
+	
+
 	checkSigAmbiguity := func(ov1 []*types.T, ov2 []*types.T) bool {
+
+		fmt.Print("ARGGGSSS", ov1, ov2)
 
 		if (len(ov1) != len(ov2)) {
 			return false
@@ -3263,41 +3266,63 @@ func getMostSignificantOverload(
 
 	preferentialOverload := func(oImpls []uint8) (QualifiedOverload, error) {
 
+
+
 		if len(oImpls) == 1 {
 			return qualifiedOverloads[oImpls[0]], nil
 		}
 
+		fmt.Print("GOT HERE")
+
+
 		found := false
 		var ret QualifiedOverload
+		var exact int
 		for _, idx := range filter {
 			r := qualifiedOverloads[idx]
 			if !(found) {
 				found = true
 				ret = r
+				exact = r.numExact(typedInputExprs)
 				continue
 			}
+
+			
 
 			srcParams := r.params()
 			prevParams := ret.params()
 
+			fmt.Print("GOT HERE TOO")
+
 			prevSig := prevParams.inputSig(typedInputExprs)
 			srcSig := srcParams.inputSig(typedInputExprs)
 
+			numMatches := r.numExact(typedInputExprs)
+
 			if (checkSigAmbiguity(prevSig, srcSig)) {
+
+				fmt.Print("HELLSSSOSOSOS")
+
+				if (srcParams.acceptsVariadic() && prevParams.acceptsVariadic()) {
+					return QualifiedOverload{}, ambiguousError()
+				}
+
+				if srcParams.acceptsVariadic() {
+					continue
+				}
+
+				if prevParams.acceptsVariadic() {
+					ret = r
+					exact = numMatches
+					continue
+				}
+
 				return QualifiedOverload{}, ambiguousError()
 			}
 
-			if srcParams.acceptsVariadic() {
-				continue
-			}
-
-			if prevParams.acceptsVariadic() {
+			if (numMatches > exact) {
 				ret = r
-				continue
-			}
-
-			if srcParams.MatchIdenticalInput(typedInputExprs) {
-				ret = r
+				exact = numMatches
 			}
 				
 		}

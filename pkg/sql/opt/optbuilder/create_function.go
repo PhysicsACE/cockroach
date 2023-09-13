@@ -102,6 +102,7 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 	// named parameters to the scope so that references to them in the body can
 	// be resolved.
 	bodyScope := b.allocScope()
+	outputParams := make([]*types.T, 0)
 	for i := range cf.Params {
 		param := &cf.Params[i]
 		typ, err := tree.ResolveType(b.ctx, param.Type, b.semaCtx.TypeResolver)
@@ -118,6 +119,10 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 		typedesc.GetTypeDescriptorClosure(typ).ForEach(func(id descpb.ID) {
 			typeDeps.Add(int(id))
 		})
+
+		if param.Class == tree.FunctionParamInOut || param.Class == tree.FunctionParamVariadic {
+			outputParams = append(outputParams, typ)
+		}
 	}
 
 	// Collect the user defined type dependency of the return type.
@@ -125,6 +130,22 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 	if err != nil {
 		panic(err)
 	}
+
+	customValidate := false
+
+	if len(outputParams) > 0 {
+		var outType *types.T
+		if len(outputParams) > 1 {
+			outType = types.MakeTuple(outputParams)
+		} else {
+			outType = outputParams[0]
+		}
+		
+		funcReturnType = outType
+		cf.ReturnType.Type = outType
+		customValidate = true
+	}
+
 	typedesc.GetTypeDescriptorClosure(funcReturnType).ForEach(func(id descpb.ID) {
 		typeDeps.Add(int(id))
 	})
@@ -157,7 +178,7 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 			// TODO(mgartner): stmtScope.cols does not describe the result
 			// columns of the statement. We should use physical.Presentation
 			// instead.
-			err := validateReturnType(funcReturnType, stmtScope.cols)
+			err := validateReturnType(funcReturnType, stmtScope.cols, customValidate)
 			if err != nil {
 				panic(err)
 			}
@@ -209,13 +230,13 @@ func formatFuncBodyStmt(fmtCtx *tree.FmtCtx, ast tree.Statement, newLine bool) {
 	fmtCtx.WriteString(";")
 }
 
-func validateReturnType(expected *types.T, cols []scopeColumn) error {
+func validateReturnType(expected *types.T, cols []scopeColumn, customValidate bool) error {
 	// If return type is void, any column types are valid.
 	if expected.Equivalent(types.Void) {
 		return nil
 	}
 	// If return type is RECORD, any column types are valid.
-	if types.IsRecordType(expected) {
+	if types.IsRecordType(expected) && !customValidate {
 		return nil
 	}
 

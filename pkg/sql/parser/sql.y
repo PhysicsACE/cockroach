@@ -1376,7 +1376,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %type <tree.ResolvableFunctionReference> func_application_name
 %type <str> opt_class opt_collate
 
-%type <str> cursor_name database_name index_name opt_index_name column_name insert_column_item statistics_name window_name opt_in_database
+%type <str> cursor_name database_name index_name opt_index_name column_name insert_column_item statistics_name window_name opt_in_database, arg_name
 %type <str> family_name opt_family_name table_alias_name constraint_name target_name zone_name partition_name collation_name
 %type <str> db_object_name_component
 %type <*tree.UnresolvedObjectName> table_name db_name standalone_index_name sequence_name type_name view_name db_object_name simple_db_object_name complex_db_object_name
@@ -4544,9 +4544,9 @@ func_param:
 
 func_param_class:
   IN { $$.val = tree.FunctionParamIn }
-| OUT { return unimplemented(sqllex, "create function with 'OUT' argument class") }
-| INOUT { return unimplemented(sqllex, "create function with 'INOUT' argument class") }
-| IN OUT { return unimplemented(sqllex, "create function with 'IN OUT' argument class") }
+| OUT { $$.val = tree.FunctionParamOut }
+| INOUT { $$.val = tree.FunctionParamInOut }
+| IN OUT { $$.val = tree.FunctionParamInOut }
 | VARIADIC { $$.val = tree.FunctionParamVariadic }
 
 func_param_type:
@@ -15339,11 +15339,11 @@ expr_list:
 
 
 named_param:
-  param_name NAMEDARG a_expr
+  arg_name DEFAULT a_expr
   {
     $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), ArgValue: $3.expr(), IsVariadic: false }
   }
-| VARIADIC param_name NAMEDARG array_expr 
+| VARIADIC arg_name DEFAULT a_expr
   {
     $$.val = &tree.NamedArgExpr{ArgName: tree.Name($2), ArgValue: $4.expr(), IsVariadic: true}
   }
@@ -15868,6 +15868,8 @@ constraint_name:       name
 database_name:         name
 
 column_name:           name
+
+arg_name:            name
 
 family_name:           name
 

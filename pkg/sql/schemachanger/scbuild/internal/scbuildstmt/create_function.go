@@ -219,6 +219,9 @@ func validateParameters(n *tree.CreateFunction) {
 		}
 
 		if defaultSeen {
+			if param.Class == tree.FunctionParamOut {
+				continue
+			}
 			panic(pgerror.Newf(
 				pgcode.InvalidFunctionDefinition, "Input parameters after one with a default value must also have a default value"))
 		}

@@ -222,14 +222,14 @@ func (n *createFunctionNode) getMutableFuncDesc(
 	scDesc catalog.SchemaDescriptor, params runParams,
 ) (fnDesc *funcdesc.Mutable, isNew bool, err error) {
 	// Resolve parameter types.
-	paramTypes := make([]*types.T, len(n.cf.Params))
-	pbParams := make([]descpb.FunctionDescriptor_Parameter, len(n.cf.Params))
+	pbParams := make([]descpb.FunctionDescriptor_Parameter, 0)
 	outputParams := make([]descpb.FunctionDescriptor_Parameter, 0)
 	paramNameSeen := make(map[tree.Name]struct{})
 	variadicSeen := false
 	defaultSeen := false
 	outSeen := false
-	for i, param := range n.cf.Params {
+	fmt.Print("INPUT", n.cf.Params)
+	for _, param := range n.cf.Params {
 
 		if param.Name != "" {
 			if _, ok := paramNameSeen[param.Name]; ok {
@@ -244,9 +244,6 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		pbParam, err := makeFunctionParam(params.ctx, param, params.p, params.p.SemaCtx())
 		if err != nil {
 			return nil, false, err
-		}
-		if pbParam.Name == "j" {
-			fmt.Print("Testing created descriptor param: (", pbParam, ")")
 		}
 
 		if (pbParam.Class == catpb.Function_Param_OUT) {
@@ -278,10 +275,13 @@ func (n *createFunctionNode) getMutableFuncDesc(
 				)
 			}
 
+			
+
 			arrType := pbParam.Type.ArrayContents()
 			pbParam.Type = arrType
 
 			variadicSeen = true
+			pbParams = append(pbParams, pbParam)
 			continue
 		}
 
@@ -303,8 +303,8 @@ func (n *createFunctionNode) getMutableFuncDesc(
 			defaultSeen = true
 		}
 
-		pbParams[i] = pbParam
-		paramTypes[i] = pbParam.Type
+
+		pbParams = append(pbParams, pbParam)
 	}
 
 	// Try to look up an existing function.
@@ -351,6 +351,8 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		params.SessionData().User(),
 		privilege.Functions,
 	)
+
+	fmt.Print("Returns ", returnType)
 
 	newUdfDesc := funcdesc.NewMutableFunctionDescriptor(
 		funcDescID,

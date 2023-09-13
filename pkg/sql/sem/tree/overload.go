@@ -439,7 +439,11 @@ func (p ParamTypesWithModes) MatchAt(typ *types.T, i int) bool {
 		return (typ.Family() == types.UnknownFamily || p[i].Typ.Equivalent(typ))
 	}
 
-	return (p.acceptsVariadic() && typ.Family() == types.UnknownFamily || p.variadicType().Equivalent(typ))
+	if (p.acceptsVariadic()) {
+		return (typ.Family() == types.UnknownFamily || p.variadicType().Equivalent(typ))
+	}
+
+	return ((typ.Family() == types.UnknownFamily || p[i].Typ.Equivalent(typ)))
 }
 
 // MatchAtIdentical is part of the TypeList interface.
@@ -680,12 +684,16 @@ func (p ParamTypesWithModes) inputSig(exprs []TypedExpr) []*types.T {
 	paramDict := p.getTyps()
 	sig := make([]*types.T, 0)
 	iterator := 0
+	minimum := p.Length()
+	if len(exprs) < minimum {
+		minimum = len(exprs)
+	}
 
 	for (len(exprs) > p.Length()) {
 		iterator = 1
 	}
 
-	for i, expr := range exprs[:p.Length() - iterator] {
+	for i, expr := range exprs[:minimum - iterator] {
 		if argExpr, ok := expr.(*NamedArgExpr); ok {
 			typ := paramDict[string(argExpr.ArgName)]
 			sig = append(sig, typ)
@@ -694,6 +702,8 @@ func (p ParamTypesWithModes) inputSig(exprs []TypedExpr) []*types.T {
 
 		sig = append(sig, p[i].Typ)
 	}
+
+	// fmt.Print("GENERATRED SIG", sig)
 
 	if (iterator == 1) {
 		sig = append(sig, p.GetAt(p.Length() - 1))
@@ -1416,7 +1426,6 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 
 	// If no overloads are provided, just type check parameters and return.
 	if numOverloads == 0 {
-		fmt.Print("After Len Check : (", s.exprs, ")")
 		for i, ok := s.resolvableIdxs.Next(0); ok; i, ok = s.resolvableIdxs.Next(i + 1) {
 			typ, err := s.exprs[i].TypeCheck(ctx, semaCtx, types.Any)
 			if err != nil {
@@ -1445,28 +1454,28 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 	matchLen := func(params TypeList) bool { return params.MatchLen(exprsLen) }
 	s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchLen)
 
-	if (len(s.overloadIdxs) == 0 && len(s.exprs) == 1) {
-		plist := s.overloads[0].params()
-		if e, ok := plist.(ParamTypesWithModes); ok {
-			fmt.Print("HOORAYYYYYYYYYYYYYYYY")
-			fmt.Print("Default Valueeee: (", e.getDefaults())
-		}
+	// if (len(s.overloadIdxs) == 0 && len(s.exprs) == 1) {
+	// 	plist := s.overloads[0].params()
+	// 	if e, ok := plist.(ParamTypesWithModes); ok {
+	// 		fmt.Print("HOORAYYYYYYYYYYYYYYYY")
+	// 		fmt.Print("Default Valueeee: (", e.getDefaults())
+	// 	}
 
-		if _, ok := plist.(ParamTypes); ok {
-			fmt.Print("BOOOOOOOOOOOOOOOOOOOOO")
-		}
+	// 	if _, ok := plist.(ParamTypes); ok {
+	// 		fmt.Print("BOOOOOOOOOOOOOOOOOOOOO")
+	// 	}
 
-		fmt.Print("checkingnnnnnnn, ", s.exprs, " overload params ()", s.overloads[0].params(), ") ")
-	}
+	// 	fmt.Print("checkingnnnnnnn, ", s.exprs, " overload params ()", s.overloads[0].params(), ") ")
+	// }
 
 	if (s.variadic) {
 		matchVariadic := func(params TypeList) bool { return params.acceptsVariadic() }
 		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchVariadic)
 	}
 
-	if (len(s.overloadIdxs) == 0) {
-		fmt.Print("After variadic Check : (", s.exprs, ")")
-	}
+	// if (len(s.overloadIdxs) == 0) {
+	// 	fmt.Print("After variadic Check : (", s.exprs, ")")
+	// }
 
 
 	// Filter out overloads which constants cannot become.
@@ -1478,9 +1487,9 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, filter)
 	}
 
-	if (len(s.overloadIdxs) == 0) {
-		fmt.Print("After const Check : (", s.exprs, "overloadparams: (", s.overloads[0].params(), "))")
-	}
+	// if (len(s.overloadIdxs) == 0) {
+	// 	fmt.Print("After const Check : (", s.exprs, "overloadparams: (", s.overloads[0].params(), "))")
+	// }
 
 	// TODO(nvanbenschoten): We should add a filtering step here to filter
 	// out impossible candidates based on identical parameters. For instance,
@@ -1533,9 +1542,9 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 		})
 	}
 
-	if (len(s.overloadIdxs) == 0) {
-		fmt.Print("After resolvable Check : (", s.exprs, ")")
-	}
+	// if (len(s.overloadIdxs) == 0) {
+	// 	fmt.Print("After resolvable Check : (", s.exprs, ")")
+	// }
 
 	var namedConstantIdxs intsets.Fast
 	for i, ok := s.namedArgIdxs.Next(0); ok; i, ok = s.namedArgIdxs.Next(i + 1) {
@@ -1555,9 +1564,9 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchArgnames)
 	}
 
-	if (len(s.overloadIdxs) == 0) {
-		fmt.Print("After named Check : (", s.exprs, ")")
-	}
+	// if (len(s.overloadIdxs) == 0) {
+	// 	fmt.Print("After named Check : (", s.exprs, ")")
+	// }
 
 	// At this point, all remaining overload candidates accept the argument list,
 	// so we begin checking for a single remainig candidate implementation to choose.

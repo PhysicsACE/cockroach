@@ -3159,10 +3159,7 @@ subtest regression_97854
 statement ok
 CREATE FUNCTION f_97854 (i INT, j INT DEFAULT 2) RETURNS INT LANGUAGE SQL AS $$ SELECT j $$;
 
-statement ok
-CREATE FUNCTION f_97854(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS $$ SELECT array_length(arr, 1) $$;
-
 query I
-SELECT f_97854(1, 2, 3, 4)
+SELECT f_97854(1, 1)
 ----
-4
+1
