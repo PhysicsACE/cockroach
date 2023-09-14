@@ -245,22 +245,6 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		if err != nil {
 			return nil, false, err
 		}
-
-		if (pbParam.Class == catpb.Function_Param_OUT) {
-			outSeen = true
-			outputParams = append(outputParams, pbParam)
-			continue
-		}
-
-		if (outSeen) {
-			return nil, false, pgerror.Newf(
-				pgcode.InvalidFunctionDefinition, "OUT parameters must be the last parameters",
-			)
-		}
-
-		if (pbParam.Class == catpb.Function_Param_IN_OUT) {
-			outputParams = append(outputParams, pbParam)
-		}
 		
 		if (pbParam.Class == catpb.Function_Param_VARIADIC) {
 			if (variadicSeen) {
@@ -274,8 +258,6 @@ func (n *createFunctionNode) getMutableFuncDesc(
 					pgcode.InvalidFunctionDefinition, "VARIADIC parameter must be an array type",
 				)
 			}
-
-			
 
 			arrType := pbParam.Type.ArrayContents()
 			pbParam.Type = arrType
