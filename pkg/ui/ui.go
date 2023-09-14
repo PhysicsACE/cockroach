@@ -28,9 +28,30 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
+
+const (
+	utc int64 = iota
+	americaNewYork
+)
+
+var _ = settings.RegisterEnumSetting(
+	settings.SystemOnly,
+	"ui.display_timezone",
+	"the timezone used to format timestamps in the ui",
+	"Etc/UTC",
+	map[int64]string{
+		utc:            "Etc/UTC",
+		americaNewYork: "America/New_York",
+		// Adding new timezones?
+		// Add them to the allowlist of included timezones!
+		// See pkg/ui/workspaces/cluster-ui/webpack.config.js
+		// and pkg/ui/workspaces/db-console/webpack.config.js.
+	},
+	settings.WithPublic)
 
 // Assets is used for embedded JS assets required for UI.
 // In case the binary is built without UI, it provides single index.html file with
@@ -69,6 +90,8 @@ type indexHTMLArgs struct {
 	OIDCLoginEnabled bool
 	OIDCButtonText   string
 	FeatureFlags     serverpb.FeatureFlags
+
+	OIDCGenerateJWTAuthTokenEnabled bool
 }
 
 // OIDCUIConf is a variable that stores data required by the
@@ -79,6 +102,8 @@ type OIDCUIConf struct {
 	ButtonText string
 	AutoLogin  bool
 	Enabled    bool
+
+	GenerateJWTAuthTokenEnabled bool
 }
 
 // OIDCUI is an interface that our OIDC configuration must implement in order to be able
@@ -143,6 +168,8 @@ func Handler(cfg Config) http.Handler {
 			OIDCLoginEnabled: oidcConf.Enabled,
 			OIDCButtonText:   oidcConf.ButtonText,
 			FeatureFlags:     cfg.Flags,
+
+			OIDCGenerateJWTAuthTokenEnabled: oidcConf.GenerateJWTAuthTokenEnabled,
 		}
 		if cfg.NodeID != nil {
 			args.NodeID = cfg.NodeID.String()

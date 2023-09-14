@@ -12,12 +12,12 @@ package tests
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -29,8 +29,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/search"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -93,11 +95,6 @@ type tpccOptions struct {
 	// also be doing a rolling-restart into the new binary while the cluster
 	// is running, but that feels like jamming too much into the tpcc setup.
 	Start func(context.Context, test.Test, cluster.Cluster)
-	// EnableCircuitBreakers causes the kv.replica_circuit_breaker.slow_replication_threshold
-	// setting to be populated, which enables per-Replica circuit breakers.
-	//
-	// TODO(tbg): remove this once https://github.com/cockroachdb/cockroach/issues/74705 is completed.
-	EnableCircuitBreakers bool
 	// SkipPostRunCheck, if set, skips post TPC-C run checks.
 	SkipPostRunCheck              bool
 	DisableDefaultScheduledBackup bool
@@ -165,10 +162,6 @@ func setupTPCC(
 		opts.Start(ctx, t, c)
 		db := c.Conn(ctx, t.L(), 1)
 		defer db.Close()
-		if opts.EnableCircuitBreakers {
-			_, err := db.Exec(`SET CLUSTER SETTING kv.replica_circuit_breaker.slow_replication_threshold = '15s'`)
-			require.NoError(t, err)
-		}
 
 		if t.SkipInit() {
 			return
@@ -224,7 +217,7 @@ func runTPCC(ctx context.Context, t test.Test, c cluster.Cluster, opts tpccOptio
 
 	var ep *tpccChaosEventProcessor
 	var promCfg *prometheus.Config
-	if !opts.DisablePrometheus {
+	if !opts.DisablePrometheus && !t.SkipInit() {
 		// TODO(irfansharif): Move this after the import step. The statistics
 		// during import itself is uninteresting and pollutes actual workload
 		// data.
@@ -326,6 +319,7 @@ var tpccSupportedWarehouses = []struct {
 	// TODO(tbg): this number is copied from gce-n4cpu16. The real number should be a
 	// little higher, find out what it is.
 	{hardware: "gce-n5cpu16", v: version.MustParse(`v19.1.0-0`), warehouses: 1300},
+	{hardware: "aws-n5cpu16", v: version.MustParse(`v19.1.0-0`), warehouses: 2100},
 	// Ditto.
 	{hardware: "gce-n5cpu16", v: version.MustParse(`v2.1.0-0`), warehouses: 1300},
 }
@@ -359,6 +353,56 @@ func maxSupportedTPCCWarehouses(
 	return warehouses
 }
 
+type backgroundFn func(ctx context.Context, u *versionUpgradeTest) error
+
+// A backgroundStepper is a tool to run long-lived commands while a cluster is
+// going through a sequence of version upgrade operations.
+// It exposes a `launch` step that launches the method carrying out long-running
+// work (in the background) and a `stop` step collecting any errors.
+type backgroundStepper struct {
+	// This is the operation that will be launched in the background. When the
+	// context gets canceled, it should shut down and return without an error.
+	// The way to typically get this is:
+	//
+	//  err := doSomething(ctx)
+	//  ctx.Err() != nil {
+	//    return nil
+	//  }
+	//  return err
+	run backgroundFn
+	// When not nil, called with the error within `.stop()`. The interceptor
+	// gets a chance to ignore the error or produce a different one (via t.Fatal).
+	onStop func(context.Context, test.Test, *versionUpgradeTest, error)
+	nodes  option.NodeListOption // nodes to monitor, defaults to c.All()
+
+	// Internal.
+	m cluster.Monitor
+}
+
+// launch spawns the function the background step was initialized with.
+func (s *backgroundStepper) launch(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+	nodes := s.nodes
+	if nodes == nil {
+		nodes = u.c.All()
+	}
+	s.m = u.c.NewMonitor(ctx, nodes)
+	s.m.Go(func(ctx context.Context) error {
+		return s.run(ctx, u)
+	})
+}
+
+func (s *backgroundStepper) wait(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+	// We don't care about the workload failing since we only use it to produce a
+	// few `RESTORE` jobs. And indeed workload will fail because it does not
+	// tolerate pausing of its jobs.
+	err := s.m.WaitE()
+	if s.onStop != nil {
+		s.onStop(ctx, t, u, err)
+	} else if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // runTPCCMixedHeadroom runs a mixed-version test that imports a large
 // `bank` dataset, and runs one or multiple database upgrades while a
 // TPCC workload is running. The number of database upgrades is
@@ -366,9 +410,6 @@ func maxSupportedTPCCWarehouses(
 func runTPCCMixedHeadroom(
 	ctx context.Context, t test.Test, c cluster.Cluster, cloud string, versionsToUpgrade int,
 ) {
-	if c.IsLocal() && runtime.GOARCH == "arm64" {
-		t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
-	}
 	crdbNodes := c.Range(1, c.Spec().NodeCount-1)
 	workloadNode := c.Node(c.Spec().NodeCount)
 
@@ -408,7 +449,9 @@ func runTPCCMixedHeadroom(
 		bankRows = 1000
 	}
 
-	history, err := version.PredecessorHistory(*t.BuildVersion(), versionsToUpgrade)
+	rng, seed := randutil.NewLockedPseudoRand()
+	t.L().Printf("using random seed %d", seed)
+	history, err := release.RandomPredecessorHistory(rng, t.BuildVersion(), versionsToUpgrade)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,18 +543,18 @@ func registerTPCC(r registry.Registry) {
 		// running with the max supported warehouses.
 		Name:              "tpcc/headroom/" + headroomSpec.String(),
 		Owner:             registry.OwnerTestEng,
-		Tags:              []string{`default`, `release_qualification`},
+		Tags:              registry.Tags(`default`, `release_qualification`, `aws`),
 		Cluster:           headroomSpec,
 		EncryptionSupport: registry.EncryptionMetamorphic,
+		Leases:            registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			maxWarehouses := maxSupportedTPCCWarehouses(*t.BuildVersion(), cloud, t.Spec().(*registry.TestSpec).Cluster)
 			headroomWarehouses := int(float64(maxWarehouses) * 0.7)
 			t.L().Printf("computed headroom warehouses of %d\n", headroomWarehouses)
 			runTPCC(ctx, t, c, tpccOptions{
-				Warehouses:            headroomWarehouses,
-				Duration:              120 * time.Minute,
-				SetupType:             usingImport,
-				EnableCircuitBreakers: true,
+				Warehouses: headroomWarehouses,
+				Duration:   120 * time.Minute,
+				SetupType:  usingImport,
 			})
 		},
 	})
@@ -522,23 +565,29 @@ func registerTPCC(r registry.Registry) {
 		// node and on a mixed version cluster which runs its long-running
 		// migrations while TPCC runs. It simulates a real production
 		// deployment in the middle of the migration into a new cluster version.
-		Name:  "tpcc/mixed-headroom/" + mixedHeadroomSpec.String(),
-		Owner: registry.OwnerTestEng,
+		Name:    "tpcc/mixed-headroom/" + mixedHeadroomSpec.String(),
+		Timeout: 5 * time.Hour,
+		Owner:   registry.OwnerTestEng,
 		// TODO(tbg): add release_qualification tag once we know the test isn't
 		// buggy.
-		Tags:              []string{`default`},
+		Tags:              registry.Tags(`default`),
 		Cluster:           mixedHeadroomSpec,
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCCMixedHeadroom(ctx, t, c, cloud, 1)
 		},
 	})
+
+	// N.B. Multiple upgrades may require a released version < 22.2.x, which wasn't built for ARM64.
+	mixedHeadroomMultiUpgradesSpec := r.MakeClusterSpec(5, spec.CPU(16), spec.RandomlyUseZfs(), spec.Arch(vm.ArchAMD64))
+
 	r.Add(registry.TestSpec{
 		// run the same mixed-headroom test, but going back two versions
-		Name:              "tpcc/mixed-headroom/multiple-upgrades/" + mixedHeadroomSpec.String(),
+		Name:              "tpcc/mixed-headroom/multiple-upgrades/" + mixedHeadroomMultiUpgradesSpec.String(),
+		Timeout:           5 * time.Hour,
 		Owner:             registry.OwnerTestEng,
-		Tags:              []string{`default`},
-		Cluster:           mixedHeadroomSpec,
+		Tags:              registry.Tags(`default`),
+		Cluster:           mixedHeadroomMultiUpgradesSpec,
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCCMixedHeadroom(ctx, t, c, cloud, 2)
@@ -549,6 +598,7 @@ func registerTPCC(r registry.Registry) {
 		Owner:             registry.OwnerTestEng,
 		Cluster:           r.MakeClusterSpec(4, spec.CPU(16)),
 		EncryptionSupport: registry.EncryptionMetamorphic,
+		Leases:            registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCC(ctx, t, c, tpccOptions{
 				Warehouses:   1,
@@ -561,12 +611,13 @@ func registerTPCC(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    "weekly/tpcc/headroom",
 		Owner:   registry.OwnerTestEng,
-		Tags:    []string{`weekly`},
+		Tags:    registry.Tags(`weekly`),
 		Cluster: r.MakeClusterSpec(4, spec.CPU(16)),
 		// Give the test a generous extra 10 hours to load the dataset and
 		// slowly ramp up the load.
 		Timeout:           4*24*time.Hour + 10*time.Hour,
 		EncryptionSupport: registry.EncryptionMetamorphic,
+		Leases:            registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			warehouses := 1000
 			runTPCC(ctx, t, c, tpccOptions{
@@ -681,10 +732,11 @@ func registerTPCC(r registry.Registry) {
 			tc := multiRegionTests[i]
 			r.Add(registry.TestSpec{
 				Name:  tc.name,
-				Owner: registry.OwnerSQLSchema,
+				Owner: registry.OwnerSQLFoundations,
 				// Add an extra node which serves as the workload nodes.
 				Cluster:           r.MakeClusterSpec(len(regions)*nodesPerRegion+1, spec.Geo(), spec.Zones(strings.Join(zs, ","))),
 				EncryptionSupport: registry.EncryptionMetamorphic,
+				Leases:            registry.MetamorphicLeases,
 				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 					t.Status(tc.desc)
 					duration := 90 * time.Minute
@@ -776,6 +828,7 @@ func registerTPCC(r registry.Registry) {
 		Owner:             registry.OwnerTestEng,
 		Cluster:           r.MakeClusterSpec(4),
 		EncryptionSupport: registry.EncryptionMetamorphic,
+		Leases:            registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			duration := 30 * time.Minute
 			runTPCC(ctx, t, c, tpccOptions{
@@ -799,26 +852,6 @@ func registerTPCC(r registry.Registry) {
 			})
 		},
 	})
-	r.Add(registry.TestSpec{
-		Name:              "tpcc/interleaved/nodes=3/cpu=16/w=500",
-		Owner:             registry.OwnerSQLQueries,
-		Cluster:           r.MakeClusterSpec(4, spec.CPU(16)),
-		Timeout:           6 * time.Hour,
-		EncryptionSupport: registry.EncryptionMetamorphic,
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			skip.WithIssue(t, 53886)
-			runTPCC(ctx, t, c, tpccOptions{
-				// Currently, we do not support import on interleaved tables which
-				// prohibits loading/importing a fixture. If/when this is supported the
-				// number of warehouses should be increased as we would no longer
-				// bottleneck on initialization which is significantly slower than import.
-				Warehouses:     500,
-				Duration:       time.Minute * 15,
-				ExtraSetupArgs: "--interleaved=true",
-				SetupType:      usingInit,
-			})
-		},
-	})
 
 	// Run a few representative tpccbench specs in CI.
 	registerTPCCBenchSpec(r, tpccBenchSpec{
@@ -830,10 +863,35 @@ func registerTPCC(r registry.Registry) {
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
 		Nodes: 3,
+		CPUs:  4,
+
+		LoadWarehouses:  1000,
+		EstimatedMax:    gceOrAws(cloud, 750, 900),
+		SharedProcessMT: true,
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes:                        3,
+		CPUs:                         4,
+		EnableDefaultScheduledBackup: true,
+		LoadWarehouses:               1000,
+		EstimatedMax:                 gceOrAws(cloud, 750, 900),
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
 		CPUs:  16,
 
 		LoadWarehouses: gceOrAws(cloud, 3500, 3900),
 		EstimatedMax:   gceOrAws(cloud, 2900, 3500),
+		Tags:           registry.Tags(`aws`),
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  16,
+
+		LoadWarehouses:  gceOrAws(cloud, 3500, 3900),
+		EstimatedMax:    gceOrAws(cloud, 2900, 3500),
+		Tags:            registry.Tags(`aws`),
+		SharedProcessMT: true,
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
 		Nodes: 12,
@@ -842,7 +900,7 @@ func registerTPCC(r registry.Registry) {
 		LoadWarehouses: gceOrAws(cloud, 11500, 11500),
 		EstimatedMax:   gceOrAws(cloud, 10000, 10000),
 
-		Tags: []string{`weekly`},
+		Tags: registry.Tags(`weekly`),
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
 		Nodes:        6,
@@ -889,6 +947,7 @@ func registerTPCC(r registry.Registry) {
 		LoadWarehouses:    gceOrAws(cloud, 3500, 3900),
 		EstimatedMax:      gceOrAws(cloud, 2900, 3500),
 		EncryptionEnabled: true,
+		Tags:              registry.Tags(`aws`),
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
 		Nodes: 12,
@@ -898,7 +957,36 @@ func registerTPCC(r registry.Registry) {
 		EstimatedMax:      gceOrAws(cloud, 10000, 10000),
 		EncryptionEnabled: true,
 
-		Tags: []string{`weekly`},
+		Tags: registry.Tags(`weekly`),
+	})
+
+	// Expiration lease benchmarks. These are duplicates of variants above.
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  4,
+
+		LoadWarehouses:   1000,
+		EstimatedMax:     gceOrAws(cloud, 750, 900),
+		ExpirationLeases: true,
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  16,
+
+		LoadWarehouses:   gceOrAws(cloud, 3500, 3900),
+		EstimatedMax:     gceOrAws(cloud, 2900, 3500),
+		ExpirationLeases: true,
+		Tags:             registry.Tags(`aws`),
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 12,
+		CPUs:  16,
+
+		LoadWarehouses:   gceOrAws(cloud, 11500, 11500),
+		EstimatedMax:     gceOrAws(cloud, 10000, 10000),
+		ExpirationLeases: true,
+
+		Tags: registry.Tags(`weekly`),
 	})
 }
 
@@ -985,13 +1073,17 @@ type tpccBenchSpec struct {
 	// change (i.e. CockroachDB gets faster!).
 	EstimatedMax int
 
-	// MinVersion to pass to testRegistryImpl.Add.
-	MinVersion string
 	// Tags to pass to testRegistryImpl.Add.
-	Tags []string
+	Tags map[string]struct{}
 	// EncryptionEnabled determines if the benchmark uses encrypted stores (i.e.
 	// Encryption-At-Rest / EAR).
 	EncryptionEnabled bool
+	// ExpirationLeases enables use of expiration-based leases.
+	ExpirationLeases             bool
+	EnableDefaultScheduledBackup bool
+	// SharedProcessMT, if true, indicates that the cluster should run in
+	// shared-process mode of multi-tenancy.
+	SharedProcessMT bool
 }
 
 // partitions returns the number of partitions specified to the load generator.
@@ -1011,6 +1103,7 @@ func (s tpccBenchSpec) partitions() int {
 // startOpts returns any extra start options that the spec requires.
 func (s tpccBenchSpec) startOpts() (option.StartOpts, install.ClusterSettings) {
 	startOpts := option.DefaultStartOpts()
+	startOpts.RoachprodOpts.ScheduleBackups = s.EnableDefaultScheduledBackup
 	settings := install.MakeClusterSettings()
 	// Facilitate diagnosing out-of-memory conditions in tpccbench runs.
 	// See https://github.com/cockroachdb/cockroach/issues/75071.
@@ -1034,8 +1127,14 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 	if b.Chaos {
 		nameParts = append(nameParts, "chaos")
 	}
+	if b.EnableDefaultScheduledBackup {
+		nameParts = append(nameParts, "backups=true")
+	}
 
-	opts := []spec.Option{spec.CPU(b.CPUs), spec.HighMem(b.HighMem)}
+	opts := []spec.Option{spec.CPU(b.CPUs)}
+	if b.HighMem {
+		opts = append(opts, spec.Mem(spec.High))
+	}
 	switch b.Distribution {
 	case singleZone:
 		// No specifier.
@@ -1066,22 +1165,30 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 		nameParts = append(nameParts, "enc=true")
 	}
 
+	leases := registry.DefaultLeases
+	if b.ExpirationLeases {
+		leases = registry.ExpirationLeases
+		nameParts = append(nameParts, "lease=expiration")
+	}
+
+	if b.SharedProcessMT {
+		nameParts = append(nameParts, "mt-shared-process")
+	}
+
 	name := strings.Join(nameParts, "/")
 
 	numNodes := b.Nodes + b.LoadConfig.numLoadNodes(b.Distribution)
 	nodes := r.MakeClusterSpec(numNodes, opts...)
 
-	minVersion := b.MinVersion
-	if minVersion == "" {
-		minVersion = "v19.1.0" // needed for import
-	}
-
 	r.Add(registry.TestSpec{
 		Name:              name,
 		Owner:             owner,
+		Benchmark:         true,
 		Cluster:           nodes,
+		Timeout:           7 * time.Hour,
 		Tags:              b.Tags,
 		EncryptionSupport: encryptionSupport,
+		Leases:            leases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCCBench(ctx, t, c, b)
 		},
@@ -1095,12 +1202,10 @@ func loadTPCCBench(
 	ctx context.Context,
 	t test.Test,
 	c cluster.Cluster,
+	db *gosql.DB,
 	b tpccBenchSpec,
 	roachNodes, loadNode option.NodeListOption,
 ) error {
-	db := c.Conn(ctx, t.L(), 1)
-	defer db.Close()
-
 	// Check if the dataset already exists and is already large enough to
 	// accommodate this benchmarking. If so, we can skip the fixture RESTORE.
 	if _, err := db.ExecContext(ctx, `USE tpcc`); err == nil {
@@ -1119,7 +1224,7 @@ func loadTPCCBench(
 
 		// If the dataset exists but is not large enough, wipe the cluster
 		// before restoring.
-		c.Wipe(ctx, roachNodes)
+		c.Wipe(ctx, false /* preserveCerts */, roachNodes)
 		startOpts, settings := b.startOpts()
 		c.Start(ctx, t.L(), startOpts, settings, roachNodes)
 	} else if pqErr := (*pq.Error)(nil); !(errors.As(err, &pqErr) &&
@@ -1148,7 +1253,11 @@ func loadTPCCBench(
 	t.L().Printf("restoring tpcc fixture\n")
 	err := WaitFor3XReplication(ctx, t, db)
 	require.NoError(t, err)
-	cmd := tpccImportCmd(b.LoadWarehouses, loadArgs)
+	var pgurl string
+	if b.SharedProcessMT {
+		pgurl = fmt.Sprintf("{pgurl%s:%s}", roachNodes[:1], appTenantName)
+	}
+	cmd := tpccImportCmd(b.LoadWarehouses, loadArgs, pgurl)
 	if err = c.RunE(ctx, roachNodes[:1], cmd); err != nil {
 		return err
 	}
@@ -1169,9 +1278,13 @@ func loadTPCCBench(
 	maxRate := tpccMaxRate(b.EstimatedMax)
 	rampTime := (1 * rebalanceWait) / 4
 	loadTime := (3 * rebalanceWait) / 4
+	var tenantSuffix string
+	if b.SharedProcessMT {
+		tenantSuffix = fmt.Sprintf(":%s", appTenantName)
+	}
 	cmd = fmt.Sprintf("./cockroach workload run tpcc --warehouses=%d --workers=%d --max-rate=%d "+
-		"--wait=false --ramp=%s --duration=%s --scatter --tolerate-errors {pgurl%s}",
-		b.LoadWarehouses, b.LoadWarehouses, maxRate, rampTime, loadTime, roachNodes)
+		"--wait=false --ramp=%s --duration=%s --scatter --tolerate-errors {pgurl%s%s}",
+		b.LoadWarehouses, b.LoadWarehouses, maxRate, rampTime, loadTime, roachNodes, tenantSuffix)
 	if _, err := c.RunWithDetailsSingleNode(ctx, t.L(), loadNode, cmd); err != nil {
 		return err
 	}
@@ -1214,6 +1327,14 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 	// Don't encrypt in tpccbench tests.
 	startOpts, settings := b.startOpts()
 	c.Start(ctx, t.L(), startOpts, settings, roachNodes)
+
+	var db *gosql.DB
+	if b.SharedProcessMT {
+		db = createInMemoryTenant(ctx, t, c, appTenantName, roachNodes, false /* secure */)
+	} else {
+		db = c.Conn(ctx, t.L(), 1)
+	}
+
 	useHAProxy := b.Chaos
 	const restartWait = 15 * time.Second
 	{
@@ -1243,7 +1364,7 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 		m := c.NewMonitor(ctx, roachNodes)
 		m.Go(func(ctx context.Context) error {
 			t.Status("setting up dataset")
-			return loadTPCCBench(ctx, t, c, b, roachNodes, c.Node(loadNodes[0]))
+			return loadTPCCBench(ctx, t, c, db, b, roachNodes, c.Node(loadNodes[0]))
 		})
 		m.Wait()
 	}
@@ -1339,10 +1460,14 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 				}
 				t.Status(fmt.Sprintf("running benchmark, warehouses=%d", warehouses))
 				histogramsPath := fmt.Sprintf("%s/warehouses=%d/stats.json", t.PerfArtifactsDir(), warehouses)
+				var tenantSuffix string
+				if b.SharedProcessMT {
+					tenantSuffix = fmt.Sprintf(":%s", appTenantName)
+				}
 				cmd := fmt.Sprintf("./cockroach workload run tpcc --warehouses=%d --active-warehouses=%d "+
-					"--tolerate-errors --ramp=%s --duration=%s%s --histograms=%s {pgurl%s}",
+					"--tolerate-errors --ramp=%s --duration=%s%s --histograms=%s {pgurl%s%s}",
 					b.LoadWarehouses, warehouses, rampDur,
-					loadDur, extraFlags, histogramsPath, sqlGateways)
+					loadDur, extraFlags, histogramsPath, sqlGateways, tenantSuffix)
 				err := c.RunE(ctx, group.loadNodes, cmd)
 				loadDone <- timeutil.Now()
 				if err != nil {
@@ -1432,117 +1557,6 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 	}
 }
 
-func registerTPCCBench(r registry.Registry) {
-	specs := []tpccBenchSpec{
-		{
-			Nodes: 3,
-			CPUs:  4,
-
-			LoadWarehouses: 1000,
-			EstimatedMax:   325,
-		},
-		{
-			Nodes: 3,
-			CPUs:  16,
-
-			LoadWarehouses: 2000,
-			EstimatedMax:   1300,
-		},
-		// objective 1, key result 1.
-		{
-			Nodes: 30,
-			CPUs:  16,
-
-			LoadWarehouses: 10000,
-			EstimatedMax:   5300,
-		},
-		// objective 1, key result 2.
-		{
-			Nodes:      18,
-			CPUs:       16,
-			LoadConfig: singlePartitionedLoadgen,
-
-			LoadWarehouses: 10000,
-			EstimatedMax:   8000,
-		},
-		// objective 2, key result 1.
-		{
-			Nodes: 7,
-			CPUs:  16,
-			Chaos: true,
-
-			LoadWarehouses: 5000,
-			EstimatedMax:   2000,
-		},
-		// objective 3, key result 1.
-		{
-			Nodes:        3,
-			CPUs:         16,
-			Distribution: multiZone,
-
-			LoadWarehouses: 2000,
-			EstimatedMax:   1000,
-		},
-		// objective 3, key result 2.
-		{
-			Nodes:        9,
-			CPUs:         16,
-			Distribution: multiRegion,
-			LoadConfig:   multiLoadgen,
-
-			LoadWarehouses: 12000,
-			EstimatedMax:   8000,
-		},
-		// objective 4, key result 2.
-		{
-			Nodes: 64,
-			CPUs:  16,
-
-			LoadWarehouses: 50000,
-			EstimatedMax:   40000,
-		},
-
-		// See https://github.com/cockroachdb/cockroach/issues/31409 for the next three specs.
-		{
-			Nodes: 6,
-			CPUs:  16,
-
-			LoadWarehouses: 5000,
-			EstimatedMax:   3000,
-			LoadConfig:     singlePartitionedLoadgen,
-		},
-		{
-			Nodes: 12,
-			CPUs:  16,
-
-			LoadWarehouses: 10000,
-			EstimatedMax:   6000,
-			LoadConfig:     singlePartitionedLoadgen,
-		},
-		{
-			Nodes: 24,
-			CPUs:  16,
-
-			LoadWarehouses: 20000,
-			EstimatedMax:   12000,
-			LoadConfig:     singlePartitionedLoadgen,
-		},
-
-		// Requested by @awoods87.
-		{
-			Nodes: 11,
-			CPUs:  32,
-
-			LoadWarehouses: 10000,
-			EstimatedMax:   8000,
-		},
-	}
-
-	for _, b := range specs {
-		registerTPCCBenchSpec(r, b)
-	}
-}
-
 // makeWorkloadScrapeNodes creates a ScrapeNode for every workloadInstance.
 func makeWorkloadScrapeNodes(
 	workloadNode install.Node, workloadInstances []workloadInstance,
@@ -1601,8 +1615,11 @@ func setupPrometheusForRoachtest(
 		t.Fatal(err)
 	}
 	cleanupFunc := func() {
+		if t.IsDebug() {
+			return // nothing to do
+		}
 		if err := c.StopGrafana(ctx, quietLogger, t.ArtifactsDir()); err != nil {
-			t.L().ErrorfCtx(ctx, "Error(s) shutting down prom/grafana %s", err)
+			t.L().ErrorfCtx(ctx, "error(s) shutting down prom/grafana: %s", err)
 		}
 	}
 	return cfg, cleanupFunc

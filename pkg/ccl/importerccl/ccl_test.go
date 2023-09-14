@@ -69,17 +69,16 @@ func TestImportMultiRegion(t *testing.T) {
 	noopDuringImportFunc := func() error { return nil }
 	duringImportFunc.Store(noopDuringImportFunc)
 	for i := 0; i < tc.NumServers(); i++ {
-		tc.Server(i).JobRegistry().(*jobs.Registry).
-			TestingResumerCreationKnobs = map[jobspb.Type]func(jobs.Resumer) jobs.Resumer{
-			jobspb.TypeImport: func(resumer jobs.Resumer) jobs.Resumer {
+		tc.Server(i).JobRegistry().(*jobs.Registry).TestingWrapResumerConstructor(
+			jobspb.TypeImport,
+			func(resumer jobs.Resumer) jobs.Resumer {
 				resumer.(interface {
 					TestingSetAfterImportKnob(fn func(summary roachpb.RowCount) error)
 				}).TestingSetAfterImportKnob(func(summary roachpb.RowCount) error {
 					return duringImportFunc.Load().(func() error)()
 				})
 				return resumer
-			},
-		}
+			})
 	}
 
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
@@ -89,7 +88,7 @@ func TestImportMultiRegion(t *testing.T) {
 	tdb.Exec(t, `CREATE DATABASE foo`)
 	tdb.Exec(t, `CREATE DATABASE multi_region PRIMARY REGION "us-east1" REGIONS "us-east1", "us-east2"`)
 
-	simpleOcf := fmt.Sprintf("nodelocal://0/avro/%s", "simple.ocf")
+	simpleOcf := fmt.Sprintf("nodelocal://1/avro/%s", "simple.ocf")
 
 	var data string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -106,7 +105,7 @@ func TestImportMultiRegion(t *testing.T) {
 	}{
 		{
 			desc:      "pgdump",
-			importSQL: `IMPORT PGDUMP 'nodelocal://0/pgdump/views_and_sequences.sql' WITH ignore_unsupported_statements`,
+			importSQL: `IMPORT PGDUMP 'nodelocal://1/pgdump/views_and_sequences.sql' WITH ignore_unsupported_statements`,
 			expected: map[string]string{
 				"tbl": "REGIONAL BY TABLE IN PRIMARY REGION",
 				"s":   "REGIONAL BY TABLE IN PRIMARY REGION",
@@ -115,7 +114,7 @@ func TestImportMultiRegion(t *testing.T) {
 		},
 		{
 			desc:      "mysqldump",
-			importSQL: `IMPORT MYSQLDUMP 'nodelocal://0/mysqldump/views_and_sequences.sql'`,
+			importSQL: `IMPORT MYSQLDUMP 'nodelocal://1/mysqldump/views_and_sequences.sql'`,
 			expected: map[string]string{
 				"tbl":          "REGIONAL BY TABLE IN PRIMARY REGION",
 				"tbl_auto_inc": "REGIONAL BY TABLE IN PRIMARY REGION",
@@ -343,23 +342,23 @@ CREATE TABLE destination_fake_rbr (crdb_region public.crdb_internal_region NOT N
 	require.NoError(t, err)
 
 	// Export the data.
-	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://0/original_rbr_full'
+	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://1/original_rbr_full'
  FROM SELECT crdb_region, i from original_rbr;`)
 	require.NoError(t, err)
 
-	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://0/original_rbr_default'
+	_, err = sqlDB.Exec(`EXPORT INTO CSV 'nodelocal://1/original_rbr_default'
 FROM TABLE original_rbr;`)
 	require.NoError(t, err)
 
 	// Import the data back into the destination table.
 	_, err = sqlDB.Exec(`IMPORT into destination (i) CSV DATA
- ('nodelocal://0/original_rbr_default/export*.csv')`)
+ ('nodelocal://1/original_rbr_default/export*.csv')`)
 	require.NoError(t, err)
 	validateNumRows(sqlDB, `destination`, 5)
 
 	// Import the full export to the fake RBR table.
 	_, err = sqlDB.Exec(`IMPORT into destination_fake_rbr (crdb_region, i) CSV DATA
- ('nodelocal://0/original_rbr_full/export*.csv')`)
+ ('nodelocal://1/original_rbr_full/export*.csv')`)
 	require.NoError(t, err)
 	validateNumRows(sqlDB, `destination_fake_rbr`, 5)
 
@@ -388,7 +387,10 @@ func TestExportInsideTenant(t *testing.T) {
 	dir, cleanupDir := testutils.TempDir(t)
 	defer cleanupDir()
 
-	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantProbabilistic,
+		ExternalIODir:     dir,
+	})
 	defer srv.Stopper().Stop(context.Background())
 
 	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
@@ -418,7 +420,7 @@ func TestImportInTenant(t *testing.T) {
 		ExternalIODir: baseDir,
 		// Test is designed to run inside a tenant so no need to
 		// probabilistically run it inside the default test tenant.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	}
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: args})
 	defer tc.Stopper().Stop(ctx)
@@ -469,8 +471,13 @@ func TestImportInMultiServerTenant(t *testing.T) {
 
 	ctx := context.Background()
 	baseDir := datapathutils.TestDataPath(t)
-	args := base.TestServerArgs{ExternalIODir: baseDir}
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{ServerArgs: args})
+	args := base.TestServerArgs{
+		// Test is designed to run inside a tenant so no need to
+		// probabilistically run it inside the default test tenant.
+		DefaultTestTenant: base.TODOTestTenantDisabled,
+		ExternalIODir:     baseDir,
+	}
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{ServerArgs: args})
 	defer tc.Stopper().Stop(ctx)
 
 	// Setup a SQL server on a tenant.

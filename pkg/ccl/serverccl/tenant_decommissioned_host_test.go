@@ -19,9 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,7 +40,9 @@ func TestTenantWithDecommissionedID(t *testing.T) {
 	// as sql connection timeouts.
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	}})
 	defer tc.Stopper().Stop(ctx)
 
 	server := tc.Server(0)
@@ -54,7 +56,7 @@ func TestTenantWithDecommissionedID(t *testing.T) {
 
 	tenantID := serverutils.TestTenantID()
 
-	var tenantSQLServer serverutils.TestTenantInterface
+	var tenantSQLServer serverutils.ApplicationLayerInterface
 	var tenantDB *gosql.DB
 	for instanceID := 1; instanceID <= int(decommissionID); instanceID++ {
 		sqlServer, tenant := serverutils.StartTenant(t, server, base.TestTenantArgs{
@@ -70,7 +72,7 @@ func TestTenantWithDecommissionedID(t *testing.T) {
 	require.NotNil(t, tenantSQLServer)
 	defer tenantDB.Close()
 
-	require.NoError(t, contextutil.RunWithTimeout(ctx, "use SQL", testutils.DefaultSucceedsSoonDuration, func(ctx context.Context) error {
+	require.NoError(t, timeutil.RunWithTimeout(ctx, "use SQL", testutils.DefaultSucceedsSoonDuration, func(ctx context.Context) error {
 		_, err := tenantDB.Exec("CREATE ROLE test_user WITH PASSWORD 'password'")
 		return err
 	}))

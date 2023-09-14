@@ -48,9 +48,7 @@ func TestSystemConfigWatcher(t *testing.T, skipSecondary bool) {
 	ctx := context.Background()
 	s, sqlDB, kvDB := serverutils.StartServer(t,
 		base.TestServerArgs{
-			// Test runs against tenant, so no need to create the default
-			// test tenant.
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		},
 	)
 	defer s.Stopper().Stop(ctx)
@@ -59,6 +57,7 @@ func TestSystemConfigWatcher(t *testing.T, skipSecondary bool) {
 	// checkpointing code while also speeding up the test.
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10 ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	t.Run("system", func(t *testing.T) {
 		runTest(t, s, sqlDB, nil)
@@ -83,7 +82,7 @@ func TestSystemConfigWatcher(t *testing.T, skipSecondary bool) {
 
 func runTest(
 	t *testing.T,
-	s serverutils.TestTenantInterface,
+	s serverutils.ApplicationLayerInterface,
 	sqlDB *gosql.DB,
 	extraRows func(t *testing.T) []roachpb.KeyValue,
 ) {
@@ -137,7 +136,7 @@ func getSystemDescriptorAndZonesSpans(
 			kvpb.NewScan(
 				append(codec.TenantPrefix(), startKey...),
 				append(codec.TenantPrefix(), endKey...),
-				false, // forUpdate
+				kvpb.NonLocking,
 			),
 		)
 		br, pErr := kvDB.NonTransactionalSender().Send(ctx, ba)

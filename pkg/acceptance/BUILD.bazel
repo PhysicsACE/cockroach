@@ -1,8 +1,8 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "acceptance",
+    testonly = 1,
     srcs = [
         "flags.go",
         "test_acceptance.go",  # keep
@@ -21,6 +21,7 @@ go_library(
         "//pkg/server",  # keep
         "//pkg/testutils",
         "//pkg/testutils/serverutils",  # keep
+        "//pkg/testutils/skip",
         "//pkg/testutils/testcluster",  # keep
         "//pkg/util/log",
         "//pkg/util/randutil",  # keep
@@ -40,9 +41,11 @@ go_test(
         "cli_test.go",
         "compose_test.go",
         "debug_remote_test.go",
+        "generated_cli_test.go",
         "main_test.go",
     ],
-    args = ["-test.timeout=3595s"],
+    # Note: we overide bazel timeout to 1800s using test_timeout.
+    args = ["-test.timeout=1795s"],
     data = glob([
         "testdata/**",
         "compose/**",
@@ -50,7 +53,9 @@ go_test(
         "//pkg/cli:interactive_tests",
     ],
     embed = [":acceptance"],
+    exec_properties = {"Pool": "large"},
     gotags = ["acceptance"],
+    shard_count = 16,
     tags = ["integration"],
     deps = [
         "//pkg/acceptance/cluster",
@@ -61,5 +66,3 @@ go_test(
         "//pkg/util/log",
     ],
 )
-
-get_x_data(name = "get_x_data")

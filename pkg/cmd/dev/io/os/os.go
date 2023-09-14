@@ -42,8 +42,9 @@ type OS struct {
 	*recorder.Recorder
 
 	knobs struct { // testing knobs
-		dryrun bool
-		silent bool
+		dryrun    bool
+		silent    bool
+		intercept map[string]string // maps commands to outputs
 	}
 }
 
@@ -93,9 +94,18 @@ func WithWorkingDir(dir string) func(o *OS) {
 }
 
 // WithDryrun configures OS to run in dryrun mode.
-func WithDryrun() func(e *OS) {
-	return func(e *OS) {
-		e.knobs.dryrun = true
+func WithDryrun() func(o *OS) {
+	return func(o *OS) {
+		o.knobs.dryrun = true
+	}
+}
+
+func WithIntercept(cmd, output string) func(e *OS) {
+	return func(o *OS) {
+		if o.knobs.intercept == nil {
+			o.knobs.intercept = make(map[string]string)
+		}
+		o.knobs.intercept[cmd] = output
 	}
 }
 
@@ -185,6 +195,35 @@ func (o *OS) Setenv(key, value string) error {
 	return err
 }
 
+// IsSymlink wraps around os.Lstat to determine if filename is a symbolic link
+// or not.
+func (o *OS) IsSymlink(filename string) (bool, error) {
+	command := fmt.Sprintf("stat %s", filename)
+	if !o.knobs.silent {
+		o.logger.Print(command)
+	}
+
+	isLinkStr, err := o.Next(command, func() (string, error) {
+		// Use os.Lstat here, since it does not attempt to resolve symlinks.
+		stat, err := os.Lstat(filename)
+		if err != nil {
+			return "", err
+		}
+
+		isLink := stat.Mode()&fs.ModeSymlink != 0
+
+		// o.Next only accepts string return values, so serialize a boolean
+		// and deserialize it outside of o.Next.
+		return strconv.FormatBool(isLink), nil
+	})
+
+	if err != nil {
+		return false, err
+	}
+
+	return strconv.ParseBool(isLinkStr)
+}
+
 // Readlink wraps around os.Readlink, which returns the destination of the named
 // symbolic link. If there is an error, it will be of type *PathError.
 func (o *OS) Readlink(filename string) (string, error) {
@@ -196,6 +235,34 @@ func (o *OS) Readlink(filename string) (string, error) {
 	return o.Next(command, func() (output string, err error) {
 		return os.Readlink(filename)
 	})
+}
+
+// ReadDir is a thin wrapper around os.ReadDir, which returns the names of files
+// or directories within dirname.
+func (o *OS) ReadDir(dirname string) ([]string, error) {
+	command := fmt.Sprintf("ls %s", dirname)
+	if !o.knobs.silent {
+		o.logger.Print(command)
+	}
+
+	output, err := o.Next(command, func() (string, error) {
+		var ret []string
+		entries, err := os.ReadDir(dirname)
+		if err != nil {
+			return "", err
+		}
+
+		for _, entry := range entries {
+			ret = append(ret, entry.Name())
+		}
+
+		return fmt.Sprintf("%s\n", strings.Join(ret, "\n")), nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(strings.TrimSpace(output), "\n"), nil
 }
 
 // IsDir wraps around os.Stat, which returns the os.FileInfo of the named
@@ -455,9 +522,27 @@ func (o *OS) CurrentUserAndGroup() (uid string, gid string, err error) {
 	return ids[0], ids[1], nil
 }
 
+// UserCacheDir returns the cache directory for the current user if possible.
+func (o *OS) UserCacheDir() (dir string, err error) {
+	command := "echo $HOME"
+	if !o.knobs.silent {
+		o.logger.Print(command)
+	}
+
+	return o.Next(command, func() (dir string, err error) {
+		return os.UserCacheDir()
+	})
+
+}
+
 // Next is a thin interceptor for all os activity, running them through
 // testing knobs first.
 func (o *OS) Next(command string, f func() (output string, err error)) (string, error) {
+	if o.knobs.intercept != nil {
+		if output, ok := o.knobs.intercept[command]; ok {
+			return output, nil
+		}
+	}
 	if o.knobs.dryrun {
 		return "", nil
 	}

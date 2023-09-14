@@ -60,6 +60,12 @@ message Session {
 }
 
 message Transaction {
+  // TODO(gtr): Implement "Cancelled" status for transaction insights.
+  enum Status {
+    Completed = 0;
+    Failed = 1;
+  }
+
   bytes id = 1 [(gogoproto.customname) = "ID",
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID",
     (gogoproto.nullable) = false];
@@ -85,6 +91,7 @@ message Transaction {
   int64 cpu_sql_nanos = 17 [(gogoproto.customname) = "CPUSQLNanos"];
   // The error code of the last failed statement in the transaction.
   string last_error_code = 18; 
+  Status status = 19;
 }
 
 message Statement {
@@ -128,7 +135,14 @@ message Insight {
   Session session = 1 [(gogoproto.nullable) = false];
   Transaction transaction = 2;
   repeated Statement statements = 6;
-  reserved 3;
-  reserved 4;
-  reserved 5;
+
+  // This field is deprecated, but we have to keep it around for 22.2
+  // backwards compatibility. 22.2 actually expects this as non-null
+  // when generating the exec insights virtual table. Removing this will
+  // cause a nil pointer deref on versions <= 22.2.6.
+  // TODO: Move these fields to 'reserved' at 23.2.
+  Statement statement = 3;
+
+  reserved  4; // Previously problem.
+  reserved 5; // Previously causes.
 }

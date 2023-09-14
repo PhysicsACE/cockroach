@@ -68,6 +68,15 @@ func WaitForJobReverting(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobI
 	waitForJobToHaveStatus(t, db, jobID, jobs.StatusReverting)
 }
 
+// InternalSystemJobsBaseQuery runs the query against an empty database string.
+// Since crdb_internal.system_jobs is a virtual table, by default, the query
+// will take a lease on the current database the SQL session is connected to. If
+// this database has been dropped or is unavailable then the query on the
+// virtual table will fail. The "" prefix prevents this lease acquisition.
+var InternalSystemJobsBaseQuery = `
+SELECT status, payload, progress FROM "".crdb_internal.system_jobs WHERE id = $1
+`
+
 func waitForJobToHaveStatus(
 	t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID, expectedStatus jobs.Status,
 ) {
@@ -75,9 +84,8 @@ func waitForJobToHaveStatus(
 	testutils.SucceedsWithin(t, func() error {
 		var status string
 		var payloadBytes []byte
-		db.QueryRow(
-			t, `SELECT status, payload FROM system.jobs WHERE id = $1`, jobID,
-		).Scan(&status, &payloadBytes)
+		query := fmt.Sprintf("SELECT status, payload FROM (%s)", InternalSystemJobsBaseQuery)
+		db.QueryRow(t, query, jobID).Scan(&status, &payloadBytes)
 		if jobs.Status(status) == jobs.StatusFailed {
 			if expectedStatus == jobs.StatusFailed {
 				return nil
@@ -140,11 +148,14 @@ func RunJob(
 // related to bulk IO/backup/restore/import: Export, Import and AddSSTable. See
 // discussion on RunJob for where this might be useful.
 func BulkOpResponseFilter(allowProgressIota *chan struct{}) kvserverbase.ReplicaResponseFilter {
-	return func(_ context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
+	return func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
 		for _, ru := range br.Responses {
 			switch ru.GetInner().(type) {
 			case *kvpb.ExportResponse, *kvpb.AddSSTableResponse:
-				<-*allowProgressIota
+				select {
+				case <-*allowProgressIota:
+				case <-ctx.Done():
+				}
 			}
 		}
 		return nil
@@ -256,7 +267,7 @@ func GetLastJobID(t testing.TB, db *sqlutils.SQLRunner) jobspb.JobID {
 func GetJobProgress(t *testing.T, db *sqlutils.SQLRunner, jobID jobspb.JobID) *jobspb.Progress {
 	ret := &jobspb.Progress{}
 	var buf []byte
-	db.QueryRow(t, `SELECT progress FROM system.jobs WHERE id = $1`, jobID).Scan(&buf)
+	db.QueryRow(t, `SELECT progress FROM crdb_internal.system_jobs WHERE id = $1`, jobID).Scan(&buf)
 	if err := protoutil.Unmarshal(buf, ret); err != nil {
 		t.Fatal(err)
 	}
@@ -266,8 +277,9 @@ func GetJobProgress(t *testing.T, db *sqlutils.SQLRunner, jobID jobspb.JobID) *j
 // GetJobPayload loads the Payload message associated with the job.
 func GetJobPayload(t *testing.T, db *sqlutils.SQLRunner, jobID jobspb.JobID) *jobspb.Payload {
 	ret := &jobspb.Payload{}
+	query := fmt.Sprintf(`SELECT payload FROM (%s)`, InternalSystemJobsBaseQuery)
 	var buf []byte
-	db.QueryRow(t, `SELECT payload FROM system.jobs WHERE id = $1`, jobID).Scan(&buf)
+	db.QueryRow(t, query, jobID).Scan(&buf)
 	if err := protoutil.Unmarshal(buf, ret); err != nil {
 		t.Fatal(err)
 	}

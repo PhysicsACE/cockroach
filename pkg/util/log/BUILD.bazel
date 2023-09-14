@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@bazel_gomock//:gomock.bzl", "gomock")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
@@ -27,7 +26,6 @@ go_library(
         "format_json.go",
         "formats.go",
         "formattable_tags.go",
-        "get_stacks.go",
         "http_sink.go",
         "intercept.go",
         "log.go",
@@ -36,8 +34,10 @@ go_library(
         "log_decoder.go",
         "log_entry.go",
         "log_flush.go",
+        "metric.go",
         "redact.go",
         "registry.go",
+        "report.go",
         "sinks.go",
         "stderr_redirect.go",
         "stderr_redirect_unix.go",
@@ -56,12 +56,15 @@ go_library(
         "//pkg/base/serverident",
         "//pkg/build",
         "//pkg/cli/exit",
+        "//pkg/settings",
         "//pkg/testutils/skip",
         "//pkg/util",
+        "//pkg/util/allstacks",
         "//pkg/util/caller",
         "//pkg/util/encoding/encodingtype",
         "//pkg/util/envutil",
         "//pkg/util/fileutil",
+        "//pkg/util/httputil",
         "//pkg/util/jsonbytes",
         "//pkg/util/log/channel",
         "//pkg/util/log/logconfig",
@@ -227,5 +230,3 @@ gomock(
         "//pkg/gen:__pkg__",
     ],
 )
-
-get_x_data(name = "get_x_data")

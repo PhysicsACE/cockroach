@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -173,7 +172,7 @@ func TestUpsertWithColumnMutationAndNotNullDefault(t *testing.T) {
 	// so disable leases on tables.
 	defer lease.TestingDisableTableLeases()()
 	// Disable external processing of mutations.
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	ctx := context.Background()
 	defer server.Stopper().Stop(ctx)
@@ -234,7 +233,7 @@ func TestOperationsWithColumnMutation(t *testing.T) {
 	defer lease.TestingDisableTableLeases()()
 	// Disable external processing of mutations.
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer server.Stopper().Stop(ctx)
 	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
@@ -500,7 +499,7 @@ func TestOperationsWithIndexMutation(t *testing.T) {
 	// The descriptor changes made must have an immediate effect.
 	defer lease.TestingDisableTableLeases()()
 	// Disable external processing of mutations.
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer server.Stopper().Stop(context.Background())
 	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
@@ -667,7 +666,7 @@ func TestOperationsWithColumnAndIndexMutation(t *testing.T) {
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
 	defer lease.TestingDisableTableLeases()()
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	ctx := context.Background()
 	defer server.Stopper().Stop(ctx)
@@ -883,7 +882,7 @@ func TestSchemaChangeCommandsWithPendingMutations(t *testing.T) {
 	// so disable leases on tables.
 	defer lease.TestingDisableTableLeases()()
 	// Disable external processing of mutations.
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			SchemaChangeJobNoOp: func() bool {
@@ -1049,11 +1048,11 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	mt.CheckQueryResults(t,
 		"SHOW INDEXES FROM t.test",
 		[][]string{
-			{"test", "test_pkey", "false", "1", "a", "a", "ASC", "false", "false", "true"},
-			{"test", "test_pkey", "false", "2", "b", "b", "N/A", "true", "false", "true"},
-			{"test", "test_pkey", "false", "3", "d", "d", "N/A", "true", "false", "true"},
-			{"test", "ufo", "true", "1", "d", "d", "ASC", "false", "false", "true"},
-			{"test", "ufo", "true", "2", "a", "a", "ASC", "false", "true", "true"},
+			{"test", "test_pkey", "false", "1", "a", "a", "ASC", "false", "false", "true", "1"},
+			{"test", "test_pkey", "false", "2", "b", "b", "N/A", "true", "false", "true", "1"},
+			{"test", "test_pkey", "false", "3", "d", "d", "N/A", "true", "false", "true", "1"},
+			{"test", "ufo", "true", "1", "d", "d", "ASC", "false", "false", "true", "1"},
+			{"test", "ufo", "true", "2", "a", "a", "ASC", "false", "true", "true", "1"},
 		},
 	)
 
@@ -1103,7 +1102,7 @@ func TestTableMutationQueue(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	// Disable synchronous and asynchronous schema change processing so that
 	// the mutations get queued up.
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			SchemaChangeJobNoOp: func() bool {
@@ -1219,7 +1218,7 @@ func TestAddingFKs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 

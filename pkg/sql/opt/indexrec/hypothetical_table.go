@@ -42,7 +42,10 @@ func BuildOptAndHypTableMaps(
 		for _, indexCols := range indexes {
 			indexOrd := hypTable.Table.IndexCount() + len(hypIndexes)
 			lastKeyCol := indexCols[len(indexCols)-1]
-			inverted := !colinfo.ColumnTypeIsIndexable(lastKeyCol.DatumType())
+			// TODO (Shivam): Index recommendations should not only allow JSON columns
+			// to be part of inverted indexes since they are also forward indexable.
+			inverted := !colinfo.ColumnTypeIsIndexable(lastKeyCol.DatumType()) ||
+				lastKeyCol.DatumType().Family() == types.JsonFamily
 			if inverted {
 				invertedCol := hypTable.addInvertedCol(lastKeyCol.Column)
 				indexCols[len(indexCols)-1] = cat.IndexColumn{Column: invertedCol}
@@ -141,6 +144,11 @@ func (ht *HypotheticalTable) Index(i cat.IndexOrdinal) cat.Index {
 	return &ht.hypotheticalIndexes[i-existingIndexCount]
 }
 
+// IsHypothetical is part of the cat.Table interface.
+func (ht *HypotheticalTable) IsHypothetical() bool {
+	return true
+}
+
 // FullyQualifiedName returns the fully qualified name of the hypothetical
 // table.
 func (ht *HypotheticalTable) FullyQualifiedName(ctx context.Context) (cat.DataSourceName, error) {
@@ -158,7 +166,7 @@ func (ht *HypotheticalTable) existingRedundantIndex(index *hypotheticalIndex) ca
 		existingIndex := ht.Table.Index(i)
 		indexExists := index.hasSameExplicitCols(existingIndex, index.IsInverted())
 		_, isPartialIndex := existingIndex.Predicate()
-		if indexExists && !isPartialIndex && !existingIndex.IsNotVisible() {
+		if indexExists && !isPartialIndex && existingIndex.GetInvisibility() == 0.0 {
 			return existingIndex
 		}
 	}

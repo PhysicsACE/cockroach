@@ -46,6 +46,19 @@ interrupt
 eexpect ":/# "
 end_test
 
+start_test "Check that using --advertise-addr does not cause a user warning."
+send "$argv start-single-node --insecure --advertise-addr=172.31.11.189\r"
+expect {
+  "WARNING: neither --listen-addr nor --advertise-addr was specified" {
+    report "unexpected WARNING: neither --listen-addr nor --advertise-addr was specified"
+	  exit 1
+  }
+}
+eexpect "node starting"
+interrupt
+eexpect ":/# "
+end_test
+
 start_test "Check that --listening-url-file gets created with the right data"
 send "$argv start-single-node --insecure --listening-url-file=foourl\r"
 eexpect "node starting"
@@ -151,6 +164,16 @@ eexpect ":/# "
 end_test
 
 stop_server $argv
+
+start_test "Check that set GOMEMLIMIT env var without specifying --max-go-memory works"
+send "export GOMEMLIMIT=1GiB;\r"
+eexpect ":/# "
+send "$argv start-single-node --insecure --store=path=logs/mystore\r"
+eexpect "node starting"
+interrupt
+eexpect ":/# "
+stop_server $argv
+end_test
 
 send "exit 0\r"
 eexpect eof

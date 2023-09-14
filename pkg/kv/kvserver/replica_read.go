@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -135,7 +136,7 @@ func (r *Replica) executeReadOnlyBatch(
 			// wait until resolution and evaluate pessimistically again.
 			//
 			// TODO(sumeer): scans and gets are correctly setting the resume span
-			// when returning a WriteIntentError. I am not sure about other
+			// when returning a LockConflictError. I am not sure about other
 			// concurrency errors. We could narrow the spans we check the latch
 			// conflicts for by using collectSpansRead as done below in the
 			// non-error path.
@@ -185,11 +186,15 @@ func (r *Replica) executeReadOnlyBatch(
 		g = nil
 	}
 
-	// Semi-synchronously process any intents that need resolving here in
-	// order to apply back pressure on the client which generated them. The
-	// resolution is semi-synchronous in that there is a limited number of
-	// outstanding asynchronous resolution tasks allowed after which
-	// further calls will block.
+	// Semi-synchronously process any intents that need resolving here in order
+	// to apply back pressure on the client which generated them. The resolution
+	// is semi-synchronous in that there is a limited number of outstanding
+	// asynchronous resolution tasks allowed after which further calls will
+	// block. The limited number of asynchronous resolution tasks ensures that
+	// the number of goroutines doing intent resolution does not diverge from
+	// the number of workload goroutines (see
+	// https://github.com/cockroachdb/cockroach/issues/4925#issuecomment-193015586
+	// for an old problem predating such a limit).
 	if len(intents) > 0 {
 		log.Eventf(ctx, "submitting %d intents to asynchronous processing", len(intents))
 		// We only allow synchronous intent resolution for consistent requests.
@@ -205,6 +210,7 @@ func (r *Replica) executeReadOnlyBatch(
 			ba.WaitPolicy != lock.WaitPolicy_SkipLocked
 		if err := r.store.intentResolver.CleanupIntentsAsync(
 			ctx,
+			ba.AdmissionHeader,
 			intents,
 			allowSyncProcessing,
 		); err != nil {
@@ -243,7 +249,7 @@ func (r *Replica) updateTimestampCacheAndDropLatches(
 	pErr *kvpb.Error,
 	st kvserverpb.LeaseStatus,
 ) {
-	ec := endCmds{repl: r, g: g, st: st}
+	ec := makeUnreplicatedEndCmds(r, g, st)
 	ec.done(ctx, ba, br, pErr)
 }
 
@@ -271,7 +277,7 @@ var allowDroppingLatchesBeforeEval = settings.RegisterBoolSetting(
 // `PinEngineStateForIterators` in `executeReadOnlyBatch`), so if there are no
 // lock conflicts, the rest of the execution is guaranteed to be isolated from
 // the effects of other requests.
-// If any conflicting intents are found, then it returns a WriteIntentError
+// If any conflicting intents are found, then it returns a LockConflictError
 // which needs to be handled by the caller before proceeding.
 //
 // [2] if the request can drop its latches early, whether it needs an intent
@@ -297,7 +303,7 @@ func (r *Replica) canDropLatchesBeforeEval(
 		ctx, 3, "can drop latches early for batch (%v); scanning lock table first to detect conflicts", ba,
 	)
 
-	maxIntents := storage.MaxIntentsPerWriteIntentError.Get(&r.store.cfg.Settings.SV)
+	maxIntents := storage.MaxIntentsPerLockConflictError.Get(&r.store.cfg.Settings.SV)
 	var intents []roachpb.Intent
 	// Check if any of the requests within the batch need to resolve any intents
 	// or if any of them need to use an intent interleaving iterator.
@@ -323,7 +329,7 @@ func (r *Replica) canDropLatchesBeforeEval(
 	}
 	if len(intents) > 0 {
 		return false /* ok */, false /* stillNeedsIntentInterleaving */, maybeAttachLease(
-			kvpb.NewError(&kvpb.WriteIntentError{Intents: intents}), &st.Lease,
+			kvpb.NewError(&kvpb.LockConflictError{Locks: roachpb.AsLocks(intents)}), &st.Lease,
 		)
 	}
 	// If there were no conflicts, then the request can drop its latches and
@@ -469,7 +475,7 @@ func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
 		// retry at a higher timestamp because it is not isolated at higher
 		// timestamps.
 		latchesHeld := g != nil
-		if !latchesHeld || !canDoServersideRetry(ctx, pErr, ba, br, g, hlc.Timestamp{}) {
+		if !latchesHeld || !canDoServersideRetry(ctx, pErr, ba, g, hlc.Timestamp{}) {
 			// TODO(aayush,arul): These metrics are incorrect at the moment since
 			// hitting this branch does not mean that we won't serverside retry, it
 			// just means that we will have to reacquire latches.
@@ -522,7 +528,7 @@ func (r *Replica) handleReadOnlyLocalEvalResult(
 // and uses that to compute the latch and lock spans.
 func (r *Replica) collectSpansRead(
 	ba *kvpb.BatchRequest, br *kvpb.BatchResponse,
-) (latchSpans, lockSpans *spanset.SpanSet, _ error) {
+) (latchSpans *spanset.SpanSet, lockSpans *lockspanset.LockSpanSet, _ error) {
 	baCopy := *ba
 	baCopy.Requests = make([]kvpb.RequestUnion, 0, len(ba.Requests))
 	for i := 0; i < len(ba.Requests); i++ {
@@ -559,7 +565,8 @@ func (r *Replica) collectSpansRead(
 					union kvpb.RequestUnion_Get
 				})
 				getAlloc.get.Key = key
-				getAlloc.get.KeyLocking = req.(kvpb.LockingReadRequest).KeyLockingStrength()
+				getAlloc.get.KeyLockingStrength,
+					getAlloc.get.KeyLockingDurability = req.(kvpb.LockingReadRequest).KeyLocking()
 				getAlloc.union.Get = &getAlloc.get
 				ru := kvpb.RequestUnion{Value: &getAlloc.union}
 				baCopy.Requests = append(baCopy.Requests, ru)

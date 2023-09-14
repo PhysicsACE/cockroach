@@ -21,75 +21,98 @@ cockroachdb/docs:
   triage_column_id: 3971225
   aliases:
     cockroachdb/docs-infra-prs: other
-cockroachdb/sql-sessions:
+cockroachdb/sql-foundations:
   aliases:
     cockroachdb/sql-syntax-prs: other
     cockroachdb/sqlproxy-prs: other
     cockroachdb/sql-api-prs: other
-  triage_column_id: 7259065
-  label: T-sql-sessions
-cockroachdb/sql-schema:
-  triage_column_id: 8946818
+  triage_column_id: 19467489
+  label: T-sql-foundations
 cockroachdb/sql-queries:
   aliases:
+    cockroachdb/sql-queries-prs: other
     cockroachdb/sql-optimizer: other
     cockroachdb/sql-opt-prs: other
-  triage_column_id: 13549252
-cockroachdb/sql-observability:
+  # SQL Queries team uses GH projects v2, which doesn't have a REST API, so
+  # there is no triage column ID.
+  # See .github/workflows/add-issues-to-project.yml.
+  label: T-sql-queries
+cockroachdb/cluster-observability:
   triage_column_id: 12618343
+  label: T-cluster-observability
 cockroachdb/kv:
   aliases:
     cockroachdb/admission-control: other
     cockroachdb/kv-triage: roachtest
     cockroachdb/kv-prs: other
   triage_column_id: 14242655
+  label: T-kv
 cockroachdb/replication:
   aliases:
     cockroachdb/repl-prs: other
   label: T-kv-replication
 cockroachdb/spatial:
   triage_column_id: 9487269
+  label: T-spatial
 cockroachdb/dev-inf:
   triage_column_id: 10210759
+  label: T-dev-inf
 cockroachdb/multiregion:
   triage_column_id: 11926170
+  label: T-multiregion
 cockroachdb/storage:
   triage_column_id: 6668367
+  label: T-storage
 cockroachdb/test-eng:
   triage_column_id: 14041337
+  label: T-testeng
 cockroachdb/security:
-  triage_column_id: 0 # TODO
+  label: T-cross-product-security
 cockroachdb/prodsec:
-  triage_column_id: 0 # TODO as well
+  label: T-cross-product-security
 cockroachdb/disaster-recovery:
   triage_column_id: 3097123
+  label: T-disaster-recovery
 cockroachdb/cdc:
   aliases:
     cockroachdb/cdc-prs: other
-  triage_column_id: 3570120
+  # CDC team uses GH projects v2, which doesn't have a REST API, so no triage column ID
+  # see .github/workflows/add-issues-to-project.yml
+  label: T-cdc
 cockroachdb/server:
   aliases:
     cockroachdb/cli-prs: other
     cockroachdb/server-prs: other
-    cockroachdb/http-api-prs: other
   triage_column_id: 2521812
 cockroachdb/admin-ui:
   aliases:
     cockroachdb/admin-ui-prs: other
   triage_column_id: 6598672
-cockroachdb/kv-obs-prs:
-  triage_column_id: 0 # TODO
+  label: T-observability-inf
 cockroachdb/obs-inf-prs:
+  aliases:
+    cockroachdb/http-api-prs: other
   triage_column_id: 14196277
+  label: T-observability-inf
 cockroachdb/multi-tenant:
+  # Multi-tenant team uses GH projects v2, which doesn't have a REST API, so no triage column ID
+  # see .github/workflows/add-issues-to-project.yml
   label: T-multitenant
 cockroachdb/jobs:
   aliases:
     cockroachdb/jobs-prs: other
-  triage_column_id: 16360666
+  # Jobs uses GH projects v2, which doesn't have a REST API, so no triage column ID
+  # see .github/workflows/add-issues-to-project.yml
+  label: T-jobs
 cockroachdb/cloud-identity:
   triage_column_id: 18588697
 cockroachdb/unowned:
   aliases:
     cockroachdb/rfc-prs: other
   triage_column_id: 0 # TODO
+cockroachdb/migrations:
+  label: T-migrations
+  triage_column_id: 18330909
+cockroachdb/release-eng:
+  label: T-release
+  triage_column_id: 9149730

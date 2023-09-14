@@ -15,27 +15,31 @@ import { Dispatch } from "redux";
 import { AppState, uiConfigActions } from "src/store";
 import { actions as nodesActions } from "src/store/nodes";
 import { actions as sqlStatsActions } from "src/store/sqlStats";
+import { actions as txnStatsActions } from "src/store/transactionStats";
 import {
   TransactionsPageStateProps,
   TransactionsPageDispatchProps,
 } from "./transactionsPage";
 import {
-  selectTransactionsData,
-  selectTransactionsLastError,
   selectTxnColumns,
   selectSortSetting,
   selectFilters,
   selectSearch,
+  selectRequestTime,
 } from "./transactionsPage.selectors";
 import { selectHasAdminRole, selectIsTenant } from "../store/uiConfig";
 import { nodeRegionsByIDSelector } from "../store/nodes";
 import {
-  selectStatementsLastUpdated,
-  selectStatementsDataValid,
-} from "src/statementsPage/statementsPage.selectors";
-import { selectTimeScale } from "../store/utils/selectors";
-import { StatementsRequest } from "src/api/statementsApi";
-import { actions as localStorageActions } from "../store/localStorage";
+  selectTxnsPageLimit,
+  selectTxnsPageReqSort,
+  selectTimeScale,
+} from "../store/utils/selectors";
+import { SqlStatsSortType, StatementsRequest } from "src/api/statementsApi";
+import {
+  actions as localStorageActions,
+  updateTxnsPageLimitAction,
+  updateTxnsPageReqSortAction,
+} from "../store/localStorage";
 import { Filters } from "../queryFilter";
 import { actions as analyticsActions } from "../store/analytics";
 import { TimeScale } from "../timeScaleDropdown";
@@ -44,22 +48,22 @@ import {
   TransactionsPageRootProps,
 } from "./transactionsPageRoot";
 import {
-  mapStateToRecentTransactionsPageProps,
-  mapDispatchToRecentTransactionsPageProps,
-} from "./recentTransactionsPage.selectors";
+  mapStateToActiveTransactionsPageProps,
+  mapDispatchToActiveTransactionsPageProps,
+} from "./activeTransactionsPage.selectors";
 import {
-  RecentTransactionsViewStateProps,
-  RecentTransactionsViewDispatchProps,
-} from "./recentTransactionsView";
+  ActiveTransactionsViewStateProps,
+  ActiveTransactionsViewDispatchProps,
+} from "./activeTransactionsView";
 
 type StateProps = {
   fingerprintsPageProps: TransactionsPageStateProps & RouteComponentProps;
-  activePageProps: RecentTransactionsViewStateProps;
+  activePageProps: ActiveTransactionsViewStateProps;
 };
 
 type DispatchProps = {
   fingerprintsPageProps: TransactionsPageDispatchProps;
-  activePageProps: RecentTransactionsViewDispatchProps;
+  activePageProps: ActiveTransactionsViewDispatchProps;
 };
 
 export const TransactionsPageConnected = withRouter(
@@ -73,29 +77,30 @@ export const TransactionsPageConnected = withRouter(
       fingerprintsPageProps: {
         ...props,
         columns: selectTxnColumns(state),
-        data: selectTransactionsData(state),
-        isDataValid: selectStatementsDataValid(state),
-        lastUpdated: selectStatementsLastUpdated(state),
+        txnsResp: state.adminUI?.transactions,
         timeScale: selectTimeScale(state),
-        error: selectTransactionsLastError(state),
         filters: selectFilters(state),
         isTenant: selectIsTenant(state),
         nodeRegions: nodeRegionsByIDSelector(state),
         search: selectSearch(state),
         sortSetting: selectSortSetting(state),
         hasAdminRole: selectHasAdminRole(state),
+        limit: selectTxnsPageLimit(state),
+        reqSortSetting: selectTxnsPageReqSort(state),
+        requestTime: selectRequestTime(state),
+        oldestDataAvailable:
+          state.adminUI?.transactions?.data?.oldest_aggregated_ts_returned,
       },
-      activePageProps: mapStateToRecentTransactionsPageProps(state),
+      activePageProps: mapStateToActiveTransactionsPageProps(state),
     }),
     (dispatch: Dispatch) => ({
       fingerprintsPageProps: {
         refreshData: (req: StatementsRequest) =>
-          dispatch(sqlStatsActions.refresh(req)),
+          dispatch(txnStatsActions.refresh(req)),
         refreshNodes: () => dispatch(nodesActions.refresh()),
         refreshUserSQLRoles: () =>
           dispatch(uiConfigActions.refreshUserSQLRoles()),
-        resetSQLStats: (req: StatementsRequest) =>
-          dispatch(sqlStatsActions.reset(req)),
+        resetSQLStats: () => dispatch(sqlStatsActions.reset()),
         onTimeScaleChange: (ts: TimeScale) => {
           dispatch(
             sqlStatsActions.updateTimeScale({
@@ -157,8 +162,30 @@ export const TransactionsPageConnected = withRouter(
             }),
           );
         },
+        onChangeLimit: (limit: number) =>
+          dispatch(updateTxnsPageLimitAction(limit)),
+        onChangeReqSort: (sort: SqlStatsSortType) =>
+          dispatch(updateTxnsPageReqSortAction(sort)),
+        onApplySearchCriteria: (ts: TimeScale, limit: number, sort: string) =>
+          dispatch(
+            analyticsActions.track({
+              name: "Apply Search Criteria",
+              page: "Transactions",
+              tsValue: ts.key,
+              limitValue: limit,
+              sortValue: sort,
+            }),
+          ),
+        onRequestTimeChange: (t: moment.Moment) => {
+          dispatch(
+            localStorageActions.update({
+              key: "requestTime/StatementsPage",
+              value: t,
+            }),
+          );
+        },
       },
-      activePageProps: mapDispatchToRecentTransactionsPageProps(dispatch),
+      activePageProps: mapDispatchToActiveTransactionsPageProps(dispatch),
     }),
     (stateProps, dispatchProps) => ({
       fingerprintsPageProps: {

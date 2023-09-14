@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package exec contains execution-related utilities. (See README.md.)
 package exec
 
 import (
@@ -56,9 +57,10 @@ type ScanParams struct {
 
 	Reverse bool
 
-	// If true, the scan will scan all spans in parallel. It should only be set to
-	// true if there is a known upper bound on the number of rows that will be
-	// scanned. It should not be set if there is a hard or soft limit.
+	// If true, the scan will scan all spans in parallel. It should only be set
+	// to true if there is a known upper bound on the number of rows that will
+	// be scanned, or if 'unbounded_parallel_scans' session variable is 'true'.
+	// It should not be set if there is a hard or soft limit.
 	Parallelize bool
 
 	// Row-level locking properties.
@@ -261,6 +263,9 @@ type InsertFastPathFKCheck struct {
 
 	MatchMethod tree.CompositeKeyMatchMethod
 
+	// Row-level locking properties of the check.
+	Locking opt.Locking
+
 	// MkErr is called when a violation is detected (i.e. the index has no entries
 	// for a given inserted row). The values passed correspond to InsertCols
 	// above.
@@ -333,8 +338,10 @@ type ExecutionStats struct {
 	KVTime                optional.Duration
 	KVContentionTime      optional.Duration
 	KVBytesRead           optional.Uint
+	KVPairsRead           optional.Uint
 	KVRowsRead            optional.Uint
 	KVBatchRequestsIssued optional.Uint
+	UsedStreamer          bool
 
 	// Storage engine iterator statistics
 	//

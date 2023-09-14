@@ -16,11 +16,11 @@ import {
   DurationToNumber,
   TimestampToMoment,
 } from "src/util/convert";
-import { BytesWithPrecision, Count } from "src/util/format";
+import { BytesWithPrecision, Count, DATE_FORMAT } from "src/util/format";
 import { Link } from "react-router-dom";
 import React from "react";
 
-import moment from "moment";
+import moment from "moment-timezone";
 
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 type ISession = cockroach.server.serverpb.Session;
@@ -39,11 +39,12 @@ import {
 } from "src/dropdown/dropdown";
 import { Button } from "src/button/button";
 import { Tooltip } from "@cockroachlabs/ui-components";
-import { computeOrUseStmtSummary } from "../util";
+import { computeOrUseStmtSummary, FixLong } from "../util";
 import {
   statisticsTableTitles,
   StatisticType,
 } from "../statsTableUtil/statsTableUtil";
+import { Timestamp } from "../timestamp";
 
 const cx = classNames.bind(styles);
 
@@ -104,23 +105,20 @@ const StatementTableCell = (props: { session: ISession }) => {
   );
 };
 
-function formatSessionStart(session: ISession): string {
-  const formatStr = "MMM DD, YYYY [at] H:mm";
+function formatSessionStart(session: ISession) {
   const start = moment.unix(Number(session.start.seconds)).utc();
-
-  return start.format(formatStr);
+  return <Timestamp time={start} format={DATE_FORMAT} />;
 }
 
-function formatStatementStart(session: ISession): string {
+function formatStatementStart(session: ISession) {
   if (session.active_queries.length == 0) {
-    return "N/A";
+    return <>N/A</>;
   }
-  const formatStr = "MMM DD, YYYY [at] H:mm";
   const start = moment
     .unix(Number(session.active_queries[0].start.seconds))
     .utc();
 
-  return start.format(formatStr);
+  return <Timestamp time={start} format={DATE_FORMAT} />;
 }
 
 export function getStatusString(status: Status): string {
@@ -232,10 +230,16 @@ export function makeSessionsColumns(
       title: statisticsTableTitles.memUsage(statType),
       className: cx("cl-table__col-session"),
       cell: session =>
-        BytesWithPrecision(session.session.alloc_bytes?.toNumber(), 0) +
+        BytesWithPrecision(
+          FixLong(session.session.alloc_bytes ?? 0).toNumber(),
+          0,
+        ) +
         "/" +
-        BytesWithPrecision(session.session.max_alloc_bytes?.toNumber(), 0),
-      sort: session => session.session.alloc_bytes?.toNumber(),
+        BytesWithPrecision(
+          FixLong(session.session.max_alloc_bytes ?? 0).toNumber(),
+          0,
+        ),
+      sort: session => FixLong(session.session.alloc_bytes ?? 0).toNumber(),
     },
     {
       name: "clientAddress",

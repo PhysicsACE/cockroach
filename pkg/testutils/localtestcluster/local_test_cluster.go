@@ -29,11 +29,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -50,8 +52,7 @@ import (
 // usage of a LocalTestCluster follows:
 //
 //	s := &LocalTestCluster{}
-//	s.Start(t, testutils.NewNodeTestBaseContext(),
-//	        kv.InitFactoryForLocalTestCluster)
+//	s.Start(t, kv.InitFactoryForLocalTestCluster)
 //	defer s.Stop()
 //
 // Note that the LocalTestCluster is different from server.TestCluster
@@ -112,11 +113,16 @@ func (ltc *LocalTestCluster) Stopper() *stop.Stopper {
 // node RPC server and all HTTP endpoints. Use the value of
 // TestServer.Addr after Start() for client connections. Use Stop()
 // to shutdown the server after the test completes.
-func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFactory InitFactoryFn) {
+func (ltc *LocalTestCluster) Start(t testing.TB, initFactory InitFactoryFn) {
 	manualClock := timeutil.NewManualTime(timeutil.Unix(0, 123))
 	clock := hlc.NewClock(manualClock,
 		50*time.Millisecond /* maxOffset */, 50*time.Millisecond /* toleratedOffset */)
-	cfg := kvserver.TestStoreConfig(clock)
+	var cfg kvserver.StoreConfig
+	if ltc.StoreTestingKnobs != nil && ltc.StoreTestingKnobs.InitialReplicaVersionOverride != nil {
+		cfg = kvserver.TestStoreConfigWithVersion(clock, *ltc.StoreTestingKnobs.InitialReplicaVersionOverride)
+	} else {
+		cfg = kvserver.TestStoreConfig(clock)
+	}
 	tr := cfg.AmbientCtx.Tracer
 	ltc.stopper = stop.NewStopper(stop.WithTracer(tr))
 	ltc.Manual = manualClock
@@ -135,15 +141,17 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	}
 
 	ltc.tester = t
-	cfg.RPCContext = rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:        roachpb.SystemTenantID,
-		Config:          baseCtx,
-		Clock:           ltc.Clock.WallClock(),
-		ToleratedOffset: ltc.Clock.ToleratedOffset(),
-		Stopper:         ltc.stopper,
-		Settings:        cfg.Settings,
-		NodeID:          nc,
-	})
+
+	opts := rpc.DefaultContextOptions()
+	opts.Clock = ltc.Clock.WallClock()
+	opts.ToleratedOffset = ltc.Clock.ToleratedOffset()
+	opts.Stopper = ltc.stopper
+	opts.Settings = cfg.Settings
+	opts.NodeID = nc
+	opts.TenantRPCAuthorizer = tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer()
+
+	cfg.RPCContext = rpc.NewContext(ctx, opts)
+
 	cfg.RPCContext.NodeID.Set(ctx, nodeID)
 	clusterID := cfg.RPCContext.StorageClusterID
 	ltc.Gossip = gossip.New(ambient, clusterID, nc, ltc.stopper, metric.NewRegistry(), roachpb.Locality{}, zonepb.DefaultZoneConfigRef())
@@ -190,20 +198,31 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		AmbientCtx:              cfg.AmbientCtx,
 		Stopper:                 ltc.stopper,
 		Clock:                   cfg.Clock,
-		DB:                      cfg.DB,
+		Storage:                 liveness.NewKVStorage(cfg.DB),
 		Gossip:                  cfg.Gossip,
 		LivenessThreshold:       active,
 		RenewalDuration:         renewal,
 		Settings:                cfg.Settings,
 		HistogramWindowInterval: cfg.HistogramWindowInterval,
+		Engines:                 []storage.Engine{ltc.Eng},
+		NodeDialer:              cfg.NodeDialer,
 	})
-	storepool.TimeUntilStoreDead.Override(ctx, &cfg.Settings.SV, storepool.TestTimeUntilStoreDead)
+	liveness.TimeUntilNodeDead.Override(ctx, &cfg.Settings.SV, liveness.TestTimeUntilNodeDead)
+	nodeCountFn := func() int {
+		var count int
+		for _, nv := range cfg.NodeLiveness.ScanNodeVitalityFromCache() {
+			if !nv.IsDecommissioning() && !nv.IsDecommissioned() {
+				count++
+			}
+		}
+		return count
+	}
 	cfg.StorePool = storepool.NewStorePool(
 		cfg.AmbientCtx,
 		cfg.Settings,
 		cfg.Gossip,
 		cfg.Clock,
-		cfg.NodeLiveness.GetNodeCount,
+		nodeCountFn,
 		storepool.MakeStorePoolNodeLivenessFunc(cfg.NodeLiveness),
 		/* deterministic */ false,
 	)
@@ -230,8 +249,9 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		1<<20, /* 1 MB */
 		cfg.DefaultSpanConfig,
 		cfg.Settings,
-		nil,
-		nil,
+		spanconfigstore.NewEmptyBoundsReader(),
+		nil, /* knobs */
+		nil, /* registry */
 	)
 	cfg.SystemConfigProvider = systemconfigwatcher.New(
 		keys.SystemSQLCodec,
@@ -276,16 +296,16 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		t.Fatalf("unable to set node descriptor: %s", err)
 	}
 
-	if !ltc.DisableLivenessHeartbeat {
-		cfg.NodeLiveness.Start(ctx,
-			liveness.NodeLivenessStartOptions{Engines: []storage.Engine{ltc.Eng}})
-	}
-
 	if err := ltc.Store.Start(ctx, ltc.stopper); err != nil {
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}
 
 	ltc.Stores.AddStore(ltc.Store)
+
+	if !ltc.DisableLivenessHeartbeat {
+		cfg.NodeLiveness.Start(ctx)
+	}
+
 	ltc.Cfg = cfg
 }
 

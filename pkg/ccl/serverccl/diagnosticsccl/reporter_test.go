@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -40,16 +39,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Dummy import to pull in kvtenantccl. This allows us to start tenants.
-var _ = kvtenantccl.Connector{}
-
 const elemName = "somestring"
 
 func TestTenantReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rt := startReporterTest(t)
+	rt := startReporterTest(t, base.TestControlsTenantsExplicitly)
 	defer rt.Close()
 
 	tenantArgs := base.TestTenantArgs{
@@ -88,7 +84,7 @@ func TestTenantReport(t *testing.T) {
 	require.NotZero(t, len(last.FeatureUsage))
 
 	// Call PeriodicallyReportDiagnostics and ensure it sends out a report.
-	reporter.PeriodicallyReportDiagnostics(ctx, tenant.Stopper())
+	reporter.PeriodicallyReportDiagnostics(ctx, tenant.AppStopper())
 	testutils.SucceedsSoon(t, func() error {
 		if rt.diagServer.NumRequests() != 2 {
 			return errors.Errorf("did not receive a diagnostics report")
@@ -103,7 +99,7 @@ func TestServerReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rt := startReporterTest(t)
+	rt := startReporterTest(t, base.TestIsSpecificToStorageLayerAndNeedsASystemTenant)
 	defer rt.Close()
 
 	ctx := context.Background()
@@ -205,6 +201,7 @@ func TestServerReport(t *testing.T) {
 	require.Equal(t, expected, actual, "expected %d changed settings, got %d: %v", expected, actual, last.AlteredSettings)
 
 	for key, expected := range map[string]string{
+		// Note: this uses setting _keys_, not setting names.
 		"cluster.organization":                     "<redacted>",
 		"diagnostics.reporting.send_crash_reports": "false",
 		"server.time_until_store_dead":             "1m30s",
@@ -302,7 +299,6 @@ func TestUsageQuantization(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(ctx)
-	ts := s.(*server.TestServer)
 
 	// Disable periodic reporting so it doesn't interfere with the test.
 	if _, err := db.Exec(`SET CLUSTER SETTING diagnostics.reporting.enabled = false`); err != nil {
@@ -333,6 +329,8 @@ func TestUsageQuantization(t *testing.T) {
 		_, err := db.Exec(`SHOW application_name`)
 		require.NoError(t, err)
 	}
+
+	ts := s.ApplicationLayer()
 
 	// Flush the SQL stat pool.
 	ts.SQLServer().(*sql.Server).GetSQLStatsController().ResetLocalSQLStats(ctx)
@@ -390,7 +388,9 @@ func (t *reporterTest) Close() {
 	t.server.Stopper().Stop(context.Background())
 }
 
-func startReporterTest(t *testing.T) *reporterTest {
+func startReporterTest(
+	t *testing.T, defaultTestTenant base.DefaultTestTenantOptions,
+) *reporterTest {
 	// Disable cloud info reporting, since it slows down tests.
 	rt := &reporterTest{
 		cloudEnable: cloudinfo.Disable(),
@@ -415,6 +415,7 @@ func startReporterTest(t *testing.T) *reporterTest {
 	storeSpec := base.DefaultTestStoreSpec
 	storeSpec.Attributes = roachpb.Attributes{Attrs: []string{elemName}}
 	rt.serverArgs = base.TestServerArgs{
+		DefaultTestTenant: defaultTestTenant,
 		StoreSpecs: []base.StoreSpec{
 			storeSpec,
 			base.DefaultTestStoreSpec,
@@ -446,7 +447,7 @@ func setupCluster(t *testing.T, db *gosql.DB) {
 	_, err = db.Exec(`SET CLUSTER SETTING diagnostics.reporting.enabled = true`)
 	require.NoError(t, err)
 
-	_, err = db.Exec(`SET CLUSTER SETTING diagnostics.reporting.send_crash_reports = false`)
+	_, err = db.Exec(`SET CLUSTER SETTING diagnostics.reporting.send_crash_reports.enabled = false`)
 	require.NoError(t, err)
 
 	_, err = db.Exec(fmt.Sprintf(`CREATE DATABASE %s`, elemName))

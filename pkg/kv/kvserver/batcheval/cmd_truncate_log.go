@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -33,7 +34,8 @@ func declareKeysTruncateLog(
 	rs ImmutableRangeState,
 	_ *kvpb.Header,
 	_ kvpb.Request,
-	latchSpans, _ *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
 ) {
 	prefix := keys.RaftLogPrefix(rs.GetRangeID())
@@ -124,7 +126,7 @@ func TruncateLog(
 	}
 	ms.SysBytes = -ms.SysBytes // simulate the deletion
 
-	tState := &roachpb.RaftTruncatedState{
+	tState := &kvserverpb.RaftTruncatedState{
 		Index: args.Index - 1,
 		Term:  term,
 	}

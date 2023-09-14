@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/lib/pq/oid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,7 +47,9 @@ func TestRandRun(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	dbName := "rand_test"
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{UseDatabase: dbName})
 	defer s.Stopper().Stop(ctx)
@@ -60,6 +63,14 @@ func TestRandRun(t *testing.T) {
 	colName := "c1"
 
 	for _, typeT := range types.OidToType {
+		// The BIT[] type is broken, so skip it.
+		// TODO(mgartner): BIT[] type is broken, primarily because the BIT type
+		// is broken. It should have a non-zero width. In should probably be
+		// exported from the types package, and there should be a datum type for
+		// BIT that is distinct from VARBIT.
+		if typeT.Family() == types.ArrayFamily && typeT.ArrayContents().Oid() == oid.T_bit {
+			continue
+		}
 		if !randgen.IsLegalColumnType(typeT) {
 			continue
 		}

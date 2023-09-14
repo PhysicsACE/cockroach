@@ -40,8 +40,9 @@ func TestEvaluatesCDCFunctionOverloads(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, ""+
@@ -178,6 +179,7 @@ func TestEvaluatesCDCFunctionOverloads(t *testing.T) {
 		schemaTS := s.Clock().Now()
 		row := makeEventRow(t, desc, schemaTS, false, s.Clock().Now(), true)
 		deletedRow := makeEventRow(t, desc, schemaTS, true, s.Clock().Now(), true)
+		prevRow := makeEventRow(t, desc, schemaTS, false, s.Clock().Now(), false)
 		nilRow := cdcevent.Row{}
 
 		for _, tc := range []struct {
@@ -197,7 +199,7 @@ func TestEvaluatesCDCFunctionOverloads(t *testing.T) {
 			{
 				op:       "update",
 				row:      row,
-				prevRow:  row,
+				prevRow:  prevRow,
 				withDiff: true,
 				expect:   "update",
 			},
@@ -220,14 +222,14 @@ func TestEvaluatesCDCFunctionOverloads(t *testing.T) {
 			{
 				op:       "delete",
 				row:      deletedRow,
-				prevRow:  row,
+				prevRow:  prevRow,
 				withDiff: true,
 				expect:   "delete",
 			},
 			{
 				op:       "delete",
 				row:      deletedRow,
-				prevRow:  row,
+				prevRow:  prevRow,
 				withDiff: false,
 				expect:   "delete",
 			},

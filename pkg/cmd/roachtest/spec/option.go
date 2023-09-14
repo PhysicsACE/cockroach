@@ -10,11 +10,37 @@
 
 package spec
 
-import "time"
+import (
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
+)
 
 // Option is the interface satisfied by options to MakeClusterSpec.
 type Option interface {
 	apply(spec *ClusterSpec)
+}
+
+type cloudOption string
+
+func (o cloudOption) apply(spec *ClusterSpec) {
+	spec.Cloud = string(o)
+}
+
+// Cloud controls what cloud is used to create the cluster.
+func Cloud(s string) Option {
+	return cloudOption(s)
+}
+
+type archOption string
+
+func (o archOption) apply(spec *ClusterSpec) {
+	spec.Arch = vm.CPUArch(o)
+}
+
+// Request specific CPU architecture.
+func Arch(arch vm.CPUArch) Option {
+	return archOption(arch)
 }
 
 type nodeCPUOption int
@@ -28,15 +54,15 @@ func CPU(n int) Option {
 	return nodeCPUOption(n)
 }
 
-type nodeHighMemOption bool
+type nodeMemOption MemPerCPU
 
-func (o nodeHighMemOption) apply(spec *ClusterSpec) {
-	spec.HighMem = bool(o)
+func (o nodeMemOption) apply(spec *ClusterSpec) {
+	spec.Mem = MemPerCPU(o)
 }
 
-// HighMem requests nodes with additional memory per CPU.
-func HighMem(enabled bool) Option {
-	return nodeHighMemOption(enabled)
+// Mem requests nodes with low/standard/high ratio of memory per CPU.
+func Mem(level MemPerCPU) Option {
+	return nodeMemOption(level)
 }
 
 type volumeSizeOption int
@@ -179,15 +205,15 @@ func (p clusterReusePolicyOption) apply(spec *ClusterSpec) {
 	spec.ReusePolicy = p.p
 }
 
-type preferSSDOption struct{}
+type preferLocalSSDOption bool
 
-func (*preferSSDOption) apply(spec *ClusterSpec) {
-	spec.PreferLocalSSD = true
+func (o preferLocalSSDOption) apply(spec *ClusterSpec) {
+	spec.PreferLocalSSD = bool(o)
 }
 
-// PreferSSD prefers using local SSD, when possible.
-func PreferSSD() Option {
-	return &preferSSDOption{}
+// PreferLocalSSD specifies whether to prefer using local SSD, when possible.
+func PreferLocalSSD(prefer bool) Option {
+	return preferLocalSSDOption(prefer)
 }
 
 type terminateOnMigrationOption struct{}

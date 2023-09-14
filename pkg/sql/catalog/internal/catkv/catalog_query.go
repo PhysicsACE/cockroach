@@ -133,8 +133,7 @@ func (cq catalogQuery) processCommentsResultRow(row kv.KeyValue, cb *nstree.Muta
 	if famID != keys.CommentsTableCommentColFamID {
 		return nil
 	}
-	cb.UpsertComment(cmtKey, string(row.ValueBytes()))
-	return nil
+	return cb.UpsertComment(cmtKey, string(row.ValueBytes()))
 }
 
 func (cq catalogQuery) processZonesResultRow(row kv.KeyValue, cb *nstree.MutableCatalog) error {
@@ -192,9 +191,6 @@ func build(
 	if expectedType != catalog.Any && b.DescriptorType() != expectedType {
 		return nil, pgerror.Newf(pgcode.WrongObjectType, "descriptor is a %s", b.DescriptorType())
 	}
-	if err := b.RunPostDeserializationChanges(); err != nil {
-		return nil, errors.NewAssertionErrorWithWrappedErrf(err, "error during RunPostDeserializationChanges")
-	}
 	b.SetRawBytesInStorage(rowValue.TagAndDataBytes())
 	desc := b.BuildImmutable()
 	if id != desc.GetID() {
@@ -218,5 +214,5 @@ func requiredError(expectedType catalog.DescriptorType, id descpb.ID) (err error
 	default:
 		err = errors.Errorf("failed to find descriptor [%d]", id)
 	}
-	return errors.CombineErrors(catalog.ErrDescriptorNotFound, err)
+	return errors.CombineErrors(catalog.NewDescriptorNotFoundError(id), err)
 }

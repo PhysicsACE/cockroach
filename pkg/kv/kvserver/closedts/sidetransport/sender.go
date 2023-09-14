@@ -8,6 +8,8 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package sidetransport contains definitions for the sidetransport layer of
+// the kvserver.
 package sidetransport
 
 import (
@@ -20,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -29,9 +32,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
 
@@ -114,7 +119,7 @@ type connTestingKnobs struct {
 // trackedRange contains the information that the side-transport last published
 // about a particular range.
 type trackedRange struct {
-	lai    ctpb.LAI
+	lai    kvpb.LeaseAppliedIndex
 	policy roachpb.RangeClosedTimestampPolicy
 }
 
@@ -167,7 +172,7 @@ type BumpSideTransportClosedResult struct {
 	// Fields only set when ok.
 
 	// The range's current LAI, to be associated with the closed timestamp.
-	LAI ctpb.LAI
+	LAI kvpb.LeaseAppliedIndex
 	// The range's current policy.
 	Policy roachpb.RangeClosedTimestampPolicy
 }
@@ -383,7 +388,12 @@ func (s *Sender) publish(ctx context.Context) hlc.ClockTimestamp {
 		// connections to the other nodes.
 		repls := closeRes.Desc.Replicas().Descriptors()
 		for i := range repls {
-			nodesWithFollowers.Add(int(repls[i].NodeID))
+			// We want to track all followers including ones running on the same node
+			// but different store. We want to bump side transport to update followers
+			// even if two replicas are colocated on the same node during rebalancing.
+			if repls[i].StoreID != lh.StoreID() {
+				nodesWithFollowers.Add(int(repls[i].NodeID))
+			}
 		}
 
 		if !closeRes.OK {
@@ -439,10 +449,13 @@ func (s *Sender) publish(ctx context.Context) hlc.ClockTimestamp {
 		// Open connections to any node that needs info from us and is missing a conn.
 		nodesWithFollowers.ForEach(func(nid int) {
 			nodeID := roachpb.NodeID(nid)
-			// Note that we don't open a connection to ourselves. The timestamps that
-			// we're closing are written directly to the sideTransportClosedTimestamp
-			// fields of the local replicas in BumpSideTransportClosed.
-			if _, ok := s.connsMu.conns[nodeID]; !ok && nodeID != s.nodeID {
+			// We don't need to update leaseholders because timestamps we are closing
+			// are written directly to the sideTransportClosedTimestamp fields of the
+			// local replicas in BumpSideTransportClosed.
+			// At the same time we can have followers colocated on the same node in
+			// different stores (e.g. during store rebalancing) so we can create
+			// connection to ourselves if we find such replicas.
+			if _, ok := s.connsMu.conns[nodeID]; !ok {
 				c := s.connFactory.new(s, nodeID)
 				c.run(ctx, s.stopper)
 				s.connsMu.conns[nodeID] = c
@@ -791,7 +804,7 @@ func (r *rpcConn) run(ctx context.Context, stopper *stop.Stopper) {
 					return
 				}
 				if err := r.maybeConnect(ctx, stopper); err != nil {
-					if everyN.ShouldLog() {
+					if !errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) && everyN.ShouldLog() {
 						log.Infof(ctx, "side-transport failed to connect to n%d: %s", r.nodeID, err)
 					}
 					time.Sleep(errSleepTime)

@@ -30,19 +30,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bulk"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
+	gogotypes "github.com/gogo/protobuf/types"
 )
 
 var backupOutputTypes = []*types.T{}
@@ -54,8 +57,8 @@ var (
 		"amount of time since the read-as-of time above which a BACKUP should use priority when retrying reads",
 		time.Minute,
 		settings.NonNegativeDuration,
-	).WithPublic()
-	delayPerAttmpt = settings.RegisterDurationSetting(
+		settings.WithPublic)
+	delayPerAttempt = settings.RegisterDurationSetting(
 		settings.TenantWritable,
 		"bulkio.backup.read_retry_delay",
 		"amount of time since the read-as-of time, per-prior attempt, to wait before making another attempt",
@@ -68,20 +71,31 @@ var (
 		"amount of time after which a read attempt is considered timed out, which causes the backup to fail",
 		time.Minute*5,
 		settings.NonNegativeDuration,
-	).WithPublic()
+		settings.WithPublic)
 	targetFileSize = settings.RegisterByteSizeSetting(
 		settings.TenantWritable,
 		"bulkio.backup.file_size",
 		"target size for individual data files produced during BACKUP",
 		128<<20,
-	).WithPublic()
+		settings.WithPublic)
 
 	splitKeysOnTimestamps = settings.RegisterBoolSetting(
 		settings.TenantWritable,
 		"bulkio.backup.split_keys_on_timestamps",
 		"split backup data on timestamps when writing revision history",
 		true,
+		settings.WithName("bulkio.backup.split_keys_on_timestamps.enabled"),
 	)
+
+	sendExportRequestWithVerboseTracing = settings.RegisterBoolSetting(
+		settings.TenantWritable,
+		"bulkio.backup.export_request_verbose_tracing",
+		"send each export request with a verbose tracing span",
+		util.ConstantWithMetamorphicTestBool("export_request_verbose_tracing", false),
+		settings.WithName("bulkio.backup.verbose_tracing.enabled"),
+	)
+
+	testingDiscardBackupData = envutil.EnvOrDefaultBool("COCKROACH_BACKUP_TESTING_DISCARD_DATA", false)
 )
 
 const (
@@ -107,7 +121,6 @@ type backupDataProcessor struct {
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.BackupDataSpec
-	output  execinfra.RowReceiver
 
 	// cancelAndWaitForWorker cancels the producer goroutine and waits for it to
 	// finish. It can be called multiple times.
@@ -120,7 +133,12 @@ type backupDataProcessor struct {
 
 	// Aggregator that aggregates StructuredEvents emitted in the
 	// backupDataProcessors' trace recording.
-	agg *bulk.TracingAggregator
+	agg      *bulk.TracingAggregator
+	aggTimer *timeutil.Timer
+
+	// completedSpans tracks how many spans have been successfully backed up by
+	// the backup processor.
+	completedSpans int32
 }
 
 var (
@@ -134,7 +152,6 @@ func newBackupDataProcessor(
 	processorID int32,
 	spec execinfrapb.BackupDataSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	memMonitor := flowCtx.Cfg.BackupMonitor
 	if knobs, ok := flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {
@@ -146,16 +163,20 @@ func newBackupDataProcessor(
 	bp := &backupDataProcessor{
 		flowCtx: flowCtx,
 		spec:    spec,
-		output:  output,
 		progCh:  make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress),
 		memAcc:  &ba,
 	}
-	if err := bp.Init(ctx, bp, post, backupOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
+	if err := bp.Init(ctx, bp, post, backupOutputTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// This processor doesn't have any inputs to drain.
 			InputsToDrain: nil,
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				bp.close()
+				if bp.agg != nil {
+					meta := bulk.ConstructTracingAggregatorProducerMeta(ctx,
+						bp.flowCtx.NodeID.SQLInstanceID(), bp.flowCtx.ID, bp.agg)
+					return []execinfrapb.ProducerMetadata{*meta}
+				}
 				return nil
 			},
 		}); err != nil {
@@ -167,13 +188,17 @@ func newBackupDataProcessor(
 // Start is part of the RowSource interface.
 func (bp *backupDataProcessor) Start(ctx context.Context) {
 	ctx = logtags.AddTag(ctx, "job", bp.spec.JobID)
-	ctx = bp.StartInternal(ctx, backupProcessorName)
-	ctx, cancel := context.WithCancel(ctx)
 
 	// Construct an Aggregator to aggregate and render AggregatorEvents emitted in
 	// bps' trace recording.
-	ctx, bp.agg = bulk.MakeTracingAggregatorWithSpan(ctx,
-		fmt.Sprintf("%s-aggregator", backupProcessorName), bp.EvalCtx.Tracer)
+	bp.agg = bulk.TracingAggregatorForContext(ctx)
+	bp.aggTimer = timeutil.NewTimer()
+	// If the aggregator is nil, we do not want the timer to fire.
+	if bp.agg != nil {
+		bp.aggTimer.Reset(15 * time.Second)
+	}
+	ctx = bp.StartInternal(ctx, backupProcessorName, bp.agg)
+	ctx, cancel := context.WithCancel(ctx)
 
 	bp.cancelAndWaitForWorker = func() {
 		cancel()
@@ -196,32 +221,58 @@ func (bp *backupDataProcessor) Start(ctx context.Context) {
 	}
 }
 
+func (bp *backupDataProcessor) constructProgressProducerMeta(
+	prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
+) *execinfrapb.ProducerMetadata {
+	// Take a copy so that we can send the progress address to the output
+	// processor.
+	p := prog
+	p.NodeID = bp.flowCtx.NodeID.SQLInstanceID()
+	p.FlowID = bp.flowCtx.ID
+
+	// Annotate the progress with the fraction completed by this backupDataProcessor.
+	progDetails := backuppb.BackupManifest_Progress{}
+	if err := gogotypes.UnmarshalAny(&prog.ProgressDetails, &progDetails); err != nil {
+		log.Warningf(bp.Ctx(), "failed to unmarshal progress details %v", err)
+	} else {
+		totalSpans := int32(len(bp.spec.Spans) + len(bp.spec.IntroducedSpans))
+		bp.completedSpans += progDetails.CompletedSpans
+		if totalSpans != 0 {
+			if p.CompletedFraction == nil {
+				p.CompletedFraction = make(map[int32]float32)
+			}
+			p.CompletedFraction[bp.ProcessorID] = float32(bp.completedSpans) / float32(totalSpans)
+		}
+	}
+
+	return &execinfrapb.ProducerMetadata{BulkProcessorProgress: &p}
+}
+
 // Next is part of the RowSource interface.
 func (bp *backupDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	if bp.State != execinfra.StateRunning {
 		return nil, bp.DrainHelper()
 	}
 
-	for prog := range bp.progCh {
-		// Take a copy so that we can send the progress address to the output
-		// processor.
-		p := prog
-		return nil, &execinfrapb.ProducerMetadata{BulkProcessorProgress: &p}
+	select {
+	case prog, ok := <-bp.progCh:
+		if !ok {
+			bp.MoveToDraining(bp.backupErr)
+			return nil, bp.DrainHelper()
+		}
+		return nil, bp.constructProgressProducerMeta(prog)
+	case <-bp.aggTimer.C:
+		bp.aggTimer.Read = true
+		bp.aggTimer.Reset(15 * time.Second)
+		return nil, bulk.ConstructTracingAggregatorProducerMeta(bp.Ctx(),
+			bp.flowCtx.NodeID.SQLInstanceID(), bp.flowCtx.ID, bp.agg)
 	}
-
-	if bp.backupErr != nil {
-		bp.MoveToDraining(bp.backupErr)
-		return nil, bp.DrainHelper()
-	}
-
-	bp.MoveToDraining(nil /* error */)
-	return nil, bp.DrainHelper()
 }
 
 func (bp *backupDataProcessor) close() {
 	bp.cancelAndWaitForWorker()
-	bp.agg.Close()
 	if bp.InternalClose() {
+		bp.aggTimer.Stop()
 		bp.memAcc.Close(bp.Ctx())
 	}
 }
@@ -308,6 +359,9 @@ func runBackupProcessor(
 			log.Infof(ctx, "backing up %d spans to default locality because backup localities %s have no match in node's localities %s", totalSpans, backupLocalities, nodeLocalities)
 		}
 	}
+	if testingDiscardBackupData {
+		destURI = "null:///discard"
+	}
 	dest, err := cloud.ExternalStorageConfFromURI(destURI, spec.User())
 	if err != nil {
 		return err
@@ -326,7 +380,7 @@ func runBackupProcessor(
 	defer logClose(ctx, storage, "external storage")
 
 	// Start start a group of goroutines which each pull spans off of `todo` and
-	// send export requests. Any spans that encounter write intent errors during
+	// send export requests. Any spans that encounter lock conflict errors during
 	// Export are put back on the todo queue for later processing.
 	numSenders, release, err := reserveWorkerMemory(ctx, clusterSettings, memAcc)
 	if err != nil {
@@ -381,7 +435,7 @@ func runBackupProcessor(
 						// We're okay with delaying this worker until then since we assume any
 						// other work it could pull off the queue will likely want to delay to
 						// a similar or later time anyway.
-						if delay := delayPerAttmpt.Get(&clusterSettings.SV) - timeutil.Since(span.lastTried); delay > 0 {
+						if delay := delayPerAttempt.Get(&clusterSettings.SV) - timeutil.Since(span.lastTried); delay > 0 {
 							timer.Reset(delay)
 							log.Infof(ctx, "waiting %s to start attempt %d of remaining spans", delay, span.attempts+1)
 							select {
@@ -430,32 +484,44 @@ func runBackupProcessor(
 					log.VEventf(ctx, 1, "sending ExportRequest for span %s (attempt %d, priority %s)",
 						span.span, span.attempts+1, header.UserPriority.String())
 					var rawResp kvpb.Response
+					var recording tracingpb.Recording
 					var pErr *kvpb.Error
 					requestSentAt := timeutil.Now()
-					exportRequestErr := contextutil.RunWithTimeout(ctx,
+					exportRequestErr := timeutil.RunWithTimeout(ctx,
 						fmt.Sprintf("ExportRequest for span %s", span.span),
 						timeoutPerAttempt.Get(&clusterSettings.SV), func(ctx context.Context) error {
+							sp := tracing.SpanFromContext(ctx)
+							opts := make([]tracing.SpanOption, 0)
+							opts = append(opts, tracing.WithParent(sp))
+							if sendExportRequestWithVerboseTracing.Get(&clusterSettings.SV) {
+								opts = append(opts, tracing.WithRecording(tracingpb.RecordingVerbose))
+							}
+							ctx, exportSpan := sp.Tracer().StartSpanCtx(ctx, "backupccl.ExportRequest", opts...)
 							rawResp, pErr = kv.SendWrappedWithAdmission(
 								ctx, flowCtx.Cfg.DB.KV().NonTransactionalSender(), header, admissionHeader, req)
+							recording = exportSpan.FinishAndGetConfiguredRecording()
 							if pErr != nil {
 								return pErr.GoError()
 							}
 							return nil
 						})
 					if exportRequestErr != nil {
-						if intentErr, ok := pErr.GetDetail().(*kvpb.WriteIntentError); ok {
+						if lockErr, ok := pErr.GetDetail().(*kvpb.LockConflictError); ok {
 							span.lastTried = timeutil.Now()
 							span.attempts++
 							todo <- span
 							// TODO(dt): send a progress update to update job progress to note
 							// the intents being hit.
-							log.VEventf(ctx, 1, "retrying ExportRequest for span %s; encountered WriteIntentError: %s", span.span, intentErr.Error())
+							log.VEventf(ctx, 1, "retrying ExportRequest for span %s; encountered LockConflictError: %s", span.span, lockErr.Error())
 							span = spanAndTime{}
 							continue
 						}
 						// TimeoutError improves the opaque `context deadline exceeded` error
 						// message so use that instead.
-						if errors.HasType(exportRequestErr, (*contextutil.TimeoutError)(nil)) {
+						if errors.HasType(exportRequestErr, (*timeutil.TimeoutError)(nil)) {
+							if recording != nil {
+								log.Errorf(ctx, "failed export request for span %s\n trace:\n%s", span.span, recording)
+							}
 							return errors.Wrap(exportRequestErr, "export request timeout")
 						}
 						// BatchTimestampBeforeGCError is returned if the ExportRequest
@@ -469,6 +535,10 @@ func runBackupProcessor(
 								span = spanAndTime{}
 								continue
 							}
+						}
+
+						if recording != nil {
+							log.Errorf(ctx, "failed export request %s\n trace:\n%s", span.span, recording)
 						}
 						return errors.Wrapf(exportRequestErr, "exporting %s", span.span)
 					}
@@ -513,6 +583,11 @@ func runBackupProcessor(
 						log.Warning(ctx, "unexpected multi-file response using header.TargetBytes = 1")
 					}
 
+					// Even if the ExportRequest did not export any data we want to report
+					// the span as completed for accurate progress tracking.
+					if len(resp.Files) == 0 {
+						sink.writeWithNoData(exportedSpan{completedSpans: completedSpans})
+					}
 					for i, file := range resp.Files {
 						entryCounts := countRows(file.Exported, spec.PKIDs)
 

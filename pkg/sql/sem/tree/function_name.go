@@ -57,12 +57,15 @@ type FunctionReferenceResolver interface {
 	// there is no function with the same oid.
 	ResolveFunctionByOID(
 		ctx context.Context, oid oid.Oid,
-	) (*FunctionName, *Overload, error)
+	) (*RoutineName, *Overload, error)
 }
 
 // ResolvableFunctionReference implements the editable reference call of a
 // FuncExpr.
 type ResolvableFunctionReference struct {
+	// ReferenceByName keeps track of the name that was used to resolve the
+	// function, if one was used. This is used for metadata dependency tracking.
+	ReferenceByName *UnresolvedObjectName
 	FunctionReference
 }
 
@@ -95,7 +98,7 @@ func (ref *ResolvableFunctionReference) Resolve(
 	case *UnresolvedName:
 		if resolver == nil {
 			// If a resolver is not provided, just try to fetch a builtin function.
-			fn, err := t.ToFunctionName()
+			fn, err := t.ToRoutineName()
 			if err != nil {
 				return nil, err
 			}
@@ -111,6 +114,8 @@ func (ref *ResolvableFunctionReference) Resolve(
 		if err != nil {
 			return nil, err
 		}
+		referenceByName, _ := t.ToUnresolvedObjectName(NoAnnotation)
+		ref.ReferenceByName = &referenceByName
 		ref.FunctionReference = fd
 		return fd, nil
 	case *FunctionOID:
@@ -143,7 +148,7 @@ func WrapFunction(n string) ResolvableFunctionReference {
 	if !ok {
 		panic(errors.AssertionFailedf("function %s() not defined", redact.Safe(n)))
 	}
-	return ResolvableFunctionReference{fd}
+	return ResolvableFunctionReference{FunctionReference: fd}
 }
 
 // FunctionReference is the common interface to UnresolvedName and QualifiedFunctionName.

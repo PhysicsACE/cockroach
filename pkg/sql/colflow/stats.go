@@ -264,15 +264,15 @@ func (vsc *vectorizedStatsCollectorImpl) GetStats() *execinfrapb.ComponentStats 
 		// time as "execution time" since "KV time" would only make sense for
 		// tableReaders, and they are less likely to be wrapped than others.
 		s.KV.KVTime.Set(time)
-		s.KV.TuplesRead.Set(uint64(vsc.kvReader.GetRowsRead()))
 		s.KV.BytesRead.Set(uint64(vsc.kvReader.GetBytesRead()))
+		s.KV.KVPairsRead.Set(uint64(vsc.kvReader.GetKVPairsRead()))
+		s.KV.TuplesRead.Set(uint64(vsc.kvReader.GetRowsRead()))
 		s.KV.BatchRequestsIssued.Set(uint64(vsc.kvReader.GetBatchRequestsIssued()))
-		totalContentionTime, events := vsc.kvReader.GetContentionInfo()
-		s.KV.ContentionTime.Set(totalContentionTime)
-		s.KV.ContentionEvents = events
+		s.KV.ContentionTime.Set(vsc.kvReader.GetContentionTime())
+		s.KV.UsedStreamer = vsc.kvReader.UsedStreamer()
 		scanStats := vsc.kvReader.GetScanStats()
 		execstats.PopulateKVMVCCStats(&s.KV, &scanStats)
-		s.Exec.ConsumedRU.Set(scanStats.ConsumedRU)
+		s.Exec.ConsumedRU.Set(vsc.kvReader.GetConsumedRU())
 
 		// In order to account for SQL CPU time, we have to subtract the CPU time
 		// spent while serving KV requests on a SQL goroutine.

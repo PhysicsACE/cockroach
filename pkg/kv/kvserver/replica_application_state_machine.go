@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -25,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"go.etcd.io/raft/v3"
 )
@@ -151,26 +149,6 @@ func (sm *replicaStateMachine) NewBatch() apply.Batch {
 	return b
 }
 
-func formatReplicatedCmd(cmd *replicatedCmd) redact.RedactableString {
-	var buf redact.StringBuilder
-	// We need to zero various data structures that would otherwise
-	// cause panics in `pretty.Sprint`.
-	var pd ProposalData
-	if cmd.proposal != nil {
-		pd = *cmd.proposal
-		pd.ctx = nil
-		pd.sp = nil
-		pd.command.TraceData = nil
-		pd.quotaAlloc = nil
-		pd.tok = TrackedRequestToken{}
-		pd.ec = endCmds{}
-	}
-
-	// NB: this redacts very poorly, but this is considered acceptable for now.
-	redact.Fprintf(&buf, "cmd:%s\n\nproposal: %s", pretty.Sprint(cmd.ReplicatedCmd), pretty.Sprint(pd))
-	return buf.RedactableString()
-}
-
 // ApplySideEffects implements the apply.StateMachine interface. The method
 // handles the third phase of applying a command to the replica state machine.
 //
@@ -244,21 +222,30 @@ func (sm *replicaStateMachine) ApplySideEffects(
 			sm.r.handleReadWriteLocalEvalResult(ctx, *cmd.localResult)
 		}
 
-		if !cmd.Rejected() {
-			if cmd.proposal.applied {
-				// If the command already applied then we shouldn't be "finishing" its
-				// application again because it should only be able to apply successfully
-				// once. We expect that when any reproposal for the same command attempts
-				// to apply it will be rejected by the below raft lease sequence or lease
-				// index check in checkForcedErr.
-				log.Fatalf(ctx, "command already applied: %+v; unexpected successful result", cmd)
-			}
-			if cmd.proposal.Supersedes(cmd.Cmd.MaxLeaseIndex) {
-				// If an entry is superseded but it wasn't rejected, something is wrong.
-				// The superseding reproposal could apply as well, leading to doubly applying
-				// a command.
-				log.Fatalf(ctx, "applying superseded proposal: %s", formatReplicatedCmd(cmd))
-			}
+		rejected := cmd.Rejected()
+		higherReproposalsExist := cmd.Cmd.MaxLeaseIndex != cmd.proposal.command.MaxLeaseIndex
+		if !rejected && higherReproposalsExist {
+			log.Fatalf(ctx, "finishing proposal with outstanding reproposal at a higher max lease index")
+		}
+		if !rejected && cmd.proposal.applied {
+			// If the command already applied then we shouldn't be "finishing" its
+			// application again because it should only be able to apply successfully
+			// once. We expect that when any reproposal for the same command attempts
+			// to apply it will be rejected by the below raft lease sequence or lease
+			// index check in checkForcedErr.
+			log.Fatalf(ctx, "command already applied: %+v; unexpected successful result", cmd)
+		}
+		// If any reproposals at a higher MaxLeaseIndex exist we know that they will
+		// never successfully apply, remove them from the map to avoid future
+		// reproposals. If there is no command referencing this proposal at a higher
+		// MaxLeaseIndex then it will already have been removed (see
+		// shouldRemove in replicaDecoder.retrieveLocalProposals()). It is possible
+		// that a later command in this batch referred to this proposal but it must
+		// have failed because it carried the same MaxLeaseIndex.
+		if higherReproposalsExist {
+			sm.r.mu.Lock()
+			delete(sm.r.mu.proposals, cmd.ID)
+			sm.r.mu.Unlock()
 		}
 		cmd.proposal.applied = true
 	}
@@ -379,7 +366,7 @@ func (sm *replicaStateMachine) maybeApplyConfChange(ctx context.Context, cmd *re
 		// to raft.
 		return nil
 	}
-	return sm.r.withRaftGroup(true, func(rn *raft.RawNode) (bool, error) {
+	return sm.r.withRaftGroup(func(rn *raft.RawNode) (bool, error) {
 		// NB: `etcd/raft` configuration changes diverge from the official Raft way
 		// in that a configuration change becomes active when the corresponding log
 		// entry is applied (rather than appended). This ultimately enables the way
@@ -451,7 +438,7 @@ type closedTimestampSetterInfo struct {
 	// lease represents the lease under which the command is being applied.
 	lease *roachpb.Lease
 	// leaseIdx is the LAI of the command.
-	leaseIdx ctpb.LAI
+	leaseIdx kvpb.LeaseAppliedIndex
 	// leaseReq is set if the request that generated this command was a
 	// RequestLeaseRequest. This is only ever set on the leaseholder replica since
 	// only the leaseholder has information about the request corresponding to a
@@ -469,7 +456,7 @@ type closedTimestampSetterInfo struct {
 // timestamp.
 func (s *closedTimestampSetterInfo) record(cmd *replicatedCmd, lease *roachpb.Lease) {
 	*s = closedTimestampSetterInfo{}
-	s.leaseIdx = ctpb.LAI(cmd.LeaseIndex)
+	s.leaseIdx = cmd.LeaseIndex
 	s.lease = lease
 	if !cmd.IsLocal() {
 		return

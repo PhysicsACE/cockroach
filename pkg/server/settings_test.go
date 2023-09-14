@@ -33,28 +33,30 @@ const durationKey = "testing.duration"
 const byteSizeKey = "testing.bytesize"
 const enumKey = "testing.enum"
 
-var strA = settings.RegisterValidatedStringSetting(
-	settings.TenantWritable, strKey, "desc", "<default>", func(sv *settings.Values, v string) error {
+var strA = settings.RegisterStringSetting(
+	settings.TenantWritable, strKey, "desc", "<default>",
+	settings.WithValidateString(func(sv *settings.Values, v string) error {
 		if len(v) > 15 {
 			return errors.Errorf("can't set %s to string longer than 15: %s", strKey, v)
 		}
 		return nil
-	})
+	}))
 var intA = settings.RegisterIntSetting(
-	settings.TenantWritable, intKey, "desc", 1, func(v int64) error {
+	settings.TenantWritable, intKey, "desc", 1,
+	settings.WithValidateInt(func(v int64) error {
 		if v < 0 {
 			return errors.Errorf("can't set %s to a negative value: %d", intKey, v)
 		}
 		return nil
-
-	})
+	}))
 var durationA = settings.RegisterDurationSetting(
-	settings.TenantWritable, durationKey, "desc", time.Minute, func(v time.Duration) error {
+	settings.TenantWritable, durationKey, "desc", time.Minute,
+	settings.WithValidateDuration(func(v time.Duration) error {
 		if v < 0 {
 			return errors.Errorf("can't set %s to a negative duration: %s", durationKey, v)
 		}
 		return nil
-	})
+	}))
 var byteSizeA = settings.RegisterByteSizeSetting(
 	settings.TenantWritable, byteSizeKey, "desc", 1024*1024,
 )
@@ -276,7 +278,7 @@ func TestSettingsShowAll(t *testing.T) {
 	if len(rows) < 2 {
 		t.Fatalf("show all returned too few rows (%d)", len(rows))
 	}
-	const expColumns = 5
+	const expColumns = 7
 	if len(rows[0]) != expColumns {
 		t.Fatalf("show all must return %d columns, found %d", expColumns, len(rows[0]))
 	}

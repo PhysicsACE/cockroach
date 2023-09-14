@@ -97,18 +97,14 @@ func TestTracerRecording(t *testing.T) {
 	require.Empty(t, rec[0].StructuredRecords)
 
 	s1.RecordStructured(&types.Int32Value{Value: 5})
-	if err := CheckRecording(s1.GetRecording(tracingpb.RecordingStructured), `
+	checkRecording(t, s1.GetRecording(tracingpb.RecordingStructured), `
 		=== operation:a
-		structured:{"@type":"type.googleapis.com/google.protobuf.Int32Value","value":5}
-	`); err != nil {
-		t.Fatal(err)
-	}
+		structured:‹{"@type":"type.googleapis.com/google.protobuf.Int32Value","value":5}›`)
 
 	s1.SetRecordingType(tracingpb.RecordingVerbose)
 	if err := CheckRecordedSpans(s1.GetRecording(tracingpb.RecordingVerbose), `
 		span: a
-			tags: _unfinished=1 _verbose=1
-	`); err != nil {
+			tags: _unfinished=1 _verbose=1`); err != nil {
 		t.Fatal(err)
 	}
 	s1.SetRecordingType(tracingpb.RecordingOff)
@@ -135,8 +131,7 @@ func TestTracerRecording(t *testing.T) {
 			event: x=2
 			span: b
 				tags: _unfinished=1 _verbose=1
-				event: x=3
-	`); err != nil {
+				event: x=3`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -163,8 +158,7 @@ func TestTracerRecording(t *testing.T) {
 				event: x=3
 				span: c
 					tags: _unfinished=1 _verbose=1 tag=val
-					event: x=4
-	`); err != nil {
+					event: x=4`); err != nil {
 		t.Fatal(err)
 	}
 	// We Finish() s3, but note that the recording shows it as _unfinished. That's
@@ -179,8 +173,7 @@ func TestTracerRecording(t *testing.T) {
 				event: x=3
 				span: c
 					tags: _unfinished=1 _verbose=1 tag=val
-					event: x=4
-	`); err != nil {
+					event: x=4`); err != nil {
 		t.Fatal(err)
 	}
 	s1.Finish()
@@ -202,8 +195,7 @@ func TestStartChildSpan(t *testing.T) {
 		span: parent
 			tags: _verbose=1
 			span: child
-				tags: _verbose=1
-	`); err != nil {
+				tags: _verbose=1`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -211,14 +203,12 @@ func TestStartChildSpan(t *testing.T) {
 	sp2 = tr.StartSpan("child", WithParent(sp1), WithDetachedRecording())
 	if err := CheckRecordedSpans(sp2.FinishAndGetRecording(tracingpb.RecordingVerbose), `
 		span: child
-			tags: _verbose=1
-	`); err != nil {
+			tags: _verbose=1`); err != nil {
 		t.Fatal(err)
 	}
 	if err := CheckRecordedSpans(sp1.FinishAndGetRecording(tracingpb.RecordingVerbose), `
 		span: parent
-			tags: _verbose=1
-	`); err != nil {
+			tags: _verbose=1`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -230,8 +220,7 @@ func TestStartChildSpan(t *testing.T) {
 		span: parent
 			tags: _verbose=1
 			span: child
-				tags: _verbose=1 key=val
-	`); err != nil {
+				tags: _verbose=1 key=val`); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -256,8 +245,7 @@ func TestSterileSpan(t *testing.T) {
 	sp3.Finish()
 	require.NoError(t, CheckRecordedSpans(sp1.GetRecording(tracingpb.RecordingVerbose), `
 		span: parent
-			tags: _unfinished=1 _verbose=1
-	`))
+			tags: _unfinished=1 _verbose=1`))
 
 	// Check that the meta of a sterile span doesn't get injected into carriers.
 	carrier := MetadataCarrier{metadata.MD{}}
@@ -345,8 +333,7 @@ func TestTracerInjectExtract(t *testing.T) {
 			tags: _verbose=1
 			span: remote op
 				tags: _verbose=1
-				event: x=1
-	`); err != nil {
+				event: x=1`); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -989,32 +976,48 @@ func TestTracerStackHistory(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tr := NewTracer()
 
-	sp := tr.StartSpan("test", WithRecording(tracingpb.RecordingVerbose))
-	ch := make(chan struct{})
-	defer close(ch)
-	go func() {
-		for range ch {
-			tr.SaveAutomaticSnapshot()
-			<-ch // read again to unpark func.
+	for _, verbose := range []bool{true, false} {
+		sp := tr.StartSpan("test", WithRecording(tracingpb.RecordingStructured))
+		if verbose {
+			sp = tr.StartSpan("test", WithRecording(tracingpb.RecordingVerbose))
 		}
-	}()
+		ch := make(chan struct{})
+		defer close(ch)
+		go func() {
+			for range ch {
+				tr.SaveAutomaticSnapshot()
+				<-ch // read again to unpark func.
+			}
+		}()
 
-	blockingFunc1(ch)
-	started := timeutil.Now()
-	blockingFunc2(ch)
-	blockingFunc3(ch)
-	blockingCaller(ch)
+		blockingFunc1(ch)
+		started := timeutil.Now()
+		blockingFunc2(ch)
+		blockingFunc3(ch)
+		blockingCaller(ch)
 
-	sp.MaybeRecordStackHistory(started)
+		sp.MaybeRecordStackHistory(started)
 
-	rec := sp.FinishAndGetRecording(tracingpb.RecordingVerbose)[0]
-	require.Len(t, rec.StructuredRecords, 3)
-	require.Len(t, rec.Logs, 3)
-	require.Len(t, rec.StructuredRecords, 3)
-	for i := range rec.Logs {
-		require.NotContains(t, rec.Logs[i].Message, "tracing.blockingFunc1")
+		rec := sp.FinishAndGetConfiguredRecording()[0]
+		require.Len(t, rec.StructuredRecords, 3)
+		stacks := make([]string, 3)
+		for i, rec := range rec.StructuredRecords {
+			var stack tracingpb.CapturedStack
+			require.NoError(t, types.UnmarshalAny(rec.Payload, &stack))
+			stacks[i] = stack.Stack
+		}
+		require.Contains(t, stacks[0], "tracing.blockingFunc2")
+		require.Contains(t, stacks[1], "tracing.blockingFunc3")
+		require.Contains(t, stacks[2], "tracing.blockingCaller")
+
+		if verbose {
+			require.Len(t, rec.Logs, 3)
+			for i := range rec.Logs {
+				require.NotContains(t, rec.Logs[i].Message, "tracing.blockingFunc1")
+			}
+			require.Contains(t, rec.Logs[0].Message, "tracing.blockingFunc2")
+			require.Contains(t, rec.Logs[1].Message, "tracing.blockingFunc3")
+			require.Contains(t, rec.Logs[2].Message, "tracing.blockingCaller")
+		}
 	}
-	require.Contains(t, rec.Logs[0].Message, "tracing.blockingFunc2")
-	require.Contains(t, rec.Logs[1].Message, "tracing.blockingFunc3")
-	require.Contains(t, rec.Logs[2].Message, "tracing.blockingCaller")
 }

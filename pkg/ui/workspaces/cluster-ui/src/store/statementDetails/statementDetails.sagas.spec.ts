@@ -29,7 +29,7 @@ import {
   SQLDetailsStatsReducerState,
 } from "./statementDetails.reducer";
 
-import moment from "moment";
+import moment from "moment-timezone";
 
 const lastUpdated = moment();
 
@@ -47,12 +47,14 @@ describe("SQLDetailsStats sagas", () => {
   });
 
   const action: PayloadAction<StatementDetailsRequest> = {
-    payload: cockroach.server.serverpb.StatementDetailsRequest.create({
+    payload: new cockroach.server.serverpb.StatementDetailsRequest({
       fingerprint_id: "SELECT * FROM crdb_internal.node_build_info",
       app_names: ["$ cockroach sql", "newname"],
     }),
     type: "request",
   };
+  // /start and /end aren't included in the above payload, but the default value
+  // when missing (0 for both) appears anyway.
   const key =
     "SELECT * FROM crdb_internal.node_build_info/$ cockroach sql,newname/0/0";
   const SQLDetailsStatsResponse =

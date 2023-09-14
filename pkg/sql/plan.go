@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/auditlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
@@ -303,13 +304,14 @@ type planTop struct {
 	planComponents
 
 	// mem/catalog retains the memo and catalog that were used to create the
-	// plan. Only set if needed by instrumentation (see ShouldSaveMemo).
+	// plan. Set unconditionally but used only by instrumentation (in order to
+	// build the stmt bundle).
 	mem     *memo.Memo
 	catalog optPlanningCatalog
 
-	// auditEvents becomes non-nil if any of the descriptors used by
-	// current statement is causing an auditing event. See exec_log.go.
-	auditEvents []auditEvent
+	// auditEventBuilders becomes non-nil if the current statement
+	// is eligible for auditing (see sql/audit_logging.go)
+	auditEventBuilders []auditlogging.AuditEventBuilder
 
 	// flags is populated during planning and execution.
 	flags planFlags
@@ -472,16 +474,10 @@ func (p *planTop) init(stmt *Statement, instrumentation *instrumentationHelper) 
 	}
 }
 
-// close ensures that the plan's resources have been deallocated.
-func (p *planTop) close(ctx context.Context) {
-	if p.flags.IsSet(planFlagExecDone) {
-		p.savePlanInfo(ctx)
-	}
-	p.planComponents.close(ctx)
-}
-
-// savePlanInfo uses p.explainPlan to populate the plan string and/or tree.
-func (p *planTop) savePlanInfo(ctx context.Context) {
+// savePlanInfo updates the instrumentationHelper with information about how the
+// plan was executed.
+// NB: should only be called _after_ the execution of the plan has completed.
+func (p *planTop) savePlanInfo() {
 	vectorized := p.flags.IsSet(planFlagVectorized)
 	distribution := physicalplan.LocalPlan
 	if p.flags.IsSet(planFlagFullyDistributed) {
@@ -588,9 +584,6 @@ const (
 
 	// planFlagNotDistributed is set if the query execution is not distributed.
 	planFlagNotDistributed
-
-	// planFlagExecDone marks that execution has been completed.
-	planFlagExecDone
 
 	// planFlagImplicitTxn marks that the plan was run inside of an implicit
 	// transaction.

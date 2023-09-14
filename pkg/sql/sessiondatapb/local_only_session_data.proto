@@ -203,6 +203,9 @@ message LocalOnlySessionData {
   // InjectRetryErrorsEnabled causes statements inside an explicit
   // transaction to return a transaction retry error. It is intended for
   // developers to test their app's retry logic.
+  //
+  // Note that this session variable is **not** propagated to the internal
+  // executors - use InternalExecutorOverride for that.
   bool inject_retry_errors_enabled = 54;
   // NullOrderedLast controls whether NULL is ordered last. We default to
   // NULLS FIRST for ascending order by default, whereas postgres defaults
@@ -219,6 +222,8 @@ message LocalOnlySessionData {
   // AvoidBuffering indicates that the returned data should not be
   // buffered by conn executor.  This is currently used by replication primitives
   // to ensure the data is flushed to the consumer immediately.
+  //
+  // Does not apply to the InternalExecutor.
   bool avoid_buffering = 59;
   // CheckFunctionBodies indicates whether functions are validated during
   // creation.
@@ -316,7 +321,6 @@ message LocalOnlySessionData {
   // optimizer should use improved statistics calculations for disjunctive
   // filters.
   bool optimizer_use_improved_disjunction_stats = 86;
-
   // OptimizerUseLimitOrderingForStreamingGroupBy enables the exploration rule
   // which optimizes 'SELECT ... GROUP BY ... ORDER BY ... LIMIT n' queries.
   // The rule uses the required ordering in the limit expression to inform an
@@ -346,12 +350,110 @@ message LocalOnlySessionData {
   // OptimizerAlwaysUseHistograms, when true, ensures that the optimizer
   // always uses histograms to calculate statistics if available.
   bool optimizer_always_use_histograms = 94;
+  // EnableCreateStatsUsingExtremes, when true, allows the use of CREATE
+  // STATISTICS .. USING EXTREMES.
+  bool enable_create_stats_using_extremes = 95;
+  // AllowRoleMembershipsToChangeDuringTransaction, when true, means that
+  // operations which consult the role membership cache do not retain their
+  // lease on that version of the cache throughout the transaction. The
+  // consequence of this is that the transaction may not experience a singular
+  // view of role membership, and it may be able to commit after the revocation
+  // of a role membership which the transaction relied on has successfully been
+  // committed and acknowledged to the user.
+  bool allow_role_memberships_to_change_during_transaction = 96;
+  // PreparedStatementsCacheSize, when not equal to 0, causes the LRU prepared
+  // statements in a session to be automatically deallocated when total prepared
+  // statement memory usage for that session is more than the cache size.
+  // Execution of these deallocated prepared statements will fail until they are
+  // prepared again.
+  int64 prepared_statements_cache_size = 97;
+  // StreamerEnabled controls whether the Streamer API can be used.
+  bool streamer_enabled = 98;
+  // DisableDropVirtualCluster causes errors when the client
+  // attempts to drop virtual clusters or tenant records.
+  bool disable_drop_virtual_cluster = 99;
+  // MultipleActivePortalEnabled determines if the pgwire portal execution
+  // for certain queries can be paused. If true, portals with read-only SELECT
+  // query without sub/post queries can be executed in interleaving manner, but
+  // with a local execution plan.
+  bool multiple_active_portals_enabled = 100;
+  // UnboundedParallelScans, when true, indicates that the TableReader DistSQL
+  // processors should parallelize scans across ranges. Note that the
+  // parallelization will still be disabled for queries with LIMITs, and it can
+  // lead to increased likelihood of OOMs.
+  bool unbounded_parallel_scans = 101;
+  // OptimizerHoistUncorrelatedEqualitySubqueries, when true, causes the
+  // optimizer to hoist uncorrelated subqueries that are part of an equality
+  // expression with a column reference, which can produce more efficient query
+  // plans.
+  bool optimizer_hoist_uncorrelated_equality_subqueries = 102;
+  // TestingOptimizerInjectPanics indicates whether random panics are injected
+  // during optimization. The goal of this setting is to flush out cases where
+  // panics used for error-propagation are uncaught.
+  bool testing_optimizer_inject_panics = 103;
+  // OptimizerUseImprovedComputedColumnFiltersDerivation, when true, causes the
+  // optimizer to derive filters on computed columns in more cases. Previously,
+  // filters could only be derived when the expression defining the computed
+  // column involved a single column and that column was equated with a single
+  // constant value in a WHERE clause filter.
+  bool optimizer_use_improved_computed_column_filters_derivation = 104;
+  // DefaultTxnIsolationLevel indicates the default isolation level of newly
+  // created transactions.
+  // NOTE: we'd prefer to use tree.IsolationLevel here, but doing so would
+  // introduce a package dependency cycle.
+  int64 default_txn_isolation_level = 105;
+  // ReplicationMode represents the replication parameter passed in during
+  // connection time.
+  ReplicationMode replication_mode = 106;
+  // OptimizerUseImprovedJoinElimination, when true, allows the optimizer to
+  // eliminate joins in more cases by remapping columns from the eliminated
+  // input of the join to equivalent columns from the preserved input.
+  bool optimizer_use_improved_join_elimination = 107;
+  // ImplicitFKLockingForSerializable is true if FOR SHARE locking may be used
+  // while checking the referenced table during an insert or update to a table
+  // with a foreign key under serializable isolation. (Under weaker isolation
+  // levels foreign key checks of the parent table always use FOR SHARE
+  // locking.)
+  bool implicit_fk_locking_for_serializable = 108 [
+    (gogoproto.customname) = "ImplicitFKLockingForSerializable"
+  ];
+  // DurableLockingForSerializable is true if we should use durable locking for
+  // SELECT FOR UPDATE statements, SELECT FOR SHARE statements, and constraint
+  // checks under serializable isolation. (Serializable isolation does not
+  // require locking for correctness, so by default we use best-effor locks for
+  // better performance.) Weaker isolation levels always use durable locking.
+  bool durable_locking_for_serializable = 109;
+  // MaxRetriesForReadCommitted indicates the maximum number of
+  // automatic retries to perform for statements in explicit READ COMMITTED
+  // transactions that see a transaction retry error.
+  int32 max_retries_for_read_committed = 110;
+
+  // StrictDDLAtomicity causes errors when the client attempts DDL
+  // operations inside an explicit txn and CockroachDB cannot
+  // guarantee the DDL to be performed atomically.
+  //
+  // When this is not set, a transaction may commit its DML
+  // statements but fail its DDL statements, resulting
+  // in error XXA00 - TransactionCommittedWithSchemaChangeFailure.
+  //
+  // When this is set, that particular atomicity violation should
+  // not occur any more (at the expense of disabling certain
+  // forms of DDL inside explicit txns).
+  bool strict_ddl_atomicity = 111 [(gogoproto.customname) = "StrictDDLAtomicity"];
 
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //
   // be propagated to the remote nodes. If so, that parameter should live  //
   // in the SessionData message instead.                                   //
   ///////////////////////////////////////////////////////////////////////////
+}
+
+// ReplicationMode represents the replication={0,1,on,off,database} connection
+// parameter in PostgreSQL.
+enum ReplicationMode {
+  REPLICATION_MODE_DISABLED = 0;
+  REPLICATION_MODE_ENABLED = 1;
+  REPLICATION_MODE_DATABASE = 2;
 }
 
 // SequenceCacheEntry is an entry in a SequenceCache.

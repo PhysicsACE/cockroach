@@ -36,6 +36,7 @@ type scheduledBackupExecutor struct {
 
 type backupMetrics struct {
 	*jobs.ExecutorMetrics
+	*jobs.ExecutorPTSMetrics
 	RpoMetric *metric.Gauge
 }
 
@@ -43,6 +44,11 @@ var _ metric.Struct = &backupMetrics{}
 
 // MetricStruct implements metric.Struct interface
 func (m *backupMetrics) MetricStruct() {}
+
+// PTSMetrics implements jobs.PTSMetrics interface.
+func (m *backupMetrics) PTSMetrics() *jobs.ExecutorPTSMetrics {
+	return m.ExecutorPTSMetrics
+}
 
 var _ jobs.ScheduledJobExecutor = &scheduledBackupExecutor{}
 
@@ -91,11 +97,10 @@ func (e *scheduledBackupExecutor) executeBackup(
 	}
 	backupStmt.AsOf = tree.AsOfClause{Expr: endTime}
 
-	log.Infof(ctx, "Starting scheduled backup %d: %s",
-		sj.ScheduleID(), tree.AsString(backupStmt))
+	log.Infof(ctx, "Starting scheduled backup %d", sj.ScheduleID())
 
 	// Invoke backup plan hook.
-	hook, cleanup := cfg.PlanHookMaker("exec-backup", txn.KV(), sj.Owner())
+	hook, cleanup := cfg.PlanHookMaker(ctx, "exec-backup", txn.KV(), sj.Owner())
 	defer cleanup()
 
 	if knobs, ok := cfg.TestingKnobs.(*jobs.TestingKnobs); ok {
@@ -142,10 +147,10 @@ func planBackup(
 ) (sql.PlanHookRowFn, error) {
 	fn, cols, _, _, err := backupPlanHook(ctx, backupStmt, p)
 	if err != nil {
-		return nil, errors.Wrapf(err, "backup eval: %q", tree.AsString(backupStmt))
+		return nil, errors.Wrapf(err, "failed to evaluate backup stmt")
 	}
 	if fn == nil {
-		return nil, errors.Newf("backup eval: %q", tree.AsString(backupStmt))
+		return nil, errors.Newf("failed to evaluate backup stmt")
 	}
 	if len(cols) != len(jobs.DetachedJobExecutionResultHeader) {
 		return nil, errors.Newf("unexpected result columns")
@@ -546,9 +551,11 @@ func init() {
 		tree.ScheduledBackupExecutor.InternalName(),
 		func() (jobs.ScheduledJobExecutor, error) {
 			m := jobs.MakeExecutorMetrics(tree.ScheduledBackupExecutor.UserName())
+			pm := jobs.MakeExecutorPTSMetrics(tree.ScheduledBackupExecutor.UserName())
 			return &scheduledBackupExecutor{
 				metrics: backupMetrics{
-					ExecutorMetrics: &m,
+					ExecutorMetrics:    &m,
+					ExecutorPTSMetrics: &pm,
 					RpoMetric: metric.NewGauge(metric.Metadata{
 						Name:        "schedules.BACKUP.last-completed-time",
 						Help:        "The unix timestamp of the most recently completed backup by a schedule specified as maintaining this metric",

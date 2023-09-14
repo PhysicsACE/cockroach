@@ -1,23 +1,27 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "oidcccl",
     srcs = [
         "authentication_oidc.go",
+        "claim_match.go",
         "settings.go",
         "state.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/oidcccl",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/ccl/jwtauthccl",
         "//pkg/ccl/utilccl",
         "//pkg/roachpb",
-        "//pkg/server",
+        "//pkg/security/username",
+        "//pkg/server/authserver",
         "//pkg/server/serverpb",
         "//pkg/server/telemetry",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/pgwire",
+        "//pkg/sql/pgwire/identmap",
         "//pkg/ui",
         "//pkg/util/log",
         "//pkg/util/protoutil",
@@ -39,26 +43,22 @@ go_test(
     ],
     args = ["-test.timeout=55s"],
     embed = [":oidcccl"],
+    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
         "//pkg/ccl",
         "//pkg/roachpb",
-        "//pkg/rpc",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
         "//pkg/server/serverpb",
-        "//pkg/testutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/randutil",
-        "//pkg/util/timeutil",
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

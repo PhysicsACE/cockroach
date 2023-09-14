@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -40,8 +39,13 @@ type runControlTestCase struct {
 func makeRunControlTestCases(t *testing.T) ([]runControlTestCase, func()) {
 	t.Helper()
 	testCases := make([]runControlTestCase, 2)
-	tc := serverutils.StartNewTestCluster(
-		t, 2 /* numNodes */, base.TestClusterArgs{ReplicationMode: base.ReplicationManual},
+	tc := serverutils.StartCluster(
+		t, 2 /* numNodes */, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
+			},
+			ReplicationMode: base.ReplicationManual,
+		},
 	)
 	testCases[0].name = "SystemTenant"
 	testCases[0].conn1 = tc.ServerConn(0).Conn
@@ -57,9 +61,6 @@ func makeRunControlTestCases(t *testing.T) ([]runControlTestCase, func()) {
 		tc.Stopper().Stop(context.Background())
 	}
 }
-
-// Dummy import to pull in kvtenantccl. This allows us to start tenants.
-var _ = kvtenantccl.Connector{}
 
 func TestCancelSelectQuery(t *testing.T) {
 	defer leaktest.AfterTest(t)()

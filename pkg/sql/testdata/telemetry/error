@@ -136,3 +136,11 @@ SELECT 2/0
 ----
 error: pq: division by zero
 errorcodes.22012
+
+feature-usage
+ALTER DOMAIN foo
+----
+error: pq: at or near "foo": syntax error: unimplemented: this syntax
+errorcodes.0A000
+unimplemented.alter domain
+unimplemented.syntax.alter domain

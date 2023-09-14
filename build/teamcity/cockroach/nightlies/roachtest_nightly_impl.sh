@@ -17,14 +17,13 @@ source $root/build/teamcity/util/roachtest_util.sh
 
 build/teamcity-roachtest-invoke.sh \
   --metamorphic-encryption-probability=0.5 \
+  --select-probability="${SELECT_PROBABILITY:-1.0}" \
   --cloud="${CLOUD}" \
   --count="${COUNT-1}" \
   --parallelism="${PARALLELISM}" \
   --cpu-quota="${CPUQUOTA}" \
   --cluster-id="${TC_BUILD_ID}" \
-  --cockroach="${PWD}/bin/cockroach" \
-  --cockroach-short="${PWD}/bin/cockroach-short-ea" \
   --artifacts=/artifacts \
   --artifacts-literal="${LITERAL_ARTIFACTS_DIR:-}" \
   --slack-token="${SLACK_TOKEN}" \
-  "${TESTS}"
+  "${TESTS}" ${FILTER}

@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -155,6 +156,33 @@ func (i *initState) validate() error {
 		return errors.New("missing node ID")
 	}
 	return nil
+}
+
+// initialStoreIDs returns the initial set of store IDs a node starts off with.
+// If it's a restarting node, restarted with no additional stores, this is just
+// all the local store IDs. If there's an additional store post-restart that's
+// yet to be initialized, it's not found in this list. For nodes newly added to
+// the cluster, it's just the first initialized store. For the remaining stores
+// in all these cases, they're accessible through
+// (*initState).additionalStoreIDs once they're initialized.
+func (i *initState) initialStoreIDs() ([]roachpb.StoreID, error) {
+	return getStoreIDsInner(i.initializedEngines)
+}
+
+func (i *initState) additionalStoreIDs() ([]roachpb.StoreID, error) {
+	return getStoreIDsInner(i.uninitializedEngines)
+}
+
+func getStoreIDsInner(engines []storage.Engine) ([]roachpb.StoreID, error) {
+	storeIDs := make([]roachpb.StoreID, 0, len(engines))
+	for _, eng := range engines {
+		storeID, err := eng.GetStoreID()
+		if err != nil {
+			return nil, err
+		}
+		storeIDs = append(storeIDs, roachpb.StoreID(storeID))
+	}
+	return storeIDs, nil
 }
 
 // joinResult is used to represent the result of a node attempting to join
@@ -370,7 +398,7 @@ func (s *initServer) startJoinLoop(ctx context.Context, stopper *stop.Stopper) (
 		if err != nil {
 			// Try the next node if unsuccessful.
 
-			if IsWaitingForInit(err) {
+			if grpcutil.IsWaitingForInit(err) {
 				log.Infof(ctx, "%s is itself waiting for init, will retry", addr)
 			} else {
 				log.Warningf(ctx, "outgoing join rpc to %s unsuccessful: %v", addr, err.Error())
@@ -416,7 +444,7 @@ func (s *initServer) startJoinLoop(ctx context.Context, stopper *stop.Stopper) (
 				// could match against connection errors to generate nicer
 				// logging. See grpcutil.connectionRefusedRe.
 
-				if IsWaitingForInit(err) {
+				if grpcutil.IsWaitingForInit(err) {
 					log.Infof(ctx, "%s is itself waiting for init, will retry", addr)
 				} else {
 					log.Warningf(ctx, "outgoing join rpc to %s unsuccessful: %v", addr, err.Error())
@@ -559,10 +587,13 @@ func assertEnginesEmpty(engines []storage.Engine) error {
 
 	for _, engine := range engines {
 		err := func() error {
-			iter := engine.NewEngineIterator(storage.IterOptions{
+			iter, err := engine.NewEngineIterator(storage.IterOptions{
 				KeyTypes:   storage.IterKeyTypePointsAndRanges,
 				UpperBound: roachpb.KeyMax,
 			})
+			if err != nil {
+				return err
+			}
 			defer iter.Close()
 
 			valid, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: roachpb.KeyMin})
@@ -624,12 +655,23 @@ func newInitServerConfig(
 	getDialOpts func(context.Context, string, rpc.ConnectionClass) ([]grpc.DialOption, error),
 ) initServerCfg {
 	binaryVersion := cfg.Settings.Version.BinaryVersion()
+	binaryMinSupportedVersion := cfg.Settings.Version.BinaryMinSupportedVersion()
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
+		// If BinaryVersionOverride is set, and our `binaryMinSupportedVersion` is
+		// at its default value, we must bootstrap the cluster at
+		// `binaryMinSupportedVersion`. This cluster will then run the necessary
+		// upgrades until `BinaryVersionOverride` before being ready to use in the
+		// test.
+		//
+		// Refer to the header comment on BinaryVersionOverride for more details.
 		if ov := knobs.(*TestingKnobs).BinaryVersionOverride; ov != (roachpb.Version{}) {
-			binaryVersion = ov
+			if binaryMinSupportedVersion.Equal(clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)) {
+				binaryVersion = clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)
+			} else {
+				binaryVersion = ov
+			}
 		}
 	}
-	binaryMinSupportedVersion := cfg.Settings.Version.BinaryMinSupportedVersion()
 	if binaryVersion.Less(binaryMinSupportedVersion) {
 		log.Fatalf(ctx, "binary version (%s) less than min supported version (%s)",
 			binaryVersion, binaryMinSupportedVersion)
@@ -694,6 +736,9 @@ func inspectEngines(
 		}
 		nodeID = storeIdent.NodeID
 
+		if err := eng.SetStoreID(ctx, int32(storeIdent.StoreID)); err != nil {
+			return nil, err
+		}
 		initializedEngines = append(initializedEngines, eng)
 	}
 	clusterVersion, err := kvstorage.SynthesizeClusterVersionFromEngines(

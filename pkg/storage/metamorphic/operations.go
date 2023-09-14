@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 )
 
 // opReference represents one operation; an opGenerator reference as well as
@@ -207,7 +207,7 @@ func (m mvccPutOp) run(ctx context.Context) string {
 	txn.Sequence++
 	writer := m.m.getReadWriter(m.writer)
 
-	err := storage.MVCCPut(ctx, writer, nil, m.key, txn.ReadTimestamp, hlc.ClockTimestamp{}, m.value, txn)
+	err := storage.MVCCPut(ctx, writer, m.key, txn.ReadTimestamp, m.value, storage.MVCCWriteOptions{Txn: txn})
 	if err != nil {
 		if writeTooOldErr := (*kvpb.WriteTooOldError)(nil); errors.As(err, &writeTooOldErr) {
 			txn.WriteTimestamp.Forward(writeTooOldErr.ActualTimestamp)
@@ -236,8 +236,8 @@ func (m mvccCPutOp) run(ctx context.Context) string {
 	writer := m.m.getReadWriter(m.writer)
 	txn.Sequence++
 
-	err := storage.MVCCConditionalPut(ctx, writer, nil, m.key,
-		txn.ReadTimestamp, hlc.ClockTimestamp{}, m.value, m.expVal, true, txn)
+	err := storage.MVCCConditionalPut(ctx, writer, m.key,
+		txn.ReadTimestamp, m.value, m.expVal, true, storage.MVCCWriteOptions{Txn: txn})
 	if err != nil {
 		if writeTooOldErr := (*kvpb.WriteTooOldError)(nil); errors.As(err, &writeTooOldErr) {
 			txn.WriteTimestamp.Forward(writeTooOldErr.ActualTimestamp)
@@ -265,7 +265,7 @@ func (m mvccInitPutOp) run(ctx context.Context) string {
 	writer := m.m.getReadWriter(m.writer)
 	txn.Sequence++
 
-	err := storage.MVCCInitPut(ctx, writer, nil, m.key, txn.ReadTimestamp, hlc.ClockTimestamp{}, m.value, false, txn)
+	err := storage.MVCCInitPut(ctx, writer, m.key, txn.ReadTimestamp, m.value, false, storage.MVCCWriteOptions{Txn: txn})
 	if err != nil {
 		if writeTooOldErr := (*kvpb.WriteTooOldError)(nil); errors.As(err, &writeTooOldErr) {
 			txn.WriteTimestamp.Forward(writeTooOldErr.ActualTimestamp)
@@ -298,8 +298,8 @@ func (m mvccDeleteRangeOp) run(ctx context.Context) string {
 
 	txn.Sequence++
 
-	keys, _, _, err := storage.MVCCDeleteRange(ctx, writer, nil, m.key, m.endKey,
-		0, txn.WriteTimestamp, hlc.ClockTimestamp{}, txn, true)
+	keys, _, _, err := storage.MVCCDeleteRange(ctx, writer, m.key, m.endKey,
+		0, txn.WriteTimestamp, storage.MVCCWriteOptions{Txn: txn}, true)
 	if err != nil {
 		return fmt.Sprintf("error: %s", err)
 	}
@@ -377,7 +377,7 @@ func (m mvccDeleteOp) run(ctx context.Context) string {
 	writer := m.m.getReadWriter(m.writer)
 	txn.Sequence++
 
-	_, err := storage.MVCCDelete(ctx, writer, nil, m.key, txn.ReadTimestamp, hlc.ClockTimestamp{}, txn)
+	_, err := storage.MVCCDelete(ctx, writer, m.key, txn.ReadTimestamp, storage.MVCCWriteOptions{Txn: txn})
 	if err != nil {
 		if writeTooOldErr := (*kvpb.WriteTooOldError)(nil); errors.As(err, &writeTooOldErr) {
 			txn.WriteTimestamp.Forward(writeTooOldErr.ActualTimestamp)
@@ -608,11 +608,14 @@ type iterOpenOp struct {
 
 func (i iterOpenOp) run(ctx context.Context) string {
 	rw := i.m.getReadWriter(i.rw)
-	iter := rw.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	iter, err := rw.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		Prefix:     false,
 		LowerBound: i.key,
 		UpperBound: i.endKey.Next(),
 	})
+	if err != nil {
+		return err.Error()
+	}
 
 	i.m.setIterInfo(i.id, iteratorInfo{
 		id:          i.id,
@@ -770,7 +773,7 @@ func (i ingestOp) run(ctx context.Context) string {
 		return fmt.Sprintf("error = %s", err.Error())
 	}
 
-	sstWriter := storage.MakeIngestionSSTWriter(ctx, i.m.st, objstorage.NewFileWritable(f))
+	sstWriter := storage.MakeIngestionSSTWriter(ctx, i.m.st, objstorageprovider.NewFileWritable(f))
 	for _, key := range i.keys {
 		_ = sstWriter.Put(key, []byte("ingested"))
 	}
@@ -779,7 +782,7 @@ func (i ingestOp) run(ctx context.Context) string {
 	}
 	sstWriter.Close()
 
-	if err := i.m.engine.IngestExternalFiles(ctx, []string{sstPath}); err != nil {
+	if err := i.m.engine.IngestLocalFiles(ctx, []string{sstPath}); err != nil {
 		return fmt.Sprintf("error = %s", err.Error())
 	}
 

@@ -1,5 +1,5 @@
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
-load("@build_bazel_rules_nodejs//nodejs:toolchain.bzl", "node_toolchain")
+load("@rules_nodejs//nodejs:toolchain.bzl", "node_toolchain")
 
 # We define a number of toolchains, each of which has a name of the form:
 #     cross_HOST_TARGET_toolchain
@@ -31,6 +31,11 @@ platform(
         "@platforms//os:linux",
         "@platforms//cpu:x86_64",
     ],
+    exec_properties = {
+        "container-image": "docker://cockroachdb/bazel@sha256:2fdff6a4a2c66bf01d6ad4c6973eb4b38acdb812d07a431a0471f2b6449bb653",
+        "dockerReuse": "True",
+        "Pool": "default",
+    },
 )
 
 toolchain(
@@ -131,6 +136,11 @@ platform(
         "@platforms//os:linux",
         "@platforms//cpu:arm64",
     ],
+    exec_properties = {
+        "container-image": "docker://cockroachdb/bazel@sha256:6acc131994de3e9adcdf05ddd0956a047cb7a7e07a939a76fa9cad11af3a1a8a",
+        "dockerReuse": "True",
+        "Pool": "default",
+    },
 )
 
 platform(
@@ -317,6 +327,19 @@ config_setting(
 )
 
 bool_flag(
+    name = "bazel_code_coverage_flag",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "bazel_code_coverage",
+    flag_values = {
+        ":bazel_code_coverage_flag": "true",
+    },
+)
+
+bool_flag(
     name = "cross_flag",
     build_setting_default = False,
     visibility = ["//visibility:public"],
@@ -347,6 +370,17 @@ config_setting(
     flag_values = {
         ":dev_flag": "true",
         ":cross_flag": "false",
+    },
+)
+
+config_setting(
+    name = "is_non_dev_macos_arm64",
+    constraint_values = [
+        "@io_bazel_rules_go//go/toolchain:darwin",
+        "@platforms//cpu:aarch64",
+    ],
+    flag_values = {
+        ":dev_flag": "false",
     },
 )
 
@@ -390,13 +424,6 @@ config_setting(
     ],
     flag_values = {
         ":cross_flag": "true",
-    },
-)
-
-config_setting(
-    name = "opt",
-    values = {
-        "compilation_mode": "opt",
     },
 )
 
@@ -506,4 +533,86 @@ config_setting(
         ":prebuild_cdeps_flag": "true",
     },
     visibility = ["//c-deps:__pkg__"],
+)
+
+config_setting(
+    name = "use_ci_timeouts",
+    values = {
+        "define": "use_ci_timeouts=true",
+    },
+)
+
+config_setting(
+    name = "is_linux_amd64_no_force_build_cdeps",
+    constraint_values = [
+        "@io_bazel_rules_go//go/toolchain:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    flag_values = {
+        ":force_build_cdeps_flag": "false",
+    },
+    visibility = [
+        "//build/bazelutil:__pkg__",
+        "//c-deps:__pkg__",
+    ],
+)
+
+config_setting(
+    name = "is_linux_arm64_no_force_build_cdeps",
+    constraint_values = [
+        "@io_bazel_rules_go//go/toolchain:linux",
+        "@platforms//cpu:arm64",
+    ],
+    flag_values = {
+        ":force_build_cdeps_flag": "false",
+    },
+    visibility = [
+        "//build/bazelutil:__pkg__",
+        "//c-deps:__pkg__",
+    ],
+)
+
+config_setting(
+    name = "is_darwin_amd64_no_force_build_cdeps",
+    constraint_values = [
+        "@io_bazel_rules_go//go/toolchain:darwin",
+        "@platforms//cpu:x86_64",
+    ],
+    flag_values = {
+        ":force_build_cdeps_flag": "false",
+    },
+    visibility = [
+        "//build/bazelutil:__pkg__",
+        "//c-deps:__pkg__",
+    ],
+)
+
+config_setting(
+    name = "is_darwin_arm64_no_force_build_cdeps",
+    constraint_values = [
+        "@io_bazel_rules_go//go/toolchain:darwin",
+        "@platforms//cpu:arm64",
+    ],
+    flag_values = {
+        ":force_build_cdeps_flag": "false",
+    },
+    visibility = [
+        "//build/bazelutil:__pkg__",
+        "//c-deps:__pkg__",
+    ],
+)
+
+config_setting(
+    name = "is_windows_amd64_no_force_build_cdeps",
+    constraint_values = [
+        "@io_bazel_rules_go//go/toolchain:windows",
+        "@platforms//cpu:x86_64",
+    ],
+    flag_values = {
+        ":force_build_cdeps_flag": "false",
+    },
+    visibility = [
+        "//build/bazelutil:__pkg__",
+        "//c-deps:__pkg__",
+    ],
 )

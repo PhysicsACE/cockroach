@@ -35,7 +35,7 @@ var (
 // checkColAgainstItselfForDistinct is similar to checkCol, but it probes the
 // vector against itself for the purposes of finding matches to unordered
 // distinct columns.
-func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck uint64, sel []int) {
+func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck uint32, sel []int) {
 	probeVec, buildVec, probeSel := vec, vec, sel
 	switch probeVec.CanonicalTypeFamily() {
 	case types.BoolFamily:
@@ -56,6 +56,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -67,7 +70,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -93,12 +97,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -107,7 +114,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -129,7 +137,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -137,6 +145,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -163,11 +174,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -189,7 +203,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -200,6 +214,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -211,7 +228,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -237,12 +255,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -251,7 +272,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -273,7 +295,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -281,6 +303,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -307,11 +332,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -333,7 +361,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -359,6 +387,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -370,7 +401,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -388,12 +420,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -402,7 +437,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -416,7 +452,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -424,6 +460,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -442,11 +481,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -460,7 +502,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -471,6 +513,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -482,7 +527,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -500,12 +546,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -514,7 +563,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -528,7 +578,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -536,6 +586,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -554,11 +607,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -572,7 +628,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -598,6 +654,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -609,7 +668,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -627,12 +687,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -641,7 +704,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -655,7 +719,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -663,6 +727,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -681,11 +748,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -699,7 +769,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -710,6 +780,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -721,7 +794,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -739,12 +813,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -753,7 +830,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -767,7 +845,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -775,6 +853,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -793,11 +874,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -811,7 +895,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -835,6 +919,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -846,7 +933,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -875,12 +963,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -889,7 +980,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -914,7 +1006,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -922,6 +1014,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -951,11 +1046,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -980,7 +1078,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -991,6 +1089,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1002,7 +1103,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1031,12 +1133,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1045,7 +1150,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1070,7 +1176,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -1078,6 +1184,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1107,11 +1216,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1136,7 +1248,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -1157,6 +1269,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1168,7 +1283,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1197,12 +1313,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1211,7 +1330,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1236,7 +1356,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -1244,6 +1364,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1273,11 +1396,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1302,7 +1428,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -1313,6 +1439,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1324,7 +1453,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1353,12 +1483,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1367,7 +1500,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1392,7 +1526,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -1400,6 +1534,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1429,11 +1566,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1458,7 +1598,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -1481,6 +1621,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1492,7 +1635,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1521,12 +1665,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1535,7 +1682,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1560,7 +1708,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -1568,6 +1716,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1597,11 +1748,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1626,7 +1780,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -1637,6 +1791,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1648,7 +1805,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1677,12 +1835,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1691,7 +1852,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1716,7 +1878,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -1724,6 +1886,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1753,11 +1918,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -1782,7 +1950,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -1808,6 +1976,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1819,7 +1990,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1856,12 +2028,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1870,7 +2045,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -1903,7 +2079,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -1911,6 +2087,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1948,11 +2127,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -1985,7 +2167,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -1996,6 +2178,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2007,7 +2192,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2044,12 +2230,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2058,7 +2247,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2091,7 +2281,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -2099,6 +2289,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2136,11 +2329,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2173,7 +2369,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -2199,6 +2395,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2210,7 +2409,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2235,12 +2435,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2249,7 +2452,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2270,7 +2474,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -2278,6 +2482,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2303,11 +2510,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2328,7 +2538,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -2339,6 +2549,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2350,7 +2563,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2375,12 +2589,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2389,7 +2606,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2410,7 +2628,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -2418,6 +2636,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2443,11 +2664,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2468,7 +2692,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -2494,6 +2718,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2505,7 +2732,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2523,12 +2751,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2537,7 +2768,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2551,7 +2783,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -2559,6 +2791,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2577,11 +2812,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2595,7 +2833,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -2606,6 +2844,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2617,7 +2858,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2635,12 +2877,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2649,7 +2894,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2663,7 +2909,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -2671,6 +2917,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2689,11 +2938,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2707,7 +2959,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -2733,6 +2985,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2744,7 +2999,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2768,12 +3024,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2782,7 +3041,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2802,7 +3062,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -2810,6 +3070,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2834,11 +3097,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -2858,7 +3124,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -2869,6 +3135,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2880,7 +3149,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2904,12 +3174,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2918,7 +3191,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -2938,7 +3212,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -2946,6 +3220,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2970,11 +3247,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -2994,7 +3274,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -3020,6 +3300,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -3031,7 +3314,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -3051,12 +3335,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -3065,7 +3352,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -3081,7 +3369,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -3089,6 +3377,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -3109,11 +3400,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = probeSel[toCheck]
 									buildIdx = probeSel[keyID-1]
@@ -3129,7 +3423,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -3140,6 +3434,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								probeVecNulls := probeVec.Nulls()
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -3151,7 +3448,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 												ht.ProbeScratch.differs[toCheck] = true
 											}
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -3171,12 +3469,15 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								probeVecNulls := probeVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -3185,7 +3486,8 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										if ht.allowNullEquality {
 											ht.ProbeScratch.differs[toCheck] = true
 										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+											ht.ProbeScratch.differs[toCheck] = true
+											ht.ProbeScratch.foundNull[toCheck] = true
 										}
 										continue
 									}
@@ -3201,7 +3503,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						} else {
@@ -3209,6 +3511,9 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 								var probeIdx, buildIdx int
 								buildVecNulls := buildVec.Nulls()
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -3229,11 +3534,14 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							} else {
 								var probeIdx, buildIdx int
 								for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+									if ht.ProbeScratch.differs[toCheck] {
+										continue
+									}
 									keyID := ht.ProbeScratch.ToCheckID[toCheck]
 									probeIdx = int(toCheck)
 									buildIdx = int(keyID - 1)
@@ -3249,7 +3557,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
+									ht.ProbeScratch.differs[toCheck] = unique
 								}
 							}
 						}
@@ -3261,7 +3569,7 @@ func (ht *HashTable) checkColAgainstItselfForDistinct(vec coldata.Vec, nToCheck 
 }
 
 func (ht *HashTable) checkColForDistinctTuples(
-	probeVec, buildVec coldata.Vec, nToCheck uint64, probeSel []int,
+	probeVec, buildVec coldata.Vec, nToCheck uint32, probeSel []int,
 ) {
 	switch probeVec.CanonicalTypeFamily() {
 	case types.BoolFamily:
@@ -3281,88 +3589,88 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										if !probeVal && buildVal {
-											cmpResult = -1
-										} else if probeVal && !buildVal {
-											cmpResult = 1
-										} else {
-											cmpResult = 0
-										}
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
+										}
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									if !probeVal && buildVal {
+										cmpResult = -1
+									} else if probeVal && !buildVal {
+										cmpResult = 1
+									} else {
+										cmpResult = 0
+									}
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										if !probeVal && buildVal {
-											cmpResult = -1
-										} else if probeVal && !buildVal {
-											cmpResult = 1
-										} else {
-											cmpResult = 0
-										}
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									if !probeVal && buildVal {
+										cmpResult = -1
+									} else if probeVal && !buildVal {
+										cmpResult = 1
+									} else {
+										cmpResult = 0
+									}
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -3370,67 +3678,65 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										if !probeVal && buildVal {
-											cmpResult = -1
-										} else if probeVal && !buildVal {
-											cmpResult = 1
-										} else {
-											cmpResult = 0
-										}
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									if !probeVal && buildVal {
+										cmpResult = -1
+									} else if probeVal && !buildVal {
+										cmpResult = 1
+									} else {
+										cmpResult = 0
+									}
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
 
-									{
-										var cmpResult int
+								{
+									var cmpResult int
 
-										if !probeVal && buildVal {
-											cmpResult = -1
-										} else if probeVal && !buildVal {
-											cmpResult = 1
-										} else {
-											cmpResult = 0
-										}
-
-										unique = cmpResult != 0
+									if !probeVal && buildVal {
+										cmpResult = -1
+									} else if probeVal && !buildVal {
+										cmpResult = 1
+									} else {
+										cmpResult = 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -3454,72 +3760,72 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = bytes.Compare(probeVal, buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
+										}
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = bytes.Compare(probeVal, buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = bytes.Compare(probeVal, buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = bytes.Compare(probeVal, buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -3527,51 +3833,49 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = bytes.Compare(probeVal, buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = bytes.Compare(probeVal, buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = bytes.Compare(probeVal, buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = bytes.Compare(probeVal, buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -3601,72 +3905,72 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = tree.CompareDecimals(&probeVal, &buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
+										}
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = tree.CompareDecimals(&probeVal, &buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = tree.CompareDecimals(&probeVal, &buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = tree.CompareDecimals(&probeVal, &buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -3674,51 +3978,49 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = tree.CompareDecimals(&probeVal, &buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = tree.CompareDecimals(&probeVal, &buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = tree.CompareDecimals(&probeVal, &buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = tree.CompareDecimals(&probeVal, &buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -3740,94 +4042,94 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
 										}
-										continue
-									}
-									if buildIsNull {
+									} else {
 										ht.ProbeScratch.differs[toCheck] = true
-										continue
+										ht.ProbeScratch.foundNull[toCheck] = true
 									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
 									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -3835,73 +4137,71 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -3926,94 +4226,94 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
 										}
-										continue
-									}
-									if buildIsNull {
+									} else {
 										ht.ProbeScratch.differs[toCheck] = true
-										continue
+										ht.ProbeScratch.foundNull[toCheck] = true
 									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
 									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -4021,73 +4321,71 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -4114,94 +4412,94 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
 										}
-										continue
-									}
-									if buildIsNull {
+									} else {
 										ht.ProbeScratch.differs[toCheck] = true
-										continue
+										ht.ProbeScratch.foundNull[toCheck] = true
 									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
 									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -4209,73 +4507,71 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := int64(probeVal), int64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else {
-												cmpResult = 0
-											}
+										a, b := int64(probeVal), int64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else {
+											cmpResult = 0
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -4308,110 +4604,110 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
 										}
-										continue
-									}
-									if buildIsNull {
+									} else {
 										ht.ProbeScratch.differs[toCheck] = true
-										continue
+										ht.ProbeScratch.foundNull[toCheck] = true
 									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := float64(probeVal), float64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else if a == b {
+										a, b := float64(probeVal), float64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else if a == b {
+											cmpResult = 0
+										} else if math.IsNaN(a) {
+											if math.IsNaN(b) {
 												cmpResult = 0
-											} else if math.IsNaN(a) {
-												if math.IsNaN(b) {
-													cmpResult = 0
-												} else {
-													cmpResult = -1
-												}
 											} else {
-												cmpResult = 1
+												cmpResult = -1
 											}
+										} else {
+											cmpResult = 1
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
 									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := float64(probeVal), float64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else if a == b {
+										a, b := float64(probeVal), float64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else if a == b {
+											cmpResult = 0
+										} else if math.IsNaN(a) {
+											if math.IsNaN(b) {
 												cmpResult = 0
-											} else if math.IsNaN(a) {
-												if math.IsNaN(b) {
-													cmpResult = 0
-												} else {
-													cmpResult = -1
-												}
 											} else {
-												cmpResult = 1
+												cmpResult = -1
 											}
+										} else {
+											cmpResult = 1
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -4419,89 +4715,87 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := float64(probeVal), float64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else if a == b {
+										a, b := float64(probeVal), float64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else if a == b {
+											cmpResult = 0
+										} else if math.IsNaN(a) {
+											if math.IsNaN(b) {
 												cmpResult = 0
-											} else if math.IsNaN(a) {
-												if math.IsNaN(b) {
-													cmpResult = 0
-												} else {
-													cmpResult = -1
-												}
 											} else {
-												cmpResult = 1
+												cmpResult = -1
 											}
+										} else {
+											cmpResult = 1
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
 
 									{
-										var cmpResult int
-
-										{
-											a, b := float64(probeVal), float64(buildVal)
-											if a < b {
-												cmpResult = -1
-											} else if a > b {
-												cmpResult = 1
-											} else if a == b {
+										a, b := float64(probeVal), float64(buildVal)
+										if a < b {
+											cmpResult = -1
+										} else if a > b {
+											cmpResult = 1
+										} else if a == b {
+											cmpResult = 0
+										} else if math.IsNaN(a) {
+											if math.IsNaN(b) {
 												cmpResult = 0
-											} else if math.IsNaN(a) {
-												if math.IsNaN(b) {
-													cmpResult = 0
-												} else {
-													cmpResult = -1
-												}
 											} else {
-												cmpResult = 1
+												cmpResult = -1
 											}
+										} else {
+											cmpResult = 1
 										}
-
-										unique = cmpResult != 0
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -4528,86 +4822,86 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										if probeVal.Before(buildVal) {
-											cmpResult = -1
-										} else if buildVal.Before(probeVal) {
-											cmpResult = 1
-										} else {
-											cmpResult = 0
-										}
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
+										}
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									if probeVal.Before(buildVal) {
+										cmpResult = -1
+									} else if buildVal.Before(probeVal) {
+										cmpResult = 1
+									} else {
+										cmpResult = 0
+									}
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										if probeVal.Before(buildVal) {
-											cmpResult = -1
-										} else if buildVal.Before(probeVal) {
-											cmpResult = 1
-										} else {
-											cmpResult = 0
-										}
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									if probeVal.Before(buildVal) {
+										cmpResult = -1
+									} else if buildVal.Before(probeVal) {
+										cmpResult = 1
+									} else {
+										cmpResult = 0
+									}
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -4615,65 +4909,63 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										if probeVal.Before(buildVal) {
-											cmpResult = -1
-										} else if buildVal.Before(probeVal) {
-											cmpResult = 1
-										} else {
-											cmpResult = 0
-										}
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									if probeVal.Before(buildVal) {
+										cmpResult = -1
+									} else if buildVal.Before(probeVal) {
+										cmpResult = 1
+									} else {
+										cmpResult = 0
+									}
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										if probeVal.Before(buildVal) {
-											cmpResult = -1
-										} else if buildVal.Before(probeVal) {
-											cmpResult = 1
-										} else {
-											cmpResult = 0
-										}
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									if probeVal.Before(buildVal) {
+										cmpResult = -1
+									} else if buildVal.Before(probeVal) {
+										cmpResult = 1
+									} else {
+										cmpResult = 0
+									}
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -4697,72 +4989,72 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = probeVal.Compare(buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
+										}
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = probeVal.Compare(buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = probeVal.Compare(buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = probeVal.Compare(buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -4770,51 +5062,49 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = probeVal.Compare(buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = probeVal.Compare(buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-										cmpResult = probeVal.Compare(buildVal)
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+									cmpResult = probeVal.Compare(buildVal)
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -4838,84 +5128,84 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										var err error
-										cmpResult, err = probeVal.Compare(buildVal)
-										if err != nil {
-											colexecerror.ExpectedError(err)
-										}
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
+										}
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									var err error
+									cmpResult, err = probeVal.Compare(buildVal)
+									if err != nil {
+										colexecerror.ExpectedError(err)
+									}
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										var err error
-										cmpResult, err = probeVal.Compare(buildVal)
-										if err != nil {
-											colexecerror.ExpectedError(err)
-										}
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									var err error
+									cmpResult, err = probeVal.Compare(buildVal)
+									if err != nil {
+										colexecerror.ExpectedError(err)
+									}
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -4923,63 +5213,61 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										var err error
-										cmpResult, err = probeVal.Compare(buildVal)
-										if err != nil {
-											colexecerror.ExpectedError(err)
-										}
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									var err error
+									cmpResult, err = probeVal.Compare(buildVal)
+									if err != nil {
+										colexecerror.ExpectedError(err)
+									}
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
+								}
 								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
 
-									{
-										var cmpResult int
+								{
+									var cmpResult int
 
-										var err error
-										cmpResult, err = probeVal.Compare(buildVal)
-										if err != nil {
-											colexecerror.ExpectedError(err)
-										}
-
-										unique = cmpResult != 0
+									var err error
+									cmpResult, err = probeVal.Compare(buildVal)
+									if err != nil {
+										colexecerror.ExpectedError(err)
 									}
 
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+									unique = cmpResult != 0
 								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -5003,76 +5291,76 @@ func (ht *HashTable) checkColForDistinctTuples(
 							probeVecNulls := probeVec.Nulls()
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											if !buildIsNull {
-												ht.ProbeScratch.differs[toCheck] = true
-											}
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										cmpResult = coldataext.CompareDatum(probeVal, probeKeys, buildVal)
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										if !buildIsNull {
+											ht.ProbeScratch.differs[toCheck] = true
+										}
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									cmpResult = coldataext.CompareDatum(probeVal, probeKeys, buildVal)
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							probeVecNulls := probeVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeIsNull := probeVecNulls.NullAt(probeIdx)
-									if probeIsNull {
-										if ht.allowNullEquality {
-											ht.ProbeScratch.differs[toCheck] = true
-										} else {
-											ht.ProbeScratch.distinct[toCheck] = true
-										}
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										cmpResult = coldataext.CompareDatum(probeVal, probeKeys, buildVal)
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeIsNull := probeVecNulls.NullAt(probeIdx)
+								if probeIsNull {
+									if ht.allowNullEquality {
+										ht.ProbeScratch.differs[toCheck] = true
+									} else {
+										ht.ProbeScratch.differs[toCheck] = true
+										ht.ProbeScratch.foundNull[toCheck] = true
+									}
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									cmpResult = coldataext.CompareDatum(probeVal, probeKeys, buildVal)
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					} else {
@@ -5080,55 +5368,53 @@ func (ht *HashTable) checkColForDistinctTuples(
 							var probeIdx, buildIdx int
 							buildVecNulls := buildVec.Nulls()
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									buildIsNull := buildVecNulls.NullAt(buildIdx)
-									if buildIsNull {
-										ht.ProbeScratch.differs[toCheck] = true
-										continue
-									}
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										cmpResult = coldataext.CompareDatum(probeVal, probeKeys, buildVal)
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								buildIsNull := buildVecNulls.NullAt(buildIdx)
+								if buildIsNull {
+									ht.ProbeScratch.differs[toCheck] = true
+									continue
+								}
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									cmpResult = coldataext.CompareDatum(probeVal, probeKeys, buildVal)
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						} else {
 							var probeIdx, buildIdx int
 							for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-								keyID := ht.ProbeScratch.ToCheckID[toCheck]
-								if keyID != 0 {
-									probeIdx = probeSel[toCheck]
-									buildIdx = int(keyID - 1)
-									probeVal := probeKeys.Get(probeIdx)
-									buildVal := buildKeys.Get(buildIdx)
-									var unique bool
-
-									{
-										var cmpResult int
-
-										cmpResult = coldataext.CompareDatum(probeVal, probeKeys, buildVal)
-
-										unique = cmpResult != 0
-									}
-
-									ht.ProbeScratch.differs[toCheck] = ht.ProbeScratch.differs[toCheck] || unique
-								} else {
-									ht.ProbeScratch.distinct[toCheck] = true
+								if ht.ProbeScratch.differs[toCheck] {
+									continue
 								}
+								keyID := ht.ProbeScratch.ToCheckID[toCheck]
+								probeIdx = probeSel[toCheck]
+								buildIdx = int(keyID - 1)
+								probeVal := probeKeys.Get(probeIdx)
+								buildVal := buildKeys.Get(buildIdx)
+								var unique bool
+
+								{
+									var cmpResult int
+
+									cmpResult = coldataext.CompareDatum(probeVal, probeKeys, buildVal)
+
+									unique = cmpResult != 0
+								}
+
+								ht.ProbeScratch.differs[toCheck] = unique
 							}
 						}
 					}
@@ -5140,30 +5426,46 @@ func (ht *HashTable) checkColForDistinctTuples(
 
 // CheckProbeForDistinct performs a column by column check for duplicated tuples
 // in the probe table.
-func (ht *HashTable) CheckProbeForDistinct(vecs []coldata.Vec, nToCheck uint64, sel []int) uint64 {
+func (ht *HashTable) CheckProbeForDistinct(vecs []coldata.Vec, nToCheck uint32, sel []int) uint32 {
 	for i := range ht.keyCols {
 		ht.checkColAgainstItselfForDistinct(vecs[i], nToCheck, sel)
 	}
-	nDiffers := uint64(0)
-	toCheckSlice := ht.ProbeScratch.ToCheck
-	_ = toCheckSlice[nToCheck-1]
-	for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
-		//gcassert:bce
-		toCheck := toCheckSlice[toCheckPos]
-		if ht.ProbeScratch.distinct[toCheck] {
-			ht.ProbeScratch.HeadID[toCheck] = toCheck + 1
-			continue
-		}
-		if !ht.ProbeScratch.differs[toCheck] {
-			keyID := ht.ProbeScratch.ToCheckID[toCheck]
-			if ht.ProbeScratch.HeadID[toCheck] == 0 {
-				ht.ProbeScratch.HeadID[toCheck] = keyID
-			}
-		} else {
-			ht.ProbeScratch.differs[toCheck] = false
+	nDiffers := uint32(0)
+	if ht.allowNullEquality {
+		toCheckSlice := ht.ProbeScratch.ToCheck
+		_ = toCheckSlice[nToCheck-1]
+		for toCheckPos := uint32(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
 			//gcassert:bce
-			toCheckSlice[nDiffers] = toCheck
-			nDiffers++
+			toCheck := toCheckSlice[toCheckPos]
+			if !ht.ProbeScratch.differs[toCheck] {
+				keyID := ht.ProbeScratch.ToCheckID[toCheck]
+				ht.ProbeScratch.HeadID[toCheck] = keyID
+			} else {
+				ht.ProbeScratch.differs[toCheck] = false
+				//gcassert:bce
+				toCheckSlice[nDiffers] = toCheck
+				nDiffers++
+			}
+		}
+	} else {
+		toCheckSlice := ht.ProbeScratch.ToCheck
+		_ = toCheckSlice[nToCheck-1]
+		for toCheckPos := uint32(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+			//gcassert:bce
+			toCheck := toCheckSlice[toCheckPos]
+			if ht.ProbeScratch.foundNull[toCheck] {
+				ht.ProbeScratch.HeadID[toCheck] = toCheck + 1
+				continue
+			}
+			if !ht.ProbeScratch.differs[toCheck] {
+				keyID := ht.ProbeScratch.ToCheckID[toCheck]
+				ht.ProbeScratch.HeadID[toCheck] = keyID
+			} else {
+				ht.ProbeScratch.differs[toCheck] = false
+				//gcassert:bce
+				toCheckSlice[nDiffers] = toCheck
+				nDiffers++
+			}
 		}
 	}
 	return nDiffers
@@ -5187,8 +5489,8 @@ func (ht *HashTable) updateSel(b coldata.Batch) {
 		hashBuffer := ht.ProbeScratch.HashBuffer
 		_ = HeadIDs[batchLength-1]
 		_ = hashBuffer[batchLength-1]
-		// Reuse the buffer allocated for distinct.
-		visited := ht.ProbeScratch.distinct
+		// Reuse the buffer allocated for foundNull.
+		visited := ht.ProbeScratch.foundNull
 		copy(visited, colexecutils.ZeroBoolColumn)
 		distinctCount := 0
 		for i := 0; i < batchLength && distinctCount < batchLength; i++ {
@@ -5214,8 +5516,8 @@ func (ht *HashTable) updateSel(b coldata.Batch) {
 		hashBuffer := ht.ProbeScratch.HashBuffer
 		_ = HeadIDs[batchLength-1]
 		_ = hashBuffer[batchLength-1]
-		// Reuse the buffer allocated for distinct.
-		visited := ht.ProbeScratch.distinct
+		// Reuse the buffer allocated for foundNull.
+		visited := ht.ProbeScratch.foundNull
 		copy(visited, colexecutils.ZeroBoolColumn)
 		distinctCount := 0
 		for i := 0; i < batchLength && distinctCount < batchLength; i++ {
@@ -5234,3 +5536,296 @@ func (ht *HashTable) updateSel(b coldata.Batch) {
 		b.SetLength(distinctCount)
 	}
 }
+
+// FindBuckets finds the buckets for all tuples in batch when probing against a
+// hash table that is specified by 'first' and 'next' vectors as well as
+// 'duplicatesChecker'. `duplicatesChecker` takes a slice of key columns of the
+// batch, number of tuples to check, and the selection vector of the batch, and
+// it returns number of tuples that needs to be checked for next iteration.
+// The "buckets" are specified by equal values in ht.ProbeScratch.HeadID.
+//
+// - zeroHeadIDForDistinctTuple controls how a bucket with a single distinct
+// tuple will be represented (i.e. this tuple is distinct from all tuples in the
+// hash table). If zeroHeadIDForDistinctTuple is true, then this tuple will have
+// HeadID of 0, otherwise, it'll have HeadID[i] = keyID(i) = i + 1.
+// - probingAgainstItself, if true, indicates that the hash table was built on
+// the probing batch itself. In such a scenario the behavior can be optimized
+// since we know that every tuple has at least one match.
+//
+// NOTE: *first* and *next* vectors should be properly populated.
+// NOTE: batch is assumed to be non-zero length.
+func (ht *HashTable) FindBuckets(
+	batch coldata.Batch,
+	keyCols []coldata.Vec,
+	first, next []keyID,
+	duplicatesChecker func([]coldata.Vec, uint32, []int) uint32,
+	zeroHeadIDForDistinctTuple bool,
+	probingAgainstItself bool,
+) {
+	ht.ProbeScratch.SetupLimitedSlices(batch.Length())
+	if zeroHeadIDForDistinctTuple {
+		if probingAgainstItself {
+			{
+				batchLength := batch.Length()
+				sel := batch.Selection()
+				// Early bounds checks.
+				toCheckIDs := ht.ProbeScratch.ToCheckID
+				_ = toCheckIDs[batchLength-1]
+				headIDs := ht.ProbeScratch.HeadID
+				_ = headIDs[batchLength-1]
+				var nToCheck uint32
+				for i, hash := range ht.ProbeScratch.HashBuffer[:batchLength] {
+					toCheck := uint32(i)
+					nextToCheckID := first[hash]
+					{
+						if toCheck+1 == nextToCheckID {
+							_ = true
+							//gcassert:gce
+							headIDs[toCheck] = nextToCheckID
+						} else {
+							{
+								_ = true
+								//gcassert:bce
+								toCheckIDs[i] = nextToCheckID
+								ht.ProbeScratch.ToCheck[nToCheck] = toCheck
+								nToCheck++
+							}
+						}
+					}
+				}
+
+				for nToCheck > 0 {
+					nToCheck = duplicatesChecker(keyCols, nToCheck, sel)
+					toCheckSlice := ht.ProbeScratch.ToCheck[:nToCheck]
+					nToCheck = 0
+					for _, toCheck := range toCheckSlice {
+						nextToCheckID := next[toCheckIDs[toCheck]]
+						{
+							if toCheck+1 == nextToCheckID {
+								_ = true
+								headIDs[toCheck] = nextToCheckID
+							} else {
+								{
+									_ = true
+									//gcassert:bce
+									toCheckIDs[toCheck] = nextToCheckID
+									ht.ProbeScratch.ToCheck[nToCheck] = toCheck
+									nToCheck++
+								}
+							}
+						}
+					}
+				}
+			}
+		} else {
+			{
+				batchLength := batch.Length()
+				sel := batch.Selection()
+				// Early bounds checks.
+				toCheckIDs := ht.ProbeScratch.ToCheckID
+				_ = toCheckIDs[batchLength-1]
+				var nToCheck uint32
+				for i, hash := range ht.ProbeScratch.HashBuffer[:batchLength] {
+					toCheck := uint32(i)
+					nextToCheckID := first[hash]
+					{
+						if nextToCheckID != 0 {
+							{
+								_ = true
+								//gcassert:bce
+								toCheckIDs[i] = nextToCheckID
+								ht.ProbeScratch.ToCheck[nToCheck] = toCheck
+								nToCheck++
+							}
+						} else {
+							_ = true
+						}
+					}
+				}
+
+				for nToCheck > 0 {
+					nToCheck = duplicatesChecker(keyCols, nToCheck, sel)
+					toCheckSlice := ht.ProbeScratch.ToCheck[:nToCheck]
+					nToCheck = 0
+					for _, toCheck := range toCheckSlice {
+						nextToCheckID := next[toCheckIDs[toCheck]]
+						{
+							if nextToCheckID != 0 {
+								{
+									_ = true
+									//gcassert:bce
+									toCheckIDs[toCheck] = nextToCheckID
+									ht.ProbeScratch.ToCheck[nToCheck] = toCheck
+									nToCheck++
+								}
+							} else {
+								_ = true
+							}
+						}
+					}
+				}
+			}
+		}
+	} else {
+		if probingAgainstItself {
+			{
+				batchLength := batch.Length()
+				sel := batch.Selection()
+				// Early bounds checks.
+				toCheckIDs := ht.ProbeScratch.ToCheckID
+				_ = toCheckIDs[batchLength-1]
+				headIDs := ht.ProbeScratch.HeadID
+				_ = headIDs[batchLength-1]
+				var nToCheck uint32
+				for i, hash := range ht.ProbeScratch.HashBuffer[:batchLength] {
+					toCheck := uint32(i)
+					nextToCheckID := first[hash]
+					{
+						if toCheck+1 == nextToCheckID {
+							_ = true
+							//gcassert:gce
+							headIDs[toCheck] = nextToCheckID
+						} else {
+							{
+								_ = true
+								//gcassert:bce
+								toCheckIDs[i] = nextToCheckID
+								ht.ProbeScratch.ToCheck[nToCheck] = toCheck
+								nToCheck++
+							}
+						}
+					}
+				}
+
+				for nToCheck > 0 {
+					nToCheck = duplicatesChecker(keyCols, nToCheck, sel)
+					toCheckSlice := ht.ProbeScratch.ToCheck[:nToCheck]
+					nToCheck = 0
+					for _, toCheck := range toCheckSlice {
+						nextToCheckID := next[toCheckIDs[toCheck]]
+						{
+							if toCheck+1 == nextToCheckID {
+								_ = true
+								headIDs[toCheck] = nextToCheckID
+							} else {
+								{
+									_ = true
+									//gcassert:bce
+									toCheckIDs[toCheck] = nextToCheckID
+									ht.ProbeScratch.ToCheck[nToCheck] = toCheck
+									nToCheck++
+								}
+							}
+						}
+					}
+				}
+			}
+		} else {
+			{
+				batchLength := batch.Length()
+				sel := batch.Selection()
+				// Early bounds checks.
+				toCheckIDs := ht.ProbeScratch.ToCheckID
+				_ = toCheckIDs[batchLength-1]
+				headIDs := ht.ProbeScratch.HeadID
+				_ = headIDs[batchLength-1]
+				var nToCheck uint32
+				for i, hash := range ht.ProbeScratch.HashBuffer[:batchLength] {
+					toCheck := uint32(i)
+					nextToCheckID := first[hash]
+					{
+						if nextToCheckID != 0 {
+							{
+								_ = true
+								//gcassert:bce
+								toCheckIDs[i] = nextToCheckID
+								ht.ProbeScratch.ToCheck[nToCheck] = toCheck
+								nToCheck++
+							}
+						} else {
+							_ = true
+							_ = true
+							//gcassert:gce
+							headIDs[toCheck] = toCheck + 1
+						}
+					}
+				}
+
+				for nToCheck > 0 {
+					nToCheck = duplicatesChecker(keyCols, nToCheck, sel)
+					toCheckSlice := ht.ProbeScratch.ToCheck[:nToCheck]
+					nToCheck = 0
+					for _, toCheck := range toCheckSlice {
+						nextToCheckID := next[toCheckIDs[toCheck]]
+						{
+							if nextToCheckID != 0 {
+								{
+									_ = true
+									//gcassert:bce
+									toCheckIDs[toCheck] = nextToCheckID
+									ht.ProbeScratch.ToCheck[nToCheck] = toCheck
+									nToCheck++
+								}
+							} else {
+								_ = true
+								_ = true
+								headIDs[toCheck] = toCheck + 1
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// execgen:inline
+const _ = "template_findBuckets"
+
+// execgen:inline
+const _ = "template_handleNextToCheckID"
+
+// execgen:inline
+const _ = "template_includeTupleToCheck"
+
+// execgen:inline
+const _ = "inlined_findBuckets_true_true"
+
+// execgen:inline
+const _ = "inlined_findBuckets_true_false"
+
+// execgen:inline
+const _ = "inlined_findBuckets_false_true"
+
+// execgen:inline
+const _ = "inlined_findBuckets_false_false"
+
+// execgen:inline
+const _ = "inlined_handleNextToCheckID_true_true_true"
+
+// execgen:inline
+const _ = "inlined_handleNextToCheckID_true_true_false"
+
+// execgen:inline
+const _ = "inlined_handleNextToCheckID_true_false_true"
+
+// execgen:inline
+const _ = "inlined_handleNextToCheckID_true_false_false"
+
+// execgen:inline
+const _ = "inlined_handleNextToCheckID_false_true_true"
+
+// execgen:inline
+const _ = "inlined_handleNextToCheckID_false_true_false"
+
+// execgen:inline
+const _ = "inlined_handleNextToCheckID_false_false_true"
+
+// execgen:inline
+const _ = "inlined_handleNextToCheckID_false_false_false"
+
+// execgen:inline
+const _ = "inlined_includeTupleToCheck_true"
+
+// execgen:inline
+const _ = "inlined_includeTupleToCheck_false"

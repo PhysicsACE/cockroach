@@ -46,10 +46,11 @@ func NewIndexBackfillerMergePlanner(execCfg *ExecutorConfig) *IndexBackfillerMer
 // MergeIndexes is part of the scexec.Merger interface.
 func (im *IndexBackfillerMergePlanner) MergeIndexes(
 	ctx context.Context,
+	job *jobs.Job,
 	progress scexec.MergeProgress,
 	tracker scexec.BackfillerProgressWriter,
 	descriptor catalog.TableDescriptor,
-) error {
+) (err error) {
 	spansToDo := make([][]roachpb.Span, len(progress.SourceIndexIDs))
 	if len(progress.CompletedSpans) != len(progress.SourceIndexIDs) {
 		return errors.AssertionFailedf("invalid MergeProgress, CompletedSpans should " +
@@ -96,6 +97,15 @@ func (im *IndexBackfillerMergePlanner) MergeIndexes(
 		)
 		return tracker.SetMergeProgress(ctx, progress)
 	}
+	mergeTimeStamp := getMergeTimestamp(im.execCfg.Clock)
+	protectedTimestampCleaner := im.execCfg.ProtectedTimestampManager.TryToProtectBeforeGC(ctx, job, descriptor, mergeTimeStamp)
+	defer func() {
+		cleanupError := protectedTimestampCleaner(ctx)
+		if cleanupError != nil {
+			err = errors.CombineErrors(cleanupError, err)
+		}
+	}()
+
 	run, err := im.plan(
 		ctx,
 		descriptor,
@@ -103,7 +113,7 @@ func (im *IndexBackfillerMergePlanner) MergeIndexes(
 		progress.DestIndexIDs,
 		progress.SourceIndexIDs,
 		updateFunc,
-		getMergeTimestamp(im.execCfg.Clock),
+		mergeTimeStamp,
 	)
 	if err != nil {
 		return err
@@ -126,7 +136,7 @@ func (im *IndexBackfillerMergePlanner) plan(
 	if err := DescsTxn(ctx, im.execCfg, func(
 		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
-		sd := NewFakeSessionData(im.execCfg.SV(), "plan-index-backfill-merge")
+		sd := NewInternalSessionData(ctx, im.execCfg.Settings, "plan-index-backfill-merge")
 		evalCtx = createSchemaChangeEvalCtx(ctx, im.execCfg, sd, txn.KV().ReadTimestamp(), descriptors)
 		planCtx = im.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn.KV(),
 			DistributionTypeSystemTenantOnly)

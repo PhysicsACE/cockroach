@@ -13,7 +13,6 @@ package keyside
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -77,6 +76,11 @@ func Encode(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, error) {
 		return encoding.EncodeStringDescending(b, string(*t)), nil
 	case *tree.DVoid:
 		return encoding.EncodeVoidAscendingOrDescending(b), nil
+	case *tree.DPGLSN:
+		if dir == encoding.Ascending {
+			return encoding.EncodeUvarintAscending(b, uint64(t.LSN)), nil
+		}
+		return encoding.EncodeUvarintDescending(b, uint64(t.LSN)), nil
 	case *tree.DBox2D:
 		if dir == encoding.Ascending {
 			return encoding.EncodeBox2DAscending(b, t.CartesianBoundingBox.BoundingBox)
@@ -174,7 +178,7 @@ func Encode(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, error) {
 		// DEncodedKey carries an already encoded key.
 		return append(b, []byte(*t)...), nil
 	case *tree.DJSON:
-		return nil, unimplemented.NewWithIssue(35706, "unable to encode JSON as a table key")
+		return encodeJSONKey(b, t, dir)
 	}
 	return nil, errors.Errorf("unable to encode table key: %T", val)
 }

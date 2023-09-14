@@ -37,52 +37,65 @@ func TestReplicaRankings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	dimensions := []aload.Dimension{aload.Queries, aload.CPU}
 	rr := NewReplicaRankings()
 
 	testCases := []struct {
-		replicasByQPS []float64
+		replicasByLoad []float64
 	}{
-		{replicasByQPS: []float64{}},
-		{replicasByQPS: []float64{0}},
-		{replicasByQPS: []float64{1, 0}},
-		{replicasByQPS: []float64{3, 2, 1, 0}},
-		{replicasByQPS: []float64{3, 3, 2, 2, 1, 1, 0, 0}},
-		{replicasByQPS: []float64{1.1, 1.0, 0.9, -0.9, -1.0, -1.1}},
+		{replicasByLoad: []float64{}},
+		{replicasByLoad: []float64{0}},
+		{replicasByLoad: []float64{1, 0}},
+		{replicasByLoad: []float64{3, 2, 1, 0}},
+		{replicasByLoad: []float64{3, 3, 2, 2, 1, 1, 0, 0}},
+		{replicasByLoad: []float64{1.1, 1.0, 0.9, -0.9, -1.0, -1.1}},
 	}
 
 	for _, tc := range testCases {
-		acc := NewReplicaAccumulator(aload.Queries)
+		for _, dimension := range dimensions {
+			acc := NewReplicaAccumulator(dimensions...)
 
-		// Randomize the order of the inputs each time the test is run.
-		want := make([]float64, len(tc.replicasByQPS))
-		copy(want, tc.replicasByQPS)
-		rand.Shuffle(len(tc.replicasByQPS), func(i, j int) {
-			tc.replicasByQPS[i], tc.replicasByQPS[j] = tc.replicasByQPS[j], tc.replicasByQPS[i]
-		})
+			// Randomize the order of the inputs each time the test is run. Also make
+			// a copy so that we can test on the copy for each dimension without
+			// mutating the underlying test case slice.
+			rLoad := make([]float64, len(tc.replicasByLoad))
+			want := make([]float64, len(tc.replicasByLoad))
+			copy(want, tc.replicasByLoad)
+			copy(rLoad, tc.replicasByLoad)
 
-		for i, replQPS := range tc.replicasByQPS {
-			acc.AddReplica(candidateReplica{
-				Replica: &Replica{RangeID: roachpb.RangeID(i)},
-				usage:   allocator.RangeUsageInfo{QueriesPerSecond: replQPS},
+			rand.Shuffle(len(rLoad), func(i, j int) {
+				rLoad[i], rLoad[j] = rLoad[j], rLoad[i]
 			})
-		}
-		rr.Update(acc)
 
-		// Make sure we can read off all expected replicas in the correct order.
-		repls := rr.TopLoad()
-		if len(repls) != len(want) {
-			t.Errorf("wrong number of replicas in output; got: %v; want: %v", repls, tc.replicasByQPS)
-			continue
-		}
-		for i := range want {
-			if repls[i].RangeUsageInfo().QueriesPerSecond != want[i] {
-				t.Errorf("got %f for %d'th element; want %f (input: %v)", repls[i].RangeUsageInfo().QueriesPerSecond, i, want, tc.replicasByQPS)
-				break
+			for i, replLoad := range rLoad {
+				acc.AddReplica(candidateReplica{
+					Replica: &Replica{RangeID: roachpb.RangeID(i)},
+					usage: allocator.RangeUsageInfo{
+						// We should get the same ordering for both QPS and CPU.
+						QueriesPerSecond:         replLoad,
+						RequestCPUNanosPerSecond: replLoad,
+					},
+				})
 			}
-		}
-		replsCopy := rr.TopLoad()
-		if !reflect.DeepEqual(repls, replsCopy) {
-			t.Errorf("got different replicas on second call to topQPS; first call: %v, second call: %v", repls, replsCopy)
+			rr.Update(acc)
+
+			// Make sure we can read off all expected replicas in the correct order.
+			repls := rr.TopLoad(dimension)
+			if len(repls) != len(want) {
+				t.Errorf("wrong number of replicas in output; got: %v; want: %v", repls, rLoad)
+				continue
+			}
+			for i := range want {
+				if repls[i].RangeUsageInfo().Load().Dim(dimension) != want[i] {
+					t.Errorf("got %f for %d'th element; want %f (input: %v)",
+						repls[i].RangeUsageInfo().Load().Dim(dimension), i, want, rLoad)
+					break
+				}
+			}
+			replsCopy := rr.TopLoad(dimension)
+			if !reflect.DeepEqual(repls, replsCopy) {
+				t.Errorf("got different replicas on second call to topQPS; first call: %v, second call: %v", repls, replsCopy)
+			}
 		}
 	}
 }
@@ -94,7 +107,7 @@ func TestAddSSTQPSStat(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 	})
 
@@ -186,7 +199,7 @@ func TestAddSSTQPSStat(t *testing.T) {
 
 // genVariableRead returns a batch request containing, start-end sequential key reads.
 func genVariableRead(ctx context.Context, start, end roachpb.Key) *kvpb.BatchRequest {
-	scan := kvpb.NewScan(start, end, false)
+	scan := kvpb.NewScan(start, end, kvpb.NonLocking)
 	readBa := &kvpb.BatchRequest{}
 	readBa.Add(scan)
 	return readBa
@@ -206,7 +219,7 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 		ReplicationMode: base.ReplicationManual,
 	}
 	args.ServerArgs.Knobs.Store = &StoreTestingKnobs{DisableCanAckBeforeApplication: true}
-	tc := serverutils.StartNewTestCluster(t, 1, args)
+	tc := serverutils.StartCluster(t, 1, args)
 
 	const epsilonAllowed = 4
 
@@ -243,7 +256,7 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 	// Disable the consistency checker, to avoid interleaving requests
 	// artificially inflating measurement due to consistency checking.
 	sqlDB.Exec(t, `SET CLUSTER SETTING server.consistency_check.interval = '0'`)
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load_enabled = false`)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load.enabled = false`)
 
 	for _, testCase := range testCases {
 		// This test can flake, where an errant request - not sent here
@@ -296,7 +309,7 @@ func TestReadLoadMetricAccounting(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 	})
 
@@ -374,7 +387,7 @@ func TestReadLoadMetricAccounting(t *testing.T) {
 	// Disable the consistency checker, to avoid interleaving requests
 	// artificially inflating measurement due to consistency checking.
 	sqlDB.Exec(t, `SET CLUSTER SETTING server.consistency_check.interval = '0'`)
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load_enabled = false`)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load.enabled = false`)
 
 	for _, testCase := range testCases {
 		// This test can flake, where an errant request - not sent here
@@ -446,7 +459,7 @@ func TestNewReplicaRankingsMap(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		acc := NewTenantReplicaAccumulator()
+		acc := NewTenantReplicaAccumulator(aload.Queries, aload.CPU)
 
 		// Randomize the order of the inputs each time the test is run.
 		rand.Shuffle(len(tc), func(i, j int) {
@@ -463,10 +476,6 @@ func TestNewReplicaRankingsMap(t *testing.T) {
 			cr.mu.tenantID = roachpb.MustMakeTenantID(c.tenantID)
 			acc.AddReplica(cr)
 
-			if c.qps <= 1 {
-				continue
-			}
-
 			if l, ok := expectedReplicasPerTenant[c.tenantID]; ok {
 				expectedReplicasPerTenant[c.tenantID] = l + 1
 			} else {
@@ -476,9 +485,9 @@ func TestNewReplicaRankingsMap(t *testing.T) {
 		rr.Update(acc)
 
 		for tID, count := range expectedReplicasPerTenant {
-			repls := rr.TopQPS(roachpb.MustMakeTenantID(tID))
+			repls := rr.TopLoad(roachpb.MustMakeTenantID(tID), aload.Queries)
 			if len(repls) != count {
-				t.Errorf("wrong number of replicas in output; got: %v; want: %v", repls, tc)
+				t.Errorf("wrong number of replicas in output; got: %v; want: %v", len(repls), count)
 				continue
 			}
 			for i := 0; i < len(repls)-1; i++ {
@@ -487,9 +496,11 @@ func TestNewReplicaRankingsMap(t *testing.T) {
 					break
 				}
 			}
-			replsCopy := rr.TopQPS(roachpb.MustMakeTenantID(tID))
-			if !reflect.DeepEqual(repls, replsCopy) {
-				t.Errorf("got different replicas on second call to topQPS; first call: %v, second call: %v", repls, replsCopy)
+			replsCopy := rr.TopLoad(roachpb.MustMakeTenantID(tID), aload.Queries)
+			for i := 0; i < len(repls); i++ {
+				if repls[i].RangeUsageInfo().QueriesPerSecond != replsCopy[i].RangeUsageInfo().QueriesPerSecond {
+					t.Errorf("got different results Range ID: %d, QPS: %f, second call: Range ID: %d, QPS: %f", repls[i].GetRangeID(), repls[i].RangeUsageInfo().QueriesPerSecond, replsCopy[i].GetRangeID(), replsCopy[i].RangeUsageInfo().QueriesPerSecond)
+				}
 			}
 		}
 	}

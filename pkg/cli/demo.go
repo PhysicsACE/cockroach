@@ -233,7 +233,6 @@ func runDemoInternal(
 			serverCfg.Stores.Specs = nil
 			return setupAndInitializeLoggingAndProfiling(ctx, cmd, false /* isServerCmd */)
 		},
-		getAdminClient,
 		func(ctx context.Context, ac serverpb.AdminClient) error {
 			return drainAndShutdown(ctx, ac, "local" /* targetNode */)
 		},
@@ -355,6 +354,8 @@ func runDemoInternal(
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
+	_, _, certsDir := c.GetSQLCredentials()
+	sqlCtx.ShellCtx.CertsDir = certsDir
 	sqlCtx.ShellCtx.ParseURL = clienturl.MakeURLParserFn(cmd, cliCtx.clientOpts)
 
 	if err := extraInit(ctx, conn); err != nil {
@@ -376,7 +377,7 @@ func runDemoInternal(
 	}
 
 	// Ensure the last few entries in the log files are flushed at the end.
-	defer log.Flush()
+	defer log.FlushFiles()
 
 	return sqlCtx.Run(ctx, conn)
 }

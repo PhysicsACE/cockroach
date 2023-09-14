@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/auditlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -40,6 +41,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -52,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
@@ -106,6 +110,9 @@ type extendedEvalContext struct {
 	SchemaChangerState *SchemaChangerState
 
 	statementPreparer statementPreparer
+
+	// validateDbZoneConfig should the DB zone config on commit.
+	validateDbZoneConfig *bool
 }
 
 // copyFromExecCfg copies relevant fields from an ExecutorConfig.
@@ -114,9 +121,13 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.Settings = execCfg.Settings
 	evalCtx.Codec = execCfg.Codec
 	evalCtx.Tracer = execCfg.AmbientCtx.Tracer
-	evalCtx.SQLLivenessReader = execCfg.SQLLiveness
+	if execCfg.SQLLiveness != nil { // nil in some tests
+		evalCtx.SQLLivenessReader = execCfg.SQLLiveness.CachedReader()
+	}
 	evalCtx.CompactEngineSpan = execCfg.CompactEngineSpanFunc
 	evalCtx.SetCompactionConcurrency = execCfg.CompactionConcurrencyFunc
+	evalCtx.GetTableMetrics = execCfg.GetTableMetricsFunc
+	evalCtx.ScanStorageInternalKeys = execCfg.ScanStorageInternalKeysFunc
 	evalCtx.TestingKnobs = execCfg.EvalContextTestingKnobs
 	evalCtx.ClusterID = execCfg.NodeInfo.LogicalClusterID()
 	evalCtx.ClusterName = execCfg.RPCContext.ClusterName()
@@ -129,6 +140,7 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.DistSQLPlanner = execCfg.DistSQLPlanner
 	evalCtx.VirtualSchemas = execCfg.VirtualSchemas
 	evalCtx.KVStoresIterator = execCfg.KVStoresIterator
+	evalCtx.InspectzServer = execCfg.InspectzServer
 }
 
 // copy returns a deep copy of ctx.
@@ -168,10 +180,6 @@ type planner struct {
 	// never be accessed directly. Nothing explicitly resets this field.
 	internalSQLTxn internalTxn
 
-	// isInternalPlanner is set to true when this planner is not bound to
-	// a SQL session.
-	isInternalPlanner bool
-
 	atomic struct {
 		// innerPlansMustUseLeafTxn is set to 1 if the "outer" plan is using
 		// the LeafTxn forcing the "inner" plans to use the LeafTxns too. An
@@ -198,6 +206,9 @@ type planner struct {
 	// StmtWithHomeRegionEnforced, if non-nil is the SQL statement for which a
 	// home region is being enforced.
 	StmtNoConstantsWithHomeRegionEnforced string
+
+	// pausablePortal is set when the query is from a pausable portal.
+	pausablePortal *PreparedPortal
 
 	instrumentation instrumentationHelper
 
@@ -256,10 +267,33 @@ type planner struct {
 
 	// evalCatalogBuiltins is used as part of the eval.Context.
 	evalCatalogBuiltins evalcatalog.Builtins
+
+	// trackDependency is used to track circular dependencies when dropping views.
+	trackDependency map[catid.DescID]bool
+
+	reducedAuditConfig *auditlogging.ReducedAuditConfig
 }
 
-func (evalCtx *extendedEvalContext) setSessionID(sessionID clusterunique.ID) {
-	evalCtx.SessionID = sessionID
+// hasFlowForPausablePortal returns true if the planner is for re-executing a
+// portal. We reuse the flow stored in p.pausablePortal.pauseInfo.
+func (p *planner) hasFlowForPausablePortal() bool {
+	return p.pausablePortal != nil && p.pausablePortal.pauseInfo != nil && p.pausablePortal.pauseInfo.resumableFlow.flow != nil
+}
+
+// resumeFlowForPausablePortal is called when re-executing a portal. We reuse
+// the flow with a new receiver, without re-generating the physical plan.
+func (p *planner) resumeFlowForPausablePortal(recv *DistSQLReceiver) error {
+	if !p.hasFlowForPausablePortal() {
+		return errors.AssertionFailedf("no flow found for pausable portal")
+	}
+	recv.discardRows = p.instrumentation.ShouldDiscardRows()
+	recv.outputTypes = p.pausablePortal.pauseInfo.resumableFlow.outputTypes
+	flow := p.pausablePortal.pauseInfo.resumableFlow.flow
+	finishedSetupFn, cleanup := getFinishedSetupFn(p)
+	finishedSetupFn(flow)
+	defer cleanup()
+	flow.Resume(recv)
+	return recv.commErr
 }
 
 // noteworthyInternalMemoryUsageBytes is the minimum size tracked by each
@@ -293,7 +327,7 @@ func NewInternalPlanner(
 	user username.SQLUsername,
 	memMetrics *MemoryMetrics,
 	execCfg *ExecutorConfig,
-	sessionData sessiondatapb.SessionData,
+	sessionData *sessiondata.SessionData,
 	opts ...InternalPlannerParamsOption,
 ) (interface{}, func()) {
 	return newInternalPlanner(opName, txn, user, memMetrics, execCfg, sessionData, opts...)
@@ -314,7 +348,7 @@ func newInternalPlanner(
 	user username.SQLUsername,
 	memMetrics *MemoryMetrics,
 	execCfg *ExecutorConfig,
-	sessionData sessiondatapb.SessionData,
+	sd *sessiondata.SessionData,
 	opts ...InternalPlannerParamsOption,
 ) (*planner, func()) {
 	// Default parameters which may be override by the supplied options.
@@ -333,19 +367,14 @@ func newInternalPlanner(
 	// suitable contexts.
 	ctx := logtags.AddTag(context.Background(), opName, "")
 
-	sd := &sessiondata.SessionData{
-		SessionData:   sessionData,
-		SearchPath:    sessiondata.DefaultSearchPathForUser(user),
-		SequenceState: sessiondata.NewSequenceState(),
-		Location:      time.UTC,
-	}
+	sd = sd.Clone()
 	if sd.SessionData.Database == "" {
 		sd.SessionData.Database = "system"
 	}
 	sd.SessionData.UserProto = user.EncodeProto()
 	sd.SessionData.Internal = true
+	sd.SearchPath = sessiondata.DefaultSearchPathForUser(user)
 	sds := sessiondata.NewStack(sd)
-
 	if params.collection == nil {
 		dsdp := catsessiondata.NewDescriptorSessionDataStackProvider(sds)
 		params.collection = execCfg.CollectionFactory.NewCollection(
@@ -367,12 +396,12 @@ func newInternalPlanner(
 	p.txn = txn
 	p.stmt = Statement{}
 	p.cancelChecker.Reset(ctx)
-	p.isInternalPlanner = true
 
 	p.semaCtx = tree.MakeSemaContext()
 	p.semaCtx.SearchPath = &sd.SearchPath
 	p.semaCtx.TypeResolver = p
 	p.semaCtx.FunctionResolver = p
+	p.semaCtx.NameResolver = p
 	p.semaCtx.DateStyle = sd.GetDateStyle()
 	p.semaCtx.IntervalStyle = sd.GetIntervalStyle()
 
@@ -407,6 +436,7 @@ func newInternalPlanner(
 	p.extendedEvalCtx.Regions = p
 	p.extendedEvalCtx.JoinTokenCreator = p
 	p.extendedEvalCtx.Gossip = p
+	p.extendedEvalCtx.JobsProfiler = p
 	p.extendedEvalCtx.ClusterID = execCfg.NodeInfo.LogicalClusterID()
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	p.extendedEvalCtx.NodeID = execCfg.NodeInfo.NodeID
@@ -420,10 +450,11 @@ func newInternalPlanner(
 	p.extendedEvalCtx.ExecCfg = execCfg
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 	p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
-	p.extendedEvalCtx.Descs = params.collection
 
 	p.queryCacheSession.Init()
 	p.optPlanningCtx.init(p)
+	p.sqlCursors = emptySqlCursors{}
+	p.preparedStatements = emptyPreparedStatements{}
 	p.createdSequences = emptyCreatedSequences{}
 
 	p.schemaResolver.descCollection = p.Descriptors()
@@ -431,6 +462,7 @@ func newInternalPlanner(
 	p.schemaResolver.txn = p.txn
 	p.schemaResolver.authAccessor = p
 	p.evalCatalogBuiltins.Init(execCfg.Codec, p.txn, p.Descriptors())
+	p.extendedEvalCtx.CatalogBuiltins = &p.evalCatalogBuiltins
 
 	return p, func() {
 		// Note that we capture ctx here. This is only valid as long as we create
@@ -470,12 +502,14 @@ func internalExtendedEvalCtx(
 	var sqlStatsController eval.SQLStatsController
 	var schemaTelemetryController eval.SchemaTelemetryController
 	var indexUsageStatsController eval.IndexUsageStatsController
+	var sqlStatsProvider *persistedsqlstats.PersistedSQLStats
 	if ief := execCfg.InternalDB; ief != nil {
 		if ief.server != nil {
 			indexUsageStats = ief.server.indexUsageStats
 			sqlStatsController = ief.server.sqlStatsController
 			schemaTelemetryController = ief.server.schemaTelemetryController
 			indexUsageStatsController = ief.server.indexUsageStatsController
+			sqlStatsProvider = ief.server.sqlStats
 		} else {
 			// If the indexUsageStats is nil from the sql.Server, we create a dummy
 			// index usage stats collector. The sql.Server in the ExecutorConfig
@@ -486,6 +520,7 @@ func internalExtendedEvalCtx(
 			sqlStatsController = &persistedsqlstats.Controller{}
 			schemaTelemetryController = &schematelemetrycontroller.Controller{}
 			indexUsageStatsController = &idxusage.Controller{}
+			sqlStatsProvider = &persistedsqlstats.PersistedSQLStats{}
 		}
 	}
 	ret := extendedEvalContext{
@@ -508,10 +543,28 @@ func internalExtendedEvalCtx(
 		Tracing:         &SessionTracing{},
 		Descs:           tables,
 		indexUsageStats: indexUsageStats,
+		statsProvider:   sqlStatsProvider,
+		jobs:            newTxnJobsCollection(),
 	}
 	ret.SetDeprecatedContext(ctx)
 	ret.copyFromExecCfg(execCfg)
 	return ret
+}
+
+// ExtendedEvalContextCopyAndReset returns a function that produces
+// extendedEvalContexts for parallel subquery, cascade, and check execution.
+func (p *planner) ExtendedEvalContextCopyAndReset() *extendedEvalContext {
+	evalCtx := p.ExtendedEvalContextCopy()
+	p.ExtendedEvalContextReset(evalCtx)
+	return evalCtx
+}
+
+// ExtendedEvalContextReset resets context fields so that the context may be
+// reused across subquery, cascade, and check execution.
+func (p *planner) ExtendedEvalContextReset(evalCtx *extendedEvalContext) {
+	evalCtx.Placeholders = &p.semaCtx.Placeholders
+	evalCtx.Annotations = &p.semaCtx.Annotations
+	evalCtx.SessionID = p.ExtendedEvalContext().SessionID
 }
 
 // SemaCtx provides access to the planner's SemaCtx.
@@ -571,6 +624,10 @@ func (p *planner) LeaseMgr() *lease.Manager {
 	return p.execCfg.LeaseManager
 }
 
+func (p *planner) AuditConfig() *auditlogging.AuditConfigLock {
+	return p.execCfg.AuditConfig
+}
+
 func (p *planner) Txn() *kv.Txn {
 	return p.txn
 }
@@ -596,6 +653,14 @@ func (p *planner) InternalSQLTxn() descs.Txn {
 		p.internalSQLTxn.init(p.txn, ie)
 	}
 	return &p.internalSQLTxn
+}
+
+func (p *planner) regionsProvider() *regions.Provider {
+	if txn := p.InternalSQLTxn(); txn != nil {
+		_ = txn.Regions() // force initialization
+		return p.internalSQLTxn.extraTxnState.regionsProvider
+	}
+	return nil
 }
 
 func (p *planner) User() username.SQLUsername {
@@ -846,6 +911,7 @@ func (p *planner) resetPlanner(
 	p.evalCatalogBuiltins.Init(p.execCfg.Codec, txn, p.Descriptors())
 	p.skipDescriptorCache = false
 	p.typeResolutionDbID = descpb.InvalidID
+	p.pausablePortal = nil
 }
 
 // GetReplicationStreamManager returns a ReplicationStreamManager.
@@ -862,12 +928,11 @@ func (p *planner) GetStreamIngestManager(ctx context.Context) (eval.StreamIngest
 
 // SpanStats returns a stats for the given span of keys.
 func (p *planner) SpanStats(
-	ctx context.Context, startKey roachpb.RKey, endKey roachpb.RKey,
+	ctx context.Context, spans roachpb.Spans,
 ) (*roachpb.SpanStatsResponse, error) {
 	req := &roachpb.SpanStatsRequest{
-		NodeID:   "0",
-		StartKey: startKey,
-		EndKey:   endKey,
+		NodeID: "0",
+		Spans:  spans,
 	}
 	return p.ExecCfg().TenantStatusServer.SpanStats(ctx, req)
 }
@@ -897,8 +962,22 @@ func (p *planner) GetDetailsForSpanStats(
 	return p.QueryIteratorEx(
 		ctx,
 		"crdb_internal.database_span_stats",
-		sessiondata.NoSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		query,
 		args...,
 	)
+}
+
+// MaybeReallocateAnnotations is part of the eval.Planner interface.
+func (p *planner) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) {
+	if len(p.SemaCtx().Annotations) > int(numAnnotations) {
+		return
+	}
+	p.SemaCtx().Annotations = tree.MakeAnnotations(numAnnotations)
+	p.ExtendedEvalContext().Annotations = &p.SemaCtx().Annotations
+}
+
+// Optimizer is part of the eval.Planner interface.
+func (p *planner) Optimizer() interface{} {
+	return p.optPlanningCtx.Optimizer()
 }

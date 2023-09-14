@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenantdirsvr"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -32,25 +31,25 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
-
-// To ensure tenant startup code is included.
-var _ = kvtenantccl.Connector{}
 
 func TestDirectoryErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.ScopeWithoutShowLogs(t).Close(t)
 
-	const tenantID = 10
-
 	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
 
-	tc, dir, _ := newTestDirectoryCache(t)
-	defer tc.Stopper().Stop(ctx)
+	dir, _ := tenantdirsvr.SetupTestDirectory(t, ctx, stopper, nil /* timeSource */)
 
-	_, err := dir.TryLookupTenantPods(ctx, roachpb.MustMakeTenantID(1000))
+	// Fail to find a tenant that does not exist.
+	_, err := dir.LookupTenant(ctx, roachpb.MustMakeTenantID(1000))
+	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant does not exist")
+
+	// Fail to find a tenant that does not exist.
+	_, err = dir.TryLookupTenantPods(ctx, roachpb.MustMakeTenantID(1000))
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 1000 not in directory cache")
 	_, err = dir.TryLookupTenantPods(ctx, roachpb.MustMakeTenantID(1001))
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 1001 not in directory cache")
@@ -58,15 +57,205 @@ func TestDirectoryErrors(t *testing.T) {
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 1002 not in directory cache")
 
 	// Fail to find tenant that does not exist.
-	_, err = dir.LookupTenantPods(ctx, roachpb.MustMakeTenantID(1000), "")
-	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 1000 not found")
-
-	// Fail to find tenant when cluster name doesn't match.
-	_, err = dir.LookupTenantPods(ctx, roachpb.MustMakeTenantID(tenantID), "unknown")
-	require.EqualError(t, err, "rpc error: code = NotFound desc = cluster name unknown doesn't match expected tenant-cluster")
+	_, err = dir.LookupTenantPods(ctx, roachpb.MustMakeTenantID(1000))
+	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant does not exist")
 
 	// No-op when reporting failure for tenant that doesn't exit.
 	require.NoError(t, dir.ReportFailure(ctx, roachpb.MustMakeTenantID(1000), ""))
+}
+
+func TestWatchTenants(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	// Make tenant watcher channel.
+	tenantWatcher := make(chan *tenant.WatchTenantsResponse, 1)
+
+	// Setup test directory cache and server.
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	dir, tds := tenantdirsvr.SetupTestDirectory(t, ctx, stopper, nil, /* timeSource */
+		tenant.TenantWatcher(tenantWatcher))
+
+	// Wait until the tenant watcher has been established.
+	testutils.SucceedsSoon(t, func() error {
+		if tds.WatchTenantsListenersCount() == 0 {
+			return errors.New("watchers have not been established yet")
+		}
+		return nil
+	})
+
+	// Creating a tenant should have no effect if the proxy hasn't initialized
+	// it before.
+	tenantID := roachpb.MustMakeTenantID(20)
+	baseTenant := &tenant.Tenant{
+		Version:                 "010",
+		TenantID:                tenantID.ToUint64(),
+		ClusterName:             "my-tenant",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16"},
+		AllowedPrivateEndpoints: []string{"a"},
+	}
+	tds.CreateTenant(tenantID, baseTenant)
+	resp := <-tenantWatcher
+	require.Equal(t, tenant.EVENT_ADDED, resp.Type)
+	require.Equal(t, &tenant.Tenant{
+		Version:                 "010",
+		TenantID:                20,
+		ClusterName:             "my-tenant",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16"},
+		AllowedPrivateEndpoints: []string{"a"},
+	}, resp.Tenant)
+	_, err := dir.TryLookupTenantPods(ctx, tenantID)
+	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 20 not in directory cache")
+
+	// Now perform the lookup, which will call Initialize.
+	tenantObj, err := dir.LookupTenant(ctx, tenantID)
+	require.NoError(t, err)
+	require.Equal(t, &tenant.Tenant{
+		Version:                 "010",
+		TenantID:                20,
+		ClusterName:             "my-tenant",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16"},
+		AllowedPrivateEndpoints: []string{"a"},
+	}, tenantObj)
+
+	// Update the tenant object.
+	updatedTenant := &tenant.Tenant{
+		Version:                 "011",
+		TenantID:                20,
+		ClusterName:             "foo-bar",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16", "0.0.0.0/0"},
+		AllowedPrivateEndpoints: []string{"a", "b"},
+	}
+	tds.UpdateTenant(tenantID, updatedTenant)
+	resp = <-tenantWatcher
+	require.Equal(t, tenant.EVENT_MODIFIED, resp.Type)
+	require.Equal(t, updatedTenant, resp.Tenant)
+
+	// The tenant should be updated.
+	tenantObj, err = dir.LookupTenant(ctx, tenantID)
+	require.NoError(t, err)
+	require.Equal(t, &tenant.Tenant{
+		Version:                 "011",
+		TenantID:                20,
+		ClusterName:             "foo-bar",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16", "0.0.0.0/0"},
+		AllowedPrivateEndpoints: []string{"a", "b"},
+	}, tenantObj)
+
+	// Update the tenant object with an old version.
+	updatedTenant = &tenant.Tenant{
+		Version:     "008",
+		TenantID:    tenantID.ToUint64(),
+		ClusterName: "foo-bar-baz",
+	}
+	tds.UpdateTenant(tenantID, updatedTenant)
+	resp = <-tenantWatcher
+	require.Equal(t, tenant.EVENT_MODIFIED, resp.Type)
+	require.Equal(t, updatedTenant, resp.Tenant)
+
+	// Tenant should still stay as v=011.
+	tenantObj, err = dir.LookupTenant(ctx, tenantID)
+	require.NoError(t, err)
+	require.Equal(t, &tenant.Tenant{
+		Version:                 "011",
+		TenantID:                20,
+		ClusterName:             "foo-bar",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16", "0.0.0.0/0"},
+		AllowedPrivateEndpoints: []string{"a", "b"},
+	}, tenantObj)
+
+	// Finally, delete the tenant.
+	tds.DeleteTenant(tenantID)
+	resp = <-tenantWatcher
+	require.Equal(t, tenant.EVENT_DELETED, resp.Type)
+	require.Equal(t, &tenant.Tenant{TenantID: 20}, resp.Tenant)
+	_, err = dir.LookupTenant(ctx, tenantID)
+	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant does not exist")
+
+	// Create two tenants: one to delete, and the other to modify.
+	tenant10 := roachpb.MustMakeTenantID(10)
+	tenant20 := roachpb.MustMakeTenantID(20)
+	tenant10Data := &tenant.Tenant{
+		Version:     "001",
+		TenantID:    tenant10.ToUint64(),
+		ClusterName: "tenant-to-delete",
+	}
+	tenant20Data := &tenant.Tenant{
+		Version:     "001",
+		TenantID:    tenant20.ToUint64(),
+		ClusterName: "tenant-to-modify",
+	}
+	tds.CreateTenant(tenant10, tenant10Data)
+	tds.CreateTenant(tenant20, tenant20Data)
+
+	tenantObj, err = dir.LookupTenant(ctx, tenant10)
+	require.NoError(t, err)
+	require.Equal(t, tenant10Data, tenantObj)
+	resp = <-tenantWatcher
+	require.Equal(t, tenant.EVENT_ADDED, resp.Type)
+	require.Equal(t, tenant10Data, resp.Tenant)
+	tenantObj, err = dir.LookupTenant(ctx, tenant20)
+	require.NoError(t, err)
+	require.Equal(t, tenant20Data, tenantObj)
+	resp = <-tenantWatcher
+	require.Equal(t, tenant.EVENT_ADDED, resp.Type)
+	require.Equal(t, tenant20Data, resp.Tenant)
+
+	// Trigger the directory server to restart. WatchTenants should handle
+	// reconnection properly.
+	tds.Stop(ctx)
+	testutils.SucceedsSoon(t, func() error {
+		if tds.WatchTenantsListenersCount() != 0 {
+			return errors.New("watchers have not been removed yet")
+		}
+		return nil
+	})
+
+	// Trigger events, which will be missed by the tenant watcher.
+	tds.DeleteTenant(tenant10)
+	tenant20Data.Version = "002"
+	tenant20Data.ClusterName = "dim-dog"
+	tds.UpdateTenant(tenant20, tenant20Data)
+
+	// Make sure that entries are still valid.
+	tenantObj, err = dir.LookupTenant(ctx, tenant10)
+	require.NoError(t, err)
+	require.Equal(t, tenant10Data, tenantObj)
+
+	// Start the directory server again.
+	require.NoError(t, tds.Start(ctx))
+	testutils.SucceedsSoon(t, func() error {
+		if tds.WatchTenantsListenersCount() == 0 {
+			return errors.New("watchers have not been established yet")
+		}
+		return nil
+	})
+
+	// Trigger a tenant update.
+	tds.UpdateTenant(tenant20, tenant20Data)
+
+	// Eventually, cache should be updated.
+	testutils.SucceedsSoon(t, func() error {
+		obj, err := dir.LookupTenant(ctx, tenant20)
+		if err != nil {
+			return err
+		}
+		if obj.Version != "002" {
+			return errors.New("tenant isn't updated yet")
+		}
+		return nil
+	})
+
+	// Tenant 10 should still be valid since deleted tenants are not removed.
+	tenantObj, err = dir.LookupTenant(ctx, tenant10)
+	require.NoError(t, err)
+	require.Equal(t, tenant10Data, tenantObj)
+
+	// Check that tenant is deleted.
+	_, err = dir.LookupTenantPods(ctx, tenant10)
+	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant does not exist")
 }
 
 func TestWatchPods(t *testing.T) {
@@ -80,18 +269,21 @@ func TestWatchPods(t *testing.T) {
 	// Setup test directory cache and server.
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	dir, tds := setupTestDirectory(t, ctx, stopper, nil /* timeSource */, tenant.PodWatcher(podWatcher))
+	dir, tds := tenantdirsvr.SetupTestDirectory(t, ctx, stopper, nil /* timeSource */, tenant.PodWatcher(podWatcher))
 
 	// Wait until the watcher has been established.
 	testutils.SucceedsSoon(t, func() error {
-		if tds.WatchListenersCount() == 0 {
+		if tds.WatchPodsListenersCount() == 0 {
 			return errors.New("watchers have not been established yet")
 		}
 		return nil
 	})
 
 	tenantID := roachpb.MustMakeTenantID(20)
-	tds.CreateTenant(tenantID, "my-tenant")
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:    tenantID.ToUint64(),
+		ClusterName: "my-tenant",
+	})
 
 	// Add a new pod to the tenant.
 	runningPod := &tenant.Pod{
@@ -142,7 +334,7 @@ func TestWatchPods(t *testing.T) {
 	// updates (just like how Kubernetes bookmarks work).
 	tds.Stop(ctx)
 	testutils.SucceedsSoon(t, func() error {
-		if tds.WatchListenersCount() != 0 {
+		if tds.WatchPodsListenersCount() != 0 {
 			return errors.New("watchers have not been removed yet")
 		}
 		return nil
@@ -154,7 +346,7 @@ func TestWatchPods(t *testing.T) {
 	// Start the directory server again.
 	require.NoError(t, tds.Start(ctx))
 	testutils.SucceedsSoon(t, func() error {
-		if tds.WatchListenersCount() == 0 {
+		if tds.WatchPodsListenersCount() == 0 {
 			return errors.New("watchers have not been established yet")
 		}
 		return nil
@@ -170,7 +362,7 @@ func TestWatchPods(t *testing.T) {
 	// that we attempted to call EnsurePod in the test directory server because
 	// the cache has no running pods. In the actual directory server, this
 	// should put the draining pod back to running.
-	pods, err = dir.LookupTenantPods(ctx, tenantID, "my-tenant")
+	pods, err = dir.LookupTenantPods(ctx, tenantID)
 	require.Regexp(t, "tenant has no pods", err)
 	require.Empty(t, pods)
 
@@ -217,7 +409,7 @@ func TestCancelLookups(t *testing.T) {
 	for i := 0; i < lookupCount; i++ {
 		wait.Add(1)
 		go func(i int) {
-			_, backgroundErrors[i] = dir.LookupTenantPods(ctx, tenantID, "")
+			_, backgroundErrors[i] = dir.LookupTenantPods(ctx, tenantID)
 			wait.Done()
 		}(i)
 	}
@@ -236,7 +428,6 @@ func TestCancelLookups(t *testing.T) {
 func TestResume(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.ScopeWithoutShowLogs(t).Close(t)
-	skip.UnderDeadlockWithIssue(t, 71365)
 
 	tenantID := roachpb.MustMakeTenantID(40)
 	const lookupCount = 5
@@ -255,27 +446,29 @@ func TestResume(t *testing.T) {
 	for i := 0; i < lookupCount; i++ {
 		wait.Add(1)
 		go func(i int) {
-			pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+			pods, err := dir.LookupTenantPods(ctx, tenantID)
 			require.NoError(t, err)
 			addrs[i] = pods[0].Addr
 			wait.Done()
 		}(i)
 	}
 
-	var processes map[net.Addr]*tenantdirsvr.Process
 	// Eventually the tenant process will be resumed.
-	require.Eventually(t, func() bool {
-		processes = tds.Get(tenantID)
-		return len(processes) == 1
-	}, 10*time.Second, 100*time.Millisecond)
+	var sqlAddr string
+	testutils.SucceedsSoon(t, func() error {
+		processes := tds.Get(tenantID)
+		if len(processes) != 1 {
+			return errors.Newf("expected 1 processes found %d", len(processes))
+		}
+		sqlAddr = processes[0].SQLAddr
+		return nil
+	})
 
 	// Wait until background goroutines complete.
 	wait.Wait()
 
-	for addr := range processes {
-		for i := 0; i < lookupCount; i++ {
-			require.Equal(t, addr.String(), addrs[i])
-		}
+	for i := 0; i < lookupCount; i++ {
+		require.Equal(t, sqlAddr, addrs[i])
 	}
 }
 
@@ -294,14 +487,23 @@ func TestDeleteTenant(t *testing.T) {
 	require.NoError(t, createTenant(tc, tenantID))
 
 	// Perform lookup to create entry in cache.
-	pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+	pods, err := dir.LookupTenantPods(ctx, tenantID)
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr := pods[0].Addr
 
+	// LookupTenant should work.
+	ten, err := dir.LookupTenant(ctx, tenantID)
+	require.NoError(t, err)
+	require.Equal(t, &tenant.Tenant{
+		TenantID:          50,
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	}, ten)
+
 	// Report failure even though tenant is healthy - refresh should do nothing.
 	require.NoError(t, dir.ReportFailure(ctx, tenantID, addr))
-	pods, err = dir.LookupTenantPods(ctx, tenantID, "")
+	pods, err = dir.LookupTenantPods(ctx, tenantID)
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr = pods[0].Addr
@@ -311,13 +513,28 @@ func TestDeleteTenant(t *testing.T) {
 		process.Stopper.Stop(ctx)
 	}
 
-	// Report failure connecting to the pod to force refresh of addrs.
-	require.NoError(t, dir.ReportFailure(ctx, tenantID, addr))
+	// There is a rare race condition where the watch event can overwrite
+	// ListPods inside ReportFailure. If that happens, retrying the ReportFailure
+	// should work as expected.
+	// See https://github.com/cockroachdb/cockroach/issues/86077
+	testutils.SucceedsSoon(t, func() error {
+		// Report failure connecting to the pod to force refresh of addrs.
+		if err := dir.ReportFailure(ctx, tenantID, addr); err != nil {
+			return err
+		}
 
-	// Ensure that tenant has no valid IP addresses.
-	pods, err = dir.TryLookupTenantPods(ctx, tenantID)
-	require.NoError(t, err)
-	require.Empty(t, pods)
+		// Ensure that tenant has no valid IP addresses.
+		pods, err = dir.TryLookupTenantPods(ctx, tenantID)
+		if err != nil {
+			return err
+		}
+
+		if len(pods) != 0 {
+			return errors.Newf("expected 0 pods found %v", pods)
+		}
+
+		return nil
+	})
 
 	// Report failure again to ensure that works when there is no ip address.
 	require.NoError(t, dir.ReportFailure(ctx, tenantID, addr))
@@ -327,7 +544,7 @@ func TestDeleteTenant(t *testing.T) {
 
 	// Now LookupTenantPods should return an error and the directory should no
 	// longer cache the tenant.
-	_, err = dir.LookupTenantPods(ctx, tenantID, "")
+	_, err = dir.LookupTenantPods(ctx, tenantID)
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 50 not found")
 	pods, err = dir.TryLookupTenantPods(ctx, tenantID)
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 50 not in directory cache")
@@ -351,7 +568,7 @@ func TestRefreshThrottling(t *testing.T) {
 	require.NoError(t, createTenant(tc, tenantID))
 
 	// Perform lookup to create entry in cache.
-	pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+	pods, err := dir.LookupTenantPods(ctx, tenantID)
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr := pods[0].Addr
@@ -370,8 +587,8 @@ func TestRefreshThrottling(t *testing.T) {
 		State:    tenant.RUNNING,
 	}}, pods)
 
-	// Now destroy the tenant and call ReportFailure again. This should be a no-op
-	// due to refresh throttling.
+	// Now destroy the tenant and call ReportFailure again. This should be a
+	// no-op due to refresh throttling.
 	require.NoError(t, destroyTenant(tc, tenantID))
 	require.NoError(t, dir.ReportFailure(ctx, tenantID, addr))
 	pods, err = dir.TryLookupTenantPods(ctx, tenantID)
@@ -423,9 +640,8 @@ func destroyTenant(tc serverutils.TestClusterInterface, id roachpb.TenantID) err
 }
 
 func startTenant(
-	ctx context.Context, srv serverutils.TestServerInterface, id uint64,
-) (*tenantdirsvr.Process, error) {
-	tenantStopper := tenantdirsvr.NewSubStopper(srv.Stopper())
+	ctx context.Context, tenantStopper *stop.Stopper, srv serverutils.TestServerInterface, id uint64,
+) (string, error) {
 	t, err := srv.StartTenant(
 		ctx,
 		base.TestTenantArgs{
@@ -439,49 +655,11 @@ func startTenant(
 	if err != nil {
 		// Remap tenant "not found" error to GRPC NotFound error.
 		if testutils.IsError(err, "not found|no tenant found") {
-			return nil, status.Errorf(codes.NotFound, "tenant %d not found", id)
+			return "", status.Errorf(codes.NotFound, "tenant %d not found", id)
 		}
-		return nil, err
+		return "", err
 	}
-	sqlAddr, err := net.ResolveTCPAddr("tcp", t.SQLAddr())
-	if err != nil {
-		return nil, err
-	}
-	return &tenantdirsvr.Process{SQL: sqlAddr, Stopper: tenantStopper}, nil
-}
-
-// setupTestDirectory returns an instance of the directory cache and the
-// in-memory test static directory server. Tenants will need to be added/removed
-// manually.
-func setupTestDirectory(
-	t *testing.T,
-	ctx context.Context,
-	stopper *stop.Stopper,
-	timeSource timeutil.TimeSource,
-	opts ...tenant.DirOption,
-) (tenant.DirectoryCache, *tenantdirsvr.TestStaticDirectoryServer) {
-	t.Helper()
-
-	// Start an in-memory static directory server.
-	directoryServer := tenantdirsvr.NewTestStaticDirectoryServer(stopper, timeSource)
-	require.NoError(t, directoryServer.Start(ctx))
-
-	// Dial the test directory server.
-	conn, err := grpc.DialContext(
-		ctx,
-		"",
-		grpc.WithContextDialer(directoryServer.DialerFunc),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	require.NoError(t, err)
-	stopper.AddCloser(stop.CloserFn(func() {
-		_ = conn.Close() // nolint:grpcconnclose
-	}))
-	client := tenant.NewDirectoryClient(conn)
-	directoryCache, err := tenant.NewDirectoryCache(ctx, stopper, client, opts...)
-	require.NoError(t, err)
-
-	return directoryCache, directoryServer
+	return t.SQLAddr(), nil
 }
 
 // Setup directory cache that uses a client connected to a test directory server
@@ -493,29 +671,26 @@ func newTestDirectoryCache(
 	directoryCache tenant.DirectoryCache,
 	tds *tenantdirsvr.TestDirectoryServer,
 ) {
-	tc = serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+	tc = serverutils.StartCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			// We need to start the cluster insecure in order to not
 			// care about TLS settings for the RPC client connection.
-			Insecure: true,
-			// Test fails when run within a tenant. More investigation
-			// is required here. Tracked with #76387.
-			DisableDefaultTestTenant: true,
+			Insecure:          true,
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		},
 	})
 	clusterStopper := tc.Stopper()
 	var err error
-	tds, err = tenantdirsvr.New(clusterStopper)
-	require.NoError(t, err)
-	tds.TenantStarterFunc = func(ctx context.Context, tenantID uint64) (*tenantdirsvr.Process, error) {
+	tds, err = tenantdirsvr.New(clusterStopper, func(ctx context.Context, stopper *stop.Stopper, tenantID uint64) (string, error) {
 		t.Logf("starting tenant %d", tenantID)
-		process, err := startTenant(ctx, tc.Server(0), tenantID)
+		sqlAddr, err := startTenant(ctx, stopper, tc.Server(0), tenantID)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		t.Logf("tenant %d started", tenantID)
-		return process, nil
-	}
+		return sqlAddr, nil
+	})
+	require.NoError(t, err)
 
 	listenPort, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

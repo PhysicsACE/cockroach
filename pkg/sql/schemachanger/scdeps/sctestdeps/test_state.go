@@ -89,6 +89,7 @@ type TestState struct {
 type catalogChanges struct {
 	descs               []catalog.Descriptor
 	namesToDelete       map[descpb.NameInfo]descpb.ID
+	namesToAdd          map[descpb.NameInfo]descpb.ID
 	descriptorsToDelete catalog.DescriptorIDSet
 	zoneConfigsToDelete catalog.DescriptorIDSet
 	commentsToUpdate    map[catalogkeys.CommentKey]string
@@ -152,8 +153,7 @@ func catalogDeepCopy(u nstree.Catalog) (ret nstree.MutableCatalog) {
 		return nil
 	})
 	_ = u.ForEachComment(func(key catalogkeys.CommentKey, cmt string) error {
-		ret.UpsertComment(key, cmt)
-		return nil
+		return ret.UpsertComment(key, cmt)
 	})
 	_ = u.ForEachZoneConfig(func(id catid.DescID, zc catalog.ZoneConfig) error {
 		zc = zc.Clone()
@@ -212,6 +212,11 @@ func (s *TestState) CanPerformDropOwnedBy(
 	ctx context.Context, role username.SQLUsername,
 ) (bool, error) {
 	return true, nil
+}
+
+// CanCreateCrossDBSequenceOwnerRef implements scbuild.SchemaFeatureCheck.
+func (s *TestState) CanCreateCrossDBSequenceOwnerRef() error {
+	return nil
 }
 
 // FeatureChecker implements scbuild.Dependencies

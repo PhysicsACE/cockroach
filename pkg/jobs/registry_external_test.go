@@ -40,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -52,7 +51,7 @@ func TestRoundtripJob(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	registry := s.JobRegistry().(*jobs.Registry)
 	defer s.Stopper().Stop(ctx)
 
@@ -94,31 +93,15 @@ func TestExpiringSessionsAndClaimJobsDoesNotTouchTerminalJobs(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 
-	payload, err := protoutil.Marshal(&jobspb.Payload{
-		Details: jobspb.WrapPayloadDetails(jobspb.BackupDetails{}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	progress, err := protoutil.Marshal(&jobspb.Progress{
-		Details: jobspb.WrapProgressDetails(jobspb.BackupProgress{}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	const insertQuery = `
    INSERT
      INTO system.jobs (
                         status,
-                        payload,
-                        progress,
                         claim_session_id,
                         claim_instance_id
                       )
-   VALUES ($1, $2, $3, $4, $5)
+   VALUES ($1, $2, $3)
 RETURNING id;
 `
 	// Disallow clean up of claimed jobs
@@ -128,12 +111,10 @@ RETURNING id;
 	terminalClaims := make([][]byte, len(terminalStatuses))
 	for i, s := range terminalStatuses {
 		terminalClaims[i] = uuid.MakeV4().GetBytes() // bogus claim
-		tdb.QueryRow(t, insertQuery, s, payload, progress, terminalClaims[i], 42).
-			Scan(&terminalIDs[i])
+		tdb.QueryRow(t, insertQuery, s, terminalClaims[i], 42).Scan(&terminalIDs[i])
 	}
 	var nonTerminalID jobspb.JobID
-	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, payload, progress, uuid.MakeV4().GetBytes(), 42).
-		Scan(&nonTerminalID)
+	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, uuid.MakeV4().GetBytes(), 42).Scan(&nonTerminalID)
 
 	checkClaimEqual := func(id jobspb.JobID, exp []byte) error {
 		const getClaimQuery = `SELECT claim_session_id FROM system.jobs WHERE id = $1`
@@ -217,12 +198,13 @@ func TestRegistrySettingUpdate(t *testing.T) {
 	}
 
 	for _, test := range [...]struct {
-		name       string      // Test case ID.
-		setting    string      // Cluster setting key.
-		value      interface{} // Duration when expecting a large number of job runs.
-		matchStmt  string      // SQL statement to match to identify the target job.
-		initCount  int         // Initial number of jobs to ignore at the beginning of the test.
-		toOverride *settings.DurationSetting
+		name         string      // Test case ID.
+		setting      string      // Cluster setting key.
+		value        interface{} // Duration when expecting a large number of job runs.
+		matchStmt    string      // SQL statement to match to identify the target job.
+		matchAppName string
+		initCount    int // Initial number of jobs to ignore at the beginning of the test.
+		toOverride   *settings.DurationSetting
 	}{
 		{
 			name:       "adopt setting",
@@ -257,33 +239,44 @@ func TestRegistrySettingUpdate(t *testing.T) {
 			toOverride: jobs.CancelIntervalSetting,
 		},
 		{
-			name:       "gc setting",
-			setting:    jobs.GcIntervalSettingKey,
-			value:      shortDuration,
-			matchStmt:  jobs.GcQuery,
-			initCount:  0,
-			toOverride: jobs.GcIntervalSetting,
+			name:         "gc setting",
+			setting:      jobs.GcIntervalSettingKey,
+			value:        shortDuration,
+			matchAppName: "$ internal-gc-jobs",
+			initCount:    0,
+			toOverride:   jobs.GcIntervalSetting,
 		},
 		{
-			name:       "gc setting with base",
-			setting:    jobs.IntervalBaseSettingKey,
-			value:      shortDurationBase,
-			matchStmt:  jobs.GcQuery,
-			initCount:  0,
-			toOverride: jobs.GcIntervalSetting,
+			name:         "gc setting with base",
+			setting:      jobs.IntervalBaseSettingKey,
+			value:        shortDurationBase,
+			matchAppName: "$ internal-gc-jobs",
+			initCount:    0,
+			toOverride:   jobs.GcIntervalSetting,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
-			// Replace multiple white spaces with a single space, remove the last ';', and
-			// trim leading and trailing spaces.
-			matchStmt := strings.TrimSpace(regexp.MustCompile(`(\s+|;+)`).ReplaceAllString(test.matchStmt, " "))
+			var stmtMatcher func(*sessiondata.SessionData, string) bool
+			if test.matchAppName != "" {
+				stmtMatcher = func(sd *sessiondata.SessionData, _ string) bool {
+					return sd.ApplicationName == test.matchAppName
+				}
+			} else {
+				// Replace multiple white spaces with a single space, remove the last ';', and
+				// trim leading and trailing spaces.
+				matchStmt := strings.TrimSpace(regexp.MustCompile(`(\s+|;+)`).ReplaceAllString(test.matchStmt, " "))
+				stmtMatcher = func(_ *sessiondata.SessionData, stmt string) bool {
+					return stmt == matchStmt
+				}
+			}
+
 			var seen = int32(0)
-			stmtFilter := func(ctxt context.Context, _ *sessiondata.SessionData, stmt string, err error) {
+			stmtFilter := func(_ context.Context, sd *sessiondata.SessionData, stmt string, err error) {
 				if err != nil {
 					return
 				}
-				if stmt == matchStmt {
+				if stmtMatcher(sd, stmt) {
 					atomic.AddInt32(&seen, 1)
 				}
 			}
@@ -346,13 +339,12 @@ func TestGCDurationControl(t *testing.T) {
 	//
 	// Replace multiple white spaces with a single space, remove the last ';', and
 	// trim leading and trailing spaces.
-	gcStmt := strings.TrimSpace(regexp.MustCompile(`(\s+|;+)`).ReplaceAllString(jobs.GcQuery, " "))
 	var seen = int32(0)
-	stmtFilter := func(ctxt context.Context, _ *sessiondata.SessionData, stmt string, err error) {
+	stmtFilter := func(_ context.Context, sd *sessiondata.SessionData, _ string, err error) {
 		if err != nil {
 			return
 		}
-		if stmt == gcStmt {
+		if sd.ApplicationName == "$ internal-gc-jobs" {
 			atomic.AddInt32(&seen, 1)
 		}
 	}
@@ -562,7 +554,7 @@ SELECT unnest(execution_errors)
 		t *testing.T, id jobspb.JobID, status jobs.Status,
 		from, to time.Time, cause string,
 	) {
-		log.Flush()
+		log.FlushFiles()
 		entries, err := log.FetchEntriesFromFiles(
 			from.UnixNano(), to.UnixNano(), 2,
 			regexp.MustCompile(fmt.Sprintf(

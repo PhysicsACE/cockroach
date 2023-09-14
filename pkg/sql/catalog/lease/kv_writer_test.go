@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -41,7 +43,7 @@ import (
 // lease table from 1 to 2. It is injected from the lease_test package so that
 // it can use sql primitives.
 var MoveTablePrimaryIndexIDto2 func(
-	context.Context, *testing.T, serverutils.TestServerInterface, descpb.ID,
+	context.Context, *testing.T, serverutils.ApplicationLayerInterface, descpb.ID,
 )
 
 // TestKVWriterMatchesIEWriter is a rather involved test to exercise the
@@ -52,36 +54,36 @@ var MoveTablePrimaryIndexIDto2 func(
 // they are the same.
 func TestKVWriterMatchesIEWriter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	// Otherwise, we wouldn't get complete SSTs in our export under stress.
-	tdb.Exec(t, "SET CLUSTER SETTING admission.elastic_cpu.enabled = false")
+	sqlutils.MakeSQLRunner(srv.SystemLayer().SQLConn(t, "")).Exec(
+		t, "SET CLUSTER SETTING admission.elastic_cpu.enabled = false",
+	)
 
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	schema := systemschema.LeaseTableSchema
-	if systemschema.TestSupportMultiRegion() {
-		schema = systemschema.MRLeaseTableSchema
-	}
 	makeTable := func(name string) (id descpb.ID) {
 		tdb.Exec(t, strings.Replace(schema, "system.lease", name, 1))
 		tdb.QueryRow(t, "SELECT id FROM system.namespace WHERE name = $1", name).Scan(&id)
 		// The MR variant of the table uses a non-
-		if systemschema.TestSupportMultiRegion() {
-			MoveTablePrimaryIndexIDto2(ctx, t, s, id)
-		}
+		MoveTablePrimaryIndexIDto2(ctx, t, s, id)
 		return id
 	}
 	lease1ID := makeTable("lease1")
 	lease2ID := makeTable("lease2")
 
 	ie := s.InternalExecutor().(isql.Executor)
-	codec := s.LeaseManager().(*Manager).Codec()
+	codec := s.Codec()
+	settingsWatcher := s.SettingsWatcher().(*settingswatcher.SettingsWatcher)
 	w := teeWriter{
 		a: newInternalExecutorWriter(ie, "defaultdb.public.lease1"),
-		b: newKVWriter(codec, kvDB, lease2ID),
+		b: newKVWriter(codec, kvDB, lease2ID, settingsWatcher),
 	}
 	start := kvDB.Clock().Now()
 	groups := generateWriteOps(2<<10, 1<<10)
@@ -157,7 +159,7 @@ func getRawHistoryKVs(
 				} else if !ok {
 					return nil
 				}
-				k := it.Key()
+				k := it.UnsafeKey().Clone()
 				suffix, _, err := codec.DecodeTablePrefix(k.Key)
 				require.NoError(t, err)
 				v, err := it.Value()
@@ -205,13 +207,11 @@ func generateWriteOps(n, numGroups int) func() (_ []writeOp, wantMore bool) {
 			panic(err)
 		}
 		lf := leaseFields{
-			descID:     descpb.ID(rand.Intn(vals)),
-			version:    descpb.DescriptorVersion(rand.Intn(vals)),
-			instanceID: base.SQLInstanceID(rand.Intn(vals)),
-			expiration: *ts,
-		}
-		if systemschema.TestSupportMultiRegion() {
-			lf.regionPrefix = enum.One
+			descID:       descpb.ID(rand.Intn(vals)),
+			version:      descpb.DescriptorVersion(rand.Intn(vals)),
+			instanceID:   base.SQLInstanceID(rand.Intn(vals)),
+			expiration:   *ts,
+			regionPrefix: enum.One,
 		}
 		return lf
 	}

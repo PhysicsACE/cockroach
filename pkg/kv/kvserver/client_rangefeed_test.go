@@ -77,7 +77,7 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 		rangefeedErrChan := make(chan error, 1)
 		ctxToCancel, cancel := context.WithCancel(ctx)
 		go func() {
-			rangefeedErrChan <- ds.RangeFeed(ctxToCancel, []roachpb.Span{descTableSpan}, startTS, false /* withDiff */, evChan)
+			rangefeedErrChan <- ds.RangeFeed(ctxToCancel, []roachpb.Span{descTableSpan}, startTS, evChan)
 		}()
 
 		// Note: 42 is a system descriptor.
@@ -137,7 +137,7 @@ func TestRangefeedWorksOnSystemRangesUnconditionally(t *testing.T) {
 		})
 		evChan := make(chan kvcoord.RangeFeedMessage)
 		require.Regexp(t, `rangefeeds require the kv\.rangefeed.enabled setting`,
-			ds.RangeFeed(ctx, []roachpb.Span{scratchSpan}, startTS, false /* withDiff */, evChan))
+			ds.RangeFeed(ctx, []roachpb.Span{scratchSpan}, startTS, evChan))
 	})
 }
 
@@ -191,7 +191,6 @@ func TestMergeOfRangeEventTableWhileRunningRangefeed(t *testing.T) {
 		rangefeedErrChan <- ds.RangeFeed(rangefeedCtx,
 			[]roachpb.Span{lhsRepl.Desc().RSpan().AsRawSpanWithNoLocals()},
 			start,
-			false, /* withDiff */
 			eventCh)
 	}()
 
@@ -222,15 +221,17 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	clusterArgs := aggressiveResolvedTimestampClusterArgs
-	// We want to manually add a non-voter to a range in this test, so disable
-	// the replicateQueue to prevent it from disrupting the test.
-	clusterArgs.ReplicationMode = base.ReplicationManual
+	clusterArgs := aggressiveResolvedTimestampManuallyReplicatedClusterArgs
 	// NB: setupClusterForClosedTSTesting sets a low closed timestamp target
 	// duration.
-	tc, _, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, clusterArgs, "cttest", "kv")
+	// NB: the replicate queue is disabled in this test, so we can manually add a
+	// non-voter to a range without being disrupted.
+	tc, _, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, 0, clusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
-	tc.AddNonVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1))
+	// This test doesn't want the default voters on s2 and s3. We want only
+	// the voter on s1 and a non-voter on s2.
+	desc = tc.RemoveVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1), tc.Target(2))
+	desc = tc.AddNonVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1))
 
 	db := tc.Server(1).DB()
 	ds := tc.Server(1).DistSenderI().(*kvcoord.DistSender)
@@ -256,7 +257,6 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 			rangefeedCtx,
 			[]roachpb.Span{desc.RSpan().AsRawSpanWithNoLocals()},
 			startTS,
-			false, /* withDiff */
 			eventCh,
 		)
 	}()
@@ -271,7 +271,8 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	}
 	rangefeedCancel()
 	require.Regexp(t, "context canceled", <-rangefeedErrChan)
-	require.Regexp(t, "attempting to create a RangeFeed over replica.*2NON_VOTER", getRecAndFinish().String())
+	require.Regexp(t, `attempting to create a RangeFeed over replica .n2,s2.:\dNON_VOTER`,
+		getRecAndFinish().String())
 }
 
 // TestRangefeedWorksOnLivenessRange ensures that a rangefeed works as expected
@@ -285,7 +286,7 @@ func TestRangefeedWorksOnLivenessRange(t *testing.T) {
 	// Speed up node liveness heartbeats.
 	var raftCfg base.RaftConfig
 	raftCfg.SetDefaults()
-	raftCfg.RangeLeaseRaftElectionTimeoutMultiplier = 1
+	raftCfg.RangeLeaseDuration = time.Second
 
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
@@ -310,7 +311,7 @@ func TestRangefeedWorksOnLivenessRange(t *testing.T) {
 	eventC := make(chan kvcoord.RangeFeedMessage)
 	errC := make(chan error, 1)
 	go func() {
-		errC <- ds.RangeFeed(ctx, []roachpb.Span{keys.NodeLivenessSpan}, startTS, false /* withDiff */, eventC)
+		errC <- ds.RangeFeed(ctx, []roachpb.Span{keys.NodeLivenessSpan}, startTS, eventC)
 	}()
 
 	// Wait for a liveness update.

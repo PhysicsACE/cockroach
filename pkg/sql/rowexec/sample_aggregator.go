@@ -93,7 +93,6 @@ func newSampleAggregator(
 	spec *execinfrapb.SampleAggregatorSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*sampleAggregator, error) {
 	for _, s := range spec.Sketches {
 		if len(s.Columns) == 0 {
@@ -113,7 +112,16 @@ func newSampleAggregator(
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// The processor will disable histogram collection if this limit is not
 	// enough.
-	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "sample-aggregator-mem")
+	//
+	// sampleAggregator doesn't spill to disk, so ensure some reasonable lower
+	// bound on the workmem limit.
+	var minMemoryLimit int64 = 8 << 20 // 8MiB
+	if flowCtx.Cfg.TestingKnobs.MemoryLimitBytes != 0 {
+		minMemoryLimit = flowCtx.Cfg.TestingKnobs.MemoryLimitBytes
+	}
+	memMonitor := execinfra.NewLimitedMonitorWithLowerBound(
+		ctx, flowCtx, "sample-aggregator-mem", minMemoryLimit,
+	)
 	rankCol := len(input.OutputTypes()) - 8
 	s := &sampleAggregator{
 		spec:         spec,
@@ -172,7 +180,7 @@ func newSampleAggregator(
 	}
 
 	if err := s.Init(
-		ctx, nil, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor,
+		ctx, nil, post, input.OutputTypes(), flowCtx, processorID, memMonitor,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				s.close()
@@ -185,22 +193,22 @@ func newSampleAggregator(
 	return s, nil
 }
 
-func (s *sampleAggregator) pushTrailingMeta(ctx context.Context) {
-	execinfra.SendTraceData(ctx, s.Output)
+func (s *sampleAggregator) pushTrailingMeta(ctx context.Context, output execinfra.RowReceiver) {
+	execinfra.SendTraceData(ctx, s.FlowCtx, output)
 }
 
 // Run is part of the Processor interface.
-func (s *sampleAggregator) Run(ctx context.Context) {
+func (s *sampleAggregator) Run(ctx context.Context, output execinfra.RowReceiver) {
 	ctx = s.StartInternal(ctx, sampleAggregatorProcName)
 	s.input.Start(ctx)
 
-	earlyExit, err := s.mainLoop(ctx)
+	earlyExit, err := s.mainLoop(ctx, output)
 	if err != nil {
-		execinfra.DrainAndClose(ctx, s.Output, err, s.pushTrailingMeta, s.input)
+		execinfra.DrainAndClose(ctx, output, err, s.pushTrailingMeta, s.input)
 	} else if !earlyExit {
-		s.pushTrailingMeta(ctx)
+		s.pushTrailingMeta(ctx, output)
 		s.input.ConsumerClosed()
-		s.Output.ProducerDone()
+		output.ProducerDone()
 	}
 	s.MoveToDraining(nil /* err */)
 }
@@ -213,7 +221,9 @@ func (s *sampleAggregator) close() {
 	}
 }
 
-func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err error) {
+func (s *sampleAggregator) mainLoop(
+	ctx context.Context, output execinfra.RowReceiver,
+) (earlyExit bool, err error) {
 	var job *jobs.Job
 	jobID := s.spec.JobID
 	// Some tests run this code without a job, so check if the jobID is 0.
@@ -274,7 +284,7 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 						sr.Disable()
 					}
 				}
-			} else if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+			} else if !emitHelper(ctx, output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 				// No cleanup required; emitHelper() took care of it.
 				return true, nil
 			}

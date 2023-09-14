@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -31,7 +32,18 @@ type SkippableTest interface {
 // WithIssue skips this test, logging the given issue ID as the reason.
 func WithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
-	t.Skip(append([]interface{}{
+	maybeSkip(t, append([]interface{}{
+		fmt.Sprintf("https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID)},
+		args...))
+}
+
+// Unimplemented skips this test case, loggint the given issue ID. It
+// is included in addition to WithIssue to allow the caller to signal
+// that this test is not being skipped because of a bug, but rather
+// because of an unimplemented feature.
+func Unimplemented(t SkippableTest, githubIssueID int, args ...interface{}) {
+	t.Helper()
+	maybeSkip(t, append([]interface{}{
 		fmt.Sprintf("https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID)},
 		args...))
 }
@@ -41,7 +53,7 @@ func WithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 // if, for example, your test should only be run in Race mode.
 func IgnoreLint(t SkippableTest, args ...interface{}) {
 	t.Helper()
-	t.Skip(args...)
+	maybeSkip(t, args...)
 }
 
 // IgnoreLintf is like IgnoreLint, and it also takes a format string.
@@ -54,7 +66,7 @@ func IgnoreLintf(t SkippableTest, format string, args ...interface{}) {
 func UnderDeadlock(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if syncutil.DeadlockEnabled {
-		t.Skip(append([]interface{}{"disabled under deadlock detector"}, args...))
+		maybeSkip(t, append([]interface{}{"disabled under deadlock detector"}, args...))
 	}
 }
 
@@ -63,7 +75,7 @@ func UnderDeadlock(t SkippableTest, args ...interface{}) {
 func UnderDeadlockWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
 	if syncutil.DeadlockEnabled {
-		t.Skip(append([]interface{}{fmt.Sprintf(
+		maybeSkip(t, append([]interface{}{fmt.Sprintf(
 			"disabled under deadlock detector. issue: https://github.com/cockroachdb/cockroach/issues/%d",
 			githubIssueID,
 		)}, args...))
@@ -74,7 +86,7 @@ func UnderDeadlockWithIssue(t SkippableTest, githubIssueID int, args ...interfac
 func UnderRace(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if util.RaceEnabled {
-		t.Skip(append([]interface{}{"disabled under race"}, args...))
+		maybeSkip(t, append([]interface{}{"disabled under race"}, args...))
 	}
 }
 
@@ -83,7 +95,7 @@ func UnderRace(t SkippableTest, args ...interface{}) {
 func UnderRaceWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
 	if util.RaceEnabled {
-		t.Skip(append([]interface{}{fmt.Sprintf(
+		maybeSkip(t, append([]interface{}{fmt.Sprintf(
 			"disabled under race. issue: https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID,
 		)}, args...))
 	}
@@ -94,7 +106,7 @@ func UnderRaceWithIssue(t SkippableTest, githubIssueID int, args ...interface{})
 func UnderBazelWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
 	if bazel.BuiltWithBazel() {
-		t.Skip(append([]interface{}{fmt.Sprintf(
+		maybeSkip(t, append([]interface{}{fmt.Sprintf(
 			"disabled under bazel. issue: https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID,
 		)}, args...))
 	}
@@ -107,7 +119,7 @@ var _ = UnderBazelWithIssue
 func UnderShort(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if testing.Short() {
-		t.Skip(append([]interface{}{"disabled under -short"}, args...))
+		maybeSkip(t, append([]interface{}{"disabled under -short"}, args...))
 	}
 }
 
@@ -115,7 +127,7 @@ func UnderShort(t SkippableTest, args ...interface{}) {
 func UnderStress(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if Stress() {
-		t.Skip(append([]interface{}{"disabled under stress"}, args...))
+		maybeSkip(t, append([]interface{}{"disabled under stress"}, args...))
 	}
 }
 
@@ -124,7 +136,7 @@ func UnderStress(t SkippableTest, args ...interface{}) {
 func UnderStressWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
 	if Stress() {
-		t.Skip(append([]interface{}{fmt.Sprintf(
+		maybeSkip(t, append([]interface{}{fmt.Sprintf(
 			"disabled under stress. issue: https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID,
 		)}, args...))
 	}
@@ -135,7 +147,7 @@ func UnderStressWithIssue(t SkippableTest, githubIssueID int, args ...interface{
 func UnderStressRace(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if Stress() && util.RaceEnabled {
-		t.Skip(append([]interface{}{"disabled under stressrace"}, args...))
+		maybeSkip(t, append([]interface{}{"disabled under stressrace"}, args...))
 	}
 }
 
@@ -144,7 +156,19 @@ func UnderStressRace(t SkippableTest, args ...interface{}) {
 func UnderMetamorphic(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if util.IsMetamorphicBuild() {
-		t.Skip(append([]interface{}{"disabled under metamorphic"}, args...))
+		maybeSkip(t, append([]interface{}{"disabled under metamorphic"}, args...))
+	}
+}
+
+// UnderMetamorphicWithIssue skips this test during metamorphic runs, which are
+// tests run with the metamorphic build tag, logging the given issue ID as the
+// reason.
+func UnderMetamorphicWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
+	t.Helper()
+	if util.IsMetamorphicBuild() {
+		maybeSkip(t, append([]interface{}{fmt.Sprintf(
+			"disabled under metamorphic. issue: https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID,
+		)}, args...))
 	}
 }
 
@@ -152,7 +176,7 @@ func UnderMetamorphic(t SkippableTest, args ...interface{}) {
 // tag.
 func UnderNonTestBuild(t SkippableTest) {
 	if !buildutil.CrdbTestBuild {
-		t.Skip("crdb_test tag required for this test")
+		maybeSkip(t, "crdb_test tag required for this test")
 	}
 }
 
@@ -165,4 +189,14 @@ func UnderBench() bool {
 	// test executable with `-test.bench 1`.
 	f := flag.Lookup("test.bench")
 	return f != nil && f.Value.String() != ""
+}
+
+var forceRunSkippedTests = envutil.EnvOrDefaultBool("COCKROACH_FORCE_RUN_SKIPPED_TESTS", false)
+
+func maybeSkip(t SkippableTest, args ...interface{}) {
+	if forceRunSkippedTests {
+		return
+	}
+
+	t.Skip(args...)
 }

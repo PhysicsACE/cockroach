@@ -44,6 +44,7 @@ type tenantNode struct {
 	httpPort, sqlPort int
 	kvAddrs           []string
 	pgURL             string
+	envVars           []string
 	// Same as pgURL but with relative ssl parameters.
 	relativeSecureURL string
 
@@ -53,32 +54,29 @@ type tenantNode struct {
 }
 
 type createTenantOptions struct {
-	// TODO(ssd): This is a hack to work around the currently tangled state of
-	// cluster management between roachtest and roachprod. createTenantNode
-	// recreates client certs. Only one copy of the client certs are cached
-	// locally, so if we want a client to work against multiple tenants in a
-	// single test, we need to create the certs with all tenants.
-	otherTenantIDs []int
-
 	// Set this to expand the scope of the nodes added to the tenant certs.
 	certNodes option.NodeListOption
+
+	// Set this to add additional environment variables to the tenant.
+	envVars []string
 }
 type createTenantOpt func(*createTenantOptions)
-
-func createTenantOtherTenantIDs(ids []int) createTenantOpt {
-	return func(c *createTenantOptions) { c.otherTenantIDs = ids }
-}
 
 func createTenantCertNodes(nodes option.NodeListOption) createTenantOpt {
 	return func(c *createTenantOptions) { c.certNodes = nodes }
 }
 
-func createTenantNode(
+func createTenantEnvVar(envVar string) createTenantOpt {
+	return func(c *createTenantOptions) { c.envVars = append(c.envVars, envVar) }
+}
+
+func createTenantNodeInternal(
 	ctx context.Context,
 	t test.Test,
 	c cluster.Cluster,
 	kvnodes option.NodeListOption,
 	tenantID, node, httpPort, sqlPort int,
+	certs bool,
 	opts ...createTenantOpt,
 ) *tenantNode {
 	var createOptions createTenantOptions
@@ -98,9 +96,34 @@ func createTenantNode(
 		kvAddrs:    kvAddrs,
 		node:       node,
 		sqlPort:    sqlPort,
+		envVars:    append(config.DefaultEnvVars(), createOptions.envVars...),
 	}
-	tn.createTenantCert(ctx, t, c, createOptions.certNodes)
+	if certs {
+		tn.createTenantCert(ctx, t, c, createOptions.certNodes)
+	}
 	return tn
+}
+
+func createTenantNode(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	kvnodes option.NodeListOption,
+	tenantID, node, httpPort, sqlPort int,
+	opts ...createTenantOpt,
+) *tenantNode {
+	return createTenantNodeInternal(ctx, t, c, kvnodes, tenantID, node, httpPort, sqlPort, true /* certs */, opts...)
+}
+
+func createTenantNodeNoCerts(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	kvnodes option.NodeListOption,
+	tenantID, node, httpPort, sqlPort int,
+	opts ...createTenantOpt,
+) *tenantNode {
+	return createTenantNodeInternal(ctx, t, c, kvnodes, tenantID, node, httpPort, sqlPort, false /* certs */, opts...)
 }
 
 func (tn *tenantNode) createTenantCert(
@@ -167,7 +190,7 @@ func (tn *tenantNode) start(ctx context.Context, t test.Test, c cluster.Cluster,
 	require.NoError(t, err)
 	tn.errCh = startTenantServer(
 		ctx, c, c.Node(tn.node), internalIPs[0], binary, tn.kvAddrs, tn.tenantID,
-		tn.httpPort, tn.sqlPort,
+		tn.httpPort, tn.sqlPort, tn.envVars,
 		extraArgs...,
 	)
 
@@ -230,6 +253,7 @@ func startTenantServer(
 	tenantID int,
 	httpPort int,
 	sqlPort int,
+	envVars []string,
 	extraFlags ...string,
 ) chan error {
 	args := []string{
@@ -245,7 +269,7 @@ func startTenantServer(
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- c.RunE(tenantCtx, node,
-			append(append(append([]string{}, config.DefaultEnvVars()...), binary, "mt", "start-sql"), args...)...,
+			append(append(append([]string{}, envVars...), binary, "mt", "start-sql"), args...)...,
 		)
 		close(errCh)
 	}()
@@ -264,6 +288,7 @@ func newTenantInstance(
 		node:       node,
 		httpPort:   http,
 		sqlPort:    sql,
+		envVars:    tn.envVars,
 	}
 	tenantCertsDir, err := os.MkdirTemp("", "tenant-certs")
 	if err != nil {
@@ -299,8 +324,12 @@ func createTenantAdminRole(t test.Test, tenantName string, tenantSQL *sqlutils.S
 		tenantName, username, password)
 }
 
-// createInMemoryTenant runs through the necessary steps to create an in-memory tenant without
-// resource limits.
+const appTenantName = "app"
+
+// createInMemoryTenant runs through the necessary steps to create an in-memory
+// tenant without resource limits and full dbconsole viewing privileges. As a
+// convenience, it also returns a connection to the tenant (on a random node in
+// the cluster).
 func createInMemoryTenant(
 	ctx context.Context,
 	t test.Test,
@@ -308,11 +337,37 @@ func createInMemoryTenant(
 	tenantName string,
 	nodes option.NodeListOption,
 	secure bool,
-) {
+) *gosql.DB {
 	sysSQL := sqlutils.MakeSQLRunner(c.Conn(ctx, t.L(), nodes.RandNode()[0]))
 	sysSQL.Exec(t, "CREATE TENANT $1", tenantName)
-	sysSQL.Exec(t, "ALTER TENANT $1 START SERVICE SHARED", tenantName)
 
+	tenantConn := startInMemoryTenant(ctx, t, c, tenantName, nodes)
+	tenantSQL := sqlutils.MakeSQLRunner(tenantConn)
+	if secure {
+		createTenantAdminRole(t, tenantName, tenantSQL)
+	}
+	return tenantConn
+}
+
+// startInMemoryTenant starts an in memory tenant that has already been created.
+// This function also removes tenant rate limiters and sets a few cluster
+// settings on the tenant.  As a convenience, it also returns a connection to
+// the tenant (on a random node in the cluster).
+func startInMemoryTenant(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	tenantName string,
+	nodes option.NodeListOption,
+) *gosql.DB {
+	sysSQL := sqlutils.MakeSQLRunner(c.Conn(ctx, t.L(), nodes.RandNode()[0]))
+	sysSQL.Exec(t, "ALTER TENANT $1 START SERVICE SHARED", tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 GRANT CAPABILITY can_view_node_info=true, can_admin_split=true,can_view_tsdb_metrics=true`, tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 SET CLUSTER SETTING sql.split_at.allow_for_secondary_tenant.enabled=true`, tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 SET CLUSTER SETTING sql.scatter.allow_for_secondary_tenant.enabled=true`, tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled=true`, tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 SET CLUSTER SETTING enterprise.license = $2`, tenantName, config.CockroachDevLicense)
+	sysSQL.Exec(t, `ALTER TENANT $1 SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - Production Testing'`, tenantName)
 	removeTenantRateLimiters(t, sysSQL, tenantName)
 
 	// Opening a SQL session to a newly created in-process tenant may require a
@@ -320,35 +375,23 @@ func createInMemoryTenant(
 	// it clear if they eagerly open a session with the tenant or wait until the
 	// first query. Therefore, wrap connection opening and a ping to the tenant
 	// server in a retry loop.
-	var tenantSQL *sqlutils.SQLRunner
+	var tenantConn *gosql.DB
 	testutils.SucceedsSoon(t, func() error {
-		tenantConn, err := c.ConnE(ctx, t.L(), nodes.RandNode()[0], option.TenantName(tenantName))
+		var err error
+		tenantConn, err = c.ConnE(ctx, t.L(), nodes.RandNode()[0], option.TenantName(tenantName))
 		if err != nil {
 			return err
 		}
-		if err := tenantConn.Ping(); err != nil {
+		if err = tenantConn.Ping(); err != nil {
 			return err
 		}
-		tenantSQL = sqlutils.MakeSQLRunner(tenantConn)
 		return nil
 	})
 
-	if secure {
-		createTenantAdminRole(t, tenantName, tenantSQL)
-	}
+	return tenantConn
 }
 
 // removeTenantRateLimiters ensures the tenant is not throttled by limiters.
 func removeTenantRateLimiters(t test.Test, systemSQL *sqlutils.SQLRunner, tenantName string) {
-	var tenantID int
-	systemSQL.QueryRow(t, `SELECT id FROM [SHOW TENANT $1]`, tenantName).Scan(&tenantID)
-	systemSQL.Exec(t, `SELECT crdb_internal.update_tenant_resource_limits($1, 10000000000, 0,
-10000000000, now(), 0);`, tenantID)
-	systemSQL.ExecMultiple(t,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.burst_limit_seconds = 10000;`,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.rate_limit = -1000; `,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.read_batch_cost = 0;`,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.read_cost_per_mebibyte = 0;`,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.write_cost_per_megabyte = 0;`,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.write_request_cost = 0;`)
+	systemSQL.Exec(t, `ALTER TENANT $1 GRANT CAPABILITY exempt_from_rate_limiting=true`, tenantName)
 }

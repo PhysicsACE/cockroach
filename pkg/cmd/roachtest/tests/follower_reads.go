@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"reflect"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
@@ -63,7 +64,11 @@ func registerFollowerReads(r registry.Registry) {
 				spec.Geo(),
 				spec.Zones("us-east1-b,us-east1-b,us-east1-b,us-west1-b,us-west1-b,europe-west2-b"),
 			),
+			Leases: registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+				if c.Spec().Cloud == spec.GCE && c.Spec().Arch == vm.ArchARM64 {
+					t.Skip("arm64 in GCE is available only in us-central1")
+				}
 				c.Put(ctx, t.Cockroach(), "./cockroach")
 				c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 				topology := topologySpec{
@@ -102,10 +107,7 @@ func registerFollowerReads(r registry.Registry) {
 			spec.CPU(2),
 		),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			if c.IsLocal() && runtime.GOARCH == "arm64" {
-				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
-			}
-			runFollowerReadsMixedVersionSingleRegionTest(ctx, t, c, *t.BuildVersion())
+			runFollowerReadsMixedVersionSingleRegionTest(ctx, t, c, t.BuildVersion())
 		},
 	})
 }
@@ -528,9 +530,11 @@ func initFollowerReadsDB(
 			// parsing the replica_localities array using the same pattern as the
 			// one used by SHOW REGIONS.
 			const q2 = `
-			SELECT
-				count(distinct substring(unnest(replica_localities), 'region=([^,]*)'))
-			FROM [SHOW RANGES FROM TABLE test.test]`
+			SELECT count(DISTINCT substring(unnested, 'region=([^,]*)'))
+			FROM (
+				SELECT unnest(replica_localities) AS unnested
+				FROM [SHOW RANGES FROM TABLE test.test]
+			)`
 
 			var distinctRegions int
 			require.NoError(t, db.QueryRowContext(ctx, q2).Scan(&distinctRegions))
@@ -730,7 +734,7 @@ func verifyHighFollowerReadRatios(
 	}
 
 	var response tspb.TimeSeriesQueryResponse
-	if err := httputil.PostJSON(http.Client{}, url, &request, &response); err != nil {
+	if err := httputil.PostProtobuf(ctx, http.Client{}, url, &request, &response); err != nil {
 		t.Fatal(err)
 	}
 
@@ -882,9 +886,9 @@ func parsePrometheusMetric(s string) (*prometheusMetric, bool) {
 // sufficient for this purpose; we're not testing non-voting replicas here
 // (which are used in multi-region tests).
 func runFollowerReadsMixedVersionSingleRegionTest(
-	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
+	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion *version.Version,
 ) {
-	predecessorVersion, err := version.PredecessorVersion(buildVersion)
+	predecessorVersion, err := release.LatestPredecessor(buildVersion)
 	require.NoError(t, err)
 
 	// Start the cluster at the old version.

@@ -714,6 +714,14 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 			colIDs = idx.CollectKeyColumnIDs()
 		}
 
+		// Inverted indexes don't store composite values in the individual
+		// paths present. The composite values will be encoded in
+		// the primary index itself.
+		compositeColIDsLocal := compositeColIDs.Copy()
+		if isInverted {
+			compositeColIDsLocal.Remove(invID)
+		}
+
 		// StoreColumnIDs are derived from StoreColumnNames just like KeyColumnIDs
 		// derives from KeyColumnNames.
 		// For primary indexes this set of columns is typically defined as the set
@@ -755,12 +763,12 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 		// or in the primary key whose type has a composite encoding, like DECIMAL
 		// for instance.
 		for _, colID := range idx.IndexDesc().KeyColumnIDs {
-			if compositeColIDs.Contains(colID) {
+			if compositeColIDsLocal.Contains(colID) {
 				idx.IndexDesc().CompositeColumnIDs = append(idx.IndexDesc().CompositeColumnIDs, colID)
 			}
 		}
 		for _, colID := range idx.IndexDesc().KeySuffixColumnIDs {
-			if compositeColIDs.Contains(colID) {
+			if compositeColIDsLocal.Contains(colID) {
 				idx.IndexDesc().CompositeColumnIDs = append(idx.IndexDesc().CompositeColumnIDs, colID)
 			}
 		}
@@ -2415,6 +2423,15 @@ func (desc *wrapper) GetStorageParams(spaceBetweenEqual bool) []string {
 	if enabled, ok := desc.ForecastStatsEnabled(); ok {
 		appendStorageParam(`sql_stats_forecasts_enabled`, strconv.FormatBool(enabled))
 	}
+	if count, ok := desc.HistogramSamplesCount(); ok {
+		appendStorageParam(`sql_stats_histogram_samples_count`, fmt.Sprintf("%d", count))
+	}
+	if count, ok := desc.HistogramBucketsCount(); ok {
+		appendStorageParam(`sql_stats_histogram_buckets_count`, fmt.Sprintf("%d", count))
+	}
+	if desc.IsSchemaLocked() {
+		appendStorageParam(`schema_locked`, `true`)
+	}
 	return storageParams
 }
 
@@ -2476,6 +2493,22 @@ func (desc *wrapper) ForecastStatsEnabled() (enabled bool, ok bool) {
 		return false, false
 	}
 	return *desc.ForecastStats, true
+}
+
+// HistogramSamplesCount implements the TableDescriptor interface.
+func (desc *wrapper) HistogramSamplesCount() (histogramSamplesCount uint32, ok bool) {
+	if desc.HistogramSamples == nil {
+		return 0, false
+	}
+	return *desc.HistogramSamples, true
+}
+
+// HistogramBucketsCount implements the TableDescriptor interface.
+func (desc *wrapper) HistogramBucketsCount() (histogramBucketsCount uint32, ok bool) {
+	if desc.HistogramBuckets == nil {
+		return 0, false
+	}
+	return *desc.HistogramBuckets, true
 }
 
 // SetTableLocalityRegionalByTable sets the descriptor's locality config to

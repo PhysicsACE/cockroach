@@ -15,7 +15,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -110,13 +109,16 @@ func doCreateSequence(
 		return nil, err
 	}
 
-	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
 		dbDesc.GetDefaultPrivilegeDescriptor(),
 		scDesc.GetDefaultPrivilegeDescriptor(),
 		dbDesc.GetID(),
 		sessionData.User(),
 		privilege.Sequences,
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	if persistence.IsTemporary() {
 		telemetry.Inc(sqltelemetry.CreateTempSequenceCounter)
@@ -152,7 +154,7 @@ func doCreateSequence(
 
 	// Initialize the sequence value.
 	seqValueKey := p.ExecCfg().Codec.SequenceKey(uint32(id))
-	b := &kv.Batch{}
+	b := p.Txn().NewBatch()
 
 	startVal := desc.SequenceOpts.Start
 	for _, option := range opts {

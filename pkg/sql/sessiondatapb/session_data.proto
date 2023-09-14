@@ -108,6 +108,10 @@ message SessionData {
   // format should be used for ScanRequests and ReverseScanRequests whenever
   // possible.
   bool direct_columnar_scans_enabled = 25;
+  // DefaultTextSearchConfig configures the default text search configuration
+  // that is used for builtins like to_tsvector and to_tsquery if no
+  // text search configuration is explicitly passed in.
+  string default_text_search_config = 26;
 }
 
 // DataConversionConfig contains the parameters that influence the output
@@ -135,16 +139,16 @@ enum VectorizeExecMode {
   // VectorizeUnset means the VectorizeExecMode wasn't explicitly set. Having
   // the first enum value as zero is required by proto3. This is mapped to
   // VectorizeOn.
-  VectorizeUnset = 0;
+  unset = 0 [(gogoproto.enumvalue_customname) = "VectorizeUnset"];
   reserved 1;
   // VectorizeOn means that any supported queries will be run using the
   // columnar execution.
-  VectorizeOn = 2;
+  on = 2 [(gogoproto.enumvalue_customname) = "VectorizeOn"];
   // VectorizeExperimentalAlways means that we attempt to vectorize all
   // queries; unsupported queries will fail. Mostly used for testing.
-  VectorizeExperimentalAlways = 3;
+  experimental_always = 3 [(gogoproto.enumvalue_customname) = "VectorizeExperimentalAlways"];
   // VectorizeOff means that columnar execution is disabled.
-  VectorizeOff = 4;
+  off = 4 [(gogoproto.enumvalue_customname) = "VectorizeOff"];
 }
 
 // SequenceState is used to marshall the sessiondata.SequenceState struct.

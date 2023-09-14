@@ -32,25 +32,53 @@ type provider struct {
 	unimplemented string
 }
 
-func (p *provider) SnapshotVolume(vm.Volume, string, string, map[string]string) (string, error) {
-	return "", errors.Newf("%s", p.unimplemented)
+func (p *provider) CreateVolumeSnapshot(
+	l *logger.Logger, volume vm.Volume, vsco vm.VolumeSnapshotCreateOpts,
+) (vm.VolumeSnapshot, error) {
+	return vm.VolumeSnapshot{}, errors.Newf("%s", p.unimplemented)
 }
 
-func (p *provider) CreateVolume(vm.VolumeCreateOpts) (vol vm.Volume, err error) {
-	return vol, errors.Newf("%s", p.unimplemented)
+func (p *provider) ListVolumeSnapshots(
+	l *logger.Logger, vslo vm.VolumeSnapshotListOpts,
+) ([]vm.VolumeSnapshot, error) {
+	return nil, errors.Newf("%s", p.unimplemented)
 }
 
-func (p *provider) AttachVolumeToVM(vm.Volume, *vm.VM) (string, error) {
+func (p *provider) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
+	return errors.Newf("%s", p.unimplemented)
+}
+
+func (p *provider) CreateVolume(*logger.Logger, vm.VolumeCreateOpts) (vm.Volume, error) {
+	return vm.Volume{}, errors.Newf("%s", p.unimplemented)
+}
+
+func (p *provider) DeleteVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) error {
+	return errors.Newf("%s", p.unimplemented)
+}
+
+func (p *provider) ListVolumes(l *logger.Logger, vm *vm.VM) ([]vm.Volume, error) {
+	return vm.NonBootAttachedVolumes, nil
+}
+
+func (p *provider) AttachVolume(*logger.Logger, vm.Volume, *vm.VM) (string, error) {
 	return "", errors.Newf("%s", p.unimplemented)
 }
 
 // CleanSSH implements vm.Provider and is a no-op.
-func (p *provider) CleanSSH() error {
+func (p *provider) CleanSSH(l *logger.Logger) error {
 	return nil
 }
 
 // ConfigSSH implements vm.Provider and is a no-op.
-func (p *provider) ConfigSSH(zones []string) error {
+func (p *provider) ConfigSSH(l *logger.Logger, zones []string) error {
+	return nil
+}
+
+func (p *provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	return nil
+}
+
+func (p *provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
 	return nil
 }
 
@@ -62,22 +90,22 @@ func (p *provider) Create(
 }
 
 // Delete implements vm.Provider and returns Unimplemented.
-func (p *provider) Delete(vms vm.List) error {
+func (p *provider) Delete(l *logger.Logger, vms vm.List) error {
 	return errors.Newf("%s", p.unimplemented)
 }
 
 // Reset implements vm.Provider and is a no-op.
-func (p *provider) Reset(vms vm.List) error {
+func (p *provider) Reset(l *logger.Logger, vms vm.List) error {
 	return nil
 }
 
 // Extend implements vm.Provider and returns Unimplemented.
-func (p *provider) Extend(vms vm.List, lifetime time.Duration) error {
+func (p *provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
 	return errors.Newf("%s", p.unimplemented)
 }
 
 // FindActiveAccount implements vm.Provider and returns an empty account.
-func (p *provider) FindActiveAccount() (string, error) {
+func (p *provider) FindActiveAccount(l *logger.Logger) (string, error) {
 	return "", nil
 }
 

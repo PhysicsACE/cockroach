@@ -13,21 +13,15 @@ package sql
 import (
 	"context"
 	"sort"
-	"strconv"
-	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 )
 
 // EngineMetrics groups a set of SQL metrics.
@@ -129,20 +123,20 @@ func (ex *connExecutor) recordStatementSummary(
 
 	// Collect the statistics.
 	idleLatRaw := phaseTimes.GetIdleLatency(ex.statsCollector.PreviousPhaseTimes())
-	idleLat := idleLatRaw.Seconds()
+	idleLatSec := idleLatRaw.Seconds()
 	runLatRaw := phaseTimes.GetRunLatency()
-	runLat := runLatRaw.Seconds()
-	parseLat := phaseTimes.GetParsingLatency().Seconds()
-	planLat := phaseTimes.GetPlanningLatency().Seconds()
+	runLatSec := runLatRaw.Seconds()
+	parseLatSec := phaseTimes.GetParsingLatency().Seconds()
+	planLatSec := phaseTimes.GetPlanningLatency().Seconds()
 	// We want to exclude any overhead to reduce possible confusion.
 	svcLatRaw := phaseTimes.GetServiceLatencyNoOverhead()
-	svcLat := svcLatRaw.Seconds()
+	svcLatSec := svcLatRaw.Seconds()
 
 	// processing latency: contributing towards SQL results.
-	processingLat := parseLat + planLat + runLat
+	processingLatSec := parseLatSec + planLatSec + runLatSec
 
 	// overhead latency: txn/retry management, error checking, etc
-	execOverhead := svcLat - processingLat
+	execOverheadSec := svcLatSec - processingLatSec
 
 	stmt := &planner.stmt
 	shouldIncludeInLatencyMetrics := shouldIncludeStmtInLatencyMetrics(stmt)
@@ -181,33 +175,34 @@ func (ex *connExecutor) recordStatementSummary(
 	idxRecommendations := idxrecommendations.FormatIdxRecommendations(planner.instrumentation.indexRecs)
 	queryLevelStats, queryLevelStatsOk := planner.instrumentation.GetQueryLevelStats()
 
-	// We only have node information when it was collected with trace, but we know at least the current
-	// node should be on the list.
-	nodeID, err := strconv.ParseInt(ex.server.sqlStats.GetSQLInstanceID().String(), 10, 64)
-	if err != nil {
-		log.Warningf(ctx, "failed to convert node ID to int: %s", err)
+	var sqlInstanceIds []int64
+	if queryLevelStatsOk {
+		sqlInstanceIds = make([]int64, 0, len(queryLevelStats.SqlInstanceIds))
+		for sqlInstanceId := range queryLevelStats.SqlInstanceIds {
+			sqlInstanceIds = append(sqlInstanceIds, int64(sqlInstanceId))
+		}
+
+		sort.Slice(sqlInstanceIds, func(i, j int) bool {
+			return sqlInstanceIds[i] < sqlInstanceIds[j]
+		})
 	}
 
-	nodes := util.CombineUniqueInt64(getNodesFromPlanner(planner), []int64{nodeID})
-	regions := getRegionsForNodes(ctx, nodes, planner.DistSQLPlanner().sqlAddressResolver)
-
 	recordedStmtStats := sqlstats.RecordedStmtStats{
-		SessionID:            ex.sessionID,
+		SessionID:            ex.planner.extendedEvalCtx.SessionID,
 		StatementID:          stmt.QueryID,
 		AutoRetryCount:       automaticRetryCount,
 		AutoRetryReason:      ex.state.mu.autoRetryReason,
 		RowsAffected:         rowsAffected,
-		IdleLatency:          idleLat,
-		ParseLatency:         parseLat,
-		PlanLatency:          planLat,
-		RunLatency:           runLat,
-		ServiceLatency:       svcLat,
-		OverheadLatency:      execOverhead,
+		IdleLatencySec:       idleLatSec,
+		ParseLatencySec:      parseLatSec,
+		PlanLatencySec:       planLatSec,
+		RunLatencySec:        runLatSec,
+		ServiceLatencySec:    svcLatSec,
+		OverheadLatencySec:   execOverheadSec,
 		BytesRead:            stats.bytesRead,
 		RowsRead:             stats.rowsRead,
 		RowsWritten:          stats.rowsWritten,
-		Nodes:                nodes,
-		Regions:              regions,
+		Nodes:                sqlInstanceIds,
 		StatementType:        stmt.AST.StatementType(),
 		Plan:                 planner.instrumentation.PlanForStats(ctx),
 		PlanGist:             planner.instrumentation.planGist.String(),
@@ -290,10 +285,10 @@ func (ex *connExecutor) recordStatementSummary(
 				"overhead %.2fµs (%.1f%%), "+
 				"session age %.4fs",
 			rowsAffected, automaticRetryCount,
-			parseLat*1e6, 100*parseLat/svcLat,
-			planLat*1e6, 100*planLat/svcLat,
-			runLat*1e6, 100*runLat/svcLat,
-			execOverhead*1e6, 100*execOverhead/svcLat,
+			parseLatSec*1e6, 100*parseLatSec/svcLatSec,
+			planLatSec*1e6, 100*planLatSec/svcLatSec,
+			runLatSec*1e6, 100*runLatSec/svcLatSec,
+			execOverheadSec*1e6, 100*execOverheadSec/svcLatSec,
 			sessionAge,
 		)
 	}
@@ -313,63 +308,4 @@ func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
 // We only want to keep track of DML (Data Manipulation Language) statements in our latency metrics.
 func shouldIncludeStmtInLatencyMetrics(stmt *Statement) bool {
 	return stmt.AST.StatementType() == tree.TypeDML
-}
-
-func getNodesFromPlanner(planner *planner) []int64 {
-	// Retrieve the list of all nodes which the statement was executed on.
-	var nodes []int64
-	if _, ok := planner.instrumentation.Tracing(); !ok {
-		trace := planner.instrumentation.sp.GetRecording(tracingpb.RecordingStructured)
-		// ForEach returns nodes in order.
-		execinfrapb.ExtractNodesFromSpans(trace).ForEach(func(i int) {
-			nodes = append(nodes, int64(i))
-		})
-	}
-	return nodes
-}
-
-var regionsPool = sync.Pool{
-	New: func() interface{} {
-		return make(map[string]struct{})
-	},
-}
-
-func getRegionsForNodes(
-	ctx context.Context, nodeIDs []int64, resolver sqlinstance.AddressResolver,
-) []string {
-	if resolver == nil {
-		return nil
-	}
-
-	instances, err := resolver.GetAllInstances(ctx)
-	if err != nil {
-		return nil
-	}
-
-	regions := regionsPool.Get().(map[string]struct{})
-	defer func() {
-		for region := range regions {
-			delete(regions, region)
-		}
-		regionsPool.Put(regions)
-	}()
-
-	for _, instance := range instances {
-		for _, node := range nodeIDs {
-			// TODO(todd): Using int64 for nodeIDs was inappropriate, see #95088.
-			if int32(instance.InstanceID) == int32(node) {
-				if region, ok := instance.Locality.Find("region"); ok {
-					regions[region] = struct{}{}
-				}
-				break
-			}
-		}
-	}
-
-	result := make([]string, 0, len(regions))
-	for region := range regions {
-		result = append(result, region)
-	}
-	sort.Strings(result)
-	return result
 }

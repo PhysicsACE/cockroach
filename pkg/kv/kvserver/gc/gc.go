@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/benignerror"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -35,12 +36,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 )
 
 const (
@@ -67,16 +69,11 @@ const (
 // IntentAgeThreshold is the threshold after which an extant intent
 // will be resolved.
 var IntentAgeThreshold = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.gc.intent_age_threshold",
 	"intents older than this threshold will be resolved when encountered by the MVCC GC queue",
 	2*time.Hour,
-	func(d time.Duration) error {
-		if d < 2*time.Minute {
-			return errors.New("intent age threshold must be >= 2 minutes")
-		}
-		return nil
-	},
+	settings.DurationWithMinimum(2*time.Minute),
 )
 
 // TxnCleanupThreshold is the threshold after which a transaction is
@@ -106,7 +103,7 @@ var TxnCleanupThreshold = settings.RegisterDurationSetting(
 // of writing. This value is subject to tuning in real environment as we have
 // more data available.
 var MaxIntentsPerCleanupBatch = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.gc.intent_cleanup_batch_size",
 	"if non zero, gc will split found intents into batches of this size when trying to resolve them",
 	5000,
@@ -125,7 +122,7 @@ var MaxIntentsPerCleanupBatch = settings.RegisterIntSetting(
 // The default value is a conservative limit to prevent pending intent key sizes
 // from ballooning.
 var MaxIntentKeyBytesPerCleanupBatch = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.gc.intent_cleanup_batch_byte_size",
 	"if non zero, gc will split found intents into batches of this size when trying to resolve them",
 	1e6,
@@ -362,10 +359,16 @@ func Run(
 			intentCleanupBatchTimeout:              options.IntentCleanupBatchTimeout,
 		}, cleanupIntentsFn, &info)
 	if err != nil {
+		if errors.Is(err, pebble.ErrSnapshotExcised) {
+			err = benignerror.NewStoreBenign(err)
+		}
 		return Info{}, err
 	}
 	err = processReplicatedRangeTombstones(ctx, desc, snap, fastPath, now, newThreshold, gcer, &info)
 	if err != nil {
+		if errors.Is(err, pebble.ErrSnapshotExcised) {
+			err = benignerror.NewStoreBenign(err)
+		}
 		return Info{}, err
 	}
 
@@ -1040,7 +1043,7 @@ func (b *intentBatcher) maybeFlushPendingIntents(ctx context.Context) error {
 		return b.cleanupIntentsFn(ctx, b.pendingIntents)
 	}
 	if b.options.intentCleanupBatchTimeout > 0 {
-		err = contextutil.RunWithTimeout(
+		err = timeutil.RunWithTimeout(
 			ctx, "intent GC batch", b.options.intentCleanupBatchTimeout, cleanupIntentsFn)
 	} else {
 		err = cleanupIntentsFn(ctx)

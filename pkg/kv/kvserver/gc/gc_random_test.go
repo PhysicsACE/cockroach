@@ -36,10 +36,11 @@ import (
 // running randomized GC tests as well as benchmarking new code vs preserved
 // legacy GC.
 type randomRunGCTestSpec struct {
-	ds           distSpec
-	now          hlc.Timestamp
-	ttlSec       int32
-	intentAgeSec int32
+	ds                distSpec
+	now               hlc.Timestamp
+	ttlSec            int32
+	intentAgeSec      int32
+	clearRangeMinKeys int64 // Set to 0 for test default value or -1 to disable.
 }
 
 var (
@@ -186,6 +187,7 @@ func BenchmarkRun(b *testing.B) {
 			CalculateThreshold(spec.now, ttl), RunOptions{
 				IntentAgeThreshold:  intentThreshold,
 				TxnCleanupThreshold: txnCleanupThreshold,
+				ClearRangeMinKeys:   defaultClearRangeMinKeys,
 			},
 			ttl,
 			NoopGCer{},
@@ -271,12 +273,57 @@ func TestNewVsInvariants(t *testing.T) {
 			now: hlc.Timestamp{
 				WallTime: 100 * time.Second.Nanoseconds(),
 			},
+			ttlSec:       10,
+			intentAgeSec: 15,
+			// Reduced clear range sequence to allow key batches to be split at
+			// various boundaries.
+			clearRangeMinKeys: 49,
+		},
+		{
+			ds: someVersionsWithSomeRangeKeys,
+			now: hlc.Timestamp{
+				WallTime: 100 * time.Second.Nanoseconds(),
+			},
+			ttlSec:       10,
+			intentAgeSec: 15,
+			// Disable clear range to reliably engage specific code paths that handle
+			// simplified no-clear-range batching.
+			clearRangeMinKeys: -1,
+		},
+		{
+			ds: someVersionsWithSomeRangeKeys,
+			now: hlc.Timestamp{
+				WallTime: 100 * time.Second.Nanoseconds(),
+			},
 			// Higher TTL means range tombstones between 70 sec and 50 sec are
 			// not removed.
 			ttlSec: 50,
 		},
+		{
+			ds: someVersionsWithSomeRangeKeys,
+			now: hlc.Timestamp{
+				WallTime: 100 * time.Second.Nanoseconds(),
+			},
+			// Higher TTL means range tombstones between 70 sec and 50 sec are
+			// not removed.
+			ttlSec: 50,
+			// Reduced clear range sequence to allow key batches to be split at
+			// various boundaries.
+			clearRangeMinKeys: 10,
+		},
 	} {
-		t.Run(fmt.Sprintf("%v@%v,ttl=%vsec", tc.ds, tc.now, tc.ttlSec), func(t *testing.T) {
+		clearRangeMinKeys := int64(0)
+		switch tc.clearRangeMinKeys {
+		case -1:
+		case 0:
+			// Default value for test.
+			clearRangeMinKeys = 100
+		default:
+			clearRangeMinKeys = tc.clearRangeMinKeys
+		}
+		name := fmt.Sprintf("%v@%v,ttl=%vsec,clearRangeMinKeys=%d", tc.ds, tc.now, tc.ttlSec,
+			clearRangeMinKeys)
+		t.Run(name, func(t *testing.T) {
 			rng, seed := randutil.NewTestRand()
 			t.Logf("Using subtest seed: %d", seed)
 
@@ -298,7 +345,7 @@ func TestNewVsInvariants(t *testing.T) {
 				gcThreshold, RunOptions{
 					IntentAgeThreshold:  intentAgeThreshold,
 					TxnCleanupThreshold: txnCleanupThreshold,
-					ClearRangeMinKeys:   100,
+					ClearRangeMinKeys:   clearRangeMinKeys,
 				}, ttl,
 				&gcer,
 				gcer.resolveIntents,
@@ -383,23 +430,25 @@ func assertLiveData(
 		GCTTL:     gcTTL,
 		Threshold: gcThreshold,
 	}
-	pointIt := before.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind,
+	pointIt, err := before.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind,
 		storage.IterOptions{
 			LowerBound: desc.StartKey.AsRawKey(),
 			UpperBound: desc.EndKey.AsRawKey(),
 			KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		})
+	require.NoError(t, err)
 	defer pointIt.Close()
 	pointIt.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 	pointExpectationsGenerator := getExpectationsGenerator(t, pointIt, gcThreshold, intentThreshold,
 		&expInfo)
 
-	rangeIt := before.NewMVCCIterator(storage.MVCCKeyIterKind,
+	rangeIt, err := before.NewMVCCIterator(storage.MVCCKeyIterKind,
 		storage.IterOptions{
 			LowerBound: desc.StartKey.AsRawKey(),
 			UpperBound: desc.EndKey.AsRawKey(),
 			KeyTypes:   storage.IterKeyTypeRangesOnly,
 		})
+	require.NoError(t, err)
 	defer rangeIt.Close()
 	rangeIt.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 	expectedRanges := mergeRanges(filterRangeFragments(rangeFragmentsFromIt(t, rangeIt), gcThreshold,
@@ -407,11 +456,12 @@ func assertLiveData(
 
 	// Loop over engine data after applying GCer requests and compare with
 	// expected point keys.
-	itAfter := after.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	itAfter, err := after.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		LowerBound: desc.StartKey.AsRawKey(),
 		UpperBound: desc.EndKey.AsRawKey(),
 		KeyTypes:   storage.IterKeyTypePointsOnly,
 	})
+	require.NoError(t, err)
 	defer itAfter.Close()
 
 	itAfter.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
@@ -444,12 +494,13 @@ func assertLiveData(
 		}
 	}
 
-	rangeItAfter := after.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	rangeItAfter, err := after.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		LowerBound:           desc.StartKey.AsRawKey(),
 		UpperBound:           desc.EndKey.AsRawKey(),
 		KeyTypes:             storage.IterKeyTypeRangesOnly,
 		RangeKeyMaskingBelow: hlc.Timestamp{},
 	})
+	require.NoError(t, err)
 	defer rangeItAfter.Close()
 	rangeItAfter.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 	actualRanges := mergeRanges(rangeFragmentsFromIt(t, rangeItAfter))
@@ -495,7 +546,7 @@ func getExpectationsGenerator(
 				}
 				p, r := it.HasPointAndRange()
 				if p {
-					k := it.Key()
+					k := it.UnsafeKey().Clone()
 					v, err := it.Value()
 					require.NoError(t, err)
 					if len(baseKey) == 0 {
@@ -619,12 +670,13 @@ func getExpectationsGenerator(
 func getKeyHistory(t *testing.T, r storage.Reader, key roachpb.Key) string {
 	var result []string
 
-	it := r.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	it, err := r.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		LowerBound:           key,
 		UpperBound:           key.Next(),
 		KeyTypes:             storage.IterKeyTypePointsAndRanges,
 		RangeKeyMaskingBelow: hlc.Timestamp{},
 	})
+	require.NoError(t, err)
 	defer it.Close()
 
 	it.SeekGE(storage.MVCCKey{Key: key})

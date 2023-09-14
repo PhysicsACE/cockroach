@@ -38,6 +38,8 @@ WHERE status='%s' AND created_by_type='%s' AND created_by_id=schedule_id
 ) AS jobsRunning`, jobs.StatusRunning, jobs.CreatedByScheduledJobs),
 		"owner",
 		"created",
+		"crdb_internal.pb_to_json('cockroach.jobs.jobspb.ScheduleDetails', schedule_details, true)->>'wait' as on_wait",
+		"crdb_internal.pb_to_json('cockroach.jobs.jobspb.ScheduleDetails', schedule_details, true)->>'onError' as on_error",
 	}
 
 	var whereExprs []string
@@ -55,6 +57,8 @@ WHERE status='%s' AND created_by_type='%s' AND created_by_id=schedule_id
 			"executor_type = '%s'", tree.ScheduledBackupExecutor.InternalName()))
 		columnExprs = append(columnExprs, fmt.Sprintf(
 			"%s->>'backup_statement' AS command", commandColumn))
+		columnExprs = append(columnExprs, fmt.Sprintf(
+			"(CASE WHEN %s->>'backup_type' IS NULL THEN 'FULL' ELSE 'INCREMENTAL' END) AS backup_type", commandColumn))
 	case tree.ScheduledSQLStatsCompactionExecutor:
 		whereExprs = append(whereExprs, fmt.Sprintf(
 			"executor_type = '%s'", tree.ScheduledSQLStatsCompactionExecutor.InternalName()))
@@ -77,7 +81,7 @@ WHERE status='%s' AND created_by_type='%s' AND created_by_id=schedule_id
 	if len(whereExprs) > 0 {
 		whereClause = fmt.Sprintf("WHERE (%s)", strings.Join(whereExprs, " AND "))
 	}
-	return parse(fmt.Sprintf(
+	return d.parse(fmt.Sprintf(
 		"SELECT %s FROM system.scheduled_jobs %s",
 		strings.Join(columnExprs, ","),
 		whereClause,

@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPrivilegeDecode(t *testing.T) {
@@ -39,7 +40,10 @@ func TestPrivilegeDecode(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		pl := privilege.ListFromBitField(tc.raw, privilege.Any)
+		pl, err := privilege.ListFromBitField(tc.raw, privilege.Any)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(pl) != len(tc.privileges) {
 			t.Fatalf("%+v: wrong privilege list from raw: %+v", tc, pl)
 		}
@@ -54,5 +58,16 @@ func TestPrivilegeDecode(t *testing.T) {
 		if pl.SortedString() != tc.sorted {
 			t.Fatalf("%+v: wrong SortedString() output: %q", tc, pl.SortedString())
 		}
+	}
+}
+
+// TestByNameHasAllPrivileges verifies that every privilege is present in ByName.
+func TestByNameHasAllPrivileges(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	for _, kind := range privilege.AllPrivileges {
+		resolvedKind, ok := privilege.ByName[kind.String()]
+		require.True(t, ok)
+		require.Equal(t, kind, resolvedKind)
 	}
 }

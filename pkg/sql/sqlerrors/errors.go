@@ -12,6 +12,8 @@
 package sqlerrors
 
 import (
+	"strings"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -34,6 +36,16 @@ const (
 // due to turning on the enforce_home_region session setting, and provides some
 // information for users or app developers.
 const EnforceHomeRegionFurtherInfo = "For more information, see https://www.cockroachlabs.com/docs/stable/cost-based-optimizer.html#control-whether-queries-are-limited-to-a-single-region"
+
+// NewSchemaChangeOnLockedTableErr creates an error signaling schema
+// change statement is attempted on a table with locked schema.
+func NewSchemaChangeOnLockedTableErr(tableName string) error {
+	return errors.WithHintf(pgerror.Newf(pgcode.OperatorIntervention,
+		`schema changes are disallowed on table %q because it is locked`, tableName),
+		"To unlock the table, try \"ALTER TABLE %v SET (schema_locked = false);\" "+
+			"\nAfter schema change completes, we recommend setting it back to true with "+
+			"\"ALTER TABLE %v SET (schema_locked = true);\"", tableName, tableName)
+}
 
 // NewTransactionAbortedError creates an error for trying to run a command in
 // the context of transaction that's in the aborted state. Any statement other
@@ -150,12 +162,6 @@ func NewUndefinedTypeError(name tree.NodeFormatter) error {
 	return pgerror.Newf(pgcode.UndefinedObject, "type %q does not exist", tree.ErrString(name))
 }
 
-// NewUndefinedFunctionError creates an error that represents a missing user
-// defined function.
-func NewUndefinedFunctionError(fn string) error {
-	return pgerror.Newf(pgcode.UndefinedFunction, "function %q does not exist", fn)
-}
-
 // NewUndefinedRelationError creates an error that represents a missing database table or view.
 func NewUndefinedRelationError(name tree.NodeFormatter) error {
 	return pgerror.Newf(pgcode.UndefinedTable,
@@ -236,6 +242,20 @@ func NewSyntaxErrorf(format string, args ...interface{}) error {
 func NewDependentObjectErrorf(format string, args ...interface{}) error {
 	return pgerror.Newf(pgcode.DependentObjectsStillExist, format, args...)
 }
+
+// NewDependentBlocksOpError creates an error because dependingObjName (of type
+// dependingObjType) has a reference to objName (of objType) when someone attempts
+// to `op` on it.
+// E.g. DROP INDEX "idx" when a VIEW "v" depends on this index and thus will block
+// this drop index.
+func NewDependentBlocksOpError(op, objType, objName, dependentType, dependentName string) error {
+	return errors.WithHintf(
+		NewDependentObjectErrorf("cannot %s %s %q because %s %q depends on it",
+			op, objType, objName, dependentType, dependentName),
+		"consider dropping %q first.", dependentName)
+}
+
+const PrimaryIndexSwapDetail = `CRDB's implementation for "ADD COLUMN", "DROP COLUMN", and "ALTER PRIMARY KEY" will drop the old/current primary index and create a new one.`
 
 // NewColumnReferencedByPrimaryKeyError is returned when attempting to drop a
 // column which is a part of the table's primary key.
@@ -340,11 +360,20 @@ func NewInvalidVolatilityError(err error) error {
 	return pgerror.Wrap(err, pgcode.InvalidFunctionDefinition, "invalid volatility")
 }
 
+func NewCannotModifyVirtualSchemaError(schema string) error {
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"%s is a virtual schema and cannot be modified", tree.ErrNameString(schema))
+}
+
+func NewProcedureUndefinedError(proc *tree.UnresolvedObjectName) error {
+	return pgerror.Newf(pgcode.UndefinedFunction, "procedure %s does not exist", proc)
+}
+
 // QueryTimeoutError is an error representing a query timeout.
 var QueryTimeoutError = pgerror.New(
 	pgcode.QueryCanceled, "query execution canceled due to statement timeout")
 
-// TxnTimeoutError is an error representing a query timeout.
+// TxnTimeoutError is an error representing a transasction timeout.
 var TxnTimeoutError = pgerror.New(
 	pgcode.QueryCanceled, "query execution canceled due to transaction timeout")
 
@@ -378,6 +407,21 @@ func IsUndefinedSchemaError(err error) bool {
 	return errHasCode(err, pgcode.UndefinedSchema)
 }
 
+// IsMissingDescriptorError checks whether the error has any indication
+// that it corresponds to a missing descriptor of any kind.
+//
+// Note that this does not deal with the lower-level
+// catalog.ErrDescriptorNotFound error. That error should be transformed
+// by this package for all uses in the SQL layer and coming out of
+// descs.Collection functions.
+func IsMissingDescriptorError(err error) bool {
+	return IsUndefinedRelationError(err) ||
+		IsUndefinedSchemaError(err) ||
+		IsUndefinedDatabaseError(err) ||
+		errHasCode(err, pgcode.UndefinedObject) ||
+		errHasCode(err, pgcode.UndefinedFunction)
+}
+
 func errHasCode(err error, code ...pgcode.Code) bool {
 	pgCode := pgerror.GetPGCode(err)
 	for _, c := range code {
@@ -386,4 +430,23 @@ func errHasCode(err error, code ...pgcode.Code) bool {
 		}
 	}
 	return false
+}
+
+// IsDistSQLRetryableError returns true if the supplied error, or any of its parent
+// causes is an rpc error.
+// This is an unfortunate implementation that should be looking for a more
+// specific error.
+func IsDistSQLRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// TODO(knz): this is a bad implementation. Make it go away
+	// by avoiding string comparisons.
+
+	errStr := err.Error()
+	// When a crdb node dies, any DistSQL flows with processors scheduled on
+	// it get an error with "rpc error" in the message from the call to
+	// `(*DistSQLPlanner).Run`.
+	return strings.Contains(errStr, `rpc error`)
 }

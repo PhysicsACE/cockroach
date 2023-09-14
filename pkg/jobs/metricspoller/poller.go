@@ -60,8 +60,7 @@ func (mp *metricsPoller) Resume(ctx context.Context, execCtx interface{}) error 
 	defer t.Stop()
 
 	runTask := func(name string, task func(ctx context.Context, execCtx sql.JobExecContext) error) error {
-		ctx = logtags.AddTag(ctx, "task", name)
-		return task(ctx, exec)
+		return task(logtags.AddTag(ctx, "task", name), exec)
 	}
 
 	for {
@@ -74,7 +73,7 @@ func (mp *metricsPoller) Resume(ctx context.Context, execCtx interface{}) error 
 			for name, task := range metricPollerTasks {
 				if err := runTask(name, task); err != nil {
 					log.Errorf(ctx, "Periodic stats collector task %s completed with error %s", name, err)
-					metrics.numErrors.Inc(1)
+					metrics.NumErrors.Inc(1)
 				}
 			}
 		}
@@ -82,21 +81,21 @@ func (mp *metricsPoller) Resume(ctx context.Context, execCtx interface{}) error 
 }
 
 type pollerMetrics struct {
-	numErrors *metric.Counter
+	NumErrors *metric.Counter
 }
 
 // metricsPollerTasks lists the list of tasks performed on each iteration
 // of metrics poller.
 var metricPollerTasks = map[string]func(ctx context.Context, execCtx sql.JobExecContext) error{
 	"paused-jobs": updatePausedMetrics,
-	"manage-pts":  manageJobsProtectedTimestamps,
+	"manage-pts":  manageProtectedTimestamps,
 }
 
 func (m pollerMetrics) MetricStruct() {}
 
 func newPollerMetrics() metric.Struct {
 	return pollerMetrics{
-		numErrors: metric.NewCounter(metric.Metadata{
+		NumErrors: metric.NewCounter(metric.Metadata{
 			Name:        "jobs.metrics.task_failed",
 			Help:        "Number of metrics poller tasks that failed",
 			Measurement: "errors",

@@ -56,6 +56,17 @@ cl-table-container {
   margin-bottom: 0px;
 }
 
+.refresh-alert {
+  margin-top: 5px;
+  padding-top: 5px;
+  display: flex;
+  flex-direction: row;
+}
+
+.margin-bottom {
+  margin-bottom: 10px;
+}
+
 .root {
   flex-grow: 0;
   width: 100%;
@@ -106,4 +117,25 @@ cl-table-container {
   &:hover {
     text-decoration: underline;
   }
+}
+
+.filter-area {
+  height: 40px;
+}
+
+.float-right {
+  float: right;
+}
+
+.float-left {
+  float: left;
+}
+
+.margin-top {
+  margin-top: 20px;
+}
+
+.margin-adjusted {
+  margin-top: 5px;
+  margin-bottom: -15px;
 }

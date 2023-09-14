@@ -1,8 +1,8 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "localcluster",
+    testonly = 1,
     srcs = [
         "cluster.go",
         "localcluster.go",
@@ -11,11 +11,9 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/acceptance/cluster",
-        "//pkg/base",
         "//pkg/config/zonepb",
         "//pkg/roachpb",
         "//pkg/rpc",
-        "//pkg/security/username",
         "//pkg/server/serverpb",
         "//pkg/settings/cluster",
         "//pkg/testutils",
@@ -31,5 +29,3 @@ go_library(
         "@com_github_lib_pq//:pq",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
+	"github.com/cockroachdb/redact"
 )
 
 func (b *Builder) buildCreateTable(ct *memo.CreateTableExpr) (execPlan, error) {
@@ -59,17 +60,12 @@ func (b *Builder) buildCreateView(cv *memo.CreateViewExpr) (execPlan, error) {
 		cols[i].Typ = md.ColumnMeta(cv.Columns[i].ID).Type
 	}
 	root, err := b.factory.ConstructCreateView(
+		cv.Syntax,
 		schema,
-		cv.ViewName,
-		cv.IfNotExists,
-		cv.Replace,
-		cv.Persistence,
-		cv.Materialized,
 		cv.ViewQuery,
 		cols,
 		cv.Deps,
 		cv.TypeDeps,
-		cv.WithData,
 	)
 	return execPlan{root: root}, err
 }
@@ -96,6 +92,7 @@ func (b *Builder) buildExplainOpt(explain *memo.ExplainExpr) (execPlan, error) {
 	case explain.Options.Flags[tree.ExplainFlagTypes]:
 		fmtFlags = memo.ExprFmtHideQualifications | memo.ExprFmtHideNotVisibleIndexInfo
 	}
+	redactValues := explain.Options.Flags[tree.ExplainFlagRedact]
 
 	// Format the plan here and pass it through to the exec factory.
 
@@ -104,27 +101,43 @@ func (b *Builder) buildExplainOpt(explain *memo.ExplainExpr) (execPlan, error) {
 	if explain.Options.Flags[tree.ExplainFlagCatalog] {
 		for _, t := range b.mem.Metadata().AllTables() {
 			tp := treeprinter.New()
-			cat.FormatTable(b.catalog, t.Table, tp)
-			planText.WriteString(tp.String())
+			cat.FormatTable(b.catalog, t.Table, tp, redactValues)
+			catStr := tp.String()
+			if redactValues {
+				catStr = string(redact.RedactableString(catStr).Redact())
+			}
+			planText.WriteString(catStr)
 		}
 		// TODO(radu): add views, sequences
 	}
 
 	// If MEMO option was passed, show the memo.
 	if explain.Options.Flags[tree.ExplainFlagMemo] {
-		planText.WriteString(b.optimizer.FormatMemo(xform.FmtPretty))
+		memoStr := b.optimizer.FormatMemo(xform.FmtPretty, redactValues)
+		if redactValues {
+			memoStr = string(redact.RedactableString(memoStr).Redact())
+		}
+		planText.WriteString(memoStr)
 	}
 
-	f := memo.MakeExprFmtCtx(b.ctx, fmtFlags, b.mem, b.catalog)
+	f := memo.MakeExprFmtCtx(b.ctx, fmtFlags, redactValues, b.mem, b.catalog)
 	f.FormatExpr(explain.Input)
-	planText.WriteString(f.Buffer.String())
+	planStr := f.Buffer.String()
+	if redactValues {
+		planStr = string(redact.RedactableString(planStr).Redact())
+	}
+	planText.WriteString(planStr)
 
 	// If we're going to display the environment, there's a bunch of queries we
 	// need to run to get that information, and we can't run them from here, so
 	// tell the exec factory what information it needs to fetch.
 	var envOpts exec.ExplainEnvData
 	if explain.Options.Flags[tree.ExplainFlagEnv] {
-		envOpts = b.getEnvData()
+		var err error
+		envOpts, err = b.getEnvData()
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 
 	node, err := b.factory.ConstructExplainOpt(planText.String(), envOpts)
@@ -383,7 +396,10 @@ func (b *Builder) buildExport(export *memo.ExportExpr) (execPlan, error) {
 			return execPlan{}, err
 		}
 	}
-	notNullColsSet := input.getNodeColumnOrdinalSet(export.Input.Relational().NotNullCols)
+	notNullColsSet, err := input.getNodeColumnOrdinalSet(export.Input.Relational().NotNullCols)
+	if err != nil {
+		return execPlan{}, err
+	}
 
 	node, err := b.factory.ConstructExport(
 		input.root,

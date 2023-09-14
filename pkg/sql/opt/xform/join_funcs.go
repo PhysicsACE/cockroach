@@ -57,11 +57,13 @@ func (c *CustomFuncs) GenerateMergeJoins(
 	// We generate MergeJoin expressions based on interesting orderings from the
 	// left side. The CommuteJoin rule will ensure that we actually try both
 	// sides.
-	orders := ordering.DeriveInterestingOrderings(left).Copy()
-	leftCols, leftFDs := leftEq.ToSet(), &left.Relational().FuncDeps
-	orders.RestrictToCols(leftCols, leftFDs)
+	leftCols := leftEq.ToSet()
+	// NOTE: leftCols cannot be mutated after this point because it is used as a
+	// key to cache the restricted orderings in left's logical properties.
+	orders := ordering.DeriveRestrictedInterestingOrderings(left, leftCols).Copy()
 
 	var mustGenerateMergeJoin bool
+	leftFDs := &left.Relational().FuncDeps
 	if len(orders) == 0 && leftCols.SubsetOf(leftFDs.ConstantCols()) {
 		// All left equality columns are constant, so we can trivially create
 		// an ordering.
@@ -366,8 +368,8 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 		return
 	}
 
-	var cb lookupjoin.ConstraintBuilder
-	cb.Init(
+	// Initialize the constraint builder.
+	c.cb.Init(
 		c.e.f,
 		c.e.mem.Metadata(),
 		c.e.evalCtx,
@@ -379,7 +381,7 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 	// Generate implicit filters from CHECK constraints and computed columns as
 	// optional filters to help generate lookup join keys.
 	optionalFilters := c.checkConstraintFilters(scanPrivate.Table)
-	computedColFilters := c.computedColFilters(scanPrivate, on, optionalFilters)
+	computedColFilters := c.ComputedColFilters(scanPrivate, on, optionalFilters)
 	optionalFilters = append(optionalFilters, computedColFilters...)
 
 	onClauseLookupRelStrictKeyCols, lookupRelEquijoinCols, inputRelJoinCols, lookupIsKey :=
@@ -408,7 +410,7 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 	var pkCols opt.ColList
 	var newScanPrivate *memo.ScanPrivate
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, on, rejectInvertedIndexes)
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, scanPrivate, on, rejectInvertedIndexes)
 	iter.ForEach(func(index cat.Index, onFilters memo.FiltersExpr, indexCols opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
 		// Skip indexes that do not cover all virtual projection columns, if
 		// there are any. This can happen when there are multiple virtual
@@ -429,7 +431,7 @@ func (c *CustomFuncs) generateLookupJoinsImpl(
 			derivedfkOnFilters = c.ForeignKeyConstraintFilters(
 				input2, scanPrivate2, indexCols2, onClauseLookupRelStrictKeyCols, lookupRelEquijoinCols, inputRelJoinCols)
 		}
-		lookupConstraint, foundEqualityCols := cb.Build(index, onFilters, optionalFilters, derivedfkOnFilters)
+		lookupConstraint, foundEqualityCols := c.cb.Build(index, onFilters, optionalFilters, derivedfkOnFilters)
 		if lookupConstraint.IsUnconstrained() {
 			// We couldn't find equality columns or a lookup expression to
 			// perform a lookup join on this index.
@@ -804,7 +806,7 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 	var optionalFilters memo.FiltersExpr
 
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, on, rejectNonInvertedIndexes)
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, scanPrivate, on, rejectNonInvertedIndexes)
 	iter.ForEach(func(index cat.Index, onFilters memo.FiltersExpr, indexCols opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
 		invertedJoin := memo.InvertedJoinExpr{Input: input}
 		numPrefixCols := index.NonInvertedPrefixColumnCount()
@@ -825,7 +827,7 @@ func (c *CustomFuncs) GenerateInvertedJoins(
 				// using them here would result in a reduced set of optional
 				// filters.
 				optionalFilters = c.checkConstraintFilters(scanPrivate.Table)
-				computedColFilters := c.computedColFilters(scanPrivate, on, optionalFilters)
+				computedColFilters := c.ComputedColFilters(scanPrivate, on, optionalFilters)
 				optionalFilters = append(optionalFilters, computedColFilters...)
 
 				eqColsAndOptionalFiltersCalculated = true
@@ -1379,7 +1381,8 @@ func (c *CustomFuncs) GetLocalityOptimizedLookupJoinExprs(
 			return nil, nil, false
 		}
 	}
-	tabMeta := c.e.mem.Metadata().TableMeta(private.Table)
+	md := c.e.mem.Metadata()
+	tabMeta := md.TableMeta(private.Table)
 
 	// The PrefixSorter has collected all the prefixes from all the different
 	// partitions (remembering which ones came from local partitions), and has
@@ -1404,7 +1407,9 @@ func (c *CustomFuncs) GetLocalityOptimizedLookupJoinExprs(
 	// Check whether the filter constrains the first column of the index
 	// to at least two constant values. We need at least two values so that one
 	// can target a local partition and one can target a remote partition.
-	col, vals, ok := filter.ScalarProps().Constraints.HasSingleColumnConstValues(c.e.evalCtx)
+	idx := md.Table(private.Table).Index(private.Index)
+	firstCol := private.Table.ColumnID(idx.Column(0).Ordinal())
+	vals, ok := filter.ScalarProps().Constraints.ExtractSingleColumnNonNullConstValues(c.e.evalCtx, firstCol)
 	if !ok || len(vals) < 2 {
 		return nil, nil, false
 	}
@@ -1427,7 +1432,7 @@ func (c *CustomFuncs) GetLocalityOptimizedLookupJoinExprs(
 	c.e.f.DisableOptimizationsTemporarily(func() {
 		// Disable normalization rules when constructing the lookup expression
 		// so that it does not get normalized into a non-canonical expression.
-		localExpr[filterIdx] = c.e.f.ConstructConstFilter(col, localValues)
+		localExpr[filterIdx] = c.e.f.ConstructConstFilter(firstCol, localValues)
 	})
 
 	remoteExpr = make(memo.FiltersExpr, len(private.LookupExpr))
@@ -1435,7 +1440,7 @@ func (c *CustomFuncs) GetLocalityOptimizedLookupJoinExprs(
 	c.e.f.DisableOptimizationsTemporarily(func() {
 		// Disable normalization rules when constructing the lookup expression
 		// so that it does not get normalized into a non-canonical expression.
-		remoteExpr[filterIdx] = c.e.f.ConstructConstFilter(col, remoteValues)
+		remoteExpr[filterIdx] = c.e.f.ConstructConstFilter(firstCol, remoteValues)
 	})
 
 	return localExpr, remoteExpr, true
@@ -1883,9 +1888,10 @@ func (c *CustomFuncs) CanMaybeGenerateLocalityOptimizedSearchOfLookupJoins(
 
 // LookupsAreLocal returns true if the lookups done by the given lookup join
 // are done in the local region.
-func (c *CustomFuncs) LookupsAreLocal(lookupJoinExpr *memo.LookupJoinExpr) bool {
-	var inputDistribution physical.Distribution
-	provided := distribution.BuildLookupJoinLookupTableDistribution(c.e.ctx, c.e.f.EvalContext(), lookupJoinExpr, 0, inputDistribution)
+func (c *CustomFuncs) LookupsAreLocal(
+	lookupJoinExpr *memo.LookupJoinExpr, required *physical.Required,
+) bool {
+	_, provided := distribution.BuildLookupJoinLookupTableDistribution(c.e.ctx, c.e.f.EvalContext(), lookupJoinExpr, required, c.e.o.MaybeGetBestCostRelation)
 	if provided.Any() || len(provided.Regions) != 1 {
 		return false
 	}
@@ -2110,6 +2116,9 @@ func (c *CustomFuncs) GenerateLocalityOptimizedSearchLOJ(
 	inputScan *memo.ScanExpr,
 	inputFilters memo.FiltersExpr,
 ) {
+	if !c.LookupsAreLocal(lookupJoinExpr, required) {
+		return
+	}
 	c.GenerateLocalityOptimizedSearchOfLookupJoins(grp, required, lookupJoinExpr, inputScan, inputFilters, nil)
 }
 

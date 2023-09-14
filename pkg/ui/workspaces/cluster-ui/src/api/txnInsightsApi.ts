@@ -9,35 +9,36 @@
 // licenses/APL.txt.
 
 import {
-  SqlApiResponse,
   executeInternalSql,
   formatApiResult,
   INTERNAL_SQL_API_APP,
+  isMaxSizeError,
   LARGE_RESULT_SIZE,
   LONG_TIMEOUT,
   sqlApiErrorMessage,
+  SqlApiResponse,
   SqlExecutionRequest,
   SqlExecutionResponse,
   sqlResultsAreEmpty,
-  isMaxSizeError,
 } from "./sqlApi";
 import {
   ContentionDetails,
   getInsightsFromProblemsAndCauses,
   InsightExecEnum,
   InsightNameEnum,
+  TransactionStatus,
   TxnContentionInsightDetails,
   TxnInsightDetails,
   TxnInsightEvent,
 } from "src/insights";
-import moment from "moment";
+import moment from "moment-timezone";
 import { FixFingerprintHexValue } from "../util";
 import {
   formatStmtInsights,
   stmtInsightsByTxnExecutionQuery,
   StmtInsightsResponseRow,
 } from "./stmtInsightsApi";
-import { INTERNAL_APP_NAME_PREFIX } from "src/recentExecutions/recentStatementUtils";
+import { INTERNAL_APP_NAME_PREFIX } from "src/util/constants";
 import { getContentionDetailsApi } from "./contentionApi";
 
 export const TXN_QUERY_PREVIEW_MAX = 800;
@@ -55,12 +56,13 @@ const makeInsightsSqlRequest = (
 });
 
 export type TxnWithStmtFingerprints = {
-  application: string;
+  application: string; // TODO #108051: (xinhaoz) this field seems deprecated.
   transactionFingerprintID: string;
   queryIDs: string[]; // Statement fingerprint IDs.
 };
 
-type TxnStmtFingerprintsResponseColumns = {
+// Exported for testing.
+export type TxnStmtFingerprintsResponseColumns = {
   transaction_fingerprint_id: string;
   query_ids: string[]; // Statement Fingerprint IDs.
   app_name: string;
@@ -73,7 +75,7 @@ SELECT
   DISTINCT ON (fingerprint_id) encode(fingerprint_id, 'hex') AS transaction_fingerprint_id,
   app_name,
   ARRAY( SELECT jsonb_array_elements_text(metadata -> 'stmtFingerprintIDs' )) AS query_ids
-FROM crdb_internal.transaction_statistics
+FROM crdb_internal.transaction_statistics_persisted
 WHERE app_name != '${INTERNAL_SQL_API_APP}'
   AND encode(fingerprint_id, 'hex') = 
       ANY ARRAY[ ${txnFingerprintIDs.map(id => `'${id}'`).join(",")} ]`;
@@ -89,7 +91,7 @@ function formatTxnFingerprintsResults(
     transactionFingerprintID: FixFingerprintHexValue(
       row.transaction_fingerprint_id,
     ),
-    queryIDs: row.query_ids,
+    queryIDs: row.query_ids.map(id => FixFingerprintHexValue(id)),
     application: row.app_name,
   }));
 }
@@ -99,7 +101,7 @@ type StmtFingerprintToQueryRecord = Map<
   string // Value = query string
 >;
 
-type FingerprintStmtsResponseColumns = {
+export type FingerprintStmtsResponseColumns = {
   statement_fingerprint_id: string;
   query: string;
 };
@@ -109,8 +111,8 @@ type FingerprintStmtsResponseColumns = {
 const fingerprintStmtsQuery = (stmtFingerprintIDs: string[]): string => `
 SELECT
   DISTINCT ON (fingerprint_id) encode(fingerprint_id, 'hex') AS statement_fingerprint_id,
-  prettify_statement(metadata ->> 'query', 108, 1, 1) AS query
-FROM crdb_internal.statement_statistics
+  (metadata ->> 'query') AS query
+FROM crdb_internal.statement_statistics_persisted
 WHERE encode(fingerprint_id, 'hex') =
       ANY ARRAY[ ${stmtFingerprintIDs.map(id => `'${id}'`).join(",")} ]`;
 
@@ -118,7 +120,7 @@ function createStmtFingerprintToQueryMap(
   response: SqlExecutionResponse<FingerprintStmtsResponseColumns>,
 ): StmtFingerprintToQueryRecord {
   const idToQuery: Map<string, string> = new Map();
-  if (sqlResultsAreEmpty(response)) {
+  if (!response || sqlResultsAreEmpty(response)) {
     // No statement fingerprint results.
     return idToQuery;
   }
@@ -158,7 +160,7 @@ function formatTxnContentionDetailsResponse(
 }
 
 export async function getTxnInsightsContentionDetailsApi(
-  req: TxnInsightDetailsRequest,
+  req: Pick<TxnInsightDetailsRequest, "txnExecutionID">,
 ): Promise<TxnContentionInsightDetails> {
   // Note that any errors encountered fetching these results are caught
   // earlier in the call stack.
@@ -172,15 +174,13 @@ export async function getTxnInsightsContentionDetailsApi(
 
   const contentionResponse = await getContentionDetailsApi({
     waitingTxnID: req.txnExecutionID,
-    waitingStmtID: null,
-    start: null,
-    end: null,
   });
   const contentionResults = contentionResponse.results;
 
   if (contentionResults.length === 0) {
-    return;
+    return null;
   }
+
   const contentionDetails =
     formatTxnContentionDetailsResponse(contentionResults);
 
@@ -202,6 +202,7 @@ export async function getTxnInsightsContentionDetailsApi(
       )}`,
     );
   }
+
   const txnsWithStmtFingerprints = formatTxnFingerprintsResults(
     getStmtFingerprintsResponse,
   );
@@ -212,18 +213,23 @@ export async function getTxnInsightsContentionDetailsApi(
   );
 
   // Request query string from stmt fingerprint ids.
-  const stmtQueriesResponse =
-    await executeInternalSql<FingerprintStmtsResponseColumns>(
-      makeInsightsSqlRequest([
-        fingerprintStmtsQuery(Array.from(stmtFingerprintIDs)),
-      ]),
-    );
-  if (stmtQueriesResponse.error) {
-    throw new Error(
-      `Error while retrieving statements information: ${sqlApiErrorMessage(
-        stmtQueriesResponse.error.message,
-      )}`,
-    );
+  let stmtQueriesResponse: SqlExecutionResponse<FingerprintStmtsResponseColumns> | null =
+    null;
+
+  if (stmtFingerprintIDs.size) {
+    stmtQueriesResponse =
+      await executeInternalSql<FingerprintStmtsResponseColumns>(
+        makeInsightsSqlRequest([
+          fingerprintStmtsQuery(Array.from(stmtFingerprintIDs)),
+        ]),
+      );
+    if (stmtQueriesResponse.error) {
+      throw new Error(
+        `Error while retrieving statements information: ${sqlApiErrorMessage(
+          stmtQueriesResponse.error.message,
+        )}`,
+      );
+    }
   }
 
   return buildTxnContentionInsightDetails(
@@ -238,11 +244,7 @@ function buildTxnContentionInsightDetails(
   txnsWithStmtFingerprints: TxnWithStmtFingerprints[],
   stmtFingerprintToQuery: StmtFingerprintToQueryRecord,
 ): TxnContentionInsightDetails {
-  if (
-    !partialTxnContentionDetails &&
-    !txnsWithStmtFingerprints.length &&
-    !stmtFingerprintToQuery.size
-  ) {
+  if (!partialTxnContentionDetails && !txnsWithStmtFingerprints.length) {
     return null;
   }
 
@@ -257,7 +259,9 @@ function buildTxnContentionInsightDetails(
     }
 
     blockedRow.blockingTxnQuery = currBlockedFingerprintStmts.queryIDs.map(
-      id => stmtFingerprintToQuery.get(id) ?? "",
+      id =>
+        stmtFingerprintToQuery.get(id) ??
+        `Query unavailable for statement fingerprint ${id}`,
     );
   });
 
@@ -293,6 +297,8 @@ type TxnInsightsResponseRow = {
   causes: string[];
   stmt_execution_ids: string[];
   cpu_sql_nanos: number;
+  last_error_code: string;
+  status: TransactionStatus;
 };
 
 type TxnQueryFilters = {
@@ -326,7 +332,9 @@ last_retry_reason,
 problems,
 causes,
 stmt_execution_ids,
-cpu_sql_nanos`;
+cpu_sql_nanos,
+last_error_code,
+status`;
 
   if (filters?.execID) {
     return `
@@ -379,7 +387,7 @@ function formatTxnInsightsRow(row: TxnInsightsResponseRow): TxnInsightEvent {
     transactionExecutionID: row.txn_id,
     transactionFingerprintID: row.txn_fingerprint_id,
     implicitTxn: row.implicit_txn,
-    query: row.query.split(" ; ").join("\n"),
+    query: row.query?.split(" ; ").join("\n") || "",
     startTime,
     endTime,
     elapsedTimeMillis: endTime.diff(startTime, "milliseconds"),
@@ -394,6 +402,8 @@ function formatTxnInsightsRow(row: TxnInsightsResponseRow): TxnInsightEvent {
     insights,
     stmtExecutionIDs: row.stmt_execution_ids,
     cpuSQLNanos: row.cpu_sql_nanos,
+    errorCode: row.last_error_code,
+    status: row.status,
   };
 }
 
@@ -417,10 +427,14 @@ export async function getTxnInsightsApi(
   const result = await executeInternalSql<TxnInsightsResponseRow>(request);
 
   if (sqlResultsAreEmpty(result)) {
-    return formatApiResult([], result.error, "retrieving insights information");
+    return formatApiResult<TxnInsightEvent[]>(
+      [],
+      result.error,
+      "retrieving insights information",
+    );
   }
 
-  return formatApiResult(
+  return formatApiResult<TxnInsightEvent[]>(
     result.execution.txn_results[0].rows.map(formatTxnInsightsRow),
     result.error,
     "retrieving insights information",
@@ -459,7 +473,7 @@ export async function getTxnInsightDetailsApi(
   // (e.g. when there is no high contention to report).
   //
   // Note the way we construct the object below is important. We spread the
-  // the existing object fields into a new object in order to ensure a new
+  // existing object fields into a new object in order to ensure a new
   // reference is returned so that components will be notified that there
   // was a change. However, we want the internal objects (e.g. txnDetails)
   // should only change when they are re-fetched so that components don't update
@@ -495,8 +509,9 @@ export async function getTxnInsightDetailsApi(
 
       const txnDetailsRes = result.execution.txn_results[0];
       if (txnDetailsRes.rows?.length) {
-        const txnDetails = formatTxnInsightsRow(txnDetailsRes.rows[0]);
-        txnInsightDetails.txnDetails = txnDetails;
+        txnInsightDetails.txnDetails = formatTxnInsightsRow(
+          txnDetailsRes.rows[0],
+        );
       }
     } catch (e) {
       errors.txnDetailsErr = e;

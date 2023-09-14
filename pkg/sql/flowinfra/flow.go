@@ -16,7 +16,6 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
@@ -24,10 +23,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxlog"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -105,8 +106,23 @@ type Flow interface {
 	// It is assumed that rowSyncFlowConsumer is set, so all errors encountered
 	// when running this flow are sent to it.
 	//
+	// noWait is set true when the flow is bound to a pausable portal. With it set,
+	// the function returns without waiting the all goroutines to finish. For a
+	// pausable portal we will persist this flow and reuse it when re-executing
+	// the portal. The flow will be cleaned when the portal is closed, rather than
+	// when each portal execution finishes.
+	//
 	// The caller needs to call f.Cleanup().
-	Run(context.Context)
+	Run(ctx context.Context, noWait bool)
+
+	// Resume continues running the Flow after it has been paused with the new
+	// output receiver. The Flow is expected to have exactly one processor.
+	// It is called when resuming a paused portal.
+	// The lifecycle of a flow for a pausable portal is:
+	// - flow.Run(ctx, true /* noWait */) (only once)
+	// - flow.Resume() (for all re-executions of the portal)
+	// - flow.Cleanup() (only once)
+	Resume(recv execinfra.RowReceiver)
 
 	// Wait waits for all the goroutines for this flow to exit. If the context gets
 	// canceled before all goroutines exit, it calls f.cancel().
@@ -136,8 +152,7 @@ type Flow interface {
 	MemUsage() int64
 
 	// Cancel cancels the flow by canceling its context. Safe to be called from
-	// any goroutine but **cannot** be called after (or concurrently with)
-	// Cleanup.
+	// any goroutine.
 	Cancel()
 
 	// AddOnCleanupStart adds a callback to be executed at the very beginning of
@@ -169,12 +184,17 @@ type Flow interface {
 type FlowBase struct {
 	execinfra.FlowCtx
 
+	// resumeCtx is only captured for using inside of Flow.Resume() implementations.
+	resumeCtx context.Context
+
 	flowRegistry *FlowRegistry
 
 	// processors contains a subset of the processors in the flow - the ones that
 	// run in their own goroutines. Some processors that implement RowSource are
 	// scheduled to run in their consumer's goroutine; those are not present here.
 	processors []execinfra.Processor
+	// outputs contains an output for each execinfra.Processor in processors.
+	outputs []execinfra.RowReceiver
 	// startables are entities that must be started when the flow starts;
 	// currently these are outboxes and routers.
 	startables []Startable
@@ -186,7 +206,8 @@ type FlowBase struct {
 	// pushing coldata.Batches to locally.
 	batchSyncFlowConsumer execinfra.BatchReceiver
 
-	localProcessors []execinfra.LocalProcessor
+	localProcessors    []execinfra.LocalProcessor
+	localVectorSources map[int32]any
 
 	// startedGoroutines specifies whether this flow started any goroutines. This
 	// is used in Wait() to avoid the overhead of waiting for non-existent
@@ -211,12 +232,19 @@ type FlowBase struct {
 
 	statementSQL string
 
-	status flowStatus
+	mu struct {
+		syncutil.Mutex
+		status flowStatus
+		// Cancel function for ctx. Call this to cancel the flow (safe to be
+		// called multiple times).
+		//
+		// NB: must be used with care as this function should **not** be called
+		// once the Flow has been cleaned up. Consider using Flow.Cancel
+		// instead when unsure.
+		ctxCancel context.CancelFunc
+	}
 
-	// Cancel function for ctx. Call this to cancel the flow (safe to be called
-	// multiple times).
-	ctxCancel context.CancelFunc
-	ctxDone   <-chan struct{}
+	ctxDone <-chan struct{}
 
 	// sp is the span that this Flow runs in. Can be nil if no span was created
 	// for the flow. Flow.Cleanup() finishes it.
@@ -228,11 +256,23 @@ type FlowBase struct {
 	admissionInfo admission.WorkInfo
 }
 
+func (f *FlowBase) getStatus() flowStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mu.status
+}
+
+func (f *FlowBase) setStatus(status flowStatus) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mu.status = status
+}
+
 // Setup is part of the Flow interface.
 func (f *FlowBase) Setup(
 	ctx context.Context, spec *execinfrapb.FlowSpec, _ FuseOpt,
 ) (context.Context, execopnode.OpChains, error) {
-	ctx, f.ctxCancel = contextutil.WithCancel(ctx)
+	ctx, f.mu.ctxCancel = ctxlog.WithCancel(ctx)
 	f.ctxDone = ctx.Done()
 	f.spec = spec
 	return ctx, nil, nil
@@ -267,7 +307,7 @@ func (f *FlowBase) SetStartedGoroutines(val bool) {
 
 // Started returns true if f has either been Run() or Start()ed.
 func (f *FlowBase) Started() bool {
-	return f.status != flowNotStarted
+	return f.getStatus() != flowNotStarted
 }
 
 var _ Flow = &FlowBase{}
@@ -283,6 +323,7 @@ func NewFlowBase(
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localProcessors []execinfra.LocalProcessor,
+	localVectorSources map[int32]any,
 	onFlowCleanupEnd func(),
 	statementSQL string,
 ) *FlowBase {
@@ -306,9 +347,9 @@ func NewFlowBase(
 		rowSyncFlowConsumer:   rowSyncFlowConsumer,
 		batchSyncFlowConsumer: batchSyncFlowConsumer,
 		localProcessors:       localProcessors,
+		localVectorSources:    localVectorSources,
 		admissionInfo:         admissionInfo,
 		onCleanupEnd:          onFlowCleanupEnd,
-		status:                flowNotStarted,
 		statementSQL:          statementSQL,
 	}
 }
@@ -357,15 +398,26 @@ func (f *FlowBase) GetCtxDone() <-chan struct{} {
 }
 
 // GetCancelFlowFn returns the context cancellation function of the context of
-// this flow.
+// this flow. The returned function is only safe to be used before Flow.Cleanup
+// has been called.
 func (f *FlowBase) GetCancelFlowFn() context.CancelFunc {
-	return f.ctxCancel
+	return f.mu.ctxCancel
 }
 
-// SetProcessors overrides the current f.processors with the provided
-// processors. This is used to set up the vectorized flow.
-func (f *FlowBase) SetProcessors(processors []execinfra.Processor) {
+// SetProcessorsAndOutputs overrides the current f.processors and f.outputs with
+// the provided slices.
+func (f *FlowBase) SetProcessorsAndOutputs(
+	processors []execinfra.Processor, outputs []execinfra.RowReceiver,
+) error {
+	if len(processors) != len(outputs) {
+		return errors.AssertionFailedf(
+			"processors and outputs don't match: %d processors, %d outputs",
+			len(processors), len(outputs),
+		)
+	}
 	f.processors = processors
+	f.outputs = outputs
+	return nil
 }
 
 // AddRemoteStream adds a remote stream to this flow.
@@ -389,6 +441,11 @@ func (f *FlowBase) GetLocalProcessors() []execinfra.LocalProcessor {
 	return f.localProcessors
 }
 
+// GetLocalVectorSources return the LocalVectorSources of this flow.
+func (f *FlowBase) GetLocalVectorSources() map[int32]any {
+	return f.localVectorSources
+}
+
 // GetAdmissionInfo returns the information to use for admission control on
 // responses received from a remote flow.
 func (f *FlowBase) GetAdmissionInfo() admission.WorkInfo {
@@ -398,7 +455,9 @@ func (f *FlowBase) GetAdmissionInfo() admission.WorkInfo {
 // StartInternal starts the flow. All processors are started, each in their own
 // goroutine. The caller must forward any returned error to rowSyncFlowConsumer if
 // set.
-func (f *FlowBase) StartInternal(ctx context.Context, processors []execinfra.Processor) error {
+func (f *FlowBase) StartInternal(
+	ctx context.Context, processors []execinfra.Processor, outputs []execinfra.RowReceiver,
+) error {
 	log.VEventf(
 		ctx, 1, "starting (%d processors, %d startables) asynchronously", len(processors), len(f.startables),
 	)
@@ -426,9 +485,9 @@ func (f *FlowBase) StartInternal(ctx context.Context, processors []execinfra.Pro
 		}
 	}
 
-	f.status = flowRunning
+	f.setStatus(flowRunning)
 
-	if multitenant.TenantRUEstimateEnabled.Get(&f.Cfg.Settings.SV) &&
+	if execinfra.IncludeRUEstimateInExplainAnalyze.Get(&f.Cfg.Settings.SV) &&
 		!f.Gateway && f.CollectStats {
 		// Remote flows begin collecting CPU usage here, and finish when the last
 		// outbox finishes. Gateway flows are handled by the connExecutor.
@@ -439,12 +498,15 @@ func (f *FlowBase) StartInternal(ctx context.Context, processors []execinfra.Pro
 		log.Infof(ctx, "registered flow %s", f.ID.Short())
 	}
 	for _, s := range f.startables {
-		s.Start(ctx, &f.waitGroup, f.ctxCancel)
+		// Note that it is safe to pass the context cancellation function
+		// directly since the main goroutine of the Flow will block until all
+		// startable goroutines exit.
+		s.Start(ctx, &f.waitGroup, f.mu.ctxCancel)
 	}
 	for i := 0; i < len(processors); i++ {
 		f.waitGroup.Add(1)
 		go func(i int) {
-			processors[i].Run(ctx)
+			processors[i].Run(ctx, outputs[i])
 			f.waitGroup.Done()
 		}(i)
 	}
@@ -463,31 +525,53 @@ func (f *FlowBase) IsLocal() bool {
 
 // Start is part of the Flow interface.
 func (f *FlowBase) Start(ctx context.Context) error {
-	return f.StartInternal(ctx, f.processors)
+	return f.StartInternal(ctx, f.processors, f.outputs)
+}
+
+// Resume is part of the Flow interface.
+func (f *FlowBase) Resume(recv execinfra.RowReceiver) {
+	if len(f.processors) != 1 || len(f.outputs) != 1 {
+		recv.Push(
+			nil, /* row */
+			&execinfrapb.ProducerMetadata{
+				Err: errors.AssertionFailedf(
+					"length of both the processor and the output must be 1",
+				)})
+		recv.ProducerDone()
+		return
+	}
+
+	f.outputs[0] = recv
+	log.VEventf(f.resumeCtx, 1, "resuming %T in the flow's goroutine", f.processors[0])
+	f.processors[0].Resume(recv)
 }
 
 // Run is part of the Flow interface.
-func (f *FlowBase) Run(ctx context.Context) {
-	defer f.Wait()
+func (f *FlowBase) Run(ctx context.Context, noWait bool) {
+	if !noWait {
+		defer f.Wait()
+	}
 
-	// We'll take care of the last processor in particular.
-	var headProc execinfra.Processor
 	if len(f.processors) == 0 {
 		f.rowSyncFlowConsumer.Push(nil /* row */, &execinfrapb.ProducerMetadata{Err: errors.AssertionFailedf("no processors in flow")})
 		f.rowSyncFlowConsumer.ProducerDone()
 		return
 	}
-	headProc = f.processors[len(f.processors)-1]
+	// We'll take care of the last processor in particular.
+	headProc := f.processors[len(f.processors)-1]
+	headOutput := f.outputs[len(f.outputs)-1]
 	otherProcs := f.processors[:len(f.processors)-1]
+	otherOutputs := f.outputs[:len(f.outputs)-1]
 
 	var err error
-	if err = f.StartInternal(ctx, otherProcs); err != nil {
+	if err = f.StartInternal(ctx, otherProcs, otherOutputs); err != nil {
 		f.rowSyncFlowConsumer.Push(nil /* row */, &execinfrapb.ProducerMetadata{Err: err})
 		f.rowSyncFlowConsumer.ProducerDone()
 		return
 	}
+	f.resumeCtx = ctx
 	log.VEventf(ctx, 1, "running %T in the flow's goroutine", headProc)
-	headProc.Run(ctx)
+	headProc.Run(ctx, headOutput)
 }
 
 // Wait is part of the Flow interface.
@@ -499,9 +583,13 @@ func (f *FlowBase) Wait() {
 	var panicVal interface{}
 	if panicVal = recover(); panicVal != nil {
 		// If Wait is called as part of stack unwinding during a panic, the flow
-		// context must be canceled to ensure that all asynchronous goroutines get
-		// the message that they must exit (otherwise we will wait indefinitely).
-		f.ctxCancel()
+		// context must be canceled to ensure that all asynchronous goroutines
+		// get the message that they must exit (otherwise we will wait
+		// indefinitely).
+		//
+		// Cleanup is only called _after_ Wait, so it's safe to use ctxCancel
+		// directly.
+		f.mu.ctxCancel()
 	}
 	waitChan := make(chan struct{})
 
@@ -531,7 +619,13 @@ func (f *FlowBase) MemUsage() int64 {
 
 // Cancel is part of the Flow interface.
 func (f *FlowBase) Cancel() {
-	f.ctxCancel()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mu.status == flowFinished {
+		// The Flow is already done, nothing to cancel.
+		return
+	}
+	f.mu.ctxCancel()
 }
 
 // AddOnCleanupStart is part of the Flow interface.
@@ -562,11 +656,13 @@ func (f *FlowBase) GetOnCleanupFns() (startCleanup, endCleanup func()) {
 }
 
 // Cleanup is part of the Flow interface.
-// NOTE: this implements only the shared clean up logic between row-based and
+// NOTE: this implements only the shared cleanup logic between row-based and
 // vectorized flows.
 func (f *FlowBase) Cleanup(ctx context.Context) {
-	if f.status == flowFinished {
-		panic("flow cleanup called twice")
+	if buildutil.CrdbTestBuild {
+		if f.getStatus() == flowFinished {
+			panic("flow cleanup called twice")
+		}
 	}
 
 	// Release any descriptors accessed by this flow.
@@ -582,7 +678,7 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 			// non-gateway nodes use the last outbox to send this information
 			// over.
 			f.sp.RecordStructured(&execinfrapb.ComponentStats{
-				Component: execinfrapb.FlowComponentID(f.NodeID.SQLInstanceID(), f.FlowCtx.ID),
+				Component: f.FlowCtx.FlowComponentID(),
 				FlowStats: execinfrapb.FlowStats{
 					MaxMemUsage:  optional.MakeUint(uint64(f.FlowCtx.Mon.MaximumBytes())),
 					MaxDiskUsage: optional.MakeUint(uint64(f.FlowCtx.DiskMonitor.MaximumBytes())),
@@ -613,8 +709,10 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 	if !f.IsLocal() && f.Started() {
 		f.flowRegistry.UnregisterFlow(f.ID)
 	}
-	f.status = flowFinished
-	f.ctxCancel()
+	// Importantly, we must mark the Flow as finished before f.sp is finished in
+	// the defer above.
+	f.setStatus(flowFinished)
+	f.mu.ctxCancel()
 }
 
 // cancel cancels all unconnected streams of this flow. This function is called

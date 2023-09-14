@@ -12,7 +12,7 @@ import React from "react";
 import _ from "lodash";
 import * as Long from "long";
 import { History } from "history";
-import { Moment } from "moment";
+import { Moment } from "moment-timezone";
 import { createSelector } from "reselect";
 
 import times from "lodash/times";
@@ -221,7 +221,7 @@ export class SortedTable<T> extends React.Component<
       data: T[],
       sortSetting: SortSetting,
       columns: ColumnDescriptor<T>[],
-      pagination?: ISortedTablePagination,
+      _pagination?: ISortedTablePagination,
     ): T[] => {
       if (!sortSetting) {
         return this.paginatedData();

@@ -67,6 +67,8 @@ func ParseAndRequireString(
 			return nil, false, typErr
 		}
 		d, err = ParseDIntervalWithTypeMetadata(intervalStyle(ctx), s, itm)
+	case types.PGLSNFamily:
+		d, err = ParseDPGLSN(s)
 	case types.Box2DFamily:
 		d, err = ParseDBox2D(s)
 	case types.GeographyFamily:
@@ -170,6 +172,8 @@ type ValueHandler interface {
 	// Decimal returns a pointer into the vec for in place construction.
 	Decimal() *apd.Decimal
 	Float(f float64)
+	Int16(i int16)
+	Int32(i int32)
 	Int(i int64)
 	Duration(d duration.Duration)
 	JSON(j json.JSON)
@@ -219,10 +223,25 @@ func ParseAndRequireStringHandler(
 		}
 	case types.IntFamily:
 		var i int64
-		if i, err = strconv.ParseInt(s, 0, 64); err == nil {
-			vh.Int(i)
-		} else {
-			err = MakeParseError(s, types.Int, err)
+		switch t.Width() {
+		case 16:
+			if i, err = strconv.ParseInt(s, 0, 16); err == nil {
+				vh.Int16(int16(i))
+			} else {
+				err = MakeParseError(s, t, err)
+			}
+		case 32:
+			if i, err = strconv.ParseInt(s, 0, 32); err == nil {
+				vh.Int32(int32(i))
+			} else {
+				err = MakeParseError(s, t, err)
+			}
+		default:
+			if i, err = strconv.ParseInt(s, 0, 64); err == nil {
+				vh.Int(i)
+			} else {
+				err = MakeParseError(s, t, err)
+			}
 		}
 	case types.JsonFamily:
 		var j json.JSON

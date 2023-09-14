@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -66,16 +67,17 @@ var ForceWriterParallelism ConfigOption = func(cfg *engineConfig) error {
 // ForTesting configures the engine for use in testing. It may randomize some
 // config options to improve test coverage.
 var ForTesting ConfigOption = func(cfg *engineConfig) error {
-	return nil
-}
-
-// ForStickyEngineTesting is similar to ForTesting but leaves separated
-// intents as enabled since we cannot ensure consistency in the test setup
-// between what the KV layer thinks and what the engine does in terms of
-// writing separated intents. Since our optimizations are for the case where
-// we know there are only separated intents, this sidesteps any test issues
-// due to inconsistencies.
-var ForStickyEngineTesting ConfigOption = func(cfg *engineConfig) error {
+	cfg.onClose = append(cfg.onClose, func(p *Pebble) {
+		m := p.db.Metrics()
+		if m.Keys.MissizedTombstonesCount > 0 {
+			// A missized tombstone is a Pebble DELSIZED tombstone that encodes
+			// the wrong size of the value it deletes. This kind of tombstone is
+			// written when ClearOptions.ValueSizeKnown=true. If this assertion
+			// failed, something might be awry in the code clearing the key. Are
+			// we feeding the wrong value length to ValueSize?
+			panic(errors.AssertionFailedf("expected to find 0 missized tombstones; found %d", m.Keys.MissizedTombstonesCount))
+		}
+	})
 	return nil
 }
 
@@ -102,6 +104,17 @@ func BlockSize(size int) ConfigOption {
 		for i := range cfg.Opts.Levels {
 			cfg.Opts.Levels[i].BlockSize = size
 			cfg.Opts.Levels[i].IndexBlockSize = size
+		}
+		return nil
+	}
+}
+
+// TargetFileSize sets the target file size across all levels of the LSM,
+// primarily for testing purposes.
+func TargetFileSize(size int64) ConfigOption {
+	return func(cfg *engineConfig) error {
+		for i := range cfg.Opts.Levels {
+			cfg.Opts.Levels[i].TargetFileSize = size
 		}
 		return nil
 	}
@@ -158,6 +171,19 @@ func BallastSize(size int64) ConfigOption {
 func SharedStorage(sharedStorage cloud.ExternalStorage) ConfigOption {
 	return func(cfg *engineConfig) error {
 		cfg.SharedStorage = sharedStorage
+		// TODO(bilal): Do the format major version ratchet while accounting for
+		// version upgrade finalization. However, seeing as shared storage is
+		// an experimental feature and upgrading from existing stores is not
+		// supported, this is fine.
+		cfg.Opts.FormatMajorVersion = pebble.ExperimentalFormatVirtualSSTables
+		return nil
+	}
+}
+
+// RemoteStorageFactory enables use of remote storage (experimental).
+func RemoteStorageFactory(accessor *cloud.ExternalStorageAccessor) ConfigOption {
+	return func(cfg *engineConfig) error {
+		cfg.RemoteStorageFactory = accessor
 		return nil
 	}
 }
@@ -219,6 +245,13 @@ func If(enable bool, opt ConfigOption) ConfigOption {
 type Location struct {
 	dir string
 	fs  vfs.FS
+}
+
+// MakeLocation constructs a Location from a directory and a vfs.FS. Typically
+// callers should prefer `Filesystem` or `InMemory` rather than directly
+// invoking MakeLocation.
+func MakeLocation(dir string, fs vfs.FS) Location {
+	return Location{dir: dir, fs: fs}
 }
 
 // Filesystem constructs a Location that instructs the storage engine to read

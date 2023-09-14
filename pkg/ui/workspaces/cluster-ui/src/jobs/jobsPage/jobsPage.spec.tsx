@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
+import moment from "moment-timezone";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { JobsPage, JobsPageProps } from "./jobsPage";
 import { formatDuration } from "../util/duration";
@@ -33,15 +33,16 @@ const getMockJobsPageProps = (jobs: Array<Job>): JobsPageProps => {
     setShow: () => {},
     setType: () => {},
     onColumnsChange: () => {},
-    jobs: {
-      jobs: jobs,
-      earliest_retained_time: earliestRetainedTime,
-      toJSON: () => ({}),
+    jobsResponse: {
+      data: {
+        jobs,
+        earliest_retained_time: earliestRetainedTime,
+      },
+      valid: true,
+      lastUpdated: moment(),
+      error: null,
+      inFlight: false,
     },
-    reqInFlight: false,
-    isDataValid: true,
-    lastUpdated: moment(),
-    jobsError: null,
     refreshJobs: () => {},
     location: history.location,
     history,
@@ -78,6 +79,7 @@ describe("Jobs", () => {
       "User Name",
       "Creation Time (UTC)",
       "Last Execution Time (UTC)",
+      "Last Modified Time (UTC)",
       "Execution Count",
     ];
 

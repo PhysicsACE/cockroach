@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -54,9 +55,7 @@ func (m *MockNodeLiveness) SetNodeStatus(
 
 // NodeLivenessFunc is the method that can be injected as part of store pool
 // construction to mock out node liveness, in tests.
-func (m *MockNodeLiveness) NodeLivenessFunc(
-	nodeID roachpb.NodeID, now time.Time, threshold time.Duration,
-) livenesspb.NodeLivenessStatus {
+func (m *MockNodeLiveness) NodeLivenessFunc(nodeID roachpb.NodeID) livenesspb.NodeLivenessStatus {
 	m.Lock()
 	defer m.Unlock()
 	if status, ok := m.nodes[nodeID]; ok {
@@ -70,19 +69,20 @@ func (m *MockNodeLiveness) NodeLivenessFunc(
 func CreateTestStorePool(
 	ctx context.Context,
 	st *cluster.Settings,
-	timeUntilStoreDeadValue time.Duration,
+	timeUntilNodeDeadValue time.Duration,
 	deterministic bool,
 	nodeCount NodeCountFunc,
 	defaultNodeStatus livenesspb.NodeLivenessStatus,
 ) (*stop.Stopper, *gossip.Gossip, *timeutil.ManualTime, *StorePool, *MockNodeLiveness) {
 	stopper := stop.NewStopper()
-	mc := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	// Pick a random date that is "realistic" and far enough away from 0.
+	mc := timeutil.NewManualTime(time.Date(2020, 0, 0, 0, 0, 0, 0, time.UTC))
 	clock := hlc.NewClockForTesting(mc)
 	ambientCtx := log.MakeTestingAmbientContext(stopper.Tracer())
 	g := gossip.NewTest(1, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	mnl := NewMockNodeLiveness(defaultNodeStatus)
 
-	TimeUntilStoreDead.Override(ctx, &st.SV, timeUntilStoreDeadValue)
+	liveness.TimeUntilNodeDead.Override(ctx, &st.SV, timeUntilNodeDeadValue)
 	storePool := NewStorePool(
 		ambientCtx,
 		st,

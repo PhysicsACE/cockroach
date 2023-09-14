@@ -17,12 +17,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -116,10 +116,9 @@ func TestShowChangefeedJobs(t *testing.T) {
 
 	bucket, accessKey, secretKey := checkS3Credentials(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, rawSQLDB, _ := serverutils.StartServer(t, params)
+	s, rawSQLDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
-	registry := s.JobRegistry().(*jobs.Registry)
+	registry := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
@@ -152,14 +151,13 @@ func TestShowChangefeedJobs(t *testing.T) {
 	doneCh := make(chan struct{})
 	defer close(doneCh)
 
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-		jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
+	registry.TestingWrapResumerConstructor(jobspb.TypeChangefeed,
+		func(raw jobs.Resumer) jobs.Resumer {
 			r := fakeResumer{
 				done: doneCh,
 			}
 			return &r
-		},
-	}
+		})
 
 	query = `SET CLUSTER SETTING kv.rangefeed.enabled = true`
 	sqlDB.Exec(t, query)
@@ -240,10 +238,10 @@ func TestShowChangefeedJobsStatusChange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	s, rawSQLDB, _ := serverutils.StartServer(t, params)
-	registry := s.JobRegistry().(*jobs.Registry)
+	registry := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
 	defer s.Stopper().Stop(context.Background())
 
@@ -253,14 +251,13 @@ func TestShowChangefeedJobsStatusChange(t *testing.T) {
 	doneCh := make(chan struct{})
 	defer close(doneCh)
 
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-		jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
+	registry.TestingWrapResumerConstructor(jobspb.TypeChangefeed,
+		func(raw jobs.Resumer) jobs.Resumer {
 			r := fakeResumer{
 				done: doneCh,
 			}
 			return &r
-		},
-	}
+		})
 
 	query = `SET CLUSTER SETTING kv.rangefeed.enabled = true`
 	sqlDB.Exec(t, query)
@@ -288,8 +285,7 @@ func TestShowChangefeedJobsNoResults(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, rawSQLDB, _ := serverutils.StartServer(t, params)
+	s, rawSQLDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
 	defer s.Stopper().Stop(context.Background())
 
@@ -419,7 +415,7 @@ func TestShowChangefeedJobsAlterChangefeed(t *testing.T) {
 		out = obtainJobRowFn()
 
 		require.Equal(t, jobID, out.id, "Expected id:%d but found id:%d", jobID, out.id)
-		require.Equal(t, "CREATE CHANGEFEED FOR TABLE d.public.bar INTO 'kafka://does.not.matter/' WITH resolved = '5s'", out.description, "Expected description:%s but found description:%s", "CREATE CHANGEFEED FOR TABLE bar INTO 'kafka://does.not.matter/ WITH resolved = '5s''", out.description)
+		require.Equal(t, "CREATE CHANGEFEED FOR TABLE d.public.bar INTO 'kafka://does.not.matter/' WITH OPTIONS (resolved = '5s')", out.description, "Expected description:%s but found description:%s", "CREATE CHANGEFEED FOR TABLE bar INTO 'kafka://does.not.matter/ WITH resolved = '5s''", out.description)
 		require.Equal(t, sinkURI, out.SinkURI, "Expected sinkUri:%s but found sinkUri:%s", sinkURI, out.SinkURI)
 		require.Equal(t, "bar", out.topics, "Expected topics:%s but found topics:%s", "bar", sortedTopics)
 		require.Equal(t, "{d.public.bar}", string(out.FullTableNames), "Expected fullTableNames:%s but found fullTableNames:%s", "{d.public.bar}", string(out.FullTableNames))

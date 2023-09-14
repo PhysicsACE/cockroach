@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/trigram"
 	"github.com/stretchr/testify/require"
@@ -46,7 +47,9 @@ type indexKeyTest struct {
 	secondaryValues []tree.Datum
 }
 
-func makeTableDescForTest(test indexKeyTest) (catalog.TableDescriptor, catalog.TableColMap) {
+func makeTableDescForTest(
+	test indexKeyTest, isSecondaryIndexForward bool,
+) (catalog.TableDescriptor, catalog.TableColMap) {
 	primaryColumnIDs := make([]descpb.ColumnID, len(test.primaryValues))
 	secondaryColumnIDs := make([]descpb.ColumnID, len(test.secondaryValues))
 	columns := make([]descpb.ColumnDescriptor, len(test.primaryValues)+len(test.secondaryValues))
@@ -64,6 +67,9 @@ func makeTableDescForTest(test indexKeyTest) (catalog.TableDescriptor, catalog.T
 			columns[i].Type = test.secondaryValues[i-len(test.primaryValues)].ResolvedType()
 			if colinfo.ColumnTypeIsInvertedIndexable(columns[i].Type) {
 				secondaryType = descpb.IndexDescriptor_INVERTED
+			}
+			if isSecondaryIndexForward && columns[i].Type.Family() == types.JsonFamily {
+				secondaryType = descpb.IndexDescriptor_FORWARD
 			}
 			secondaryColumnIDs[i-len(test.primaryValues)] = columns[i].ID
 		}
@@ -98,7 +104,7 @@ func decodeIndex(
 	}
 	values := make([]EncDatum, index.NumKeyColumns())
 	colDirs := index.IndexDesc().KeyColumnDirections
-	if _, _, err := DecodeIndexKey(codec, types, values, colDirs, key); err != nil {
+	if _, err := DecodeIndexKey(codec, values, colDirs, key); err != nil {
 		return nil, err
 	}
 
@@ -116,6 +122,14 @@ func decodeIndex(
 }
 
 func TestIndexKey(t *testing.T) {
+	parseJSON := func(s string) *tree.DJSON {
+		j, err := json.ParseJSON(s)
+		if err != nil {
+			t.Fatalf("Failed to parse %s: %v", s, err)
+		}
+		return tree.NewDJSON(j)
+	}
+
 	rng, _ := randutil.NewTestRand()
 	var a tree.DatumAlloc
 
@@ -155,6 +169,82 @@ func TestIndexKey(t *testing.T) {
 			[]tree.Datum{tree.NewDInt(10), tree.NewDInt(11), tree.NewDInt(12)},
 			[]tree.Datum{tree.NewDInt(20), tree.NewDInt(21), tree.NewDInt(22)},
 		},
+		// Testing JSON in primary indexes.
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`"a"`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`1`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`"a"`), parseJSON(`[1, 2, 3]`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`{"a": "b"}`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`{"a": "b", "c": "d"}`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`[1, "a", {"a": "b"}]`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID: 50,
+			primaryValues: []tree.Datum{parseJSON(`null`), parseJSON(`[]`), parseJSON(`{}`),
+				parseJSON(`""`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		// Testing JSON in secondary indexes.
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{tree.NewDInt(20)},
+			secondaryValues: []tree.Datum{parseJSON(`{"a": "b"}`)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{tree.NewDInt(20), tree.NewDInt(50)},
+			secondaryValues: []tree.Datum{parseJSON(`{"a": "b"}`), parseJSON(`[1, "a", {"a": "b"}]`)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{tree.NewDInt(20), tree.NewDInt(50)},
+			secondaryValues: []tree.Datum{parseJSON(`1`)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{tree.NewDInt(20), tree.NewDInt(50)},
+			secondaryValues: []tree.Datum{parseJSON(`"b"`)},
+		},
+		{
+			tableID:       50,
+			primaryValues: []tree.Datum{tree.NewDInt(20), tree.NewDInt(50)},
+			secondaryValues: []tree.Datum{parseJSON(`null`), parseJSON(`[]`), parseJSON(`{}`),
+				parseJSON(`""`)},
+		},
+		// Testing JSON in both primary and secondary indexes.
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`"a"`)},
+			secondaryValues: []tree.Datum{parseJSON(`"b"`)},
+		},
+		{
+			tableID:       50,
+			primaryValues: []tree.Datum{parseJSON(`{"a": "b"}`), parseJSON(`[1, "a", {"a": "b"}]`)},
+			secondaryValues: []tree.Datum{parseJSON(`null`), parseJSON(`[]`), parseJSON(`{}`),
+				parseJSON(`""`)},
+		},
 	}
 
 	for i := 0; i < 1000; i++ {
@@ -178,7 +268,7 @@ func TestIndexKey(t *testing.T) {
 	for i, test := range tests {
 		evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer evalCtx.Stop(context.Background())
-		tableDesc, colMap := makeTableDescForTest(test)
+		tableDesc, colMap := makeTableDescForTest(test, true /* isSecondaryIndexForward */)
 		// Add the default family to each test, since secondary indexes support column families.
 		var (
 			colNames []string
@@ -348,7 +438,8 @@ func TestInvertedIndexKey(t *testing.T) {
 	runTest := func(value tree.Datum, expectedKeys int, version descpb.IndexDescriptorVersion) {
 		primaryValues := []tree.Datum{tree.NewDInt(10)}
 		secondaryValues := []tree.Datum{value}
-		tableDesc, colMap := makeTableDescForTest(indexKeyTest{50, primaryValues, secondaryValues})
+		tableDesc, colMap := makeTableDescForTest(indexKeyTest{50, primaryValues, secondaryValues},
+			false /* isSecondaryIndexForward */)
 		for _, idx := range tableDesc.PublicNonPrimaryIndexes() {
 			idx.IndexDesc().Version = version
 		}
@@ -670,7 +761,7 @@ func ExtractIndexKey(
 	}
 	values := make([]EncDatum, index.NumKeyColumns())
 	dirs := index.IndexDesc().KeyColumnDirections
-	key, _, err = DecodeKeyVals(indexTypes, values, dirs, key)
+	key, _, err = DecodeKeyVals(values, dirs, key)
 	if err != nil {
 		return nil, err
 	}
@@ -693,7 +784,7 @@ func ExtractIndexKey(
 			return nil, err
 		}
 	}
-	_, _, err = DecodeKeyVals(extraTypes, extraValues, dirs, extraKey)
+	_, _, err = DecodeKeyVals(extraValues, dirs, extraKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1123,5 +1214,47 @@ func TestEncodeTrigramInvertedIndexSpansError(t *testing.T) {
 		} else {
 			require.NoError(t, err)
 		}
+	}
+}
+
+func TestDecodeKeyVals(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		desc                 string
+		key                  []byte
+		vals                 []EncDatum
+		expectedRemainingKey []byte
+		expectedNumVals      int
+	}{
+		{
+			desc:                 "vals_eq_bytes",
+			key:                  []byte{1},
+			vals:                 make([]EncDatum, 1),
+			expectedRemainingKey: []byte{},
+			expectedNumVals:      1,
+		},
+		{
+			desc:                 "vals_lt_bytes",
+			key:                  []byte{1, 1},
+			vals:                 make([]EncDatum, 1),
+			expectedRemainingKey: []byte{1},
+			expectedNumVals:      1,
+		},
+		{
+			desc:                 "vals_gt_bytes",
+			key:                  []byte{1},
+			vals:                 make([]EncDatum, 2),
+			expectedRemainingKey: []byte{},
+			expectedNumVals:      1,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			actualRemainingKey, actualNumVals, err := DecodeKeyVals(tc.vals, nil, tc.key)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedRemainingKey, actualRemainingKey)
+			require.Equal(t, tc.expectedNumVals, actualNumVals)
+		})
 	}
 }

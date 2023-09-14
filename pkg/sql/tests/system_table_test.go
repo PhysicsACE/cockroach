@@ -45,6 +45,7 @@ import (
 func TestInitialKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	const keysPerDesc = 2
 
 	testutils.RunTrueAndFalse(t, "system tenant", func(t *testing.T, systemTenant bool) {
@@ -52,7 +53,7 @@ func TestInitialKeys(t *testing.T) {
 		var nonDescKeys int
 		if systemTenant {
 			codec = keys.SystemSQLCodec
-			nonDescKeys = 15
+			nonDescKeys = 16
 		} else {
 			codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 			nonDescKeys = 4
@@ -114,6 +115,7 @@ func TestInitialKeys(t *testing.T) {
 func TestInitialKeysAndSplits(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	datadriven.RunTest(t, datapathutils.TestDataPath(t, "initial_keys"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "initial-keys":
@@ -167,6 +169,7 @@ func TestInitialKeysAndSplits(t *testing.T) {
 func TestSystemTableLiterals(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	type testcase struct {
 		schema string
 		pkg    catalog.TableDescriptor
@@ -191,10 +194,13 @@ func TestSystemTableLiterals(t *testing.T) {
 		}
 	}
 
-	const expectedNumberOfSystemTables = bootstrap.NumSystemTablesForSystemTenant
+	// Add one for the system.span_count table, which is currently the only
+	// non-system tenant table.
+	const expectedNumberOfSystemTables = bootstrap.NumSystemTablesForSystemTenant + 1
 	require.Equal(t, expectedNumberOfSystemTables, len(testcases))
 
-	runTest := func(name string, test testcase) {
+	runTest := func(t *testing.T, name string, test testcase) {
+		t.Helper()
 		privs := *test.pkg.GetPrivileges()
 		desc := test.pkg
 		// Allocate an ID to dynamically allocated system tables.
@@ -204,7 +210,7 @@ func TestSystemTableLiterals(t *testing.T) {
 			desc = mut.ImmutableCopy().(catalog.TableDescriptor)
 		}
 		leaseManager := s.LeaseManager().(*lease.Manager)
-		collection := descs.MakeTestCollection(ctx, leaseManager)
+		collection := descs.MakeTestCollection(ctx, keys.SystemSQLCodec, leaseManager)
 
 		gen, err := sql.CreateTestTableDescriptor(
 			context.Background(),
@@ -220,6 +226,23 @@ func TestSystemTableLiterals(t *testing.T) {
 		}
 		require.NoError(t, desctestutils.TestingValidateSelf(gen))
 
+		// The tables with regional by row compatible indexes had their
+		// indexes rewritten to ID 2. There is no way to specify index
+		// ids in SQL, so we need to manually patch the descriptor to
+		// get the sql constructed descriptor to match the statically
+		// constructed descriptor.
+		switch gen.GetID() {
+		case keys.SqllivenessID:
+			gen.TableDescriptor.PrimaryIndex.ID = 2
+			gen.TableDescriptor.NextIndexID = 3
+		case keys.SQLInstancesTableID:
+			gen.TableDescriptor.PrimaryIndex.ID = 2
+			gen.TableDescriptor.NextIndexID = 3
+		case keys.LeaseTableID:
+			gen.TableDescriptor.PrimaryIndex.ID = 2
+			gen.TableDescriptor.NextIndexID = 3
+		}
+
 		if desc.TableDesc().Equal(gen.TableDesc()) {
 			return
 		}
@@ -230,7 +253,7 @@ func TestSystemTableLiterals(t *testing.T) {
 
 	for name, test := range testcases {
 		t.Run(name, func(t *testing.T) {
-			runTest(name, test)
+			runTest(t, name, test)
 		})
 	}
 }

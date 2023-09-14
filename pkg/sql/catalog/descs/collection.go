@@ -535,10 +535,7 @@ func (tc *Collection) WriteZoneConfigToBatch(
 		return err
 	}
 
-	if descID != keys.RootNamespaceID && !keys.IsPseudoTableID(uint32(descID)) {
-		return tc.AddUncommittedZoneConfig(descID, zc.ZoneConfigProto())
-	}
-	return nil
+	return tc.AddUncommittedZoneConfig(descID, zc.ZoneConfigProto())
 }
 
 // DeleteZoneConfigInBatch deletes zone config of the table.
@@ -555,9 +552,7 @@ func (tc *Collection) DeleteZoneConfigInBatch(
 		return err
 	}
 
-	if descID != keys.RootNamespaceID && !keys.IsPseudoTableID(uint32(descID)) {
-		tc.MarkUncommittedZoneConfigDeleted(descID)
-	}
+	tc.MarkUncommittedZoneConfigDeleted(descID)
 	return nil
 }
 
@@ -702,6 +697,18 @@ func (tc *Collection) GetUncommittedTables() (tables []catalog.TableDescriptor) 
 	return tables
 }
 
+// GetUncommittedDatabases returns all the databases updated or created in the
+// transaction.
+func (tc *Collection) GetUncommittedDatabases() (databases []catalog.DatabaseDescriptor) {
+	_ = tc.uncommitted.iterateUncommittedByID(func(desc catalog.Descriptor) error {
+		if database, ok := desc.(catalog.DatabaseDescriptor); ok {
+			databases = append(databases, database)
+		}
+		return nil
+	})
+	return databases
+}
+
 func newMutableSyntheticDescriptorAssertionError(id descpb.ID) error {
 	return errors.AssertionFailedf("attempted mutable access of synthetic descriptor %d", id)
 }
@@ -718,6 +725,23 @@ func (tc *Collection) GetAll(ctx context.Context, txn *kv.Txn) (nstree.Catalog, 
 		return nstree.Catalog{}, err
 	}
 	return ret.Catalog, nil
+}
+
+// GetAllComments gets all comments for all descriptors. This method never
+// returns the underlying catalog, since it will be incomplete and only
+// contain comments.
+func (tc *Collection) GetAllComments(
+	ctx context.Context, txn *kv.Txn,
+) (nstree.CommentCatalog, error) {
+	kvComments, err := tc.cr.ScanAllComments(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	comments, err := tc.aggregateAllLayers(ctx, txn, kvComments)
+	if err != nil {
+		return nil, err
+	}
+	return comments, nil
 }
 
 // GetAllFromStorageUnvalidated delegates to an uncached catkv.CatalogReader's
@@ -842,8 +866,9 @@ func (tc *Collection) GetAllInDatabase(
 	if err != nil {
 		return nstree.Catalog{}, err
 	}
+
 	var inDatabaseIDs catalog.DescriptorIDSet
-	_ = ret.ForEachDescriptor(func(desc catalog.Descriptor) error {
+	if err := ret.ForEachDescriptor(func(desc catalog.Descriptor) error {
 		if desc.DescriptorType() == catalog.Schema {
 			if dbID := desc.GetParentID(); dbID != descpb.InvalidID && dbID != db.GetID() {
 				return nil
@@ -855,7 +880,10 @@ func (tc *Collection) GetAllInDatabase(
 		}
 		inDatabaseIDs.Add(desc.GetID())
 		return nil
-	})
+	}); err != nil {
+		return nstree.Catalog{}, err
+	}
+
 	return ret.FilterByIDs(inDatabaseIDs.Ordered()), nil
 }
 
@@ -941,7 +969,7 @@ func (tc *Collection) aggregateAllLayers(
 	// Add stored comments which are not shadowed.
 	_ = stored.ForEachComment(func(key catalogkeys.CommentKey, cmt string) error {
 		if _, _, isShadowed := tc.uncommittedComments.getUncommitted(key); !isShadowed {
-			ret.UpsertComment(key, cmt)
+			return ret.UpsertComment(key, cmt)
 		}
 		return nil
 	})
@@ -984,7 +1012,9 @@ func (tc *Collection) aggregateAllLayers(
 		})
 	}
 	// Add uncommitted comments and zone configs.
-	tc.uncommittedComments.addAllToCatalog(ret)
+	if err := tc.uncommittedComments.addAllToCatalog(ret); err != nil {
+		return nstree.MutableCatalog{}, err
+	}
 	tc.uncommittedZoneConfigs.addAllToCatalog(ret)
 	// Remove deleted descriptors from consideration, re-read and add the rest.
 	tc.deletedDescs.ForEach(descIDs.Remove)
@@ -1201,12 +1231,15 @@ func (tc *Collection) GetConstraintComment(
 }
 
 // MakeTestCollection makes a Collection that can be used for tests.
-func MakeTestCollection(ctx context.Context, leaseManager *lease.Manager) Collection {
+func MakeTestCollection(
+	ctx context.Context, codec keys.SQLCodec, leaseManager LeaseManager,
+) Collection {
 	settings := cluster.MakeTestingClusterSettings()
 	return Collection{
 		settings: settings,
 		version:  settings.Version.ActiveVersion(ctx),
 		leased:   makeLeasedDescriptors(leaseManager),
+		cr:       catkv.NewUncachedCatalogReader(codec),
 	}
 }
 

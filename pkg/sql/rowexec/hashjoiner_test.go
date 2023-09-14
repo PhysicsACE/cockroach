@@ -991,6 +991,7 @@ func mirrorJoinTypeAndOnExpr(
 
 func TestHashJoiner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	testCases := hashJoinerTestCases()
 
@@ -1064,7 +1065,7 @@ func TestHashJoiner(t *testing.T) {
 					OnExpr:         c.onExpr,
 				}
 				h, err := newHashJoiner(
-					ctx, &flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post, out,
+					ctx, &flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post,
 				)
 				if err != nil {
 					return err
@@ -1073,7 +1074,7 @@ func TestHashJoiner(t *testing.T) {
 				if hjSetup != nil {
 					hjSetup(h)
 				}
-				h.Run(ctx)
+				h.Run(ctx, out)
 
 				if !out.ProducerClosed() {
 					return errors.New("output RowReceiver not closed")
@@ -1101,6 +1102,7 @@ func TestHashJoiner(t *testing.T) {
 
 func TestHashJoinerError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := [10]rowenc.EncDatum{}
 	for i := range v {
@@ -1147,13 +1149,13 @@ func TestHashJoinerError(t *testing.T) {
 				OnExpr:         c.onExpr,
 			}
 			h, err := newHashJoiner(
-				ctx, &flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post, out,
+				ctx, &flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post,
 			)
 			if err != nil {
 				return err
 			}
 			outTypes := h.OutputTypes()
-			h.Run(ctx)
+			h.Run(ctx, out)
 
 			if !out.ProducerClosed() {
 				return errors.New("output RowReceiver not closed")
@@ -1211,6 +1213,8 @@ func checkExpectedRows(
 // the consumer is draining.
 func TestHashJoinerDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	v := [10]rowenc.EncDatum{}
 	for i := range v {
 		v[i] = rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(i)))
@@ -1285,14 +1289,14 @@ func TestHashJoinerDrain(t *testing.T) {
 
 	post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: outCols}
 	h, err := newHashJoiner(
-		ctx, &flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out,
+		ctx, &flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	out.ConsumerDone()
-	h.Run(ctx)
+	h.Run(ctx, out)
 
 	if !out.ProducerClosed() {
 		t.Fatalf("output RowReceiver not closed")
@@ -1319,6 +1323,7 @@ func TestHashJoinerDrain(t *testing.T) {
 // joiner will drain both inputs.
 func TestHashJoinerDrainAfterBuildPhaseError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := [10]rowenc.EncDatum{}
 	for i := range v {
@@ -1418,13 +1423,13 @@ func TestHashJoinerDrainAfterBuildPhaseError(t *testing.T) {
 
 	post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: outCols}
 	h, err := newHashJoiner(
-		ctx, &flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out,
+		ctx, &flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	h.Run(ctx)
+	h.Run(ctx, out)
 
 	if !out.ProducerClosed() {
 		t.Fatalf("output RowReceiver not closed")
@@ -1505,12 +1510,12 @@ func BenchmarkHashJoiner(b *testing.B) {
 						// TODO(asubiotto): Get rid of uncleared state between
 						// hashJoiner Run()s to omit instantiation time from benchmarks.
 						h, err := newHashJoiner(
-							ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, &rowDisposer{},
+							ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post,
 						)
 						if err != nil {
 							b.Fatal(err)
 						}
-						h.Run(ctx)
+						h.Run(ctx, &rowDisposer{})
 						leftInput.Reset()
 						rightInput.Reset()
 					}

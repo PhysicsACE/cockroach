@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -106,7 +105,7 @@ func MakeBulkAdder(
 			disallowShadowingBelow: opts.DisallowShadowingBelow,
 			batchTS:                opts.BatchTimestamp,
 			writeAtBatchTS:         opts.WriteAtBatchTimestamp,
-			mem:                    bulkMon.MakeBoundAccount(),
+			mem:                    bulkMon.MakeConcurrentBoundAccount(),
 			limiter:                sendLimiter,
 		},
 		timestamp:      timestamp,
@@ -125,7 +124,6 @@ func MakeBulkAdder(
 	b.sink.mu.onFlush = func(batchSummary kvpb.BulkOpSummary) {
 		b.curBufSummary.Add(batchSummary)
 	}
-	b.sink.mem.Mu = &syncutil.Mutex{}
 	// At minimum a bulk adder needs enough space to store a buffer of
 	// curBufferSize, and a subsequent SST of SSTSize in-memory. If the memory
 	// account is unable to reserve this minimum threshold we cannot continue.
@@ -258,9 +256,7 @@ func (b *BufferingAdder) doFlush(ctx context.Context, forSize bool) error {
 		b.curBufSummary.Reset()
 		return nil
 	}
-	if err := b.sink.Reset(ctx); err != nil {
-		return err
-	}
+	b.sink.Reset(ctx)
 	b.sink.currentStats.BufferFlushes++
 
 	var before *bulkpb.IngestionPerformanceStats

@@ -148,7 +148,9 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 	opName := "recursive-cte-iteration-" + strconv.Itoa(n.iterationCount)
 	ctx, sp := tracing.ChildSpan(params.ctx, opName)
 	defer sp.Finish()
-	if err := runPlanInsidePlan(ctx, params, newPlan.(*planComponents), rowResultWriter(n)); err != nil {
+	if err := runPlanInsidePlan(
+		ctx, params, newPlan.(*planComponents), rowResultWriter(n), nil, /* deferredRoutineSender */
+	); err != nil {
 		return false, err
 	}
 
@@ -198,8 +200,8 @@ func (n *recursiveCTENode) AddRow(ctx context.Context, row tree.Datums) error {
 	return n.workingRows.AddRow(ctx, row)
 }
 
-// IncrementRowsAffected is part of the rowResultWriter interface.
-func (n *recursiveCTENode) IncrementRowsAffected(context.Context, int) {
+// SetRowsAffected is part of the rowResultWriter interface.
+func (n *recursiveCTENode) SetRowsAffected(context.Context, int) {
 }
 
 // SetError is part of the rowResultWriter interface.

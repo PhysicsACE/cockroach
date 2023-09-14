@@ -20,12 +20,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 func TestTenantTempTableCleanup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	t.Helper()
@@ -92,10 +94,11 @@ func TestTenantTempTableCleanup(t *testing.T) {
 			},
 		},
 	}
-	tc := serverutils.StartNewTestCluster(
+	tc := serverutils.StartCluster(
 		t, 3 /* numNodes */, base.TestClusterArgs{ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
-				Settings: settings,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
+				Settings:          settings,
 			},
 		},
 	)

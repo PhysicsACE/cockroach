@@ -22,7 +22,11 @@ import {
   limitText,
   NO_SAMPLES_FOUND,
 } from "src/util";
-import { InsightExecEnum, StmtInsightEvent } from "src/insights";
+import {
+  InsightExecEnum,
+  StatementStatus,
+  StmtInsightEvent,
+} from "src/insights";
 import {
   InsightCell,
   insightsTableTitles,
@@ -32,9 +36,21 @@ import { Tooltip } from "@cockroachlabs/ui-components";
 import { Link } from "react-router-dom";
 import classNames from "classnames/bind";
 import styles from "../util/workloadInsights.module.scss";
-import { TimeScale } from "../../../timeScaleDropdown";
+import { Badge } from "src/badge";
+import { Timestamp } from "../../../timestamp";
 
 const cx = classNames.bind(styles);
+
+function stmtStatusToString(status: StatementStatus) {
+  switch (status) {
+    case StatementStatus.COMPLETED:
+      return "success";
+    case StatementStatus.FAILED:
+      return "danger";
+    default:
+      return "info";
+  }
+}
 
 interface StatementInsightsTable {
   data: StmtInsightEvent[];
@@ -78,6 +94,15 @@ export function makeStatementInsightsColumns(): ColumnDescriptor<StmtInsightEven
       showByDefault: true,
     },
     {
+      name: "status",
+      title: insightsTableTitles.status(execType),
+      cell: (item: StmtInsightEvent) => (
+        <Badge text={item.status} status={stmtStatusToString(item.status)} />
+      ),
+      sort: (item: StmtInsightEvent) => item.status,
+      showByDefault: true,
+    },
+    {
       name: "insights",
       title: insightsTableTitles.insights(execType),
       cell: (item: StmtInsightEvent) =>
@@ -92,7 +117,14 @@ export function makeStatementInsightsColumns(): ColumnDescriptor<StmtInsightEven
       name: "startTime",
       title: insightsTableTitles.startTime(execType),
       cell: (item: StmtInsightEvent) =>
-        item.startTime?.format(DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT),
+        item.startTime ? (
+          <Timestamp
+            time={item.startTime}
+            format={DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT}
+          />
+        ) : (
+          <>N/A</>
+        ),
       sort: (item: StmtInsightEvent) => item.startTime.unix(),
       showByDefault: true,
     },

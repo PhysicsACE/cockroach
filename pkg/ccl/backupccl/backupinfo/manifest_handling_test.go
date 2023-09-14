@@ -40,7 +40,7 @@ func TestManifestHandlingIteratorOperations(t *testing.T) {
 	const changesPerDescriptor = 3
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
 	store, err := cloud.ExternalStorageFromURI(ctx, "userfile:///foo",
@@ -63,9 +63,7 @@ func TestManifestHandlingIteratorOperations(t *testing.T) {
 		return backupinfo.FileCmp(left, right) < 0
 	}
 	var sortedFiles []backuppb.BackupManifest_File
-	for i := range m.Files {
-		sortedFiles = append(sortedFiles, m.Files[i])
-	}
+	sortedFiles = append(sortedFiles, m.Files...)
 	sort.Slice(sortedFiles, func(i, j int) bool {
 		return fileLess(m.Files[i], m.Files[j])
 	})
@@ -76,9 +74,7 @@ func TestManifestHandlingIteratorOperations(t *testing.T) {
 		return tLeft.ID < tRight.ID
 	}
 	var sortedDescs []descpb.Descriptor
-	for i := range m.Descriptors {
-		sortedDescs = append(sortedDescs, m.Descriptors[i])
-	}
+	sortedDescs = append(sortedDescs, m.Descriptors...)
 	sort.Slice(sortedDescs, func(i, j int) bool {
 		return descLess(sortedDescs[i], sortedDescs[j])
 	})
@@ -90,9 +86,7 @@ func TestManifestHandlingIteratorOperations(t *testing.T) {
 		return backupinfo.DescChangesLess(&left, &right)
 	}
 	var sortedDescRevs []backuppb.BackupManifest_DescriptorRevision
-	for i := range m.DescriptorChanges {
-		sortedDescRevs = append(sortedDescRevs, m.DescriptorChanges[i])
-	}
+	sortedDescRevs = append(sortedDescRevs, m.DescriptorChanges...)
 	sort.Slice(sortedDescRevs, func(i, j int) bool {
 		return descRevsLess(sortedDescRevs[i], sortedDescRevs[j])
 	})
@@ -114,7 +108,7 @@ func TestManifestHandlingEmptyIterators(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
 	store, err := cloud.ExternalStorageFromURI(ctx, "userfile:///foo",

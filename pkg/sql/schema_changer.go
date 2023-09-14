@@ -48,13 +48,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -74,6 +75,32 @@ var schemaChangeJobMaxRetryBackoff = settings.RegisterDurationSetting(
 	20*time.Second,
 	settings.PositiveDuration,
 )
+
+type schemaChangerMode int
+
+const (
+	// schemaChangerModeNone indicates that the schema changer was not used.
+	schemaChangerModeNone schemaChangerMode = iota
+	// schemaChangerModeLegacy indicates that the legacy schema changer was used.
+	schemaChangerModeLegacy
+	// schemaChangerModeDeclarative indicates that the declarative schema changer
+	// was used.
+	schemaChangerModeDeclarative
+)
+
+// String returns a string representation of the schema changer mode.
+func (m schemaChangerMode) String() string {
+	switch m {
+	case schemaChangerModeNone:
+		return "none"
+	case schemaChangerModeLegacy:
+		return "legacy"
+	case schemaChangerModeDeclarative:
+		return "declarative"
+	default:
+		return fmt.Sprintf("schemaChangerMode(%d)", m)
+	}
+}
 
 const (
 	// RunningStatusWaitingForMVCCGC is used for the GC job when it has cleared
@@ -130,6 +157,7 @@ type SchemaChanger struct {
 	clock                *hlc.Clock
 	settings             *cluster.Settings
 	execCfg              *ExecutorConfig
+	sessionData          *sessiondatapb.SessionData
 }
 
 // NewSchemaChangerForTesting only for tests.
@@ -265,6 +293,8 @@ func (sc *SchemaChanger) refreshMaterializedView(
 	return sc.backfillQueryIntoTable(ctx, tableToRefresh, table.GetViewQuery(), refresh.AsOf(), "refreshView")
 }
 
+const schemaChangerBackfillTxnDebugName = "schemaChangerBackfill"
+
 func (sc *SchemaChanger) backfillQueryIntoTable(
 	ctx context.Context, table catalog.TableDescriptor, query string, ts hlc.Timestamp, desc string,
 ) error {
@@ -274,11 +304,18 @@ func (sc *SchemaChanger) backfillQueryIntoTable(
 		}
 	}
 
+	isTxnRetry := false
 	return sc.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		defer func() {
+			isTxnRetry = true
+		}()
+		txn.KV().SetDebugName(schemaChangerBackfillTxnDebugName)
 		if err := txn.KV().SetFixedTimestamp(ctx, ts); err != nil {
 			return err
 		}
 
+		sd := NewInternalSessionData(ctx, sc.execCfg.Settings, "backfillQueryIntoTable")
+		sd.SessionData = *sc.sessionData
 		// Create an internal planner as the planner used to serve the user query
 		// would have committed by this point.
 		p, cleanup := NewInternalPlanner(
@@ -287,11 +324,28 @@ func (sc *SchemaChanger) backfillQueryIntoTable(
 			username.RootUserName(),
 			&MemoryMetrics{},
 			sc.execCfg,
-			sessiondatapb.SessionData{},
+			sd,
 		)
 
 		defer cleanup()
 		localPlanner := p.(*planner)
+
+		// Delete existing span before ingestion to prevent key collisions.
+		// BulkRowWriter adds SSTables non-transactionally so the writes are not
+		// rolled back.
+		if isTxnRetry {
+			request := kvpb.BatchRequest{
+				Header: kvpb.Header{
+					Timestamp: ts,
+				},
+			}
+			tableSpan := table.TableSpan(localPlanner.EvalContext().Codec)
+			request.Add(kvpb.NewDeleteRange(tableSpan.Key, tableSpan.EndKey, false))
+			if _, err := localPlanner.execCfg.DB.NonTransactionalSender().Send(ctx, &request); err != nil {
+				return err.GoError()
+			}
+		}
+
 		stmt, err := parser.ParseOne(query)
 		if err != nil {
 			return err
@@ -542,6 +596,8 @@ func (sc *SchemaChanger) execLogTags() *logtags.Buffer {
 	}
 	if sc.droppedDatabaseID != descpb.InvalidID {
 		buf = buf.Add("db", sc.droppedDatabaseID)
+	} else if !sc.droppedSchemaIDs.Empty() {
+		buf = buf.Add("schema", sc.droppedSchemaIDs)
 	}
 	return buf
 }
@@ -556,20 +612,50 @@ func (sc *SchemaChanger) notFirstInLine(ctx context.Context, desc catalog.Descri
 		// descriptor, it seems possible for a job to be resumed after the mutation
 		// has already been removed. If there's a mutation provided, we should check
 		// whether it actually exists on the table descriptor and exit the job if not.
-		for i, mutation := range tableDesc.AllMutations() {
+		allMutations := tableDesc.AllMutations()
+		for i, mutation := range allMutations {
 			if mutation.MutationID() == sc.mutationID {
 				if i != 0 {
+					blockingJobIDsAsSet := make(map[catpb.JobID]struct{})
+					for j := 0; j < i; j++ {
+						blockingJobID, err := mustGetJobIDWithMutationID(tableDesc, allMutations[j].MutationID())
+						if err != nil {
+							return err
+						}
+						blockingJobIDsAsSet[blockingJobID] = struct{}{}
+					}
+					blockingJobIDs := make([]catpb.JobID, 0, len(blockingJobIDsAsSet))
+					for jobID := range blockingJobIDsAsSet {
+						blockingJobIDs = append(blockingJobIDs, jobID)
+					}
 					log.Infof(ctx,
-						"schema change on %q (v%d): another change is still in progress",
-						desc.GetName(), desc.GetVersion(),
+						"schema change on %q (v%d): another %v schema change job(s) %v is still in progress "+
+							"and it is blocking this job from proceeding",
+						desc.GetName(), desc.GetVersion(), len(blockingJobIDs), blockingJobIDs,
 					)
-					return errSchemaChangeNotFirstInLine
+					return errors.Wrapf(errSchemaChangeNotFirstInLine, "schema change is "+
+						"blocked by %v other schema change job(s) %v", len(blockingJobIDs), blockingJobIDs)
 				}
 				break
 			}
 		}
 	}
 	return nil
+}
+
+func mustGetJobIDWithMutationID(
+	tableDesc catalog.TableDescriptor, mutationID descpb.MutationID,
+) (jobID catpb.JobID, err error) {
+	for _, mutationJob := range tableDesc.GetMutationJobs() {
+		if mutationJob.MutationID == mutationID {
+			jobID = mutationJob.JobID
+		}
+	}
+	if jobID == catpb.InvalidJobID {
+		return 0, errors.AssertionFailedf("mutation job with mutation ID %v is not found in table %q",
+			mutationID, tableDesc.GetName())
+	}
+	return jobID, nil
 }
 
 func (sc *SchemaChanger) getTargetDescriptor(ctx context.Context) (catalog.Descriptor, error) {
@@ -718,7 +804,7 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 	}
 
 	// Otherwise, continue with the rest of the schema change state machine.
-	if tableDesc.Dropped() && sc.droppedDatabaseID == descpb.InvalidID {
+	if tableDesc.Dropped() && sc.droppedDatabaseID == descpb.InvalidID && sc.droppedSchemaIDs.Empty() {
 		if tableDesc.IsPhysicalTable() {
 			// We've dropped this physical table, let's kick off a GC job.
 			dropTime := timeutil.Now().UnixNano()
@@ -738,7 +824,7 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 				sc.job.Payload().UsernameProto.Decode(),
 				sc.job.Payload().Description,
 				gcDetails,
-				!sc.settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob),
+				!storage.CanUseMVCCRangeTombstones(ctx, sc.settings),
 			); err != nil {
 				return err
 			}
@@ -1074,7 +1160,7 @@ func (sc *SchemaChanger) rollbackSchemaChange(ctx context.Context, err error) er
 					},
 				},
 			},
-			!sc.settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob),
+			!storage.CanUseMVCCRangeTombstones(ctx, sc.settings),
 		)
 		if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, jobRecord, gcJobID, txn); err != nil {
 			return err
@@ -1145,7 +1231,6 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 				tbl,
 				m,
 				false, // isDone
-				txn.Descriptors(),
 			); err != nil {
 				return err
 			}
@@ -1284,7 +1369,7 @@ func (sc *SchemaChanger) createIndexGCJobWithDropTime(
 
 	gcJobRecord := CreateGCJobRecord(
 		jobDesc, sc.job.Payload().UsernameProto.Decode(), indexGCDetails,
-		!sc.settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob),
+		!sc.settings.Version.IsActive(ctx, clusterversion.V23_1_UseDelRangeInGCJob),
 	)
 	jobID := sc.jobRegistry.MakeJobID()
 	if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, gcJobRecord, jobID, txn); err != nil {
@@ -1440,7 +1525,6 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				scTable,
 				m,
 				true, // isDone
-				txn.Descriptors(),
 			); err != nil {
 				return err
 			}
@@ -1542,8 +1626,7 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 							sc.execCfg.JobsKnobs(),
 							scheduledJobs,
 							scTable.GetPrivileges().Owner(),
-							scTable.GetID(),
-							modify.RowLevelTTL(),
+							scTable,
 						)
 						if err != nil {
 							return err
@@ -1816,14 +1899,13 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 // tenant.
 func maybeUpdateZoneConfigsForPKChange(
 	ctx context.Context,
-	txn isql.Txn,
+	txn descs.Txn,
 	execCfg *ExecutorConfig,
 	kvTrace bool,
-	descriptors *descs.Collection,
 	table *tabledesc.Mutable,
 	swapInfo *descpb.PrimaryKeySwap,
 ) error {
-	zoneWithRaw, err := descriptors.GetZoneConfig(ctx, txn.KV(), table.GetID())
+	zoneWithRaw, err := txn.Descriptors().GetZoneConfig(ctx, txn.KV(), table.GetID())
 	if err != nil {
 		return err
 	}
@@ -1863,9 +1945,9 @@ func maybeUpdateZoneConfigsForPKChange(
 	// Write the zone back. This call regenerates the index spans that apply
 	// to each partition in the index.
 	_, err = writeZoneConfig(
-		ctx, txn.KV(), table.ID, table,
+		ctx, txn, table.ID, table,
 		zoneWithRaw.ZoneConfigProto(), zoneWithRaw.GetRawBytesInStorage(),
-		execCfg, descriptors, false, kvTrace,
+		execCfg, false, kvTrace,
 	)
 	if err != nil && !sqlerrors.IsCCLRequiredError(err) {
 		return err
@@ -2101,6 +2183,7 @@ func (sc *SchemaChanger) updateJobForRollback(
 			TableMutationID: sc.mutationID,
 			ResumeSpanList:  spanList,
 			FormatVersion:   oldDetails.FormatVersion,
+			SessionData:     sc.sessionData,
 		},
 	); err != nil {
 		return err
@@ -2460,7 +2543,7 @@ func (sc *SchemaChanger) txn(ctx context.Context, f func(context.Context, descs.
 		ctx context.Context, txn descs.Txn,
 	) error {
 		return f(ctx, txn)
-	})
+	}, isql.WithPriority(admissionpb.BulkNormalPri))
 }
 
 // createSchemaChangeEvalCtx creates an extendedEvalContext() to be used for backfills.
@@ -2522,41 +2605,6 @@ func createSchemaChangeEvalCtx(
 	return evalCtx
 }
 
-// NewFakeSessionData returns "fake" session data for use in internal queries
-// that are not run on behalf of a user session, such as those run during the
-// steps of background jobs and schema changes.
-func NewFakeSessionData(sv *settings.Values, opName string) *sessiondata.SessionData {
-	sd := &sessiondata.SessionData{
-		SessionData: sessiondatapb.SessionData{
-			// The database is not supposed to be needed in schema changes, as there
-			// shouldn't be unqualified identifiers in backfills, and the pure functions
-			// that need it should have already been evaluated.
-			//
-			// TODO(andrei): find a way to assert that this field is indeed not used.
-			// And in fact it is used by `current_schemas()`, which, although is a pure
-			// function, takes arguments which might be impure (so it can't always be
-			// pre-evaluated).
-			Database:      "",
-			UserProto:     username.NodeUserName().EncodeProto(),
-			VectorizeMode: sessiondatapb.VectorizeExecMode(VectorizeClusterMode.Get(sv)),
-			Internal:      true,
-		},
-		LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
-			DistSQLMode: sessiondatapb.DistSQLExecMode(DistSQLClusterExecMode.Get(sv)),
-		},
-		SearchPath:    sessiondata.DefaultSearchPathForUser(username.NodeUserName()),
-		SequenceState: sessiondata.NewSequenceState(),
-		Location:      time.UTC,
-	}
-
-	sd.ApplicationName = catconstants.InternalAppNamePrefix
-	if opName != "" {
-		sd.ApplicationName = catconstants.InternalAppNamePrefix + "-" + opName
-	}
-
-	return sd
-}
-
 type schemaChangeResumer struct {
 	job *jobs.Job
 }
@@ -2592,6 +2640,7 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 			settings:             p.ExecCfg().Settings,
 			execCfg:              p.ExecCfg(),
 			metrics:              p.ExecCfg().SchemaChangerMetrics,
+			sessionData:          details.SessionData,
 		}
 		opts := retry.Options{
 			InitialBackoff: 20 * time.Millisecond,
@@ -2761,9 +2810,7 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 			r.job.Payload().UsernameProto.Decode(),
 			r.job.Payload().Description,
 			multiTableGCDetails,
-			!p.ExecCfg().Settings.Version.IsActive(
-				ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob,
-			),
+			!storage.CanUseMVCCRangeTombstones(ctx, p.ExecCfg().Settings),
 		); err != nil {
 			return err
 		}
@@ -2811,6 +2858,7 @@ func (r schemaChangeResumer) OnFailOrCancel(
 		clock:                p.ExecCfg().Clock,
 		settings:             p.ExecCfg().Settings,
 		execCfg:              p.ExecCfg(),
+		sessionData:          details.SessionData,
 	}
 
 	if r.job.Payload().FinalResumeError == nil {
@@ -2914,6 +2962,7 @@ func (sc *SchemaChanger) queueCleanupJob(
 				// The version distinction for database jobs doesn't matter for jobs on
 				// tables.
 				FormatVersion: jobspb.DatabaseJobFormatVersion,
+				SessionData:   sc.sessionData,
 			},
 			Progress:      jobspb.SchemaChangeProgress{},
 			NonCancelable: true,
@@ -2933,12 +2982,11 @@ func (sc *SchemaChanger) queueCleanupJob(
 
 func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
 	ctx context.Context,
-	txn isql.Txn,
+	txn descs.Txn,
 	dbDesc catalog.DatabaseDescriptor,
 	tableDesc *tabledesc.Mutable,
 	mutation catalog.Mutation,
 	isDone bool,
-	descsCol *descs.Collection,
 ) error {
 	if pkSwap := mutation.AsPrimaryKeySwap(); pkSwap != nil {
 		if pkSwap.HasLocalityConfig() {
@@ -3001,16 +3049,15 @@ func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
 				)
 			}
 
-			regionConfig, err := SynthesizeRegionConfig(ctx, txn.KV(), dbDesc.GetID(), descsCol)
+			regionConfig, err := SynthesizeRegionConfig(ctx, txn.KV(), dbDesc.GetID(), txn.Descriptors())
 			if err != nil {
 				return err
 			}
 			if err := ApplyZoneConfigForMultiRegionTable(
 				ctx,
-				txn.KV(),
+				txn,
 				sc.execCfg,
 				false, /* kvTrace */
-				descsCol,
 				regionConfig,
 				tableDesc,
 				opts...,
@@ -3023,7 +3070,7 @@ func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
 		// Note this is done even for isDone = true, though not strictly
 		// necessary.
 		return maybeUpdateZoneConfigsForPKChange(
-			ctx, txn, sc.execCfg, false /* kvTrace */, descsCol, tableDesc, pkSwap.PrimaryKeySwapDesc(),
+			ctx, txn, sc.execCfg, false /* kvTrace */, tableDesc, pkSwap.PrimaryKeySwapDesc(),
 		)
 	}
 	return nil
@@ -3191,4 +3238,18 @@ func (p *planner) CanPerformDropOwnedBy(
 		return false, err
 	}
 	return tree.MustBeDInt(row[0]) == 0, err
+}
+
+// CanCreateCrossDBSequenceOwnerRef returns if cross database sequence
+// owner references are allowed.
+func (p *planner) CanCreateCrossDBSequenceOwnerRef() error {
+	if !allowCrossDatabaseSeqOwner.Get(&p.execCfg.Settings.SV) {
+		return errors.WithHintf(
+			pgerror.Newf(pgcode.FeatureNotSupported,
+				"OWNED BY cannot refer to other databases; (see the '%s' cluster setting)",
+				allowCrossDatabaseSeqOwnerSetting),
+			crossDBReferenceDeprecationHint(),
+		)
+	}
+	return nil
 }

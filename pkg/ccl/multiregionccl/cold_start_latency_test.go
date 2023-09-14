@@ -22,13 +22,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils/regionlatency"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -38,7 +38,6 @@ import (
 	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 )
 
@@ -47,10 +46,8 @@ import (
 func TestColdStartLatency(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 96334)
 	skip.UnderRace(t, "too slow")
 	skip.UnderStress(t, "too slow")
-	defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "1")()
 
 	// We'll need to make some per-node args to assign the different
 	// KV nodes to different regions and AZs. We'll want to do it to
@@ -82,8 +79,7 @@ func TestColdStartLatency(t *testing.T) {
 	for i := 0; i < numNodes; i++ {
 		i := i
 		args := base.TestServerArgs{
-			DisableDefaultTestTenant: true,
-			Locality:                 localities[i],
+			Locality: localities[i],
 		}
 		signalAfter[i] = make(chan struct{})
 		serverKnobs := &server.TestingKnobs{
@@ -123,6 +119,9 @@ func TestColdStartLatency(t *testing.T) {
 	tc := testcluster.NewTestCluster(t, numNodes, base.TestClusterArgs{
 		ParallelStart:     true,
 		ServerArgsPerNode: perServerArgs,
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TODOTestTenantDisabled,
+		},
 	})
 	go func() {
 		for _, c := range signalAfter {
@@ -146,25 +145,35 @@ func TestColdStartLatency(t *testing.T) {
 	}
 	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(1))
 
+	// Shorten the closed timestamp target duration so that span configs
+	// propagate more rapidly.
 	tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '200ms'`)
+	tdb.Exec(t, `SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '200ms'`)
+	tdb.Exec(t, "SET CLUSTER SETTING kv.allocator.load_based_rebalancing = off")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.allocator.min_lease_transfer_interval = '10ms'")
+	// Lengthen the lead time for the global tables to prevent overload from
+	// resulting in delays in propagating closed timestamps and, ultimately
+	// forcing requests from being redirected to the leaseholder. Without this
+	// change, the test sometimes is flakey because the latency budget allocated
+	// to closed timestamp propagation proves to be insufficient. This value is
+	// very cautious, and makes this already slow test even slower.
+	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '50 ms'")
+	tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.lead_for_global_reads_override = '1500ms'`)
 	tdb.Exec(t, `ALTER TENANT ALL SET CLUSTER SETTING spanconfig.reconciliation_job.checkpoint_interval = '500ms'`)
 
-	applyGlobalTables := func(t *testing.T, db *gosql.DB, isTenant bool) {
-		stmts := []string{
-			`alter database system configure zone discard;`,
-			`alter database system set primary region "us-east1";`,
-			`alter database system add region "us-west1";`,
-			`alter database system add region "europe-west1"`,
-		}
-
+	configureSystem := func(t *testing.T, db *gosql.DB, isTenant bool) {
+		var stmts []string
 		if !isTenant {
-			stmts = append(stmts,
-				"ALTER TENANT ALL SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled = true",
-				"ALTER TENANT ALL SET CLUSTER SETTING sql.multi_region.allow_abstractions_for_secondary_tenants.enabled = true",
-				`alter range meta configure zone using constraints = '{"+region=us-east1": 1, "+region=us-west1": 1, "+region=europe-west1": 1}';`)
+			stmts = []string{
+				`alter range meta configure zone using constraints = '{"+region=us-east1": 1, "+region=us-west1": 1, "+region=europe-west1": 1}';`,
+			}
 		} else {
-			stmts = append(stmts,
-				`SELECT crdb_internal.unsafe_optimize_system_database()`)
+			stmts = []string{`
+BEGIN;
+ALTER DATABASE system PRIMARY REGION "us-east1";
+ALTER DATABASE system ADD REGION "us-west1";
+ALTER DATABASE system ADD REGION "europe-west1";
+COMMIT;`}
 		}
 		tdb := sqlutils.MakeSQLRunner(db)
 		for i, stmt := range stmts {
@@ -172,7 +181,7 @@ func TestColdStartLatency(t *testing.T) {
 			tdb.Exec(t, stmt)
 		}
 	}
-	applyGlobalTables(t, tc.ServerConn(0), false)
+	configureSystem(t, tc.ServerConn(0), false)
 
 	var blockCrossRegionTenantAccess atomic.Bool
 	maybeWait := func(ctx context.Context, a, b int) {
@@ -249,7 +258,7 @@ func TestColdStartLatency(t *testing.T) {
 			},
 			Locality: localities[0],
 		})
-		applyGlobalTables(t, tenantDB, true)
+		configureSystem(t, tenantDB, true)
 		tdb := sqlutils.MakeSQLRunner(tenantDB)
 		tdb.Exec(t, "CREATE USER foo PASSWORD $1 LOGIN", password)
 		tdb.Exec(t, "GRANT admin TO foo")
@@ -264,7 +273,7 @@ func TestColdStartLatency(t *testing.T) {
                             'progress',
                             progress
                            )->'AutoSpanConfigReconciliation' AS p
-                      FROM system.jobs
+                      FROM crdb_internal.system_jobs
                      WHERE status = 'running'
                 ),
        checkpoint AS (
@@ -275,39 +284,31 @@ func TestColdStartLatency(t *testing.T) {
 SELECT checkpoint > extract(epoch from after)
   FROM checkpoint, after`,
 			[][]string{{"true"}})
-		tenant.Stopper().Stop(ctx)
+		tenant.AppStopper().Stop(ctx)
 	}
+
 	// Wait for the configs to be applied.
 	testutils.SucceedsWithin(t, func() error {
-		reporter := tc.Servers[0].Server.SpanConfigReporter()
-		report, err := reporter.SpanConfigConformance(ctx, []roachpb.Span{
-			{Key: keys.TableDataMin, EndKey: keys.TenantTableDataMax},
-		})
-		if err != nil {
-			return err
-		}
-		if !report.IsEmpty() {
-			var g errgroup.Group
-			for _, r := range report.ViolatingConstraints {
-				r := r // for closure
-				g.Go(func() error {
-					_, err := tc.Server(0).DB().AdminScatter(
-						ctx, r.RangeDescriptor.StartKey.AsRawKey(), 0,
-					)
-					return err
-				})
-			}
-			if err := g.Wait(); err != nil {
+		for _, server := range tc.Servers {
+			reporter := server.SpanConfigReporter().(spanconfig.Reporter)
+			report, err := reporter.SpanConfigConformance(ctx, []roachpb.Span{
+				{Key: keys.TableDataMin, EndKey: keys.TenantTableDataMax},
+			})
+			if err != nil {
 				return err
 			}
-			return errors.Errorf("expected empty report, got: {over: %d, under: %d, violating: %d, unavailable: %d}",
-				len(report.OverReplicated),
-				len(report.UnderReplicated),
-				len(report.ViolatingConstraints),
-				len(report.Unavailable))
+			if !report.IsEmpty() {
+				return errors.Errorf("expected empty report, got: {over: %d, under: %d, violating: %d, unavailable: %d}",
+					len(report.OverReplicated),
+					len(report.UnderReplicated),
+					len(report.ViolatingConstraints),
+					len(report.Unavailable))
+			}
 		}
 		return nil
 	}, 5*time.Minute)
+
+	require.NoError(t, tc.WaitForFullReplication())
 
 	doTest := func(wg *sync.WaitGroup, qp *quotapool.IntPool, i int, duration *time.Duration) {
 		defer wg.Done()
@@ -324,10 +325,10 @@ SELECT checkpoint > extract(epoch from after)
 			},
 			Locality: localities[i],
 		})
-		defer tenant.Stopper().Stop(ctx)
 		require.NoError(t, err)
+		defer tenant.AppStopper().Stop(ctx)
 		pgURL, cleanup, err := sqlutils.PGUrlWithOptionalClientCertsE(
-			tenant.SQLAddr(), "tenantdata", url.UserPassword("foo", password),
+			tenant.AdvSQLAddr(), "tenantdata", url.UserPassword("foo", password),
 			false, // withClientCerts
 		)
 		if !assert.NoError(t, err) {

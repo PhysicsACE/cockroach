@@ -109,5 +109,22 @@ const (
 
 	// UpgradedDeclarativeSchemaChangerState indicates the declarative schema changer
 	// state was modified.
-	UpgradedDeclarativeSchemaChangerState = 15
+	UpgradedDeclarativeSchemaChangerState
+
+	// SetIndexInvisibility indicates that the invisibility of at least one index
+	// descriptor was updated to a non-zero value.
+	SetIndexInvisibility
+
+	// StrippedDanglingBackReferences indicates that at least one dangling
+	// back-reference was removed from the descriptor.
+	StrippedDanglingBackReferences
+
+	// StrippedDanglingSelfBackReferences indicates that at least one dangling
+	// back-reference to something within the descriptor itself was removed
+	// from the descriptor.
+	StrippedDanglingSelfBackReferences
+
+	// FixSecondaryIndexEncodingType indicates that a secondary index had its
+	// encoding type fixed, so it is not incorrectly marked as a primary index.
+	FixSecondaryIndexEncodingType
 )

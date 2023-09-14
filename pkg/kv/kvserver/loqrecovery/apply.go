@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb"
@@ -265,7 +266,7 @@ func applyReplicaUpdate(
 		// A crude form of the intent resolution process: abort the
 		// transaction by deleting its record.
 		txnKey := keys.TransactionKey(res.Intent.Txn.Key, res.Intent.Txn.ID)
-		if _, err := storage.MVCCDelete(ctx, readWriter, &ms, txnKey, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil); err != nil {
+		if _, err := storage.MVCCDelete(ctx, readWriter, txnKey, hlc.Timestamp{}, storage.MVCCWriteOptions{Stats: &ms}); err != nil {
 			return PrepareReplicaReport{}, err
 		}
 		update := roachpb.LockUpdate{
@@ -292,8 +293,8 @@ func applyReplicaUpdate(
 	newDesc.NextReplicaID = update.NextReplicaID
 
 	if err := storage.MVCCPutProto(
-		ctx, readWriter, &ms, key, clock.Now(),
-		hlc.ClockTimestamp{}, nil /* txn */, &newDesc,
+		ctx, readWriter, key, clock.Now(),
+		&newDesc, storage.MVCCWriteOptions{Stats: &ms},
 	); err != nil {
 		return PrepareReplicaReport{}, err
 	}
@@ -365,6 +366,10 @@ func MaybeApplyPendingRecoveryPlan(
 	}
 
 	applyPlan := func(nodeID roachpb.NodeID, plan loqrecoverypb.ReplicaUpdatePlan) error {
+		if err := CheckEnginesVersion(ctx, engines, plan, false); err != nil {
+			return errors.Wrap(err, "failed to check cluster version against storage")
+		}
+
 		log.Infof(ctx, "applying staged loss of quorum recovery plan %s", plan.PlanID)
 		batches := make(map[roachpb.StoreID]storage.Batch)
 		for _, e := range engines {
@@ -435,4 +440,21 @@ func MaybeApplyPendingRecoveryPlan(
 		log.Errorf(ctx, "failed to write loss of quorum recovery results to store: %s", err)
 	}
 	return nil
+}
+
+func CheckEnginesVersion(
+	ctx context.Context,
+	engines []storage.Engine,
+	plan loqrecoverypb.ReplicaUpdatePlan,
+	ignoreInternal bool,
+) error {
+	binaryVersion := clusterversion.ByKey(clusterversion.BinaryVersionKey)
+	binaryMinSupportedVersion := clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)
+	clusterVersion, err := kvstorage.SynthesizeClusterVersionFromEngines(
+		ctx, engines, binaryVersion, binaryMinSupportedVersion,
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to get cluster version from storage")
+	}
+	return checkPlanVersionMatches(plan.Version, clusterVersion.Version, ignoreInternal)
 }

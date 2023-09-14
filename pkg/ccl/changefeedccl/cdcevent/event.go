@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -29,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -108,6 +110,15 @@ func (r Row) ForAllColumns() Iterator {
 // ForEachUDTColumn returns Datum iterator for each column containing user defined types.
 func (r Row) ForEachUDTColumn() Iterator {
 	return iter{r: r, cols: r.udtCols}
+}
+
+// DatumNamed returns the datum with the specified column name, in the form of an Iterator.
+func (r Row) DatumNamed(n string) (Iterator, error) {
+	idx, ok := r.EventDescriptor.colsByName[n]
+	if !ok {
+		return nil, errors.Errorf("No column with name %s in this row", n)
+	}
+	return iter{r: r, cols: []int{idx}}, nil
 }
 
 // DatumAt returns Datum at specified position.
@@ -236,10 +247,11 @@ type EventDescriptor struct {
 	cols []ResultColumn
 
 	// Precomputed index lists into cols.
-	keyCols   []int // Primary key columns.
-	valueCols []int // All column family columns.
-	udtCols   []int // Columns containing UDTs.
-	allCols   []int // Contains all the columns
+	keyCols    []int          // Primary key columns.
+	valueCols  []int          // All column family columns.
+	udtCols    []int          // Columns containing UDTs.
+	allCols    []int          // Contains all the columns
+	colsByName map[string]int // All columns, map[col.GetName()]idx in cols
 }
 
 // NewEventDescriptor returns EventDescriptor for specified table and family descriptors.
@@ -260,7 +272,8 @@ func NewEventDescriptor(
 			HasOtherFamilies: desc.NumFamilies() > 1,
 			SchemaTS:         schemaTS,
 		},
-		td: desc,
+		td:         desc,
+		colsByName: make(map[string]int),
 	}
 
 	// addColumn is a helper to add a column to this descriptor.
@@ -278,6 +291,7 @@ func NewEventDescriptor(
 
 		colIdx := len(sd.cols)
 		sd.cols = append(sd.cols, resultColumn)
+		sd.colsByName[col.GetName()] = colIdx
 
 		if col.GetType().UserDefined() {
 			sd.udtCols = append(sd.udtCols, colIdx)
@@ -339,7 +353,7 @@ func NewEventDescriptor(
 
 	allCols := make([]int, len(sd.cols))
 	for i := 0; i < len(sd.cols); i++ {
-		allCols = append(allCols, i)
+		allCols[i] = i
 	}
 	sd.allCols = allCols
 
@@ -485,6 +499,31 @@ const (
 func (d *eventDecoder) DecodeKV(
 	ctx context.Context, kv roachpb.KeyValue, rt RowType, schemaTS hlc.Timestamp, keyOnly bool,
 ) (Row, error) {
+	r, err := d.decodeKV(ctx, kv, rt, schemaTS, keyOnly)
+	if err == nil {
+		return r, nil
+	}
+
+	// Failure to decode roachpb.KeyValue we received from rangefeed is pretty bad.
+	// At this point, we only have guesses why this happened (schema change? data corruption?).
+	// Retrying this error however is likely to produce exactly the same result.
+	// So, be loud and treat this error as a terminal changefeed error.
+	kvBytes, marshalErr := protoutil.Marshal(&kv)
+	if marshalErr != nil {
+		// That's mighty surprising.  Just shove error message into kvBytes.
+		kvBytes = []byte(fmt.Sprintf("marshalErr<%s>", marshalErr.Error()))
+	}
+	err = changefeedbase.WithTerminalError(errors.Wrapf(err,
+		"error decoding key %s@%s (hex_kv: %x)",
+		keys.PrettyPrint(nil, kv.Key), kv.Value.Timestamp, kvBytes))
+	log.Errorf(ctx, "terminal error decoding KV: %v", err)
+	return Row{}, err
+}
+
+// decodeKV decodes key value at specified schema timestamp.
+func (d *eventDecoder) decodeKV(
+	ctx context.Context, kv roachpb.KeyValue, rt RowType, schemaTS hlc.Timestamp, keyOnly bool,
+) (Row, error) {
 	if err := d.initForKey(ctx, kv.Key, schemaTS, keyOnly); err != nil {
 		return Row{}, err
 	}
@@ -549,15 +588,15 @@ type fetcher struct {
 	*row.Fetcher
 }
 
-// nextRow returns the next row from the fetcher, but stips out
-// tableoid system column if the row is the "previous" row.
+// nextRow returns the next row from the fetcher, but strips out
+// system columns.
 func (f *fetcher) nextRow(ctx context.Context, isPrev bool) (rowenc.EncDatumRow, error) {
 	r, _, err := f.Fetcher.NextRow(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if isPrev {
-		r = r[:len(r)-1]
+		r = r[:len(r)-len(systemColumns)]
 	}
 	return r, nil
 }

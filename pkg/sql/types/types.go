@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/gogo/protobuf/proto"
 	"github.com/lib/pq/oid"
 )
@@ -191,12 +192,12 @@ type UserDefinedTypeMetadata struct {
 	// Name is the resolved name of this type.
 	Name *UserDefinedTypeName
 
+	// EnumData is non-nil iff the metadata is for an ENUM type.
+	EnumData *EnumMetadata
+
 	// Version is the descriptor version of the descriptor used to construct
 	// this version of the type metadata.
 	Version uint32
-
-	// EnumData is non-nil iff the metadata is for an ENUM type.
-	EnumData *EnumMetadata
 
 	// ImplicitRecordType is true if the metadata is for an implicit record type
 	// for a table. Note: this can be deleted if we migrate implicit record types
@@ -457,6 +458,15 @@ var (
 		},
 	}
 
+	// PGLSN is the type representing a PostgreSQL LSN object.
+	PGLSN = &T{
+		InternalType: InternalType{
+			Family: PGLSNFamily,
+			Oid:    oid.T_pg_lsn,
+			Locale: &emptyLocale,
+		},
+	}
+
 	// Void is the type representing void.
 	Void = &T{
 		InternalType: InternalType{
@@ -520,6 +530,7 @@ var (
 		Oid,
 		Uuid,
 		INet,
+		PGLSN,
 		Time,
 		TimeTZ,
 		Jsonb,
@@ -597,9 +608,13 @@ var (
 	UUIDArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: Uuid, Oid: oid.T__uuid, Locale: &emptyLocale}}
 
-	// TimeArray is the type of an array value having Date-typed elements.
+	// DateArray is the type of an array value having Date-typed elements.
 	DateArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: Date, Oid: oid.T__date, Locale: &emptyLocale}}
+
+	// PGLSNArray is the type of an array value having PGLSN-typed elements.
+	PGLSNArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: PGLSN, Oid: oid.T__pg_lsn, Locale: &emptyLocale}}
 
 	// TimeArray is the type of an array value having Time-typed elements.
 	TimeArray = &T{InternalType: InternalType{
@@ -1450,6 +1465,7 @@ var familyNames = map[Family]string{
 	IntervalFamily:       "interval",
 	JsonFamily:           "jsonb",
 	OidFamily:            "oid",
+	PGLSNFamily:          "pg_lsn",
 	StringFamily:         "string",
 	TimeFamily:           "time",
 	TimestampFamily:      "timestamp",
@@ -1717,6 +1733,8 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 		default:
 			panic(errors.AssertionFailedf("unexpected Oid: %v", errors.Safe(t.Oid())))
 		}
+	case PGLSNFamily:
+		return "pg_lsn"
 	case StringFamily, CollatedStringFamily:
 		switch t.Oid() {
 		case oid.T_text:
@@ -1923,6 +1941,41 @@ func (t *T) SQLString() string {
 	return strings.ToUpper(t.Name())
 }
 
+// SQLStringForError returns a version of SQLString that will preserve safe
+// information during redaction. It is suitable for usage in error messages.
+func (t *T) SQLStringForError() redact.RedactableString {
+	if t.UserDefined() {
+		// Show the redacted SQLString output with an un-redacted prefix to indicate
+		// that the type is user defined (and possibly enum or record).
+		prefix := "TYPE"
+		switch t.Family() {
+		case EnumFamily:
+			prefix = "ENUM"
+		case TupleFamily:
+			prefix = "RECORD"
+		case ArrayFamily:
+			prefix = "ARRAY"
+		}
+		return redact.Sprintf("USER DEFINED %s: %s", redact.Safe(prefix), t.SQLString())
+	}
+	switch t.Family() {
+	case EnumFamily, TupleFamily, ArrayFamily:
+		// These types can be or can contain user-defined types, but the SQLString
+		// is safe when they are not user-defined. We filtered out the user-defined
+		// case above.
+		return redact.Sprint(redact.Safe(t.SQLString()))
+	case BoolFamily, IntFamily, FloatFamily, DecimalFamily, DateFamily, TimestampFamily,
+		IntervalFamily, StringFamily, BytesFamily, TimestampTZFamily, CollatedStringFamily, OidFamily,
+		UnknownFamily, UuidFamily, INetFamily, TimeFamily, JsonFamily, TimeTZFamily, BitFamily,
+		GeometryFamily, GeographyFamily, Box2DFamily, VoidFamily, EncodedKeyFamily, TSQueryFamily,
+		TSVectorFamily, AnyFamily, PGLSNFamily:
+		// These types do not contain other types, and do not require redaction.
+		return redact.Sprint(redact.SafeString(t.SQLString()))
+	}
+	// Default to redaction for unhandled types.
+	return redact.Sprint(t.SQLString())
+}
+
 // FormatTypeName is an injected dependency from tree to properly format a
 // type name. The logic for proper formatting lives in the tree package.
 var FormatTypeName = fallbackFormatTypeName
@@ -2102,7 +2155,7 @@ func (t *InternalType) Identical(other *InternalType) bool {
 		return false
 	}
 	if t.Locale != nil && other.Locale != nil {
-		if *t.Locale != *other.Locale {
+		if !lex.LocaleNamesAreEqual(*t.Locale, *other.Locale) {
 			return false
 		}
 	} else if t.Locale != nil {

@@ -13,15 +13,20 @@ package server
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime/pprof"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
+	"github.com/cockroachdb/cockroach/pkg/server/debug/pprofui"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -29,7 +34,7 @@ import (
 // profileLocal runs a performance profile of the requested type (heap, cpu etc).
 // on the local node. This method returns a gRPC error to the caller.
 func profileLocal(
-	ctx context.Context, req *serverpb.ProfileRequest, st *cluster.Settings,
+	ctx context.Context, req *serverpb.ProfileRequest, st *cluster.Settings, nodeID roachpb.NodeID,
 ) (*serverpb.JSONResponse, error) {
 	switch req.Type {
 	case serverpb.ProfileRequest_CPU:
@@ -45,7 +50,7 @@ func profileLocal(
 			}
 			if err := pprof.StartCPUProfile(&buf); err != nil {
 				// Construct a gRPC error to return to the caller.
-				return serverError(ctx, err)
+				return srverrors.ServerError(ctx, err)
 			}
 			defer pprof.StopCPUProfile()
 			select {
@@ -56,6 +61,29 @@ func profileLocal(
 			}
 		}); err != nil {
 			return nil, err
+		}
+		return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
+	case serverpb.ProfileRequest_GOROUTINE:
+		p := pprof.Lookup("goroutine")
+		if p == nil {
+			return nil, status.Error(codes.Internal, "unable to find goroutine profile")
+		}
+		var buf bytes.Buffer
+		if req.Labels {
+			buf.WriteString(fmt.Sprintf("Stacks for node: %d\n\n", nodeID))
+			if err := p.WriteTo(&buf, 1); err != nil {
+				return nil, status.Errorf(codes.Internal, err.Error())
+			}
+			buf.WriteString("\n\n")
+
+			// Now check if we need to filter the goroutines by the provided label filter.
+			if req.LabelFilter != "" {
+				return &serverpb.JSONResponse{Data: pprofui.FilterStacksWithLabels(buf.Bytes(), req.LabelFilter)}, nil
+			}
+		} else {
+			if err := p.WriteTo(&buf, 0); err != nil {
+				return nil, status.Errorf(codes.Internal, err.Error())
+			}
 		}
 		return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
 	default:
@@ -79,19 +107,19 @@ func profileLocal(
 // stacksLocal retrieves goroutine stack files on the local node. This method
 // returns a gRPC error to the caller.
 func stacksLocal(req *serverpb.StacksRequest) (*serverpb.JSONResponse, error) {
-	var stackType int
+	var buf *bytes.Buffer
 	switch req.Type {
 	case serverpb.StacksType_GOROUTINE_STACKS:
-		stackType = 2
+		// Use allstacks.Get because it doesn't have an arbitrary 64MB limit (as
+		// opposed to the profile).
+		buf = bytes.NewBuffer(allstacks.Get())
 	case serverpb.StacksType_GOROUTINE_STACKS_DEBUG_1:
-		stackType = 1
+		buf = bytes.NewBuffer(nil)
+		if err := pprof.Lookup("goroutine").WriteTo(buf, 1 /* debug */); err != nil {
+			return nil, status.Errorf(codes.Unknown, "failed to write goroutine stack: %s", err)
+		}
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown stacks type: %s", req.Type)
-	}
-
-	var buf bytes.Buffer
-	if err := pprof.Lookup("goroutine").WriteTo(&buf, stackType); err != nil {
-		return nil, status.Errorf(codes.Unknown, "failed to write goroutine stack: %s", err)
 	}
 	return &serverpb.JSONResponse{Data: buf.Bytes()}, nil
 }

@@ -155,11 +155,11 @@ func (s *StatementStatistics) Add(other *StatementStatistics) {
 	s.BytesRead.Add(other.BytesRead, s.Count, other.Count)
 	s.RowsRead.Add(other.RowsRead, s.Count, other.Count)
 	s.RowsWritten.Add(other.RowsWritten, s.Count, other.Count)
-	s.Nodes = util.CombineUniqueInt64(s.Nodes, other.Nodes)
-	s.Regions = util.CombineUniqueString(s.Regions, other.Regions)
-	s.PlanGists = util.CombineUniqueString(s.PlanGists, other.PlanGists)
+	s.Nodes = util.CombineUnique(s.Nodes, other.Nodes)
+	s.Regions = util.CombineUnique(s.Regions, other.Regions)
+	s.PlanGists = util.CombineUnique(s.PlanGists, other.PlanGists)
 	s.IndexRecommendations = other.IndexRecommendations
-	s.Indexes = util.CombineUniqueString(s.Indexes, other.Indexes)
+	s.Indexes = util.CombineUnique(s.Indexes, other.Indexes)
 
 	s.ExecStats.Add(other.ExecStats)
 	s.LatencyInfo.Add(other.LatencyInfo)
@@ -252,5 +252,25 @@ func (s *LatencyInfo) Add(other LatencyInfo) {
 	}
 	if other.Max > s.Max {
 		s.Max = other.Max
+	}
+	s.checkPercentiles()
+}
+
+// checkPercentiles is a patchy solution and not ideal.
+// When the execution count for a period is smaller than 500,
+// the percentiles sample is including previous aggregation periods,
+// making the p99 possible be greater than the max.
+// For now, we just do a check and update the percentiles to the max
+// possible size.
+// TODO(maryliag): use a proper sample size (#99070)
+func (s *LatencyInfo) checkPercentiles() {
+	if s.P99 > s.Max {
+		s.P99 = s.Max
+	}
+	if s.P90 > s.Max {
+		s.P90 = s.Max
+	}
+	if s.P50 > s.Max {
+		s.P50 = s.Max
 	}
 }

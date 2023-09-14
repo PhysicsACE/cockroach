@@ -32,6 +32,10 @@ func (d FakeResumer) ForceRealSpan() bool {
 	return d.TraceRealSpan
 }
 
+func (d FakeResumer) DumpTraceAfterRun() bool {
+	return true
+}
+
 var _ Resumer = FakeResumer{}
 
 func (d FakeResumer) Resume(ctx context.Context, execCtx interface{}) error {
@@ -120,7 +124,6 @@ func (j *Job) TestingCurrentStatus(ctx context.Context) (Status, error) {
 const (
 	AdoptQuery                     = claimQuery
 	CancelQuery                    = pauseAndCancelUpdate
-	GcQuery                        = expiredJobsQuery
 	RemoveClaimsQuery              = removeClaimsForDeadSessionsQuery
 	ProcessJobsQuery               = processQueryWithBackoff
 	IntervalBaseSettingKey         = intervalBaseSettingKey

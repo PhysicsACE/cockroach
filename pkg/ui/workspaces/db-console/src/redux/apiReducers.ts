@@ -11,7 +11,7 @@
 import _ from "lodash";
 import { Action, combineReducers } from "redux";
 import { ThunkAction, ThunkDispatch } from "redux-thunk";
-import moment from "moment";
+import moment from "moment-timezone";
 import {
   api as clusterUiApi,
   util,
@@ -32,8 +32,12 @@ import { versionCheck } from "src/util/cockroachlabsAPI";
 import { INodeStatus, RollupStoreMetrics } from "src/util/proto";
 import * as protos from "src/js/protos";
 import Long from "long";
+import { createSelector, ParametricSelector } from "reselect";
+import { AdminUIState } from "./state";
+import { RouteComponentProps } from "react-router";
 
-const { generateStmtDetailsToID, HexStringToInt64String } = util;
+const { generateStmtDetailsToID, HexStringToInt64String, generateTableID } =
+  util;
 
 const SessionsRequest = protos.cockroach.server.serverpb.ListSessionsRequest;
 
@@ -105,14 +109,14 @@ const databasesReducerObj = new CachedDataReducer(
 );
 export const refreshDatabases = databasesReducerObj.refresh;
 
-export const databaseRequestToID = (
-  req: api.DatabaseDetailsRequestMessage,
-): string => req.database;
+export const databaseRequestPayloadToID = (
+  params: clusterUiApi.DatabaseDetailsReqParams,
+): string => params.database;
 
 const databaseDetailsReducerObj = new KeyedCachedDataReducer(
-  api.getDatabaseDetails,
+  clusterUiApi.getDatabaseDetails,
   "databaseDetails",
-  databaseRequestToID,
+  databaseRequestPayloadToID,
   null,
   moment.duration(10, "m"),
 );
@@ -124,42 +128,30 @@ export const hotRangesReducerObj = new PaginatedCachedDataReducer(
   api.getHotRanges,
   "hotRanges",
   hotRangesRequestToID,
+  1000 /* page limit */,
+  null /* invalidation period */,
+  moment.duration(30, "minutes"),
 );
 
 export const refreshDatabaseDetails = databaseDetailsReducerObj.refresh;
 
 export const refreshHotRanges = hotRangesReducerObj.refresh;
 
-// NOTE: We encode the db and table name so we can combine them as a string.
-// TODO(maxlang): there's probably a nicer way to do this
-export function generateTableID(db: string, table: string) {
-  return `${encodeURIComponent(db)}/${encodeURIComponent(table)}`;
-}
-
 export const tableRequestToID = (
   req:
-    | api.TableDetailsRequestMessage
     | api.TableStatsRequestMessage
-    | api.IndexStatsRequestMessage,
+    | api.IndexStatsRequestMessage
+    | clusterUiApi.TableDetailsReqParams,
 ): string => generateTableID(req.database, req.table);
 
 const tableDetailsReducerObj = new KeyedCachedDataReducer(
-  api.getTableDetails,
+  clusterUiApi.getTableDetails,
   "tableDetails",
   tableRequestToID,
   null,
   moment.duration(10, "m"),
 );
 export const refreshTableDetails = tableDetailsReducerObj.refresh;
-
-const tableStatsReducerObj = new KeyedCachedDataReducer(
-  api.getTableStats,
-  "tableStats",
-  tableRequestToID,
-  null,
-  moment.duration(10, "m"),
-);
-export const refreshTableStats = tableStatsReducerObj.refresh;
 
 const indexStatsReducerObj = new KeyedCachedDataReducer(
   api.getIndexStats,
@@ -224,6 +216,19 @@ const jobReducerObj = new KeyedCachedDataReducer(
   moment.duration(10, "m"),
 );
 export const refreshJob = jobReducerObj.refresh;
+
+export const jobProfilerRequestKey = (
+  req: api.ListJobProfilerExecutionDetailsRequestMessage,
+): string => `${req.job_id}`;
+
+const jobProfilerReducerObj = new KeyedCachedDataReducer(
+  api.listExecutionDetailFiles,
+  "jobProfiler",
+  jobProfilerRequestKey,
+  null,
+  moment.duration(10, "m"),
+);
+export const refreshListExecutionDetailFiles = jobProfilerReducerObj.refresh;
 
 export const queryToID = (req: api.QueryPlanRequestMessage): string =>
   req.query;
@@ -327,13 +332,24 @@ const storesReducerObj = new KeyedCachedDataReducer(
 export const refreshStores = storesReducerObj.refresh;
 
 const queriesReducerObj = new CachedDataReducer(
-  api.getCombinedStatements,
+  clusterUiApi.getCombinedStatements,
   "statements",
   null,
-  moment.duration(30, "m"),
+  moment.duration(10, "m"),
+  true,
 );
 export const invalidateStatements = queriesReducerObj.invalidateData;
 export const refreshStatements = queriesReducerObj.refresh;
+
+const txnFingerprintStatsReducerObj = new CachedDataReducer(
+  clusterUiApi.getFlushedTxnStatsApi,
+  "transactions",
+  null,
+  moment.duration(30, "m"),
+  true,
+);
+export const invalidateTxns = txnFingerprintStatsReducerObj.invalidateData;
+export const refreshTxns = txnFingerprintStatsReducerObj.refresh;
 
 export const statementDetailsRequestToID = (
   req: api.StatementDetailsRequestMessage,
@@ -369,16 +385,19 @@ const userSQLRolesReducerObj = new CachedDataReducer(
 export const invalidateUserSQLRoles = userSQLRolesReducerObj.invalidateData;
 export const refreshUserSQLRoles = userSQLRolesReducerObj.refresh;
 
+export const statementDiagnosticInvalidationPeriod = moment.duration(5, "m");
 const statementDiagnosticsReportsReducerObj = new CachedDataReducer(
   clusterUiApi.getStatementDiagnosticsReports,
   "statementDiagnosticsReports",
-  moment.duration(5, "m"),
+  statementDiagnosticInvalidationPeriod,
   moment.duration(1, "m"),
 );
 export const refreshStatementDiagnosticsRequests =
   statementDiagnosticsReportsReducerObj.refresh;
 export const invalidateStatementDiagnosticsRequests =
   statementDiagnosticsReportsReducerObj.invalidateData;
+export const RECEIVE_STATEMENT_DIAGNOSTICS_REPORT =
+  statementDiagnosticsReportsReducerObj.RECEIVE;
 
 const dataDistributionReducerObj = new CachedDataReducer(
   api.getDataDistribution,
@@ -522,6 +541,23 @@ const rawTraceReducerObj = new KeyedCachedDataReducer(
 );
 export const refreshRawTrace = rawTraceReducerObj.refresh;
 
+const tenantsListObj = new CachedDataReducer(
+  api.getTenants,
+  "tenants",
+  moment.duration(60, "m"),
+);
+
+export const refreshTenantsList = tenantsListObj.refresh;
+
+const connectivityObj = new CachedDataReducer(
+  api.getNetworkConnectivity,
+  "connectivity",
+  moment.duration(30, "s"),
+  moment.duration(1, "minute"),
+);
+
+export const refreshConnectivity = connectivityObj.refresh;
+
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
   events: CachedDataReducerState<
@@ -533,13 +569,17 @@ export interface APIReducersState {
   version: CachedDataReducerState<VersionList>;
   locations: CachedDataReducerState<api.LocationsResponseMessage>;
   databases: CachedDataReducerState<clusterUiApi.DatabasesListResponse>;
-  databaseDetails: KeyedCachedDataReducerState<api.DatabaseDetailsResponseMessage>;
-  tableDetails: KeyedCachedDataReducerState<api.TableDetailsResponseMessage>;
-  tableStats: KeyedCachedDataReducerState<api.TableStatsResponseMessage>;
+  databaseDetails: KeyedCachedDataReducerState<
+    clusterUiApi.SqlApiResponse<clusterUiApi.DatabaseDetailsResponse>
+  >;
+  tableDetails: KeyedCachedDataReducerState<
+    clusterUiApi.SqlApiResponse<clusterUiApi.TableDetailsResponse>
+  >;
   indexStats: KeyedCachedDataReducerState<api.IndexStatsResponseMessage>;
   nonTableStats: CachedDataReducerState<api.NonTableStatsResponseMessage>;
   logs: CachedDataReducerState<api.LogEntriesResponseMessage>;
   liveness: CachedDataReducerState<api.LivenessResponseMessage>;
+  jobProfiler: KeyedCachedDataReducerState<api.ListJobProfilerExecutionDetailsResponseMessage>;
   jobs: KeyedCachedDataReducerState<api.JobsResponseMessage>;
   job: KeyedCachedDataReducerState<api.JobResponseMessage>;
   queryPlan: CachedDataReducerState<api.QueryPlanResponseMessage>;
@@ -551,7 +591,8 @@ export interface APIReducersState {
   sessions: CachedDataReducerState<api.SessionsResponseMessage>;
   settings: CachedDataReducerState<api.SettingsResponseMessage>;
   stores: KeyedCachedDataReducerState<api.StoresResponseMessage>;
-  statements: CachedDataReducerState<api.StatementsResponseMessage>;
+  statements: CachedDataReducerState<clusterUiApi.SqlStatsResponse>;
+  transactions: CachedDataReducerState<clusterUiApi.SqlStatsResponse>;
   statementDetails: KeyedCachedDataReducerState<api.StatementDetailsResponseMessage>;
   dataDistribution: CachedDataReducerState<api.DataDistributionResponseMessage>;
   metricMetadata: CachedDataReducerState<api.MetricMetadataResponseMessage>;
@@ -581,6 +622,8 @@ export interface APIReducersState {
   snapshots: KeyedCachedDataReducerState<clusterUiApi.ListTracingSnapshotsResponse>;
   snapshot: KeyedCachedDataReducerState<clusterUiApi.GetTracingSnapshotResponse>;
   rawTrace: KeyedCachedDataReducerState<clusterUiApi.GetTraceResponse>;
+  tenants: CachedDataReducerState<api.ListTenantsResponseMessage>;
+  connectivity: CachedDataReducerState<api.NetworkConnectivityResponse>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -595,11 +638,11 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [databaseDetailsReducerObj.actionNamespace]:
     databaseDetailsReducerObj.reducer,
   [tableDetailsReducerObj.actionNamespace]: tableDetailsReducerObj.reducer,
-  [tableStatsReducerObj.actionNamespace]: tableStatsReducerObj.reducer,
   [indexStatsReducerObj.actionNamespace]: indexStatsReducerObj.reducer,
   [nonTableStatsReducerObj.actionNamespace]: nonTableStatsReducerObj.reducer,
   [logsReducerObj.actionNamespace]: logsReducerObj.reducer,
   [livenessReducerObj.actionNamespace]: livenessReducerObj.reducer,
+  [jobProfilerReducerObj.actionNamespace]: jobProfilerReducerObj.reducer,
   [jobsReducerObj.actionNamespace]: jobsReducerObj.reducer,
   [jobReducerObj.actionNamespace]: jobReducerObj.reducer,
   [queryPlanReducerObj.actionNamespace]: queryPlanReducerObj.reducer,
@@ -612,6 +655,8 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [sessionsReducerObj.actionNamespace]: sessionsReducerObj.reducer,
   [storesReducerObj.actionNamespace]: storesReducerObj.reducer,
   [queriesReducerObj.actionNamespace]: queriesReducerObj.reducer,
+  [txnFingerprintStatsReducerObj.actionNamespace]:
+    txnFingerprintStatsReducerObj.reducer,
   [statementDetailsReducerObj.actionNamespace]:
     statementDetailsReducerObj.reducer,
   [dataDistributionReducerObj.actionNamespace]:
@@ -634,6 +679,106 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [rawTraceReducerObj.actionNamespace]: rawTraceReducerObj.reducer,
   [statementFingerprintInsightsReducerObj.actionNamespace]:
     statementFingerprintInsightsReducerObj.reducer,
+  [tenantsListObj.actionNamespace]: tenantsListObj.reducer,
+  [connectivityObj.actionNamespace]: connectivityObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };
+
+// This mapped type assigns keys in object type T where the key value
+// is of type V to the key value. Otherwise, it assigns it 'never'.
+// This enables one to extract keys in an object T of type V.
+// Example:
+// type MyObject = {
+//   a: string;
+//   b: string;
+// . c: number;
+// }
+// type KeysThatHaveStringsInMyObject = KeysMatching<MyObject, string>;
+// KeysThatHaveStringsInMyObject maps to the following type:
+// Result = {
+//    a: 'a';
+// .  b: 'b';
+// .  c: never;
+// }
+//
+type KeysMatchingType<T, V> = {
+  [K in keyof T]: T[K] extends V ? K : never;
+}[keyof T];
+
+type CachedDataTypesInState = {
+  [K in keyof APIReducersState]: APIReducersState[K] extends CachedDataReducerState<unknown>
+    ? APIReducersState[K]["data"]
+    : never;
+}[keyof APIReducersState];
+
+// These selector creators are used to create selectors that will map the
+// cached data reducer state to the expected  'clusterUiApi.RequestState'
+// type. It also prevents passing a new object when the underlying cached
+// data reducer hasn't changed.
+export function createSelectorForCachedDataField<
+  RespType extends CachedDataTypesInState,
+>(
+  fieldName: KeysMatchingType<
+    APIReducersState,
+    CachedDataReducerState<RespType>
+  >,
+) {
+  return createSelector<
+    AdminUIState,
+    CachedDataReducerState<RespType>,
+    clusterUiApi.RequestState<RespType>
+  >(
+    (state: AdminUIState): CachedDataReducerState<RespType> =>
+      state.cachedData[fieldName] as CachedDataReducerState<RespType>,
+    (response): clusterUiApi.RequestState<RespType> => {
+      return {
+        data: response?.data,
+        error: response?.lastError,
+        valid: response?.valid ?? false,
+        inFlight: response?.inFlight ?? false,
+        lastUpdated: response?.setAt,
+      };
+    },
+  );
+}
+
+// Extract the data types we store in the KeyedCachedData manager.
+type KeyedCachedDataTypesInState = {
+  [K in keyof APIReducersState]: APIReducersState[K] extends KeyedCachedDataReducerState<unknown>
+    ? APIReducersState[K][string]["data"]
+    : never;
+}[keyof APIReducersState];
+
+export function createSelectorForKeyedCachedDataField<
+  RespType extends KeyedCachedDataTypesInState,
+>(
+  fieldName: KeysMatchingType<
+    APIReducersState,
+    KeyedCachedDataReducerState<RespType>
+  >,
+  selectKey: ParametricSelector<unknown, RouteComponentProps, string>,
+) {
+  return createSelector<
+    AdminUIState,
+    RouteComponentProps,
+    KeyedCachedDataReducerState<RespType>,
+    string,
+    clusterUiApi.RequestState<RespType>
+  >(
+    (state: AdminUIState, _props: RouteComponentProps) =>
+      state.cachedData[fieldName] as KeyedCachedDataReducerState<RespType>,
+    selectKey,
+    (response, key): clusterUiApi.RequestState<RespType> => {
+      const cachedEntry = response[key];
+
+      return {
+        data: cachedEntry?.data,
+        error: cachedEntry?.lastError,
+        valid: cachedEntry?.valid ?? true,
+        inFlight: cachedEntry?.inFlight ?? false,
+        lastUpdated: cachedEntry?.setAt,
+      };
+    },
+  );
+}

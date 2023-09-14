@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
@@ -89,6 +88,9 @@ type Cluster struct {
 	CreatedAt time.Time     `json:"created_at"`
 	Lifetime  time.Duration `json:"lifetime"`
 	VMs       vm.List       `json:"vms"`
+	// CostPerHour is an estimate, in dollars, of how much this cluster costs to
+	// run per hour. 0 if the cost estimate is unavailable.
+	CostPerHour float64
 }
 
 // Clouds returns the names of all of the various cloud providers used
@@ -161,19 +163,9 @@ func (c *Cluster) IsLocal() bool {
 	return config.IsLocalClusterName(c.Name)
 }
 
-const vmNameFormat = "user-<clusterid>-<nodeid>"
-
-// namesFromVM determines the user name and the cluster name from a VM.
-func namesFromVM(v vm.VM) (userName string, clusterName string, _ error) {
-	if v.IsLocal() {
-		return config.Local, v.LocalClusterName, nil
-	}
-	name := v.Name
-	parts := strings.Split(name, "-")
-	if len(parts) < 3 {
-		return "", "", fmt.Errorf("expected VM name in the form %s, got %s", vmNameFormat, name)
-	}
-	return parts[0], strings.Join(parts[:len(parts)-1], "-"), nil
+// IsEmptyCluster returns true if a cluster has no resources.
+func (c *Cluster) IsEmptyCluster() bool {
+	return c.VMs[0].EmptyCluster
 }
 
 // ListCloud returns information about all instances (across all available
@@ -193,25 +185,33 @@ func ListCloud(l *logger.Logger, options vm.ListOptions) (*Cloud, error) {
 		g.Go(func() error {
 			var err error
 			providerVMs[index], err = provider.List(l, options)
-			return err
+			return errors.Wrapf(err, "provider %s", provider.Name())
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, err
+		// We continue despite the error as we don't want to fail for all providers if only one
+		// has an issue. The function that calls ListCloud may not even use the erring provider.
+		// If it does, it will fail later when it doesn't find the specified cluster.
+		l.Printf("WARNING: Error listing VMs, continuing but list may be incomplete. %s \n", err.Error())
 	}
 
 	for _, vms := range providerVMs {
 		for _, v := range vms {
 			// Parse cluster/user from VM name, but only for non-local VMs
-			userName, clusterName, err := namesFromVM(v)
+			userName, err := v.UserName()
+			if err != nil {
+				v.Errors = append(v.Errors, vm.ErrInvalidName)
+			}
+			clusterName, err := v.ClusterName()
 			if err != nil {
 				v.Errors = append(v.Errors, vm.ErrInvalidName)
 			}
 
 			// Anything with an error gets tossed into the BadInstances slice, and we'll correct
-			// the problem later on.
-			if len(v.Errors) > 0 {
+			// the problem later on. Ignore empty clusters since BadInstances will be destroyed on
+			// the VM level. GC will destroy them instead.
+			if len(v.Errors) > 0 && !v.EmptyCluster {
 				cloud.BadInstances = append(cloud.BadInstances, v)
 				continue
 			}
@@ -235,11 +235,16 @@ func ListCloud(l *logger.Logger, options vm.ListOptions) (*Cloud, error) {
 			if v.Lifetime < c.Lifetime {
 				c.Lifetime = v.Lifetime
 			}
+			c.CostPerHour += v.CostPerHour
 		}
 	}
 
 	// Sort VMs for each cluster. We want to make sure we always have the same order.
+	// Also assert that no cluster can be empty.
 	for _, c := range cloud.Clusters {
+		if len(c.VMs) == 0 {
+			return nil, errors.Errorf("found no VMs in cluster %s", c.Name)
+		}
 		sort.Sort(c.VMs)
 	}
 
@@ -274,21 +279,27 @@ func CreateCluster(
 }
 
 // DestroyCluster TODO(peter): document
-func DestroyCluster(c *Cluster) error {
-	return vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+func DestroyCluster(l *logger.Logger, c *Cluster) error {
+	err := vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
 		// Enable a fast-path for providers that can destroy a cluster in one shot.
 		if x, ok := p.(vm.DeleteCluster); ok {
-			return x.DeleteCluster(c.Name)
+			return x.DeleteCluster(l, c.Name)
 		}
-		return p.Delete(vms)
+		return p.Delete(l, vms)
+	})
+	if err != nil {
+		return err
+	}
+	return vm.FanOutDNS(c.VMs, func(p vm.DNSProvider, vms vm.List) error {
+		return p.DeleteRecordsBySubdomain(c.Name)
 	})
 }
 
 // ExtendCluster TODO(peter): document
-func ExtendCluster(c *Cluster, extension time.Duration) error {
+func ExtendCluster(l *logger.Logger, c *Cluster, extension time.Duration) error {
 	// Round new lifetime to nearest second.
 	newLifetime := (c.Lifetime + extension).Round(time.Second)
 	return vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
-		return p.Extend(vms, newLifetime)
+		return p.Extend(l, vms, newLifetime)
 	})
 }

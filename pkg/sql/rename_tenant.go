@@ -33,7 +33,7 @@ func (p *planner) alterRenameTenant(
 		return nil, err
 	}
 
-	e := n.NewName
+	e := n.NewName.Expr
 	// If the expression is a simple identifier, handle
 	// that specially: we promote that identifier to a SQL string.
 	// This is alike what is done for CREATE USER.
@@ -41,12 +41,12 @@ func (p *planner) alterRenameTenant(
 		e = tree.NewStrVal(tree.AsStringWithFlags(s, tree.FmtBareIdentifiers))
 	}
 	tname, err := p.analyzeExpr(
-		ctx, e, nil, tree.IndexedVarHelper{}, types.String, true, "ALTER TENANT RENAME")
+		ctx, e, nil, tree.IndexedVarHelper{}, types.String, true, "ALTER VIRTUAL CLUSTER RENAME")
 	if err != nil {
 		return nil, err
 	}
 
-	tspec, err := p.planTenantSpec(ctx, n.TenantSpec, "ALTER TENANT RENAME")
+	tspec, err := p.planTenantSpec(ctx, n.TenantSpec, "ALTER VIRTUAL CLUSTER RENAME")
 	if err != nil {
 		return nil, err
 	}

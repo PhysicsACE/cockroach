@@ -19,13 +19,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -104,7 +103,7 @@ func (zc *debugZipContext) collectCPUProfiles(
 			}
 
 			var pd profData
-			err := contextutil.RunWithTimeout(ctx, "fetch cpu profile", zc.timeout+zipCtx.cpuProfDuration, func(ctx context.Context) error {
+			err := timeutil.RunWithTimeout(ctx, "fetch cpu profile", zc.timeout+zipCtx.cpuProfDuration, func(ctx context.Context) error {
 				resp, err := zc.status.Profile(ctx, &serverpb.ProfileRequest{
 					NodeId:  fmt.Sprintf("%d", nodeID),
 					Type:    serverpb.ProfileRequest_CPU,
@@ -133,7 +132,7 @@ func (zc *debugZipContext) collectCPUProfiles(
 			continue // skipped node
 		}
 		nodeID := nodeList[i].NodeID
-		prefix := fmt.Sprintf("%s/%s/%s", zc.prefix, nodesPrefix, fmt.Sprintf("%d", nodeID))
+		prefix := fmt.Sprintf("%s%s/%s", zc.prefix, nodesPrefix, fmt.Sprintf("%d", nodeID))
 		s := zc.clusterPrinter.start("profile for node %d", nodeID)
 		if err := zc.z.createRawOrError(s, prefix+"/cpu.pprof", pd.data, pd.err); err != nil {
 			return err
@@ -221,30 +220,26 @@ func (zc *debugZipContext) collectPerNodeData(
 		}
 	}
 
-	var stacksData []byte
-	s := nodePrinter.start("requesting stacks")
-	requestErr := zc.runZipFn(ctx, s,
-		func(ctx context.Context) error {
-			stacks, err := zc.status.Stacks(ctx, &serverpb.StacksRequest{
-				NodeId: id,
-				Type:   serverpb.StacksType_GOROUTINE_STACKS,
+	if zipCtx.includeStacks {
+		var stacksData []byte
+		s := nodePrinter.start("requesting stacks")
+		requestErr := zc.runZipFn(ctx, s,
+			func(ctx context.Context) error {
+				stacks, err := zc.status.Stacks(ctx, &serverpb.StacksRequest{
+					NodeId: id,
+					Type:   serverpb.StacksType_GOROUTINE_STACKS,
+				})
+				if err == nil {
+					stacksData = stacks.Data
+				}
+				return err
 			})
-			if err == nil {
-				stacksData = stacks.Data
-			}
+		if err := zc.z.createRawOrError(s, prefix+"/stacks.txt", stacksData, requestErr); err != nil {
 			return err
-		})
-	if err := zc.z.createRawOrError(s, prefix+"/stacks.txt", stacksData, requestErr); err != nil {
-		return err
-	}
+		}
 
-	var stacksDataWithLabels []byte
-	s = nodePrinter.start("requesting stacks with labels")
-	// This condition is added to workaround https://github.com/cockroachdb/cockroach/issues/74133.
-	// Please make the call to retrieve stacks unconditional after the issue is fixed.
-	if util.RaceEnabled {
-		stacksDataWithLabels = []byte("disabled in race mode, see 74133")
-	} else {
+		var stacksDataWithLabels []byte
+		s = nodePrinter.start("requesting stacks with labels")
 		requestErr = zc.runZipFn(ctx, s,
 			func(ctx context.Context) error {
 				stacks, err := zc.status.Stacks(ctx, &serverpb.StacksRequest{
@@ -256,14 +251,16 @@ func (zc *debugZipContext) collectPerNodeData(
 				}
 				return err
 			})
-	}
-	if err := zc.z.createRawOrError(s, prefix+"/stacks_with_labels.txt", stacksDataWithLabels, requestErr); err != nil {
-		return err
+		if err := zc.z.createRawOrError(s, prefix+"/stacks_with_labels.txt", stacksDataWithLabels, requestErr); err != nil {
+			return err
+		}
+	} else {
+		nodePrinter.info("Skipping fetching goroutine stacks. Enable via the --" + cliflags.ZipIncludeGoroutineStacks.Name + " flag.")
 	}
 
 	var heapData []byte
-	s = nodePrinter.start("requesting heap profile")
-	requestErr = zc.runZipFn(ctx, s,
+	s := nodePrinter.start("requesting heap profile")
+	requestErr := zc.runZipFn(ctx, s,
 		func(ctx context.Context) error {
 			heap, err := zc.status.Profile(ctx, &serverpb.ProfileRequest{
 				NodeId: id,
@@ -524,27 +521,26 @@ func (zc *debugZipContext) collectPerNodeData(
 		}
 	}
 
-	var ranges *serverpb.RangesResponse
-	s = nodePrinter.start("requesting ranges")
-	if requestErr := zc.runZipFn(ctx, s, func(ctx context.Context) error {
-		var err error
-		ranges, err = zc.status.Ranges(ctx, &serverpb.RangesRequest{NodeId: id})
-		return err
-	}); requestErr != nil {
-		if err := zc.z.createError(s, prefix+"/ranges", requestErr); err != nil {
+	if zipCtx.includeRangeInfo {
+		var ranges *serverpb.RangesResponse
+		s = nodePrinter.start("requesting ranges")
+		if requestErr := zc.runZipFn(ctx, s, func(ctx context.Context) error {
+			var err error
+			ranges, err = zc.status.Ranges(ctx, &serverpb.RangesRequest{NodeId: id})
 			return err
-		}
-	} else {
-		s.done()
-		nodePrinter.info("%d ranges found", len(ranges.Ranges))
-		sort.Slice(ranges.Ranges, func(i, j int) bool {
-			return ranges.Ranges[i].State.Desc.RangeID <
-				ranges.Ranges[j].State.Desc.RangeID
-		})
-		for _, r := range ranges.Ranges {
-			s := nodePrinter.start("writing range %d", r.State.Desc.RangeID)
-			name := fmt.Sprintf("%s/ranges/%s", prefix, r.State.Desc.RangeID)
-			if err := zc.z.createJSON(s, name+".json", r); err != nil {
+		}); requestErr != nil {
+			if err := zc.z.createError(s, prefix+"/ranges", requestErr); err != nil {
+				return err
+			}
+		} else {
+			s.done()
+			sort.Slice(ranges.Ranges, func(i, j int) bool {
+				return ranges.Ranges[i].State.Desc.RangeID <
+					ranges.Ranges[j].State.Desc.RangeID
+			})
+			s := nodePrinter.start("writing ranges")
+			name := fmt.Sprintf("%s/ranges.json", prefix)
+			if err := zc.z.createJSON(s, name, ranges.Ranges); err != nil {
 				return err
 			}
 		}

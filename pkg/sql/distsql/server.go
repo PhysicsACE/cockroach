@@ -85,9 +85,12 @@ func NewServer(
 		memMonitor: mon.NewMonitor(
 			"distsql",
 			mon.MemoryResource,
-			cfg.Metrics.CurBytesCount,
-			cfg.Metrics.MaxBytesHist,
-			-1, /* increment: use default block size */
+			// Note that we don't use 'sql.mem.distsql.*' metrics here since
+			// that would double count them with the 'flow' monitor in
+			// setupFlow.
+			nil, /* curCount */
+			nil, /* maxHist */
+			-1,  /* increment: use default block size */
 			noteworthyMemoryUsageBytes,
 			cfg.Settings,
 		),
@@ -389,7 +392,8 @@ func (ds *ServerImpl) setupFlow(
 	isVectorized := req.EvalContext.SessionData.VectorizeMode != sessiondatapb.VectorizeOff
 	f := newFlow(
 		flowCtx, sp, ds.flowRegistry, rowSyncFlowConsumer, batchSyncFlowConsumer,
-		localState.LocalProcs, isVectorized, onFlowCleanupEnd, req.StatementSQL,
+		localState.LocalProcs, localState.LocalVectorSources, isVectorized,
+		onFlowCleanupEnd, req.StatementSQL,
 	)
 	opt := flowinfra.FuseNormally
 	if !localState.MustUseLeafTxn() {
@@ -495,9 +499,9 @@ func (ds *ServerImpl) newFlowContext(
 	}
 
 	if localState.IsLocal && localState.Collection != nil {
-		// If we were passed a descs.Collection to use, then take it. In this case,
-		// the caller will handle releasing the used descriptors, so we don't need
-		// to cleanup the descriptors when cleaning up the flow.
+		// If we were passed a descs.Collection to use, then take it. In this
+		// case, the caller will handle releasing the used descriptors, so we
+		// don't need to clean up the descriptors when cleaning up the flow.
 		flowCtx.Descriptors = localState.Collection
 	} else {
 		// If we weren't passed a descs.Collection, then make a new one. We are
@@ -521,11 +525,12 @@ func newFlow(
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localProcessors []execinfra.LocalProcessor,
+	localVectorSources map[int32]any,
 	isVectorized bool,
 	onFlowCleanupEnd func(),
 	statementSQL string,
 ) flowinfra.Flow {
-	base := flowinfra.NewFlowBase(flowCtx, sp, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, onFlowCleanupEnd, statementSQL)
+	base := flowinfra.NewFlowBase(flowCtx, sp, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, localVectorSources, onFlowCleanupEnd, statementSQL)
 	if isVectorized {
 		return colflow.NewVectorizedFlow(base)
 	}
@@ -562,6 +567,11 @@ type LocalState struct {
 	// LocalProcs is an array of planNodeToRowSource processors. It's in order and
 	// will be indexed into by the RowSourceIdx field in LocalPlanNodeSpec.
 	LocalProcs []execinfra.LocalProcessor
+
+	// LocalVectorSources is a map of local vector sources for Insert operator
+	// mapping to coldata.Batch, use any to avoid injecting new
+	// dependencies.
+	LocalVectorSources map[int32]any
 }
 
 // MustUseLeafTxn returns true if a LeafTxn must be used. It is valid to call
@@ -703,11 +713,13 @@ func (ds *ServerImpl) flowStreamInt(
 		if err == io.EOF {
 			return errors.AssertionFailedf("missing header message")
 		}
+		log.VEventf(ctx, 2, "FlowStream (server) error while receiving header: %v", err)
 		return err
 	}
 	if msg.Header == nil {
 		return errors.AssertionFailedf("no header in first message")
 	}
+	log.VEvent(ctx, 2, "FlowStream (server) received header")
 	flowID := msg.Header.FlowID
 	streamID := msg.Header.StreamID
 	if log.V(1) {

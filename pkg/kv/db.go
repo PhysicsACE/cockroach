@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
@@ -263,8 +264,12 @@ type DB struct {
 	// SQLKVResponseAdmissionQ is for use by SQL clients of the DB, and is
 	// placed here simply for plumbing convenience, as there is a diversity of
 	// SQL code that all uses kv.DB.
-	// TODO(sumeer): find a home for this in the SQL layer.
+	//
+	// TODO(sumeer,irfansharif): Find a home for these in the SQL layer.
+	// Especially SettingsValue.
 	SQLKVResponseAdmissionQ *admission.WorkQueue
+	AdmissionPacerFactory   admission.PacerFactory
+	SettingsValues          *settings.Values
 }
 
 // NonTransactionalSender returns a Sender that can be used for sending
@@ -285,6 +290,16 @@ func (db *DB) GetFactory() TxnSenderFactory {
 // Clock returns the DB's hlc.Clock.
 func (db *DB) Clock() *hlc.Clock {
 	return db.clock
+}
+
+// Context returns the DB's DBContext.
+func (db *DB) Context() DBContext {
+	return db.ctx
+}
+
+// NewBatch creates a new empty batch.
+func (db *DB) NewBatch() *Batch {
+	return &Batch{}
 }
 
 // NewDB returns a new DB.
@@ -338,6 +353,20 @@ func (db *DB) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 func (db *DB) GetForUpdate(ctx context.Context, key interface{}) (KeyValue, error) {
 	b := &Batch{}
 	b.GetForUpdate(key)
+	return getOneRow(db.Run(ctx, b), b)
+}
+
+// GetForShare retrieves the value for a key, returning the retrieved key/value
+// or an error. An unreplicated, shared lock is acquired on the key, if it
+// exists. It is not considered an error for the key not to exist.
+//
+//	r, err := db.GetForShare("a")
+//	// string(r.Key) == "a"
+//
+// key can be either a byte slice or a string.
+func (db *DB) GetForShare(ctx context.Context, key interface{}) (KeyValue, error) {
+	b := &Batch{}
+	b.GetForShare(key)
 	return getOneRow(db.Run(ctx, b), b)
 }
 
@@ -463,7 +492,7 @@ func (db *DB) scan(
 	begin, end interface{},
 	maxRows int64,
 	isReverse bool,
-	forUpdate bool,
+	str kvpb.KeyLockingStrengthType,
 	readConsistency kvpb.ReadConsistencyType,
 ) ([]KeyValue, error) {
 	b := &Batch{}
@@ -471,7 +500,7 @@ func (db *DB) scan(
 	if maxRows > 0 {
 		b.Header.MaxSpanRequestKeys = maxRows
 	}
-	b.scan(begin, end, isReverse, forUpdate)
+	b.scan(begin, end, isReverse, str)
 	r, err := getOneResult(db.Run(ctx, b), b)
 	return r.Rows, err
 }
@@ -483,7 +512,7 @@ func (db *DB) scan(
 //
 // key can be either a byte slice or a string.
 func (db *DB) Scan(ctx context.Context, begin, end interface{}, maxRows int64) ([]KeyValue, error) {
-	return db.scan(ctx, begin, end, maxRows, false /* isReverse */, false /* forUpdate */, kvpb.CONSISTENT)
+	return db.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.NonLocking, kvpb.CONSISTENT)
 }
 
 // ScanForUpdate retrieves the rows between begin (inclusive) and end
@@ -496,7 +525,20 @@ func (db *DB) Scan(ctx context.Context, begin, end interface{}, maxRows int64) (
 func (db *DB) ScanForUpdate(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return db.scan(ctx, begin, end, maxRows, false /* isReverse */, true /* forUpdate */, kvpb.CONSISTENT)
+	return db.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForUpdate, kvpb.CONSISTENT)
+}
+
+// ScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in ascending order. Unreplicated, shared locks are
+// acquired on each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements.
+//
+// key can be either a byte slice or a string.
+func (db *DB) ScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64,
+) ([]KeyValue, error) {
+	return db.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForShare, kvpb.CONSISTENT)
 }
 
 // ReverseScan retrieves the rows between begin (inclusive) and end (exclusive)
@@ -508,7 +550,7 @@ func (db *DB) ScanForUpdate(
 func (db *DB) ReverseScan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return db.scan(ctx, begin, end, maxRows, true /* isReverse */, false /* forUpdate */, kvpb.CONSISTENT)
+	return db.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.NonLocking, kvpb.CONSISTENT)
 }
 
 // ReverseScanForUpdate retrieves the rows between begin (inclusive) and end
@@ -521,7 +563,20 @@ func (db *DB) ReverseScan(
 func (db *DB) ReverseScanForUpdate(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return db.scan(ctx, begin, end, maxRows, true /* isReverse */, true /* forUpdate */, kvpb.CONSISTENT)
+	return db.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForUpdate, kvpb.CONSISTENT)
+}
+
+// ReverseScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in descending order. Unreplicated, shared locks are acquired
+// on each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements.
+//
+// key can be either a byte slice or a string.
+func (db *DB) ReverseScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64,
+) ([]KeyValue, error) {
+	return db.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForShare, kvpb.CONSISTENT)
 }
 
 // Del deletes one or more keys.
@@ -702,6 +757,8 @@ func (db *DB) AdminRelocateRange(
 	return getOneErr(db.Run(ctx, b), b)
 }
 
+var noRemoteFile kvpb.AddSSTableRequest_RemoteFile
+
 // AddSSTable links a file into the Pebble log-structured merge-tree.
 //
 // The disallowConflicts, disallowShadowingBelow parameters
@@ -718,8 +775,27 @@ func (db *DB) AddSSTable(
 	batchTs hlc.Timestamp,
 ) (roachpb.Span, int64, error) {
 	b := &Batch{Header: kvpb.Header{Timestamp: batchTs}}
-	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowing, disallowShadowingBelow,
+	b.addSSTable(begin, end, data, noRemoteFile, disallowConflicts, disallowShadowing, disallowShadowingBelow,
 		stats, ingestAsWrites, hlc.Timestamp{} /* sstTimestampToRequestTimestamp */)
+	err := getOneErr(db.Run(ctx, b), b)
+	if err != nil {
+		return roachpb.Span{}, 0, err
+	}
+	if l := len(b.response.Responses); l != 1 {
+		return roachpb.Span{}, 0, errors.AssertionFailedf("expected single response, got %d", l)
+	}
+	resp := b.response.Responses[0].GetAddSstable()
+	return resp.RangeSpan, resp.AvailableBytes, nil
+}
+
+func (db *DB) AddRemoteSSTable(
+	ctx context.Context,
+	span roachpb.Span,
+	file kvpb.AddSSTableRequest_RemoteFile,
+	stats *enginepb.MVCCStats,
+) (roachpb.Span, int64, error) {
+	b := &Batch{}
+	b.addSSTable(span.Key, span.EndKey, nil, file, false, false, hlc.Timestamp{}, stats, false, hlc.Timestamp{})
 	err := getOneErr(db.Run(ctx, b), b)
 	if err != nil {
 		return roachpb.Span{}, 0, err
@@ -749,7 +825,8 @@ func (db *DB) AddSSTableAtBatchTimestamp(
 	batchTs hlc.Timestamp,
 ) (hlc.Timestamp, roachpb.Span, int64, error) {
 	b := &Batch{Header: kvpb.Header{Timestamp: batchTs}}
-	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowing, disallowShadowingBelow,
+	b.addSSTable(begin, end, data, noRemoteFile,
+		disallowConflicts, disallowShadowing, disallowShadowingBelow,
 		stats, ingestAsWrites, batchTs)
 	err := getOneErr(db.Run(ctx, b), b)
 	if err != nil {
@@ -894,10 +971,10 @@ func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
 // callback may return either nil or the retryable error. Txn is responsible for
 // resetting the transaction and retrying the callback.
 //
-// TODO(irfansharif): Audit uses of this since API since it bypasses AC. Make
-// the other variant (TxnWithAdmissionControl) the default, or maybe rename this
-// to be more explicit (TxnWithoutAdmissionControl) so new callers have to be
-// conscious about what they want.
+// TODO(irfansharif): Audit uses of this since API since it bypasses AC for the
+// system tenant. Make the other variant (TxnWithAdmissionControl) the default,
+// or maybe rename this to be more explicit (TxnWithoutAdmissionControl) so new
+// callers have to be conscious about what they want.
 func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) error) error {
 	return db.TxnWithAdmissionControl(
 		ctx, kvpb.AdmissionHeader_OTHER, admissionpb.NormalPri,
@@ -961,9 +1038,7 @@ func (db *DB) TxnRootKV(ctx context.Context, retryable func(context.Context, *Tx
 
 // runTxn runs the given retryable transaction function using the given *Txn.
 func runTxn(ctx context.Context, txn *Txn, retryable func(context.Context, *Txn) error) error {
-	err := txn.exec(ctx, func(ctx context.Context, txn *Txn) error {
-		return retryable(ctx, txn)
-	})
+	err := txn.exec(ctx, retryable)
 	if err != nil {
 		if rollbackErr := txn.Rollback(ctx); rollbackErr != nil {
 			log.Eventf(ctx, "failure aborting transaction: %s; abort caused by: %s", rollbackErr, err)

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/crypto/bcrypt"
@@ -44,12 +45,12 @@ var BcryptCost = settings.RegisterIntSetting(
 	// It incurs a password check latency of ~60ms on AMD 3950X 3.7GHz.
 	// For reference, value 11 incurs ~110ms latency on the same hw, value 12 incurs ~390ms.
 	password.DefaultBcryptCost,
-	func(i int64) error {
+	settings.WithValidateInt(func(i int64) error {
 		if i < int64(bcrypt.MinCost) || i > int64(bcrypt.MaxCost) {
 			return bcrypt.InvalidCostError(int(i))
 		}
 		return nil
-	}).WithPublic()
+	}), settings.WithPublic)
 
 // BcryptCostSettingName is the name of the cluster setting BcryptCost.
 const BcryptCostSettingName = "server.user_login.password_hashes.default_cost.crdb_bcrypt"
@@ -72,12 +73,8 @@ var SCRAMCost = settings.RegisterIntSetting(
 	// For further discussion, see the explanation on bcryptCostToSCRAMIterCount
 	// below.
 	password.DefaultSCRAMCost,
-	func(i int64) error {
-		if i < password.ScramMinCost || i > password.ScramMaxCost {
-			return errors.Newf("cost not in allowed range (%d,%d)", password.ScramMinCost, password.ScramMaxCost)
-		}
-		return nil
-	}).WithPublic()
+	settings.IntInRange(password.ScramMinCost, password.ScramMaxCost),
+	settings.WithPublic)
 
 // SCRAMCostSettingName is the name of the cluster setting SCRAMCost.
 const SCRAMCostSettingName = "server.user_login.password_hashes.default_cost.scram_sha_256"
@@ -111,7 +108,7 @@ var PasswordHashMethod = settings.RegisterEnumSetting(
 		int64(password.HashBCrypt):      password.HashBCrypt.String(),
 		int64(password.HashSCRAMSHA256): password.HashSCRAMSHA256.String(),
 	},
-).WithPublic()
+	settings.WithPublic)
 
 // GetConfiguredPasswordCost returns the configured hashing cost
 // for the given method.
@@ -154,7 +151,7 @@ var MinPasswordLength = settings.RegisterIntSetting(
 		"Note that a value lower than 1 is ignored: passwords cannot be empty in any case.",
 	1,
 	settings.NonNegativeInt,
-).WithPublic()
+	settings.WithPublic)
 
 // AutoUpgradePasswordHashes is the cluster setting that configures whether to
 // automatically re-encode stored passwords using crdb-bcrypt to scram-sha-256.
@@ -164,7 +161,7 @@ var AutoUpgradePasswordHashes = settings.RegisterBoolSetting(
 	"if server.user_login.password_encryption=scram-sha-256, this controls "+
 		"whether to automatically re-encode stored passwords using crdb-bcrypt to scram-sha-256",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // AutoDowngradePasswordHashes is the cluster setting that configures whether to
 // automatically re-encode stored passwords using scram-sha-256 to crdb-bcrypt.
@@ -174,7 +171,7 @@ var AutoDowngradePasswordHashes = settings.RegisterBoolSetting(
 	"if server.user_login.password_encryption=crdb-bcrypt, this controls "+
 		"whether to automatically re-encode stored passwords using scram-sha-256 to crdb-bcrypt",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // AutoRehashOnSCRAMCostChange is the cluster setting that configures whether to
 // automatically re-encode stored passwords using scram-sha-256 to use a new
@@ -186,7 +183,7 @@ var AutoRehashOnSCRAMCostChange = settings.RegisterBoolSetting(
 		"the cost in a stored hash, this controls whether to automatically re-encode "+
 		"stored passwords using scram-sha-256 with the new default cost",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // expensiveHashComputeSemOnce wraps a semaphore that limits the
 // number of concurrent calls to the bcrypt and sha256 hash
@@ -209,8 +206,7 @@ var expensiveHashComputeSemOnce struct {
 // Otherwise, a default is computed from the configure GOMAXPROCS.
 var envMaxHashComputeConcurrency = envutil.EnvOrDefaultInt("COCKROACH_MAX_PW_HASH_COMPUTE_CONCURRENCY", 0)
 
-// GetExpensiveHashComputeSem retrieves the hashing semaphore.
-func GetExpensiveHashComputeSem(ctx context.Context) password.HashSemaphore {
+func maybeInitializeSem(ctx context.Context) {
 	expensiveHashComputeSemOnce.once.Do(func() {
 		var n int
 		if envMaxHashComputeConcurrency >= 1 {
@@ -228,7 +224,25 @@ func GetExpensiveHashComputeSem(ctx context.Context) password.HashSemaphore {
 		log.VInfof(ctx, 1, "configured maximum hashing concurrency: %d", n)
 		expensiveHashComputeSemOnce.sem = quotapool.NewIntPool("password_hashes", uint64(n))
 	})
-	return func(ctx context.Context) (func(), error) {
+}
+
+// GetExpensiveHashComputeSem retrieves the hashing semaphore.
+func GetExpensiveHashComputeSem(ctx context.Context) password.HashSemaphore {
+	return GetExpensiveHashComputeSemWithGauge(ctx, nil /* gauge */)
+}
+
+// GetExpensiveHashComputeSemWithGauge retrieves the hashing semaphore and
+// will make the callback update a gauge to track the number of goroutines
+// waiting for the semaphore.
+func GetExpensiveHashComputeSemWithGauge(
+	ctx context.Context, gauge *metric.Gauge,
+) password.HashSemaphore {
+	maybeInitializeSem(ctx)
+	return func(ctx context.Context) (cleanup func(), retErr error) {
+		if gauge != nil {
+			gauge.Inc(1)
+			defer gauge.Dec(1)
+		}
 		alloc, err := expensiveHashComputeSemOnce.sem.Acquire(ctx, 1)
 		if err != nil {
 			return nil, err

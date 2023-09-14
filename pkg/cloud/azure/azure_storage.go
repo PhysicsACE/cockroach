@@ -32,8 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"go.opentelemetry.io/otel/attribute"
@@ -45,7 +45,7 @@ var maxConcurrentUploadBuffers = settings.RegisterIntSetting(
 	"controls the number of concurrent buffers that will be used by the Azure client when uploading chunks."+
 		"Each buffer can buffer up to cloudstorage.write_chunk.size of memory during an upload",
 	1,
-).WithPublic()
+	settings.WithPublic)
 
 // A note on Azure authentication:
 //
@@ -250,12 +250,20 @@ func makeAzureStorage(
 	case cloudpb.AzureAuth_IMPLICIT:
 		if args.IOConf.DisableImplicitCredentials {
 			return nil, errors.New(
-				"implicit credentials disallowed for azure due to --external-io-implicit-credentials flag")
+				"implicit credentials disallowed for azure due to --external-io-disable-implicit-credentials flag")
 		}
-		// The Default credential supports env vars and managed identity magic.
-		// We rely on the former for testing and the latter in prod.
-		// https://learn.microsoft.com/en-us/dotnet/api/azure.identity.defaultazurecredential
-		credential, err := azidentity.NewDefaultAzureCredential(nil)
+
+		options := cloud.ExternalStorageOptions{}
+		for _, o := range args.Options {
+			o(&options)
+		}
+
+		defaultCredentialsOptions := &DefaultAzureCredentialWithFileOptions{}
+		if knobs := options.AzureStorageTestingKnobs; knobs != nil {
+			defaultCredentialsOptions.testingKnobs = knobs.(*TestingKnobs)
+		}
+
+		credential, err := NewDefaultAzureCredentialWithFile(defaultCredentialsOptions)
 		if err != nil {
 			return nil, errors.Wrap(err, "azure default credential")
 		}
@@ -313,20 +321,14 @@ func (s *azureStorage) Writer(ctx context.Context, basename string) (io.WriteClo
 	}), nil
 }
 
-// ReadFile is shorthand for ReadFileAt with offset 0.
-func (s *azureStorage) ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error) {
-	reader, _, err := s.ReadFileAt(ctx, basename, 0)
-	return reader, err
-}
-
-func (s *azureStorage) ReadFileAt(
-	ctx context.Context, basename string, offset int64,
-) (ioctx.ReadCloserCtx, int64, error) {
-	ctx, sp := tracing.ChildSpan(ctx, "azure.ReadFileAt")
+func (s *azureStorage) ReadFile(
+	ctx context.Context, basename string, opts cloud.ReadOptions,
+) (_ ioctx.ReadCloserCtx, fileSize int64, _ error) {
+	ctx, sp := tracing.ChildSpan(ctx, "azure.ReadFile")
 	defer sp.Finish()
 	sp.SetTag("path", attribute.StringValue(path.Join(s.prefix, basename)))
 	resp, err := s.getBlob(basename).DownloadStream(ctx, &azblob.DownloadStreamOptions{Range: azblob.
-		HTTPRange{Offset: offset}})
+		HTTPRange{Offset: opts.Offset}})
 	if err != nil {
 		if azerr := (*azcore.ResponseError)(nil); errors.As(err, &azerr) {
 			if azerr.ErrorCode == "BlobNotFound" {
@@ -341,17 +343,18 @@ func (s *azureStorage) ReadFileAt(
 		return nil, 0, errors.Wrapf(err, "failed to create azure reader")
 	}
 
-	var size int64
-	if offset == 0 {
-		size = *resp.ContentLength
-	} else {
-		size, err = cloud.CheckHTTPContentRangeHeader(*resp.ContentRange, offset)
-		if err != nil {
-			return nil, 0, err
+	if !opts.NoFileSize {
+		if opts.Offset == 0 {
+			fileSize = *resp.ContentLength
+		} else {
+			fileSize, err = cloud.CheckHTTPContentRangeHeader(*resp.ContentRange, opts.Offset)
+			if err != nil {
+				return nil, 0, err
+			}
 		}
 	}
 	reader := resp.NewRetryReader(ctx, &azblob.RetryReaderOptions{MaxRetries: 3})
-	return ioctx.ReadCloserAdapter(reader), size, nil
+	return ioctx.ReadCloserAdapter(reader), fileSize, nil
 }
 
 func (s *azureStorage) List(ctx context.Context, prefix, delim string, fn cloud.ListingFn) error {
@@ -383,7 +386,7 @@ func (s *azureStorage) List(ctx context.Context, prefix, delim string, fn cloud.
 }
 
 func (s *azureStorage) Delete(ctx context.Context, basename string) error {
-	err := contextutil.RunWithTimeout(ctx, "delete azure file", cloud.Timeout.Get(&s.settings.SV),
+	err := timeutil.RunWithTimeout(ctx, "delete azure file", cloud.Timeout.Get(&s.settings.SV),
 		func(ctx context.Context) error {
 			_, err := s.getBlob(basename).Delete(ctx, nil)
 			return err
@@ -393,7 +396,7 @@ func (s *azureStorage) Delete(ctx context.Context, basename string) error {
 
 func (s *azureStorage) Size(ctx context.Context, basename string) (int64, error) {
 	var props blob.GetPropertiesResponse
-	err := contextutil.RunWithTimeout(ctx, "size azure file", cloud.Timeout.Get(&s.settings.SV),
+	err := timeutil.RunWithTimeout(ctx, "size azure file", cloud.Timeout.Get(&s.settings.SV),
 		func(ctx context.Context) error {
 			var err error
 			props, err = s.getBlob(basename).GetProperties(ctx, nil)
@@ -409,6 +412,14 @@ func (s *azureStorage) Size(ctx context.Context, basename string) (int64, error)
 func (s *azureStorage) Close() error {
 	return nil
 }
+
+type TestingKnobs struct {
+	MapFileCredentialToken func(azcore.AccessToken, error) (azcore.AccessToken, error)
+}
+
+func (*TestingKnobs) ModuleTestingKnobs() {}
+
+var _ base.ModuleTestingKnobs = &TestingKnobs{}
 
 func init() {
 	cloud.RegisterExternalStorageProvider(cloudpb.ExternalStorageProvider_azure,

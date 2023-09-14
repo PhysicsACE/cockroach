@@ -815,11 +815,19 @@ func NewPlaceholder(name string) (*Placeholder, error) {
 
 // Format implements the NodeFormatter interface.
 func (node *Placeholder) Format(ctx *FmtCtx) {
-	if ctx.placeholderFormat != nil {
-		ctx.placeholderFormat(ctx, node)
-		return
+	if ctx.HasFlags(FmtHideConstants) {
+		if ctx.placeholderFormat != nil {
+			ctx.placeholderFormat(ctx, node)
+			return
+		}
+		ctx.Printf("$%d", node.Idx+1)
+	} else {
+		if ctx.placeholderFormat != nil {
+			ctx.placeholderFormat(ctx, node)
+			return
+		}
+		ctx.Printf("$%d", node.Idx+1)
 	}
-	ctx.Printf("$%d", node.Idx+1)
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -1351,6 +1359,10 @@ func (node *FuncExpr) IsVectorizeStreaming() bool {
 	return node.fnProps != nil && node.fnProps.VectorizeStreaming
 }
 
+func (node *FuncExpr) SetTypeAnnotation(t *types.T) {
+	node.typ = t
+}
+
 type funcType int
 
 // FuncExpr.Type
@@ -1827,6 +1839,7 @@ func (node *DTimeTZ) String() string          { return AsString(node) }
 func (node *DDecimal) String() string         { return AsString(node) }
 func (node *DFloat) String() string           { return AsString(node) }
 func (node *DBox2D) String() string           { return AsString(node) }
+func (node *DPGLSN) String() string           { return AsString(node) }
 func (node *DGeography) String() string       { return AsString(node) }
 func (node *DGeometry) String() string        { return AsString(node) }
 func (node *DInt) String() string             { return AsString(node) }

@@ -51,7 +51,8 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 
 	asyncNotification := make(chan struct{})
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
+	params.DefaultTestTenant = base.TODOTestTenantDisabled
 	params.Knobs = base.TestingKnobs{
 		GCJob: &sql.GCJobTestingKnobs{
 			RunBeforeResume: func(_ jobspb.JobID) error {
@@ -61,9 +62,11 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 			SkipWaitingForMVCCGC: true,
 		},
 	}
-	s, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
+	srv, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
+
 	sqlDB := sqlutils.MakeSQLRunner(sqlDBRaw)
-	defer s.Stopper().Stop(context.Background())
 
 	// Create a test table with a partitioned secondary index.
 	if err := tests.CreateKVTable(sqlDBRaw, "kv", numRows); err != nil {
@@ -73,7 +76,7 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 		PARTITION p1 VALUES IN (1),
 		PARTITION p2 VALUES IN (2)
 	)`)
-	codec := tenantOrSystemCodec(s)
+	codec := s.Codec()
 	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
 	index, err := catalog.MustFindIndexByName(tableDesc, "i")
 	if err != nil {
@@ -201,8 +204,8 @@ SELECT job_id
 		ctx := context.Background()
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
-				Knobs:                    knobs,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				Knobs:             knobs,
 			},
 		})
 		defer tc.Stopper().Stop(ctx)
@@ -217,7 +220,8 @@ SELECT job_id
 	              PARTITION c VALUES IN ('c')
 	  )`)
 		tdb.Exec(t, `CREATE INDEX idx ON t (e)`)
-		tdb.Exec(t, `ALTER PARTITION a OF TABLE t CONFIGURE ZONE USING range_min_bytes = 123456, range_max_bytes = 654321`)
+		tdb.Exec(t, `ALTER PARTITION a OF TABLE t CONFIGURE ZONE USING range_min_bytes = 123456, 
+range_max_bytes = 654321000`)
 		tdb.Exec(t, `ALTER INDEX t@idx CONFIGURE ZONE USING gc.ttlseconds = 1`)
 		tdb.Exec(t, `DROP INDEX t@idx`)
 
@@ -246,8 +250,8 @@ SELECT job_id
 		ctx := context.Background()
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
-				Knobs:                    knobs,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				Knobs:             knobs,
 			},
 		})
 		defer tc.Stopper().Stop(ctx)
@@ -271,8 +275,10 @@ SELECT job_id
 	              PARTITION ci VALUES IN ('c')
 	          )`,
 		)
-		tdb.Exec(t, `ALTER PARTITION ai OF INDEX t@idx CONFIGURE ZONE USING range_min_bytes = 123456,range_max_bytes = 654321`)
-		tdb.Exec(t, `ALTER PARTITION a OF TABLE t CONFIGURE ZONE USING range_min_bytes = 123456, range_max_bytes = 654321`)
+		tdb.Exec(t, `ALTER PARTITION ai OF INDEX t@idx CONFIGURE ZONE USING range_min_bytes = 123456,
+range_max_bytes = 654321000`)
+		tdb.Exec(t, `ALTER PARTITION a OF TABLE t CONFIGURE ZONE USING range_min_bytes = 123456, 
+range_max_bytes = 654321000`)
 		tdb.Exec(t, `ALTER INDEX t@idx CONFIGURE ZONE USING gc.ttlseconds = 1`)
 		tdb.Exec(t, `DROP INDEX t@idx`)
 		tdb.Exec(t, `DROP TABLE t`)

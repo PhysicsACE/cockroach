@@ -172,6 +172,7 @@ import ({{ if .SqliteLogicTest }}
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"{{ if .Ccl }}
 	"github.com/cockroachdb/cockroach/pkg/ccl"{{ end }}
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
@@ -214,6 +215,11 @@ func TestMain(m *testing.M) {
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
+
+	defer serverutils.TestingSetDefaultTenantSelectionOverride(
+		base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(76378),
+	)()
+
 	os.Exit(m.Run())
 }
 
@@ -249,15 +255,17 @@ func TestLogic_tmp(t *testing.T) {
 // There is probably room for optimization here. Among other things:
 // some tests may declare a testdata dependency they don't actually need, and
 // the sizes for some of these tests can probably be smaller than "enormous".
-const buildFileTemplate = `load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
-load("@io_bazel_rules_go//go:def.bzl", "go_test")
+const buildFileTemplate = `load("@io_bazel_rules_go//go:def.bzl", "go_test")
 
 go_test(
     name = "{{ .TestRuleName }}_test",
     size = "enormous",
     srcs = ["generated_test.go"],{{ if .SqliteLogicTest }}
     args = ["-test.timeout=7195s"],{{ else }}
-    args = ["-test.timeout=3595s"],{{ end }}
+    args = select({
+        "//build/toolchains:use_ci_timeouts": ["-test.timeout=895s"],
+        "//conditions:default": ["-test.timeout=3595s"],
+    }),{{ end }}
     data = [
         "//c-deps:libgeos",  # keep{{ if .SqliteLogicTest }}
         "@com_github_cockroachdb_sqllogictest//:testfiles",  # keep{{ end }}{{ if .CockroachGoTestserverTest }}
@@ -266,9 +274,18 @@ go_test(
         "//pkg/sql/logictest:testdata",  # keep{{ end }}{{ if .ExecBuildLogicTest }}
         "//pkg/sql/opt/exec/execbuilder:testdata",  # keep{{ end }}
     ],
-    shard_count = {{ if gt .TestCount 16 }}16{{ else }}{{ .TestCount }}{{end}},
-    tags = ["cpu:{{ if gt .NumCPU 4 }}4{{ else }}{{ .NumCPU }}{{ end }}"],
+    exec_properties = {{ if eq .TestRuleName "cockroach-go-testserver-upgrade-to-master" }}{
+        "dockerNetwork": "standard",
+        {{ else }}{
+        {{ end }}"Pool": "large",
+    },
+    shard_count = {{ if gt .TestCount 48 }}48{{ else }}{{ .TestCount }}{{end}},
+    tags = [{{ if .Ccl }}
+        "ccl_test",{{ end }}
+        "cpu:{{ if gt .NumCPU 4 }}4{{ else }}{{ .NumCPU }}{{ end }}",
+    ],
     deps = [
+        "//pkg/base",
         "//pkg/build/bazel",{{ if .Ccl }}
         "//pkg/ccl",{{ end }}
         "//pkg/security/securityassets",
@@ -284,8 +301,6 @@ go_test(
         "//pkg/util/randutil",
     ],
 )
-
-get_x_data(name = "get_x_data")
 `
 
 var (

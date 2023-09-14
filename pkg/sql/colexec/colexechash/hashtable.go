@@ -70,7 +70,7 @@ const (
 //	keyID = i + 1.
 //
 // keyID of 0 is reserved to indicate the end of the hash chain.
-type keyID = uint64
+type keyID = uint32
 
 // hashChains describes the partitioning of a set of tuples into singly-linked
 // lists ("buckets") where all tuples in a list have the same hash.
@@ -123,7 +123,7 @@ type hashTableProbeBuffer struct {
 
 	///////////////////////////////////////////////////////////////
 	// Slices below are allocated dynamically but are limited by //
-	// coldata.BatchSize() in size.                              //
+	// HashTable.maxProbingBatchLength in size.                  //
 	///////////////////////////////////////////////////////////////
 
 	// ToCheck stores the indices of tuples from the probing batch for which we
@@ -136,13 +136,13 @@ type hashTableProbeBuffer struct {
 	// chains are empty) while tuples with ordinals 1 and 2 have hash
 	// collisions against the current "candidates", then ToCheck will be updated
 	// to [1, 2].
-	ToCheck []uint64
+	ToCheck []uint32
 
 	// ToCheckID stores the keyIDs of the current "candidate" matches for the
 	// tuples from the probing batch. Concretely, ToCheckID[i] is the keyID of
 	// the tuple in the hash table which we are currently comparing with the ith
 	// tuple of the probing batch. i is included in ToCheck. The result of the
-	// comparison is stored in 'differs' and/or 'distinct'.
+	// comparison is stored in 'differs' and/or 'foundNull'.
 	//
 	// On the first iteration:
 	//   ToCheckID[i] = First[hash[i]]
@@ -151,17 +151,17 @@ type hashTableProbeBuffer struct {
 	// calculated as
 	//   ToCheckID[i] = Next[ToCheckID[i]].
 	// Whenever ToCheckID[i] becomes 0, there are no more matches for the ith
-	// probing tuple.
+	// probing tuple, and the ith tuple is no longer included into ToCheck.
 	ToCheckID []keyID
 
 	// differs stores whether the probing tuple included in ToCheck differs
 	// from the corresponding "candidate" tuple specified in ToCheckID.
 	differs []bool
 
-	// distinct stores whether the probing tuple is distinct (i.e. it will
-	// differ from all possible "candidates"). Used only for the hash aggregator
-	// and the unordered distinct.
-	distinct []bool
+	// foundNull stores whether the probing tuple contains a NULL value in the
+	// key. Populated when allowNullEquality=false since a single NULL makes the
+	// key distinct from all other possible "candidates".
+	foundNull []bool
 
 	// HeadID stores the keyID of the tuple that has an equality match with the
 	// tuple at any given index from the probing batch. Unlike First where we
@@ -196,7 +196,7 @@ type hashTableProbeBuffer struct {
 
 	// HashBuffer stores the hash values of each tuple in the probing batch. It
 	// will be dynamically updated when the HashTable is built in distinct mode.
-	HashBuffer []uint64
+	HashBuffer []uint32
 }
 
 // HashTable is a structure used by the hash joiner, the hash aggregator, and
@@ -218,11 +218,12 @@ type hashTableProbeBuffer struct {
 // find possible matches for each tuple. For more details see the comments on
 // hashAggregator.onlineAgg and DistinctBuild.
 type HashTable struct {
-	allocator *colmem.Allocator
+	allocator             *colmem.Allocator
+	maxProbingBatchLength int
 
-	// unlimitedSlicesNumUint64AccountedFor stores the number of uint64 from
+	// unlimitedSlicesNumUint32AccountedFor stores the number of uint32 from
 	// the unlimited slices that we have already accounted for.
-	unlimitedSlicesNumUint64AccountedFor int64
+	unlimitedSlicesNumUint32AccountedFor int64
 
 	// BuildScratch contains the hash chains among tuples of the hash table
 	// (those stored in Vals).
@@ -262,7 +263,7 @@ type HashTable struct {
 	// numBuckets returns the number of buckets the HashTable employs at the
 	// moment. This number increases as more tuples are added into the hash
 	// table.
-	numBuckets uint64
+	numBuckets uint32
 	// loadFactor determines the average number of tuples per bucket exceeding
 	// of which will trigger resizing the hash table.
 	loadFactor float64
@@ -284,6 +285,8 @@ var _ colexecop.Resetter = &HashTable{}
 //
 // - allocator must be the allocator that is owned by the hash table and not
 // shared with any other components.
+//
+// - maxProbingBatchLength indicates the maximum size of the probing batch.
 //
 // - loadFactor determines the average number of tuples per bucket which, if
 // exceeded, will trigger resizing the hash table. This number can have a
@@ -309,8 +312,9 @@ var _ colexecop.Resetter = &HashTable{}
 func NewHashTable(
 	ctx context.Context,
 	allocator *colmem.Allocator,
+	maxProbingBatchLength int,
 	loadFactor float64,
-	initialNumHashBuckets uint64,
+	initialNumHashBuckets uint32,
 	sourceTypes []*types.T,
 	keyCols []uint32,
 	allowNullEquality bool,
@@ -350,7 +354,8 @@ func NewHashTable(
 		colexecerror.InternalError(errors.AssertionFailedf("unknown HashTableBuildMode %d", buildMode))
 	}
 	ht := &HashTable{
-		allocator: allocator,
+		allocator:             allocator,
+		maxProbingBatchLength: maxProbingBatchLength,
 		BuildScratch: hashChains{
 			First: make([]keyID, initialNumHashBuckets),
 		},
@@ -376,18 +381,6 @@ func NewHashTable(
 	return ht
 }
 
-// HashTableInitialToCheck is a slice that contains all consequent integers in
-// [0, coldata.MaxBatchSize) range that can be used to initialize ToCheck buffer
-// for most of the join types.
-var HashTableInitialToCheck []uint64
-
-func init() {
-	HashTableInitialToCheck = make([]uint64, coldata.MaxBatchSize)
-	for i := range HashTableInitialToCheck {
-		HashTableInitialToCheck[i] = uint64(i)
-	}
-}
-
 // shouldResize returns whether the hash table storing numTuples should be
 // resized in order to not exceed the load factor given the current number of
 // buckets.
@@ -396,10 +389,10 @@ func (ht *HashTable) shouldResize(numTuples int) bool {
 }
 
 // probeBufferInternalMaxMemUsed returns the maximum memory used by the slices
-// of hashTableProbeBuffer that are limited by coldata.BatchSize() in size.
-func probeBufferInternalMaxMemUsed() int64 {
+// of hashTableProbeBuffer that are limited by maxProbingBatchLength in size.
+func probeBufferInternalMaxMemUsed(maxProbingBatchLength int) int64 {
 	// probeBufferInternalMaxMemUsed accounts for:
-	// - five uint64 slices:
+	// - five uint32 slices:
 	//   - hashTableProbeBuffer.hashChains.Next
 	//   - hashTableProbeBuffer.ToCheck
 	//   - hashTableProbeBuffer.ToCheckID
@@ -407,18 +400,20 @@ func probeBufferInternalMaxMemUsed() int64 {
 	//   - hashTableProbeBuffer.HashBuffer
 	// - two bool slices:
 	//   - hashTableProbeBuffer.differs
-	//   - hashTableProbeBuffer.distinct.
-	return memsize.Uint64*int64(5*coldata.BatchSize()) + memsize.Bool*int64(2*coldata.BatchSize())
+	//   - hashTableProbeBuffer.foundNull.
+	return memsize.Uint32*int64(5*maxProbingBatchLength) + memsize.Bool*int64(2*maxProbingBatchLength)
 }
 
 // accountForLimitedSlices checks whether we have already accounted for the
-// memory used by the slices that are limited by coldata.BatchSize() in size
+// memory used by the slices that are limited by maxProbingBatchLength in size
 // and adjusts the allocator accordingly if we haven't.
-func (p *hashTableProbeBuffer) accountForLimitedSlices(allocator *colmem.Allocator) {
+func (p *hashTableProbeBuffer) accountForLimitedSlices(
+	allocator *colmem.Allocator, maxProbingBatchLength int,
+) {
 	if p.limitedSlicesAreAccountedFor {
 		return
 	}
-	allocator.AdjustMemoryUsage(probeBufferInternalMaxMemUsed())
+	allocator.AdjustMemoryUsage(probeBufferInternalMaxMemUsed(maxProbingBatchLength))
 	p.limitedSlicesAreAccountedFor = true
 }
 
@@ -436,7 +431,7 @@ func (ht *HashTable) buildFromBufferedTuples() {
 	}
 	// Account for memory used by the internal auxiliary slices that are limited
 	// in size.
-	ht.ProbeScratch.accountForLimitedSlices(ht.allocator)
+	ht.ProbeScratch.accountForLimitedSlices(ht.allocator, ht.maxProbingBatchLength)
 	// Figure out the minimum capacities of the unlimited slices before actually
 	// allocating then.
 	needCapacity := int64(ht.numBuckets) + int64(ht.Vals.Length()+1) // ht.BuildScratch.First + ht.BuildScratch.Next
@@ -448,33 +443,33 @@ func (ht *HashTable) buildFromBufferedTuples() {
 		// perform the memory accounting for the anticipated memory usage. Note
 		// that it might not be precise, so we'll reconcile after the
 		// allocations below.
-		ht.allocator.AdjustMemoryUsage(memsize.Uint64 * (needCapacity - ht.unlimitedSlicesNumUint64AccountedFor))
-		ht.unlimitedSlicesNumUint64AccountedFor = needCapacity
+		ht.allocator.AdjustMemoryUsage(memsize.Uint32 * (needCapacity - ht.unlimitedSlicesNumUint32AccountedFor))
+		ht.unlimitedSlicesNumUint32AccountedFor = needCapacity
 	}
 	// Perform the actual build.
 	ht.buildFromBufferedTuplesNoAccounting()
 	// Now ensure that the accounting is precise (cap's of the slices might
 	// exceed len's that we've accounted for).
-	ht.allocator.AdjustMemoryUsageAfterAllocation(memsize.Uint64 * (ht.unlimitedSlicesCapacity() - ht.unlimitedSlicesNumUint64AccountedFor))
-	ht.unlimitedSlicesNumUint64AccountedFor = ht.unlimitedSlicesCapacity()
+	ht.allocator.AdjustMemoryUsageAfterAllocation(memsize.Uint32 * (ht.unlimitedSlicesCapacity() - ht.unlimitedSlicesNumUint32AccountedFor))
+	ht.unlimitedSlicesNumUint32AccountedFor = ht.unlimitedSlicesCapacity()
 }
 
 // buildFromBufferedTuples builds the hash table from already buffered tuples in
 // ht.Vals according to the current number of buckets. No memory accounting is
 // performed, so this function is guaranteed to not throw a memory error.
 func (ht *HashTable) buildFromBufferedTuplesNoAccounting() {
-	ht.BuildScratch.First = colexecutils.MaybeAllocateUint64Array(ht.BuildScratch.First, int(ht.numBuckets))
+	ht.BuildScratch.First = colexecutils.MaybeAllocateUint32Array(ht.BuildScratch.First, int(ht.numBuckets))
 	if ht.ProbeScratch.First != nil {
-		ht.ProbeScratch.First = colexecutils.MaybeAllocateUint64Array(ht.ProbeScratch.First, int(ht.numBuckets))
+		ht.ProbeScratch.First = colexecutils.MaybeAllocateUint32Array(ht.ProbeScratch.First, int(ht.numBuckets))
 	}
 	// ht.BuildScratch.Next is used to store the computed hash value of each key.
-	ht.BuildScratch.Next = colexecutils.MaybeAllocateUint64Array(ht.BuildScratch.Next, ht.Vals.Length()+1)
+	ht.BuildScratch.Next = colexecutils.MaybeAllocateUint32Array(ht.BuildScratch.Next, ht.Vals.Length()+1)
 
 	for i, keyCol := range ht.keyCols {
 		ht.Keys[i] = ht.Vals.ColVec(int(keyCol))
 	}
 	ht.ComputeBuckets(ht.BuildScratch.Next[1:], ht.Keys, ht.Vals.Length(), nil /* sel */)
-	ht.buildNextChains(ht.BuildScratch.First, ht.BuildScratch.Next, 1 /* offset */, uint64(ht.Vals.Length()))
+	ht.buildNextChains(ht.BuildScratch.First, ht.BuildScratch.Next, 1 /* offset */, uint32(ht.Vals.Length()))
 }
 
 // FullBuild executes the entirety of the hash table build phase using the input
@@ -634,10 +629,16 @@ func (ht *HashTable) DistinctBuild(batch coldata.Batch) {
 		))
 	}
 	ht.ComputeHashAndBuildChains(batch)
-	ht.RemoveDuplicates(batch, ht.Keys, ht.ProbeScratch.First, ht.ProbeScratch.Next, ht.CheckProbeForDistinct)
+	ht.RemoveDuplicates(
+		batch, ht.Keys, ht.ProbeScratch.First, ht.ProbeScratch.Next,
+		ht.CheckProbeForDistinct, true, /* probingAgainstItself */
+	)
 	// We only check duplicates when there is at least one buffered tuple.
 	if ht.Vals.Length() > 0 {
-		ht.RemoveDuplicates(batch, ht.Keys, ht.BuildScratch.First, ht.BuildScratch.Next, ht.CheckBuildForDistinct)
+		ht.RemoveDuplicates(
+			batch, ht.Keys, ht.BuildScratch.First, ht.BuildScratch.Next,
+			ht.CheckBuildForDistinct, false, /* probingAgainstItself */
+		)
 	}
 	if batch.Length() > 0 {
 		ht.AppendAllDistinct(batch)
@@ -672,47 +673,11 @@ func (ht *HashTable) ComputeHashAndBuildChains(batch coldata.Batch) {
 			ht.ProbeScratch.First[hash] = 0
 		}
 	} else {
-		for n := 0; n < len(ht.ProbeScratch.First); n += copy(ht.ProbeScratch.First[n:], colexecutils.ZeroUint64Column) {
+		for n := 0; n < len(ht.ProbeScratch.First); n += copy(ht.ProbeScratch.First[n:], colexecutils.ZeroUint32Column) {
 		}
 	}
 
-	ht.buildNextChains(ht.ProbeScratch.First, ht.ProbeScratch.Next, 1 /* offset */, uint64(batchLength))
-}
-
-// FindBuckets finds the buckets for all tuples in batch when probing against a
-// hash table that is specified by 'first' and 'next' vectors as well as
-// 'duplicatesChecker'. `duplicatesChecker` takes a slice of key columns of the
-// batch, number of tuples to check, and the selection vector of the batch, and
-// it returns number of tuples that needs to be checked for next iteration.
-// The "buckets" are specified by equal values in ht.ProbeScratch.HeadID.
-// NOTE: *first* and *next* vectors should be properly populated.
-// NOTE: batch is assumed to be non-zero length.
-func (ht *HashTable) FindBuckets(
-	batch coldata.Batch,
-	keyCols []coldata.Vec,
-	first, next []keyID,
-	duplicatesChecker func([]coldata.Vec, uint64, []int) uint64,
-) {
-	batchLength := batch.Length()
-	sel := batch.Selection()
-
-	ht.ProbeScratch.SetupLimitedSlices(batchLength, ht.BuildMode)
-	// Early bounds checks.
-	toCheckIDs := ht.ProbeScratch.ToCheckID
-	_ = toCheckIDs[batchLength-1]
-	for i, hash := range ht.ProbeScratch.HashBuffer[:batchLength] {
-		f := first[hash]
-		//gcassert:bce
-		toCheckIDs[i] = f
-	}
-	copy(ht.ProbeScratch.ToCheck, HashTableInitialToCheck[:batchLength])
-
-	for nToCheck := uint64(batchLength); nToCheck > 0; {
-		// Continue searching for the build table matching keys while the ToCheck
-		// array is non-empty.
-		nToCheck = duplicatesChecker(keyCols, nToCheck, sel)
-		ht.FindNext(next, nToCheck)
-	}
+	ht.buildNextChains(ht.ProbeScratch.First, ht.ProbeScratch.Next, 1 /* offset */, uint32(batchLength))
 }
 
 // RemoveDuplicates updates the selection vector of the batch to only include
@@ -723,9 +688,13 @@ func (ht *HashTable) RemoveDuplicates(
 	batch coldata.Batch,
 	keyCols []coldata.Vec,
 	first, next []keyID,
-	duplicatesChecker func([]coldata.Vec, uint64, []int) uint64,
+	duplicatesChecker func([]coldata.Vec, uint32, []int) uint32,
+	probingAgainstItself bool,
 ) {
-	ht.FindBuckets(batch, keyCols, first, next, duplicatesChecker)
+	ht.FindBuckets(
+		batch, keyCols, first, next, duplicatesChecker,
+		false /* zeroHeadIDForDistinctTuple */, probingAgainstItself,
+	)
 	ht.updateSel(batch)
 }
 
@@ -734,10 +703,10 @@ func (ht *HashTable) RemoveDuplicates(
 // contains the hash codes for all of them.
 // NOTE: batch must be of non-zero length.
 func (ht *HashTable) AppendAllDistinct(batch coldata.Batch) {
-	numBuffered := uint64(ht.Vals.Length())
+	numBuffered := uint32(ht.Vals.Length())
 	ht.Vals.AppendTuples(batch, 0 /* startIdx */, batch.Length())
 	ht.BuildScratch.Next = append(ht.BuildScratch.Next, ht.ProbeScratch.HashBuffer[:batch.Length()]...)
-	ht.buildNextChains(ht.BuildScratch.First, ht.BuildScratch.Next, numBuffered+1, uint64(batch.Length()))
+	ht.buildNextChains(ht.BuildScratch.First, ht.BuildScratch.Next, numBuffered+1, uint32(batch.Length()))
 	if ht.shouldResize(ht.Vals.Length()) {
 		ht.buildFromBufferedTuples()
 	}
@@ -758,7 +727,7 @@ func (ht *HashTable) RepairAfterDistinctBuild() {
 }
 
 // checkCols performs a column by column checkCol on the key columns.
-func (ht *HashTable) checkCols(probeVecs []coldata.Vec, nToCheck uint64, probeSel []int) {
+func (ht *HashTable) checkCols(probeVecs []coldata.Vec, nToCheck uint32, probeSel []int) {
 	switch ht.probeMode {
 	case HashTableDefaultProbeMode:
 		for i, keyCol := range ht.keyCols {
@@ -777,7 +746,7 @@ func (ht *HashTable) checkCols(probeVecs []coldata.Vec, nToCheck uint64, probeSe
 // tuples in the probe table that are not present in the build table.
 // NOTE: It assumes that probeSel has already been populated and it is not nil.
 func (ht *HashTable) checkColsForDistinctTuples(
-	probeVecs []coldata.Vec, nToCheck uint64, probeSel []int,
+	probeVecs []coldata.Vec, nToCheck uint32, probeSel []int,
 ) {
 	buildVecs := ht.Vals.ColVecs()
 	for i := range ht.keyCols {
@@ -790,7 +759,7 @@ func (ht *HashTable) checkColsForDistinctTuples(
 
 // ComputeBuckets computes the hash value of each key and stores the result in
 // buckets.
-func (ht *HashTable) ComputeBuckets(buckets []uint64, keys []coldata.Vec, nKeys int, sel []int) {
+func (ht *HashTable) ComputeBuckets(buckets []uint32, keys []coldata.Vec, nKeys int, sel []int) {
 	if nKeys == 0 {
 		// No work to do - avoid doing the loops below.
 		return
@@ -815,7 +784,7 @@ func (ht *HashTable) ComputeBuckets(buckets []uint64, keys []coldata.Vec, nKeys 
 }
 
 // buildNextChains builds the hash map from the computed hash values.
-func (ht *HashTable) buildNextChains(first, next []keyID, offset, batchSize uint64) {
+func (ht *HashTable) buildNextChains(first, next []keyID, offset, batchSize uint32) {
 	// The loop direction here is reversed to ensure that when we are building the
 	// next chain for the probe table, the keyID in each equality chain inside
 	// `next` is strictly in ascending order. This is crucial to ensure that when
@@ -834,7 +803,7 @@ func (ht *HashTable) buildNextChains(first, next []keyID, offset, batchSize uint
 		// keyID in each equality chain. firstKeyID==0 means it is the first tuple
 		// that we have encountered with the given hash value.
 		if firstKeyID == 0 || id < firstKeyID {
-			next[id] = first[hash]
+			next[id] = firstKeyID
 			first[hash] = id
 		} else {
 			next[id] = next[firstKeyID]
@@ -844,16 +813,14 @@ func (ht *HashTable) buildNextChains(first, next []keyID, offset, batchSize uint
 	ht.cancelChecker.CheckEveryCall()
 }
 
-// SetupLimitedSlices ensures that HeadID, differs, distinct, ToCheckID, and
-// ToCheck are of the desired length and are setup for probing.
+// SetupLimitedSlices ensures that HeadID, differs, foundNull, ToCheckID, and
+// ToCheck are of the desired length and are set up for probing.
 // Note that if the old ToCheckID or ToCheck slices have enough capacity, they
 // are *not* zeroed out.
-func (p *hashTableProbeBuffer) SetupLimitedSlices(length int, buildMode HashTableBuildMode) {
-	p.HeadID = colexecutils.MaybeAllocateLimitedUint64Array(p.HeadID, length)
+func (p *hashTableProbeBuffer) SetupLimitedSlices(length int) {
+	p.HeadID = colexecutils.MaybeAllocateLimitedUint32Array(p.HeadID, length)
 	p.differs = colexecutils.MaybeAllocateLimitedBoolArray(p.differs, length)
-	if buildMode == HashTableDistinctBuildMode {
-		p.distinct = colexecutils.MaybeAllocateLimitedBoolArray(p.distinct, length)
-	}
+	p.foundNull = colexecutils.MaybeAllocateLimitedBoolArray(p.foundNull, length)
 	// Note that we don't use maybeAllocate* methods below because ToCheckID and
 	// ToCheck don't need to be zeroed out when reused.
 	if cap(p.ToCheckID) < length {
@@ -862,17 +829,9 @@ func (p *hashTableProbeBuffer) SetupLimitedSlices(length int, buildMode HashTabl
 		p.ToCheckID = p.ToCheckID[:length]
 	}
 	if cap(p.ToCheck) < length {
-		p.ToCheck = make([]uint64, length)
+		p.ToCheck = make([]uint32, length)
 	} else {
 		p.ToCheck = p.ToCheck[:length]
-	}
-}
-
-// FindNext determines the id of the next key inside the ToCheckID buckets for
-// each equality column key in ToCheck.
-func (ht *HashTable) FindNext(next []keyID, nToCheck uint64) {
-	for _, toCheck := range ht.ProbeScratch.ToCheck[:nToCheck] {
-		ht.ProbeScratch.ToCheckID[toCheck] = next[ht.ProbeScratch.ToCheckID[toCheck]]
 	}
 }
 
@@ -883,20 +842,22 @@ func (ht *HashTable) FindNext(next []keyID, nToCheck uint64) {
 // NOTE: It assumes that probeSel has already been populated and it is not nil.
 // NOTE: It assumes that nToCheck is positive.
 func (ht *HashTable) CheckBuildForDistinct(
-	probeVecs []coldata.Vec, nToCheck uint64, probeSel []int,
-) uint64 {
+	probeVecs []coldata.Vec, nToCheck uint32, probeSel []int,
+) uint32 {
 	if probeSel == nil {
 		colexecerror.InternalError(errors.AssertionFailedf("invalid selection vector"))
 	}
 	ht.checkColsForDistinctTuples(probeVecs, nToCheck, probeSel)
-	nDiffers := uint64(0)
+	nDiffers := uint32(0)
 	toCheckSlice := ht.ProbeScratch.ToCheck
 	_ = toCheckSlice[nToCheck-1]
-	for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+	for toCheckPos := uint32(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
 		//gcassert:bce
 		toCheck := toCheckSlice[toCheckPos]
-		if ht.ProbeScratch.distinct[toCheck] {
-			ht.ProbeScratch.distinct[toCheck] = false
+		if ht.ProbeScratch.foundNull[toCheck] {
+			// foundNull is only set to true when allowNullEquality is false, so
+			// since this tuple has a NULL value, it's distinct from all others.
+			ht.ProbeScratch.foundNull[toCheck] = false
 			// Calculated using the convention: keyID = keys.indexOf(key) + 1.
 			ht.ProbeScratch.HeadID[toCheck] = toCheck + 1
 		} else if ht.ProbeScratch.differs[toCheck] {
@@ -918,33 +879,32 @@ func (ht *HashTable) CheckBuildForDistinct(
 // NOTE: It assumes that probeSel has already been populated and it is not nil.
 // NOTE: It assumes that nToCheck is positive.
 func (ht *HashTable) CheckBuildForAggregation(
-	probeVecs []coldata.Vec, nToCheck uint64, probeSel []int,
-) uint64 {
+	probeVecs []coldata.Vec, nToCheck uint32, probeSel []int,
+) uint32 {
 	if probeSel == nil {
 		colexecerror.InternalError(errors.AssertionFailedf("invalid selection vector"))
 	}
+	if !ht.allowNullEquality {
+		colexecerror.InternalError(errors.AssertionFailedf("NULL equality is assumed to be allowed in CheckBuildForAggregation"))
+	}
 	ht.checkColsForDistinctTuples(probeVecs, nToCheck, probeSel)
-	nDiffers := uint64(0)
+	nDiffers := uint32(0)
 	toCheckSlice := ht.ProbeScratch.ToCheck
 	_ = toCheckSlice[nToCheck-1]
-	for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+	for toCheckPos := uint32(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
 		//gcassert:bce
 		toCheck := toCheckSlice[toCheckPos]
-		if !ht.ProbeScratch.distinct[toCheck] {
-			// If the tuple is distinct, it doesn't have a duplicate in the
-			// hash table already, so we skip it.
-			if ht.ProbeScratch.differs[toCheck] {
-				// We have a hash collision, so we need to continue probing
-				// against the next tuples in the hash chain.
-				ht.ProbeScratch.differs[toCheck] = false
-				//gcassert:bce
-				toCheckSlice[nDiffers] = toCheck
-				nDiffers++
-			} else {
-				// This tuple has a duplicate in the hash table, so we remember
-				// keyID of that duplicate.
-				ht.ProbeScratch.HeadID[toCheck] = ht.ProbeScratch.ToCheckID[toCheck]
-			}
+		if ht.ProbeScratch.differs[toCheck] {
+			// We have a hash collision, so we need to continue probing against
+			// the next tuples in the hash chain.
+			ht.ProbeScratch.differs[toCheck] = false
+			//gcassert:bce
+			toCheckSlice[nDiffers] = toCheck
+			nDiffers++
+		} else {
+			// This tuple has a duplicate in the hash table, so we remember
+			// keyID of that duplicate.
+			ht.ProbeScratch.HeadID[toCheck] = ht.ProbeScratch.ToCheckID[toCheck]
 		}
 	}
 	return nDiffers
@@ -955,16 +915,21 @@ func (ht *HashTable) CheckBuildForAggregation(
 // ToCheck. If the bucket has reached the end, the key is rejected. The ToCheck
 // list is reconstructed to only hold the indices of the keyCols keys that have
 // not been found. The new length of ToCheck is returned by this function.
-func (ht *HashTable) DistinctCheck(nToCheck uint64, probeSel []int) uint64 {
+func (ht *HashTable) DistinctCheck(nToCheck uint32, probeSel []int) uint32 {
 	ht.checkCols(ht.Keys, nToCheck, probeSel)
 	// Select the indices that differ and put them into ToCheck.
-	nDiffers := uint64(0)
+	nDiffers := uint32(0)
 	toCheckSlice := ht.ProbeScratch.ToCheck
 	_ = toCheckSlice[nToCheck-1]
-	for toCheckPos := uint64(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
+	for toCheckPos := uint32(0); toCheckPos < nToCheck && nDiffers < nToCheck; toCheckPos++ {
 		//gcassert:bce
 		toCheck := toCheckSlice[toCheckPos]
-		if ht.ProbeScratch.differs[toCheck] {
+		if ht.ProbeScratch.foundNull[toCheck] {
+			// We found a NULL value in the equality column with
+			// allowNullEquality=false, so we know for sure this probing tuple
+			// won't ever get a match.
+			ht.ProbeScratch.ToCheckID[toCheck] = 0
+		} else if ht.ProbeScratch.differs[toCheck] {
 			ht.ProbeScratch.differs[toCheck] = false
 			//gcassert:bce
 			toCheckSlice[nDiffers] = toCheck
@@ -982,13 +947,13 @@ func (ht *HashTable) DistinctCheck(nToCheck uint64, probeSel []int) uint64 {
 // allocation is needed, and at that time the allocator will update the memory
 // account accordingly.
 func (ht *HashTable) Reset(_ context.Context) {
-	for n := 0; n < len(ht.BuildScratch.First); n += copy(ht.BuildScratch.First[n:], colexecutils.ZeroUint64Column) {
+	for n := 0; n < len(ht.BuildScratch.First); n += copy(ht.BuildScratch.First[n:], colexecutils.ZeroUint32Column) {
 	}
 	ht.Vals.ResetInternalBatch()
 	// ht.ProbeScratch.Next, ht.Same and ht.Visited are reset separately before
 	// they are used (these slices are not used in all of the code paths).
 	// ht.ProbeScratch.HeadID, ht.ProbeScratch.differs, and
-	// ht.ProbeScratch.distinct are reset before they are used (these slices
+	// ht.ProbeScratch.foundNull are reset before they are used (these slices
 	// are limited in size and dynamically allocated).
 	// ht.ProbeScratch.ToCheckID and ht.ProbeScratch.ToCheck don't need to be
 	// reset because they are populated manually every time before checking the

@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -46,13 +47,13 @@ import (
 // ReporterInterval is the interval between two generations of the reports.
 // When set to zero - disables the report generation.
 var ReporterInterval = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.replication_reports.interval",
 	"the frequency for generating the replication_constraint_stats, replication_stats_report and "+
 		"replication_critical_localities reports (set to 0 to disable)",
 	time.Minute,
 	settings.NonNegativeDuration,
-).WithPublic()
+	settings.WithPublic)
 
 // Reporter periodically produces a couple of reports on the cluster's data
 // distribution: the system tables: replication_constraint_stats,
@@ -208,9 +209,8 @@ func (stats *Reporter) update(
 		return allStores[id]
 	}
 
-	isLiveMap := stats.liveness.GetIsLiveMap()
 	isNodeLive := func(nodeID roachpb.NodeID) bool {
-		return isLiveMap[nodeID].IsLive
+		return stats.liveness.GetNodeVitalityFromCache(nodeID).IsLive(livenesspb.Metrics)
 	}
 
 	nodeLocalities := make(map[roachpb.NodeID]roachpb.Locality, len(allStores))
@@ -447,9 +447,12 @@ func visitAncestors(
 	cfg *config.SystemConfig,
 	visitor func(context.Context, *zonepb.ZoneConfig, ZoneKey) bool,
 ) (bool, error) {
+	// This is a bug: see https://github.com/cockroachdb/cockroach/issues/48123.
+	var FIXMEIDONTKNOWWHICHCODECTOUSE = keys.MakeSQLCodec(roachpb.SystemTenantID)
+
 	// Check to see if it's a table. If so, inherit from the database.
 	// For all other cases, inherit from the default.
-	descVal := cfg.GetValue(catalogkeys.MakeDescMetadataKey(keys.TODOSQLCodec, descpb.ID(id)))
+	descVal := cfg.GetValue(catalogkeys.MakeDescMetadataKey(FIXMEIDONTKNOWWHICHCODECTOUSE, descpb.ID(id)))
 	if descVal == nil {
 		// Couldn't find a descriptor. This is not expected to happen.
 		// Let's just look at the default zone config.
@@ -607,8 +610,8 @@ func visitRanges(
 		key = newKey
 		first = false
 
-		for i, v := range visitors {
-			var err error
+		for i := 0; i < len(visitors); {
+			v := visitors[i]
 			if sameZoneAsPrevRange {
 				v.visitSameZone(ctx, &rd)
 			} else {
@@ -623,6 +626,8 @@ func visitRanges(
 				// Remove this visitor; it shouldn't be called any more.
 				visitors = append(visitors[:i], visitors[i+1:]...)
 				visitorErrs = append(visitorErrs, err)
+			} else {
+				i++
 			}
 		}
 	}

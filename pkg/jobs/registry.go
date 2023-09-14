@@ -11,12 +11,12 @@
 package jobs
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -28,7 +28,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/server/tracedumper"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -49,11 +51,13 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
-// adoptedJobs represents a the epoch and cancelation of a job id being run
-// by the registry.
+// adoptedJobs represents the epoch and cancellation of a job id being run by
+// the registry.
 type adoptedJob struct {
 	session sqlliveness.Session
 	isIdle  bool
+	// Reference to the Resumer that is currently running the job.
+	resumer Resumer
 	// Calling the func will cancel the context the job was resumed with.
 	cancel context.CancelFunc
 }
@@ -97,7 +101,6 @@ type Registry struct {
 
 	ac        log.AmbientContext
 	stopper   *stop.Stopper
-	db        isql.DB
 	clock     *hlc.Clock
 	clusterID *base.ClusterIDContainer
 	nodeID    *base.SQLIDContainer
@@ -112,26 +115,15 @@ type Registry struct {
 	adoptionCh  chan adoptionNotice
 	sqlInstance sqlliveness.Instance
 
-	// internalDB provides a way for jobs to create internal executors.
-	// This is rarely needed, and usually job resumers should
-	// use the internal executor from the JobExecCtx. The intended user of this
-	// interface is the schema change job resumer, which needs to set the
-	// tableCollectionModifier on the internal executor to different values in
-	// multiple concurrent queries. This situation is an exception to the internal
-	// executor generally being a stateless wrapper, and makes it impossible to
-	// reuse the same internal executor across all the queries (without
-	// refactoring to get rid of the tableCollectionModifier field, which we
-	// should do eventually).
+	// db is used by the jobs subsystem to manage job records.
 	//
-	// Note that, while this API is not ideal, internal executors are basically
-	// lightweight wrappers requiring no additional teardown. There's not much
-	// cost incurred in creating these.
+	// This isql.DB is instantiated with special parameters that are
+	// tailored to job management. It is not suitable for execution of
+	// SQL queries by job resumers.
 	//
-	// TODO (lucy): We should refactor and get rid of the tableCollectionModifier
-	// field. Modifying the TableCollection is basically a per-query operation
-	// and should be a per-query setting. #34304 is the issue for creating/
-	// improving this API.
-	internalDB isql.DB
+	// Instead resumer functions should reach for the isql.DB that comes
+	// from the SQl executor config.
+	db isql.DB
 
 	// if non-empty, indicates path to file that prevents any job adoptions.
 	preventAdoptionFile     string
@@ -156,19 +148,39 @@ type Registry struct {
 		// draining indicates whether this node is draining or
 		// not. It is set by the drain server when the drain
 		// process starts.
-		//
-		// TODO(ssd): We may want to prevent the adoption of
-		// jobs onto a draining node. At the moment, jobs can
-		// access this to make per-job decisions about what to
-		// do.
 		draining bool
+
+		// numDrainWait is the number of jobs that are still
+		// processing drain request.
+		numDrainWait int
+
+		// ingestingJobs is a map of jobs which are actively ingesting on this node
+		// including via a processor.
+		ingestingJobs map[jobspb.JobID]struct{}
 	}
+
+	// drainRequested signaled to indicate that this registry will shut
+	// down soon.  It's an opportunity for currently running jobs
+	// to detect this (OnDrain) and to have a bit of time to do cleanup/shutdown
+	// in an orderly fashion, prior to resumer context being canceled.
+	// The registry will no longer adopt new jobs once this channel closed.
+	drainRequested chan struct{}
+	// jobDrained signaled to indicate that the job watching drainRequested channel
+	// completed its drain logic.
+	jobDrained chan struct{}
+
+	// drainJobs closed when registry should drain/cancel all active
+	// jobs and should no longer adopt new jobs.
+	drainJobs chan struct{}
+
+	startedControllerTasksWG sync.WaitGroup
 
 	// withSessionEvery ensures that logging when failing to get a live session
 	// is not too loud.
 	withSessionEvery log.EveryN
 
-	TestingResumerCreationKnobs map[jobspb.Type]func(Resumer) Resumer
+	// test only overrides for resumer creation.
+	creationKnobs sync.Map
 }
 
 func (r *Registry) UpdateJobWithTxn(
@@ -193,7 +205,7 @@ func (r *Registry) UpdateJobWithTxn(
 // subpackage like sqlbase is difficult because of the amount of sql-only
 // stuff that JobExecContext exports. One other choice is to merge this package
 // back into the sql package. There's maybe a better way that I'm unaware of.
-type jobExecCtxMaker func(opName string, user username.SQLUsername) (interface{}, func())
+type jobExecCtxMaker func(ctx context.Context, opName string, user username.SQLUsername) (interface{}, func())
 
 // PreventAdoptionFile is the name of the file which, if present in the first
 // on-disk store, will prevent the adoption of background jobs by that node.
@@ -207,7 +219,6 @@ func MakeRegistry(
 	ac log.AmbientContext,
 	stopper *stop.Stopper,
 	clock *hlc.Clock,
-	db isql.DB,
 	clusterID *base.ClusterIDContainer,
 	nodeID *base.SQLIDContainer,
 	sqlInstance sqlliveness.Instance,
@@ -223,7 +234,6 @@ func MakeRegistry(
 		ac:                      ac,
 		stopper:                 stopper,
 		clock:                   clock,
-		db:                      db,
 		clusterID:               clusterID,
 		nodeID:                  nodeID,
 		sqlInstance:             sqlInstance,
@@ -237,6 +247,9 @@ func MakeRegistry(
 		// if a notification is already queued.
 		adoptionCh:       make(chan adoptionNotice, 1),
 		withSessionEvery: log.Every(time.Second),
+		drainJobs:        make(chan struct{}),
+		drainRequested:   make(chan struct{}),
+		jobDrained:       make(chan struct{}, 1),
 	}
 	if knobs != nil {
 		r.knobs = *knobs
@@ -254,7 +267,7 @@ func MakeRegistry(
 // executor. We expose this separately from the constructor to avoid a circular
 // dependency.
 func (r *Registry) SetInternalDB(db isql.DB) {
-	r.internalDB = db
+	r.db = db
 }
 
 // MetricsStruct returns the metrics for production monitoring of each job type.
@@ -303,6 +316,12 @@ const (
 
 	// JobMetricsPollerJobID A static job ID is used for the job metrics polling job.
 	JobMetricsPollerJobID = jobspb.JobID(101)
+
+	// AutoConfigRunnerJobID A static job ID is used for the auto config runner job.
+	AutoConfigRunnerJobID = jobspb.JobID(102)
+
+	// SqlActivityUpdaterJobID A static job ID is used for the SQL activity tables.
+	SqlActivityUpdaterJobID = jobspb.JobID(103)
 )
 
 // MakeJobID generates a new job ID.
@@ -389,7 +408,17 @@ func createJobsInBatchWithTxn(
 	}
 	start := txn.KV().ReadTimestamp().GoTime()
 	modifiedMicros := timeutil.ToUnixMicros(start)
-	stmt, args, jobIDs, err := batchJobInsertStmt(ctx, r, s.ID(), records, modifiedMicros)
+
+	jobs := make([]*Job, len(records))
+	for i, record := range records {
+		j, err := r.newJob(ctx, *record)
+		if err != nil {
+			return nil, err
+		}
+		jobs[i] = j
+	}
+
+	stmt, args, jobIDs, err := batchJobInsertStmt(ctx, r, s.ID(), jobs, modifiedMicros)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +431,45 @@ func createJobsInBatchWithTxn(
 		return nil, err
 	}
 
+	// Insert the job payload and details into the system.job_info table if the
+	// associated cluster version is active.
+	//
+	// TODO(adityamaru): Stop writing the payload and details to the system.jobs
+	// table once we are outside the compatability window for 22.2.
+	if r.settings.Version.IsActive(ctx, clusterversion.V23_1CreateSystemJobInfoTable) {
+		if err := batchJobWriteToJobInfo(ctx, txn, jobs, modifiedMicros); err != nil {
+			return nil, err
+		}
+	}
+
 	return jobIDs, nil
+}
+
+func batchJobWriteToJobInfo(
+	ctx context.Context, txn isql.Txn, jobs []*Job, modifiedMicros int64,
+) error {
+	for _, j := range jobs {
+		infoStorage := j.InfoStorage(txn)
+		payload := j.Payload()
+		var payloadBytes, progressBytes []byte
+		var err error
+		if payloadBytes, err = protoutil.Marshal(&payload); err != nil {
+			return err
+		}
+		if err := infoStorage.WriteLegacyPayload(ctx, payloadBytes); err != nil {
+			return err
+		}
+		progress := j.Progress()
+		if progressBytes, err = protoutil.Marshal(&progress); err != nil {
+			return err
+		}
+		progress.ModifiedMicros = modifiedMicros
+		if err := infoStorage.WriteLegacyProgress(ctx, progressBytes); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // batchJobInsertStmt creates an INSERT statement and its corresponding arguments
@@ -411,12 +478,9 @@ func batchJobInsertStmt(
 	ctx context.Context,
 	r *Registry,
 	sessionID sqlliveness.SessionID,
-	records []*Record,
+	jobs []*Job,
 	modifiedMicros int64,
 ) (string, []interface{}, []jobspb.JobID, error) {
-	instanceID := r.ID()
-	columns := []string{`id`, `created`, `status`, `payload`, `progress`, `claim_session_id`, `claim_instance_id`, `job_type`}
-	numColumns := len(columns)
 	marshalPanic := func(m protoutil.Message) []byte {
 		data, err := protoutil.Marshal(m)
 		if err != nil {
@@ -429,29 +493,46 @@ func batchJobInsertStmt(
 	if err != nil {
 		return "", nil, nil, errors.NewAssertionErrorWithWrappedErrf(err, "failed to make timestamp for creation of job")
 	}
-
-	valueFns := map[string]func(*Record) (interface{}, error){
-		`id`:                func(rec *Record) (interface{}, error) { return rec.JobID, nil },
-		`created`:           func(rec *Record) (interface{}, error) { return created, nil },
-		`status`:            func(rec *Record) (interface{}, error) { return StatusRunning, nil },
-		`claim_session_id`:  func(rec *Record) (interface{}, error) { return sessionID.UnsafeBytes(), nil },
-		`claim_instance_id`: func(rec *Record) (interface{}, error) { return instanceID, nil },
-		`payload`: func(rec *Record) (interface{}, error) {
-			payload, err := r.makePayload(ctx, rec)
-			if err != nil {
-				return []byte{}, err
-			}
+	instanceID := r.ID()
+	columns := []string{`id`, `created`, `status`, `payload`, `progress`, `claim_session_id`, `claim_instance_id`, `job_type`}
+	valueFns := map[string]func(*Job) (interface{}, error){
+		`id`:                func(job *Job) (interface{}, error) { return job.ID(), nil },
+		`created`:           func(job *Job) (interface{}, error) { return created, nil },
+		`status`:            func(job *Job) (interface{}, error) { return StatusRunning, nil },
+		`claim_session_id`:  func(job *Job) (interface{}, error) { return sessionID.UnsafeBytes(), nil },
+		`claim_instance_id`: func(job *Job) (interface{}, error) { return instanceID, nil },
+		`payload`: func(job *Job) (interface{}, error) {
+			payload := job.Payload()
 			return marshalPanic(&payload), nil
 		},
-		`progress`: func(rec *Record) (interface{}, error) {
-			progress := r.makeProgress(rec)
+		`progress`: func(job *Job) (interface{}, error) {
+			progress := job.Progress()
 			progress.ModifiedMicros = modifiedMicros
 			return marshalPanic(&progress), nil
 		},
-		`job_type`: func(rec *Record) (interface{}, error) {
-			return (&jobspb.Payload{Details: jobspb.WrapPayloadDetails(rec.Details)}).Type().String(), nil
+		`job_type`: func(job *Job) (interface{}, error) {
+			payload := job.Payload()
+			return payload.Type().String(), nil
 		},
 	}
+
+	// TODO(adityamaru: Remove this once we are outside the compatability
+	// window for 22.2.
+	if r.settings.Version.IsActive(ctx, clusterversion.V23_1StopWritingPayloadAndProgressToSystemJobs) {
+		columns = []string{`id`, `created`, `status`, `claim_session_id`, `claim_instance_id`, `job_type`}
+		valueFns = map[string]func(*Job) (interface{}, error){
+			`id`:                func(job *Job) (interface{}, error) { return job.ID(), nil },
+			`created`:           func(job *Job) (interface{}, error) { return created, nil },
+			`status`:            func(job *Job) (interface{}, error) { return StatusRunning, nil },
+			`claim_session_id`:  func(job *Job) (interface{}, error) { return sessionID.UnsafeBytes(), nil },
+			`claim_instance_id`: func(job *Job) (interface{}, error) { return instanceID, nil },
+			`job_type`: func(job *Job) (interface{}, error) {
+				payload := job.Payload()
+				return payload.Type().String(), nil
+			},
+		}
+	}
+	numColumns := len(columns)
 
 	// TODO(jayant): remove this version gate in 24.1
 	// To run the upgrade below, migration and schema change jobs will need to be
@@ -460,19 +541,19 @@ func batchJobInsertStmt(
 		numColumns -= 1
 	}
 
-	appendValues := func(rec *Record, vals *[]interface{}) (err error) {
+	appendValues := func(job *Job, vals *[]interface{}) (err error) {
 		defer func() {
 			switch r := recover(); r.(type) {
 			case nil:
 			case error:
-				err = errors.CombineErrors(err, errors.Wrapf(r.(error), "encoding job %d", rec.JobID))
+				err = errors.CombineErrors(err, errors.Wrapf(r.(error), "encoding job %d", job.ID()))
 			default:
 				panic(r)
 			}
 		}()
 		for j := 0; j < numColumns; j++ {
 			c := columns[j]
-			val, err := valueFns[c](rec)
+			val, err := valueFns[c](job)
 			if err != nil {
 				return err
 			}
@@ -480,14 +561,14 @@ func batchJobInsertStmt(
 		}
 		return nil
 	}
-	args := make([]interface{}, 0, len(records)*numColumns)
-	jobIDs := make([]jobspb.JobID, 0, len(records))
+	args := make([]interface{}, 0, len(jobs)*numColumns)
+	jobIDs := make([]jobspb.JobID, 0, len(jobs))
 	var buf strings.Builder
 	buf.WriteString(`INSERT INTO system.jobs (`)
 	buf.WriteString(strings.Join(columns[:numColumns], ", "))
 	buf.WriteString(`) VALUES `)
 	argIdx := 1
-	for i, rec := range records {
+	for i, job := range jobs {
 		if i > 0 {
 			buf.WriteString(", ")
 		}
@@ -501,10 +582,10 @@ func batchJobInsertStmt(
 			argIdx++
 		}
 		buf.WriteString(")")
-		if err := appendValues(rec, &args); err != nil {
+		if err := appendValues(job, &args); err != nil {
 			return "", nil, nil, err
 		}
-		jobIDs = append(jobIDs, rec.JobID)
+		jobIDs = append(jobIDs, job.ID())
 	}
 	return buf.String(), args, jobIDs, nil
 }
@@ -547,9 +628,14 @@ func (r *Registry) CreateJobWithTxn(
 		if err != nil {
 			return errors.NewAssertionErrorWithWrappedErrf(err, "failed to construct job created timestamp")
 		}
-		cols := [...]string{"id", "created", "status", "payload", "progress", "claim_session_id", "claim_instance_id", "job_type"}
-		const totalNumCols = len(cols)
-		vals := [totalNumCols]interface{}{jobID, created, StatusRunning, payloadBytes, progressBytes, s.ID().UnsafeBytes(), r.ID(), jobType.String()}
+
+		cols := []string{"id", "created", "status", "payload", "progress", "claim_session_id", "claim_instance_id", "job_type"}
+		vals := []interface{}{jobID, created, StatusRunning, payloadBytes, progressBytes, s.ID().UnsafeBytes(), r.ID(), jobType.String()}
+		if r.settings.Version.IsActive(ctx, clusterversion.V23_1StopWritingPayloadAndProgressToSystemJobs) {
+			cols = []string{"id", "created", "status", "claim_session_id", "claim_instance_id", "job_type"}
+			vals = []interface{}{jobID, created, StatusRunning, s.ID().UnsafeBytes(), r.ID(), jobType.String()}
+		}
+		totalNumCols := len(cols)
 		numCols := totalNumCols
 		placeholders := func() string {
 			var p strings.Builder
@@ -567,18 +653,6 @@ func (r *Registry) CreateJobWithTxn(
 		override := sessiondata.RootUserSessionDataOverride
 		override.Database = catconstants.SystemDatabaseName
 		hasJobTypeColumn := r.settings.Version.IsActive(ctx, clusterversion.V23_1AddTypeColumnToJobsTable)
-		if hasJobTypeColumn {
-			// Relying on the version gate may not be sufficient.
-			const pgAttributeStmt = `
-			SELECT * FROM system.pg_catalog.pg_attribute
-			         WHERE attrelid = 'system.public.jobs'::REGCLASS
-			         AND attname = 'job_type'`
-			row, err := txn.QueryRowEx(ctx, "job-columns-get", txn.KV(), override, pgAttributeStmt)
-			if err != nil {
-				return err
-			}
-			hasJobTypeColumn = row != nil
-		}
 		if !hasJobTypeColumn {
 			numCols -= 1
 		}
@@ -589,7 +663,26 @@ func (r *Registry) CreateJobWithTxn(
 			override,
 			insertStmt, vals[:numCols]...,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+
+		// Insert the job payload and details into the system.job_info table if the
+		// associated cluster version is active.
+		//
+		// TODO(adityamaru): Stop writing the payload and details to the system.jobs
+		// table once we are outside the compatability window for 22.2.
+		if r.settings.Version.IsActive(ctx, clusterversion.V23_1CreateSystemJobInfoTable) {
+			infoStorage := j.InfoStorage(txn)
+			if err := infoStorage.WriteLegacyPayload(ctx, payloadBytes); err != nil {
+				return err
+			}
+			if err := infoStorage.WriteLegacyProgress(ctx, progressBytes); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	}
 
 	run := r.db.Txn
@@ -605,6 +698,44 @@ func (r *Registry) CreateJobWithTxn(
 		return nil, err
 	}
 	return j, nil
+}
+
+// CreateIfNotExistAdoptableJobWithTxn checks if a job already exists in
+// the system.jobs table, and if it does not it will create the job. The job
+// will be adopted for execution at a later time by some node in the cluster.
+func (r *Registry) CreateIfNotExistAdoptableJobWithTxn(
+	ctx context.Context, record Record, txn isql.Txn,
+) error {
+	if record.JobID == 0 {
+		return fmt.Errorf("invalid record.JobID value: %d", record.JobID)
+	}
+
+	if txn == nil {
+		return fmt.Errorf("txn is required for job: %d", record.JobID)
+	}
+
+	// Make sure job with id doesn't already exist in system.jobs.
+	// Use a txn to avoid race conditions
+	row, err := txn.QueryRowEx(
+		ctx,
+		"check if job exists",
+		txn.KV(),
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		"SELECT id FROM system.jobs WHERE id = $1",
+		record.JobID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// If there isn't a row for the job, create the job.
+	if row == nil {
+		if _, err = r.CreateAdoptableJobWithTxn(ctx, record, record.JobID, txn); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // CreateAdoptableJobWithTxn creates a job which will be adopted for execution
@@ -644,11 +775,17 @@ func (r *Registry) CreateAdoptableJobWithTxn(
 		typ := j.mu.payload.Type().String()
 
 		nCols := 7
-		cols := [7]string{"id", "status", "payload", "progress", "created_by_type", "created_by_id", "job_type"}
-		placeholders := [7]string{"$1", "$2", "$3", "$4", "$5", "$6", "$7"}
-		values := [7]interface{}{jobID, StatusRunning, payloadBytes, progressBytes, createdByType, createdByID, typ}
+		cols := []string{"id", "status", "payload", "progress", "created_by_type", "created_by_id", "job_type"}
+		placeholders := []string{"$1", "$2", "$3", "$4", "$5", "$6", "$7"}
+		values := []interface{}{jobID, StatusRunning, payloadBytes, progressBytes, createdByType, createdByID, typ}
 		if !r.settings.Version.IsActive(ctx, clusterversion.V23_1AddTypeColumnToJobsTable) {
 			nCols -= 1
+		}
+		if r.settings.Version.IsActive(ctx, clusterversion.V23_1StopWritingPayloadAndProgressToSystemJobs) {
+			cols = []string{"id", "status", "created_by_type", "created_by_id", "job_type"}
+			placeholders = []string{"$1", "$2", "$3", "$4", "$5"}
+			values = []interface{}{jobID, StatusRunning, createdByType, createdByID, typ}
+			nCols = 5
 		}
 		// Insert the job row, but do not set a `claim_session_id`. By not
 		// setting the claim, the job can be adopted by any node and will
@@ -661,7 +798,26 @@ func (r *Registry) CreateAdoptableJobWithTxn(
 			User:     username.NodeUserName(),
 			Database: catconstants.SystemDatabaseName,
 		}, stmt, values[:nCols]...)
-		return err
+		if err != nil {
+			return err
+		}
+
+		// Insert the job payload and details into the system.job_info table if the
+		// associated cluster version is active.
+		//
+		// TODO(adityamaru): Stop writing the payload and details to the system.jobs
+		// table once we are outside the compatability window for 22.2.
+		if r.settings.Version.IsActive(ctx, clusterversion.V23_1CreateSystemJobInfoTable) {
+			infoStorage := j.InfoStorage(txn)
+			if err := infoStorage.WriteLegacyPayload(ctx, payloadBytes); err != nil {
+				return err
+			}
+			if err := infoStorage.WriteLegacyProgress(ctx, progressBytes); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	}
 	run := r.db.Txn
 	if txn != nil {
@@ -733,7 +889,7 @@ func (r *Registry) CreateStartableJobWithTxn(
 		// Using a new context allows for independent lifetimes and cancellation.
 		resumerCtx, cancel = r.makeCtx()
 
-		if alreadyAdopted := r.addAdoptedJob(jobID, j.session, cancel); alreadyAdopted {
+		if alreadyAdopted := r.addAdoptedJob(jobID, j.session, cancel, resumer); alreadyAdopted {
 			log.Fatalf(
 				ctx,
 				"job %d: was just created but found in registered adopted jobs",
@@ -795,120 +951,6 @@ func (r *Registry) LoadJobWithTxn(
 		return nil, err
 	}
 	return j, nil
-}
-
-// GetJobInfo fetches the latest info record for the given job and infoKey.
-func (r *Registry) GetJobInfo(
-	ctx context.Context, jobID jobspb.JobID, infoKey []byte, txn isql.Txn,
-) ([]byte, bool, error) {
-	row, err := txn.QueryRowEx(
-		ctx, "job-info-get", txn.KV(),
-		sessiondata.NodeUserSessionDataOverride,
-		"SELECT value FROM system.job_info WHERE job_id = $1 AND info_key = $2 ORDER BY written DESC LIMIT 1",
-		jobID, infoKey,
-	)
-
-	if err != nil {
-		return nil, false, err
-	}
-
-	if row == nil {
-		return nil, false, nil
-	}
-
-	value, ok := row[0].(*tree.DBytes)
-	if !ok {
-		return nil, false, errors.AssertionFailedf("job info: expected value to be DBytes (was %T)", row[0])
-	}
-
-	return []byte(*value), true, nil
-}
-
-// IterateJobInfo iterates though the info records for a given job and info key
-// prefix.
-func (r *Registry) IterateJobInfo(
-	ctx context.Context,
-	jobID jobspb.JobID,
-	infoPrefix []byte,
-	fn func(infoKey []byte, value []byte) error,
-	txn isql.Txn,
-) (retErr error) {
-	// TODO(dt): verify this predicate hits the index.
-	rows, err := txn.QueryIteratorEx(
-		ctx, "job-info-iter", txn.KV(),
-		sessiondata.NodeUserSessionDataOverride,
-		`SELECT info_key, value
-		FROM system.job_info
-		WHERE job_id = $1 AND substring(info_key for $2) = $3
-		ORDER BY info_key ASC, written DESC`,
-		jobID, len(infoPrefix), infoPrefix,
-	)
-	if err != nil {
-		return err
-	}
-	defer func(it isql.Rows) { retErr = errors.CombineErrors(retErr, it.Close()) }(rows)
-
-	var prevKey []byte
-	var ok bool
-	for ok, err = rows.Next(ctx); ok; ok, err = rows.Next(ctx) {
-		if err != nil {
-			return err
-		}
-		row := rows.Cur()
-
-		key, ok := row[0].(*tree.DBytes)
-		if !ok {
-			return errors.AssertionFailedf("job info: expected info_key to be DBytes (was %T)", row[0])
-		}
-		infoKey := []byte(*key)
-
-		if bytes.Equal(infoKey, prevKey) {
-			continue
-		}
-		prevKey = append(prevKey[:0], infoKey...)
-
-		value, ok := row[1].(*tree.DBytes)
-		if !ok {
-			return errors.AssertionFailedf("job info: expected value to be DBytes (was %T)", row[1])
-		}
-		if err = fn(infoKey, []byte(*value)); err != nil {
-			return err
-		}
-	}
-
-	return err
-}
-
-// WriteJobInfo writes the provided value to an info record for the provided
-// jobID and infoKey after removing any existing info records for that job and
-// infoKey using the same transaction, effectively replacing any older row with
-// a row with the new value.
-func (r *Registry) WriteJobInfo(
-	ctx context.Context, jobID jobspb.JobID, infoKey, value []byte, txn isql.Txn,
-) error {
-	// Assert we have a non-nil txn with which to delete and then write.
-	if txn == nil {
-		return errors.AssertionFailedf("a txn is required to write job info record")
-	}
-	// First clear out any older revisions of this info.
-	_, err := txn.ExecEx(
-		ctx, "job-info-write", txn.KV(),
-		sessiondata.NodeUserSessionDataOverride,
-		"DELETE FROM system.job_info WHERE job_id = $1 AND info_key = $2",
-		jobID, infoKey,
-	)
-	if err != nil {
-		return err
-	}
-
-	// Write the new info, using the same transaction.
-	_, err = txn.ExecEx(
-		ctx, "job-info-write", txn.KV(),
-		sessiondata.NodeUserSessionDataOverride,
-		`INSERT INTO system.job_info (job_id, info_key, written, value) VALUES ($1, $2, now(), $3)`,
-		jobID, infoKey, value,
-	)
-	return err
 }
 
 // UpdateJobWithTxn calls the Update method on an existing job with jobID, using
@@ -1065,7 +1107,10 @@ func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
 		}
 	})
 
+	r.startedControllerTasksWG.Add(1)
 	if err := stopper.RunAsyncTask(ctx, "jobs/cancel", func(ctx context.Context) {
+		defer r.startedControllerTasksWG.Done()
+
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
 		defer cancel()
 
@@ -1077,7 +1122,11 @@ func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
 			case <-lc.updated:
 				lc.onUpdate()
 			case <-r.stopper.ShouldQuiesce():
-				log.Warningf(ctx, "canceling all adopted jobs due to stopper quiescing")
+				// Note: the jobs are cancelled by virtue of being run with a
+				// WithCancelOnQuesce context. See the resumeJob() function.
+				return
+			case <-r.drainJobs:
+				log.Warningf(ctx, "canceling all adopted jobs due to graceful drain request")
 				r.cancelAllAdoptedJobs()
 				return
 			case <-lc.timer.C:
@@ -1087,9 +1136,14 @@ func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
 			}
 		}
 	}); err != nil {
+		r.startedControllerTasksWG.Done()
 		return err
 	}
+
+	r.startedControllerTasksWG.Add(1)
 	if err := stopper.RunAsyncTask(ctx, "jobs/gc", func(ctx context.Context) {
+		defer r.startedControllerTasksWG.Done()
+
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
 		defer cancel()
 
@@ -1110,6 +1164,8 @@ func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
 				lc.onUpdate()
 			case <-stopper.ShouldQuiesce():
 				return
+			case <-r.drainJobs:
+				return
 			case <-lc.timer.C:
 				lc.timer.Read = true
 				old := timeutil.Now().Add(-1 * retentionDuration())
@@ -1120,9 +1176,14 @@ func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
 			}
 		}
 	}); err != nil {
+		r.startedControllerTasksWG.Done()
 		return err
 	}
-	return stopper.RunAsyncTask(ctx, "jobs/adopt", func(ctx context.Context) {
+
+	r.startedControllerTasksWG.Add(1)
+	if err := stopper.RunAsyncTask(ctx, "jobs/adopt", func(ctx context.Context) {
+		defer r.startedControllerTasksWG.Done()
+
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
 		defer cancel()
 		lc, cleanup := makeLoopController(r.settings, adoptIntervalSetting, r.knobs.IntervalOverrides.Adopt)
@@ -1132,6 +1193,10 @@ func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
 			case <-lc.updated:
 				lc.onUpdate()
 			case <-stopper.ShouldQuiesce():
+				return
+			case <-r.drainRequested:
+				return
+			case <-r.drainJobs:
 				return
 			case shouldClaim := <-r.adoptionCh:
 				// Try to adopt the most recently created job.
@@ -1146,7 +1211,11 @@ func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
 				lc.onExecute()
 			}
 		}
-	})
+	}); err != nil {
+		r.startedControllerTasksWG.Done()
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) maybeCancelJobs(ctx context.Context, s sqlliveness.Session) {
@@ -1175,12 +1244,31 @@ func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) erro
 	}
 }
 
-// TODO (sajjad): Why are we returning column 'created' in this query? It's not
-// being used.
-const expiredJobsQuery = "SELECT id, payload, status, created FROM system.jobs " +
-	"WHERE (created < $1) AND (id > $2) " +
-	"ORDER BY id " + // the ordering is important as we keep track of the maximum ID we've seen
-	"LIMIT $3"
+// The ordering is important as we keep track of the maximum ID we've seen.
+const expiredJobsQuery = `
+SELECT id, payload, status FROM "".crdb_internal.system_jobs
+WHERE (created < $1) AND (id > $2)
+ORDER BY id
+LIMIT $3`
+
+const expiredJobsQueryWithJobInfoTable = `
+WITH
+latestpayload AS (
+    SELECT job_id, value
+    FROM system.job_info AS payload
+    WHERE job_id > $2 AND info_key = 'legacy_payload'
+    ORDER BY written desc
+),
+jobpage AS (
+    SELECT id, status
+    FROM system.jobs
+    WHERE (created < $1) and (id > $2)
+    ORDER BY id
+    LIMIT $3
+)
+SELECT distinct (id), latestpayload.value AS payload, status
+FROM jobpage AS j
+INNER JOIN latestpayload ON j.id = latestpayload.job_id`
 
 // cleanupOldJobsPage deletes up to cleanupPageSize job rows with ID > minID.
 // minID is supposed to be the maximum ID returned by the previous page (0 if no
@@ -1188,7 +1276,15 @@ const expiredJobsQuery = "SELECT id, payload, status, created FROM system.jobs "
 func (r *Registry) cleanupOldJobsPage(
 	ctx context.Context, olderThan time.Time, minID jobspb.JobID, pageSize int,
 ) (done bool, maxID jobspb.JobID, retErr error) {
-	it, err := r.db.Executor().QueryIterator(ctx, "gc-jobs", nil /* txn */, expiredJobsQuery, olderThan, minID, pageSize)
+	var query string
+	if r.settings.Version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled) {
+		query = expiredJobsQueryWithJobInfoTable
+	} else {
+		query = expiredJobsQuery
+	}
+
+	it, err := r.db.Executor().QueryIterator(ctx, "gc-jobs", nil, /* txn */
+		query, olderThan, minID, pageSize)
 	if err != nil {
 		return false, 0, err
 	}
@@ -1442,8 +1538,26 @@ type JobResultsReporter interface {
 // that can be used by the other methods.
 type Constructor func(job *Job, settings *cluster.Settings) Resumer
 
-var constructors = make(map[jobspb.Type]Constructor)
-var options = make(map[jobspb.Type]registerOptions)
+// The constructors and options are protected behind a mutex because
+// the unit tests in this package register constructors/options
+// concurrently with the initialization of test servers, where jobs
+// can get created and adopted.
+var globalMu = struct {
+	syncutil.Mutex
+
+	constructors map[jobspb.Type]Constructor
+	options      map[jobspb.Type]registerOptions
+}{
+	constructors: make(map[jobspb.Type]Constructor),
+	options:      make(map[jobspb.Type]registerOptions),
+}
+
+func getRegisterOptions(typ jobspb.Type) (registerOptions, bool) {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+	opts, ok := globalMu.options[typ]
+	return opts, ok
+}
 
 // RegisterConstructor registers a Resumer constructor for a certain job type.
 //
@@ -1453,7 +1567,10 @@ var options = make(map[jobspb.Type]registerOptions)
 // engineers to explicitly pass one of these options so that they will be
 // prompted to think about which is appropriate for their new job type.
 func RegisterConstructor(typ jobspb.Type, fn Constructor, opts ...RegisterOption) {
-	constructors[typ] = fn
+	globalMu.Lock()
+	defer globalMu.Unlock()
+
+	globalMu.constructors[typ] = fn
 
 	// Apply all options to the struct.
 	var resOpts registerOptions
@@ -1464,16 +1581,21 @@ func RegisterConstructor(typ jobspb.Type, fn Constructor, opts ...RegisterOption
 		panic("when registering a new job type, either jobs.DisablesTenantCostControl " +
 			"or jobs.UsesTenantCostControl is required; see comments for these options to learn more")
 	}
-	options[typ] = resOpts
+	globalMu.options[typ] = resOpts
 }
 
 func (r *Registry) createResumer(job *Job, settings *cluster.Settings) (Resumer, error) {
 	payload := job.Payload()
-	fn := constructors[payload.Type()]
+	fn := func() Constructor {
+		globalMu.Lock()
+		defer globalMu.Unlock()
+		return globalMu.constructors[payload.Type()]
+	}()
 	if fn == nil {
 		return nil, errors.Errorf("no resumer is available for %s", payload.Type())
 	}
-	if wrapper := r.TestingResumerCreationKnobs[payload.Type()]; wrapper != nil {
+	if v, ok := r.creationKnobs.Load(payload.Type()); ok {
+		wrapper := v.(func(Resumer) Resumer)
 		return wrapper(fn(job, settings)), nil
 	}
 	return fn(job, settings), nil
@@ -1490,13 +1612,17 @@ func (r *Registry) stepThroughStateMachine(
 	payload := job.Payload()
 	jobType := payload.Type()
 	if jobErr != nil {
-		log.Infof(ctx, "%s job %d: stepping through state %s with error: %+v", jobType, job.ID(), status, jobErr)
+		if pgerror.HasCandidateCode(jobErr) {
+			log.Infof(ctx, "%s job %d: stepping through state %s with error: %v", jobType, job.ID(), status, jobErr)
+		} else {
+			log.Errorf(ctx, "%s job %d: stepping through state %s with unexpected error: %+v", jobType, job.ID(), status, jobErr)
+		}
 	} else {
 		log.Infof(ctx, "%s job %d: stepping through state %s", jobType, job.ID(), status)
 	}
 	jm := r.metrics.JobMetrics[jobType]
 	onExecutionFailed := func(cause error) error {
-		log.InfofDepth(
+		log.ErrorfDepth(
 			ctx, 1,
 			"job %d: %s execution encountered retriable error: %+v",
 			job.ID(), status, cause,
@@ -1550,8 +1676,12 @@ func (r *Registry) stepThroughStateMachine(
 			jm.ResumeRetryError.Inc(1)
 			return errors.Errorf("job %d: node liveness error: restarting in background", job.ID())
 		}
-		if errors.Is(err, errJobLeaseNotHeld) {
+		if IsLeaseRelocationError(err) {
 			return err
+		}
+
+		if pauseOnErrErr := r.CheckPausepoint("after_exec_error"); pauseOnErrErr != nil {
+			err = errors.WithSecondaryError(pauseOnErrErr, err)
 		}
 
 		if errors.Is(err, errPauseSelfSentinel) {
@@ -1761,6 +1891,19 @@ func (r *Registry) cancelRegisteredJobContext(jobID jobspb.JobID) bool {
 	return ok
 }
 
+// GetResumerForClaimedJob returns the resumer of the jobID if the registry has
+// a claim on the job.
+func (r *Registry) GetResumerForClaimedJob(jobID jobspb.JobID) (Resumer, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	aj, ok := r.mu.adoptedJobs[jobID]
+	if !ok {
+		return nil, &JobNotFoundError{jobID: jobID}
+	}
+	return aj.resumer, nil
+}
+
 func (r *Registry) getClaimedJob(jobID jobspb.JobID) (*Job, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1867,6 +2010,11 @@ func (r *Registry) RelocateLease(
 	return errors.Mark(errors.Newf("execution of job %d relocated to %d", id, destID), errJobLeaseNotHeld), nil
 }
 
+// IsLeaseRelocationError returns true if the error indicates lease relocation.
+func IsLeaseRelocationError(err error) bool {
+	return errors.Is(err, errJobLeaseNotHeld)
+}
+
 // IsDraining returns true if the job system has been informed that
 // the local node is draining.
 //
@@ -1879,14 +2027,68 @@ func (r *Registry) IsDraining() bool {
 	return r.mu.draining
 }
 
-// SetDraining informs the job system if the node is draining.
-//
-// NB: Check the implementation of drain before adding code that would
-// make this block.
-func (r *Registry) SetDraining(draining bool) {
+// WaitForRegistryShutdown waits for all background job registry tasks to complete.
+func (r *Registry) WaitForRegistryShutdown(ctx context.Context) {
+	log.Infof(ctx, "starting to wait for job registry to shut down")
+	defer log.Infof(ctx, "job registry tasks successfully shut down")
+	r.startedControllerTasksWG.Wait()
+}
+
+// DrainRequested informs the job system that this node is being drained.
+// Waits for the jobs to complete their drain logic (or context cancellation)
+// prior to returning.  After this function returns, no new jobs will be adopted,
+// and all running jobs will be canceled.
+// WaitForRegistryShutdown can then be used to wait for those tasks to complete.
+func (r *Registry) DrainRequested(ctx context.Context) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.mu.draining = draining
+	alreadyDraining := r.mu.draining
+	numWait := r.mu.numDrainWait
+	r.mu.draining = true
+	r.mu.Unlock()
+
+	if alreadyDraining {
+		return
+	}
+
+	close(r.drainRequested)
+	defer close(r.drainJobs)
+
+	if numWait == 0 {
+		return
+	}
+
+	for numWait > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.stopper.ShouldQuiesce():
+			return
+		case <-r.jobDrained:
+			r.mu.Lock()
+			numWait = r.mu.numDrainWait
+			r.mu.Unlock()
+		}
+	}
+}
+
+// OnDrain returns a channel that can be selected on to detect when the job
+// registry begins draining.
+// The caller must invoke returned function when drain completes.
+func (r *Registry) OnDrain() (<-chan struct{}, func()) {
+	r.mu.Lock()
+	r.mu.numDrainWait++
+	r.mu.Unlock()
+
+	return r.drainRequested, func() {
+		r.mu.Lock()
+		r.mu.numDrainWait--
+		r.mu.Unlock()
+
+		select {
+		case r.jobDrained <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // TestingIsJobIdle returns true if the job is adopted and currently idle.
@@ -1895,4 +2097,33 @@ func (r *Registry) TestingIsJobIdle(jobID jobspb.JobID) bool {
 	defer r.mu.Unlock()
 	adoptedJob := r.mu.adoptedJobs[jobID]
 	return adoptedJob != nil && adoptedJob.isIdle
+}
+
+// MarkAsIngesting records a given jobID as actively ingesting data on the node
+// in which this Registry resides, either directly or via a processor running on
+// behalf of a job being run by a different registry. The returned function is
+// to be called when this node is no longer ingesting for that jobID, typically
+// by deferring it when calling this method. See IsIngesting.
+func (r *Registry) MarkAsIngesting(jobID catpb.JobID) func() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.mu.ingestingJobs == nil {
+		r.mu.ingestingJobs = make(map[catpb.JobID]struct{})
+	}
+	r.mu.ingestingJobs[jobID] = struct{}{}
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		delete(r.mu.ingestingJobs, jobID)
+	}
+}
+
+// IsIngesting returns true if a given job has indicated it is ingesting at this
+// time on this node. See MarkAsIngesting.
+func (r *Registry) IsIngesting(jobID catpb.JobID) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.mu.ingestingJobs[jobID]
+	return ok
 }

@@ -35,6 +35,7 @@ import {
   selectLivenessRequestStatus,
   selectNodeRequestStatus,
 } from "src/redux/nodes";
+import { BackToAdvanceDebug } from "src/views/reports/containers/util";
 
 type DataDistributionResponse =
   cockroach.server.serverpb.DataDistributionResponse;
@@ -54,6 +55,18 @@ const ZONE_CONFIG_TEXT = (
     </a>
     ) control how CockroachDB distributes data across nodes.
   </span>
+);
+
+const RANGE_COALESCING_ADVICE = (
+  <div>
+    <pre>
+      SET CLUSTER SETTING spanconfig.range_coalescing.system.enabled = false;
+    </pre>
+    <pre>
+      SET CLUSTER SETTING spanconfig.range_coalescing.application.enabled =
+      false;
+    </pre>
+  </div>
 );
 
 interface DataDistributionProps {
@@ -159,7 +172,9 @@ interface DataDistributionPageProps {
   refreshLiveness: typeof refreshLiveness;
 }
 
-export class DataDistributionPage extends React.Component<DataDistributionPageProps> {
+export class DataDistributionPage extends React.Component<
+  DataDistributionPageProps & RouteComponentProps
+> {
   componentDidMount() {
     this.props.refreshDataDistribution();
     this.props.refreshNodes();
@@ -176,8 +191,15 @@ export class DataDistributionPage extends React.Component<DataDistributionPagePr
     return (
       <div>
         <Helmet title="Data Distribution" />
+        <BackToAdvanceDebug history={this.props.history} />
         <section className="section">
           <h1 className="base-heading">Data Distribution</h1>
+          <p style={{ maxWidth: 300, paddingTop: 10 }}>
+            Note: the data distribution render does not work with coalesced
+            ranges. To disable coalesced ranges (would increase range count),
+            run the following SQL statement:
+          </p>
+          {RANGE_COALESCING_ADVICE}
         </section>
         <section className="section">
           <Loading

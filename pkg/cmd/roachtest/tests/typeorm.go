@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -24,7 +25,7 @@ import (
 )
 
 var typeORMReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedTypeORMRelease = "0.3.5"
+var supportedTypeORMRelease = "0.3.17"
 
 // This test runs TypeORM's full test suite against a single cockroach node.
 func registerTypeORM(r registry.Registry) {
@@ -89,7 +90,7 @@ func registerTypeORM(r registry.Registry) {
 			c,
 			node,
 			"add nodesource repository",
-			`sudo apt install ca-certificates && curl -fsSL https://deb.nodesource.com/setup_16.x | sudo -E bash -`,
+			`sudo apt install ca-certificates && curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -166,12 +167,27 @@ func registerTypeORM(r registry.Registry) {
 		rawResults := result.Stdout + result.Stderr
 		t.L().Printf("Test Results: %s", rawResults)
 		if err != nil {
+			// We don't have a good way of parsing test results from javascript, so we
+			// use substring matching and regexp instead of using a blocklist like
+			// we use for other ORM tests.
+			numFailingRegex := regexp.MustCompile(`(\d+) failing`)
+			matches := numFailingRegex.FindStringSubmatch(rawResults)
+			numFailing, convErr := strconv.Atoi(matches[1])
+			if convErr != nil {
+				t.Fatal(convErr)
+			}
+
+			// One test is known to flake during setup.
+			if strings.Contains(rawResults, `"before each" hook for "should select specific columns":`) {
+				numFailing -= 1
+			}
+
+			// Tests are allowed to flake due to transaction retry errors.
 			txnRetryErrCount := strings.Count(rawResults, "restart transaction")
-			if strings.Contains(rawResults, "1 failing") && txnRetryErrCount == 1 {
-				err = nil
-			} else if strings.Contains(rawResults, "2 failing") && txnRetryErrCount == 2 {
+			if numFailing == txnRetryErrCount {
 				err = nil
 			}
+
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -180,9 +196,10 @@ func registerTypeORM(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:    "typeorm",
-		Owner:   registry.OwnerSQLSessions,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `orm`},
+		Leases:  registry.MetamorphicLeases,
+		Tags:    registry.Tags(`default`, `orm`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTypeORM(ctx, t, c)
 		},

@@ -16,9 +16,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -79,7 +79,7 @@ func TestDeclareKeysResolveIntent(t *testing.T) {
 	}
 	ctx := context.Background()
 	engine := storage.NewDefaultInMemForTesting()
-	st := makeClusterSettingsUsingEngineIntentsSetting(engine)
+	st := cluster.MakeTestingClusterSettings()
 	defer engine.Close()
 	testutils.RunTrueAndFalse(t, "ranged", func(t *testing.T, ranged bool) {
 		for _, test := range tests {
@@ -100,7 +100,8 @@ func TestDeclareKeysResolveIntent(t *testing.T) {
 
 				as := abortspan.New(desc.RangeID)
 
-				var latchSpans, lockSpans spanset.SpanSet
+				var latchSpans spanset.SpanSet
+				var lockSpans lockspanset.LockSpanSet
 
 				var h kvpb.Header
 				h.RangeID = desc.RangeID
@@ -150,7 +151,7 @@ func TestResolveIntentAfterPartialRollback(t *testing.T) {
 	ts := hlc.Timestamp{WallTime: 1}
 	ts2 := hlc.Timestamp{WallTime: 2}
 	endKey := roachpb.Key("z")
-	txn := roachpb.MakeTransaction("test", k, 0, ts, 0, 1)
+	txn := roachpb.MakeTransaction("test", k, 0, 0, ts, 0, 1, 0)
 	desc := roachpb.RangeDescriptor{
 		RangeID:  99,
 		StartKey: roachpb.RKey(k),
@@ -162,19 +163,19 @@ func TestResolveIntentAfterPartialRollback(t *testing.T) {
 		defer db.Close()
 		batch := db.NewBatch()
 		defer batch.Close()
-		st := makeClusterSettingsUsingEngineIntentsSetting(db)
+		st := cluster.MakeTestingClusterSettings()
 
 		var v roachpb.Value
 		// Write a first value at key.
 		v.SetString("a")
 		txn.Sequence = 0
-		if err := storage.MVCCPut(ctx, batch, nil, k, ts, hlc.ClockTimestamp{}, v, &txn); err != nil {
+		if err := storage.MVCCPut(ctx, batch, k, ts, v, storage.MVCCWriteOptions{Txn: &txn}); err != nil {
 			t.Fatal(err)
 		}
 		// Write another value.
 		v.SetString("b")
 		txn.Sequence = 1
-		if err := storage.MVCCPut(ctx, batch, nil, k, ts, hlc.ClockTimestamp{}, v, &txn); err != nil {
+		if err := storage.MVCCPut(ctx, batch, k, ts, v, storage.MVCCWriteOptions{Txn: &txn}); err != nil {
 			t.Fatal(err)
 		}
 		if err := batch.Commit(true); err != nil {
@@ -294,17 +295,17 @@ func TestResolveIntentWithTargetBytes(t *testing.T) {
 		}
 		values[i] = roachpb.MakeValueFromBytes([]byte{b})
 	}
-	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 0, ts, 0, 1)
+	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 0, 0, ts, 0, 1, 0)
 
 	testutils.RunTrueAndFalse(t, "ranged", func(t *testing.T, ranged bool) {
 		db := storage.NewDefaultInMemForTesting()
 		defer db.Close()
 		batch := db.NewBatch()
 		defer batch.Close()
-		st := makeClusterSettingsUsingEngineIntentsSetting(db)
+		st := cluster.MakeTestingClusterSettings()
 
 		for i, testKey := range testKeys {
-			err := storage.MVCCPut(ctx, batch, nil, testKey, ts, hlc.ClockTimestamp{}, values[i], &txn)
+			err := storage.MVCCPut(ctx, batch, testKey, ts, values[i], storage.MVCCWriteOptions{Txn: &txn})
 			require.NoError(t, err)
 		}
 		initialBytes := batch.Len()
@@ -476,9 +477,4 @@ func TestResolveIntentWithTargetBytes(t *testing.T) {
 			}
 		}
 	})
-}
-
-func makeClusterSettingsUsingEngineIntentsSetting(engine storage.Engine) *cluster.Settings {
-	version := clusterversion.TestingBinaryVersion
-	return cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
 }

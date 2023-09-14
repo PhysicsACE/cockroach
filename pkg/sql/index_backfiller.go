@@ -13,7 +13,9 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -23,8 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
 // IndexBackfillPlanner holds dependencies for an index backfiller
@@ -70,8 +74,22 @@ func (ib *IndexBackfillPlanner) BackfillIndexes(
 	ctx context.Context,
 	progress scexec.BackfillProgress,
 	tracker scexec.BackfillerProgressWriter,
+	job *jobs.Job,
 	descriptor catalog.TableDescriptor,
-) error {
+) (err error) {
+	// Potentially install a protected timestamp before the GC interval is hit,
+	// which can help avoid transaction retry errors, with shorter GC intervals.
+	protectedTimestampCleaner := ib.execCfg.ProtectedTimestampManager.TryToProtectBeforeGC(ctx,
+		job,
+		descriptor,
+		progress.MinimumWriteTimestamp)
+	defer func() {
+		cleanupError := protectedTimestampCleaner(ctx)
+		if cleanupError != nil {
+			err = errors.CombineErrors(cleanupError, err)
+		}
+	}()
+
 	var completed = struct {
 		syncutil.Mutex
 		g roachpb.SpanGroup
@@ -131,20 +149,25 @@ func scanTargetSpansToPushTimestampCache(
 	ctx context.Context, db *kv.DB, backfillTimestamp hlc.Timestamp, targetSpans []roachpb.Span,
 ) error {
 	const pageSize = 10000
-	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.SetFixedTimestamp(ctx, backfillTimestamp); err != nil {
-			return err
-		}
-		for _, span := range targetSpans {
-			// TODO(dt): a Count() request would be nice here if the target isn't
-			// empty, since we don't need to drag all the results back just to
-			// then ignore them -- we just need the iteration on the far end.
-			if err := txn.Iterate(ctx, span.Key, span.EndKey, pageSize, iterateNoop); err != nil {
+	return db.TxnWithAdmissionControl(
+		ctx, kvpb.AdmissionHeader_FROM_SQL, admissionpb.BulkNormalPri,
+		kv.SteppingDisabled,
+		func(
+			ctx context.Context, txn *kv.Txn,
+		) error {
+			if err := txn.SetFixedTimestamp(ctx, backfillTimestamp); err != nil {
 				return err
 			}
-		}
-		return nil
-	})
+			for _, span := range targetSpans {
+				// TODO(dt): a Count() request would be nice here if the target isn't
+				// empty, since we don't need to drag all the results back just to
+				// then ignore them -- we just need the iteration on the far end.
+				if err := txn.Iterate(ctx, span.Key, span.EndKey, pageSize, iterateNoop); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 }
 
 func iterateNoop(_ []kv.KeyValue) error { return nil }
@@ -167,7 +190,7 @@ func (ib *IndexBackfillPlanner) plan(
 	if err := DescsTxn(ctx, ib.execCfg, func(
 		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
-		sd := NewFakeSessionData(ib.execCfg.SV(), "plan-index-backfill")
+		sd := NewInternalSessionData(ctx, ib.execCfg.Settings, "plan-index-backfill")
 		evalCtx = createSchemaChangeEvalCtx(ctx, ib.execCfg, sd, nowTimestamp, descriptors)
 		planCtx = ib.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx,
 			nil /* planner */, txn.KV(), DistributionTypeSystemTenantOnly)

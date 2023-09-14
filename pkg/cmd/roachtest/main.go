@@ -19,15 +19,21 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/tests"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -36,6 +42,11 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
+
+// Note that the custom exit codes below are not exposed when running
+// roachtest on TeamCity. See `teamcity-roachtest-invoke.sh` for more
+// details. Also, if the exit codes here change, they need to updated
+// on that script accordingly.
 
 // ExitCodeTestsFailed is the exit code that results from a run of
 // roachtest in which the infrastructure worked, but at least one
@@ -74,7 +85,6 @@ func parseCreateOpts(flags *pflag.FlagSet, opts *vm.CreateOpts) {
 }
 
 func main() {
-	rand.Seed(timeutil.Now().UnixNano())
 	username := os.Getenv("ROACHPROD_USER")
 	parallelism := 10
 	var cpuQuota int
@@ -94,6 +104,7 @@ func main() {
 	var clusterID string
 	var count = 1
 	var versionsBinaryOverride map[string]string
+	var selectProbability float64
 
 	cobra.EnableCommandSorting = false
 
@@ -118,16 +129,57 @@ func main() {
 			if cmd.Name() == "help" {
 				return nil
 			}
-
-			if clusterName != "" && local {
-				return fmt.Errorf(
-					"cannot specify both an existing cluster (%s) and --local. However, if a local cluster "+
-						"already exists, --clusters=local will use it",
-					clusterName)
+			local := cmd.Flags().Lookup("local").Value.String() == "true"
+			if local {
+				if clusterName != "" {
+					return fmt.Errorf(
+						"cannot specify both an existing cluster (%s) and --local. However, if a local cluster "+
+							"already exists, --clusters=local will use it",
+						clusterName)
+				}
+				cloud = spec.Local
 			}
 			switch cmd.Name() {
 			case "run", "bench", "store-gen":
+				if !(0 <= arm64Probability && arm64Probability <= 1) {
+					return fmt.Errorf("'metamorphic-arm64-probability' must be in [0,1]")
+				}
+				if !(0 <= fipsProbability && fipsProbability <= 1) {
+					return fmt.Errorf("'metamorphic-fips-probability' must be in [0,1]")
+				}
+				if arm64Probability == 1 && fipsProbability != 0 {
+					return fmt.Errorf("'metamorphic-fips-probability' must be 0 when 'metamorphic-arm64-probability' is 1")
+				}
+				if fipsProbability == 1 && arm64Probability != 0 {
+					return fmt.Errorf("'metamorphic-arm64-probability' must be 0 when 'metamorphic-fips-probability' is 1")
+				}
+				if !(0 <= selectProbability && selectProbability <= 1) {
+					return fmt.Errorf("'select-probability' must be in [0,1]")
+				}
+				arm64Opt := cmd.Flags().Lookup("metamorphic-arm64-probability")
+				if !arm64Opt.Changed && runtime.GOARCH == "arm64" && cloud == spec.Local {
+					fmt.Printf("Detected 'arm64' in 'local mode', setting 'metamorphic-arm64-probability' to 1; use --metamorphic-arm64-probability to run (emulated) with other binaries\n")
+					arm64Probability = 1
+				}
+				// Find and validate all required binaries and libraries.
 				initBinariesAndLibraries()
+
+				if arm64Probability > 0 {
+					fmt.Printf("ARM64 clusters will be provisioned with probability %.2f\n", arm64Probability)
+				}
+				amd64Probability := 1 - arm64Probability
+				if amd64Probability > 0 {
+					fmt.Printf("AMD64 clusters will be provisioned with probability %.2f\n", amd64Probability)
+				}
+				if fipsProbability > 0 {
+					// N.B. arm64Probability < 1, otherwise fipsProbability == 0, as per above check.
+					// Hence, amd64Probability > 0 is implied.
+					fmt.Printf("FIPS clusters will be provisioned with probability %.2f\n", fipsProbability*amd64Probability)
+				}
+
+				if selectProbability > 0 {
+					fmt.Printf("Matching tests will be selected with probability %.2f\n", selectProbability)
+				}
 			}
 			return nil
 		},
@@ -139,6 +191,7 @@ func main() {
 			"If fewer than --parallelism names are specified, then the parallelism "+
 			"is capped to the number of clusters specified. When a cluster does not exist "+
 			"yet, it is created according to the spec.")
+	var local bool
 	rootCmd.PersistentFlags().BoolVarP(
 		&local, "local", "l", local, "run tests locally")
 	rootCmd.PersistentFlags().StringVarP(
@@ -146,15 +199,25 @@ func main() {
 		"Username to use as a cluster name prefix. "+
 			"If blank, the current OS user is detected and specified.")
 	rootCmd.PersistentFlags().StringVar(
-		&cockroach, "cockroach", "", "path to cockroach binary to use")
+		&cockroachPath, "cockroach", "", "absolute path to cockroach binary to use")
 	rootCmd.PersistentFlags().StringVar(
-		&cockroachShort, "cockroach-short", "", "path to cockroach-short binary (compiled with crdb_test build tag) to use")
+		&cockroachEAPath, "cockroach-ea", "", "absolute path to cockroach binary with enabled (runtime) assertions (i.e, compiled with crdb_test)")
 	rootCmd.PersistentFlags().StringVar(
-		&workload, "workload", "", "path to workload binary to use")
+		&workloadPath, "workload", "", "absolute path to workload binary to use")
 	rootCmd.PersistentFlags().Float64Var(
 		&encryptionProbability, "metamorphic-encryption-probability", defaultEncryptionProbability,
 		"probability that clusters will be created with encryption-at-rest enabled "+
 			"for tests that support metamorphic encryption (default 1.0)")
+	rootCmd.PersistentFlags().Float64Var(
+		&fipsProbability, "metamorphic-fips-probability", defaultFIPSProbability,
+		"conditional probability that amd64 clusters will be created with FIPS, i.e., P(fips | amd64), "+
+			"for tests that support FIPS and whose CPU architecture is 'amd64' (default 0) "+
+			"NOTE: amd64 clusters are created with probability 1-P(arm64), where P(arm64) is 'metamorphic-arm64-probability'. "+
+			"Hence, P(fips | amd64) = P(fips) * (1 - P(arm64))")
+	rootCmd.PersistentFlags().Float64Var(
+		&arm64Probability, "metamorphic-arm64-probability", defaultARM64Probability,
+		"probability that clusters will be created with 'arm64' CPU architecture "+
+			"for tests that support 'arm64' (default 0)")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   `version`,
@@ -178,37 +241,70 @@ Use --bench to list benchmarks instead of tests.
 
 Each test has a set of tags. The tags are used to skip tests which don't match
 the tag filter. The tag filter is specified by specifying a pattern with the
-"tag:" prefix. The default tag filter is "tag:default" which matches any test
-that has the "default" tag. Note that tests are selected based on their name,
-and skipped based on their tag.
+"tag:" prefix.
+
+If multiple "tag:" patterns are specified, the test must match at
+least one of them.
+
+Within a single "tag:" pattern, multiple tags can be specified by separating them
+with a comma. In this case, the test must match all of the tags.
 
 Examples:
 
    roachtest list acceptance copy/bank/.*false
-   roachtest list tag:acceptance
+   roachtest list tag:owner-kv
    roachtest list tag:weekly
+
+   # match weekly kv owned tests
+   roachtest list tag:owner-kv,weekly
+
+   # match weekly kv owner tests or aws tests
+   roachtest list tag:owner-kv,weekly tag:aws
 `,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
-			if !listBench {
-				tests.RegisterTests(&r)
-			} else {
-				tests.RegisterBenchmarks(&r)
-			}
+			r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg, listBench)
+			tests.RegisterTests(&r)
 
-			matchedTests := r.List(context.Background(), args)
-			for _, test := range matchedTests {
+			filter := registry.NewTestFilter(args, runSkipped)
+			specs := testsToRun(r, filter, selectProbability, false)
+
+			for _, s := range specs {
 				var skip string
-				if test.Skip != "" && !runSkipped {
-					skip = " (skipped: " + test.Skip + ")"
+				if s.Skip != "" && !runSkipped {
+					skip = " (skipped: " + s.Skip + ")"
 				}
-				fmt.Printf("%s [%s]%s\n", test.Name, test.Owner, skip)
+				fmt.Printf("%s [%s]%s\n", s.Name, s.Owner, skip)
 			}
 			return nil
 		},
 	}
 	listCmd.Flags().BoolVar(
 		&listBench, "bench", false, "list benchmarks instead of tests")
+	listCmd.Flags().StringVar(
+		&cloud, "cloud", cloud, "cloud provider to use (aws, azure, or gce)")
+
+	runFn := func(args []string, benchOnly bool) error {
+		if literalArtifacts == "" {
+			literalArtifacts = artifacts
+		}
+		return runTests(tests.RegisterTests, cliCfg{
+			args:                   args,
+			count:                  count,
+			cpuQuota:               cpuQuota,
+			runSkipped:             runSkipped,
+			debugMode:              debugModeFromOpts(),
+			skipInit:               skipInit,
+			httpPort:               httpPort,
+			promPort:               promPort,
+			parallelism:            parallelism,
+			artifactsDir:           artifacts,
+			literalArtifactsDir:    literalArtifacts,
+			user:                   getUser(username),
+			clusterID:              clusterID,
+			versionsBinaryOverride: versionsBinaryOverride,
+			selectProbability:      selectProbability,
+		}, benchOnly)
+	}
 
 	var runCmd = &cobra.Command{
 		// Don't display usage when tests fail.
@@ -224,27 +320,12 @@ the test tags.
 If all invoked tests passed, the exit status is zero. If at least one test
 failed, it is 10. Any other exit status reports a problem with the test
 runner itself.
+
+COCKROACH_ environment variables in the local environment are passed through to
+the cluster nodes on start.
 `,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if literalArtifacts == "" {
-				literalArtifacts = artifacts
-			}
-			return runTests(tests.RegisterTests, cliCfg{
-				args:                   args,
-				count:                  count,
-				cpuQuota:               cpuQuota,
-				runSkipped:             runSkipped,
-				debugMode:              debugModeFromOpts(),
-				skipInit:               skipInit,
-				httpPort:               httpPort,
-				promPort:               promPort,
-				parallelism:            parallelism,
-				artifactsDir:           artifacts,
-				literalArtifactsDir:    literalArtifacts,
-				user:                   username,
-				clusterID:              clusterID,
-				versionsBinaryOverride: versionsBinaryOverride,
-			})
+			return runFn(args, false /* benchOnly */)
 		},
 	}
 
@@ -257,6 +338,9 @@ runner itself.
 	runCmd.Flags().IntVar(
 		&promPort, "prom-port", 2113,
 		"the http port on which to expose prom metrics from the roachtest process")
+	runCmd.Flags().Float64Var(
+		&selectProbability, "select-probability", 1.0,
+		"the probability of a matched test being selected to run. Note: this will return at least one test per prefix.")
 
 	var benchCmd = &cobra.Command{
 		// Don't display usage when tests fail.
@@ -265,23 +349,7 @@ runner itself.
 		Short:        "run automated benchmarks on cockroach cluster",
 		Long:         `Run automated benchmarks on existing or ephemeral cockroach clusters.`,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if literalArtifacts == "" {
-				literalArtifacts = artifacts
-			}
-			return runTests(tests.RegisterBenchmarks, cliCfg{
-				args:                   args,
-				count:                  count,
-				cpuQuota:               cpuQuota,
-				runSkipped:             runSkipped,
-				debugMode:              debugModeFromOpts(),
-				skipInit:               skipInit,
-				httpPort:               httpPort,
-				parallelism:            parallelism,
-				artifactsDir:           artifacts,
-				user:                   username,
-				clusterID:              clusterID,
-				versionsBinaryOverride: versionsBinaryOverride,
-			})
+			return runFn(args, true /* benchOnly */)
 		},
 	}
 
@@ -294,7 +362,7 @@ runner itself.
 		cmd.Flags().StringVar(
 			&cloud, "cloud", cloud, "cloud provider to use (aws, azure, or gce)")
 		cmd.Flags().StringVar(
-			&clusterID, "cluster-id", "", "an identifier to use in the test cluster's name")
+			&clusterID, "cluster-id", "", "an identifier to use in the name of the test cluster(s)")
 		cmd.Flags().IntVar(
 			&count, "count", 1, "the number of times to run each test")
 		cmd.Flags().BoolVarP(
@@ -330,8 +398,8 @@ runner itself.
 		cmd.Flags().StringToStringVar(
 			&versionsBinaryOverride, "versions-binary-override", nil,
 			"List of <version>=<path to cockroach binary>. If a certain version <ver> "+
-				"is present in the list,"+"the respective binary will be used when a "+
-				"multi-version test asks for the respective binary, instead of "+
+				"is present in the list, the respective binary will be used when a "+
+				"mixed-version test asks for the respective binary, instead of "+
 				"`roachprod stage <ver>`. Example: 20.1.4=cockroach-20.1,20.2.0=cockroach-20.2.")
 	}
 
@@ -348,6 +416,8 @@ runner itself.
 		fmt.Fprintf(os.Stderr, "unable to lookup current user: %s\n", err)
 		os.Exit(1)
 	}
+	// Disable spinners and other fancy status messages since all IO is non-interactive.
+	config.Quiet = true
 
 	if err := roachprod.InitDirs(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
@@ -382,13 +452,17 @@ type cliCfg struct {
 	user                   string
 	clusterID              string
 	versionsBinaryOverride map[string]string
+	selectProbability      float64
 }
 
-func runTests(register func(registry.Registry), cfg cliCfg) error {
+func runTests(register func(registry.Registry), cfg cliCfg, benchOnly bool) error {
 	if cfg.count <= 0 {
 		return fmt.Errorf("--count (%d) must by greater than 0", cfg.count)
 	}
-	r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
+	r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg, benchOnly)
+
+	// actual registering of tests
+	// TODO: don't register if we can't run on the specified registry cloud
 	register(&r)
 	cr := newClusterRegistry()
 	stopper := stop.NewStopper()
@@ -398,7 +472,7 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	filter := registry.NewTestFilter(cfg.args, cfg.runSkipped)
 	clusterType := roachprodCluster
 	bindTo := ""
-	if local {
+	if cloud == spec.Local {
 		clusterType = localCluster
 
 		// This will suppress the annoying "Allow incoming network connections" popup from
@@ -415,17 +489,19 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	opt := clustersOpt{
 		typ:         clusterType,
 		clusterName: clusterName,
-		user:        getUser(cfg.user),
-		cpuQuota:    cfg.cpuQuota,
-		debugMode:   cfg.debugMode,
-		clusterID:   cfg.clusterID,
+		// Precedence for resolving the user: cli arg, env.ROACHPROD_USER, current user.
+		user:      cfg.user,
+		cpuQuota:  cfg.cpuQuota,
+		debugMode: cfg.debugMode,
+		clusterID: cfg.clusterID,
 	}
 	if err := runner.runHTTPServer(cfg.httpPort, os.Stdout, bindTo); err != nil {
 		return err
 	}
 
-	tests := testsToRun(context.Background(), r, filter)
-	n := len(tests)
+	specs := testsToRun(r, filter, cfg.selectProbability, true)
+
+	n := len(specs)
 	if n*cfg.count < cfg.parallelism {
 		// Don't spin up more workers than necessary. This has particular
 		// implications for the common case of running a single test once: if
@@ -463,8 +539,15 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	CtrlC(ctx, l, cancel, cr)
+	// Install goroutine leak checker and run it at the end of the entire test
+	// run. If a test is leaking a goroutine, then it will likely be still around.
+	// We could diff goroutine snapshots before/after each executed test, but that
+	// could yield false positives; e.g., user-specified test teardown goroutines
+	// may still be running long after the test has completed.
+	defer leaktest.AfterTest(l)()
+
 	err := runner.Run(
-		ctx, tests, cfg.count, cfg.parallelism, opt,
+		ctx, specs, cfg.count, cfg.parallelism, opt,
 		testOpts{
 			versionsBinaryOverride: cfg.versionsBinaryOverride,
 			skipInit:               cfg.skipInit,
@@ -530,11 +613,11 @@ func CtrlC(ctx context.Context, l *logger.Logger, cancel func(), cr *clusterRegi
 		select {
 		case <-sig:
 			shout(ctx, l, os.Stderr, "Second SIGINT received. Quitting. Cluster might be left behind.")
-			os.Exit(2)
 		case <-destroyCh:
 			shout(ctx, l, os.Stderr, "Done destroying all clusters.")
-			os.Exit(2)
 		}
+		l.Printf("all stacks:\n\n%s\n", allstacks.Get())
+		os.Exit(2)
 	}()
 }
 
@@ -571,28 +654,112 @@ func testRunnerLogger(
 }
 
 func testsToRun(
-	ctx context.Context, r testRegistryImpl, filter *registry.TestFilter,
+	r testRegistryImpl, filter *registry.TestFilter, selectProbability float64, print bool,
 ) []registry.TestSpec {
-	tests, tagMismatch := r.GetTests(ctx, filter)
+	specs, tagMismatch := r.GetTests(filter)
 
 	var notSkipped []registry.TestSpec
-	for _, s := range tests {
+	for _, s := range specs {
 		if s.Skip == "" || filter.RunSkipped {
 			notSkipped = append(notSkipped, s)
 		} else {
-			if teamCity {
+			if print && teamCity {
 				fmt.Fprintf(os.Stdout, "##teamcity[testIgnored name='%s' message='%s']\n",
 					s.Name, teamCityEscape(s.Skip))
 			}
-			fmt.Fprintf(os.Stdout, "--- SKIP: %s (%s)\n\t%s\n", s.Name, "0.00s", s.Skip)
+			if print {
+				fmt.Fprintf(os.Stdout, "--- SKIP: %s (%s)\n\t%s\n", s.Name, "0.00s", s.Skip)
+			}
 		}
 	}
 	for _, s := range tagMismatch {
-		if teamCity {
+		if print && teamCity {
 			fmt.Fprintf(os.Stdout, "##teamcity[testIgnored name='%s' message='tag mismatch']\n",
 				s.Name)
 		}
-		fmt.Fprintf(os.Stdout, "--- SKIP: %s (%s)\n\ttag mismatch\n", s.Name, "0.00s")
+		if print {
+			fmt.Fprintf(os.Stdout, "--- SKIP: %s (%s)\n\ttag mismatch\n", s.Name, "0.00s")
+		}
 	}
-	return notSkipped
+
+	return selectSpecs(notSkipped, selectProbability, true, print)
+}
+
+// selectSpecs returns a random sample of the given test specs.
+// If atLeastOnePerPrefix is true, it guarantees that at least one test is
+// selected for each prefix (e.g. kv0/, acceptance/).
+// This assumes that specs are sorted by name, which is the case for
+// testRegistryImpl.GetTests().
+// TODO(smg260): Perhaps expose `atLeastOnePerPrefix` via CLI
+func selectSpecs(
+	specs []registry.TestSpec, samplePct float64, atLeastOnePerPrefix bool, print bool,
+) []registry.TestSpec {
+	if samplePct == 1 || len(specs) == 0 {
+		return specs
+	}
+
+	var sampled []registry.TestSpec
+	var selectedIdxs []int
+
+	prefix := strings.Split(specs[0].Name, "/")[0]
+	prefixSelected := false
+	prefixIdx := 0
+
+	// Selects one random spec from the range [start, end) and appends it to sampled.
+	collectRandomSpecFromRange := func(start, end int) {
+		i := start + rand.Intn(end-start)
+		sampled = append(sampled, specs[i])
+		selectedIdxs = append(selectedIdxs, i)
+	}
+	for i, s := range specs {
+		if atLeastOnePerPrefix {
+			currPrefix := strings.Split(s.Name, "/")[0]
+			// New prefix. Check we've at least one selected test for the previous prefix.
+			if currPrefix != prefix {
+				if !prefixSelected {
+					collectRandomSpecFromRange(prefixIdx, i)
+				}
+				prefix = currPrefix
+				prefixIdx = i
+				prefixSelected = false
+			}
+		}
+
+		if rand.Float64() < samplePct {
+			sampled = append(sampled, s)
+			selectedIdxs = append(selectedIdxs, i)
+			prefixSelected = true
+			continue
+		}
+
+		if atLeastOnePerPrefix && i == len(specs)-1 && !prefixSelected {
+			// i + 1 since we want to include the last element
+			collectRandomSpecFromRange(prefixIdx, i+1)
+		}
+	}
+
+	p := 0
+	// The list would already be sorted were it not for the lookback to
+	// ensure at least one test per prefix.
+	if atLeastOnePerPrefix {
+		sort.Ints(selectedIdxs)
+	}
+	// This loop depends on an ordered list as we are essentially
+	// skipping all values in between the selected indexes.
+	for _, i := range selectedIdxs {
+		for j := p; j < i; j++ {
+			s := specs[j]
+			if print && teamCity {
+				fmt.Fprintf(os.Stdout, "##teamcity[testIgnored name='%s' message='excluded via sampling']\n",
+					s.Name)
+			}
+
+			if print {
+				fmt.Fprintf(os.Stdout, "--- SKIP: %s (%s)\n\texcluded via sampling\n", s.Name, "0.00s")
+			}
+		}
+		p = i + 1
+	}
+
+	return sampled
 }

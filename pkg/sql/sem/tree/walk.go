@@ -775,6 +775,9 @@ func (expr *DInterval) Walk(_ Visitor) Expr { return expr }
 func (expr *DBox2D) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
+func (expr *DPGLSN) Walk(_ Visitor) Expr { return expr }
+
+// Walk implements the Expr interface.
 func (expr *DGeography) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
@@ -1056,6 +1059,34 @@ func (n *AlterTenantReplication) walkStmt(v Visitor) Statement {
 	return ret
 }
 
+// copyNode makes a copy of this node without recursing.
+func (n *LikeTenantSpec) copyNode() *LikeTenantSpec {
+	nodeCopy := *n
+	return &nodeCopy
+}
+
+// copyNode makes a copy of this Statement without recursing in any child Statements.
+func (n *CreateTenant) copyNode() *CreateTenant {
+	stmtCopy := *n
+	return &stmtCopy
+}
+
+// walkStmt is part of the walkableStmt interface.
+func (n *CreateTenant) walkStmt(v Visitor) Statement {
+	ret := n
+	if n.Like.OtherTenant != nil {
+		ts, changed := walkTenantSpec(v, n.TenantSpec)
+		if changed {
+			if ret == n {
+				ret = n.copyNode()
+			}
+			ret.Like = n.Like.copyNode()
+			ret.Like.OtherTenant = ts
+		}
+	}
+	return ret
+}
+
 // copyNode makes a copy of this Statement without recursing in any child Statements.
 func (n *CreateTenantFromReplication) copyNode() *CreateTenantFromReplication {
 	stmtCopy := *n
@@ -1086,6 +1117,16 @@ func (n *CreateTenantFromReplication) walkStmt(v Visitor) Statement {
 				ret = n.copyNode()
 			}
 			ret.Options.Retention = e
+		}
+	}
+	if n.Like.OtherTenant != nil {
+		ts, changed := walkTenantSpec(v, n.TenantSpec)
+		if changed {
+			if ret == n {
+				ret = n.copyNode()
+			}
+			ret.Like = n.Like.copyNode()
+			ret.Like.OtherTenant = ts
 		}
 	}
 	return ret
@@ -1125,6 +1166,13 @@ func (n *AlterTenantRename) walkStmt(v Visitor) Statement {
 			ret = n.copyNode()
 		}
 		ret.TenantSpec = ts
+	}
+	ts, changed = walkTenantSpec(v, n.NewName)
+	if changed {
+		if ret == n {
+			ret = n.copyNode()
+		}
+		ret.NewName = ts
 	}
 	return ret
 }
@@ -1230,6 +1278,16 @@ func (stmt *Backup) walkStmt(v Visitor) Statement {
 				ret = stmt.copyNode()
 			}
 			ret.Options.IncludeAllSecondaryTenants = include
+		}
+	}
+
+	if stmt.Options.ExecutionLocality != nil {
+		rh, changed := WalkExpr(v, stmt.Options.ExecutionLocality)
+		if changed {
+			if ret == stmt {
+				ret = stmt.copyNode()
+			}
+			ret.Options.ExecutionLocality = rh
 		}
 	}
 
@@ -1511,6 +1569,16 @@ func (stmt *Restore) walkStmt(v Visitor) Statement {
 		}
 	}
 
+	if stmt.Options.ExecutionLocality != nil {
+		include, changed := WalkExpr(v, stmt.Options.ExecutionLocality)
+		if changed {
+			if ret == stmt {
+				ret = stmt.copyNode()
+			}
+			ret.Options.ExecutionLocality = include
+		}
+	}
+
 	return ret
 }
 
@@ -1558,6 +1626,16 @@ func (stmt *Select) copyNode() *Select {
 		}
 	}
 	return &stmtCopy
+}
+
+func (n *CopyTo) walkStmt(v Visitor) Statement {
+	if newStmt, changed := walkStmt(v, n.Statement); changed {
+		// Make a copy of the CopyTo statement.
+		stmtCopy := *n
+		ret := &(stmtCopy)
+		ret.Statement = newStmt
+	}
+	return n
 }
 
 // walkStmt is part of the walkableStmt interface.
@@ -1915,6 +1993,7 @@ var _ walkableStmt = &CancelSessions{}
 var _ walkableStmt = &ControlJobs{}
 var _ walkableStmt = &ControlSchedules{}
 var _ walkableStmt = &CreateTable{}
+var _ walkableStmt = &CreateTenant{}
 var _ walkableStmt = &CreateTenantFromReplication{}
 var _ walkableStmt = &Delete{}
 var _ walkableStmt = &DropTenant{}

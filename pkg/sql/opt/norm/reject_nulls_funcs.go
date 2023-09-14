@@ -31,6 +31,9 @@ func (c *CustomFuncs) RejectNullCols(in memo.RelExpr) opt.ColSet {
 func (c *CustomFuncs) HasNullRejectingFilter(
 	filters memo.FiltersExpr, nullRejectCols opt.ColSet,
 ) bool {
+	if nullRejectCols.Empty() {
+		return false
+	}
 	for i := range filters {
 		constraints := filters[i].ScalarProps().Constraints
 		if constraints == nil {
@@ -214,9 +217,10 @@ func DeriveRejectNullCols(in memo.RelExpr, disabledRules intsets.Fast) opt.ColSe
 		relProps.Rule.RejectNullCols.UnionWith(deriveScanRejectNullCols(in))
 	}
 
-	if relProps.Rule.RejectNullCols.Intersects(relProps.NotNullCols) {
-		panic(errors.AssertionFailedf("null rejection requested on non-null column"))
-	}
+	// Don't attempt to request null-rejection for non-null cols. This can happen
+	// if normalization failed to null-reject, and then exploration "uncovered"
+	// the possibility for null-rejection of a column.
+	relProps.Rule.RejectNullCols.DifferenceWith(relProps.NotNullCols)
 
 	return relProps.Rule.RejectNullCols
 }

@@ -1,0 +1,53 @@
+parse
+DECLARE
+BEGIN
+x := 10;
+WHILE x > 0 LOOP
+  x := x - 1;
+END LOOP;
+END
+----
+DECLARE
+BEGIN
+x := 10;
+WHILE x > 0 LOOP
+x := x - 1;
+END LOOP;
+END
+
+parse
+DECLARE
+BEGIN
+x := 10;
+WHILE x > 0 AND x < 100 LOOP
+  x := x - 1;
+  x := x - 2;
+END LOOP;
+END
+----
+DECLARE
+BEGIN
+x := 10;
+WHILE (x > 0) AND (x < 100) LOOP
+x := x - 1;
+x := x - 2;
+END LOOP;
+END
+
+parse
+DECLARE
+BEGIN
+x := 10;
+<<labeled>>
+WHILE x > 0 LOOP
+  x := x - 1;
+END LOOP labeled;
+END
+----
+DECLARE
+BEGIN
+x := 10;
+WHILE x > 0 LOOP
+x := x - 1;
+END LOOP labeled;
+END

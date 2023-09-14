@@ -12,6 +12,7 @@ package typedesc
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -104,14 +105,15 @@ func (tdb *typeDescriptorBuilder) RunPostDeserializationChanges() (err error) {
 		tdb.maybeModified.ModificationTime = tdb.mvccTimestamp
 		tdb.changes.Add(catalog.SetModTimeToMVCCTimestamp)
 	}
-	fixedPrivileges := catprivilege.MaybeFixPrivileges(
+	if fixedPrivileges, err := catprivilege.MaybeFixPrivileges(
 		&tdb.maybeModified.Privileges,
 		tdb.maybeModified.GetParentID(),
 		tdb.maybeModified.GetParentSchemaID(),
 		privilege.Type,
 		tdb.maybeModified.GetName(),
-	)
-	if fixedPrivileges {
+	); err != nil {
+		return err
+	} else if fixedPrivileges {
 		tdb.changes.Add(catalog.UpgradedPrivileges)
 	}
 	return nil
@@ -122,8 +124,27 @@ func (tdb *typeDescriptorBuilder) RunRestoreChanges(
 	version clusterversion.ClusterVersion, descLookupFn func(id descpb.ID) catalog.Descriptor,
 ) error {
 	// Upgrade the declarative schema changer state
-	if scpb.MigrateDescriptorState(version, tdb.maybeModified.DeclarativeSchemaChangerState) {
+	if scpb.MigrateDescriptorState(version, tdb.maybeModified.ParentID, tdb.maybeModified.DeclarativeSchemaChangerState) {
 		tdb.changes.Add(catalog.UpgradedDeclarativeSchemaChangerState)
+	}
+	return nil
+}
+
+// StripDanglingBackReferences implements the catalog.DescriptorBuilder
+// interface.
+func (tdb *typeDescriptorBuilder) StripDanglingBackReferences(
+	descIDMightExist func(id descpb.ID) bool, nonTerminalJobIDMightExist func(id jobspb.JobID) bool,
+) error {
+	sliceIdx := 0
+	for _, id := range tdb.maybeModified.ReferencingDescriptorIDs {
+		tdb.maybeModified.ReferencingDescriptorIDs[sliceIdx] = id
+		if descIDMightExist(id) {
+			sliceIdx++
+		}
+	}
+	if sliceIdx < len(tdb.maybeModified.ReferencingDescriptorIDs) {
+		tdb.maybeModified.ReferencingDescriptorIDs = tdb.maybeModified.ReferencingDescriptorIDs[:sliceIdx]
+		tdb.changes.Add(catalog.StrippedDanglingBackReferences)
 	}
 	return nil
 }

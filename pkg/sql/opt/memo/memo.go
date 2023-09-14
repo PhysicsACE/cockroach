@@ -8,11 +8,13 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package memo exposes logic for `Memo`, the central data structure for `opt`.
 package memo
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
@@ -135,34 +137,45 @@ type Memo struct {
 	// planning. We need to cross-check these before reusing a cached memo.
 	// NOTE: If you add new fields here, be sure to add them to the relevant
 	//       fields in explain_bundle.go.
-	reorderJoinsLimit                      int
-	zigzagJoinEnabled                      bool
-	useForecasts                           bool
-	useHistograms                          bool
-	useMultiColStats                       bool
-	useNotVisibleIndex                     bool
-	localityOptimizedSearch                bool
-	safeUpdates                            bool
-	preferLookupJoinsForFKs                bool
-	saveTablesPrefix                       string
-	dateStyle                              pgdate.DateStyle
-	intervalStyle                          duration.IntervalStyle
-	propagateInputOrdering                 bool
-	disallowFullTableScans                 bool
-	largeFullScanRows                      float64
-	nullOrderedLast                        bool
-	costScansWithDefaultColSize            bool
-	allowUnconstrainedNonCoveringIndexScan bool
-	testingOptimizerRandomSeed             int64
-	testingOptimizerCostPerturbation       float64
-	testingOptimizerDisableRuleProbability float64
-	enforceHomeRegion                      bool
-	variableInequalityLookupJoinEnabled    bool
-	allowOrdinalColumnReferences           bool
-	useImprovedDisjunctionStats            bool
-	useLimitOrderingForStreamingGroupBy    bool
-	useImprovedSplitDisjunctionForJoins    bool
-	alwaysUseHistograms                    bool
+	reorderJoinsLimit                          int
+	zigzagJoinEnabled                          bool
+	useForecasts                               bool
+	useHistograms                              bool
+	useMultiColStats                           bool
+	useNotVisibleIndex                         bool
+	localityOptimizedSearch                    bool
+	safeUpdates                                bool
+	preferLookupJoinsForFKs                    bool
+	saveTablesPrefix                           string
+	dateStyle                                  pgdate.DateStyle
+	intervalStyle                              duration.IntervalStyle
+	propagateInputOrdering                     bool
+	disallowFullTableScans                     bool
+	largeFullScanRows                          float64
+	txnRowsReadErr                             int64
+	nullOrderedLast                            bool
+	costScansWithDefaultColSize                bool
+	allowUnconstrainedNonCoveringIndexScan     bool
+	testingOptimizerRandomSeed                 int64
+	testingOptimizerCostPerturbation           float64
+	testingOptimizerDisableRuleProbability     float64
+	enforceHomeRegion                          bool
+	variableInequalityLookupJoinEnabled        bool
+	allowOrdinalColumnReferences               bool
+	useImprovedDisjunctionStats                bool
+	useLimitOrderingForStreamingGroupBy        bool
+	useImprovedSplitDisjunctionForJoins        bool
+	alwaysUseHistograms                        bool
+	hoistUncorrelatedEqualitySubqueries        bool
+	useImprovedComputedColumnFiltersDerivation bool
+	useImprovedJoinElimination                 bool
+	implicitFKLockingForSerializable           bool
+	durableLockingForSerializable              bool
+
+	// txnIsoLevel is the isolation level under which the plan was created. This
+	// affects the planning of some locking operations, so it must be included in
+	// memo staleness calculation.
+	txnIsoLevel isolation.Level
 
 	// curRank is the highest currently in-use scalar expression rank.
 	curRank opt.ScalarRank
@@ -192,35 +205,42 @@ func (m *Memo) Init(ctx context.Context, evalCtx *eval.Context) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*m = Memo{
-		metadata:                               m.metadata,
-		reorderJoinsLimit:                      int(evalCtx.SessionData().ReorderJoinsLimit),
-		zigzagJoinEnabled:                      evalCtx.SessionData().ZigzagJoinEnabled,
-		useForecasts:                           evalCtx.SessionData().OptimizerUseForecasts,
-		useHistograms:                          evalCtx.SessionData().OptimizerUseHistograms,
-		useMultiColStats:                       evalCtx.SessionData().OptimizerUseMultiColStats,
-		useNotVisibleIndex:                     evalCtx.SessionData().OptimizerUseNotVisibleIndexes,
-		localityOptimizedSearch:                evalCtx.SessionData().LocalityOptimizedSearch,
-		safeUpdates:                            evalCtx.SessionData().SafeUpdates,
-		preferLookupJoinsForFKs:                evalCtx.SessionData().PreferLookupJoinsForFKs,
-		saveTablesPrefix:                       evalCtx.SessionData().SaveTablesPrefix,
-		dateStyle:                              evalCtx.SessionData().GetDateStyle(),
-		intervalStyle:                          evalCtx.SessionData().GetIntervalStyle(),
-		propagateInputOrdering:                 evalCtx.SessionData().PropagateInputOrdering,
-		disallowFullTableScans:                 evalCtx.SessionData().DisallowFullTableScans,
-		largeFullScanRows:                      evalCtx.SessionData().LargeFullScanRows,
-		nullOrderedLast:                        evalCtx.SessionData().NullOrderedLast,
-		costScansWithDefaultColSize:            evalCtx.SessionData().CostScansWithDefaultColSize,
-		allowUnconstrainedNonCoveringIndexScan: evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled,
-		testingOptimizerRandomSeed:             evalCtx.SessionData().TestingOptimizerRandomSeed,
-		testingOptimizerCostPerturbation:       evalCtx.SessionData().TestingOptimizerCostPerturbation,
-		testingOptimizerDisableRuleProbability: evalCtx.SessionData().TestingOptimizerDisableRuleProbability,
-		enforceHomeRegion:                      evalCtx.SessionData().EnforceHomeRegion,
-		variableInequalityLookupJoinEnabled:    evalCtx.SessionData().VariableInequalityLookupJoinEnabled,
-		allowOrdinalColumnReferences:           evalCtx.SessionData().AllowOrdinalColumnReferences,
-		useImprovedDisjunctionStats:            evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats,
-		useLimitOrderingForStreamingGroupBy:    evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy,
-		useImprovedSplitDisjunctionForJoins:    evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins,
-		alwaysUseHistograms:                    evalCtx.SessionData().OptimizerAlwaysUseHistograms,
+		metadata:                                   m.metadata,
+		reorderJoinsLimit:                          int(evalCtx.SessionData().ReorderJoinsLimit),
+		zigzagJoinEnabled:                          evalCtx.SessionData().ZigzagJoinEnabled,
+		useForecasts:                               evalCtx.SessionData().OptimizerUseForecasts,
+		useHistograms:                              evalCtx.SessionData().OptimizerUseHistograms,
+		useMultiColStats:                           evalCtx.SessionData().OptimizerUseMultiColStats,
+		useNotVisibleIndex:                         evalCtx.SessionData().OptimizerUseNotVisibleIndexes,
+		localityOptimizedSearch:                    evalCtx.SessionData().LocalityOptimizedSearch,
+		safeUpdates:                                evalCtx.SessionData().SafeUpdates,
+		preferLookupJoinsForFKs:                    evalCtx.SessionData().PreferLookupJoinsForFKs,
+		saveTablesPrefix:                           evalCtx.SessionData().SaveTablesPrefix,
+		dateStyle:                                  evalCtx.SessionData().GetDateStyle(),
+		intervalStyle:                              evalCtx.SessionData().GetIntervalStyle(),
+		propagateInputOrdering:                     evalCtx.SessionData().PropagateInputOrdering,
+		disallowFullTableScans:                     evalCtx.SessionData().DisallowFullTableScans,
+		largeFullScanRows:                          evalCtx.SessionData().LargeFullScanRows,
+		txnRowsReadErr:                             evalCtx.SessionData().TxnRowsReadErr,
+		nullOrderedLast:                            evalCtx.SessionData().NullOrderedLast,
+		costScansWithDefaultColSize:                evalCtx.SessionData().CostScansWithDefaultColSize,
+		allowUnconstrainedNonCoveringIndexScan:     evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled,
+		testingOptimizerRandomSeed:                 evalCtx.SessionData().TestingOptimizerRandomSeed,
+		testingOptimizerCostPerturbation:           evalCtx.SessionData().TestingOptimizerCostPerturbation,
+		testingOptimizerDisableRuleProbability:     evalCtx.SessionData().TestingOptimizerDisableRuleProbability,
+		enforceHomeRegion:                          evalCtx.SessionData().EnforceHomeRegion,
+		variableInequalityLookupJoinEnabled:        evalCtx.SessionData().VariableInequalityLookupJoinEnabled,
+		allowOrdinalColumnReferences:               evalCtx.SessionData().AllowOrdinalColumnReferences,
+		useImprovedDisjunctionStats:                evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats,
+		useLimitOrderingForStreamingGroupBy:        evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy,
+		useImprovedSplitDisjunctionForJoins:        evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins,
+		alwaysUseHistograms:                        evalCtx.SessionData().OptimizerAlwaysUseHistograms,
+		hoistUncorrelatedEqualitySubqueries:        evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries,
+		useImprovedComputedColumnFiltersDerivation: evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation,
+		useImprovedJoinElimination:                 evalCtx.SessionData().OptimizerUseImprovedJoinElimination,
+		implicitFKLockingForSerializable:           evalCtx.SessionData().ImplicitFKLockingForSerializable,
+		durableLockingForSerializable:              evalCtx.SessionData().DurableLockingForSerializable,
+		txnIsoLevel:                                evalCtx.TxnIsoLevel,
 	}
 	m.metadata.Init()
 	m.logPropsBuilder.init(ctx, evalCtx, m)
@@ -295,12 +315,6 @@ func (m *Memo) SetRoot(e RelExpr, phys *physical.Required) {
 	}
 }
 
-// SetScalarRoot stores the root memo expression when it is a scalar expression.
-// Used only for testing.
-func (m *Memo) SetScalarRoot(scalar opt.ScalarExpr) {
-	m.rootExpr = scalar
-}
-
 // HasPlaceholders returns true if the memo contains at least one placeholder
 // operator.
 func (m *Memo) HasPlaceholders() bool {
@@ -350,6 +364,7 @@ func (m *Memo) IsStale(
 		m.propagateInputOrdering != evalCtx.SessionData().PropagateInputOrdering ||
 		m.disallowFullTableScans != evalCtx.SessionData().DisallowFullTableScans ||
 		m.largeFullScanRows != evalCtx.SessionData().LargeFullScanRows ||
+		m.txnRowsReadErr != evalCtx.SessionData().TxnRowsReadErr ||
 		m.nullOrderedLast != evalCtx.SessionData().NullOrderedLast ||
 		m.costScansWithDefaultColSize != evalCtx.SessionData().CostScansWithDefaultColSize ||
 		m.allowUnconstrainedNonCoveringIndexScan != evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled ||
@@ -362,14 +377,20 @@ func (m *Memo) IsStale(
 		m.useImprovedDisjunctionStats != evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats ||
 		m.useLimitOrderingForStreamingGroupBy != evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy ||
 		m.useImprovedSplitDisjunctionForJoins != evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins ||
-		m.alwaysUseHistograms != evalCtx.SessionData().OptimizerAlwaysUseHistograms {
+		m.alwaysUseHistograms != evalCtx.SessionData().OptimizerAlwaysUseHistograms ||
+		m.hoistUncorrelatedEqualitySubqueries != evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries ||
+		m.useImprovedComputedColumnFiltersDerivation != evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation ||
+		m.useImprovedJoinElimination != evalCtx.SessionData().OptimizerUseImprovedJoinElimination ||
+		m.implicitFKLockingForSerializable != evalCtx.SessionData().ImplicitFKLockingForSerializable ||
+		m.durableLockingForSerializable != evalCtx.SessionData().DurableLockingForSerializable ||
+		m.txnIsoLevel != evalCtx.TxnIsoLevel {
 		return true, nil
 	}
 
 	// Memo is stale if the fingerprint of any object in the memo's metadata has
 	// changed, or if the current user no longer has sufficient privilege to
 	// access the object.
-	if depsUpToDate, err := m.Metadata().CheckDependencies(ctx, catalog); err != nil {
+	if depsUpToDate, err := m.Metadata().CheckDependencies(ctx, evalCtx, catalog); err != nil {
 		return true, err
 	} else if !depsUpToDate {
 		return true, nil
@@ -553,3 +574,11 @@ func (l *LiteralValuesExpr) ColList() opt.ColList {
 func (l *LiteralValuesExpr) Len() int {
 	return l.Rows.Rows.NumRows()
 }
+
+// GetLookupJoinLookupTableDistribution returns the Distribution of a lookup
+// table in a lookup join if that distribution can be statically determined.
+var GetLookupJoinLookupTableDistribution func(
+	lookupJoin *LookupJoinExpr,
+	required *physical.Required,
+	optimizer interface{},
+) (physicalDistribution physical.Distribution)

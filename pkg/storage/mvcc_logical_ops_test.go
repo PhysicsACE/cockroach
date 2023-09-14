@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -36,36 +37,36 @@ func TestMVCCOpLogWriter(t *testing.T) {
 	defer ol.Close()
 
 	// Write a value and an intent.
-	if err := MVCCPut(ctx, ol, nil, testKey1, hlc.Timestamp{Logical: 1}, hlc.ClockTimestamp{}, value1, nil); err != nil {
+	if err := MVCCPut(ctx, ol, testKey1, hlc.Timestamp{Logical: 1}, value1, MVCCWriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	txn1ts := makeTxn(*txn1, hlc.Timestamp{Logical: 2})
-	if err := MVCCPut(ctx, ol, nil, testKey1, txn1ts.ReadTimestamp, hlc.ClockTimestamp{}, value2, txn1ts); err != nil {
+	if err := MVCCPut(ctx, ol, testKey1, txn1ts.ReadTimestamp, value2, MVCCWriteOptions{Txn: txn1ts}); err != nil {
 		t.Fatal(err)
 	}
 
 	// Write a value and an intent on local keys.
 	localKey := keys.MakeRangeIDPrefix(1)
-	if err := MVCCPut(ctx, ol, nil, localKey, hlc.Timestamp{Logical: 1}, hlc.ClockTimestamp{}, value1, nil); err != nil {
+	if err := MVCCPut(ctx, ol, localKey, hlc.Timestamp{Logical: 1}, value1, MVCCWriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := MVCCPut(ctx, ol, nil, localKey, txn1ts.ReadTimestamp, hlc.ClockTimestamp{}, value2, txn1ts); err != nil {
+	if err := MVCCPut(ctx, ol, localKey, txn1ts.ReadTimestamp, value2, MVCCWriteOptions{Txn: txn1ts}); err != nil {
 		t.Fatal(err)
 	}
 
 	// Update the intents and write another.
 	txn1ts.Sequence++
 	txn1ts.WriteTimestamp = hlc.Timestamp{Logical: 3}
-	if err := MVCCPut(ctx, ol, nil, testKey1, txn1ts.ReadTimestamp, hlc.ClockTimestamp{}, value2, txn1ts); err != nil {
+	if err := MVCCPut(ctx, ol, testKey1, txn1ts.ReadTimestamp, value2, MVCCWriteOptions{Txn: txn1ts}); err != nil {
 		t.Fatal(err)
 	}
-	if err := MVCCPut(ctx, ol, nil, localKey, txn1ts.ReadTimestamp, hlc.ClockTimestamp{}, value2, txn1ts); err != nil {
+	if err := MVCCPut(ctx, ol, localKey, txn1ts.ReadTimestamp, value2, MVCCWriteOptions{Txn: txn1ts}); err != nil {
 		t.Fatal(err)
 	}
 	// Set the txn timestamp to a larger value than the intent.
 	txn1LargerTS := makeTxn(*txn1, hlc.Timestamp{Logical: 4})
 	txn1LargerTS.WriteTimestamp = hlc.Timestamp{Logical: 4}
-	if err := MVCCPut(ctx, ol, nil, testKey2, txn1LargerTS.ReadTimestamp, hlc.ClockTimestamp{}, value3, txn1LargerTS); err != nil {
+	if err := MVCCPut(ctx, ol, testKey2, txn1LargerTS.ReadTimestamp, value3, MVCCWriteOptions{Txn: txn1LargerTS}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -88,8 +89,9 @@ func TestMVCCOpLogWriter(t *testing.T) {
 	}
 
 	// Write another intent, push it, then abort it.
-	txn2ts := makeTxn(*txn2, hlc.Timestamp{Logical: 5})
-	if err := MVCCPut(ctx, ol, nil, testKey3, txn2ts.ReadTimestamp, hlc.ClockTimestamp{}, value4, txn2ts); err != nil {
+	txn2 := makeTxn(*txn2, hlc.Timestamp{Logical: 5})
+	txn2.IsoLevel = isolation.ReadCommitted
+	if err := MVCCPut(ctx, ol, testKey3, txn2.ReadTimestamp, value4, MVCCWriteOptions{Txn: txn2}); err != nil {
 		t.Fatal(err)
 	}
 	txn2Pushed := *txn2
@@ -110,7 +112,7 @@ func TestMVCCOpLogWriter(t *testing.T) {
 	}
 
 	// Write an inline value. This should be ignored by the log.
-	if err := MVCCPut(ctx, ol, nil, testKey6, hlc.Timestamp{}, hlc.ClockTimestamp{}, value6, nil); err != nil {
+	if err := MVCCPut(ctx, ol, testKey6, hlc.Timestamp{}, value6, MVCCWriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -128,6 +130,7 @@ func TestMVCCOpLogWriter(t *testing.T) {
 		makeOp(&enginepb.MVCCWriteIntentOp{
 			TxnID:           txn1.ID,
 			TxnKey:          txn1.Key,
+			TxnIsoLevel:     txn1.IsoLevel,
 			TxnMinTimestamp: txn1.MinTimestamp,
 			Timestamp:       hlc.Timestamp{Logical: 2},
 		}),
@@ -138,6 +141,7 @@ func TestMVCCOpLogWriter(t *testing.T) {
 		makeOp(&enginepb.MVCCWriteIntentOp{
 			TxnID:           txn1.ID,
 			TxnKey:          txn1.Key,
+			TxnIsoLevel:     txn1.IsoLevel,
 			TxnMinTimestamp: txn1.MinTimestamp,
 			Timestamp:       hlc.Timestamp{Logical: 4},
 		}),
@@ -154,6 +158,7 @@ func TestMVCCOpLogWriter(t *testing.T) {
 		makeOp(&enginepb.MVCCWriteIntentOp{
 			TxnID:           txn2.ID,
 			TxnKey:          txn2.Key,
+			TxnIsoLevel:     txn2.IsoLevel,
 			TxnMinTimestamp: txn2.MinTimestamp,
 			Timestamp:       hlc.Timestamp{Logical: 5},
 		}),

@@ -14,6 +14,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -34,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -64,7 +67,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		*tree.BeginTransaction,
 		*tree.CommentOnColumn, *tree.CommentOnConstraint, *tree.CommentOnDatabase, *tree.CommentOnIndex, *tree.CommentOnTable, *tree.CommentOnSchema,
 		*tree.CommitTransaction,
-		*tree.CopyFrom, *tree.CreateDatabase, *tree.CreateIndex, *tree.CreateView,
+		*tree.CopyFrom, *tree.CopyTo, *tree.CreateDatabase, *tree.CreateIndex, *tree.CreateView,
 		*tree.CreateSequence,
 		*tree.CreateStats,
 		*tree.Deallocate, *tree.Discard, *tree.DropDatabase, *tree.DropIndex,
@@ -90,7 +93,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		// we need to set the expected output columns to the output columns of the
 		// prepared statement that the user is trying to execute.
 		name := string(t.Name)
-		prepared, ok := p.preparedStatements.Get(name)
+		prepared, ok := p.preparedStatements.Get(name, true /* touchLRU */)
 		if !ok {
 			// We're trying to prepare an EXECUTE of a statement that doesn't exist.
 			// Let's just give up at this point.
@@ -355,6 +358,7 @@ func (opc *optPlanningCtx) reset(ctx context.Context) {
 	// support it for all statements in principle, but it would increase the
 	// surface of potential issues (conditions we need to detect to invalidate a
 	// cached memo).
+	// TODO(mgartner): Enable memo caching for CALL statements.
 	switch p.stmt.AST.(type) {
 	case *tree.ParenSelect, *tree.Select, *tree.SelectClause, *tree.UnionClause, *tree.ValuesClause,
 		*tree.Insert, *tree.Update, *tree.Delete, *tree.CannedOptPlan:
@@ -576,11 +580,18 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 
 	// For index recommendations, after building we must interrupt the flow to
 	// find potential index candidates in the memo.
-	_, isExplain := opc.p.stmt.AST.(*tree.Explain)
-	if isExplain && p.SessionData().IndexRecommendationsEnabled {
-		if err := opc.makeQueryIndexRecommendation(ctx); err != nil {
+	explainModeShowsRec := func(m tree.ExplainMode) bool {
+		// Only the PLAN (the default), DISTSQL, and GIST explain modes show
+		// index recommendations.
+		return m == tree.ExplainPlan || m == tree.ExplainDistSQL || m == tree.ExplainGist
+	}
+	e, isExplain := opc.p.stmt.AST.(*tree.Explain)
+	if isExplain && explainModeShowsRec(e.Mode) && p.SessionData().IndexRecommendationsEnabled {
+		indexRecs, err := opc.makeQueryIndexRecommendation(ctx)
+		if err != nil {
 			return nil, err
 		}
+		opc.p.instrumentation.explainIndexRecs = indexRecs
 	}
 
 	if _, isCanned := opc.p.stmt.AST.(*tree.CannedOptPlan); !isCanned {
@@ -629,7 +640,7 @@ func (opc *optPlanningCtx) runExecBuilder(
 	var bld *execbuilder.Builder
 	if !planTop.instrumentation.ShouldBuildExplainPlan() {
 		bld = execbuilder.New(ctx, f, &opc.optimizer, mem, opc.catalog, mem.RootExpr(),
-			evalCtx, allowAutoCommit, stmt.IsANSIDML())
+			evalCtx, allowAutoCommit, statements.IsANSIDML(stmt.AST))
 		plan, err := bld.Build()
 		if err != nil {
 			return err
@@ -639,7 +650,7 @@ func (opc *optPlanningCtx) runExecBuilder(
 		// Create an explain factory and record the explain.Plan.
 		explainFactory := explain.NewFactory(f)
 		bld = execbuilder.New(ctx, explainFactory, &opc.optimizer, mem, opc.catalog, mem.RootExpr(),
-			evalCtx, allowAutoCommit, stmt.IsANSIDML())
+			evalCtx, allowAutoCommit, statements.IsANSIDML(stmt.AST))
 		plan, err := bld.Build()
 		if err != nil {
 			return err
@@ -680,6 +691,15 @@ func (opc *optPlanningCtx) runExecBuilder(
 	planTop.flags = opc.flags
 	if bld.IsDDL {
 		planTop.flags.Set(planFlagIsDDL)
+
+		// The declarative schema changer mode would have already been set here,
+		// since all declarative schema changes are built opaquely. However, some
+		// DDLs (e.g. CREATE TABLE) are built non-opaquely, so we need to set the
+		// mode here if it wasn't already set.
+		if planTop.instrumentation.schemaChangerMode == schemaChangerModeNone {
+			telemetry.Inc(sqltelemetry.LegacySchemaChangerCounter)
+			planTop.instrumentation.schemaChangerMode = schemaChangerModeLegacy
+		}
 	}
 	if bld.ContainsFullTableScan {
 		planTop.flags.Set(planFlagContainsFullTableScan)
@@ -699,10 +719,8 @@ func (opc *optPlanningCtx) runExecBuilder(
 	if bld.ContainsNonDefaultKeyLocking {
 		planTop.flags.Set(planFlagContainsNonDefaultLocking)
 	}
-	if planTop.instrumentation.ShouldSaveMemo() {
-		planTop.mem = mem
-		planTop.catalog = opc.catalog
-	}
+	planTop.mem = mem
+	planTop.catalog = opc.catalog
 	return nil
 }
 
@@ -721,7 +739,9 @@ func (p *planner) DecodeGist(gist string, external bool) ([]string, error) {
 // indexes hypothetically added to the table. An index recommendation for the
 // query is outputted based on which hypothetical indexes are helpful in the
 // optimal plan.
-func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (err error) {
+func (opc *optPlanningCtx) makeQueryIndexRecommendation(
+	ctx context.Context,
+) (_ []indexrec.Rec, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// This code allows us to propagate internal errors without having to add
@@ -757,7 +777,7 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (er
 		return ruleName.IsNormalize()
 	})
 	if _, err = opc.optimizer.Optimize(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Walk through the fully normalized memo to determine index candidates and
@@ -775,12 +795,13 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (er
 	)
 	opc.optimizer.Memo().Metadata().UpdateTableMeta(f.EvalContext(), hypTables)
 	if _, err = opc.optimizer.Optimize(); err != nil {
-		return err
+		return nil, err
 	}
 
-	opc.p.instrumentation.indexRecs, err = indexrec.FindRecs(ctx, f.Memo().RootExpr(), f.Metadata())
+	var indexRecs []indexrec.Rec
+	indexRecs, err = indexrec.FindRecs(ctx, f.Memo().RootExpr(), f.Metadata())
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Re-initialize the optimizer (which also re-initializes the factory) and
@@ -794,5 +815,10 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (er
 		f.CopyWithoutAssigningPlaceholders,
 	)
 
-	return nil
+	return indexRecs, nil
+}
+
+// Optimizer returns the Optimizer associated with this planning context.
+func (opc *optPlanningCtx) Optimizer() interface{} {
+	return &opc.optimizer
 }

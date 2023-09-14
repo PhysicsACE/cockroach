@@ -12,7 +12,7 @@ import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { createMemoryHistory } from "history";
 import Long from "long";
 import { JobsPageProps } from "./jobsPage";
-import moment from "moment";
+import moment from "moment-timezone";
 
 import JobsResponse = cockroach.server.serverpb.JobsResponse;
 import Job = cockroach.server.serverpb.IJobResponse;
@@ -127,7 +127,7 @@ const runningWithMessageRemainingJobFixture = {
 export const retryRunningJobFixture = {
   ...defaultJobProperties,
   id: new Long(3390625793, 70312826),
-  type: "STREAM INGESTION",
+  type: "REPLICATION STREAM INGESTION",
   description: "GC for DROP TABLE havent_started_running_2",
   status: "retry-running",
   fraction_completed: 0,
@@ -156,7 +156,7 @@ const retryRunningWithMessageJobFixture = {
 const retryRunningWithRemainingJobFixture = {
   ...defaultJobProperties,
   id: new Long(3390625793, 70312826),
-  type: "STREAM INGESTION",
+  type: "REPLICATION STREAM INGESTION",
   description:
     "RESTORE DATABASE backup_database_name FROM 'your_backup_location';",
   status: "retry-running",
@@ -328,16 +328,18 @@ const getJobsPageProps = (
   isLoading = false,
 ): JobsPageProps => ({
   ...staticJobProps,
-  jobs: JobsResponse.create({
-    jobs: jobs,
-    earliest_retained_time: earliestRetainedTime,
-  }),
-  jobsError: error,
-  reqInFlight: isLoading,
-  isDataValid: !isLoading,
+  jobsResponse: {
+    data: new JobsResponse({
+      jobs: jobs,
+      earliest_retained_time: earliestRetainedTime,
+    }),
+    error,
+    inFlight: isLoading,
+    valid: !isLoading,
+    lastUpdated: moment.utc(),
+  },
   columns: null,
   onColumnsChange: () => {},
-  lastUpdated: moment(),
 });
 
 export const withData: JobsPageProps = getJobsPageProps(allJobsFixture);

@@ -26,7 +26,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/peer"
+	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -79,6 +79,19 @@ func (a kvAuth) unaryInterceptor(
 	// Handle authorization according to the selected authz method.
 	switch ar := authz.(type) {
 	case authzTenantServerToKVServer:
+		// Clear any leftover gRPC incoming metadata, if this call
+		// is originating from a RPC handler function called as
+		// a result of a tenant call. This is this case:
+		//
+		//    tenant -(rpc)-> tenant -(rpc)-> KV
+		//                            ^ YOU ARE HERE
+		//
+		// at this point, the left side RPC has left some incoming
+		// metadata in the context, but we need to get rid of it
+		// before we let the call go through KV. Any stray metadata
+		// could influence the execution on the KV-level handlers.
+		ctx = grpcutil.ClearIncomingContext(ctx)
+
 		if err := a.tenant.authorize(ctx, a.sv, roachpb.TenantID(ar), info.FullMethod, req); err != nil {
 			return nil, err
 		}
@@ -110,6 +123,28 @@ func (a kvAuth) streamInterceptor(
 	// Handle authorization according to the selected authz method.
 	switch ar := authz.(type) {
 	case authzTenantServerToKVServer:
+		// Clear any leftover gRPC incoming metadata, if this call
+		// is originating from a RPC handler function called as
+		// a result of a tenant call. This is this case:
+		//
+		//    tenant -(rpc)-> tenant -(rpc)-> KV
+		//                            ^ YOU ARE HERE
+		//
+		// at this point, the left side RPC has left some incoming
+		// metadata in the context, but we need to get rid of it
+		// before we let the call go through KV. Any stray metadata
+		// could influence the execution on the KV-level handlers.
+		//
+		// We have a single unfortunate quirk, the PutStream
+		// method of the blob service. That RPC uses incoming
+		// metadata to identify the filename of the file being
+		// uploaded.
+		if info.FullMethod == "/cockroach.blobs.Blob/PutStream" {
+			ctx = grpcutil.ClearIncomingContextExcept(ctx, "filename")
+		} else {
+			ctx = grpcutil.ClearIncomingContext(ctx)
+		}
+
 		origSS := ss
 		ss = &wrappedServerStream{
 			ServerStream: origSS,
@@ -157,7 +192,7 @@ type authnResult interface {
 }
 
 func getClientCert(ctx context.Context) (*x509.Certificate, error) {
-	p, ok := peer.FromContext(ctx)
+	p, ok := grpcpeer.FromContext(ctx)
 	if !ok {
 		return nil, errTLSInfoMissing
 	}

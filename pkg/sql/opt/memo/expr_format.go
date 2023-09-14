@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // ScalarFmtInterceptor is a callback that can be set to a custom formatting
@@ -39,43 +40,15 @@ var ScalarFmtInterceptor func(f *ExprFmtCtx, expr opt.ScalarExpr) string
 // formatted output.
 type ExprFmtFlags int
 
-// ExprFmtFlags takes advantages of bit masking and iota. If you want to add a
-// flag here, you should only add flags to hide things but not to show things.
-// Also, you have to add the flag after ExprFmtHideMiscProps and before
-// ExprFmtHideAll.
-
-// iota is initialized as 0 at the start of const and increments by 1 every time
-// a new const is declared. In addition, expressions are also implicitly repeated.
-// For example,
-// const (                              // const (
-//	First  int = iota // 0              // 	First  int = iota * 3 // 0 * 3
-//	Second            // 1              // 	Second                // 1 * 3
-//	Third             // 2              // )
-//	Fourth            // 3
-// )
-
-// In our example here, 1 means the flag is on and 0 means the flag is off.
-// const (
+// ExprFmtFlags is a bitmask that can contain any of the flags below. The zero
+// value represents showing all possible information when formatting an
+// expression. Flags are used to hide information. For example, to hide
+// constraints and functional dependencies, you can combine the flags
+// ExprFmtHideConstraints and ExprFmtHideFuncDeps:
 //
-//		ExprFmtShowAll int = 0 // iota is 0, but it's not used    0000 0000
-//		ExprFmtHideMiscProps int = 1 << (iota - 1)
-//	                            // iota is 1, 1 << (1 - 1) 0000 0001 = 1
-//		ExprFmtHideConstraints     // iota is 2, 1 << (2 - 1) 0000 0010 = 2
-//		ExprFmtHideFuncDeps        // iota is 3, 1 << (3 - 1) 0000 0100 = 4
-//	 ...
-//	 ExprFmtHideAll             // (1 << iota) - 1
+//	myFlag := ExprFmtHideConstraints|ExprFmtHideFuncDeps
 //
-// )
-// If we want to set ExprFmtHideMiscProps and ExprFmtHideConstraints on, we
-// would have f := ExprFmtHideMiscProps | ExprFmtHideConstraints 0000 0011.
-// ExprFmtShowAll has all 0000 0000. This is because all flags represent when
-// something is hiding. If every bit is 0, that just means everything is
-// showing. ExprFmtHideAll is (1 << iota) - 1. For example, if the last const
-// iota is 4, ExprFmtHideAll would have (1 << 4) - 1 which is 0001 0000 - 1 =
-// 0000 1111 which is just setting all flags on => hiding everything. If we have
-// a flag that show things, ShowAll = 0000..000 would actually turn this flag
-// off. Thus, in order for ExprFmtShowAll and ExprFmtHideAll to be correct, we
-// can only add flags to hide things but not flags to show things.
+// New flags should be added before the ExprFmtHideAll flag.
 const (
 	// ExprFmtShowAll shows all properties of the expression.
 	ExprFmtShowAll ExprFmtFlags = 0
@@ -146,13 +119,18 @@ func (f ExprFmtFlags) HasFlags(subset ExprFmtFlags) bool {
 // FormatExpr returns a string representation of the given expression, formatted
 // according to the specified flags.
 func FormatExpr(
-	ctx context.Context, e opt.Expr, flags ExprFmtFlags, mem *Memo, catalog cat.Catalog,
+	ctx context.Context,
+	e opt.Expr,
+	flags ExprFmtFlags,
+	redactableValues bool,
+	mem *Memo,
+	catalog cat.Catalog,
 ) string {
 	if catalog == nil {
 		// Automatically hide qualifications if we have no catalog.
 		flags |= ExprFmtHideQualifications
 	}
-	f := MakeExprFmtCtx(ctx, flags, mem, catalog)
+	f := MakeExprFmtCtx(ctx, flags, redactableValues, mem, catalog)
 	f.FormatExpr(e)
 	return f.Buffer.String()
 }
@@ -164,8 +142,12 @@ type ExprFmtCtx struct {
 	Ctx    context.Context
 	Buffer *bytes.Buffer
 
-	// Flags controls how the expression is formatted.
+	// Flags controls which information is included in the formatted expression.
 	Flags ExprFmtFlags
+
+	// If RedactableValues is true we surround any constant values or other user
+	// data from the formatted expression with redaction markers, including spans.
+	RedactableValues bool
 
 	// Memo must contain any expression that is formatted.
 	Memo *Memo
@@ -178,32 +160,52 @@ type ExprFmtCtx struct {
 	// correspond to the tables that would be saved if the query were run
 	// with the session variable `save_tables_prefix` set to the same value.
 	nameGen *ExprNameGenerator
+
+	// seenUDFs is used to ensure that formatting of recursive UDFs does not
+	// infinitely recurse.
+	seenUDFs map[*UDFDefinition]struct{}
 }
 
 // makeExprFmtCtxForString creates an expression formatting context from a new
 // buffer with the context.Background(). This method is designed to be used in
 // stringer.String implementations.
 func makeExprFmtCtxForString(flags ExprFmtFlags, mem *Memo, catalog cat.Catalog) ExprFmtCtx {
-	return MakeExprFmtCtxBuffer(context.Background(), &bytes.Buffer{}, flags, mem, catalog)
+	return MakeExprFmtCtxBuffer(
+		context.Background(), &bytes.Buffer{}, flags, false /* redactableValues */, mem, catalog,
+	)
 }
 
 // MakeExprFmtCtx creates an expression formatting context from a new buffer.
 func MakeExprFmtCtx(
-	ctx context.Context, flags ExprFmtFlags, mem *Memo, catalog cat.Catalog,
+	ctx context.Context, flags ExprFmtFlags, redactableValues bool, mem *Memo, catalog cat.Catalog,
 ) ExprFmtCtx {
-	return MakeExprFmtCtxBuffer(ctx, &bytes.Buffer{}, flags, mem, catalog)
+	return MakeExprFmtCtxBuffer(ctx, &bytes.Buffer{}, flags, redactableValues, mem, catalog)
 }
 
 // MakeExprFmtCtxBuffer creates an expression formatting context from an
 // existing buffer.
 func MakeExprFmtCtxBuffer(
-	ctx context.Context, buf *bytes.Buffer, flags ExprFmtFlags, mem *Memo, catalog cat.Catalog,
+	ctx context.Context,
+	buf *bytes.Buffer,
+	flags ExprFmtFlags,
+	redactableValues bool,
+	mem *Memo,
+	catalog cat.Catalog,
 ) ExprFmtCtx {
 	var nameGen *ExprNameGenerator
 	if mem != nil && mem.saveTablesPrefix != "" {
 		nameGen = NewExprNameGenerator(mem.saveTablesPrefix)
 	}
-	return ExprFmtCtx{Ctx: ctx, Buffer: buf, Flags: flags, Memo: mem, Catalog: catalog, nameGen: nameGen}
+	return ExprFmtCtx{
+		Ctx:              ctx,
+		Buffer:           buf,
+		Flags:            flags,
+		RedactableValues: redactableValues,
+		Memo:             mem,
+		Catalog:          catalog,
+		nameGen:          nameGen,
+		seenUDFs:         make(map[*UDFDefinition]struct{}),
+	}
 }
 
 // HasFlags tests whether the given flags are all set.
@@ -236,10 +238,6 @@ func (f *ExprFmtCtx) formatExpr(e opt.Expr, tp treeprinter.Node) {
 func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 	md := f.Memo.Metadata()
 	required := e.RequiredPhysical()
-	if r, ok := e.(RelRequiredPropsExpr); ok {
-		e = r.RelExpr
-		required = r.PhysProps
-	}
 	relational := e.Relational()
 	if required == nil {
 		// required can be nil before optimization has taken place.
@@ -461,11 +459,14 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			if c.IsContradiction() {
 				tp.Childf("constraint: contradiction")
 			} else if c.Spans.Count() == 1 {
-				tp.Childf("constraint: %s: %s", c.Columns.String(), c.Spans.Get(0).String())
+				tp.Childf(
+					"constraint: %s: %s", c.Columns.String(),
+					cat.MaybeMarkRedactable(c.Spans.Get(0).String(), f.RedactableValues),
+				)
 			} else {
 				n := tp.Childf("constraint: %s", c.Columns.String())
 				for i := 0; i < c.Spans.Count(); i++ {
-					n.Child(c.Spans.Get(i).String())
+					n.Child(cat.MaybeMarkRedactable(c.Spans.Get(i).String(), f.RedactableValues))
 				}
 			}
 		}
@@ -477,7 +478,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 				b.WriteString(fmt.Sprintf("%d", private.Table.ColumnID(idx.Column(i).Ordinal())))
 			}
 			n := tp.Childf("inverted constraint: %s", b.String())
-			ic.Format(n, "spans")
+			ic.Format(n, "spans", f.RedactableValues)
 		}
 		if private.HardLimit.IsSet() {
 			tp.Childf("limit: %s", private.HardLimit)
@@ -537,7 +538,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		b.WriteRune('/')
 		b.WriteString(fmt.Sprintf("%d", t.InvertedColumn))
 		n := tp.Childf("inverted expression: %s", b.String())
-		t.InvertedExpression.Format(n, false /* includeSpansToRead */)
+		t.InvertedExpression.Format(n, false /* includeSpansToRead */, f.RedactableValues)
 		if t.PreFiltererState != nil {
 			n := tp.Childf("pre-filterer expression")
 			f.formatExpr(t.PreFiltererState.Expr, n)
@@ -812,7 +813,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 	}
 
 	if !f.HasFlags(ExprFmtHideStats) {
-		if f.HasFlags(ExprFmtHideHistograms) {
+		if f.HasFlags(ExprFmtHideHistograms) || f.RedactableValues {
 			tp.Childf("stats: %s", relational.Statistics().StringWithoutHistograms())
 		} else {
 			tp.Childf("stats: %s", relational.Statistics())
@@ -863,6 +864,19 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		// distribution if this is a Distribute expression.
 		if !required.Distribution.Any() {
 			tp.Childf("distribution: %s", required.Distribution.String())
+		}
+		// Show the lookup table distribution of a lookup join, if it has been set.
+		if lookupJoinExpr, ok := e.(*LookupJoinExpr); ok && f.Catalog != nil {
+			if optimizer := f.Catalog.Optimizer(); optimizer != nil {
+				providedDistribution := GetLookupJoinLookupTableDistribution(
+					lookupJoinExpr,
+					lookupJoinExpr.RequiredPhysical(),
+					optimizer,
+				)
+				if !providedDistribution.Any() {
+					tp.Childf("lookup table distribution: %s", providedDistribution.String())
+				}
+			}
 		}
 		if distribute, ok := e.(*DistributeExpr); ok {
 			tp.Childf("input distribution: %s", distribute.Input.ProvidedPhysical().Distribution.String())
@@ -923,18 +937,43 @@ func (f *ExprFmtCtx) formatScalar(scalar opt.ScalarExpr, tp treeprinter.Node) {
 func (f *ExprFmtCtx) formatScalarWithLabel(
 	label string, scalar opt.ScalarExpr, tp treeprinter.Node,
 ) {
-	formatUDFInputAndBody := func(udf *UDFExpr, tp treeprinter.Node) {
+	formatUDFInputAndBody := func(udf *UDFCallExpr, tp treeprinter.Node) {
 		var n treeprinter.Node
-		if len(udf.Params) > 0 {
-			f.formatColList(tp, "params:", udf.Params, opt.ColSet{} /* notNullCols */)
+		if !udf.Def.CalledOnNullInput {
+			tp.Child("strict")
+		}
+		if len(udf.Args) > 0 {
 			n = tp.Child("args")
 			for i := range udf.Args {
 				f.formatExpr(udf.Args[i], n)
 			}
 		}
-		n = tp.Child("body")
-		for i := range udf.Body {
-			f.formatExpr(udf.Body[i], n)
+		if _, seen := f.seenUDFs[udf.Def]; !seen {
+			// Ensure that the definition of the UDF is not printed out again if it
+			// is recursively called.
+			f.seenUDFs[udf.Def] = struct{}{}
+			if len(udf.Def.Params) > 0 {
+				f.formatColList(tp, "params:", udf.Def.Params, opt.ColSet{} /* notNullCols */)
+			}
+			n = tp.Child("body")
+			for i := range udf.Def.Body {
+				f.formatExpr(udf.Def.Body[i], n)
+			}
+			delete(f.seenUDFs, udf.Def)
+		} else {
+			tp.Child("recursive-call")
+		}
+		// Only print the exception handler for the top-level call.
+		if udf.Def.ExceptionBlock != nil && strings.HasPrefix(udf.Def.Name, "exception_block") {
+			n = tp.Child("exception-handler")
+			for i := range udf.Def.ExceptionBlock.Codes {
+				code := udf.Def.ExceptionBlock.Codes[i]
+				body := udf.Def.ExceptionBlock.Actions[i].Body
+				branch := n.Childf("SQLSTATE '%s'", code)
+				for j := range body {
+					f.formatExpr(body[j], branch)
+				}
+			}
 		}
 	}
 
@@ -992,9 +1031,9 @@ func (f *ExprFmtCtx) formatScalarWithLabel(
 		}
 		return
 
-	case opt.UDFOp:
-		udf := scalar.(*UDFExpr)
-		fmt.Fprintf(f.Buffer, "udf: %s", udf.Name)
+	case opt.UDFCallOp:
+		udf := scalar.(*UDFCallExpr)
+		fmt.Fprintf(f.Buffer, "udf: %s", udf.Def.Name)
 		f.FormatScalarProps(scalar)
 		tp = tp.Child(f.Buffer.String())
 		formatUDFInputAndBody(udf, tp)
@@ -1049,11 +1088,11 @@ func (f *ExprFmtCtx) formatScalarWithLabel(
 	}
 
 	var intercepted bool
-	if udf, ok := scalar.(*UDFExpr); ok && !f.HasFlags(ExprFmtHideScalars) {
+	if udf, ok := scalar.(*UDFCallExpr); ok && !f.HasFlags(ExprFmtHideScalars) {
 		// A UDF function body will be printed after the scalar props, so
 		// pre-emptively set intercepted=true to avoid the default
 		// formatScalarPrivate formatting below.
-		fmt.Fprintf(f.Buffer, "udf: %s", udf.Name)
+		fmt.Fprintf(f.Buffer, "udf: %s", udf.Def.Name)
 		intercepted = true
 	}
 	if !intercepted && f.HasFlags(ExprFmtHideScalars) && ScalarFmtInterceptor != nil {
@@ -1073,7 +1112,7 @@ func (f *ExprFmtCtx) formatScalarWithLabel(
 	}
 	tp = tp.Child(f.Buffer.String())
 
-	if udf, ok := scalar.(*UDFExpr); ok && !f.HasFlags(ExprFmtHideScalars) {
+	if udf, ok := scalar.(*UDFCallExpr); ok && !f.HasFlags(ExprFmtHideScalars) {
 		formatUDFInputAndBody(udf, tp)
 	}
 
@@ -1133,7 +1172,10 @@ func (f *ExprFmtCtx) scalarPropsStrings(scalar opt.ScalarExpr) []string {
 				if scalarProps.TightConstraints {
 					tight = "; tight"
 				}
-				emitProp("constraints=(%s%s)", scalarProps.Constraints, tight)
+				emitProp(
+					"constraints=(%s%s)",
+					cat.MaybeMarkRedactable(scalarProps.Constraints.String(), f.RedactableValues), tight,
+				)
 			}
 		}
 
@@ -1231,6 +1273,9 @@ func (f *ExprFmtCtx) formatScalarPrivate(scalar opt.ScalarExpr) {
 			f.Buffer.WriteString(string(col.ColName()))
 		}
 		f.Buffer.WriteByte(')')
+
+	case *UDFCallExpr:
+		private = nil
 
 	default:
 		private = scalar.Private()
@@ -1536,7 +1581,15 @@ func (f *ExprFmtCtx) formatLockingWithPrefix(
 	default:
 		panic(errors.AssertionFailedf("unexpected wait policy"))
 	}
-	tp.Childf("%slocking: %s%s", labelPrefix, strength, wait)
+	durability := ""
+	switch locking.Durability {
+	case tree.LockDurabilityBestEffort:
+	case tree.LockDurabilityGuaranteed:
+		durability = ",durability-guaranteed"
+	default:
+		panic(errors.AssertionFailedf("unexpected durability"))
+	}
+	tp.Childf("%slocking: %s%s%s", labelPrefix, strength, wait, durability)
 }
 
 // formatDependencies adds a new treeprinter child for schema dependencies.
@@ -1694,7 +1747,7 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 
 	case *CreateViewPrivate:
 		schema := f.Memo.Metadata().Schema(t.Schema)
-		fmt.Fprintf(f.Buffer, " %s.%s", schema.Name(), t.ViewName)
+		fmt.Fprintf(f.Buffer, " %s.%s", schema.Name(), t.Syntax.Name.Table())
 
 	case *JoinPrivate:
 		// Nothing to show; flags are shown separately.
@@ -1703,7 +1756,11 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 		// Don't show anything, because it's mostly redundant.
 
 	default:
-		fmt.Fprintf(f.Buffer, " %v", private)
+		if f.RedactableValues {
+			redact.Fprintf(f.Buffer, " %v", private)
+		} else {
+			fmt.Fprintf(f.Buffer, " %v", private)
+		}
 	}
 }
 

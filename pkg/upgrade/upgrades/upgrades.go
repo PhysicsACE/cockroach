@@ -19,15 +19,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
-	"github.com/cockroachdb/errors"
 )
 
 // SettingsDefaultOverrides documents the effect of several migrations that add
 // an explicit value for a setting, effectively changing the "default value"
 // from what was defined in code.
-var SettingsDefaultOverrides = map[string]string{
+var SettingsDefaultOverrides = map[settings.InternalKey]string{
 	"diagnostics.reporting.enabled": "true",
 	"cluster.secret":                "<random>",
 }
@@ -94,56 +94,18 @@ var upgrades = []upgradebase.Upgrade{
 		"create default databases", // v22_2StartupMigrationName
 	),
 	upgrade.NewTenantUpgrade(
-		"ensure preconditions are met before starting upgrading to v22.2",
-		toCV(clusterversion.TODODelete_V22_2Start),
-		preconditionBeforeStartingAnUpgrade,
-		NoTenantUpgradeFunc,
-	),
-	upgrade.NewTenantUpgrade(
-		"upgrade sequences to be referenced by ID",
-		toCV(clusterversion.TODODelete_V22_2UpgradeSequenceToBeReferencedByID),
-		upgrade.NoPrecondition,
-		upgradeSequenceToBeReferencedByID,
-	),
-	upgrade.NewTenantUpgrade(
-		"update system.statement_diagnostics_requests to support sampling probabilities",
-		toCV(clusterversion.TODODelete_V22_2SampledStmtDiagReqs),
-		upgrade.NoPrecondition,
-		sampledStmtDiagReqsMigration,
-	),
-	upgrade.NewTenantUpgrade(
 		"add the system.external_connections table",
 		toCV(clusterversion.TODODelete_V22_2SystemExternalConnectionsTable),
 		upgrade.NoPrecondition,
 		systemExternalConnectionsTableMigration,
 	),
-	upgrade.NewTenantUpgrade(
+	upgrade.NewPermanentTenantUpgrade(
 		"add default SQL schema telemetry schedule",
-		toCV(clusterversion.TODODelete_V22_2SQLSchemaTelemetryScheduledJobs),
-		upgrade.NoPrecondition,
+		toCV(clusterversion.Permanent_V22_2SQLSchemaTelemetryScheduledJobs),
 		ensureSQLSchemaTelemetrySchedule,
+		"add default SQL schema telemetry schedule",
 	),
-	upgrade.NewTenantUpgrade("ensure all GC jobs send DeleteRange requests",
-		toCV(clusterversion.TODODelete_V22_2WaitedForDelRangeInGCJob),
-		checkForPausedGCJobs,
-		waitForDelRangeInGCJob,
-	),
-	upgrade.NewTenantUpgrade(
-		"wait for all in-flight schema changes",
-		toCV(clusterversion.TODODelete_V22_2NoNonMVCCAddSSTable),
-		upgrade.NoPrecondition,
-		waitForAllSchemaChanges,
-	),
-	upgrade.NewTenantUpgrade("update invalid column IDs in sequence back references",
-		toCV(clusterversion.TODODelete_V22_2UpdateInvalidColumnIDsInSequenceBackReferences),
-		upgrade.NoPrecondition,
-		updateInvalidColumnIDsInSequenceBackReferences,
-	),
-	upgrade.NewTenantUpgrade("fix corrupt user-file related table descriptors",
-		toCV(clusterversion.TODODelete_V22_2FixUserfileRelatedDescriptorCorruption),
-		upgrade.NoPrecondition,
-		fixInvalidObjectsThatLookLikeBadUserfileConstraint,
-	),
+	firstUpgradeTowardsV23_1,
 	upgrade.NewTenantUpgrade("add columns to system.tenants and populate a system tenant entry",
 		toCV(clusterversion.V23_1TenantNamesStateAndServiceMode),
 		upgrade.NoPrecondition,
@@ -287,13 +249,111 @@ var upgrades = []upgradebase.Upgrade{
 		upgrade.NoPrecondition,
 		backfillExternalConnectionsTableOwnerIDColumn,
 	),
+	upgrade.NewTenantUpgrade(
+		"backfill the system.job_info table with the payload and progress of each job in the system.jobs table",
+		toCV(clusterversion.V23_1JobInfoTableIsBackfilled),
+		upgrade.NoPrecondition,
+		backfillJobInfoTable,
+	),
+	upgrade.NewTenantUpgrade("ensure all GC jobs send DeleteRange requests",
+		toCV(clusterversion.V23_1_UseDelRangeInGCJob),
+		checkForPausedGCJobs,
+		waitForDelRangeInGCJob,
+	),
+	upgrade.NewSystemUpgrade(
+		"create system.tenant_tasks and system.task_payloads",
+		toCV(clusterversion.V23_1_TaskSystemTables),
+		createTaskSystemTables,
+	),
+	upgrade.NewPermanentTenantUpgrade("create auto config runner job",
+		toCV(clusterversion.V23_1_CreateAutoConfigRunnerJob),
+		createAutoConfigRunnerJob,
+		"create auto config runner job",
+	),
+	upgrade.NewTenantUpgrade(
+		"create and index new computed columns on system sql stats tables",
+		toCV(clusterversion.V23_1AddSQLStatsComputedIndexes),
+		upgrade.NoPrecondition,
+		createComputedIndexesOnSystemSQLStatistics,
+	),
+	upgrade.NewTenantUpgrade(
+		"create statement_activity and transaction_activity tables",
+		toCV(clusterversion.V23_1AddSystemActivityTables),
+		upgrade.NoPrecondition,
+		systemStatisticsActivityTableMigration,
+	),
+	upgrade.NewPermanentSystemUpgrade(
+		"change TTL for SQL Stats system tables",
+		toCV(clusterversion.V23_1ChangeSQLStatsTTL),
+		sqlStatsTTLChange,
+		"change TTL for SQL Stats system tables",
+	),
+	upgrade.NewTenantUpgrade(
+		"stop writing payload and progress to system.jobs",
+		toCV(clusterversion.V23_1StopWritingPayloadAndProgressToSystemJobs),
+		upgrade.NoPrecondition,
+		alterPayloadColumnToNullable,
+	),
+	upgrade.NewSystemUpgrade(
+		"create system.tenant_id_seq",
+		toCV(clusterversion.V23_1_TenantIDSequence),
+		tenantIDSequenceForSystemTenant,
+	),
+	upgrade.NewPermanentTenantUpgrade(
+		"create sql activity updater job",
+		toCV(clusterversion.V23_1CreateSystemActivityUpdateJob),
+		createActivityUpdateJobMigration,
+		"create statement_activity and transaction_activity job",
+	),
+	firstUpgradeTowardsV23_2,
+	upgrade.NewTenantUpgrade(
+		"enable partially visible indexes",
+		toCV(clusterversion.V23_2_PartiallyVisibleIndexes),
+		upgrade.NoPrecondition,
+		NoTenantUpgradeFunc,
+	),
+	upgrade.NewTenantUpgrade(
+		"update system.statement_diagnostics_requests to support plan gist matching",
+		toCV(clusterversion.V23_2_StmtDiagForPlanGist),
+		upgrade.NoPrecondition,
+		stmtDiagForPlanGistMigration,
+	),
+	upgrade.NewTenantUpgrade(
+		"create system.region_liveness table",
+		toCV(clusterversion.V23_2_RegionaLivenessTable),
+		upgrade.NoPrecondition,
+		createRegionLivenessTables,
+	),
 }
+
+var (
+	firstUpgradeTowardsV23_1 = upgrade.NewTenantUpgrade(
+		"prepare upgrade to v23.1 release",
+		toCV(clusterversion.V23_1Start),
+		FirstUpgradeFromReleasePrecondition,
+		NoTenantUpgradeFunc,
+	)
+
+	firstUpgradeTowardsV23_2 = upgrade.NewTenantUpgrade(
+		"prepare upgrade to v23.2 release",
+		toCV(clusterversion.V23_2Start),
+		FirstUpgradeFromReleasePrecondition,
+		FirstUpgradeFromRelease,
+	)
+
+	// This slice must contain all upgrades bound to V??_?Start cluster
+	// version keys. These should have FirstUpgradeFromReleasePrecondition as a
+	// precondition and FirstUpgradeFromRelease as the upgrade function itself,
+	// except for V23_1Start which remains a no-op, due to this functionality
+	// having been added in the 23.2 release cycle.
+	firstUpgradesAfterPreExistingReleases = []upgradebase.Upgrade{
+		firstUpgradeTowardsV23_1,
+		firstUpgradeTowardsV23_2,
+	}
+)
 
 func init() {
 	for _, m := range upgrades {
-		if _, exists := registry[m.Version()]; exists {
-			panic(errors.AssertionFailedf("duplicate upgrade registration for %v", m.Version()))
-		}
 		registry[m.Version()] = m
 	}
 }

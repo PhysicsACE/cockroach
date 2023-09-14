@@ -49,7 +49,6 @@ type sketchInfo struct {
 type samplerProcessor struct {
 	execinfra.ProcessorBase
 
-	flowCtx         *execinfra.FlowCtx
 	input           execinfra.RowSource
 	memAcc          mon.BoundAccount
 	sr              stats.SampleReservoir
@@ -106,7 +105,6 @@ func newSamplerProcessor(
 	spec *execinfrapb.SamplerSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*samplerProcessor, error) {
 	for _, s := range spec.Sketches {
 		if _, ok := supportedSketchTypes[s.SketchType]; !ok {
@@ -117,9 +115,17 @@ func newSamplerProcessor(
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// The processor will disable histogram collection if this limit is not
 	// enough.
-	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "sampler-mem")
+	//
+	// sampler doesn't spill to disk, so ensure some reasonable lower bound on
+	// the workmem limit.
+	var minMemoryLimit int64 = 8 << 20 // 8MiB
+	if flowCtx.Cfg.TestingKnobs.MemoryLimitBytes != 0 {
+		minMemoryLimit = flowCtx.Cfg.TestingKnobs.MemoryLimitBytes
+	}
+	memMonitor := execinfra.NewLimitedMonitorWithLowerBound(
+		ctx, flowCtx, "sampler-mem", minMemoryLimit,
+	)
 	s := &samplerProcessor{
-		flowCtx:         flowCtx,
 		input:           input,
 		memAcc:          memMonitor.MakeBoundAccount(),
 		sketches:        make([]sketchInfo, len(spec.Sketches)),
@@ -204,7 +210,7 @@ func newSamplerProcessor(
 	s.outTypes = outTypes
 
 	if err := s.Init(
-		ctx, nil, post, outTypes, flowCtx, processorID, output, memMonitor,
+		ctx, nil, post, outTypes, flowCtx, processorID, memMonitor,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				s.close()
@@ -217,27 +223,29 @@ func newSamplerProcessor(
 	return s, nil
 }
 
-func (s *samplerProcessor) pushTrailingMeta(ctx context.Context) {
-	execinfra.SendTraceData(ctx, s.Output)
+func (s *samplerProcessor) pushTrailingMeta(ctx context.Context, output execinfra.RowReceiver) {
+	execinfra.SendTraceData(ctx, s.FlowCtx, output)
 }
 
 // Run is part of the Processor interface.
-func (s *samplerProcessor) Run(ctx context.Context) {
+func (s *samplerProcessor) Run(ctx context.Context, output execinfra.RowReceiver) {
 	ctx = s.StartInternal(ctx, samplerProcName)
 	s.input.Start(ctx)
 
-	earlyExit, err := s.mainLoop(ctx)
+	earlyExit, err := s.mainLoop(ctx, output)
 	if err != nil {
-		execinfra.DrainAndClose(ctx, s.Output, err, s.pushTrailingMeta, s.input)
+		execinfra.DrainAndClose(ctx, output, err, s.pushTrailingMeta, s.input)
 	} else if !earlyExit {
-		s.pushTrailingMeta(ctx)
+		s.pushTrailingMeta(ctx, output)
 		s.input.ConsumerClosed()
-		s.Output.ProducerDone()
+		output.ProducerDone()
 	}
 	s.MoveToDraining(nil /* err */)
 }
 
-func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err error) {
+func (s *samplerProcessor) mainLoop(
+	ctx context.Context, output execinfra.RowReceiver,
+) (earlyExit bool, err error) {
 	rng, _ := randutil.NewPseudoRand()
 	var da tree.DatumAlloc
 	var buf []byte
@@ -252,7 +260,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 	for {
 		row, meta := s.input.Next()
 		if meta != nil {
-			if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+			if !emitHelper(ctx, output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 				// No cleanup required; emitHelper() took care of it.
 				return true, nil
 			}
@@ -269,7 +277,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 			meta := &execinfrapb.ProducerMetadata{SamplerProgress: &execinfrapb.RemoteProducerMetadata_SamplerProgress{
 				RowsProcessed: uint64(SamplerProgressInterval),
 			}}
-			if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+			if !emitHelper(ctx, output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 				return true, nil
 			}
 
@@ -278,7 +286,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 				//  - if it is lower than cpuUsageMinThrottle, we do not throttle;
 				//  - if it is higher than cpuUsageMaxThrottle, we throttle all the way;
 				//  - in-between, we scale the idle time proportionally.
-				usage := s.flowCtx.Cfg.RuntimeStats.GetCPUCombinedPercentNorm()
+				usage := s.FlowCtx.Cfg.RuntimeStats.GetCPUCombinedPercentNorm()
 
 				if usage > cpuUsageMinThrottle {
 					fractionIdle := s.maxFractionIdle
@@ -308,7 +316,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 					case <-timer.C:
 						timer.Read = true
 						break
-					case <-s.flowCtx.Stopper().ShouldQuiesce():
+					case <-s.FlowCtx.Stopper().ShouldQuiesce():
 						break
 					}
 				}
@@ -321,7 +329,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 				return false, err
 			}
 		}
-		if earlyExit, err = s.sampleRow(ctx, &s.sr, row, rng); earlyExit || err != nil {
+		if earlyExit, err = s.sampleRow(ctx, output, &s.sr, row, rng); earlyExit || err != nil {
 			return earlyExit, err
 		}
 
@@ -350,7 +358,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 				if err := s.invSketch[col].addRow(ctx, invRow, bytesRowType, &buf, &da); err != nil {
 					return false, err
 				}
-				if earlyExit, err = s.sampleRow(ctx, invSr, invRow, rng); earlyExit || err != nil {
+				if earlyExit, err = s.sampleRow(ctx, output, invSr, invRow, rng); earlyExit || err != nil {
 					return earlyExit, err
 				}
 			}
@@ -367,7 +375,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 	for _, sample := range s.sr.Get() {
 		copy(outRow, sample.Row)
 		outRow[s.rankCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(sample.Rank))}
-		if !emitHelper(ctx, s.Output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
+		if !emitHelper(ctx, output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
 			return true, nil
 		}
 	}
@@ -383,7 +391,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 			// Reuse the rank column for inverted index keys.
 			outRow[s.rankCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(sample.Rank))}
 			outRow[s.invIdxKeyCol] = sample.Row[0]
-			if !emitHelper(ctx, s.Output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
+			if !emitHelper(ctx, output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
 				return true, nil
 			}
 		}
@@ -398,7 +406,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 	}
 	for i, si := range s.sketches {
 		outRow[s.sketchIdxCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(i))}
-		if earlyExit, err := s.emitSketchRow(ctx, &si, outRow); earlyExit || err != nil {
+		if earlyExit, err := s.emitSketchRow(ctx, output, &si, outRow); earlyExit || err != nil {
 			return earlyExit, err
 		}
 	}
@@ -409,7 +417,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 	}
 	for col, invSketch := range s.invSketch {
 		outRow[s.invColIdxCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(col))}
-		if earlyExit, err := s.emitSketchRow(ctx, invSketch, outRow); earlyExit || err != nil {
+		if earlyExit, err := s.emitSketchRow(ctx, output, invSketch, outRow); earlyExit || err != nil {
 			return earlyExit, err
 		}
 	}
@@ -418,7 +426,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 	meta := &execinfrapb.ProducerMetadata{SamplerProgress: &execinfrapb.RemoteProducerMetadata_SamplerProgress{
 		RowsProcessed: uint64(rowCount % SamplerProgressInterval),
 	}}
-	if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+	if !emitHelper(ctx, output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 		return true, nil
 	}
 
@@ -426,7 +434,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 }
 
 func (s *samplerProcessor) emitSketchRow(
-	ctx context.Context, si *sketchInfo, outRow rowenc.EncDatumRow,
+	ctx context.Context, output execinfra.RowReceiver, si *sketchInfo, outRow rowenc.EncDatumRow,
 ) (earlyExit bool, err error) {
 	outRow[s.numRowsCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(si.numRows))}
 	outRow[s.numNullsCol] = rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(si.numNulls))}
@@ -436,7 +444,7 @@ func (s *samplerProcessor) emitSketchRow(
 		return false, err
 	}
 	outRow[s.sketchCol] = rowenc.EncDatum{Datum: tree.NewDBytes(tree.DBytes(data))}
-	if !emitHelper(ctx, s.Output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
+	if !emitHelper(ctx, output, &s.OutputHelper, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
 		return true, nil
 	}
 	return false, nil
@@ -444,7 +452,11 @@ func (s *samplerProcessor) emitSketchRow(
 
 // sampleRow looks at a row and either drops it or adds it to the reservoir.
 func (s *samplerProcessor) sampleRow(
-	ctx context.Context, sr *stats.SampleReservoir, row rowenc.EncDatumRow, rng *rand.Rand,
+	ctx context.Context,
+	output execinfra.RowReceiver,
+	sr *stats.SampleReservoir,
+	row rowenc.EncDatumRow,
+	rng *rand.Rand,
 ) (earlyExit bool, err error) {
 	// Use Int63 so we don't have headaches converting to DInt.
 	rank := uint64(rng.Int63())
@@ -464,7 +476,7 @@ func (s *samplerProcessor) sampleRow(
 		meta := &execinfrapb.ProducerMetadata{SamplerProgress: &execinfrapb.RemoteProducerMetadata_SamplerProgress{
 			HistogramDisabled: true,
 		}}
-		if !emitHelper(ctx, s.Output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
+		if !emitHelper(ctx, output, &s.OutputHelper, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 			return true, nil
 		}
 	} else if sr.Cap() != prevCapacity {

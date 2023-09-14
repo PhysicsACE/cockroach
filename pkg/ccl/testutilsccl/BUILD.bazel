@@ -1,8 +1,8 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "testutilsccl",
+    testonly = 1,
     srcs = ["alter_primary_key.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl",
     visibility = ["//visibility:public"],
@@ -13,11 +13,8 @@ go_library(
         "//pkg/sql",
         "//pkg/sql/execinfra",
         "//pkg/sql/sqltestutils",
-        "//pkg/sql/tests",
         "//pkg/testutils/serverutils",
         "//pkg/util",
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

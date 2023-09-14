@@ -30,9 +30,13 @@ import (
 func registerSchemaChangeDuringKV(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    `schemachange/during/kv`,
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(5),
+		Leases:  registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			if c.Spec().Cloud != spec.GCE && !c.IsLocal() {
+				t.Skip("uses gs://cockroach-fixtures; see https://github.com/cockroachdb/cockroach/issues/105968")
+			}
 			const fixturePath = `gs://cockroach-fixtures/workload/tpch/scalefactor=10/backup?AUTH=implicit`
 
 			c.Put(ctx, t.Cockroach(), "./cockroach")
@@ -45,7 +49,8 @@ func registerSchemaChangeDuringKV(r registry.Registry) {
 			m := c.NewMonitor(ctx, c.All())
 			m.Go(func(ctx context.Context) error {
 				t.Status("loading fixture")
-				if _, err := db.Exec(`RESTORE DATABASE tpch FROM $1`, fixturePath); err != nil {
+				if _, err := db.Exec(
+					`RESTORE DATABASE tpch FROM $1 WITH unsafe_restore_incompatible_version`, fixturePath); err != nil {
 					t.Fatal(err)
 				}
 				return nil
@@ -293,8 +298,8 @@ func findIndexProblem(
 	return nil
 }
 
-func registerSchemaChangeIndexTPCC1000(r registry.Registry) {
-	r.Add(makeIndexAddTpccTest(r.MakeClusterSpec(5, spec.CPU(16)), 1000, time.Hour*2))
+func registerSchemaChangeIndexTPCC800(r registry.Registry) {
+	r.Add(makeIndexAddTpccTest(r.MakeClusterSpec(5, spec.CPU(16)), 800, time.Hour*2))
 }
 
 func registerSchemaChangeIndexTPCC100(r registry.Registry) {
@@ -305,10 +310,12 @@ func makeIndexAddTpccTest(
 	spec spec.ClusterSpec, warehouses int, length time.Duration,
 ) registry.TestSpec {
 	return registry.TestSpec{
-		Name:    fmt.Sprintf("schemachange/index/tpcc/w=%d", warehouses),
-		Owner:   registry.OwnerSQLSchema,
-		Cluster: spec,
-		Timeout: length * 3,
+		Name:      fmt.Sprintf("schemachange/index/tpcc/w=%d", warehouses),
+		Owner:     registry.OwnerSQLFoundations,
+		Benchmark: true,
+		Cluster:   spec,
+		Leases:    registry.MetamorphicLeases,
+		Timeout:   length * 3,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCC(ctx, t, c, tpccOptions{
 				Warehouses: warehouses,
@@ -338,8 +345,9 @@ func makeSchemaChangeBulkIngestTest(
 ) registry.TestSpec {
 	return registry.TestSpec{
 		Name:    "schemachange/bulkingest",
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(numNodes),
+		Leases:  registry.MetamorphicLeases,
 		Timeout: length * 2,
 		// `fixtures import` (with the workload paths) is not supported in 2.1
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -415,18 +423,20 @@ func makeSchemaChangeBulkIngestTest(
 	}
 }
 
-func registerSchemaChangeDuringTPCC1000(r registry.Registry) {
-	r.Add(makeSchemaChangeDuringTPCC(r.MakeClusterSpec(5, spec.CPU(16)), 1000, time.Hour*3))
+func registerSchemaChangeDuringTPCC800(r registry.Registry) {
+	r.Add(makeSchemaChangeDuringTPCC(r.MakeClusterSpec(5, spec.CPU(16)), 800, time.Hour*3))
 }
 
 func makeSchemaChangeDuringTPCC(
 	spec spec.ClusterSpec, warehouses int, length time.Duration,
 ) registry.TestSpec {
 	return registry.TestSpec{
-		Name:    "schemachange/during/tpcc",
-		Owner:   registry.OwnerSQLSchema,
-		Cluster: spec,
-		Timeout: length * 3,
+		Name:      "schemachange/during/tpcc",
+		Owner:     registry.OwnerSQLFoundations,
+		Benchmark: true,
+		Cluster:   spec,
+		Leases:    registry.MetamorphicLeases,
+		Timeout:   length * 3,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCC(ctx, t, c, tpccOptions{
 				Warehouses: warehouses,

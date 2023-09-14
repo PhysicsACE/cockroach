@@ -37,11 +37,11 @@ type timeSeriesResolutionInfo struct {
 // pair will only be identified once, even if the range contains keys for that
 // name/resolution pair at multiple timestamps or from multiple sources.
 //
-// An engine snapshot is used, rather than a client, because this function is
+// A local engine is used, rather than a client, because this function is
 // intended to be called by a storage queue which can inspect the local data for
 // a single range without the need for expensive network calls.
 func (tsdb *DB) findTimeSeries(
-	snapshot storage.Reader, startKey, endKey roachpb.RKey, now hlc.Timestamp,
+	reader storage.Reader, startKey, endKey roachpb.RKey, now hlc.Timestamp,
 ) ([]timeSeriesResolutionInfo, error) {
 	var results []timeSeriesResolutionInfo
 
@@ -64,7 +64,10 @@ func (tsdb *DB) findTimeSeries(
 	thresholds := tsdb.computeThresholds(now.WallTime)
 
 	// NB: timeseries don't have intents.
-	iter := snapshot.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{UpperBound: endKey.AsRawKey()})
+	iter, err := reader.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{UpperBound: endKey.AsRawKey()})
+	if err != nil {
+		return nil, err
+	}
 	defer iter.Close()
 
 	for iter.SeekGE(next); ; iter.SeekGE(next) {
@@ -73,7 +76,7 @@ func (tsdb *DB) findTimeSeries(
 		} else if !ok || !iter.UnsafeKey().Less(end) {
 			break
 		}
-		foundKey := iter.Key().Key
+		foundKey := iter.UnsafeKey().Key.Clone()
 
 		// Extract the name and resolution from the discovered key.
 		name, _, res, tsNanos, err := DecodeDataKey(foundKey)

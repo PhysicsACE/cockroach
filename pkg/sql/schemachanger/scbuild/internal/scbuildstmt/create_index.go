@@ -11,11 +11,13 @@
 package scbuildstmt
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -45,15 +47,16 @@ import (
 
 // CreateIndex implements CREATE INDEX.
 func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
+	b.IncrementSchemaChangeCreateCounter("index")
 	// Resolve the table name and start building the new index element.
 	relationElements := b.ResolveRelation(n.Table.ToUnresolvedObjectName(), ResolveParams{
 		IsExistenceOptional: false,
 		RequiredPrivilege:   privilege.CREATE,
 	})
-	// We don't support handling zone config related properties for tables, so
-	// throw an unsupported error.
+	// We don't support handling zone config related properties for tables required
+	// for regional by row tables.
 	if _, _, tbl := scpb.FindTable(relationElements); tbl != nil {
-		fallBackIfZoneConfigExists(b, n, tbl.TableID)
+		fallBackIfRegionalByRowTable(b, n, tbl.TableID)
 	}
 	_, _, partitioning := scpb.FindTablePartitioning(relationElements)
 	if partitioning != nil && n.PartitionByIndex != nil &&
@@ -63,6 +66,7 @@ func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 			"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
 		))
 	}
+	panicIfSchemaIsLocked(relationElements)
 
 	// Inverted indexes do not support hash sharding or unique.
 	if n.Inverted {
@@ -75,22 +79,29 @@ func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 		if n.Unique {
 			panic(pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique"))
 		}
-		b.IncrementSchemaChangeIndexCounter("inverted_index")
-		if len(n.Columns) > 0 {
-			b.IncrementSchemaChangeIndexCounter("multi_column_inverted_index")
+		b.IncrementSchemaChangeIndexCounter("inverted")
+		if len(n.Columns) > 1 {
+			b.IncrementSchemaChangeIndexCounter("multi_column_inverted")
 		}
+	}
+	activeVersion := b.EvalCtx().Settings.Version.ActiveVersion(context.TODO())
+	if !activeVersion.IsActive(clusterversion.V23_2_PartiallyVisibleIndexes) &&
+		n.Invisibility.Value > 0.0 && n.Invisibility.Value < 1.0 {
+		panic(unimplemented.New("partially visible indexes", "partially visible indexes are not yet supported"))
 	}
 	var idxSpec indexSpec
 	idxSpec.secondary = &scpb.SecondaryIndex{
 		Index: scpb.Index{
+			IsUnique:       n.Unique,
 			IsInverted:     n.Inverted,
 			IsConcurrently: n.Concurrently,
-			IsNotVisible:   n.NotVisible,
+			IsNotVisible:   n.Invisibility.Value != 0.0,
+			Invisibility:   n.Invisibility.Value,
 		},
 	}
 	var relation scpb.Element
 	var sourceIndex *scpb.PrimaryIndex
-	relationElements.ForEachElementStatus(func(_ scpb.Status, target scpb.TargetStatus, e scpb.Element) {
+	relationElements.ForEach(func(_ scpb.Status, target scpb.TargetStatus, e scpb.Element) {
 		switch t := e.(type) {
 		case *scpb.Table:
 			n.Table.ObjectNamePrefix = b.NamePrefix(t)
@@ -148,9 +159,6 @@ func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 	if idxSpec.secondary.TableID == catid.InvalidDescID || sourceIndex == nil {
 		panic(pgerror.Newf(pgcode.WrongObjectType,
 			"%q is not a table or materialized view", n.Table.ObjectName))
-	}
-	if n.Unique {
-		idxSpec.secondary.IsUnique = true
 	}
 	// Resolve the index name and make sure it doesn't exist yet.
 	{
@@ -243,7 +251,7 @@ func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 func nextRelationIndexID(b BuildCtx, relation scpb.Element) catid.IndexID {
 	switch t := relation.(type) {
 	case *scpb.Table:
-		return b.NextTableIndexID(t)
+		return b.NextTableIndexID(t.TableID)
 	case *scpb.View:
 		return b.NextViewIndexID(t)
 	default:
@@ -257,8 +265,7 @@ func newUndefinedOpclassError(opclass tree.Name) error {
 
 // checkColumnAccessibilityForIndex validate that any columns that are explicitly referenced in a column for storage or
 // as a key are either accessible and not system columns.
-func checkColumnAccessibilityForIndex(colName string, columnElts ElementResultSet, store bool) {
-	_, _, column := scpb.FindColumn(columnElts)
+func checkColumnAccessibilityForIndex(colName string, column *scpb.Column, store bool) {
 	if column.IsInaccessible {
 		panic(pgerror.Newf(
 			pgcode.UndefinedColumn,
@@ -370,6 +377,7 @@ func processColNodeType(
 		})
 	}
 	// Only certain column types are supported for inverted indexes.
+	version := b.EvalCtx().Settings.Version.ActiveVersion(b)
 	if n.Inverted && lastColIdx &&
 		!colinfo.ColumnTypeIsInvertedIndexable(columnType.Type) {
 		colNameForErr := colName
@@ -379,7 +387,8 @@ func processColNodeType(
 		panic(tabledesc.NewInvalidInvertedColumnError(colNameForErr,
 			columnType.Type.String()))
 	} else if (!n.Inverted || !lastColIdx) &&
-		!colinfo.ColumnTypeIsIndexable(columnType.Type) {
+		(!colinfo.ColumnTypeIsIndexable(columnType.Type) ||
+			(columnType.Type.Family() == types.JsonFamily && !version.IsActive(clusterversion.V23_2))) {
 		// Otherwise, check if the column type is indexable.
 		panic(unimplemented.NewWithIssueDetailf(35730,
 			columnType.Type.DebugString(),
@@ -492,20 +501,23 @@ func maybeAddPartitionDescriptorForIndex(b BuildCtx, n *tree.CreateIndex, idxSpe
 	// which is undesirable in most cases.
 	// Avoid the warning if we have PARTITION ALL BY as all indexes will implicitly
 	// have relevant partitioning columns prepended at the front.
-	scpb.ForEachIndexPartitioning(b, func(current scpb.Status, target scpb.TargetStatus, e *scpb.IndexPartitioning) {
-		if target == scpb.ToPublic &&
-			e.IndexID == idxSpec.secondary.SourceIndexID && e.TableID == idxSpec.secondary.TableID &&
-			e.NumColumns > 0 &&
-			partitioning == nil {
-			b.EvalCtx().ClientNoticeSender.BufferClientNotice(
-				b,
-				errors.WithHint(
-					pgnotice.Newf("creating non-partitioned index on partitioned table may not be performant"),
-					"Consider modifying the index such that it is also partitioned.",
-				),
-			)
-		}
-	})
+	scpb.ForEachIndexPartitioning(
+		b.QueryByID(idxSpec.secondary.TableID),
+		func(current scpb.Status, target scpb.TargetStatus, e *scpb.IndexPartitioning) {
+			if target == scpb.ToPublic &&
+				e.IndexID == idxSpec.secondary.SourceIndexID &&
+				e.NumColumns > 0 &&
+				partitioning == nil {
+				b.EvalCtx().ClientNoticeSender.BufferClientNotice(
+					b,
+					errors.WithHint(
+						pgnotice.Newf("creating non-partitioned index on partitioned table may not be performant"),
+						"Consider modifying the index such that it is also partitioned.",
+					),
+				)
+			}
+		},
+	)
 }
 
 // addColumnsForSecondaryIndex updates the index spec to add columns needed
@@ -556,40 +568,31 @@ func addColumnsForSecondaryIndex(
 	for i, columnNode := range n.Columns {
 		colName := columnNode.Column
 		if columnNode.Expr != nil {
-			tbl := relation.(*scpb.Table)
-			colNameStr := maybeCreateVirtualColumnForIndex(b, &n.Table, tbl, columnNode.Expr, n.Inverted, i == len(n.Columns)-1)
+			colNameStr := maybeCreateVirtualColumnForIndex(b, &n.Table, relation.(*scpb.Table), columnNode.Expr, n.Inverted, i == len(n.Columns)-1)
 			colName = tree.Name(colNameStr)
 			if !expressionTelemtryCounted {
 				b.IncrementSchemaChangeIndexCounter("expression")
 				expressionTelemtryCounted = true
 			}
 		}
-		colElts := b.ResolveColumn(tableID, colName, ResolveParams{
-			RequiredPrivilege: privilege.CREATE,
-		})
-		_, _, column := scpb.FindColumn(colElts)
-		_, _, columnType := scpb.FindColumnType(colElts)
-		invertedKind := processColNodeType(b, n, idxSpec, string(colName), columnNode, columnType, i == lastColumnIdx)
+		colID := getColumnIDFromColumnName(b, tableID, colName, true /* required */)
+		columnTypeElem := mustRetrieveColumnTypeElem(b, tableID, colID)
+		columnElem := mustRetrieveColumnElem(b, tableID, colID)
 		// Column should be accessible.
 		if columnNode.Expr == nil {
-			checkColumnAccessibilityForIndex(string(colName), colElts, false)
+			checkColumnAccessibilityForIndex(string(colName), columnElem, false)
 		}
 		keyColNames[i] = string(colName)
-		direction := catenumpb.IndexColumn_ASC
-		if columnNode.Direction == tree.Descending {
-			direction = catenumpb.IndexColumn_DESC
-		}
-		ic := &scpb.IndexColumn{
+		idxSpec.columns = append(idxSpec.columns, &scpb.IndexColumn{
 			TableID:       idxSpec.secondary.TableID,
 			IndexID:       idxSpec.secondary.IndexID,
-			ColumnID:      column.ColumnID,
+			ColumnID:      colID,
 			OrdinalInKind: uint32(i),
 			Kind:          scpb.IndexColumn_KEY,
-			Direction:     direction,
-			InvertedKind:  invertedKind,
-		}
-		idxSpec.columns = append(idxSpec.columns, ic)
-		keyColIDs.Add(column.ColumnID)
+			Direction:     indexColumnDirection(columnNode.Direction),
+			InvertedKind:  processColNodeType(b, n, idxSpec, string(colName), columnNode, columnTypeElem, i == lastColumnIdx),
+		})
+		keyColIDs.Add(colID)
 	}
 	// Set the key suffix column IDs.
 	// We want to find the key column IDs
@@ -637,7 +640,7 @@ func addColumnsForSecondaryIndex(
 			RequiredPrivilege: privilege.CREATE,
 		})
 		_, _, column := scpb.FindColumn(colElts)
-		checkColumnAccessibilityForIndex(storingNode.String(), colElts, true)
+		checkColumnAccessibilityForIndex(storingNode.String(), column, true)
 		c := &scpb.IndexColumn{
 			TableID:       idxSpec.secondary.TableID,
 			IndexID:       idxSpec.secondary.IndexID,
@@ -650,25 +653,13 @@ func addColumnsForSecondaryIndex(
 	// Set up sharding.
 	if n.Sharded != nil {
 		b.IncrementSchemaChangeIndexCounter("hash_sharded")
-		buckets, err := tabledesc.EvalShardBucketCount(b, b.SemaCtx(), b.EvalCtx(), n.Sharded.ShardBuckets, n.StorageParams)
-		if err != nil {
-			panic(err)
-		}
-		shardColName := maybeCreateAndAddShardCol(b, int(buckets), relation.(*scpb.Table), keyColNames, n)
-		idxSpec.secondary.Sharding = &catpb.ShardedDescriptor{
-			IsSharded:    true,
-			Name:         shardColName,
-			ShardBuckets: buckets,
-			ColumnNames:  keyColNames,
-		}
-		colElts := b.ResolveColumn(tableID, tree.Name(shardColName), ResolveParams{
-			RequiredPrivilege: privilege.CREATE,
-		})
-		_, _, column := scpb.FindColumn(colElts)
+		sharding, shardColID := ensureShardColAndMakeShardDesc(b, relation.(*scpb.Table), keyColNames,
+			n.Sharded.ShardBuckets, n.StorageParams, n)
+		idxSpec.secondary.Sharding = sharding
 		indexColumn := &scpb.IndexColumn{
 			IndexID:       idxSpec.secondary.IndexID,
-			TableID:       column.TableID,
-			ColumnID:      column.ColumnID,
+			TableID:       tableID,
+			ColumnID:      shardColID,
 			OrdinalInKind: 0,
 			Kind:          scpb.IndexColumn_KEY,
 			Direction:     catenumpb.IndexColumn_ASC,
@@ -676,7 +667,7 @@ func addColumnsForSecondaryIndex(
 		// Remove the sharded column if it's there in the primary
 		// index already, before adding it.
 		for pos, ic := range idxSpec.columns {
-			if ic.ColumnID == column.ColumnID {
+			if ic.ColumnID == shardColID {
 				idxSpec.columns = append(idxSpec.columns[:pos], idxSpec.columns[pos+1:]...)
 				break
 			}
@@ -690,7 +681,7 @@ func addColumnsForSecondaryIndex(
 // buckets.
 func maybeCreateAndAddShardCol(
 	b BuildCtx, shardBuckets int, tbl *scpb.Table, colNames []string, n tree.NodeFormatter,
-) (shardColName string) {
+) (shardColName string, shardColID catid.ColumnID) {
 	shardColName = tabledesc.GetShardColumnName(colNames, int32(shardBuckets))
 	elts := b.QueryByID(tbl.TableID)
 	// TODO(ajwerner): In what ways is the column referenced by
@@ -711,21 +702,20 @@ func maybeCreateAndAddShardCol(
 		}
 	})
 	if existingShardColID != 0 {
-		return shardColName
+		return shardColName, existingShardColID
 	}
 	expr := schemaexpr.MakeHashShardComputeExpr(colNames, shardBuckets)
 	parsedExpr, err := parser.ParseExpr(*expr)
 	if err != nil {
 		panic(err)
 	}
-	shardColID := b.NextTableColumnID(tbl)
+	shardColID = b.NextTableColumnID(tbl)
 	spec := addColumnSpec{
 		tbl: tbl,
 		col: &scpb.Column{
-			TableID:        tbl.TableID,
-			ColumnID:       shardColID,
-			IsHidden:       true,
-			PgAttributeNum: catid.PGAttributeNum(shardColID),
+			TableID:  tbl.TableID,
+			ColumnID: shardColID,
+			IsHidden: true,
 		},
 		name: &scpb.ColumnName{
 			TableID:  tbl.TableID,
@@ -743,7 +733,7 @@ func maybeCreateAndAddShardCol(
 		},
 		notNull: true,
 	}
-	addColumn(b, spec, n)
+	backing := addColumn(b, spec, n)
 	// Create a new check constraint for the hash sharded index column.
 	checkConstraintBucketValues := strings.Builder{}
 	checkConstraintBucketValues.WriteString(fmt.Sprintf("%q IN (", shardColName))
@@ -761,24 +751,26 @@ func maybeCreateAndAddShardCol(
 				checkConstraintBucketValues.String()),
 			err))
 	}
+	shardColCkConstraintID := b.NextTableConstraintID(tbl.TableID)
 	shardCheckConstraint := &scpb.CheckConstraint{
 		TableID:      tbl.TableID,
-		ConstraintID: b.NextTableConstraintID(tbl.TableID),
+		ConstraintID: shardColCkConstraintID,
 		Expression: scpb.Expression{
 			Expr:                catpb.Expression(checkConstraintBucketValues.String()),
 			ReferencedColumnIDs: []catid.ColumnID{shardColID},
 		},
 		FromHashShardedColumn: true,
+		IndexIDForValidation:  backing.IndexID,
 	}
 	b.Add(shardCheckConstraint)
 	shardCheckConstraintName := &scpb.ConstraintWithoutIndexName{
 		TableID:      tbl.TableID,
-		ConstraintID: shardCheckConstraint.ConstraintID,
+		ConstraintID: shardColCkConstraintID,
 		Name:         generateUniqueCheckConstraintName(b, tbl.TableID, chkConstraintExpr),
 	}
 	b.Add(shardCheckConstraintName)
 
-	return shardColName
+	return shardColName, shardColID
 }
 
 func maybeCreateVirtualColumnForIndex(

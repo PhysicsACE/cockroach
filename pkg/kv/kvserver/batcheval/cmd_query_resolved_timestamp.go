@@ -30,7 +30,7 @@ import (
 // QueryResolvedTimestampIntentCleanupAge configures the minimum intent age that
 // QueryResolvedTimestamp requests will consider for async intent cleanup.
 var QueryResolvedTimestampIntentCleanupAge = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.query_resolved_timestamp.intent_cleanup_age",
 	"minimum intent age that QueryResolvedTimestamp requests will consider for async intent cleanup",
 	10*time.Second,
@@ -104,7 +104,10 @@ func computeMinIntentTimestamp(
 ) (hlc.Timestamp, []roachpb.Intent, error) {
 	ltStart, _ := keys.LockTableSingleKey(span.Key, nil)
 	ltEnd, _ := keys.LockTableSingleKey(span.EndKey, nil)
-	iter := reader.NewEngineIterator(storage.IterOptions{LowerBound: ltStart, UpperBound: ltEnd})
+	iter, err := reader.NewEngineIterator(storage.IterOptions{LowerBound: ltStart, UpperBound: ltEnd})
+	if err != nil {
+		return hlc.Timestamp{}, nil, err
+	}
 	defer iter.Close()
 
 	var meta enginepb.MVCCMetadata

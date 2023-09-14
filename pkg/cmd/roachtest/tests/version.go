@@ -13,7 +13,6 @@ package tests
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"strings"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 )
@@ -219,13 +219,11 @@ func registerVersion(r registry.Registry) {
 	for _, n := range []int{3, 5} {
 		r.Add(registry.TestSpec{
 			Name:    fmt.Sprintf("version/mixed/nodes=%d", n),
+			Timeout: 4 * time.Hour,
 			Owner:   registry.OwnerTestEng,
 			Cluster: r.MakeClusterSpec(n + 1),
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				if c.IsLocal() && runtime.GOARCH == "arm64" {
-					t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
-				}
-				pred, err := version.PredecessorVersion(*t.BuildVersion())
+				pred, err := release.LatestPredecessor(t.BuildVersion())
 				if err != nil {
 					t.Fatal(err)
 				}

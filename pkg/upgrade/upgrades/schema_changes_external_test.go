@@ -173,6 +173,7 @@ CREATE TABLE test.test_table (
 // alters a column in a table multiple times with failures at different stages
 // of the migration.
 func TestMigrationWithFailuresMultipleAltersOnSameColumn(t *testing.T) {
+
 	const createTableBefore = `
 CREATE TABLE test.test_table (
    username STRING NOT NULL
@@ -242,9 +243,12 @@ func testMigrationWithFailures(
 
 	skip.UnderRace(t, "very slow")
 
-	// We're going to be migrating from the minimum supported version to the current version.
-	startCV := clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)
-	endCV := clusterversion.ByKey(clusterversion.BinaryVersionKey)
+	// We're going to be migrating from the minimum supported version to the
+	// "next" version. We'll be injecting the migration for the next version.
+	startKey := clusterversion.BinaryMinSupportedVersionKey
+	startCV := clusterversion.ByKey(startKey)
+	endCV := startCV
+	endCV.Internal += 2
 
 	// The tests follows the following procedure.
 	//
@@ -337,6 +341,7 @@ func testMigrationWithFailures(
 						Server: &server.TestingKnobs{
 							DisableAutomaticVersionUpgrade: make(chan struct{}),
 							BinaryVersionOverride:          startCV,
+							BootstrapVersionKeyOverride:    startKey,
 						},
 						JobsTestingKnobs: jobsKnobs,
 						SQLExecutor: &sql.ExecutorTestingKnobs{
@@ -505,7 +510,7 @@ func testMigrationWithFailures(
 			})
 			if test.waitForMigrationRestart {
 				// Ensure that we have observed the expected number of ignored schema change jobs.
-				log.Flush()
+				log.FlushFiles()
 				entries, err := log.FetchEntriesFromFiles(
 					0, math.MaxInt64, 10000,
 					regexp.MustCompile("skipping.*operation as the schema change already exists."),

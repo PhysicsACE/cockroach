@@ -16,12 +16,15 @@ import (
 	"io"
 	"net/url"
 	"path"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -60,23 +63,29 @@ type confluentSchemaRegistry struct {
 
 var _ schemaRegistry = (*confluentSchemaRegistry)(nil)
 
-type schemaRegistryParams map[string][]byte
+type schemaRegistryParams struct {
+	params  map[string][]byte
+	timeout time.Duration
+}
 
 func (s schemaRegistryParams) caCert() []byte {
-	return s[changefeedbase.RegistryParamCACert]
+	return s.params[changefeedbase.RegistryParamCACert]
 }
 
 func (s schemaRegistryParams) clientCert() []byte {
-	return s[changefeedbase.RegistryParamClientCert]
+	return s.params[changefeedbase.RegistryParamClientCert]
 }
 
 func (s schemaRegistryParams) clientKey() []byte {
-	return s[changefeedbase.RegistryParamClientKey]
+	return s.params[changefeedbase.RegistryParamClientKey]
 }
 
-func getAndDeleteParams(u *url.URL) (schemaRegistryParams, error) {
+const timeoutParam = "timeout"
+const defaultSchemaRegistryTimeout = 30 * time.Second
+
+func getAndDeleteParams(u *url.URL) (*schemaRegistryParams, error) {
 	query := u.Query()
-	s := make(schemaRegistryParams, 3)
+	s := schemaRegistryParams{params: make(map[string][]byte, 3)}
 	for _, k := range []string{
 		changefeedbase.RegistryParamCACert,
 		changefeedbase.RegistryParamClientCert,
@@ -87,19 +96,31 @@ func getAndDeleteParams(u *url.URL) (schemaRegistryParams, error) {
 			if err != nil {
 				return nil, errors.Wrapf(err, "param %s must be base 64 encoded", k)
 			}
-			s[k] = decoded
+			s.params[k] = decoded
 			query.Del(k)
 		}
 	}
+
+	if strTimeout := query.Get(timeoutParam); strTimeout != "" {
+		dur, err := time.ParseDuration(strTimeout)
+		if err != nil {
+			return nil, err
+		}
+		s.timeout = dur
+	} else {
+		// Default timeout in httputil is way too low. Use something more reasonable.
+		s.timeout = defaultSchemaRegistryTimeout
+	}
+
 	// remove crdb query params to ensure compatibility with schema
 	// registry implementation
 	u.RawQuery = query.Encode()
-	return s, nil
+	return &s, nil
 }
 
 func newConfluentSchemaRegistry(
 	baseURL string, p externalConnectionProvider, sliMetrics *sliMetrics,
-) (*confluentSchemaRegistry, error) {
+) (schemaRegistry, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, errors.Wrap(err, "malformed schema registry url")
@@ -117,6 +138,22 @@ func newConfluentSchemaRegistry(
 		return nil, errors.Errorf("unsupported scheme: %q", u.Scheme)
 	}
 
+	var src *schemaRegistryCache
+	var ok bool
+	func() {
+		schemaRegistrySingletons.mu.Lock()
+		defer schemaRegistrySingletons.mu.Unlock()
+		src, ok = schemaRegistrySingletons.cachePerEndpoint[baseURL]
+		if !ok {
+			src = &schemaRegistryCache{entries: cache.NewUnorderedCache(
+				cache.Config{Policy: cache.CacheLRU, ShouldEvict: func(size int, _, _ interface{}) bool {
+					return size > 1023
+				}}),
+			}
+			schemaRegistrySingletons.cachePerEndpoint[baseURL] = src
+		}
+	}()
+
 	s, err := getAndDeleteParams(u)
 	if err != nil {
 		return nil, err
@@ -129,25 +166,32 @@ func newConfluentSchemaRegistry(
 
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.MaxRetries = 5
-	return &confluentSchemaRegistry{
-		baseURL:    u,
-		client:     httpClient,
-		retryOpts:  retryOpts,
-		sliMetrics: sliMetrics,
-	}, nil
+	reg := schemaRegistryWithCache{
+		base: &confluentSchemaRegistry{
+			baseURL:    u,
+			client:     httpClient,
+			retryOpts:  retryOpts,
+			sliMetrics: sliMetrics,
+		},
+		cache: src,
+	}
+	return &reg, nil
 }
 
 // Setup the httputil.Client to use when dialing Confluent schema registry. If `ca_cert`
 // is set as a query param in the registry URL, client should trust the corresponding
 // cert while dialing. Otherwise, use the DefaultClient.
-func setupHTTPClient(baseURL *url.URL, s schemaRegistryParams) (*httputil.Client, error) {
-	if len(s) == 0 {
-		return httputil.DefaultClient, nil
+func setupHTTPClient(baseURL *url.URL, s *schemaRegistryParams) (*httputil.Client, error) {
+	if len(s.params) == 0 {
+		return httputil.NewClientWithTimeout(s.timeout), nil
 	}
+
 	httpClient, err := newClientFromTLSKeyPair(s.caCert(), s.clientCert(), s.clientKey())
 	if err != nil {
 		return nil, err
 	}
+	httpClient.Timeout = s.timeout
+
 	if baseURL.Scheme == "http" {
 		log.Warningf(context.Background(), "TLS configuration provided but schema registry %s uses HTTP", baseURL)
 	}
@@ -217,6 +261,9 @@ func (r *confluentSchemaRegistry) RegisterSchemaForSubject(
 	if err != nil {
 		return 0, err
 	}
+	if r.sliMetrics != nil {
+		r.sliMetrics.SchemaRegistrations.Inc(1)
+	}
 	return id, nil
 }
 
@@ -266,4 +313,74 @@ func (r *confluentSchemaRegistry) urlForPath(relPath string) string {
 	u := *r.baseURL
 	u.Path = path.Join(u.EscapedPath(), relPath)
 	return u.String()
+}
+
+type schemaRegistryCacheKey struct {
+	subject string
+	schema  string
+}
+
+type schemaRegistryCache struct {
+	mu syncutil.Mutex
+	// cache[schemaRegistryCacheKey]registeredSchemaID
+	entries *cache.UnorderedCache
+}
+
+// Get returns the already-registered id for this key if present, and
+// a bool indicating a hit or miss.
+func (src *schemaRegistryCache) Get(key schemaRegistryCacheKey) (int32, bool) {
+	v, ok := src.entries.Get(key)
+	if ok {
+		return v.(int32), true
+	}
+	return 0, false
+}
+
+// Add caches a registered schema id.
+func (src *schemaRegistryCache) Add(key schemaRegistryCacheKey, id int32) {
+	src.entries.Add(key, id)
+}
+
+type schemaRegistryWithCache struct {
+	base  schemaRegistry
+	cache *schemaRegistryCache
+}
+
+// Ping implements the schemaRegistry interface.
+func (csr *schemaRegistryWithCache) Ping(ctx context.Context) error {
+	return csr.base.Ping(ctx)
+}
+
+// RegisterSchemaForSubject implements the schemaRegistry interface.
+func (csr *schemaRegistryWithCache) RegisterSchemaForSubject(
+	ctx context.Context, subject string, schema string,
+) (int32, error) {
+	cacheKey := schemaRegistryCacheKey{
+		subject: subject, schema: schema,
+	}
+	csr.cache.mu.Lock()
+	defer csr.cache.mu.Unlock()
+	id, ok := csr.cache.Get(cacheKey)
+	if ok {
+		return id, nil
+	}
+	id, err := csr.base.RegisterSchemaForSubject(ctx, subject, schema)
+	if err == nil {
+		csr.cache.Add(cacheKey, id)
+	}
+	return id, err
+}
+
+type sharedSchemaRegistryCaches struct {
+	mu               syncutil.Mutex
+	cachePerEndpoint map[string]*schemaRegistryCache
+}
+
+var schemaRegistrySingletons = &sharedSchemaRegistryCaches{cachePerEndpoint: make(map[string]*schemaRegistryCache)}
+
+// TestingClearSchemaRegistrySingleton clears out the singleton so that different tests don't pollute each other
+func TestingClearSchemaRegistrySingleton() {
+	schemaRegistrySingletons.mu.Lock()
+	defer schemaRegistrySingletons.mu.Unlock()
+	schemaRegistrySingletons.cachePerEndpoint = make(map[string]*schemaRegistryCache)
 }

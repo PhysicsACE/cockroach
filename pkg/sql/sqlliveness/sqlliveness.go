@@ -34,25 +34,35 @@ type SessionID string
 // Provider is a wrapper around the sqlliveness subsystem for external
 // consumption.
 type Provider interface {
-	Liveness
+	Instance
+	StorageReader
 
 	// Start starts the sqlliveness subsystem. regionPhysicalRep should
 	// represent the physical representation of the current process region
-	// stored in the multi-region enum type associated with the system database.
+	// stored in the multi-region enum type associated with the system
+	// database.
 	Start(ctx context.Context, regionPhysicalRep []byte)
+
+	// Release delete's the sqlliveness session managed by the provider. This
+	// should be called near the end of the drain process, after the server has
+	// no running tasks that depend on the session.
+	Release(ctx context.Context) (SessionID, error)
 
 	// Metrics returns a metric.Struct which holds metrics for the provider.
 	Metrics() metric.Struct
+}
+
+// StorageReader provides access to Readers which either block or do not
+// block.
+type StorageReader interface {
+	// BlockingReader returns a Reader which only synchronously
+	// checks whether a session is alive if it does not have any
+	// cached information which implies that it currently is.
+	BlockingReader() Reader
 
 	// CachedReader returns a reader which only consults its local cache and
 	// does not perform any RPCs in the IsAlive call.
 	CachedReader() Reader
-}
-
-// Liveness exposes Reader and Instance interfaces.
-type Liveness interface {
-	Reader
-	Instance
 }
 
 // String returns a hex-encoded version of the SessionID.

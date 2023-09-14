@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -83,15 +84,20 @@ func alterChangefeedPlanHook(
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
-		if err := validateSettings(ctx, p); err != nil {
-			return err
-		}
+		jobID, err := func() (jobspb.JobID, error) {
+			origProps := p.SemaCtx().Properties
+			p.SemaCtx().Properties.Require("cdc", tree.RejectSubqueries)
+			defer p.SemaCtx().Properties.Restore(origProps)
 
-		typedExpr, err := alterChangefeedStmt.Jobs.TypeCheck(ctx, p.SemaCtx(), types.Int)
+			id, err := p.ExprEvaluator("ALTER CHANGEFEED").Int(ctx, alterChangefeedStmt.Jobs)
+			if err != nil {
+				return jobspb.JobID(0), err
+			}
+			return jobspb.JobID(id), nil
+		}()
 		if err != nil {
-			return err
+			return pgerror.Wrap(err, pgcode.DatatypeMismatch, "changefeed ID must be an INT value")
 		}
-		jobID := jobspb.JobID(tree.MustBeDInt(typedExpr))
 
 		job, err := p.ExecCfg().JobRegistry.LoadJobWithTxn(ctx, jobID, p.InternalSQLTxn())
 		if err != nil {
@@ -125,6 +131,14 @@ func alterChangefeedPlanHook(
 			ctx, exprEval, alterChangefeedStmt.Cmds, prevOpts, prevDetails.SinkURI,
 		)
 		if err != nil {
+			return err
+		}
+
+		st, err := newOptions.GetInitialScanType()
+		if err != nil {
+			return err
+		}
+		if err := validateSettings(ctx, st != changefeedbase.OnlyInitialScan, p.ExecCfg()); err != nil {
 			return err
 		}
 
@@ -701,6 +715,10 @@ func generateNewProgress(
 ) (jobspb.Progress, hlc.Timestamp, error) {
 	prevHighWater := prevProgress.GetHighWater()
 	changefeedProgress := prevProgress.GetChangefeed()
+	ptsRecord := uuid.UUID{}
+	if changefeedProgress != nil {
+		ptsRecord = changefeedProgress.ProtectedTimestampRecord
+	}
 
 	haveHighwater := !(prevHighWater == nil || prevHighWater.IsEmpty())
 	haveCheckpoint := changefeedProgress != nil && changefeedProgress.Checkpoint != nil &&
@@ -743,6 +761,7 @@ func generateNewProgress(
 					Checkpoint: &jobspb.ChangefeedProgress_Checkpoint{
 						Spans: existingTargetSpans,
 					},
+					ProtectedTimestampRecord: ptsRecord,
 				},
 			},
 		}
@@ -772,6 +791,7 @@ func generateNewProgress(
 				Checkpoint: &jobspb.ChangefeedProgress_Checkpoint{
 					Spans: mergedSpanGroup.Slice(),
 				},
+				ProtectedTimestampRecord: ptsRecord,
 			},
 		},
 	}

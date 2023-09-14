@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
@@ -48,6 +47,7 @@ func streamIngestionJobDescription(
 		ReplicationSourceTenantName: streamIngestion.ReplicationSourceTenantName,
 		ReplicationSourceAddress:    tree.NewDString(redactedSourceAddr),
 		Options:                     streamIngestion.Options,
+		Like:                        streamIngestion.Like,
 	}
 	ann := p.ExtendedEvalContext().Annotations
 	return tree.AsStringWithFQNames(redactedCreateStmt, ann), nil
@@ -64,12 +64,20 @@ func ingestionTypeCheck(
 	if !ok {
 		return false, nil, nil
 	}
-	if err := exprutil.TypeCheck(ctx, "INGESTION", p.SemaCtx(),
+	toTypeCheck := []exprutil.ToTypeCheck{
 		exprutil.TenantSpec{TenantSpec: ingestionStmt.TenantSpec},
 		exprutil.TenantSpec{TenantSpec: ingestionStmt.ReplicationSourceTenantName},
 		exprutil.Strings{
 			ingestionStmt.ReplicationSourceAddress,
-			ingestionStmt.Options.Retention}); err != nil {
+			ingestionStmt.Options.Retention},
+	}
+	if ingestionStmt.Like.OtherTenant != nil {
+		toTypeCheck = append(toTypeCheck,
+			exprutil.TenantSpec{TenantSpec: ingestionStmt.Like.OtherTenant},
+		)
+	}
+
+	if err := exprutil.TypeCheck(ctx, "INGESTION", p.SemaCtx(), toTypeCheck...); err != nil {
 		return false, nil, err
 	}
 
@@ -119,6 +127,15 @@ func ingestionPlanHook(
 		return nil, nil, nil, false, err
 	}
 
+	var likeTenantID uint64
+	var likeTenantName string
+	if ingestionStmt.Like.OtherTenant != nil {
+		_, likeTenantID, likeTenantName, err = exprEval.TenantSpec(ctx, ingestionStmt.Like.OtherTenant)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+	}
+
 	options, err := evalTenantReplicationOptions(ctx, ingestionStmt.Options, exprEval)
 	if err != nil {
 		return nil, nil, nil, false, err
@@ -134,8 +151,12 @@ func ingestionPlanHook(
 
 		if err := utilccl.CheckEnterpriseEnabled(
 			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(),
-			"CREATE TENANT FROM REPLICATION",
+			"CREATE VIRTUAL CLUSTER FROM REPLICATION",
 		); err != nil {
+			return err
+		}
+
+		if err := sql.CanManageTenant(ctx, p); err != nil {
 			return err
 		}
 
@@ -144,16 +165,6 @@ func ingestionPlanHook(
 		if err != nil {
 			return err
 		}
-		q := streamURL.Query()
-
-		// Operator should specify a postgres scheme address with cert authentication.
-		if hasPostgresAuthentication := (q.Get("sslmode") == "verify-full") &&
-			q.Has("sslrootcert") && q.Has("sslkey") && q.Has("sslcert"); (streamURL.Scheme == "postgres") &&
-			!hasPostgresAuthentication {
-			return errors.Errorf(
-				"stream replication address should have cert authentication if in postgres scheme: %s", streamAddress)
-		}
-
 		streamAddress = streamingccl.StreamAddress(streamURL.String())
 
 		// TODO(adityamaru): Add privileges checks. Probably the same as RESTORE.
@@ -164,20 +175,20 @@ func ingestionPlanHook(
 				sourceTenant, dstTenantName, dstTenantID)
 		}
 
+		// Determine which template will be used as config template to
+		// create the new tenant below.
+		tenantInfo, err := sql.GetTenantTemplate(ctx, p.ExecCfg().Settings, p.InternalSQLTxn(), nil, likeTenantID, likeTenantName)
+		if err != nil {
+			return err
+		}
+
 		// Create a new tenant for the replication stream.
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
-		tenantInfo := &mtinfopb.TenantInfoWithUsage{
-			ProtoInfo: mtinfopb.ProtoInfo{
-				TenantReplicationJobID: jobID,
-			},
-			SQLInfo: mtinfopb.SQLInfo{
-				// dstTenantID may be zero which will cause auto-allocation.
-				ID:          dstTenantID,
-				DataState:   mtinfopb.DataStateAdd,
-				ServiceMode: mtinfopb.ServiceModeNone,
-				Name:        roachpb.TenantName(dstTenantName),
-			},
-		}
+		tenantInfo.TenantReplicationJobID = jobID
+		// dstTenantID may be zero which will cause auto-allocation.
+		tenantInfo.ID = dstTenantID
+		tenantInfo.DataState = mtinfopb.DataStateAdd
+		tenantInfo.Name = roachpb.TenantName(dstTenantName)
 
 		initialTenantZoneConfig, err := sql.GetHydratedZoneConfigForTenantsRange(ctx, p.Txn(), p.ExtendedEvalContext().Descs)
 		if err != nil {
@@ -188,9 +199,15 @@ func ingestionPlanHook(
 			p.InternalSQLTxn(),
 			p.ExecCfg().SpanConfigKVAccessor.WithTxn(ctx, p.Txn()),
 			tenantInfo, initialTenantZoneConfig,
+			ingestionStmt.IfNotExists,
+			p.ExecCfg().TenantTestingKnobs,
 		)
 		if err != nil {
 			return err
+		} else if !destinationTenantID.IsSet() {
+			// No error but no valid tenant ID: there was an IF NOT EXISTS
+			// clause and the tenant already existed. Nothing else to do.
+			return nil
 		}
 
 		// Create a new stream with stream client.
@@ -200,7 +217,7 @@ func ingestionPlanHook(
 		}
 		// Create the producer job first for the purpose of observability, user is
 		// able to know the producer job id immediately after executing
-		// CREATE TENANT ... FROM REPLICATION.
+		// CREATE VIRTUAL CLUSTER ... FROM REPLICATION.
 		replicationProducerSpec, err := client.Create(ctx, roachpb.TenantName(sourceTenant))
 		if err != nil {
 			return err
@@ -209,11 +226,10 @@ func ingestionPlanHook(
 			return err
 		}
 
-		prefix := keys.MakeTenantPrefix(destinationTenantID)
 		streamIngestionDetails := jobspb.StreamIngestionDetails{
 			StreamAddress:         string(streamAddress),
 			StreamID:              uint64(replicationProducerSpec.StreamID),
-			Span:                  roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()},
+			Span:                  keys.MakeTenantSpan(destinationTenantID),
 			DestinationTenantID:   destinationTenantID,
 			SourceTenantName:      roachpb.TenantName(sourceTenant),
 			DestinationTenantName: roachpb.TenantName(dstTenantName),
@@ -244,13 +260,4 @@ func ingestionPlanHook(
 
 func init() {
 	sql.AddPlanHook("ingestion", ingestionPlanHook, ingestionTypeCheck)
-	jobs.RegisterConstructor(
-		jobspb.TypeStreamIngestion,
-		func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
-			return &streamIngestionResumer{
-				job: job,
-			}
-		},
-		jobs.UsesTenantCostControl,
-	)
 }

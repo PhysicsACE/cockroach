@@ -21,11 +21,11 @@ import (
 
 const (
 	// rulesVersion version of elements that can be appended to rel rule names.
-	rulesVersion = "-23.1"
+	rulesVersion = "-23.2"
 )
 
 // rulesVersionKey version of elements used by this rule set.
-var rulesVersionKey = clusterversion.V23_1
+var rulesVersionKey = clusterversion.V23_2
 
 // descriptorIsNotBeingDropped creates a clause which leads to the outer clause
 // failing to unify if the passed element is part of a descriptor and
@@ -202,7 +202,8 @@ func isColumnTypeDependent(e scpb.Element) bool {
 
 func isIndexDependent(e scpb.Element) bool {
 	switch e.(type) {
-	case *scpb.IndexName, *scpb.IndexComment, *scpb.IndexColumn:
+	case *scpb.IndexName, *scpb.IndexComment, *scpb.IndexColumn,
+		*scpb.IndexZoneConfig:
 		return true
 	case *scpb.IndexPartitioning, *scpb.SecondaryIndexPartial:
 		return true
@@ -258,6 +259,14 @@ func isConstraintDependent(e scpb.Element) bool {
 	case *scpb.ConstraintWithoutIndexName:
 		return true
 	case *scpb.ConstraintComment:
+		return true
+	}
+	return false
+}
+
+func isConstraintWithIndexName(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.ConstraintWithoutIndexName:
 		return true
 	}
 	return false

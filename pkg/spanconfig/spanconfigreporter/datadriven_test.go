@@ -68,7 +68,7 @@ func TestDataDriven(t *testing.T) {
 
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		cluster := newMockCluster(t, st, scKnobs)
-		reporter := spanconfigreporter.New(cluster, cluster, cluster, cluster, st, scKnobs)
+		reporter := spanconfigreporter.New(cluster.liveness, cluster, cluster, cluster, st, scKnobs)
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "init":
@@ -216,11 +216,10 @@ type mockCluster struct {
 
 	nodes    map[roachpb.NodeID]roachpb.NodeDescriptor
 	ranges   map[roachpb.RangeID]roachpb.RangeDescriptor
-	liveness map[roachpb.NodeID]bool
+	liveness livenesspb.TestNodeVitality
 	store    *spanconfigstore.Store
 }
 
-var _ spanconfigreporter.Liveness = &mockCluster{}
 var _ constraint.StoreResolver = &mockCluster{}
 var _ rangedesc.Scanner = &mockCluster{}
 var _ spanconfig.StoreReader = &mockCluster{}
@@ -232,20 +231,14 @@ func newMockCluster(
 		t:        t,
 		nodes:    make(map[roachpb.NodeID]roachpb.NodeDescriptor),
 		ranges:   make(map[roachpb.RangeID]roachpb.RangeDescriptor),
-		liveness: make(map[roachpb.NodeID]bool),
-		store:    spanconfigstore.New(roachpb.TestingDefaultSpanConfig(), st, scKnobs),
+		liveness: livenesspb.TestNodeVitality{},
+		store: spanconfigstore.New(
+			roachpb.TestingDefaultSpanConfig(),
+			st,
+			spanconfigstore.NewEmptyBoundsReader(),
+			scKnobs,
+		),
 	}
-}
-
-// GetIsLiveMap implements spanconfigreporter.Liveness.
-func (s *mockCluster) GetIsLiveMap() livenesspb.IsLiveMap {
-	isLiveMap := livenesspb.IsLiveMap{}
-	for nid, isLive := range s.liveness {
-		isLiveMap[nid] = livenesspb.IsLiveMapEntry{
-			IsLive: isLive,
-		}
-	}
-	return isLiveMap
 }
 
 // GetStoreDescriptor implements constraint.StoreResolver.
@@ -274,12 +267,14 @@ func (s *mockCluster) Scan(
 }
 
 // NeedsSplit implements spanconfig.StoreReader.
-func (s *mockCluster) NeedsSplit(ctx context.Context, start, end roachpb.RKey) bool {
+func (s *mockCluster) NeedsSplit(ctx context.Context, start, end roachpb.RKey) (bool, error) {
 	return s.store.NeedsSplit(ctx, start, end)
 }
 
 // ComputeSplitKey implements spanconfig.StoreReader.
-func (s *mockCluster) ComputeSplitKey(ctx context.Context, start, end roachpb.RKey) roachpb.RKey {
+func (s *mockCluster) ComputeSplitKey(
+	ctx context.Context, start, end roachpb.RKey,
+) (roachpb.RKey, error) {
 	return s.store.ComputeSplitKey(ctx, start, end)
 }
 
@@ -294,13 +289,19 @@ func (s *mockCluster) addNode(desc roachpb.NodeDescriptor) {
 	_, found := s.nodes[desc.NodeID]
 	require.Falsef(s.t, found, "attempting to re-add n%d", desc.NodeID)
 	s.nodes[desc.NodeID] = desc
+	s.liveness.AddNode(desc.NodeID)
 	s.markLive(desc.NodeID, true /* live */)
 }
 
 func (s *mockCluster) markLive(id roachpb.NodeID, live bool) {
 	_, found := s.nodes[id]
 	require.Truef(s.t, found, "n%d not found", id)
-	s.liveness[id] = live
+
+	if live {
+		s.liveness.RestartNode(id)
+	} else {
+		s.liveness.DownNode(id)
+	}
 }
 
 func (s *mockCluster) addRange(desc roachpb.RangeDescriptor) {

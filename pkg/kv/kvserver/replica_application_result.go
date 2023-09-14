@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
+	"go.etcd.io/raft/v3"
 )
 
 // replica_application_*.go files provide concrete implementations of
@@ -100,21 +102,22 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 	if pErr != nil {
 		// A forced error was set (i.e. we did not apply the proposal,
 		// for instance due to its log position).
+		cmd.response.Err = pErr
 		switch cmd.Rejection {
 		case kvserverbase.ProposalRejectionPermanent:
-			cmd.response.Err = pErr
 		case kvserverbase.ProposalRejectionIllegalLeaseIndex:
 			// Reset the error as it's now going to be determined by the outcome of
-			// reproposing (or not).
+			// reproposing (or not); note that tryReproposeWithNewLeaseIndex will
+			// return `nil` if the entry is not eligible for reproposals.
 			//
-			// Note that if pErr remains nil, we will mark the proposal as non-local at
-			// the end of this block and return, so we're not hitting an NPE near the end
-			// of this method where we're attempting to reach into `cmd.proposal`.
+			// If pErr gets "reset" here as a result, we will mark the proposal as
+			// non-local at the end of this block and return, so we're not hitting an
+			// NPE near the end of this method where we're attempting to reach into
+			// `cmd.proposal`.
 			//
 			// This control flow is sketchy but it preserves existing behavior
 			// that would be too risky to change at the time of writing.
 			//
-			pErr = nil
 			// If we failed to apply at the right lease index, try again with a
 			// new one. This is important for pipelined writes, since they don't
 			// have a client watching to retry, so a failure to eventually apply
@@ -162,8 +165,21 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 			//
 			// These many possible worlds are a major source of complexity, a
 			// reduction of which is postponed.
-			if !cmd.proposal.applied && !cmd.proposal.Supersedes(cmd.Cmd.MaxLeaseIndex) {
-				pErr = tryReproposeWithNewLeaseIndex(ctx, cmd, (*replicaReproposer)(r))
+			pErr = nil
+			if fn := r.store.TestingKnobs().InjectReproposalError; fn != nil {
+				if err := fn(cmd.proposal); err != nil {
+					pErr = kvpb.NewError(err)
+				}
+			}
+			if pErr == nil { // since we might have injected an error
+				pErr = kvpb.NewError(r.tryReproposeWithNewLeaseIndex(ctx, cmd))
+				if pErr == nil {
+					// Avoid falling through below. We managed to repropose, but this
+					// proposal is still erroring out. We don't want to assign to
+					// localResult. If there is an error though, we do fall through into
+					// the existing tangle of correct but unreadable handling below.
+					return
+				}
 			}
 
 			if pErr != nil {
@@ -183,42 +199,32 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 				// It is thus safe to signal the error back to the client, which is also
 				// the only sensible choice at this point.
 				//
-				// We also know that the proposal is not in the proposals map, since the
-				// command is local and wasn't superseded, which is the condition in
-				// retrieveLocalProposals for removing from the map. So we're not leaking
-				// a map entry here, which we assert against below (and which has coverage,
-				// at time of writing, through TestReplicaReproposalWithNewLeaseIndexError).
-				log.Infof(ctx, "failed to repropose %s at idx %d with new lease index: %s", cmd.ID, cmd.Index(), pErr)
-				cmd.response.Err = pErr
-
-				// This assertion can mis-fire if we artificially inject invalid LAIs
-				// during proposal, see the explanatory comment above. If, in the
-				// current app batch, we had two identical copies of an entry (which
-				// maps to a local proposal), and the LAI was stale, then both entries
-				// would be local. The first could succeed to repropose, which, if the
-				// propBuf was full, would immediately insert into the proposals map.
-				// Normally, when we then apply the second entry, it would be superseded
-				// and not hit the assertion. But, if we injected a stale LAI during
-				// this last reproposal, we could "accidentally" assign the same LAI
-				// again. The second entry would then try to repropose again, which is
-				// fine, but it could bump into the closed timestamp, get an error,
-				// enter this branch, and then trip the assertion.
+				// Note that the proposal may or may not be in the proposals map at this
+				// point. For example, if we artificially inject invalid LAIs during
+				// proposal, see the explanatory comment above. If, in the current app
+				// batch, we had two identical copies of an entry (which maps to a local
+				// proposal), and the LAI was stale, then both entries would be local.
+				// The first could succeed to repropose, which, if the propBuf was full,
+				// would immediately insert into the proposals map. Normally, when we
+				// then apply the second entry, it would be superseded and not hit the
+				// assertion. But, if we injected a stale LAI during this last
+				// reproposal, we could "accidentally" assign the same LAI again. The
+				// second entry would then try to repropose again, which is fine, but it
+				// could bump into the closed timestamp, get an error, and now we are in
+				// a situation where a reproposal attempt failed with the proposal being
+				// present in the map.
 				//
 				// For proposed simplifications, see:
 				// https://github.com/cockroachdb/cockroach/issues/97633
-				r.mu.RLock()
-				_, inMap := r.mu.proposals[cmd.ID]
-				r.mu.RUnlock()
-
-				if inMap {
-					log.Fatalf(ctx, "failed reproposal unexpectedly in proposals map: %+v", cmd)
-				}
-			} else {
-				// Unbind the entry's local proposal because we just succeeded in
-				// reproposing it or decided not to repropose. Either way, we don't want
-				// to acknowledge the client yet.
-				cmd.proposal = nil
-				return
+				log.Infof(ctx, "failed to repropose %s at idx %d with new lease index: %s", cmd.ID, cmd.Index(), pErr)
+				// TODO(repl): we're replacing an error (illegal LAI) here with another error.
+				// A pattern where the error is assigned exactly once would be simpler to
+				// reason about. In particular, we want to make sure we never replace an
+				// ambiguous error with an unambiguous one (at least if the resulting
+				// error will reach the proposer, such as can be the case here, though
+				// the error we're replacing is also definite so it's ok).
+				cmd.response.Err = pErr
+				// Fall through.
 			}
 		default:
 			panic("unexpected")
@@ -228,7 +234,30 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 	} else {
 		log.Fatalf(ctx, "proposal must return either a reply or an error: %+v", cmd.proposal)
 	}
+
+	// The current proposal has no error (and wasn't reproposed successfully or we
+	// would've early returned already) OR it has an error AND we failed to
+	// repropose it.
+	//
+	// TODO(tbg): it doesn't make sense to assign to `cmd.response` unconditionally.
+	// We're returning an error; the response should be nil. The error tracking in
+	// this method should be cleaned up.
+	// TODO(tbg): we should have an invariant about `cmd.response`: it is
+	// initially nil (in particular, a command that evaluates with an error - say
+	// a TransactionRetryError - must not enter the replication pipeline; we could
+	// relax this if we ever want erroring commands to be able to mutate the state
+	// machine but safe to say we don't have this now) and is only written once
+	// (in this method).
+	// Also, If a caller gets signaled early (ambiguous result, etc) this does not
+	// affect `response.Err`.
 	cmd.response.EncounteredIntents = cmd.proposal.Local.DetachEncounteredIntents()
+	// TODO(tbg): this seems wrong. the "Always" (pErr != nil) flavor of intents is
+	// for transaction aborts that still "know" about the ultimate fate of an intent.
+	// But since we're never reaching this code for a proposal that evaluated to an
+	// error, we can only reach it for illegal lease errors and the like, and even
+	// though it might be "correct" to surface the "always" intents in the response
+	// in that case, it would seem prudent not to take advantage of that. In other
+	// words, the line below this comment should be conditional on `pErr == nil`.
 	cmd.response.EndTxns = cmd.proposal.Local.DetachEndTxns(pErr != nil)
 	if pErr == nil {
 		cmd.localResult = cmd.proposal.Local
@@ -237,85 +266,165 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 	}
 }
 
-// reproposer is used by tryReproposeWithNewLeaseIndex.
-type reproposer interface {
-	trackEvaluatingRequest(context.Context, hlc.Timestamp) (hlc.Timestamp, TrackedRequestToken)
-	propose(context.Context, *ProposalData, TrackedRequestToken) *kvpb.Error
-	newNotLeaseHolderError(string) *kvpb.NotLeaseHolderError
-}
-
-type replicaReproposer Replica
-
-var _ reproposer = (*replicaReproposer)(nil)
-
-func (r *replicaReproposer) trackEvaluatingRequest(
-	ctx context.Context, wts hlc.Timestamp,
-) (hlc.Timestamp, TrackedRequestToken) {
-	// NB: must not hold r.mu here, the propBuf acquires it itself.
-	return r.mu.proposalBuf.TrackEvaluatingRequest(ctx, wts)
-}
-
-func (r *replicaReproposer) propose(
-	ctx context.Context, p *ProposalData, tok TrackedRequestToken,
-) *kvpb.Error {
-	return (*Replica)(r).propose(ctx, p, tok)
-}
-
-func (r *replicaReproposer) newNotLeaseHolderError(msg string) *kvpb.NotLeaseHolderError {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return kvpb.NewNotLeaseHolderError(
-		*r.mu.state.Lease,
-		r.store.StoreID(),
-		r.mu.state.Desc,
-		msg,
-	)
-}
-
-// tryReproposeWithNewLeaseIndex is used by prepareLocalResult to repropose
-// commands that have gotten an illegal lease index error, and that we know
-// could not have applied while their lease index was valid (that is, we
-// observed all applied entries between proposal and the lease index becoming
-// invalid, as opposed to skipping some of them by applying a snapshot).
+// makeReproposal returns a new re-proposal of the given proposal, and a
+// function that must be called if this re-proposal is successfully proposed.
 //
-// The caller must already have checked that the entry is local and not
-// superseded, and that it was rejected with an illegal lease index error.
-func tryReproposeWithNewLeaseIndex(
-	ctx context.Context, cmd *replicatedCmd, r reproposer,
-) *kvpb.Error {
-	p := cmd.proposal
+// We want to move a few items from origP to the new command, but only if we
+// managed to propose the new command. For example, if we move the latches over
+// too early but then fail to actually get the new proposal started, the old
+// proposal will not release the latches. This would result in a lost latch.
+func (r *Replica) makeReproposal(origP *ProposalData) (reproposal *ProposalData, success func()) {
+	// NB: original command remains "Local". It's just not going to signal anyone
+	// or release any latches.
+
+	seedP := origP.seedProposal
+	if seedP == nil {
+		seedP = origP
+	}
+
+	// Go through the original proposal field by field and decide what transfers
+	// to the new proposal (and how that affects the old proposal). The overall
+	// goal is that the old proposal remains a local proposal (switching it to
+	// non-local now invites logic bugs) but not bound to the caller.
+
+	newCommand := kvserverpb.RaftCommand{
+		ProposerLeaseSequence: origP.command.ProposerLeaseSequence,
+		ReplicatedEvalResult:  origP.command.ReplicatedEvalResult,
+		WriteBatch:            origP.command.WriteBatch,
+		LogicalOpLog:          origP.command.LogicalOpLog,
+		TraceData:             origP.command.TraceData,
+
+		MaxLeaseIndex:       0,   // assigned on flush
+		ClosedTimestamp:     nil, // assigned on flush
+		AdmissionPriority:   0,   // assigned on flush
+		AdmissionCreateTime: 0,   // assigned on flush
+		AdmissionOriginNode: 0,   // assigned on flush
+	}
+
+	// Now we construct the remainder of the ProposalData. The pieces that
+	// actively "move over", are removed from the original proposal in the
+	// deferred func below. For example, those fields that have to do with the
+	// latches held and the caller waiting to be signaled.
+
+	// TODO(tbg): work on the lifecycle of ProposalData. This struct (and the
+	// surrounding replicatedCmd) are populated in an overly ad-hoc manner.
+	// TODO(tbg): the fields are spelled out here to make explicit what is being copied
+	// here. Add a unit test that fails on addition of a new field and points at the
+	// need to double check what the intended behavior of the new field in this method
+	// is.
+	newProposal := &ProposalData{
+		// The proposal's context and span carry over. Recall that they are *not*
+		// used for command application; `cmd.{ctx,sp}` are; and since this last
+		// span "follows from" the proposal's span, if the proposal sticks around
+		// for (some reincarnation of) the command to eventually apply, its trace
+		// will reflect the reproposal as well.
+		ctx:             origP.ctx,
+		idKey:           raftlog.MakeCmdIDKey(),
+		proposedAtTicks: 0, // set in registerProposalLocked
+		createdAtTicks:  0, // set in registerProposalLocked
+		command:         &newCommand,
+
+		// Next comes the block of fields that are "moved" to the new proposal. See
+		// the deferred function call below which, correspondingly, clears these
+		// fields in the original proposal.
+		sp: origP.sp,
+		// NB: quotaAlloc is always nil here, because we already released the quota
+		// unconditionally in retrieveLocalProposals. So the below is a no-op.
+		//
+		// TODO(tbg): if we shifted the release of proposal quota to *after*
+		// successful application, we could move the quota over prematurely
+		// releasing it here.
+		quotaAlloc: origP.quotaAlloc,
+		ec:         origP.ec,
+		doneCh:     origP.doneCh,
+
+		applied: false,
+
+		// Local is copied over. It won't be used on the old proposal (since that
+		// proposal got rejected), but since it's still "local" we don't want to put
+		// it into  an undefined state by removing its response. The same goes for
+		// Request.
+		Local:                   origP.Local,
+		Request:                 origP.Request,
+		leaseStatus:             origP.leaseStatus,
+		tok:                     TrackedRequestToken{}, // filled in in `propose`
+		encodedCommand:          nil,
+		raftAdmissionMeta:       nil,
+		v2SeenDuringApplication: false,
+
+		seedProposal: seedP,
+	}
+
+	return newProposal, func() {
+		// If the original proposal had an explicit span, it's an async consensus
+		// proposal and the span would be finished momentarily (when we return to
+		// the caller) if we didn't unlink it here, but we want it to continue
+		// tracking newProposal. We leave it in `origP.ctx` though, since that
+		// context will become unused once the application of this (soft-failed)
+		// proposal concludes, i.e. soon after this method returns, in case there is
+		// anything left to log into it.
+		origP.sp = nil
+		origP.quotaAlloc = nil
+		origP.ec = makeEmptyEndCmds()
+		origP.doneCh = nil
+
+		// If the proposal is synchronous, the client is waiting on the seed
+		// proposal. By the time it has to act on the result, a bunch of reproposals
+		// can have happened, and some may still be running and using the
+		// context/tracing span (probably only the latest one, but we assume any,
+		// for defence-in-depth).
+		//
+		// Unbind the latest reproposal's context so that it no longer posts updates
+		// to the tracing span (it won't apply anyway). Link to the new latest
+		// reproposal, so that the client can clear its context at post-processing.
+		// This is effectively a "move" of the context to the reproposal.
+		//
+		// TODO(pavelkalinnikov): there should be a better way, after ProposalData
+		// lifecycle is reconsidered.
+		//
+		// TODO(radu): Should this context be created via tracer.ForkSpan?
+		// We'd need to make sure the span is finished eventually.
+		origP.ctx = r.AnnotateCtx(context.TODO())
+		seedP.lastReproposal = newProposal
+	}
+}
+
+func (r *Replica) tryReproposeWithNewLeaseIndex(ctx context.Context, origCmd *replicatedCmd) error {
+	newProposal, onSuccess := r.makeReproposal(origCmd.proposal)
+
 	// We need to track the request again in order to protect its timestamp until
 	// it gets reproposed.
 	// TODO(andrei): Only track if the request consults the ts cache. Some
 	// requests (e.g. EndTxn) don't care about closed timestamps.
-	minTS, tok := r.trackEvaluatingRequest(ctx, p.Request.WriteTimestamp())
+	minTS, tok := r.mu.proposalBuf.TrackEvaluatingRequest(ctx, newProposal.Request.WriteTimestamp())
 	defer tok.DoneIfNotMoved(ctx)
 
-	// NB: p.Request.Timestamp reflects the action of ba.SetActiveTimestamp.
-	if p.Request.AppliesTimestampCache() && p.Request.WriteTimestamp().LessEq(minTS) {
+	// NB: newProposal.Request.Timestamp reflects the action of ba.SetActiveTimestamp.
+	if newProposal.Request.AppliesTimestampCache() && newProposal.Request.WriteTimestamp().LessEq(minTS) {
 		// The tracker wants us to forward the request timestamp, but we can't
 		// do that without re-evaluating, so give up. The error returned here
-		// will go back to DistSender, so send something it can digest.
-		return kvpb.NewError(r.newNotLeaseHolderError("reproposal failed due to closed timestamp"))
+		// will go to back to DistSender, so send something it can digest.
+		err := kvpb.NewNotLeaseHolderError(
+			*r.mu.state.Lease,
+			r.store.StoreID(),
+			r.mu.state.Desc,
+			"reproposal failed due to closed timestamp",
+		)
+		return err
 	}
 	// Some tests check for this log message in the trace.
 	log.VEventf(ctx, 2, "retry: proposalIllegalLeaseIndex")
 
-	// Reset the command for reproposal.
-	prevMaxLeaseIndex := p.command.MaxLeaseIndex
-	prevEncodedCommand := p.encodedCommand
-	p.command.MaxLeaseIndex = 0
-	p.encodedCommand = nil
-	pErr := r.propose(ctx, p, tok.Move(ctx))
-	if pErr != nil {
-		// On error, reset the fields we zeroed out to their old value.
-		// This ensures that the proposal doesn't count as Superseded
-		// now.
-		p.command.MaxLeaseIndex = prevMaxLeaseIndex
-		p.encodedCommand = prevEncodedCommand
-		return pErr
+	// See I7 from kvflowcontrol/doc.go: we don't re-deduct flow tokens on
+	// reproposals.
+	newProposal.raftAdmissionMeta = nil
+
+	if pErr := r.propose(ctx, newProposal, tok.Move(ctx)); pErr != nil {
+		return pErr.GoError()
 	}
-	log.VEventf(ctx, 2, "reproposed command %x", cmd.ID)
+	log.VEventf(ctx, 2, "reproposed command %x", newProposal.idKey)
+
+	onSuccess()
 	return nil
 }
 
@@ -361,7 +470,9 @@ func (r *Replica) handleLeaseResult(
 }
 
 func (r *Replica) handleTruncatedStateResult(
-	ctx context.Context, t *roachpb.RaftTruncatedState, expectedFirstIndexPreTruncation uint64,
+	ctx context.Context,
+	t *kvserverpb.RaftTruncatedState,
+	expectedFirstIndexPreTruncation kvpb.RaftIndex,
 ) (raftLogDelta int64, expectedFirstIndexWasAccurate bool) {
 	r.mu.Lock()
 	expectedFirstIndexWasAccurate =
@@ -444,6 +555,12 @@ func (r *Replica) handleChangeReplicasResult(
 	// responsible.
 	if log.V(1) {
 		log.Infof(ctx, "removing replica due to ChangeReplicasTrigger: %v", chng)
+	}
+
+	// This is currently executed before the conf change is applied to the Raft
+	// node, so we still see ourselves as the leader.
+	if r.raftBasicStatusRLocked().RaftState == raft.StateLeader {
+		r.store.metrics.RangeRaftLeaderRemovals.Inc(1)
 	}
 
 	if _, err := r.store.removeInitializedReplicaRaftMuLocked(ctx, r, chng.NextReplicaID(), RemoveOptions{

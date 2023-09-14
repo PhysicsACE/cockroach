@@ -15,15 +15,21 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -31,29 +37,38 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
+	"github.com/dustin/go-humanize"
 )
 
 // CopyBatchRowSizeDefault is the number of rows we insert in one insert
 // statement.
 const CopyBatchRowSizeDefault = 100
 
+// Vector wise inserts scale much better and this is suitable default.
+// Empirically determined limit where we start to see diminishing speedups.
+const CopyBatchRowSizeVectorDefault = 32 << 10
+
 // When this many rows are in the copy buffer, they are inserted.
-var copyBatchRowSize = util.ConstantWithMetamorphicTestRange("copy-batch-size", CopyBatchRowSizeDefault, 1, 10000)
+var CopyBatchRowSize = util.ConstantWithMetamorphicTestRange("copy-batch-size", CopyBatchRowSizeDefault, 1, 50_000)
 
 // SetCopyFromBatchSize exports overriding copy batch size for test code.
 func SetCopyFromBatchSize(i int) int {
-	old := copyBatchRowSize
+	old := CopyBatchRowSize
 	if buildutil.CrdbTestBuild {
-		copyBatchRowSize = i
+		CopyBatchRowSize = i
 	} else {
 		// We don't want non-test code mutating globals.
 		panic("SetCopyFromBatchSize is a test utility that requires crdb_test tag")
@@ -203,7 +218,7 @@ type copyMachine struct {
 	csvReader    *csv.Reader
 	// buf is used to parse input data into rows. It also accumulates a partial
 	// row between protocol messages.
-	buf bytes.Buffer
+	buf []byte
 	// rows accumulates a batch of rows to be eventually inserted.
 	rows rowcontainer.RowContainer
 	// insertedRows keeps track of the total number of rows inserted by the
@@ -237,12 +252,19 @@ type copyMachine struct {
 
 	processRows func(ctx context.Context, finalBatch bool) error
 
-	scratchRow []tree.Datum
+	scratchRow    []tree.Datum
+	batch         coldata.Batch
+	accHelper     colmem.SetAccountingHelper
+	typs          []*types.T
+	valueHandlers []tree.ValueHandler
+	ph            pgdate.ParseHelper
 
 	// For testing we want to be able to override this on the instance level.
 	copyBatchRowSize int
-
-	implicitTxn bool
+	maxRowMem        int64
+	implicitTxn      bool
+	copyFastPath     bool
+	vectorized       bool
 }
 
 // newCopyMachine creates a new copyMachine.
@@ -275,6 +297,7 @@ func newCopyMachine(
 	}
 	// We need a planner to do the initial planning, in addition
 	// to those used for the main execution of the COPY afterwards.
+	txnOpt.initPlanner(ctx, c.p)
 	cleanup := c.p.preparePlannerForCopy(ctx, &c.txnOpt, false /* finalBatch */, c.implicitTxn)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
@@ -298,6 +321,7 @@ func newCopyMachine(
 		return nil, err
 	}
 	c.resultColumns = make(colinfo.ResultColumns, len(cols))
+	typs := make([]*types.T, len(cols))
 	for i, col := range cols {
 		c.resultColumns[i] = colinfo.ResultColumn{
 			Name:           col.GetName(),
@@ -305,7 +329,9 @@ func newCopyMachine(
 			TableID:        tableDesc.GetID(),
 			PGAttributeNum: uint32(col.GetPGAttributeNum()),
 		}
+		typs[i] = col.GetType()
 	}
+	c.typs = typs
 	// If there are no column specifiers and we expect non-visible columns
 	// to have field data then we have to populate the expectedHiddenColumnIdxs
 	// field with the columns indexes we expect to be hidden.
@@ -318,9 +344,127 @@ func newCopyMachine(
 	}
 	c.initMonitoring(ctx, parentMon)
 	c.processRows = c.insertRows
-	c.rows.Init(c.rowsMemAcc, colinfo.ColTypeInfoFromResCols(c.resultColumns), copyBatchRowSize)
-	c.scratchRow = make(tree.Datums, len(c.resultColumns))
+	c.copyFastPath = c.p.SessionData().CopyFastPathEnabled
+
+	// We want to do as many rows as we can keeping things under command mem
+	// limit. Conservatively target a fraction of kv command size. If we
+	// exceed this due to large dynamic values we will bail early and
+	// insert the rows we have so far. Note once the coldata.Batch is full
+	// we still have all the encoder allocations to make.
+	c.maxRowMem = kvserverbase.MaxCommandSize.Get(c.p.execCfg.SV()) / 3
+
+	if c.canSupportVectorized(tableDesc) {
+		if err := c.initVectorizedCopy(ctx, typs); err != nil {
+			return nil, err
+		}
+	} else {
+		c.copyBatchRowSize = CopyBatchRowSize
+		c.vectorized = false
+		c.rows.Init(c.rowsMemAcc, colinfo.ColTypeInfoFromResCols(c.resultColumns), c.copyBatchRowSize)
+		c.scratchRow = make(tree.Datums, len(c.resultColumns))
+	}
 	return c, nil
+}
+
+func (c *copyMachine) canSupportVectorized(table catalog.TableDescriptor) bool {
+	// TODO(cucaroach): support vectorized binary.
+	if c.format == tree.CopyFormatBinary {
+		return false
+	}
+	// Vectorized requires avoiding materializing the rows for the optimizer.
+	if !c.copyFastPath {
+		return false
+	}
+	if c.p.SessionData().VectorizeMode == sessiondatapb.VectorizeOff {
+		return false
+	}
+	// Vectorized COPY doesn't support foreign key checks, no reason it couldn't
+	// but it doesn't work right now because we don't have the ability to
+	// hold the results in a bufferNode. We wouldn't want to enable it
+	// until we were sure that all the checks could be vectorized so the
+	// "bufferNode" used doesn't just get materialized into a datum based
+	// row container. I think that requires a vectorized version of lookup
+	// join. TODO(cucaroach): extend the vectorized insert code to support
+	// insertFastPath style FK checks.
+	return len(table.EnforcedOutboundForeignKeys()) == 0
+}
+
+func (c *copyMachine) initVectorizedCopy(ctx context.Context, typs []*types.T) error {
+	if buildutil.CrdbTestBuild {
+		// We have to honor metamorphic default in testing, the transaction
+		// commit tests rely on it, specifically they override it to
+		// 1.
+		c.copyBatchRowSize = CopyBatchRowSize
+	} else {
+		batchSize := CopyBatchRowSizeVectorDefault
+		minBatchSize := 100
+		// When the coldata.Batch memory usage exceeds maxRowMem we flush the
+		// rows we have so we want the batch's initial memory usage to
+		// be smaller so we don't flush every row. We also want to
+		// leave a comfortable buffer so some dynamic values (ie
+		// strings, json) don't unnecessarily push us past the limit
+		// but if we encounter lots of huge dynamic values we do want
+		// to flush the batch.
+		targetBatchMemUsage := c.maxRowMem / 2
+
+		// Now adjust batch size down based on EstimateBatchSizeBytes. Rather than
+		// try to unpack EstimateBatchSizeBytes just use a simple
+		// iterative algorithm to arrive at a reasonable batch size.
+		// Basically we want something from 100 to maxBatchSize but we
+		// don't want to have a bunch of unused memory in the
+		// coldata.Batch so dial it in using EstimateBatchSizeBytes.
+		for colmem.EstimateBatchSizeBytes(typs, batchSize) > targetBatchMemUsage &&
+			batchSize > minBatchSize {
+			batchSize /= 2
+		}
+		// Go back up by tenths to make up for 1/2 reduction overshoot.
+		for colmem.EstimateBatchSizeBytes(typs, batchSize) < targetBatchMemUsage &&
+			batchSize < CopyBatchRowSizeVectorDefault {
+			batchSize += batchSize / 10
+		}
+		if batchSize > CopyBatchRowSizeVectorDefault {
+			batchSize = CopyBatchRowSizeVectorDefault
+		}
+		// Note its possible we overshot minBatchSize and schema was so wide we
+		// didn't go back over it. Worst case we end up with a batch size of 50
+		// but if the schema has that many columns smaller is probably better.
+		c.copyBatchRowSize = batchSize
+	}
+	log.VEventf(ctx, 2, "vectorized copy chose %d for batch size", c.copyBatchRowSize)
+	c.vectorized = true
+	factory := coldataext.NewExtendedColumnFactory(c.p.EvalContext())
+	alloc := colmem.NewLimitedAllocator(ctx, &c.rowsMemAcc, nil /*optional unlimited memory account*/, factory)
+	alloc.SetMaxBatchSize(c.copyBatchRowSize)
+	// TODO(cucaroach): Avoid allocating selection vector.
+	c.accHelper.Init(alloc, c.maxRowMem, typs, false /*alwaysReallocate*/)
+	// Start with small number of rows, compromise between going too big and
+	// overallocating memory and avoiding some doubling growth batches.
+	if err := colexecerror.CatchVectorizedRuntimeError(func() {
+		c.batch, _ = c.accHelper.ResetMaybeReallocate(c.typs, c.batch, 64)
+	}); err != nil {
+		return err
+	}
+	initialMemUsage := c.rowsMemAcc.Used()
+	if initialMemUsage > c.maxRowMem {
+		// Some tests set the max raft command size lower and if the metamorphic
+		// batch size is big enough this can happen. The affect is
+		// that every row will be flushed which is fine for testing so
+		// ignore it.
+		if !buildutil.CrdbTestBuild {
+			// The logic above failed us, this shouldn't happen, basically this
+			// means EstimateBatchSizeBytes off by a factor of 2.
+			panic(errors.AssertionFailedf("EstimateBatchSizeBytes estimated %s for %d row but actual was %s and maxRowMem was %s",
+				humanize.IBytes(uint64(colmem.EstimateBatchSizeBytes(typs, c.copyBatchRowSize))),
+				c.copyBatchRowSize,
+				humanize.IBytes(uint64(initialMemUsage)),
+				humanize.IBytes(uint64(c.maxRowMem))))
+		}
+	}
+	c.valueHandlers = make([]tree.ValueHandler, len(typs))
+	for i := range typs {
+		c.valueHandlers[i] = coldataext.MakeVecHandler(c.batch.ColVec(i))
+	}
+	return nil
 }
 
 func (c *copyMachine) numInsertedRows() int {
@@ -342,7 +486,6 @@ func (c *copyMachine) initMonitoring(ctx context.Context, parentMon *mon.BytesMo
 	c.copyMon.StartNoReserved(ctx, parentMon)
 	c.bufMemAcc = c.copyMon.MakeBoundAccount()
 	c.rowsMemAcc = c.copyMon.MakeBoundAccount()
-	c.copyBatchRowSize = copyBatchRowSize
 }
 
 // copyTxnOpt contains information about the transaction in which the copying
@@ -361,7 +504,11 @@ type copyTxnOpt struct {
 }
 
 func (c *copyMachine) Close(ctx context.Context) {
-	c.rows.Close(ctx)
+	if c.vectorized {
+		c.rowsMemAcc.Close(ctx)
+	} else {
+		c.rows.Close(ctx)
+	}
 	c.bufMemAcc.Close(ctx)
 	c.copyMon.Stop(ctx)
 }
@@ -433,7 +580,7 @@ Loop:
 		switch typ {
 		case pgwirebase.ClientMsgCopyData:
 			if err := c.processCopyData(
-				ctx, string(readBuf.Msg), false, /* final */
+				ctx, unsafeUint8ToString(readBuf.Msg), false, /* final */
 			); err != nil {
 				return err
 			}
@@ -453,13 +600,7 @@ Loop:
 		}
 	}
 
-	// Finalize execution by sending the statement tag and number of rows
-	// inserted.
-	dummy := tree.CopyFrom{}
-	tag := []byte(dummy.StatementTag())
-	tag = append(tag, ' ')
-	tag = strconv.AppendInt(tag, int64(c.insertedRows), 10 /* base */)
-	return c.conn.SendCommandComplete(tag)
+	return nil
 }
 
 const (
@@ -475,20 +616,20 @@ const (
 func (c *copyMachine) processCopyData(ctx context.Context, data string, final bool) (retErr error) {
 	// At the end, adjust the mem accounting to reflect what's left in the buffer.
 	defer func() {
-		if err := c.bufMemAcc.ResizeTo(ctx, int64(c.buf.Cap())); err != nil && retErr == nil {
+		if err := c.bufMemAcc.ResizeTo(ctx, int64(cap(c.buf))); err != nil && retErr == nil {
 			retErr = err
 		}
 	}()
 
-	if len(data) > (c.buf.Cap() - c.buf.Len()) {
+	if len(data) > (cap(c.buf) - len(c.buf)) {
 		// If it looks like the buffer will need to allocate to accommodate data,
 		// account for the memory here. This is not particularly accurate - we don't
 		// know how much the buffer will actually grow by.
-		if err := c.bufMemAcc.ResizeTo(ctx, int64(len(data))); err != nil {
+		if err := c.bufMemAcc.Grow(ctx, int64(len(data))); err != nil {
 			return err
 		}
 	}
-	c.buf.WriteString(data)
+	c.buf = append(c.buf, data...)
 	var readFn func(ctx context.Context, final bool) (brk bool, err error)
 	switch c.format {
 	case tree.CopyFormatText:
@@ -500,41 +641,77 @@ func (c *copyMachine) processCopyData(ctx context.Context, data string, final bo
 	default:
 		panic("unknown copy format")
 	}
-	for c.buf.Len() > 0 {
+	for len(c.buf) > 0 {
 		brk, err := readFn(ctx, final)
 		if err != nil {
 			return err
+		}
+		var batchDone bool
+		if !brk && c.vectorized {
+			if err := colexecerror.CatchVectorizedRuntimeError(func() {
+				batchDone = c.accHelper.AccountForSet(c.batch.Length() - 1)
+			}); err != nil {
+				if sqlerrors.IsOutOfMemoryError(err) {
+					// Getting the COPY to complete is a hail mary but the
+					// vectorized inserter will fall back to inserting a row at
+					// a time so give it a shot.
+					batchDone = true
+				} else {
+					return err
+				}
+			}
+		}
+		// If we have a full batch of rows or we have exceeded maxRowMem process
+		// them. Only set finalBatch to true if this is the last
+		// CopyData segment AND we have no more data in the buffer.
+		if length := c.currentBatchSize(); length > 0 && (c.rowsMemAcc.Used() > c.maxRowMem || length >= c.copyBatchRowSize || batchDone) {
+			if length != c.copyBatchRowSize {
+				log.VEventf(ctx, 2, "copy batch of %d rows flushing due to memory usage %d > %d", length, c.rowsMemAcc.Used(), c.maxRowMem)
+			}
+			if err := c.processRows(ctx, final && len(c.buf) == 0); err != nil {
+				return err
+			}
 		}
 		if brk {
 			break
 		}
 	}
-	// Only do work if we have a full batch of rows or this is the end.
-	if ln := c.rows.Len(); !final && (ln == 0 || ln < c.copyBatchRowSize) {
-		return nil
+	// If we're done, process any remainder, if we're not done let more rows
+	// accumulate.
+	if final {
+		return c.processRows(ctx, final)
 	}
-	return c.processRows(ctx, final)
+	return nil
+}
+
+func (c *copyMachine) currentBatchSize() int {
+	if c.vectorized {
+		return c.batch.Length()
+	}
+	return c.rows.Len()
 }
 
 func (c *copyMachine) readTextData(ctx context.Context, final bool) (brk bool, err error) {
-	line, err := c.buf.ReadBytes(lineDelim)
-	if err != nil {
-		if err != io.EOF {
-			return false, err
-		} else if !final {
-			// Put the incomplete row back in the buffer, to be processed next time.
-			c.buf.Write(line)
+	idx := bytes.IndexByte(c.buf, lineDelim)
+	var line []byte
+	if idx == -1 {
+		if !final {
+			// Leave the incomplete row in the buffer, to be processed next time.
 			return true, nil
 		}
+		// If this is the final batch, use the whole buffer.
+		line = c.buf[:len(c.buf)]
+		c.buf = c.buf[len(c.buf):]
 	} else {
 		// Remove lineDelim from end.
-		line = line[:len(line)-1]
+		line = c.buf[:idx]
+		c.buf = c.buf[idx+1:]
 		// Remove a single '\r' at EOL, if present.
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
 	}
-	if c.buf.Len() == 0 && bytes.Equal(line, []byte(`\.`)) {
+	if len(c.buf) == 0 && bytes.Equal(line, []byte(`\.`)) {
 		return true, nil
 	}
 	err = c.readTextTuple(ctx, line)
@@ -544,29 +721,29 @@ func (c *copyMachine) readTextData(ctx context.Context, final bool) (brk bool, e
 func (c *copyMachine) readCSVData(ctx context.Context, final bool) (brk bool, err error) {
 	var fullLine []byte
 	quoteCharsSeen := 0
+	offset := 0
 	// Keep reading lines until we encounter a newline that is not inside a
 	// quoted field, and therefore signifies the end of a CSV record.
 	for {
-		line, err := c.buf.ReadBytes(lineDelim)
-		fullLine = append(fullLine, line...)
-		if err != nil {
-			if err == io.EOF {
-				if final {
-					// If we reached EOF and this is the final chunk of input data, then
-					// try to process it.
-					break
-				} else {
-					// If there's more CopyData, put the incomplete row back in the
-					// buffer, to be processed next time.
-					c.buf.Write(fullLine)
-					return true, nil
-				}
+		idx := bytes.IndexByte(c.buf[offset:], lineDelim)
+		if idx == -1 {
+			if final {
+				// If we reached EOF and this is the final chunk of input data, then
+				// try to process it.
+				fullLine = append(fullLine, c.buf[offset:]...)
+				c.buf = c.buf[len(c.buf):]
+				break
 			} else {
-				return false, err
+				// If there's more CopyData, keep the incomplete row in the
+				// buffer, to be processed next time.
+				return true, nil
 			}
 		}
-
-		// Now we need to calculate if we are have reached the end of the quote.
+		// Include the delimiter in the line.
+		line := c.buf[offset : offset+idx+1]
+		offset += idx + 1
+		fullLine = append(fullLine, line...)
+		// Now we need to calculate if we have reached the end of the quote.
 		// If so, break out.
 		if c.csvEscape == 0 {
 			// CSV escape is not specified and hence defaults to '"'.¥
@@ -602,6 +779,7 @@ func (c *copyMachine) readCSVData(ctx context.Context, final bool) (brk bool, er
 			}
 		}
 		if quoteCharsSeen%2 == 0 {
+			c.buf = c.buf[offset:]
 			break
 		}
 	}
@@ -610,14 +788,14 @@ func (c *copyMachine) readCSVData(ctx context.Context, final bool) (brk bool, er
 	// the header row in all circumstances. Do the same.
 	if c.csvExpectHeader {
 		c.csvExpectHeader = false
-		return false, nil
+		return c.readCSVData(ctx, final)
 	}
 
 	c.csvInput.Write(fullLine)
 	record, err := c.csvReader.Read()
 	// Look for end of data before checking for errors, since a field count
 	// error will still return record data.
-	if len(record) == 1 && !record[0].Quoted && record[0].Val == endOfData && c.buf.Len() == 0 {
+	if len(record) == 1 && !record[0].Quoted && record[0].Val == endOfData && len(c.buf) == 0 {
 		return true, nil
 	}
 	if err != nil {
@@ -648,23 +826,38 @@ func (c *copyMachine) readCSVTuple(ctx context.Context, record []csv.Record) err
 			"expected %d values, got %d", expected, len(record))
 	}
 	record = c.maybeIgnoreHiddenColumnsStr(record)
-	datums := c.scratchRow
-	for i, s := range record {
-		// NB: When we implement FORCE_NULL, then quoted values also are allowed
-		// to be treated as NULL.
-		if !s.Quoted && s.Val == c.null {
-			datums[i] = tree.DNull
-			continue
+	if c.vectorized {
+		vh := c.valueHandlers
+		for i, s := range record {
+			// NB: When we implement FORCE_NULL, then quoted values also are allowed
+			// to be treated as NULL.
+			if !s.Quoted && s.Val == c.null {
+				vh[i].Null()
+				continue
+			}
+			if err := tree.ParseAndRequireStringHandler(c.resultColumns[i].Typ, s.Val, c.parsingEvalCtx, vh[i], &c.ph); err != nil {
+				return err
+			}
 		}
-		d, _, err := tree.ParseAndRequireString(c.resultColumns[i].Typ, s.Val, c.parsingEvalCtx)
-		if err != nil {
+		c.batch.SetLength(c.batch.Length() + 1)
+	} else {
+		datums := c.scratchRow
+		for i, s := range record {
+			// NB: When we implement FORCE_NULL, then quoted values also are allowed
+			// to be treated as NULL.
+			if !s.Quoted && s.Val == c.null {
+				datums[i] = tree.DNull
+				continue
+			}
+			d, _, err := tree.ParseAndRequireString(c.resultColumns[i].Typ, s.Val, c.parsingEvalCtx)
+			if err != nil {
+				return err
+			}
+			datums[i] = d
+		}
+		if _, err := c.rows.AddRow(ctx, datums); err != nil {
 			return err
 		}
-
-		datums[i] = d
-	}
-	if _, err := c.rows.AddRow(ctx, datums); err != nil {
-		return err
 	}
 	return nil
 }
@@ -678,25 +871,31 @@ func (c *copyMachine) readBinaryData(ctx context.Context, final bool) (brk bool,
 	}
 	switch c.binaryState {
 	case binaryStateNeedSignature:
-		if readSoFar, err := c.readBinarySignature(); err != nil {
+		n, err := c.readBinarySignature()
+		if err != nil {
 			// If this isn't the last message and we saw incomplete data, then
-			// put it back in the buffer to process more next time.
-			if !final && (err == io.EOF || err == io.ErrUnexpectedEOF) {
-				c.buf.Write(readSoFar)
+			// leave it in the buffer to process more next time.
+			if !final && err == io.ErrUnexpectedEOF {
 				return true, nil
 			}
+			c.buf = c.buf[n:]
 			return false, err
 		}
+		c.buf = c.buf[n:]
+		return false, nil
 	case binaryStateRead:
-		if readSoFar, err := c.readBinaryTuple(ctx); err != nil {
+		n, err := c.readBinaryTuple(ctx)
+		if err != nil {
 			// If this isn't the last message and we saw incomplete data, then
-			// put it back in the buffer to process more next time.
-			if !final && (err == io.EOF || err == io.ErrUnexpectedEOF) {
-				c.buf.Write(readSoFar)
+			// leave it in the buffer to process more next time.
+			if !final && err == io.ErrUnexpectedEOF {
 				return true, nil
 			}
+			c.buf = c.buf[n:]
 			return false, errors.Wrapf(err, "read binary tuple")
 		}
+		c.buf = c.buf[n:]
+		return false, nil
 	case binaryStateFoundTrailer:
 		if !final {
 			return false, pgerror.New(pgcode.BadCopyFileFormat,
@@ -706,34 +905,33 @@ func (c *copyMachine) readBinaryData(ctx context.Context, final bool) (brk bool,
 	default:
 		panic("unknown binary state")
 	}
-	return false, nil
 }
 
-func (c *copyMachine) readBinaryTuple(ctx context.Context) (readSoFar []byte, err error) {
+func (c *copyMachine) readBinaryTuple(ctx context.Context) (bytesRead int, err error) {
 	var fieldCount int16
 	var fieldCountBytes [2]byte
-	n, err := io.ReadFull(&c.buf, fieldCountBytes[:])
-	readSoFar = append(readSoFar, fieldCountBytes[:n]...)
-	if err != nil {
-		return readSoFar, err
+	n := copy(fieldCountBytes[:], c.buf[bytesRead:])
+	bytesRead += n
+	if n < len(fieldCountBytes) {
+		return bytesRead, io.ErrUnexpectedEOF
 	}
 	fieldCount = int16(binary.BigEndian.Uint16(fieldCountBytes[:]))
 	if fieldCount == -1 {
 		c.binaryState = binaryStateFoundTrailer
-		return nil, nil
+		return bytesRead, nil
 	}
 	if fieldCount < 1 {
-		return nil, pgerror.Newf(pgcode.BadCopyFileFormat,
+		return bytesRead, pgerror.Newf(pgcode.BadCopyFileFormat,
 			"unexpected field count: %d", fieldCount)
 	}
 	datums := make(tree.Datums, fieldCount)
 	var byteCount int32
 	var byteCountBytes [4]byte
 	for i := range datums {
-		n, err := io.ReadFull(&c.buf, byteCountBytes[:])
-		readSoFar = append(readSoFar, byteCountBytes[:n]...)
-		if err != nil {
-			return readSoFar, err
+		n := copy(byteCountBytes[:], c.buf[bytesRead:])
+		bytesRead += n
+		if n < len(byteCountBytes) {
+			return bytesRead, io.ErrUnexpectedEOF
 		}
 		byteCount = int32(binary.BigEndian.Uint32(byteCountBytes[:]))
 		if byteCount == -1 {
@@ -741,10 +939,10 @@ func (c *copyMachine) readBinaryTuple(ctx context.Context) (readSoFar []byte, er
 			continue
 		}
 		data := make([]byte, byteCount)
-		n, err = io.ReadFull(&c.buf, data)
-		readSoFar = append(readSoFar, data[:n]...)
-		if err != nil {
-			return readSoFar, err
+		n = copy(data, c.buf[bytesRead:])
+		bytesRead += n
+		if n < len(data) {
+			return bytesRead, io.ErrUnexpectedEOF
 		}
 		d, err := pgwirebase.DecodeDatum(
 			ctx,
@@ -754,33 +952,35 @@ func (c *copyMachine) readBinaryTuple(ctx context.Context) (readSoFar []byte, er
 			data,
 		)
 		if err != nil {
-			return nil, pgerror.Wrapf(err, pgcode.BadCopyFileFormat,
+			return bytesRead, pgerror.Wrapf(err, pgcode.BadCopyFileFormat,
 				"decode datum as %s: %s", c.resultColumns[i].Typ.SQLString(), data)
 		}
 		datums[i] = d
 	}
 	_, err = c.rows.AddRow(ctx, datums)
 	if err != nil {
-		return nil, err
+		return bytesRead, err
 	}
-	return nil, nil
+	return bytesRead, nil
 }
 
-func (c *copyMachine) readBinarySignature() ([]byte, error) {
-	// This is the standard 11-byte binary signature with the flags and
-	// header 32-bit integers appended since we only support the zero value
-	// of them.
-	const binarySignature = "PGCOPY\n\377\r\n\000" + "\x00\x00\x00\x00" + "\x00\x00\x00\x00"
-	var sig [11 + 8]byte
-	if n, err := io.ReadFull(&c.buf, sig[:]); err != nil {
-		return sig[:n], err
+// This is the standard 11-byte binary signature with the flags and
+// header 32-bit integers appended since we only support the zero value
+// of them.
+var copyBinarySignature = [19]byte{'P', 'G', 'C', 'O', 'P', 'Y', '\n', '\377', '\r', '\n', '\000', '\x00', '\x00', '\x00', '\x00', '\x00', '\x00', '\x00', '\x00'}
+
+func (c *copyMachine) readBinarySignature() (int, error) {
+	var sig [19]byte
+	n := copy(sig[:], c.buf)
+	if n < len(sig) {
+		return n, io.ErrUnexpectedEOF
 	}
-	if !bytes.Equal(sig[:], []byte(binarySignature)) {
-		return sig[:], pgerror.New(pgcode.BadCopyFileFormat,
+	if sig != copyBinarySignature {
+		return n, pgerror.New(pgcode.BadCopyFileFormat,
 			"unrecognized binary copy signature")
 	}
 	c.binaryState = binaryStateRead
-	return sig[:], nil
+	return n, nil
 }
 
 // preparePlannerForCopy resets the planner so that it can be used during
@@ -858,6 +1058,11 @@ func (c *copyMachine) insertRows(ctx context.Context, finalBatch bool) error {
 			// NOTE: in theory we can also retry if c.insertRows == 0.
 			if c.implicitTxn && !c.p.SessionData().CopyFromAtomicEnabled && c.p.SessionData().CopyFromRetriesEnabled && errIsRetriable(err) {
 				log.SqlExec.Infof(ctx, "%s failed on attempt %d and is retrying, error %+v", c.copyFromAST.String(), r.CurrentAttempt(), err)
+				if c.p.ExecCfg().TestingKnobs.CopyFromInsertRetry != nil {
+					if err := c.p.ExecCfg().TestingKnobs.CopyFromInsertRetry(); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 			return err
@@ -872,21 +1077,25 @@ func (c *copyMachine) insertRowsInternal(ctx context.Context, finalBatch bool) (
 	defer func() {
 		retErr = cleanup(ctx, retErr)
 	}()
-	if c.rows.Len() == 0 {
-		return nil
-	}
-	numRows := c.rows.Len()
-
 	if c.p.ExecCfg().TestingKnobs.BeforeCopyFromInsert != nil {
 		if err := c.p.ExecCfg().TestingKnobs.BeforeCopyFromInsert(); err != nil {
 			return err
 		}
 	}
-
-	copyFastPath := c.p.SessionData().CopyFastPathEnabled
+	numRows := c.currentBatchSize()
+	if numRows == 0 {
+		return nil
+	}
+	// TODO(cucaroach): Investigate caching memo/plan/etc so that we don't
+	// rebuild everything for every batch.
 	var vc tree.SelectStatement
-	if copyFastPath {
-		vc = &tree.LiteralValuesClause{Rows: &c.rows}
+	if c.copyFastPath {
+		if c.vectorized {
+			b := tree.VectorRows{Batch: c.batch}
+			vc = &tree.LiteralValuesClause{Rows: &b}
+		} else {
+			vc = &tree.LiteralValuesClause{Rows: &c.rows}
+		}
 	} else {
 		// This is best effort way of mimic'ing pre-copyFastPath behavior, its
 		// not exactly the same but should suffice to workaround any bugs due to
@@ -914,7 +1123,8 @@ func (c *copyMachine) insertRowsInternal(ctx context.Context, finalBatch bool) (
 		},
 		Returning: tree.AbsentReturningClause,
 	}
-	c.txnOpt.initPlanner(ctx, c.p)
+
+	// TODO(cucaroach): We shouldn't need to do this for every batch.
 	if err := c.p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
@@ -929,12 +1139,33 @@ func (c *copyMachine) insertRowsInternal(ctx context.Context, finalBatch bool) (
 	}
 
 	if rows := res.RowsAffected(); rows != numRows {
-		log.Fatalf(ctx, "didn't insert all buffered rows and yet no error was reported. "+
+		return errors.AssertionFailedf("COPY didn't insert all buffered rows and yet no error was reported. "+
 			"Inserted %d out of %d rows.", rows, numRows)
 	}
 	c.insertedRows += numRows
 	// We're done reset for next batch.
-	return c.rows.UnsafeReset(ctx)
+	if c.vectorized {
+		var realloc bool
+		if err := colexecerror.CatchVectorizedRuntimeError(func() {
+			c.batch, realloc = c.accHelper.ResetMaybeReallocate(c.typs, c.batch, 0 /* tuplesToBeSet*/)
+		}); err != nil {
+			return err
+		}
+		if realloc {
+			for i := range c.typs {
+				c.valueHandlers[i] = coldataext.MakeVecHandler(c.batch.ColVec(i))
+			}
+		} else {
+			for _, vh := range c.valueHandlers {
+				vh.Reset()
+			}
+		}
+	} else {
+		if err := c.rows.UnsafeReset(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *copyMachine) maybeIgnoreHiddenColumnsBytes(in [][]byte) [][]byte {
@@ -958,9 +1189,17 @@ func (c *copyMachine) readTextTuple(ctx context.Context, line []byte) error {
 			"expected %d values, got %d", expected, len(parts))
 	}
 	parts = c.maybeIgnoreHiddenColumnsBytes(parts)
+	if c.vectorized {
+		return c.readTextTupleVec(ctx, parts)
+	} else {
+		return c.readTextTupleDatum(ctx, parts)
+	}
+}
+
+func (c *copyMachine) readTextTupleDatum(ctx context.Context, parts [][]byte) error {
 	datums := c.scratchRow
 	for i, part := range parts {
-		s := string(part)
+		s := unsafeUint8ToString(part)
 		// Disable NULL conversion during file uploads.
 		if !c.forceNotNull && s == c.null {
 			datums[i] = tree.DNull
@@ -999,6 +1238,43 @@ func (c *copyMachine) readTextTuple(ctx context.Context, line []byte) error {
 	}
 	_, err := c.rows.AddRow(ctx, datums)
 	return err
+}
+
+func (c *copyMachine) readTextTupleVec(ctx context.Context, parts [][]byte) error {
+	for i, part := range parts {
+		s := unsafeUint8ToString(part)
+		// Disable NULL conversion during file uploads.
+		if !c.forceNotNull && s == c.null {
+			c.valueHandlers[i].Null()
+			continue
+		}
+		decodeTyp := c.resultColumns[i].Typ
+		for decodeTyp.Family() == types.ArrayFamily {
+			decodeTyp = decodeTyp.ArrayContents()
+		}
+		switch decodeTyp.Family() {
+		case types.BytesFamily,
+			types.DateFamily,
+			types.IntervalFamily,
+			types.INetFamily,
+			types.StringFamily,
+			types.TimestampFamily,
+			types.TimestampTZFamily,
+			types.UuidFamily:
+			s = DecodeCopy(s)
+		}
+		switch c.resultColumns[i].Typ.Family() {
+		case types.BytesFamily:
+			// This just bypasses DecodeRawBytesToByteArrayAuto, not sure why...
+			c.valueHandlers[i].Bytes(encoding.UnsafeConvertStringToBytes(s))
+		default:
+			if err := tree.ParseAndRequireStringHandler(c.resultColumns[i].Typ, s, c.parsingEvalCtx, c.valueHandlers[i], &c.ph); err != nil {
+				return err
+			}
+		}
+	}
+	c.batch.SetLength(c.batch.Length() + 1)
+	return nil
 }
 
 // DecodeCopy unescapes a single COPY field.
@@ -1116,3 +1392,7 @@ const (
 	binaryStateRead
 	binaryStateFoundTrailer
 )
+
+func unsafeUint8ToString(data []uint8) string {
+	return *(*string)(unsafe.Pointer(&data))
+}

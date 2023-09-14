@@ -10,6 +10,7 @@ package backupccl
 
 import (
 	"context"
+	"hash/fnv"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupencryption"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/logtags"
 )
 
@@ -49,7 +51,6 @@ type generativeSplitAndScatterProcessor struct {
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.GenerativeSplitAndScatterSpec
-	output  execinfra.RowReceiver
 
 	// chunkSplitAndScatterers contain the splitAndScatterers for the group of
 	// split and scatter workers that's responsible for splitting and scattering
@@ -68,7 +69,7 @@ type generativeSplitAndScatterProcessor struct {
 
 	doneScatterCh chan entryNode
 	// A cache for routing datums, so only 1 is allocated per node.
-	routingDatumCache map[roachpb.NodeID]rowenc.EncDatum
+	routingDatumCache routingDatumCache
 	scatterErr        error
 }
 
@@ -80,7 +81,6 @@ func newGenerativeSplitAndScatterProcessor(
 	processorID int32,
 	spec execinfrapb.GenerativeSplitAndScatterSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	db := flowCtx.Cfg.DB
 	numChunkSplitAndScatterWorkers := int(spec.NumNodes)
@@ -124,14 +124,16 @@ func newGenerativeSplitAndScatterProcessor(
 	ssp := &generativeSplitAndScatterProcessor{
 		flowCtx:                      flowCtx,
 		spec:                         spec,
-		output:                       output,
 		chunkSplitAndScatterers:      chunkSplitAndScatterers,
 		chunkEntrySplitAndScatterers: chunkEntrySplitAndScatterers,
-		// Large enough so that it never blocks.
-		doneScatterCh:     make(chan entryNode, spec.NumEntries),
-		routingDatumCache: make(map[roachpb.NodeID]rowenc.EncDatum),
+		// There's not much science behind this sizing of doneScatterCh,
+		// other than it's the max number of entries that can be processed
+		// in parallel downstream. It has been verified ad-hoc that this
+		// sizing does not bottleneck restore.
+		doneScatterCh:     make(chan entryNode, int(spec.NumNodes)*maxConcurrentRestoreWorkers),
+		routingDatumCache: newRoutingDatumCache(),
 	}
-	if err := ssp.Init(ctx, ssp, post, generativeSplitAndScatterOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
+	if err := ssp.Init(ctx, ssp, post, generativeSplitAndScatterOutputTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: nil, // there are no inputs to drain
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -161,7 +163,8 @@ func (gssp *generativeSplitAndScatterProcessor) Start(ctx context.Context) {
 		TaskName: "generativeSplitAndScatter-worker",
 		SpanOpt:  stop.ChildSpan,
 	}, func(ctx context.Context) {
-		gssp.scatterErr = runGenerativeSplitAndScatter(scatterCtx, gssp.flowCtx, &gssp.spec, gssp.chunkSplitAndScatterers, gssp.chunkEntrySplitAndScatterers, gssp.doneScatterCh)
+		gssp.scatterErr = runGenerativeSplitAndScatter(scatterCtx, gssp.flowCtx, &gssp.spec, gssp.chunkSplitAndScatterers, gssp.chunkEntrySplitAndScatterers, gssp.doneScatterCh,
+			&gssp.routingDatumCache)
 		cancel()
 		close(gssp.doneScatterCh)
 		close(workerDone)
@@ -191,10 +194,10 @@ func (gssp *generativeSplitAndScatterProcessor) Next() (
 		}
 
 		// The routing datums informs the router which output stream should be used.
-		routingDatum, ok := gssp.routingDatumCache[scatteredEntry.node]
+		routingDatum, ok := gssp.routingDatumCache.getRoutingDatum(scatteredEntry.node)
 		if !ok {
 			routingDatum, _ = routingDatumsForSQLInstance(base.SQLInstanceID(scatteredEntry.node))
-			gssp.routingDatumCache[scatteredEntry.node] = routingDatum
+			gssp.routingDatumCache.putRoutingDatum(scatteredEntry.node, routingDatum)
 		}
 
 		row := rowenc.EncDatumRow{
@@ -263,6 +266,7 @@ func runGenerativeSplitAndScatter(
 	chunkSplitAndScatterers []splitAndScatterer,
 	chunkEntrySplitAndScatterers []splitAndScatterer,
 	doneScatterCh chan<- entryNode,
+	cache *routingDatumCache,
 ) error {
 	log.Infof(ctx, "Running generative split and scatter with %d total spans, %d chunk size, %d nodes",
 		spec.NumEntries, spec.ChunkSize, spec.NumNodes)
@@ -281,28 +285,36 @@ func runGenerativeSplitAndScatter(
 		if err != nil {
 			return err
 		}
-
 		introducedSpanFrontier, err := createIntroducedSpanFrontier(backups, spec.EndTime)
 		if err != nil {
 			return err
 		}
-
 		backupLocalityMap, err := makeBackupLocalityMap(spec.BackupLocalityInfo, spec.User())
 		if err != nil {
 			return err
 		}
-
+		checkpointFrontier, err := loadCheckpointFrontier(spec.Spans, spec.CheckpointedSpans)
+		if err != nil {
+			return err
+		}
+		filter, err := makeSpanCoveringFilter(
+			checkpointFrontier,
+			spec.HighWater,
+			introducedSpanFrontier,
+			spec.TargetSize,
+			spec.UseFrontierCheckpointing)
+		if err != nil {
+			return err
+		}
 		return generateAndSendImportSpans(
 			ctx,
 			spec.Spans,
 			backups,
 			layerToFileIterFactory,
 			backupLocalityMap,
-			introducedSpanFrontier,
-			spec.HighWater,
-			spec.TargetSize,
-			restoreSpanEntriesCh,
+			filter,
 			spec.UseSimpleImportSpans,
+			restoreSpanEntriesCh,
 		)
 	})
 
@@ -351,6 +363,8 @@ func runGenerativeSplitAndScatter(
 	for worker := 0; worker < chunkSplitAndScatterWorkers; worker++ {
 		worker := worker
 		g2.GoCtx(func(ctx context.Context) error {
+			hash := fnv.New32a()
+
 			// Chunks' leaseholders should be randomly placed throughout the
 			// cluster.
 			for importSpanChunk := range restoreEntryChunksCh {
@@ -367,13 +381,32 @@ func runGenerativeSplitAndScatter(
 					return err
 				}
 				if chunkDestination == 0 {
-					// If scatter failed to find a node for range ingestion, route the range
-					// to the node currently running the split and scatter processor.
+					// If scatter failed to find a node for range ingestion, route the
+					// range to a random node that has already been scattered to so far.
+					// The random node is chosen by hashing the scatter key.
 					if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); ok {
+						cachedNodeIDs := cache.cachedNodeIDs()
+						if len(cachedNodeIDs) > 0 {
+							hash.Reset()
+							if _, err := hash.Write(scatterKey); err != nil {
+								log.Warningf(ctx, "scatter returned node 0. Route span starting at %s to current node %v because of hash error: %v",
+									scatterKey, nodeID, err)
+							} else {
+								hashedKey := int(hash.Sum32())
+								nodeID = cachedNodeIDs[hashedKey%len(cachedNodeIDs)]
+							}
+
+							log.Warningf(ctx, "scatter returned node 0. "+
+								"Random route span starting at %s node %v", scatterKey, nodeID)
+						} else {
+							log.Warningf(ctx, "scatter returned node 0. "+
+								"Route span starting at %s to current node %v", scatterKey, nodeID)
+						}
 						chunkDestination = nodeID
-						log.Warningf(ctx, "scatter returned node 0. "+
-							"Route span starting at %s to current node %v", scatterKey, nodeID)
 					} else {
+						// TODO(rui): OptionalNodeID only returns a node if the sql server runs
+						// in the same process as the kv server (e.g., not serverless). Figure
+						// out how to handle this error in serverless restore.
 						log.Warningf(ctx, "scatter returned node 0. "+
 							"Route span starting at %s to default stream", scatterKey)
 					}
@@ -447,6 +480,40 @@ func runGenerativeSplitAndScatter(
 	}
 
 	return g.Wait()
+}
+
+type routingDatumCache struct {
+	syncutil.Mutex
+	cache   map[roachpb.NodeID]rowenc.EncDatum
+	nodeIDs []roachpb.NodeID
+}
+
+func (c *routingDatumCache) getRoutingDatum(nodeID roachpb.NodeID) (rowenc.EncDatum, bool) {
+	c.Lock()
+	defer c.Unlock()
+	d, ok := c.cache[nodeID]
+	return d, ok
+}
+
+func (c *routingDatumCache) putRoutingDatum(nodeID roachpb.NodeID, datum rowenc.EncDatum) {
+	c.Lock()
+	defer c.Unlock()
+	if _, ok := c.cache[nodeID]; !ok {
+		c.nodeIDs = append(c.nodeIDs, nodeID)
+	}
+	c.cache[nodeID] = datum
+}
+
+func (c *routingDatumCache) cachedNodeIDs() []roachpb.NodeID {
+	c.Lock()
+	defer c.Unlock()
+	return c.nodeIDs
+}
+
+func newRoutingDatumCache() routingDatumCache {
+	return routingDatumCache{
+		cache: make(map[roachpb.NodeID]rowenc.EncDatum),
+	}
 }
 
 func init() {

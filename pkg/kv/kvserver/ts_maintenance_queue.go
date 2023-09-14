@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -112,12 +113,14 @@ func newTimeSeriesMaintenanceQueue(
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
-			needsSystemConfig:    false,
+			needsSpanConfigs:     false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.TimeSeriesMaintenanceQueueSuccesses,
 			failures:             store.metrics.TimeSeriesMaintenanceQueueFailures,
+			storeFailures:        store.metrics.StoreFailures,
 			pending:              store.metrics.TimeSeriesMaintenanceQueuePending,
 			processingNanos:      store.metrics.TimeSeriesMaintenanceQueueProcessingNanos,
+			disabledConfig:       kvserverbase.TimeSeriesMaintenanceQueueEnabled,
 		},
 	)
 
@@ -148,11 +151,10 @@ func (q *timeSeriesMaintenanceQueue) process(
 	ctx context.Context, repl *Replica, _ spanconfig.StoreReader,
 ) (processed bool, err error) {
 	desc := repl.Desc()
-	snap := repl.store.TODOEngine().NewSnapshot()
+	eng := repl.store.StateEngine()
 	now := repl.store.Clock().Now()
-	defer snap.Close()
 	if err := q.tsData.MaintainTimeSeries(
-		ctx, snap, desc.StartKey, desc.EndKey, q.db, q.mem, TimeSeriesMaintenanceMemoryBudget, now,
+		ctx, eng, desc.StartKey, desc.EndKey, q.db, q.mem, TimeSeriesMaintenanceMemoryBudget, now,
 	); err != nil {
 		return false, err
 	}

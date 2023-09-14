@@ -142,9 +142,7 @@ func EncDatumFromEncoded(enc catenumpb.DatumEncoding, encoded []byte) EncDatum {
 // possibly followed by other data. Similar to EncDatumFromEncoded,
 // except that this function figures out where the encoding stops and returns a
 // slice for the rest of the buffer.
-func EncDatumFromBuffer(
-	typ *types.T, enc catenumpb.DatumEncoding, buf []byte,
-) (EncDatum, []byte, error) {
+func EncDatumFromBuffer(enc catenumpb.DatumEncoding, buf []byte) (EncDatum, []byte, error) {
 	if len(buf) == 0 {
 		return EncDatum{}, nil, errors.New("empty encoded value")
 	}
@@ -194,7 +192,7 @@ func DatumToEncDatum(ctyp *types.T, d tree.Datum) EncDatum {
 
 	dTyp := d.ResolvedType()
 	if d != tree.DNull && !ctyp.Equivalent(dTyp) && !dTyp.IsAmbiguous() {
-		panic(errors.AssertionFailedf("invalid datum type given: %s, expected %s", dTyp, ctyp))
+		panic(errors.AssertionFailedf("invalid datum type given: %s, expected %s", dTyp.SQLStringForError(), ctyp.SQLStringForError()))
 	}
 	return EncDatum{Datum: d}
 }

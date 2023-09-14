@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
+import moment from "moment-timezone";
 import Long from "long";
 import { createMemoryHistory } from "history";
 import { noop } from "lodash";
@@ -71,7 +71,6 @@ const statementDetailsNoData: StatementDetailsResponse = {
   internal_app_name_prefix: "$ internal",
   statement_statistics_per_aggregated_ts: [],
   statement_statistics_per_plan_hash: [],
-  toJSON: () => ({}),
 };
 
 const statementDetailsData: StatementDetailsResponse = {
@@ -814,7 +813,6 @@ const statementDetailsData: StatementDetailsResponse = {
     },
   ],
   internal_app_name_prefix: "$ internal",
-  toJSON: () => ({}),
 };
 
 export const getStatementDetailsPropsFixture = (
@@ -853,6 +851,7 @@ export const getStatementDetailsPropsFixture = (
     "3": "gcp-us-west1",
     "4": "gcp-europe-west1",
   },
+  requestTime: moment.utc("2021.12.12"),
   refreshStatementDetails: noop,
   refreshStatementDiagnosticsRequests: noop,
   refreshNodes: noop,
@@ -862,6 +861,7 @@ export const getStatementDetailsPropsFixture = (
   diagnosticsReports: [],
   dismissStatementDiagnosticsAlertMessage: noop,
   onTimeScaleChange: noop,
+  onRequestTimeChange: noop,
   createStatementDiagnosticsReport: noop,
   uiConfig: {
     showStatementDiagnosticsLink: true,

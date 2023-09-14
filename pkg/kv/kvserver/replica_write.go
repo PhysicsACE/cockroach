@@ -30,9 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -43,7 +43,7 @@ import (
 // TODO(erikgrinaker): this, and the timeout handling, should be moved into a
 // migration helper that manages checkpointing and retries as well.
 var migrateApplicationTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.migration.migrate_application.timeout",
 	"timeout for a Migrate request to be applied across all replicas of a range",
 	1*time.Minute,
@@ -154,11 +154,13 @@ func (r *Replica) executeWriteBatch(
 		// meant to protect against future correctness anomalies.
 		defer func() {
 			if br != nil && ba.Txn != nil && br.Txn == nil {
-				log.Fatalf(ctx, "assertion failed: transaction updated by "+
-					"timestamp cache, but transaction returned in response; "+
-					"updated timestamp would have been lost (recovered): "+
-					"%s in batch %s", ba.Txn, ba,
-				)
+				pErr = kvpb.NewError(errors.NewAssertionErrorWithWrappedErrf(pErr.GoError(),
+					"assertion failed: transaction updated by "+
+						"timestamp cache, but transaction returned in response; "+
+						"updated timestamp would have been lost (recovered): "+
+						"%s in batch %s", ba.Txn, ba,
+				))
+				logcrash.ReportOrPanic(ctx, &r.store.cfg.Settings.SV, "%v", pErr)
 			}
 		}()
 	}
@@ -172,7 +174,8 @@ func (r *Replica) executeWriteBatch(
 
 	// If the command is proposed to Raft, ownership of and responsibility for
 	// the concurrency guard will be assumed by Raft, so provide the guard to
-	// evalAndPropose.
+	// evalAndPropose. If we return with an error from executeWriteBatch, we
+	// also return the guard which the caller reassumes ownership of.
 	ch, abandon, _, writeBytes, pErr := r.evalAndPropose(ctx, ba, g, &st, ui, tok.Move(ctx))
 	if pErr != nil {
 		if cErr, ok := pErr.GetDetail().(*kvpb.ReplicaCorruptionError); ok {
@@ -204,8 +207,12 @@ func (r *Replica) executeWriteBatch(
 			// Semi-synchronously process any intents that need resolving here in
 			// order to apply back pressure on the client which generated them. The
 			// resolution is semi-synchronous in that there is a limited number of
-			// outstanding asynchronous resolution tasks allowed after which
-			// further calls will block.
+			// outstanding asynchronous resolution tasks allowed after which further
+			// calls will block. The limited number of asynchronous resolution tasks
+			// ensures that the number of goroutines doing intent resolution does
+			// not diverge from the number of workload goroutines (see
+			// https://github.com/cockroachdb/cockroach/issues/4925#issuecomment-193015586
+			// for an old problem predating such a limit).
 			if len(propResult.EndTxns) > 0 {
 				if err := r.store.intentResolver.CleanupTxnIntentsAsync(
 					ctx, r.RangeID, propResult.EndTxns, true, /* allowSync */
@@ -215,7 +222,7 @@ func (r *Replica) executeWriteBatch(
 			}
 			if len(propResult.EncounteredIntents) > 0 {
 				if err := r.store.intentResolver.CleanupIntentsAsync(
-					ctx, propResult.EncounteredIntents, true, /* allowSync */
+					ctx, ba.AdmissionHeader, propResult.EncounteredIntents, true, /* allowSync */
 				); err != nil {
 					log.Warningf(ctx, "intent cleanup failed: %v", err)
 				}
@@ -266,7 +273,7 @@ func (r *Replica) executeWriteBatch(
 				//
 				// [1]: See PurgeOutdatedReplicas from the Migration service.
 				// [2]: pkg/migration
-				applicationErr := contextutil.RunWithTimeout(ctx, "wait for Migrate application",
+				applicationErr := timeutil.RunWithTimeout(ctx, "wait for Migrate application",
 					migrateApplicationTimeout.Get(&r.ClusterSettings().SV),
 					func(ctx context.Context) error {
 						desc := r.Desc()
@@ -305,7 +312,7 @@ func (r *Replica) executeWriteBatch(
 					r.AnnotateCtx(context.Background()),
 					taskName,
 					func(ctx context.Context) {
-						err := contextutil.RunWithTimeout(ctx, taskName, 20*time.Second,
+						err := timeutil.RunWithTimeout(ctx, taskName, 20*time.Second,
 							func(ctx context.Context) error {
 								select {
 								case propResult := <-ch:
@@ -353,9 +360,13 @@ func (r *Replica) canAttempt1PCEvaluation(
 		return false
 	}
 
-	if ba.Timestamp != ba.Txn.WriteTimestamp {
-		log.Fatalf(ctx, "unexpected 1PC execution with diverged timestamp. %s != %s",
-			ba.Timestamp, ba.Txn.WriteTimestamp)
+	// isOnePhaseCommit ensured that the transaction has a non-skewed read/write
+	// timestamp, even for isolation levels that can commit with such skew. Sanity
+	// check that this timestamp is equal to the batch timestamp.
+	if ba.Timestamp != ba.Txn.ReadTimestamp || ba.Timestamp != ba.Txn.WriteTimestamp {
+		log.Fatalf(ctx, "unexpected 1PC execution with diverged read or write timestamps; "+
+			"ba.Timestamp: %s, ba.Txn.ReadTimestamp: %s, ba.Txn.WriteTimestamp: %s",
+			ba.Timestamp, ba.Txn.ReadTimestamp, ba.Txn.WriteTimestamp)
 	}
 
 	// The EndTxn checks whether the txn record can be created and, if so, at what
@@ -399,9 +410,10 @@ func (r *Replica) evaluateWriteBatch(
 ) (storage.Batch, enginepb.MVCCStats, *kvpb.BatchResponse, result.Result, *kvpb.Error) {
 	log.Event(ctx, "executing read-write batch")
 
-	// If the transaction has been pushed but it can commit at the higher
+	// If the transaction has been pushed but it can be forwarded to the higher
 	// timestamp, let's evaluate the batch at the bumped timestamp. This will
-	// allow it commit, and also it'll allow us to attempt the 1PC code path.
+	// allow serializable transactions to commit. It will also allow transactions
+	// with any isolation level to attempt the 1PC code path.
 	maybeBumpReadTimestampToWriteTimestamp(ctx, ba, g)
 
 	// Attempt 1PC execution, if applicable. If not transactional or there are
@@ -589,15 +601,20 @@ func (r *Replica) evaluate1PC(
 	resolvedLocks := make([]roachpb.LockUpdate, 0, len(etArg.LockSpans))
 	var externalLocks []roachpb.Span
 	for _, sp := range etArg.LockSpans {
-		inSpan, outSpans := kvserverbase.IntersectSpan(sp, desc)
-		externalLocks = append(externalLocks, outSpans...)
-		if inSpan != nil {
-			resolvedLocks = append(resolvedLocks, roachpb.LockUpdate{
-				Span:           *inSpan,
-				Txn:            clonedTxn.TxnMeta,
-				Status:         clonedTxn.Status,
-				IgnoredSeqNums: clonedTxn.IgnoredSeqNums,
-			})
+		if len(sp.EndKey) == 0 {
+			// NOTE: kvserverbase.IntersectSpan does not support point spans, so we
+			// don't call it for point lock spans.
+			if kvserverbase.ContainsKey(desc, sp.Key) {
+				resolvedLocks = append(resolvedLocks, roachpb.MakeLockUpdate(clonedTxn, sp))
+			} else {
+				externalLocks = append(externalLocks, sp)
+			}
+		} else {
+			inSpan, outSpans := kvserverbase.IntersectSpan(sp, desc)
+			if inSpan != nil {
+				resolvedLocks = append(resolvedLocks, roachpb.MakeLockUpdate(clonedTxn, *inSpan))
+			}
+			externalLocks = append(externalLocks, outSpans...)
 		}
 	}
 	clonedTxn.LockSpans = externalLocks
@@ -662,21 +679,13 @@ func (r *Replica) evaluateWriteBatchWithServersideRefreshes(
 
 		batch, br, res, pErr = r.evaluateWriteBatchWrapper(ctx, idKey, rec, ms, ba, g, st, ui)
 
-		var success bool
-		if pErr == nil {
-			wto := br.Txn != nil && br.Txn.WriteTooOld
-			success = !wto
-		} else {
-			success = false
-		}
-
 		// Allow one retry only; a non-txn batch containing overlapping
 		// spans will always experience WriteTooOldError.
-		if success || retries > 0 {
+		if pErr == nil || retries > 0 {
 			break
 		}
 		// If we can retry, set a higher batch timestamp and continue.
-		if !canDoServersideRetry(ctx, pErr, ba, br, g, deadline) {
+		if !canDoServersideRetry(ctx, pErr, ba, g, deadline) {
 			r.store.Metrics().WriteEvaluationServerSideRetryFailure.Inc(1)
 			break
 		} else {
@@ -776,14 +785,28 @@ func (r *Replica) newBatchedEngine(
 // isOnePhaseCommit returns true iff the BatchRequest contains all writes in the
 // transaction and ends with an EndTxn. One phase commits are disallowed if any
 // of the following conditions are true:
-// (1) the transaction has already been flagged with a write too old error
-// (2) the transaction's commit timestamp has been forwarded
-// (3) the transaction exceeded its deadline
-// (4) the transaction is not in its first epoch and the EndTxn request does
-//
-//	not require one phase commit.
+//  1. the transaction's commit timestamp has been forwarded. Note that this
+//     prevents one phase commit even for isolation levels that can otherwise
+//     tolerate write skew.
+//  2. the transaction is failing a commit condition and must retry. This
+//     condition is isolation level dependent.
+//  3. the transaction is not in its first epoch and the EndTxn request does
+//     not require one phase commit.
 func isOnePhaseCommit(ba *kvpb.BatchRequest) bool {
 	if ba.Txn == nil {
+		return false
+	}
+	if ba.Txn.ReadTimestamp != ba.Txn.WriteTimestamp {
+		// If the transaction's read and write timestamp are skewed, one phase
+		// commit is not allowed. This is true even for isolation levels that can
+		// otherwise tolerate write skew. This is because the one phase commit
+		// evaluation logic operates using a non-transactional batch which does not
+		// know how to evaluate with reads and writes at different timestamps. Even
+		// for write-only batches, the non-transactional path would be unable to
+		// detect write-write version conflicts between the transaction's read and
+		// write timestamps.
+		//
+		// NOTE: ba.Timestamp == ba.Txn.ReadTimestamp
 		return false
 	}
 	if !ba.IsCompleteTransaction() {
@@ -791,7 +814,7 @@ func isOnePhaseCommit(ba *kvpb.BatchRequest) bool {
 	}
 	arg, _ := ba.GetArg(kvpb.EndTxn)
 	etArg := arg.(*kvpb.EndTxnRequest)
-	if retry, _, _ := batcheval.IsEndTxnTriggeringRetryError(ba.Txn, etArg); retry {
+	if retry, _, _ := batcheval.IsEndTxnTriggeringRetryError(ba.Txn, etArg.Deadline); retry {
 		return false
 	}
 	// If the transaction has already restarted at least once then it may have

@@ -581,7 +581,7 @@ statement ok
 CREATE SCHEMA user1_schema AUTHORIZATION user1
 
 # The created schemas should both be owned by user1.
-query TT
+query TT rowsort
 SELECT
   nspname, usename
 FROM
@@ -911,3 +911,446 @@ DROP SCHEMA sc
 
 statement ok
 SET CLUSTER SETTING server.eventlog.enabled = false
+
+subtest alter_table_schema
+
+# Renaming the schema should invalidate a schema-qualified table reference.
+statement ok
+CREATE SCHEMA sc;
+CREATE TABLE sc.xy (x INT, y INT);
+INSERT INTO sc.xy VALUES (1, 1);
+
+query II
+SELECT * FROM sc.xy;
+----
+1 1
+
+statement ok
+ALTER SCHEMA sc RENAME TO sc1;
+
+query error pq: relation "sc.xy" does not exist
+SELECT * FROM sc.xy;
+
+query II
+SELECT * FROM sc1.xy;
+----
+1 1
+
+statement ok
+DROP SCHEMA sc1 CASCADE;
+
+# Renaming the database should invalidate a database-qualified table reference.
+statement ok
+CREATE DATABASE d;
+USE d;
+CREATE TABLE d.xy (x INT, y INT);
+INSERT INTO d.xy VALUES (1, 1);
+
+query II
+SELECT * FROM d.xy;
+----
+1 1
+
+statement ok
+ALTER DATABASE d RENAME TO d1;
+USE d1;
+
+query error pq: relation "d.xy" does not exist
+SELECT * FROM d.xy;
+
+query II
+SELECT * FROM d1.xy;
+----
+1 1
+
+statement ok
+USE test;
+DROP DATABASE d1 CASCADE;
+
+# Changing the current database should invalidate an unqualified table
+# reference.
+statement ok
+CREATE TABLE xy (x INT, y INT);
+INSERT INTO xy VALUES (1, 1);
+
+query II
+SELECT * FROM xy;
+----
+1 1
+
+statement ok
+CREATE DATABASE d;
+USE d;
+
+query error pq: relation "xy" does not exist
+SELECT * FROM xy;
+
+statement ok
+USE test;
+DROP DATABASE d;
+DROP TABLE xy;
+
+# Regression tests for #96674.
+subtest alter_udt_schema
+
+# Renaming the schema should invalidate a schema-qualified UDT reference.
+statement ok
+CREATE SCHEMA sc;
+CREATE TYPE sc.t AS ENUM ('HELLO');
+
+query T
+SELECT 'HELLO'::sc.t;
+----
+HELLO
+
+statement ok
+ALTER SCHEMA sc RENAME TO sc1;
+
+query error pq: type "sc.t" does not exist
+SELECT 'HELLO'::sc.t;
+
+query T
+SELECT 'HELLO'::sc1.t;
+----
+HELLO
+
+statement ok
+DROP SCHEMA sc1 CASCADE;
+
+# Renaming the database should invalidate a database-qualified UDT reference.
+statement ok
+CREATE DATABASE d;
+USE d;
+CREATE TYPE d.t AS ENUM ('HELLO');
+
+query T
+SELECT 'HELLO'::d.t;
+----
+HELLO
+
+statement ok
+ALTER DATABASE d RENAME TO d1;
+USE d1;
+
+query error pq: type "d.t" does not exist
+SELECT 'HELLO'::d.t;
+
+query T
+SELECT 'HELLO'::d1.t;
+----
+HELLO
+
+statement ok
+USE test;
+DROP DATABASE d1 CASCADE;
+
+# Changing the current database should invalidate an unqualified UDT reference.
+statement ok
+CREATE TYPE t AS ENUM ('HELLO');
+
+query T
+SELECT 'HELLO'::t;
+----
+HELLO
+
+statement ok
+CREATE DATABASE d;
+USE d;
+
+query error pq: type "t" does not exist
+SELECT 'HELLO'::t;
+
+statement ok
+USE test;
+DROP DATABASE d;
+DROP TYPE t;
+
+subtest alter_udf_schema
+
+# Renaming the schema should invalidate a schema-qualified UDF reference.
+statement ok
+CREATE SCHEMA sc;
+CREATE FUNCTION sc.fn(INT) RETURNS INT LANGUAGE SQL AS 'SELECT $1';
+
+query I
+SELECT sc.fn(1);
+----
+1
+
+statement ok
+ALTER SCHEMA sc RENAME TO sc1;
+
+query error pq: schema "sc" does not exist
+SELECT sc.fn(1);
+
+query I
+SELECT sc1.fn(1);
+----
+1
+
+statement ok
+DROP SCHEMA sc1 CASCADE;
+
+# Renaming the database should invalidate a database-qualified UDF reference.
+statement ok
+CREATE DATABASE d;
+USE d;
+CREATE FUNCTION fn(INT) RETURNS INT LANGUAGE SQL AS 'SELECT $1';
+
+query I
+SELECT d.public.fn(1);
+----
+1
+
+statement ok
+ALTER DATABASE d RENAME TO d1;
+USE d1;
+
+query error cross-database function references not allowed
+SELECT d.public.fn(1);
+
+query I
+SELECT d1.public.fn(1);
+----
+1
+
+statement ok
+USE test;
+DROP DATABASE d1 CASCADE;
+
+# Changing the current database should invalidate an unqualified UDF reference.
+statement ok
+CREATE FUNCTION fn(INT) RETURNS INT LANGUAGE SQL AS 'SELECT $1';
+
+query I
+SELECT fn(1);
+----
+1
+
+statement ok
+CREATE DATABASE d;
+USE d;
+
+query error pq: unknown function: fn\(\): function undefined
+SELECT fn(1);
+
+statement ok
+USE test;
+DROP DATABASE d;
+DROP FUNCTION fn;
+
+# Regression test for #97757 - invalidate the query cache after changes to the
+# search path cause a function call to resolve to a UDF when it previously
+# resolved to a builtin function.
+subtest invalidate-builtin
+
+statement ok
+CREATE FUNCTION public.abs(val INT) RETURNS INT CALLED ON NULL INPUT LANGUAGE SQL AS $$ SELECT val+100 $$;
+
+query I
+SELECT abs(1);
+----
+1
+
+statement ok
+SET search_path = public, pg_catalog;
+
+# This should use the UDF abs which returns 101.
+query I
+SELECT abs(1);
+----
+101
+
+statement ok
+RESET search_path;
+
+# This should use the builtin abs again.
+query I
+SELECT abs(1);
+----
+1
+
+subtest search_path
+
+# Verify that spaces are trimmed.
+statement ok
+SET search_path = public,      a,     "   b  ",   c
+
+query T
+SHOW search_path
+----
+public, a, "   b  ", c
+
+# When each identifier is enclosed in single quotes, the search_path should
+# have multiple elements.
+statement ok
+SET search_path = '$user', 'public'
+
+query T
+SHOW search_path
+----
+"$user", public
+
+# When the whole value is enclosed in single quotes, the search_path should
+# have contain one element.
+statement ok
+SET search_path = '$user, public'
+
+query T
+SHOW search_path
+----
+"$user, public"
+
+# With single quotes, the identifier case is preserved.
+statement ok
+SET search_path = 'Abc', 'public'
+
+query T
+SHOW search_path
+----
+"Abc", public
+
+# Without single quotes, the identifier is normalized to lower case.
+statement ok
+SET search_path = Abc, 'public'
+
+query T
+SHOW search_path
+----
+abc, public
+
+# An empty identifier is allowed.
+statement ok
+SET search_path = ''
+
+query T
+SHOW search_path
+----
+""
+
+# An empty identifier is allowed.
+statement ok
+SET search_path = ""
+
+query T
+SHOW search_path
+----
+""
+
+# A whitespace identifier is allowed.
+statement ok
+SET search_path = "  ", abc
+
+query T
+SHOW search_path
+----
+"  ", abc
+
+# Handle special characters.
+statement ok
+SET search_path = 'a\bc', "d\ef", 'g-hi', "j-kl"
+
+query T
+SHOW search_path
+----
+"a\bc", "d\ef", "g-hi", "j-kl"
+
+statement error syntax error
+SET search_path = abc, def,
+
+subtest end
+
+# Regression test for #102375 - check that all data sources resolve to the same
+# schema objects before checking access privileges.
+subtest privileges
+
+user root
+
+statement ok
+RESET search_path;
+CREATE DATABASE testdb1;
+USE testdb1;
+CREATE TABLE ab (a INT PRIMARY KEY, b INT);
+INSERT INTO ab VALUES (1, 1);
+CREATE TABLE xy (x INT, y INT, FOREIGN KEY (x) REFERENCES ab(a));
+GRANT ALL ON xy TO testuser;
+GRANT ALL ON ab TO testuser;
+
+statement ok
+CREATE DATABASE testdb2;
+USE testdb2;
+CREATE TABLE ab (a INT PRIMARY KEY, b INT);
+INSERT INTO ab VALUES (1, 1);
+CREATE TABLE xy (x INT, y INT, FOREIGN KEY (x) REFERENCES ab(a));
+CREATE USER testuser2;
+GRANT ALL ON xy TO testuser2;
+GRANT ALL ON ab TO testuser2;
+
+user testuser
+
+statement ok
+USE testdb1
+
+statement ok
+INSERT into xy VALUES(1, 1)
+
+user testuser2
+
+statement ok
+USE testdb2
+
+statement ok
+INSERT into xy VALUES(1, 1)
+
+statement ok
+INSERT into xy VALUES(1, 1)
+
+user testuser
+
+statement ok
+USE testdb1
+
+statement ok
+INSERT into xy VALUES(1, 1)
+
+user root
+
+statement ok
+USE test;
+REVOKE ALL ON testdb2.xy FROM testuser2;
+REVOKE ALL ON testdb2.ab FROM testuser2;
+DROP USER testuser2;
+DROP DATABASE testdb1 CASCADE;
+DROP DATABASE testdb2 CASCADE;
+
+subtest end
+
+subtest public_schema_create_privilege
+
+statement ok
+CREATE DATABASE should_have_create
+
+statement ok
+USE should_have_create
+
+query TTTT rowsort
+SELECT database_name, schema_name, grantee, privilege_type FROM [SHOW GRANTS ON SCHEMA public] WHERE grantee = 'public'
+----
+should_have_create  public  public  CREATE
+should_have_create  public  public  USAGE
+
+statement ok
+SET CLUSTER SETTING sql.auth.public_schema_create_privilege.enabled = false
+
+statement ok
+CREATE DATABASE should_not_have_create
+
+statement ok
+USE should_not_have_create
+
+query TTTT
+SELECT database_name, schema_name, grantee, privilege_type FROM [SHOW GRANTS ON SCHEMA public] WHERE grantee = 'public'
+----
+should_not_have_create  public  public  USAGE
+
+subtest end

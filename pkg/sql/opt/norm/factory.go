@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package norm implements normalization for queries.
 package norm
 
 import (
@@ -16,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins" // register all builtins in builtins:init() for memo package
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
@@ -296,6 +298,8 @@ func (f *Factory) EvalContext() *eval.Context {
 func (f *Factory) CopyAndReplace(
 	from memo.RelExpr, fromProps *physical.Required, replace ReplaceFunc,
 ) {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
+
 	if !f.mem.IsEmpty() {
 		panic(errors.AssertionFailedf("destination memo must be empty"))
 	}
@@ -353,6 +357,28 @@ func (f *Factory) AssignPlaceholders(from *memo.Memo) (err error) {
 				panic(err)
 			}
 			return f.ConstructConstVal(d, placeholder.DataType())
+		}
+		// A recursive CTE may have the stats change on its Initial expression
+		// after placeholder assignment, if that happens we need to
+		// propagate that change to the Binding expression and rebuild
+		// everything.
+		if rcte, ok := e.(*memo.RecursiveCTEExpr); ok {
+			newInitial := f.CopyAndReplaceDefault(rcte.Initial, replaceFn).(memo.RelExpr)
+			if newInitial != rcte.Initial {
+				newBinding := f.ConstructFakeRel(&memo.FakeRelPrivate{
+					Props: MakeBindingPropsForRecursiveCTE(
+						props.AnyCardinality, rcte.Binding.Relational().OutputCols,
+						newInitial.Relational().Statistics().RowCount)})
+				if id := rcte.WithBindingID(); id != 0 {
+					f.Metadata().AddWithBinding(id, newBinding)
+				}
+				return f.ConstructRecursiveCTE(
+					newBinding,
+					newInitial,
+					f.invokeReplace(rcte.Recursive, replaceFn).(memo.RelExpr),
+					&rcte.RecursiveCTEPrivate,
+				)
+			}
 		}
 		return f.CopyAndReplaceDefault(e, replaceFn)
 	}
@@ -442,6 +468,7 @@ func (f *Factory) ConstructZeroValues() memo.RelExpr {
 func (f *Factory) ConstructJoin(
 	joinOp opt.Operator, left, right memo.RelExpr, on memo.FiltersExpr, private *memo.JoinPrivate,
 ) memo.RelExpr {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
 	switch joinOp {
 	case opt.InnerJoinOp:
 		return f.ConstructInnerJoin(left, right, on, private)
@@ -473,6 +500,7 @@ func (f *Factory) ConstructJoin(
 // Null operators require the static type to be specified, so that rewrites do
 // not change it.
 func (f *Factory) ConstructConstVal(d tree.Datum, t *types.T) opt.ScalarExpr {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
 	if d == tree.DNull {
 		return f.ConstructNull(t)
 	}
@@ -490,6 +518,7 @@ func (f *Factory) ConstructConstVal(d tree.Datum, t *types.T) opt.ScalarExpr {
 // of the given set of constant values. This is performed by either constructing
 // an equality expression or an IN expression.
 func (f *Factory) ConstructConstFilter(col opt.ColumnID, values tree.Datums) memo.FiltersItem {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
 	if len(values) == 1 {
 		return f.ConstructFiltersItem(f.ConstructEq(
 			f.ConstructVariable(col),
@@ -520,6 +549,8 @@ func (f *Factory) ConstructConstFilter(col opt.ColumnID, values tree.Datums) mem
 // encountered in the input ScalarExpr that are not keys in colMap, they are not
 // remapped.
 func (f *Factory) RemapCols(scalar opt.ScalarExpr, colMap opt.ColMap) opt.ScalarExpr {
+	opt.MaybeInjectOptimizerTestingPanic(f.ctx, f.evalCtx)
+
 	// Recursively walk the scalar sub-tree looking for references to columns
 	// that need to be replaced and then replace them appropriately.
 	var replace ReplaceFunc

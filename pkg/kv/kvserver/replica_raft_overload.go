@@ -15,11 +15,11 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"go.etcd.io/raft/v3/tracker"
 )
@@ -31,16 +31,7 @@ var pauseReplicationIOThreshold = settings.RegisterFloatSetting(
 	"admission.kv.pause_replication_io_threshold",
 	"pause replication to non-essential followers when their I/O admission control score exceeds the given threshold (zero to disable)",
 	0,
-	func(v float64) error {
-		if v == 0 {
-			return nil
-		}
-		const min = 0.3
-		if v < min {
-			return errors.Errorf("minimum admissible nonzero value is %f", min)
-		}
-		return nil
-	},
+	settings.FloatWithMinimumOrZeroDisable(0.3),
 )
 
 type ioThresholdMapI interface {
@@ -72,7 +63,7 @@ type computeExpendableOverloadedFollowersInput struct {
 	// that the original store can now contribute to quorum. However, that store
 	// is likely behind on the log, and we should consider it as non-live until
 	// it has caught up.
-	minLiveMatchIndex uint64
+	minLiveMatchIndex kvpb.RaftIndex
 }
 
 type nonLiveReason byte
@@ -123,13 +114,14 @@ func computeExpendableOverloadedFollowers(
 			prs = d.getProgressMap(ctx)
 			nonLive = map[roachpb.ReplicaID]nonLiveReason{}
 			for id, pr := range prs {
+				// NB: RecentActive is populated by updateRaftProgressFromActivity().
 				if !pr.RecentActive {
 					nonLive[roachpb.ReplicaID(id)] = nonLiveReasonInactive
 				}
 				if pr.IsPaused() {
 					nonLive[roachpb.ReplicaID(id)] = nonLiveReasonPaused
 				}
-				if pr.Match < d.minLiveMatchIndex {
+				if kvpb.RaftIndex(pr.Match) < d.minLiveMatchIndex {
 					nonLive[roachpb.ReplicaID(id)] = nonLiveReasonBehind
 				}
 			}
@@ -354,7 +346,7 @@ func (r *Replica) updatePausedFollowersLocked(ctx context.Context, ioThresholdMa
 		getProgressMap: func(_ context.Context) map[uint64]tracker.Progress {
 			prs := r.mu.internalRaftGroup.Status().Progress
 			updateRaftProgressFromActivity(ctx, prs, r.descRLocked().Replicas().AsProto(), func(id roachpb.ReplicaID) bool {
-				return r.mu.lastUpdateTimes.isFollowerActiveSince(ctx, id, now, r.store.cfg.RangeLeaseActiveDuration())
+				return r.mu.lastUpdateTimes.isFollowerActiveSince(id, now, r.store.cfg.RangeLeaseDuration)
 			})
 			return prs
 		},
@@ -372,4 +364,5 @@ func (r *Replica) updatePausedFollowersLocked(ctx context.Context, ioThresholdMa
 		// with more wasted work.
 		r.mu.internalRaftGroup.ReportUnreachable(uint64(replicaID))
 	}
+	r.mu.replicaFlowControlIntegration.onFollowersPaused(ctx)
 }

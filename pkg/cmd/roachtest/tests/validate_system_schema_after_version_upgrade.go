@@ -12,7 +12,6 @@ package tests
 
 import (
 	"context"
-	"runtime"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -20,8 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/pmezard/go-difflib/difflib"
 )
 
@@ -33,13 +32,10 @@ func registerValidateSystemSchemaAfterVersionUpgrade(r registry.Registry) {
 	// and assert that the output matches the expected output content.
 	r.Add(registry.TestSpec{
 		Name:    "systemschema/validate-after-version-upgrade",
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			if c.IsLocal() && runtime.GOARCH == "arm64" {
-				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
-			}
-			predecessorVersion, err := version.PredecessorVersion(*t.BuildVersion())
+			predecessorVersion, err := release.LatestPredecessor(t.BuildVersion())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -79,7 +75,7 @@ func registerValidateSystemSchemaAfterVersionUpgrade(r registry.Registry) {
 			// Wipe nodes in this test's cluster.
 			wipeClusterStep := func(nodes option.NodeListOption) versionStep {
 				return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-					u.c.Wipe(ctx, nodes)
+					u.c.Wipe(ctx, false /* preserveCerts */, nodes)
 				}
 			}
 

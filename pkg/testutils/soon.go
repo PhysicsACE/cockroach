@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -36,7 +37,7 @@ const (
 // immediately at first and then successively with an exponential backoff
 // starting at 1ns and ending at DefaultSucceedsSoonDuration (or
 // RaceSucceedsSoonDuration if race is enabled).
-func SucceedsSoon(t TB, fn func() error) {
+func SucceedsSoon(t TestFataler, fn func() error) {
 	t.Helper()
 	SucceedsWithin(t, fn, succeedsSoonDuration())
 }
@@ -54,9 +55,12 @@ func SucceedsSoonError(fn func() error) error {
 // function runs without error within the given duration. The function
 // is invoked immediately at first and then successively with an
 // exponential backoff starting at 1ns and ending at duration.
-func SucceedsWithin(t TB, fn func() error, duration time.Duration) {
+func SucceedsWithin(t TestFataler, fn func() error, duration time.Duration) {
 	t.Helper()
 	if err := SucceedsWithinError(fn, duration); err != nil {
+		if f, l, _, ok := errors.GetOneLineSource(err); ok {
+			err = errors.Wrapf(err, "from %s:%d", f, l)
+		}
 		t.Fatalf("condition failed to evaluate within %s: %s", duration, err)
 	}
 }

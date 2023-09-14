@@ -11,11 +11,11 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
@@ -34,26 +34,31 @@ func ownerToAlias(o registry.Owner) team.Alias {
 }
 
 type testRegistryImpl struct {
-	m            map[string]*registry.TestSpec
-	cloud        string
-	instanceType string // optional
-	zones        string
-	preferSSD    bool
+	m                map[string]*registry.TestSpec
+	cloud            string
+	instanceType     string // optional
+	zones            string
+	preferSSD        bool
+	snapshotPrefixes map[string]struct{}
 
 	promRegistry *prometheus.Registry
+	// benchOnly is true iff the registry is being used to run benchmarks only.
+	benchOnly bool
 }
 
 // makeTestRegistry constructs a testRegistryImpl and configures it with opts.
 func makeTestRegistry(
-	cloud string, instanceType string, zones string, preferSSD bool,
+	cloud string, instanceType string, zones string, preferSSD bool, benchOnly bool,
 ) testRegistryImpl {
 	return testRegistryImpl{
-		cloud:        cloud,
-		instanceType: instanceType,
-		zones:        zones,
-		preferSSD:    preferSSD,
-		m:            make(map[string]*registry.TestSpec),
-		promRegistry: prometheus.NewRegistry(),
+		cloud:            cloud,
+		instanceType:     instanceType,
+		zones:            zones,
+		preferSSD:        preferSSD,
+		m:                make(map[string]*registry.TestSpec),
+		snapshotPrefixes: make(map[string]struct{}),
+		promRegistry:     prometheus.NewRegistry(),
+		benchOnly:        benchOnly,
 	}
 }
 
@@ -62,6 +67,20 @@ func (r *testRegistryImpl) Add(spec registry.TestSpec) {
 	if _, ok := r.m[spec.Name]; ok {
 		fmt.Fprintf(os.Stderr, "test %s already registered\n", spec.Name)
 		os.Exit(1)
+	}
+	if r.benchOnly && !spec.Benchmark {
+		// Skip non-benchmarks.
+		return
+	}
+	if spec.SnapshotPrefix != "" {
+		for existingPrefix := range r.snapshotPrefixes {
+			if strings.HasPrefix(existingPrefix, spec.SnapshotPrefix) {
+				fmt.Fprintf(os.Stderr, "snapshot prefix %s shares prefix with another registered prefix %s\n",
+					spec.SnapshotPrefix, existingPrefix)
+				os.Exit(1)
+			}
+		}
+		r.snapshotPrefixes[spec.SnapshotPrefix] = struct{}{}
 	}
 	if err := r.prepareSpec(&spec); err != nil {
 		fmt.Fprintf(os.Stderr, "%+v\n", err)
@@ -77,7 +96,7 @@ func (r *testRegistryImpl) MakeClusterSpec(nodeCount int, opts ...spec.Option) s
 	// overrides the SSD and zones settings from the registry.
 	var finalOpts []spec.Option
 	if r.preferSSD {
-		finalOpts = append(finalOpts, spec.PreferSSD())
+		finalOpts = append(finalOpts, spec.PreferLocalSSD(true))
 	}
 	if r.zones != "" {
 		finalOpts = append(finalOpts, spec.Zones(r.zones))
@@ -115,9 +134,9 @@ func (r *testRegistryImpl) prepareSpec(spec *registry.TestSpec) error {
 		return fmt.Errorf(`%s: unknown owner [%s]`, spec.Name, spec.Owner)
 	}
 	if len(spec.Tags) == 0 {
-		spec.Tags = []string{registry.DefaultTag}
+		spec.Tags = registry.Tags(registry.DefaultTag)
 	}
-	spec.Tags = append(spec.Tags, "owner-"+string(spec.Owner))
+	spec.Tags["owner-"+string(spec.Owner)] = struct{}{}
 
 	// At the time of writing, we expect the roachtest job to finish within 24h
 	// and have corresponding timeouts set up in CI. Since each individual test
@@ -127,10 +146,8 @@ func (r *testRegistryImpl) prepareSpec(spec *registry.TestSpec) error {
 	const maxTimeout = 18 * time.Hour
 	if spec.Timeout > maxTimeout {
 		var weekly bool
-		for _, tag := range spec.Tags {
-			if tag == "weekly" {
-				weekly = true
-			}
+		if _, ok := spec.Tags["weekly"]; ok {
+			weekly = true
 		}
 		if !weekly {
 			return fmt.Errorf(
@@ -145,11 +162,11 @@ func (r *testRegistryImpl) PromFactory() promauto.Factory {
 	return promauto.With(r.promRegistry)
 }
 
-// GetTests returns all the tests that match the given regexp.
+// GetTests returns all the tests that match the given regexp, sorted by name.
 // Skipped tests are included, and tests that don't match their minVersion spec
 // are also included but marked as skipped.
 func (r testRegistryImpl) GetTests(
-	ctx context.Context, filter *registry.TestFilter,
+	filter *registry.TestFilter,
 ) ([]registry.TestSpec, []registry.TestSpec) {
 	var tests []registry.TestSpec
 	var tagMismatch []registry.TestSpec
@@ -172,9 +189,13 @@ func (r testRegistryImpl) GetTests(
 }
 
 // List lists tests that match one of the filters.
-func (r testRegistryImpl) List(ctx context.Context, filters []string) []registry.TestSpec {
+func (r testRegistryImpl) List(filters []string) []registry.TestSpec {
 	filter := registry.NewTestFilter(filters, true)
-	tests, _ := r.GetTests(ctx, filter)
+	tests, _ := r.GetTests(filter)
 	sort.Slice(tests, func(i, j int) bool { return tests[i].Name < tests[j].Name })
 	return tests
+}
+
+func (r testRegistryImpl) Cloud() string {
+	return r.cloud
 }

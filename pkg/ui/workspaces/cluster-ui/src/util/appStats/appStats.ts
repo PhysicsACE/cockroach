@@ -8,21 +8,17 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import _ from "lodash";
-import * as protos from "@cockroachlabs/crdb-protobuf-client";
-import {
-  FixLong,
-  TimestampToNumber,
-  DurationToNumber,
-  uniqueLong,
-  unique,
-} from "src/util";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import { TimestampToNumber, DurationToNumber } from "src/util/convert";
+
+import { FixLong } from "src/util/fixLong";
+import { uniqueLong, unique } from "src/util/arrays";
 import Long from "long";
 
-export type StatementStatistics = protos.cockroach.sql.IStatementStatistics;
-export type ExecStats = protos.cockroach.sql.IExecStats;
+export type StatementStatistics = cockroach.sql.IStatementStatistics;
+export type ExecStats = cockroach.sql.IExecStats;
 export type CollectedStatementStatistics =
-  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+  cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 
 export interface NumericStat {
   mean?: number;
@@ -64,7 +60,7 @@ export function aggregateNumericStats(
 export function aggregateLatencyInfo(
   a: StatementStatistics,
   b: StatementStatistics,
-): protos.cockroach.sql.ILatencyInfo {
+): cockroach.sql.ILatencyInfo {
   const min =
     a.latency_info?.min == 0 || a.latency_info?.min > b.latency_info?.min
       ? b.latency_info?.min
@@ -97,9 +93,9 @@ export function aggregateLatencyInfo(
 }
 
 export function coalesceSensitiveInfo(
-  a: protos.cockroach.sql.ISensitiveInfo,
-  b: protos.cockroach.sql.ISensitiveInfo,
-): protos.cockroach.sql.ISensitiveInfo {
+  a: cockroach.sql.ISensitiveInfo,
+  b: cockroach.sql.ISensitiveInfo,
+): cockroach.sql.ISensitiveInfo {
   return {
     last_err: a.last_err || b.last_err,
     most_recent_plan_description:
@@ -265,30 +261,6 @@ export function addStatementStats(
   };
 }
 
-export function aggregateStatementStats(
-  statementStats: CollectedStatementStatistics[],
-): CollectedStatementStatistics[] {
-  const statementsMap: {
-    [statement: string]: CollectedStatementStatistics[];
-  } = {};
-  statementStats.forEach((statement: CollectedStatementStatistics) => {
-    const matches =
-      statementsMap[statement.key.key_data.query] ||
-      (statementsMap[statement.key.key_data.query] = []);
-    matches.push(statement);
-  });
-
-  return _.values(statementsMap).map(statements =>
-    _.reduce(
-      statements,
-      (a: CollectedStatementStatistics, b: CollectedStatementStatistics) => ({
-        key: a.key,
-        stats: addStatementStats(a.stats, b.stats),
-      }),
-    ),
-  );
-}
-
 export interface ExecutionStatistics {
   statement_fingerprint_id: Long;
   statement: string;
@@ -303,7 +275,7 @@ export interface ExecutionStatistics {
   full_scan: boolean;
   failed: boolean;
   node_id: number;
-  transaction_fingerprint_id: Long;
+  txn_fingerprint_ids: Long[];
   stats: StatementStatistics;
 }
 
@@ -324,22 +296,10 @@ export function flattenStatementStats(
     full_scan: stmt.key.key_data.full_scan,
     failed: stmt.key.key_data.failed,
     node_id: stmt.key.node_id,
-    transaction_fingerprint_id: stmt.key.key_data.transaction_fingerprint_id,
+    txn_fingerprint_ids: stmt.txn_fingerprint_ids,
     stats: stmt.stats,
   }));
 }
-
-export function combineStatementStats(
-  statementStats: StatementStatistics[],
-): StatementStatistics {
-  return _.reduce(statementStats, addStatementStats);
-}
-
-export const getSearchParams = (searchParams: string) => {
-  const sp = new URLSearchParams(searchParams);
-  return (key: string, defaultValue?: string | boolean | number) =>
-    sp.get(key) || defaultValue;
-};
 
 // This function returns a key based on all parameters
 // that should be used to group statements.
@@ -355,7 +315,7 @@ export function statementKey(stmt: ExecutionStatistics): string {
 export function transactionScopedStatementKey(
   stmt: ExecutionStatistics,
 ): string {
-  return statementKey(stmt) + stmt.transaction_fingerprint_id.toString();
+  return statementKey(stmt) + stmt.txn_fingerprint_ids?.toString();
 }
 
 export const generateStmtDetailsToID = (

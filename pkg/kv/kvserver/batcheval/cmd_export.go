@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -37,14 +38,14 @@ const SSTTargetSizeSetting = "kv.bulk_sst.target_size"
 // ExportRequestTargetFileSize controls the target file size for SSTs created
 // during backups.
 var ExportRequestTargetFileSize = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	SSTTargetSizeSetting,
 	fmt.Sprintf("target size for SSTs emitted from export requests; "+
 		"export requests (i.e. BACKUP) may buffer up to the sum of %s and %s in memory",
 		SSTTargetSizeSetting, MaxExportOverageSetting,
 	),
 	16<<20,
-).WithPublic()
+	settings.WithPublic)
 
 // MaxExportOverageSetting is the cluster setting name for the
 // ExportRequestMaxAllowedFileSizeOverage setting.
@@ -55,14 +56,14 @@ const MaxExportOverageSetting = "kv.bulk_sst.max_allowed_overage"
 // and an SST would exceed this size (due to large rows or large numbers of
 // versions), then the export will fail.
 var ExportRequestMaxAllowedFileSizeOverage = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	MaxExportOverageSetting,
 	fmt.Sprintf("if positive, allowed size in excess of target size for SSTs from export requests; "+
 		"export requests (i.e. BACKUP) may buffer up to the sum of %s and %s in memory",
 		SSTTargetSizeSetting, MaxExportOverageSetting,
 	),
 	64<<20, /* 64 MiB */
-).WithPublic()
+	settings.WithPublic)
 
 func init() {
 	RegisterReadOnlyCommand(kvpb.Export, declareKeysExport, evalExport)
@@ -72,7 +73,8 @@ func declareKeysExport(
 	rs ImmutableRangeState,
 	header *kvpb.Header,
 	req kvpb.Request,
-	latchSpans, lockSpans *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
 ) {
 	DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
@@ -153,7 +155,7 @@ func evalExport(
 	}
 
 	var maxIntents uint64
-	if m := storage.MaxIntentsPerWriteIntentError.Get(&cArgs.EvalCtx.ClusterSettings().SV); m > 0 {
+	if m := storage.MaxIntentsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV); m > 0 {
 		maxIntents = uint64(m)
 	}
 
@@ -194,8 +196,23 @@ func evalExport(
 			// values before fingerprinting so that the fingerprint is tenant
 			// agnostic.
 			opts.FingerprintOptions = storage.MVCCExportFingerprintOptions{
-				StripTenantPrefix:  true,
-				StripValueChecksum: true,
+				StripTenantPrefix:            true,
+				StripValueChecksum:           true,
+				StripIndexPrefixAndTimestamp: args.FingerprintOptions.StripIndexPrefixAndTimestamp,
+			}
+			if opts.FingerprintOptions.StripIndexPrefixAndTimestamp && args.MVCCFilter == kvpb.MVCCFilter_All {
+				// If a key's value were updated from a to b, the xor hash without
+				// timestamps of those two mvcc values would look the same if the key
+				// were updated from b to a. In other words, the order of key value
+				// updates without timestamps does not affect the xor hash; but this
+				// order clearly presents different mvcc history, therefore, do not
+				// strip timestamps if fingerprinting all mvcc history.
+				return result.Result{}, errors.New("cannot fingerprint without mvcc timestamps and with mvcc history")
+			}
+			if opts.FingerprintOptions.StripIndexPrefixAndTimestamp && !args.StartTime.IsEmpty() {
+				// Supplying a startKey only complicates results (e.g. it surfaces
+				// tombstones), given that only the latest keys are surfaced.
+				return result.Result{}, errors.New("cannot fingerprint without mvcc timestamps and with a start time")
 			}
 			var hasRangeKeys bool
 			summary, resumeInfo, fingerprint, hasRangeKeys, err = storage.MVCCExportFingerprint(ctx,
@@ -218,6 +235,15 @@ func evalExport(
 				return result.Result{}, maybeAnnotateExceedMaxSizeError(err)
 			}
 		}
+
+		// Check if our ctx has been cancelled while we were constructing the SST.
+		// If it has been cancelled the client is no longer expecting a response.
+		select {
+		case <-ctx.Done():
+			return result.Result{}, ctx.Err()
+		default:
+		}
+
 		data := destFile.Bytes()
 
 		// NB: This should only happen in two cases:

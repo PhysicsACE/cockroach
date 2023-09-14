@@ -35,6 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -125,6 +127,7 @@ func TestRegistryGC(t *testing.T) {
 				// This test wants to look at job records.
 				DontUseJobs:                       true,
 				SkipJobMetricsPollingJobBootstrap: true,
+				SkipAutoConfigRunnerJobBootstrap:  true,
 			},
 			KeyVisualizer: &keyvisualizer.TestingKnobs{
 				SkipJobBootstrap: true,
@@ -199,8 +202,9 @@ INSERT INTO t."%s" VALUES('a', 'foo');
 
 		var id jobspb.JobID
 		db.QueryRow(t,
-			`INSERT INTO system.jobs (status, payload, progress, created) VALUES ($1, $2, $3, $4) RETURNING id`,
-			status, payload, progress, created).Scan(&id)
+			`INSERT INTO system.jobs (status, created) VALUES ($1, $2) RETURNING id`, status, created).Scan(&id)
+		db.Exec(t, `INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`, id, GetLegacyPayloadKey(), payload)
+		db.Exec(t, `INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`, id, GetLegacyProgressKey(), progress)
 		return strconv.Itoa(int(id))
 	}
 
@@ -232,22 +236,23 @@ INSERT INTO t."%s" VALUES('a', 'foo');
 			newCanceledJob := writeJob("new_canceled", earlier, earlier.Add(time.Minute),
 				StatusCanceled, mutOptions)
 
+			sqlActivityJob := fmt.Sprintf("%d", SqlActivityUpdaterJobID)
 			db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-				{oldRunningJob}, {oldSucceededJob}, {oldFailedJob}, {oldRevertFailedJob}, {oldCanceledJob},
+				{sqlActivityJob}, {oldRunningJob}, {oldSucceededJob}, {oldFailedJob}, {oldRevertFailedJob}, {oldCanceledJob},
 				{newRunningJob}, {newSucceededJob}, {newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
 
 			if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
 				t.Fatal(err)
 			}
 			db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-				{oldRunningJob}, {oldRevertFailedJob}, {newRunningJob}, {newSucceededJob},
-				{newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
+				{sqlActivityJob}, {oldRunningJob}, {oldRevertFailedJob}, {newRunningJob},
+				{newSucceededJob}, {newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
 
 			if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, ts.Add(time.Minute*-10)); err != nil {
 				t.Fatal(err)
 			}
 			db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-				{oldRunningJob}, {oldRevertFailedJob}, {newRunningJob}, {newRevertFailedJob}})
+				{sqlActivityJob}, {oldRunningJob}, {oldRevertFailedJob}, {newRunningJob}, {newRevertFailedJob}})
 
 			// Delete the revert failed, and running jobs for the next run of the
 			// test.
@@ -275,6 +280,8 @@ func TestRegistryGCPagination(t *testing.T) {
 				// This test wants to count job records.
 				DontUseJobs:                       true,
 				SkipJobMetricsPollingJobBootstrap: true,
+				SkipAutoConfigRunnerJobBootstrap:  true,
+				SkipUpdateSQLActivityJobBootstrap: true,
 			},
 			KeyVisualizer: &keyvisualizer.TestingKnobs{
 				SkipJobBootstrap: true,
@@ -288,9 +295,12 @@ func TestRegistryGCPagination(t *testing.T) {
 	for i := 0; i < 2*cleanupPageSize+1; i++ {
 		payload, err := protoutil.Marshal(&jobspb.Payload{})
 		require.NoError(t, err)
-		db.Exec(t,
-			`INSERT INTO system.jobs (status, created, payload) VALUES ($1, $2, $3)`,
-			StatusCanceled, timeutil.Now().Add(-time.Hour), payload)
+		var jobID jobspb.JobID
+		db.QueryRow(t,
+			`INSERT INTO system.jobs (status, created) VALUES ($1, $2) RETURNING id`,
+			StatusCanceled, timeutil.Now().Add(-time.Hour)).Scan(&jobID)
+		db.Exec(t, `INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`,
+			jobID, GetLegacyPayloadKey(), payload)
 	}
 
 	ts := timeutil.Now()
@@ -298,6 +308,180 @@ func TestRegistryGCPagination(t *testing.T) {
 	var count int
 	db.QueryRow(t, `SELECT count(1) FROM system.jobs`).Scan(&count)
 	require.Zero(t, count)
+}
+
+// TestCreateJobWritesToJobInfo tests that the `Create` methods exposed by the
+// registry to create a job write the job payload and progress to the
+// system.job_info table alongwith creating a job record in the system.jobs
+// table.
+func TestCreateJobWritesToJobInfo(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	args := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			// Avoiding jobs to be adopted.
+			JobsTestingKnobs: &TestingKnobs{
+				DisableAdoptions: true,
+			},
+			// DisableAdoptions needs this.
+			UpgradeManager: &upgradebase.TestingKnobs{
+				DontUseJobs:                       true,
+				SkipJobMetricsPollingJobBootstrap: true,
+			},
+			KeyVisualizer: &keyvisualizer.TestingKnobs{
+				SkipJobBootstrap: true,
+			},
+		},
+		DisableSpanConfigs: true,
+	}
+
+	ctx := context.Background()
+	s := serverutils.StartServerOnly(t, args)
+	ief := s.InternalDB().(isql.DB)
+	defer s.Stopper().Stop(ctx)
+	r := s.JobRegistry().(*Registry)
+
+	RegisterConstructor(jobspb.TypeImport, func(job *Job, cs *cluster.Settings) Resumer {
+		return FakeResumer{
+			OnResume: func(ctx context.Context) error {
+				return nil
+			},
+		}
+	}, UsesTenantCostControl)
+
+	record := &Record{
+		Details:  jobspb.ImportDetails{},
+		Progress: jobspb.ImportProgress{},
+		Username: username.RootUserName(),
+	}
+
+	verifyPayloadAndProgress := func(t *testing.T, createdJob *Job, txn isql.Txn, expectedPayload jobspb.Payload,
+		expectedProgress jobspb.Progress) {
+		infoStorage := createdJob.InfoStorage(txn)
+
+		// Verify the payload in the system.job_info is the same as what we read
+		// from system.jobs.
+		require.NoError(t, infoStorage.Iterate(ctx, LegacyPayloadKey, func(infoKey string, value []byte) error {
+			data, err := protoutil.Marshal(&expectedPayload)
+			if err != nil {
+				panic(err)
+			}
+			require.Equal(t, data, value)
+			return nil
+		}))
+
+		// Verify the progress in the system.job_info is the same as what we read
+		// from system.jobs.
+		require.NoError(t, infoStorage.Iterate(ctx, LegacyProgressKey, func(infoKey string, value []byte) error {
+			data, err := protoutil.Marshal(&expectedProgress)
+			if err != nil {
+				panic(err)
+			}
+			require.Equal(t, data, value)
+			return nil
+		}))
+	}
+
+	runTests := func(t *testing.T, createdJob *Job) {
+		t.Run("verify against system.jobs", func(t *testing.T) {
+			require.NoError(t, ief.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				countSystemJobs := `SELECT count(*)  FROM system.jobs`
+				row, err := txn.QueryRowEx(ctx, "verify-job-query", txn.KV(),
+					sessiondata.NodeUserSessionDataOverride, countSystemJobs)
+				if err != nil {
+					return err
+				}
+				jobsCount := tree.MustBeDInt(row[0])
+
+				countSystemJobInfo := `SELECT count(*)  FROM system.job_info;`
+				row, err = txn.QueryRowEx(ctx, "verify-job-query", txn.KV(),
+					sessiondata.NodeUserSessionDataOverride, countSystemJobInfo)
+				if err != nil {
+					return err
+				}
+				jobInfoCount := tree.MustBeDInt(row[0])
+				require.Equal(t, jobsCount*2, jobInfoCount)
+
+				// Ensure no progress and payload is written to system.jobs.
+				nullPayloadAndProgress := `SELECT count(*) FROM system.jobs WHERE progress IS NOT NULL OR payload IS NOT NULL;`
+				row, err = txn.QueryRowEx(ctx, "verify-job-query", txn.KV(),
+					sessiondata.NodeUserSessionDataOverride, nullPayloadAndProgress)
+				if err != nil {
+					return err
+				}
+				nullProgressAndPayload := tree.MustBeDInt(row[0])
+				require.Equal(t, 0, int(nullProgressAndPayload))
+
+				return nil
+			}))
+		})
+
+		t.Run("verify against in-memory job", func(t *testing.T) {
+			require.NoError(t, ief.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				verifyPayloadAndProgress(t, createdJob, txn, createdJob.Payload(), createdJob.Progress())
+				return nil
+			}))
+		})
+	}
+
+	t.Run("CreateJobWithTxn", func(t *testing.T) {
+		var createdJob *Job
+		require.NoError(t, ief.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			record.JobID = r.MakeJobID()
+			var err error
+			createdJob, err = r.CreateJobWithTxn(ctx, *record, record.JobID, txn)
+			return err
+		}))
+		runTests(t, createdJob)
+	})
+
+	t.Run("CreateAdoptableJobWithTxn", func(t *testing.T) {
+		var createdJob *Job
+		require.NoError(t, ief.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			record.JobID = r.MakeJobID()
+			var err error
+			createdJob, err = r.CreateAdoptableJobWithTxn(ctx, *record, record.JobID, txn)
+			if err != nil {
+				return err
+			}
+			return nil
+		}))
+		runTests(t, createdJob)
+	})
+
+	t.Run("CreateIfNotExistAdoptableJobWithTxn", func(t *testing.T) {
+		tempRecord := Record{
+			JobID:    r.MakeJobID(),
+			Details:  jobspb.ImportDetails{},
+			Progress: jobspb.ImportProgress{},
+			Username: username.RootUserName(),
+		}
+
+		// loop to verify no errors if create if not exist is called multiple times
+		for i := 0; i < 3; i++ {
+			err := ief.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				return r.CreateIfNotExistAdoptableJobWithTxn(ctx, tempRecord, txn)
+			})
+			require.NoError(t, err)
+		}
+
+		require.NoError(t, ief.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			row, err := txn.QueryRowEx(
+				ctx,
+				"check if job exists",
+				txn.KV(),
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+				"SELECT id FROM system.jobs WHERE id = $1",
+				tempRecord.JobID,
+			)
+			if err != nil {
+				return err
+			}
+			require.NotNil(t, row)
+			return nil
+		}))
+	})
 }
 
 func TestBatchJobsCreation(t *testing.T) {
@@ -328,12 +512,15 @@ func TestBatchJobsCreation(t *testing.T) {
 						},
 						// DisableAdoptions needs this.
 						UpgradeManager: &upgradebase.TestingKnobs{
-							DontUseJobs: true,
+							DontUseJobs:                       true,
+							SkipJobMetricsPollingJobBootstrap: true,
+							SkipAutoConfigRunnerJobBootstrap:  true,
 						},
 						KeyVisualizer: &keyvisualizer.TestingKnobs{
 							SkipJobBootstrap: true,
 						},
 					},
+					DisableSpanConfigs: true,
 				}
 
 				ctx := context.Background()
@@ -353,14 +540,18 @@ func TestBatchJobsCreation(t *testing.T) {
 
 				// Create a batch of job specifications.
 				var records []*Record
+				var jobIDStrings []string
 				for i := 0; i < test.batchSize; i++ {
+					jobID := r.MakeJobID()
+					jobIDStrings = append(jobIDStrings, fmt.Sprintf("%d", jobID))
 					records = append(records, &Record{
-						JobID:    r.MakeJobID(),
+						JobID:    jobID,
 						Details:  jobspb.ImportDetails{},
 						Progress: jobspb.ImportProgress{},
 						Username: username.RootUserName(),
 					})
 				}
+				jobIdsClause := fmt.Sprint(strings.Join(jobIDStrings, ", "))
 				// Create jobs in a batch.
 				var jobIDs []jobspb.JobID
 				require.NoError(t, ief.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
@@ -369,7 +560,13 @@ func TestBatchJobsCreation(t *testing.T) {
 					return err
 				}))
 				require.Equal(t, len(jobIDs), test.batchSize)
-				tdb.CheckQueryResults(t, "SELECT count(*) FROM [SHOW JOBS]",
+				tdb.CheckQueryResults(t, fmt.Sprintf("SELECT count(*) FROM [SHOW JOBS] WHERE job_id IN (%s)", jobIdsClause),
+					[][]string{{fmt.Sprintf("%d", test.batchSize)}})
+
+				// Ensure that we are also writing the payload and progress to the job_info table.
+				tdb.CheckQueryResults(t, fmt.Sprintf(`SELECT count(*) FROM system.job_info WHERE info_key = 'legacy_payload' AND job_id IN (%s)`, jobIdsClause),
+					[][]string{{fmt.Sprintf("%d", test.batchSize)}})
+				tdb.CheckQueryResults(t, fmt.Sprintf(`SELECT count(*) FROM system.job_info WHERE info_key = 'legacy_progress' AND job_id IN (%s)`, jobIdsClause),
 					[][]string{{fmt.Sprintf("%d", test.batchSize)}})
 			}
 		})
@@ -502,6 +699,8 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 				UpgradeManager: &upgradebase.TestingKnobs{
 					DontUseJobs:                       true,
 					SkipJobMetricsPollingJobBootstrap: true,
+					SkipAutoConfigRunnerJobBootstrap:  true,
+					SkipUpdateSQLActivityJobBootstrap: true,
 				},
 				KeyVisualizer: &keyvisualizer.TestingKnobs{
 					SkipJobBootstrap: true,
@@ -534,14 +733,24 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 						return nil
 					}
 					bti.resumeCh <- struct{}{}
-					return <-bti.errCh
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case err := <-bti.errCh:
+						return err
+					}
 				},
 				FailOrCancel: func(ctx context.Context) error {
 					if bti.done.Load().(bool) {
 						return nil
 					}
 					bti.failOrCancelCh <- struct{}{}
-					return <-bti.errCh
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case err := <-bti.errCh:
+						return err
+					}
 				},
 			}
 		}, UsesTenantCostControl)
@@ -594,7 +803,14 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			expectedResumed++
 			retryCnt++
 			// Validate that the job is resumed only once.
-			require.Equal(t, expectedResumed, bti.resumed.Count(), "unexpected number of jobs resumed in retry %d", i)
+			//
+			// For tests that immediately resume, we can't make this
+			// assertion because the waitFn above might have already
+			// put the job into the state where it will be retried
+			// and by definition it is not going to wait to retry.
+			if !bti.expectImmediateRetry {
+				require.Equal(t, expectedResumed, bti.resumed.Count(), "unexpected number of jobs resumed in retry (post waitFn) %d", i)
+			}
 			lastRun = bti.clock.Now()
 		}
 		bti.done.Store(true)
@@ -640,7 +856,6 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 	t.Run("pause running", func(t *testing.T) {
 		ctx := context.Background()
 		bti := BackoffTestInfra{expectImmediateRetry: true}
-		skip.WithIssue(t, 74399)
 		bti.afterJobStateMachineKnob = func() {
 			if bti.done.Load().(bool) {
 				return
@@ -657,7 +872,6 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 			<-bti.resumeCh
 			insqlDB := bti.s.InternalDB().(isql.DB)
 			pauseOrCancelJob(t, ctx, insqlDB, bti.registry, jobID, pause)
-			bti.errCh <- nil
 			<-bti.transitionCh
 			waitUntilStatus(t, bti.tdb, jobID, StatusPaused)
 			require.NoError(t, bti.registry.Unpause(ctx, nil, jobID))
@@ -721,7 +935,6 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 	t.Run("pause reverting", func(t *testing.T) {
 		ctx := context.Background()
 		bti := BackoffTestInfra{expectImmediateRetry: true}
-		skip.WithIssue(t, 74399)
 
 		bti.afterJobStateMachineKnob = func() {
 			if bti.done.Load().(bool) {
@@ -746,11 +959,6 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 		runTest(t, jobID, retryCnt, expectedResumed, lastRun, &bti, func(_ int64) {
 			<-bti.failOrCancelCh
 			pauseOrCancelJob(t, ctx, bti.idb, bti.registry, jobID, pause)
-			// We have to return error here because, otherwise, the job will be marked as
-			// failed regardless of the fact that it is currently pause-requested in the
-			// jobs table. This is because we currently do not check the current status
-			// of a job before marking it as failed.
-			bti.errCh <- MarkAsRetryJobError(errors.New("injecting error in reverting state to retry"))
 			<-bti.transitionCh
 			waitUntilStatus(t, bti.tdb, jobID, StatusPaused)
 			require.NoError(t, bti.registry.Unpause(ctx, nil, jobID))
@@ -988,7 +1196,7 @@ func TestRunWithoutLoop(t *testing.T) {
 	ctx := context.Background()
 	settings := cluster.MakeTestingClusterSettings()
 	intervalBaseSetting.Override(ctx, &settings.SV, 1e6)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Settings: settings,
 	})
 
@@ -1196,7 +1404,7 @@ func TestDisablingJobAdoptionClearsClaimSessionID(t *testing.T) {
 	// Insert a running job with a `claim_session_id` equal to our overridden test
 	// session.
 	tdb.Exec(t,
-		"INSERT INTO system.jobs (id, status, created, payload, claim_session_id) values ($1, $2, $3, 'test'::bytes, $4)",
+		"INSERT INTO system.jobs (id, status, created, claim_session_id) values ($1, $2, $3, $4)",
 		1, StatusRunning, timeutil.Now(), session.ID(),
 	)
 
@@ -1205,123 +1413,12 @@ func TestDisablingJobAdoptionClearsClaimSessionID(t *testing.T) {
 	tdb.CheckQueryResultsRetry(t, `SELECT claim_session_id FROM system.jobs WHERE id = 1`, [][]string{{"NULL"}})
 }
 
-func TestJobInfoAccessors(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
-
-	idb := s.InternalDB().(isql.DB)
-	r := s.JobRegistry().(*Registry)
-
-	kPrefix, kA, kB, kC := []byte("🔑"), []byte("🔑A"), []byte("🔑B"), []byte("🔑C")
-	v1, v2 := []byte("val1"), []byte("val2")
-
-	// Key doesn't exist yet.
-	getJobInfo := func(id jobspb.JobID, key []byte) (v []byte, ok bool, err error) {
-		err = idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-			v, ok, err = r.GetJobInfo(ctx, id, key, txn)
-			return err
-		})
-		return v, ok, err
-	}
-	_, ok, err := getJobInfo(1, kA)
-	require.NoError(t, err)
-	require.False(t, ok)
-
-	// Write kA = v1.
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.WriteJobInfo(ctx, 1, kA, v1, txn)
-	}))
-
-	// Check that key is now found with value v1.
-	v, ok, err := getJobInfo(1, kA)
-	require.NoError(t, err)
-	require.True(t, ok)
-	require.Equal(t, v1, v)
-
-	// Overwrite kA = v2.
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.WriteJobInfo(ctx, 1, kA, v2, txn)
-	}))
-
-	// Check that key is now v1.
-	v, ok, err = getJobInfo(1, kA)
-	require.NoError(t, err)
-	require.True(t, ok)
-	require.Equal(t, v2, v)
-
-	// Verify a different is not found.
-	_, ok, err = getJobInfo(1, kB)
-	require.NoError(t, err)
-	require.False(t, ok)
-
-	// Verify that the same key for a different job is not found.
-	_, ok, err = getJobInfo(2, kB)
-	require.NoError(t, err)
-	require.False(t, ok)
-
-	// Write and revise some info keys a, b and c (out of order, just for fun).
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.WriteJobInfo(ctx, 2, kB, v2, txn)
-	}))
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.WriteJobInfo(ctx, 2, kA, v1, txn)
-	}))
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.WriteJobInfo(ctx, 2, kC, v2, txn)
-	}))
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.WriteJobInfo(ctx, 2, kA, v2, txn)
-	}))
-
-	// Iterate the common prefix of a, b and c.
-	var i int
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.IterateJobInfo(ctx, 2, kPrefix, func(key, value []byte) error {
-			i++
-			switch i {
-			case 1:
-				require.Equal(t, key, kA)
-			case 2:
-				require.Equal(t, key, kB)
-			case 3:
-				require.Equal(t, key, kC)
-			}
-			require.Equal(t, v2, value)
-			return nil
-		}, txn)
-	}))
-	require.Equal(t, 3, i)
-
-	// Iterate the specific prefix of just a.
-	found := false
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.IterateJobInfo(ctx, 2, kA, func(key, value []byte) error {
-			require.Equal(t, kA, key)
-			require.Equal(t, v2, value)
-			found = true
-			return nil
-		}, txn)
-	}))
-	require.True(t, found)
-
-	// Iterate a different job.
-	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return r.IterateJobInfo(ctx, 3, kPrefix, func(key, value []byte) error {
-			t.Fatalf("unexpected record for job 3: %v = %v", key, value)
-			return nil
-		}, txn)
-	}))
-}
-
 // TestJobRecordMissingUsername tests that we get an error when
 // trying to produce jobs given records without usernames.
 func TestJobRecordMissingUsername(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
@@ -1332,26 +1429,92 @@ func TestJobRecordMissingUsername(t *testing.T) {
 		Details:  jobspb.ImportDetails{},
 		Progress: jobspb.ImportProgress{},
 	}
-	idb := r.internalDB
 	{
-		err := idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			_, err := r.CreateAdoptableJobWithTxn(ctx, invalidRecord, 0, txn)
 			return err
 		})
 		assert.EqualError(t, err, "job record missing username; could not make payload")
 	}
 	{
-		err := idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			_, err := r.CreateJobWithTxn(ctx, invalidRecord, 0, txn)
 			return err
 		})
 		assert.EqualError(t, err, "job record missing username; could not make payload")
 	}
 	{
-		err := idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			_, err := r.CreateJobsWithTxn(ctx, txn, []*Record{&invalidRecord})
 			return err
 		})
 		assert.EqualError(t, err, "job record missing username; could not make payload")
 	}
+}
+
+func TestGetClaimedResumerFromRegistry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	intervalOverride := time.Millisecond
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		// Ensure no other jobs are created and adoptions and cancellations are quick
+		Knobs: base.TestingKnobs{
+			SpanConfig: &spanconfig.TestingKnobs{
+				ManagerDisableJobCreation: true,
+			},
+			JobsTestingKnobs: &TestingKnobs{
+				IntervalOverrides: TestingIntervalOverrides{
+					Adopt:  &intervalOverride,
+					Cancel: &intervalOverride,
+				},
+			},
+			KeyVisualizer: &keyvisualizer.TestingKnobs{
+				SkipJobBootstrap: true,
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+	idb := s.InternalDB().(isql.DB)
+	r := s.JobRegistry().(*Registry)
+
+	resumeStartChan := make(chan struct{})
+	resumeErrChan := make(chan error)
+	defer close(resumeErrChan)
+	var counter int
+	RegisterConstructor(jobspb.TypeImport, func(_ *Job, cs *cluster.Settings) Resumer {
+		return FakeResumer{
+			OnResume: func(ctx context.Context) error {
+				resumeStartChan <- struct{}{}
+				return <-resumeErrChan
+			},
+			FailOrCancel: func(ctx context.Context) error {
+				counter++
+				return nil
+			},
+		}
+	}, UsesTenantCostControl)
+
+	createJob := func() *Job {
+		jobID := r.MakeJobID()
+		require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			_, err := r.CreateJobWithTxn(ctx, Record{
+				Details:  jobspb.ImportDetails{},
+				Progress: jobspb.ImportProgress{},
+				Username: username.TestUserName(),
+			}, jobID, txn)
+			return err
+		}))
+		job, err := r.LoadJob(ctx, jobID)
+		require.NoError(t, err)
+		<-resumeStartChan
+		return job
+	}
+
+	job1 := createJob()
+	resumer, err := r.GetResumerForClaimedJob(job1.ID())
+	require.NoError(t, err)
+	require.NoError(t, resumer.OnFailOrCancel(ctx, nil, nil))
+	require.Equal(t, 1, counter)
 }

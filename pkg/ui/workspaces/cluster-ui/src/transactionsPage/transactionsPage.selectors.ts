@@ -11,32 +11,24 @@
 import { createSelector } from "reselect";
 
 import { localStorageSelector } from "../store/utils/selectors";
-import { sqlStatsSelector } from "../store/sqlStats/sqlStats.selector";
-
-export const selectTransactionsData = createSelector(
-  sqlStatsSelector,
-  transactionsState =>
-    // The state is valid if we have successfully fetched data, and it has not yet been invalidated.
-    transactionsState.valid ? transactionsState.data : null,
-);
-
-export const selectTransactionsLastError = createSelector(
-  sqlStatsSelector,
-  state => state.lastError,
-);
 
 export const selectTxnColumns = createSelector(
   localStorageSelector,
   // return array of columns if user have customized it or `null` otherwise
   localStorage =>
     localStorage["showColumns/TransactionPage"]
-      ? localStorage["showColumns/TransactionPage"].split(",")
+      ? localStorage["showColumns/TransactionPage"]?.split(",")
       : null,
 );
 
 export const selectSortSetting = createSelector(
   localStorageSelector,
   localStorage => localStorage["sortSetting/TransactionsPage"],
+);
+
+export const selectRequestTime = createSelector(
+  localStorageSelector,
+  localStorage => localStorage["requestTime/TransactionsPage"],
 );
 
 export const selectFilters = createSelector(

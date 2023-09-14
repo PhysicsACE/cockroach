@@ -1,3 +1,5 @@
+# LogicTest: !local-mixed-22.2-23.1
+
 query BB
 SELECT 'foo:1,2 bar:3'::tsvector @@ 'foo <-> bar'::tsquery, 'foo <-> bar'::tsquery @@ 'foo:1,2 bar:3'::tsvector
 ----
@@ -242,7 +244,7 @@ CREATE TABLE t95680 (c1 FLOAT NOT NULL, c2 TSVECTOR NOT NULL, INVERTED INDEX (c1
 INSERT INTO t95680 VALUES (1.0::FLOAT, e'\'kCrLZNl\' \'sVDj\' \'yO\' \'z\':54C,440B,519C,794B':::TSVECTOR);
 
 # More tests for these functions live in pkg/util/tsearch/testdata
-query IT
+query IT nosort
 SELECT * FROM ts_parse('default', 'Hello this is a parsi-ng t.est 1.234 4 case324')
 ----
 1  Hello
@@ -268,6 +270,22 @@ SELECT * FROM phraseto_tsquery('simple', 'Hello this is a parsi-ng t.est 1.234 4
 ----
 'hello' <-> 'this' <-> 'is' <-> 'a' <-> 'parsi' <-> 'ng' <-> 't' <-> 'est' <-> '1' <-> '234' <-> '4' <-> 'case324'
 
+
+query T
+SELECT phraseto_tsquery('No hardcoded configuration')
+----
+'hardcod' <-> 'configur'
+
+query T
+SELECT plainto_tsquery('No hardcoded configuration')
+----
+'hardcod' & 'configur'
+
+query T
+SELECT to_tsquery('No | hardcoded | configuration')
+----
+'hardcod' | 'configur'
+
 query T
 SELECT * FROM to_tsquery('simple', 'a | b & c <-> d')
 ----
@@ -275,3 +293,147 @@ SELECT * FROM to_tsquery('simple', 'a | b & c <-> d')
 
 query error syntax
 SELECT * FROM to_tsquery('simple', 'Hello this is a parsi-ng t.est 1.234 4 case324')
+
+# Test default variants of the to_ts* functions.
+
+query T
+SHOW default_text_search_config
+----
+pg_catalog.english
+
+query T
+SELECT to_tsvector('Hello I am a potato')
+----
+'hello':1 'potato':5
+
+statement error text search configuration \"blah\" does not exist
+SET default_text_search_config = 'blah'
+
+statement ok
+SET default_text_search_config = 'spanish'
+
+query T
+SELECT to_tsvector('Hello I am a potato')
+----
+'am':3 'hell':1 'i':2 'potat':5
+
+query TT
+SELECT to_tsvector('english', ''), to_tsvector('english', 'and the')
+----
+·  ·
+
+statement error doesn't contain lexemes
+SELECT to_tsquery('english', 'the')
+
+statement ok
+CREATE TABLE sentences (sentence text, v TSVECTOR AS (to_tsvector('english', sentence)) STORED, INVERTED INDEX (v));
+INSERT INTO sentences VALUES
+  ('Future users of large data banks must be protected from having to know how the data is organized in the machine (the internal representation).'),
+  ('A prompting service which supplies such information is not a satisfactory solution.'),
+  ('Activities of users at terminals and most application programs should remain unaffected when the internal representation of data is changed and even when some aspects of the external representation
+  are changed.'),
+  ('Changes in data representation will often be needed as a result of changes in query, update, and report traffic and natural growth in the types of stored information.'),
+  ('Existing noninferential, formatted data systems provide users with tree-structured files or slightly more general network models of the data.'),
+  ('In Section 1, inadequacies of these models are discussed.'),
+  ('A model based on n-ary relations, a normal form for data base relations, and the concept of a universal data sublanguage are introduced.'),
+  ('In Section 2, certain operations on relations (other than logical inference) are discussed and applied to the problems of redundancy and consistency in the user’s model.')
+
+query FFFFT
+SELECT
+ts_rank(v, query) AS rank,
+ts_rank(ARRAY[0.2, 0.3, 0.5, 0.9]:::FLOAT[], v, query) AS wrank,
+ts_rank(v, query, 2|8) AS nrank,
+ts_rank(ARRAY[0.3, 0.4, 0.6, 0.95]:::FLOAT[], v, query, 1|2|4|8|16|32) AS wnrank,
+v
+FROM sentences, to_tsquery('english', 'relation') query
+WHERE query @@ v
+ORDER BY rank DESC
+LIMIT 10
+----
+0.075990885  0.15198177  0.00042217158  8.555783e-05  'ari':6 'base':3,13 'concept':17 'data':12,21 'form':10 'introduc':24 'model':2 'n':5 'normal':9 'relat':7,14 'sublanguag':22 'univers':20
+0.06079271   0.12158542  0.0003101669   6.095758e-05  '2':3 'appli':15 'certain':4 'consist':22 'discuss':13 'infer':11 'logic':10 'model':27 'oper':5 'problem':18 'redund':20 'relat':7 'section':2 'user':25
+
+# Regression test for #99334. Truncate arrays longer than 4 elements that are
+# passed to ts_rank to avoid an internal error.
+query F
+SELECT
+	ts_rank(ARRAY[1.0039,2.37098,-0.022,0.4277,0.00387]::FLOAT8[], '''AoS'' ''HXfAX'' ''HeWdr'' ''MIHLoJM'' ''UfIQOM'' ''bw'' ''o'''::TSVECTOR, '''QqJVCgwp'''::TSQUERY)
+LIMIT
+	2
+----
+0
+
+subtest 98804_regression_test
+
+statement ok
+RESET default_text_search_config
+
+statement ok
+CREATE TABLE ab (a TEXT, b TEXT)
+
+statement ok
+INSERT INTO ab VALUES('fat rats', 'fat cats chased fat, out of shape rats');
+
+query B
+SELECT a @@ b FROM ab
+----
+false
+
+query B
+SELECT b @@ a FROM ab
+----
+true
+
+query B
+SELECT 'fat rats' @@ b FROM ab
+----
+false
+
+query B
+SELECT b @@ 'fat rats' FROM ab
+----
+true
+
+query B
+SELECT a @@ 'fat cats ate fat bats' FROM ab
+----
+false
+
+query B
+SELECT 'fat cats ate fat bats' @@ a FROM ab
+----
+false
+
+statement error pgcode 22023 unsupported comparison operator: <string> @@ <tsvector>
+SELECT b @@ a::tsvector FROM ab
+
+statement error pgcode 22023 unsupported comparison operator: <tsvector> @@ <string>
+SELECT a::tsvector @@ b FROM ab
+
+query B
+SELECT 'fat bat cat' @@ 'bats fats'
+----
+true
+
+query B
+SELECT 'bats fats' @@ 'fat bat cat'
+----
+false
+
+query B
+SELECT 'fat' @@ 'fat rats'::tsvector
+----
+true
+
+# TODO(#75101): The error should be "syntax error in TSQuery".
+statement error pgcode 22023 unsupported comparison operator: <string> @@ <tsvector>
+SELECT 'fat cats chased fat, out of shape rats' @@ 'fat rats'::tsvector
+
+query B
+SELECT 'fat rats'::tsvector @@ 'fat'
+----
+true
+
+# TODO(#75101): The error should be "syntax error in TSQuery".
+statement error pgcode 22023 unsupported comparison operator: <tsvector> @@ <string>
+SELECT 'fat rats'::tsvector @@ 'fat cats chased fat, out of shape rats'

@@ -11,13 +11,13 @@ package replicationtestutils
 import (
 	"bytes"
 	"context"
+	"math/rand"
 	"net/url"
-	"strings"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -29,7 +29,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -47,6 +48,12 @@ func KeyMatches(key roachpb.Key) FeedEventPredicate {
 			return false
 		}
 		return bytes.Equal(key, msg.GetKV().Key)
+	}
+}
+
+func AnySpanConfigMatches() FeedEventPredicate {
+	return func(msg streamingccl.Event) bool {
+		return msg.Type() == streamingccl.SpanConfigEvent
 	}
 }
 
@@ -104,27 +111,39 @@ func MakeReplicationFeed(t *testing.T, f FeedSource) *ReplicationFeed {
 // Note: we don't do any buffering here.  Therefore, it is required that the key
 // we want to observe will arrive at some point in the future.
 func (rf *ReplicationFeed) ObserveKey(ctx context.Context, key roachpb.Key) roachpb.KeyValue {
-	require.NoError(rf.t, rf.consumeUntil(ctx, KeyMatches(key), func(err error) bool {
-		return true
-	}))
+	rf.consumeUntil(ctx, KeyMatches(key), func(err error) bool {
+		return false
+	})
 	return *rf.msg.GetKV()
+}
+
+// ObserveAnySpanConfigRecord consumes the feed until any span config record is observed.
+// Note: we don't do any buffering here.  Therefore, it is required that the key
+// we want to observe will arrive at some point in the future.
+func (rf *ReplicationFeed) ObserveAnySpanConfigRecord(
+	ctx context.Context,
+) streampb.StreamedSpanConfigEntry {
+	rf.consumeUntil(ctx, AnySpanConfigMatches(), func(err error) bool {
+		return false
+	})
+	return *rf.msg.GetSpanConfigEvent()
 }
 
 // ObserveResolved consumes the feed until we received resolved timestamp that's at least
 // as high as the specified low watermark.  Returns observed resolved timestamp.
 func (rf *ReplicationFeed) ObserveResolved(ctx context.Context, lo hlc.Timestamp) hlc.Timestamp {
-	require.NoError(rf.t, rf.consumeUntil(ctx, ResolvedAtLeast(lo), func(err error) bool {
-		return true
-	}))
+	rf.consumeUntil(ctx, ResolvedAtLeast(lo), func(err error) bool {
+		return false
+	})
 	return minResolvedTimestamp(rf.msg.GetResolvedSpans())
 }
 
 // ObserveError consumes the feed until the feed is exhausted, and the final error should
 // match 'errPred'.
 func (rf *ReplicationFeed) ObserveError(ctx context.Context, errPred FeedErrorPredicate) {
-	require.NoError(rf.t, rf.consumeUntil(ctx, func(message streamingccl.Event) bool {
+	rf.consumeUntil(ctx, func(message streamingccl.Event) bool {
 		return false
-	}, errPred))
+	}, errPred)
 }
 
 // Close cleans up any resources.
@@ -134,51 +153,33 @@ func (rf *ReplicationFeed) Close(ctx context.Context) {
 
 func (rf *ReplicationFeed) consumeUntil(
 	ctx context.Context, pred FeedEventPredicate, errPred FeedErrorPredicate,
-) error {
-	const maxWait = 2 * time.Minute
-	doneCh := make(chan struct{})
-	mu := struct {
-		syncutil.Mutex
-		err error
-	}{}
-	defer close(doneCh)
-	go func() {
-		select {
-		case <-time.After(maxWait):
-			mu.Lock()
-			mu.err = errors.New("test timed out")
-			mu.Unlock()
-			rf.f.Close(ctx)
-		case <-doneCh:
-		}
-	}()
-
-	rowCount := 0
-	for {
-		msg, haveMoreRows := rf.f.Next()
-		if !haveMoreRows {
-			// We have run out of rows, let's try and make a nice error
-			// message.
-			mu.Lock()
-			err := mu.err
-			mu.Unlock()
-			if rf.f.Error() != nil {
-				require.True(rf.t, errPred(rf.f.Error()))
-				return nil
-			} else if err != nil {
-				rf.t.Fatal(err)
-			} else {
-				rf.t.Fatalf("ran out of rows after processing %d rows", rowCount)
+) {
+	require.NoError(rf.t, timeutil.RunWithTimeout(ctx, "consume", 2*time.Minute,
+		func(ctx context.Context) error {
+			rowCount := 0
+			for {
+				msg, haveMoreRows := rf.f.Next()
+				if !haveMoreRows {
+					if err := rf.f.Error(); err != nil {
+						if errPred(err) {
+							return nil
+						}
+						return err
+					}
+					return errors.Newf("ran out of rows after processing %d rows", rowCount)
+				}
+				rowCount++
+				if msg == nil {
+					return errors.New("consumed empty msg")
+				}
+				if pred(msg) {
+					rf.msg = msg
+					return nil
+				}
 			}
-		}
-		rowCount++
+		}),
+	)
 
-		require.NotNil(rf.t, msg)
-		if pred(msg) {
-			rf.msg = msg
-			return nil
-		}
-	}
 }
 
 // TenantState maintains test state related to tenant.
@@ -198,11 +199,14 @@ type TenantState struct {
 // as a PGUrl to the underlying server.
 type ReplicationHelper struct {
 	// SysServer is the backing server.
-	SysServer serverutils.TestServerInterface
+	SysServer  serverutils.ApplicationLayerInterface
+	TestServer serverutils.TestServerInterface
 	// SysSQL is a sql connection to the system tenant.
 	SysSQL *sqlutils.SQLRunner
 	// PGUrl is the pgurl of this server.
 	PGUrl url.URL
+
+	rng *rand.Rand
 }
 
 // NewReplicationHelper starts test server with the required cluster settings for streming
@@ -212,33 +216,41 @@ func NewReplicationHelper(
 	ctx := context.Background()
 
 	// Start server
-	s, db, _ := serverutils.StartServer(t, serverArgs)
+	srv, db, _ := serverutils.StartServer(t, serverArgs)
+	s := srv.SystemLayer()
 
-	// Make changefeeds run faster.
-	resetFreq := changefeedbase.TestingSetDefaultMinCheckpointFrequency(50 * time.Millisecond)
-
-	// Set required cluster settings.
 	sqlDB := sqlutils.MakeSQLRunner(db)
-	sqlDB.ExecMultiple(t, strings.Split(`
-SET CLUSTER SETTING kv.rangefeed.enabled = true;
-SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s';
-SET CLUSTER SETTING changefeed.experimental_poll_interval = '10ms';
-SET CLUSTER SETTING cross_cluster_replication.enabled = true;
-`, `;`)...)
+	sqlDB.ExecMultiple(t,
+		// Required for replication stremas to work.
+		`SET CLUSTER SETTING kv.rangefeed.enabled = true`,
+		`SET CLUSTER SETTING cross_cluster_replication.enabled = true`,
+
+		// Speeds up the tests a bit.
+		`SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '200ms'`,
+		`ALTER TENANT ALL SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '200ms'`,
+		`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'`,
+		`ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'`,
+		`SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10ms'`,
+		`ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10ms'`,
+		`SET CLUSTER SETTING stream_replication.min_checkpoint_frequency = '10ms'`)
 
 	// Sink to read data from.
-	sink, cleanupSink := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+	sink, cleanupSink := sqlutils.PGUrl(t, s.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
+
+	rng, seed := randutil.NewPseudoRand()
+	t.Logf("Replication helper seed %d", seed)
 
 	h := &ReplicationHelper{
-		SysServer: s,
-		SysSQL:    sqlutils.MakeSQLRunner(db),
-		PGUrl:     sink,
+		SysServer:  s,
+		TestServer: srv,
+		SysSQL:     sqlutils.MakeSQLRunner(db),
+		PGUrl:      sink,
+		rng:        rng,
 	}
 
 	return h, func() {
 		cleanupSink()
-		resetFreq()
-		s.Stopper().Stop(ctx)
+		srv.Stopper().Stop(ctx)
 	}
 }
 
@@ -246,7 +258,7 @@ SET CLUSTER SETTING cross_cluster_replication.enabled = true;
 func (rh *ReplicationHelper) CreateTenant(
 	t *testing.T, tenantID roachpb.TenantID, tenantName roachpb.TenantName,
 ) (TenantState, func()) {
-	_, tenantConn := serverutils.StartTenant(t, rh.SysServer, base.TestTenantArgs{
+	_, tenantConn := serverutils.StartTenant(t, rh.TestServer, base.TestTenantArgs{
 		TenantID:   tenantID,
 		TenantName: tenantName,
 	})
@@ -279,4 +291,24 @@ func (rh *ReplicationHelper) StartReplicationStream(
 	err := protoutil.Unmarshal(rawReplicationProducerSpec, &replicationProducerSpec)
 	require.NoError(t, err)
 	return replicationProducerSpec
+}
+
+func (rh *ReplicationHelper) MaybeGenerateInlineURL(t *testing.T) *url.URL {
+	if rh.rng.Float64() > 0.5 {
+		return &rh.PGUrl
+	}
+
+	t.Log("using inline certificates")
+	ret := rh.PGUrl
+	v := ret.Query()
+	for _, opt := range []string{"sslcert", "sslkey", "sslrootcert"} {
+		path := v.Get(opt)
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+		v.Set(opt, string(content))
+
+	}
+	v.Set("sslinline", "true")
+	ret.RawQuery = v.Encode()
+	return &ret
 }

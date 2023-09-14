@@ -76,6 +76,7 @@ func TestRegistry(t *testing.T) {
 		)
 
 		require.Equal(t, expected[0], actual[0])
+		require.Equal(t, transaction.Status, Transaction_Status(statement.Status))
 	})
 
 	t.Run("failure detection", func(t *testing.T) {
@@ -112,6 +113,7 @@ func TestRegistry(t *testing.T) {
 
 		require.Equal(t, expected, actual)
 		require.Equal(t, transaction.LastErrorCode, statement.ErrorCode)
+		require.Equal(t, transaction.Status, Transaction_Status(statement.Status))
 	})
 
 	t.Run("disabled", func(t *testing.T) {
@@ -221,7 +223,7 @@ func TestRegistry(t *testing.T) {
 			FingerprintID:    appstatspb.StmtFingerprintID(100),
 			LatencyInSeconds: 2,
 		}
-		siblingStatment := &Statement{
+		siblingStatement := &Statement{
 			ID:            clusterunique.IDFromBytes([]byte("dddddddddddddddddddddddddddddddd")),
 			FingerprintID: appstatspb.StmtFingerprintID(101),
 		}
@@ -231,7 +233,7 @@ func TestRegistry(t *testing.T) {
 		store := newStore(st)
 		registry := newRegistry(st, &latencyThresholdDetector{st: st}, store)
 		registry.ObserveStatement(session.ID, statement)
-		registry.ObserveStatement(session.ID, siblingStatment)
+		registry.ObserveStatement(session.ID, siblingStatement)
 		registry.ObserveTransaction(session.ID, transaction)
 
 		expected := []*Insight{
@@ -240,7 +242,7 @@ func TestRegistry(t *testing.T) {
 				Transaction: transaction,
 				Statements: []*Statement{
 					newStmtWithProblemAndCauses(statement, Problem_SlowExecution, nil),
-					siblingStatment,
+					siblingStatement,
 				},
 			},
 		}
@@ -253,6 +255,7 @@ func TestRegistry(t *testing.T) {
 		)
 
 		require.Equal(t, expected, actual)
+		require.Equal(t, transaction.Status, Transaction_Status(statement.Status))
 	})
 
 	t.Run("txn with no stmts", func(t *testing.T) {
@@ -301,5 +304,59 @@ func TestRegistry(t *testing.T) {
 		)
 
 		require.Equal(t, expected, actual)
+		require.Equal(t, transaction.Status, Transaction_Status(statement.Status))
+	})
+
+	t.Run("statement that is slow but should be ignored", func(t *testing.T) {
+		statementNotIgnored := &Statement{
+			Status:           Statement_Completed,
+			ID:               clusterunique.IDFromBytes([]byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+			FingerprintID:    appstatspb.StmtFingerprintID(100),
+			LatencyInSeconds: 2,
+			Query:            "SELECT * FROM users",
+		}
+		statementIgnoredSet := &Statement{
+			ID:               clusterunique.IDFromBytes([]byte("dddddddddddddddddddddddddddddddd")),
+			FingerprintID:    appstatspb.StmtFingerprintID(101),
+			LatencyInSeconds: 2,
+			Query:            "SET vectorize = '_'",
+		}
+		statementIgnoredExplain := &Statement{
+			ID:               clusterunique.IDFromBytes([]byte("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")),
+			FingerprintID:    appstatspb.StmtFingerprintID(102),
+			LatencyInSeconds: 2,
+			Query:            "EXPLAIN SELECT * FROM users",
+		}
+
+		st := cluster.MakeTestingClusterSettings()
+		LatencyThreshold.Override(ctx, &st.SV, 1*time.Second)
+		store := newStore(st)
+		registry := newRegistry(st, &latencyThresholdDetector{st: st}, store)
+		registry.ObserveStatement(session.ID, statementNotIgnored)
+		registry.ObserveStatement(session.ID, statementIgnoredSet)
+		registry.ObserveStatement(session.ID, statementIgnoredExplain)
+		registry.ObserveTransaction(session.ID, transaction)
+
+		expected := []*Insight{
+			{
+				Session:     session,
+				Transaction: transaction,
+				Statements: []*Statement{
+					newStmtWithProblemAndCauses(statementNotIgnored, Problem_SlowExecution, nil),
+					statementIgnoredSet,
+					statementIgnoredExplain,
+				},
+			},
+		}
+		var actual []*Insight
+		store.IterateInsights(
+			context.Background(),
+			func(ctx context.Context, o *Insight) {
+				actual = append(actual, o)
+			},
+		)
+
+		require.Equal(t, expected, actual)
+		require.Equal(t, transaction.Status, Transaction_Status(statementNotIgnored.Status))
 	})
 }

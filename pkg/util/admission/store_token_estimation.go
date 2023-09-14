@@ -12,6 +12,12 @@ package admission
 
 import "github.com/cockroachdb/pebble"
 
+// TODO(irfansharif): This comment is a bit stale with replication admission
+// control where admission is asynchronous. AC is informed of the write when
+// it's being physically done, so we know its size then. We don't need upfront
+// estimates anymore. The AdmittedWorkDone interface and surrounding types
+// (StoreWorkDoneInfo for ex.) are no longer central.
+//
 // The logic in this file deals with token estimation for a store write in two
 // situations: (a) at admission time, (b) when the admitted work is done. At
 // (a) we have no information provided about the work size (NB: this choice is
@@ -105,7 +111,11 @@ const ingestMultiplierMin = 0.5
 const ingestMultiplierMax = 1.5
 
 type storePerWorkTokenEstimator struct {
-	atAdmissionWorkTokens           int64
+	atAdmissionWorkTokens int64
+
+	// NB: The linear model fitters below are used to determine how many tokens
+	// to consume once the size of the work is known.
+
 	atDoneL0WriteTokensLinearModel  tokensLinearModelFitter
 	atDoneL0IngestTokensLinearModel tokensLinearModelFitter
 	// Unlike the models above that model bytes into L0, this model computes all
@@ -177,8 +187,8 @@ func (e *storePerWorkTokenEstimator) updateEstimates(
 	if adjustedIntL0IngestedBytes < 0 {
 		adjustedIntL0IngestedBytes = 0
 	}
-	intWorkCount := int64(admissionStats.admittedCount) -
-		int64(e.cumStoreAdmissionStats.admittedCount)
+	intWorkCount := int64(admissionStats.workCount) -
+		int64(e.cumStoreAdmissionStats.workCount)
 	intL0WriteAccountedBytes :=
 		int64(admissionStats.writeAccountedBytes) - int64(e.cumStoreAdmissionStats.writeAccountedBytes)
 	// Note that these are not L0 ingested bytes, since we don't know how
@@ -238,7 +248,7 @@ func (e *storePerWorkTokenEstimator) getStoreRequestEstimatesAtAdmission() store
 	return storeRequestEstimates{writeTokens: e.atAdmissionWorkTokens}
 }
 
-func (e *storePerWorkTokenEstimator) getModelsAtAdmittedDone() (
+func (e *storePerWorkTokenEstimator) getModelsAtDone() (
 	l0WriteLM tokensLinearModel,
 	l0IngestLM tokensLinearModel,
 	ingestLM tokensLinearModel,

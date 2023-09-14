@@ -159,14 +159,13 @@ func Example_sql_config() {
 	// 123
 	// # 1 row
 	// sql --set unknownoption -e select 123 as "123"
-	// invalid syntax: \set unknownoption. Try \? for help.
-	// ERROR: -e: invalid syntax
+	// ERROR: -e: unknown variable name: "unknownoption"
 	// sql --set display_format=invalidvalue -e select 123 as "123"
-	// \set display_format=invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
-	// ERROR: -e: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
+	// ERROR: -e: \set display_format=invalidvalue: invalid table display format: invalidvalue
+	// HINT: Possible values: tsv, csv, table, records, ndjson, json, sql, html, raw.
 	// sql -e \set display_format=invalidvalue -e select 123 as "123"
-	// \set display_format=invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
-	// ERROR: -e: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
+	// ERROR: -e: \set display_format=invalidvalue: invalid table display format: invalidvalue
+	// HINT: Possible values: tsv, csv, table, records, ndjson, json, sql, html, raw.
 }
 
 func Example_sql_watch() {
@@ -348,7 +347,7 @@ func Example_includes() {
 	// ?column?
 	// 123
 	// sql -f testdata/i_maxrecursion.sql
-	// \i: too many recursion levels (max 10)
+	// ERROR: \i: too many recursion levels (max 10)
 	// ERROR: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: testdata/i_maxrecursion.sql: \i: too many recursion levels (max 10)
 }
 
@@ -360,7 +359,7 @@ func Example_sql_lex() {
 	var sqlConnCtx clisqlclient.Context
 	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard,
 		fmt.Sprintf("postgres://%s@%s/?sslmode=disable",
-			username.RootUser, c.ServingSQLAddr()))
+			username.RootUser, c.Server.AdvSQLAddr()))
 	defer func() {
 		if err := conn.Close(); err != nil {
 			fmt.Printf("error closing connection: %v\n", err)

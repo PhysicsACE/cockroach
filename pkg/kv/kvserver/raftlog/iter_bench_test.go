@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -55,8 +56,8 @@ type mockReader struct {
 
 func (m *mockReader) NewMVCCIterator(
 	storage.MVCCIterKind, storage.IterOptions,
-) storage.MVCCIterator {
-	return m.iter
+) (storage.MVCCIterator, error) {
+	return m.iter, nil
 }
 
 func mkRaftCommand(keySize, valSize, writeBatchSize int) *kvserverpb.RaftCommand {
@@ -96,7 +97,7 @@ func mkBenchEnt(b *testing.B) (_ raftpb.Entry, metaB []byte) {
 	cmd := mkRaftCommand(100, 1800, 2000)
 	cmdB, err := protoutil.Marshal(cmd)
 	require.NoError(b, err)
-	data := EncodeRaftCommand(EntryEncodingStandardWithoutAC, "cmd12345", cmdB)
+	data := EncodeCommandBytes(EntryEncodingStandardWithoutAC, "cmd12345", cmdB)
 
 	ent := raftpb.Entry{
 		Term:  1,
@@ -137,14 +138,20 @@ func BenchmarkIterator(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			it := NewIterator(rangeID, &mockReader{}, IterOptions{Hi: 123456})
+			it, err := NewIterator(rangeID, &mockReader{}, IterOptions{Hi: 123456})
+			if err != nil {
+				b.Fatal(err)
+			}
 			setMockIter(it)
 			it.Close()
 		}
 	})
 
 	benchForOp := func(b *testing.B, method func(*Iterator) (bool, error)) {
-		it := NewIterator(rangeID, &mockReader{}, IterOptions{Hi: 123456})
+		it, err := NewIterator(rangeID, &mockReader{}, IterOptions{Hi: 123456})
+		if err != nil {
+			b.Fatal(err)
+		}
 		setMockIter(it)
 
 		b.ReportAllocs()
@@ -178,7 +185,7 @@ func BenchmarkVisit(b *testing.B) {
 	defer eng.Close()
 
 	ent, metaB := mkBenchEnt(b)
-	require.NoError(b, eng.PutUnversioned(keys.RaftLogKey(rangeID, ent.Index), metaB))
+	require.NoError(b, eng.PutUnversioned(keys.RaftLogKey(rangeID, kvpb.RaftIndex(ent.Index)), metaB))
 
 	b.ReportAllocs()
 	b.ResetTimer()

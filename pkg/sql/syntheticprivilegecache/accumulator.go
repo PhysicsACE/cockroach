@@ -29,7 +29,9 @@ type accumulator struct {
 // newAccumulator initializes a Accumulator.
 func newAccumulator(objectType privilege.ObjectType, path string) *accumulator {
 	return &accumulator{
-		desc:       &catpb.PrivilegeDescriptor{},
+		desc: &catpb.PrivilegeDescriptor{
+			OwnerProto: username.NodeUserName().EncodeProto(),
+		},
 		objectType: objectType,
 		path:       path,
 	}
@@ -50,22 +52,28 @@ func (s *accumulator) addRow(path, user tree.DString, privArr, grantOptionArr *t
 	for _, elem := range grantOptionArr.Array {
 		grantOptionStrings = append(grantOptionStrings, string(tree.MustBeDString(elem)))
 	}
-	privs, err := privilege.ListFromStrings(privilegeStrings)
+	privs, err := privilege.ListFromStrings(privilegeStrings, privilege.OriginFromSystemTable)
 	if err != nil {
 		return err
 	}
-	grantOptions, err := privilege.ListFromStrings(grantOptionStrings)
+	grantOptions, err := privilege.ListFromStrings(grantOptionStrings, privilege.OriginFromSystemTable)
 	if err != nil {
 		return err
 	}
-	privsWithGrantOption := privilege.ListFromBitField(
+	privsWithGrantOption, err := privilege.ListFromBitField(
 		privs.ToBitField()&grantOptions.ToBitField(),
 		s.objectType,
 	)
-	privsWithoutGrantOption := privilege.ListFromBitField(
+	if err != nil {
+		return err
+	}
+	privsWithoutGrantOption, err := privilege.ListFromBitField(
 		privs.ToBitField()&^privsWithGrantOption.ToBitField(),
 		s.objectType,
 	)
+	if err != nil {
+		return err
+	}
 	s.desc.Grant(
 		username.MakeSQLUsernameFromPreNormalizedString(string(user)),
 		privsWithGrantOption,

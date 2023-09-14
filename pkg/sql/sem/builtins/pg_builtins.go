@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/errors"
@@ -101,9 +102,10 @@ func PGIOBuiltinPrefix(typ *types.T) string {
 
 // initPGBuiltins adds all of the postgres builtins to the builtins map.
 func init() {
+	const enforceClass = true
 	for k, v := range pgBuiltins {
 		v.props.Category = builtinconstants.CategoryCompatibility
-		registerBuiltin(k, v)
+		registerBuiltin(k, v, tree.NormalClass, enforceClass)
 	}
 
 	// Make non-array type i/o builtins.
@@ -118,19 +120,19 @@ func init() {
 		}
 		builtinPrefix := PGIOBuiltinPrefix(typ)
 		for name, builtin := range makeTypeIOBuiltins(builtinPrefix, typ) {
-			registerBuiltin(name, builtin)
+			registerBuiltin(name, builtin, tree.NormalClass, enforceClass)
 		}
 	}
 	// Make array type i/o builtins.
 	for name, builtin := range makeTypeIOBuiltins("array_", types.AnyArray) {
-		registerBuiltin(name, builtin)
+		registerBuiltin(name, builtin, tree.NormalClass, enforceClass)
 	}
 	for name, builtin := range makeTypeIOBuiltins("anyarray_", types.AnyArray) {
-		registerBuiltin(name, builtin)
+		registerBuiltin(name, builtin, tree.NormalClass, enforceClass)
 	}
 	// Make enum type i/o builtins.
 	for name, builtin := range makeTypeIOBuiltins("enum_", types.AnyEnum) {
-		registerBuiltin(name, builtin)
+		registerBuiltin(name, builtin, tree.NormalClass, enforceClass)
 	}
 
 	// Make type cast builtins.
@@ -147,11 +149,13 @@ func init() {
 		if !ok {
 			return
 		}
+		distSQLBlockList := toType.Family() == types.OidFamily
 		if _, ok := castBuiltins[toOID]; !ok {
 			castBuiltins[toOID] = &builtinDefinition{
 				props: tree.FunctionProperties{
-					Category:     builtinconstants.CategoryCast,
-					Undocumented: true,
+					Category:         builtinconstants.CategoryCast,
+					Undocumented:     true,
+					DistsqlBlocklist: distSQLBlockList,
 				},
 			}
 		}
@@ -200,7 +204,7 @@ func init() {
 	for toOID, def := range castBuiltins {
 		n := cast.CastTypeName(types.OidToType[toOID])
 		CastBuiltinNames[n] = struct{}{}
-		registerBuiltin(n, *def)
+		registerBuiltin(n, *def, tree.NormalClass, enforceClass)
 	}
 
 	// Make crdb_internal.create_regfoo and to_regfoo builtins.
@@ -216,8 +220,8 @@ func init() {
 		{"Translates a textual type name to its OID", types.RegType},
 	} {
 		typName := b.typ.SQLStandardName()
-		registerBuiltin("crdb_internal.create_"+typName, makeCreateRegDef(b.typ))
-		registerBuiltin("to_"+typName, makeToRegOverload(b.typ, b.toRegOverloadHelpText))
+		registerBuiltin("crdb_internal.create_"+typName, makeCreateRegDef(b.typ), tree.NormalClass, enforceClass)
+		registerBuiltin("to_"+typName, makeToRegOverload(b.typ, b.toRegOverloadHelpText), tree.NormalClass, enforceClass)
 	}
 }
 
@@ -305,7 +309,6 @@ func makePGGetViewDef(paramTypes tree.ParamTypes) tree.Overload {
 	return tree.Overload{
 		Types:      paramTypes,
 		ReturnType: tree.FixedReturnType(types.String),
-		IsUDF:      true,
 		Body: `SELECT definition
 		FROM pg_catalog.pg_views v
 		JOIN pg_catalog.pg_class c ON c.relname=v.viewname
@@ -317,6 +320,7 @@ func makePGGetViewDef(paramTypes tree.ParamTypes) tree.Overload {
 		WHERE c.oid=$1`,
 		Info:       "Returns the CREATE statement for an existing view.",
 		Volatility: volatility.Stable,
+		Language:   tree.RoutineLangSQL,
 	}
 }
 
@@ -325,10 +329,10 @@ func makePGGetConstraintDef(paramTypes tree.ParamTypes) tree.Overload {
 	return tree.Overload{
 		Types:      paramTypes,
 		ReturnType: tree.FixedReturnType(types.String),
-		IsUDF:      true,
 		Body:       `SELECT condef FROM pg_catalog.pg_constraint WHERE oid=$1 LIMIT 1`,
 		Info:       notUsableInfo,
 		Volatility: volatility.Stable,
+		Language:   tree.RoutineLangSQL,
 	}
 }
 
@@ -563,16 +567,16 @@ func makeToRegOverload(typ *types.T, helpText string) builtinDefinition {
 
 // Format the array {type,othertype} as type, othertype.
 // If there are no args, output the empty string.
-const getFunctionArgStringQuery = `SELECT 
-										COALESCE(
-										    (SELECT trim('{}' FROM replace(
-										        array_agg(unnest(proargtypes)::REGTYPE::TEXT)::TEXT,
-										        ',', ', ')))
-										    , '')
-                    FROM pg_catalog.pg_proc
-                    WHERE oid=$1
-                    GROUP BY oid, proargtypes
-                    LIMIT 1`
+const getFunctionArgStringQuery = `
+SELECT COALESCE(
+    (SELECT trim('{}' FROM replace(
+        (
+            SELECT array_agg(unnested::REGTYPE::TEXT)
+            FROM unnest(proargtypes) AS unnested
+        )::TEXT, ',', ', '))
+    ), '')
+FROM pg_catalog.pg_proc WHERE oid=$1 GROUP BY oid, proargtypes LIMIT 1
+`
 
 var pgBuiltins = map[string]builtinDefinition{
 	// See https://www.postgresql.org/docs/9.6/static/functions-info.html.
@@ -693,7 +697,6 @@ var pgBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
-			IsUDF:      true,
 			Body: fmt.Sprintf(
 				`SELECT COALESCE(create_statement, prosrc)
              FROM pg_catalog.pg_proc
@@ -706,6 +709,7 @@ var pgBuiltins = map[string]builtinDefinition{
 				"For builtin functions, returns the name of the function.",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -714,12 +718,29 @@ var pgBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
-			IsUDF:      true,
 			Body:       getFunctionArgStringQuery,
 			Info: "Returns the argument list (with defaults) necessary to identify a function, " +
 				"in the form it would need to appear in within CREATE FUNCTION.",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
+		},
+	),
+
+	"pg_get_function_arg_default": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}, {Name: "arg_num", Typ: types.Int4}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Body:       "SELECT NULL",
+			Info: "Get textual representation of a function argument's default value. " +
+				"The second argument of this function is the argument number among all " +
+				"arguments (i.e. proallargtypes, *not* proargtypes), starting with 1, " +
+				"because that's how information_schema.sql uses it. Currently, this " +
+				"always returns NULL, since CockroachDB does not support default values.",
+			Volatility:        volatility.Stable,
+			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -732,7 +753,6 @@ var pgBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
-			IsUDF:      true,
 			Body: `SELECT t.typname
              FROM pg_catalog.pg_proc p
              JOIN pg_catalog.pg_type t
@@ -741,6 +761,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			Info:              "Returns the types of the result of the specified function.",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -753,12 +774,12 @@ var pgBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
-			IsUDF:      true,
 			Body:       getFunctionArgStringQuery,
 			Info: "Returns the argument list (without defaults) necessary to identify a function, " +
 				"in the form it would need to appear in within ALTER FUNCTION, for instance.",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -767,16 +788,15 @@ var pgBuiltins = map[string]builtinDefinition{
 	"pg_get_indexdef": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo, DistsqlBlocklist: true},
 		tree.Overload{
-			IsUDF:             true,
 			Types:             tree.ParamTypes{{Name: "index_oid", Typ: types.Oid}},
 			ReturnType:        tree.FixedReturnType(types.String),
 			Body:              `SELECT indexdef FROM pg_catalog.pg_indexes WHERE crdb_oid = $1`,
 			Info:              "Gets the CREATE INDEX command for index",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "index_oid", Typ: types.Oid}, {Name: "column_no", Typ: types.Int}, {Name: "pretty_bool", Typ: types.Bool}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT CASE
@@ -791,11 +811,12 @@ var pgBuiltins = map[string]builtinDefinition{
 						ELSE a.attname
 					END as pg_get_indexdef
 					FROM pg_catalog.pg_index i
-					LEFT JOIN pg_attribute a ON (a.attrelid = i.indexrelid AND a.attnum = $2)
-					LEFT JOIN pg_indexes defs ON ($2 = 0 AND defs.crdb_oid = i.indexrelid)
+					LEFT JOIN pg_catalog.pg_attribute a ON (a.attrelid = i.indexrelid AND a.attnum = $2)
+					LEFT JOIN pg_catalog.pg_indexes defs ON ($2 = 0 AND defs.crdb_oid = i.indexrelid)
 					WHERE i.indexrelid = $1`,
 			Info:       "Gets the CREATE INDEX command for index, or definition of just one index column when given a non-zero column number",
 			Volatility: volatility.Stable,
+			Language:   tree.RoutineLangSQL,
 		},
 	),
 
@@ -829,10 +850,34 @@ var pgBuiltins = map[string]builtinDefinition{
 					return tree.DNull, nil
 				}
 				res.ExplicitCatalog = false
-				return tree.NewDString(fmt.Sprintf(`%s.%s`, res.Schema(), res.Object())), nil
+				return tree.NewDString(fmt.Sprintf(`%s.%s`, res.SchemaName.String(), res.ObjectName.String())), nil
 			},
 			Info:       "Returns the name of the sequence used by the given column_name in the table table_name.",
 			Volatility: volatility.Stable,
+		},
+	),
+
+	"pg_sequence_last_value": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySequences,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "sequence_oid", Typ: types.Oid}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				seqOid := tree.MustBeDOid(args[0])
+
+				value, wasCalled, err := evalCtx.Sequence.GetLastSequenceValueByID(ctx, uint32(seqOid.Oid))
+				if err != nil {
+					return nil, err
+				}
+				if !wasCalled {
+					return tree.DNull, nil
+				}
+				return tree.NewDInt(tree.DInt(value)), nil
+			},
+			Info:       "Returns the last value generated by a sequence, or NULL if the sequence has not been used yet.",
+			Volatility: volatility.Volatile,
 		},
 	),
 
@@ -948,11 +993,11 @@ var pgBuiltins = map[string]builtinDefinition{
 				{Name: "role_oid", Typ: types.Oid},
 			},
 			ReturnType:        tree.FixedReturnType(types.String),
-			IsUDF:             true,
 			Body:              `SELECT COALESCE((SELECT rolname FROM pg_catalog.pg_roles WHERE oid=$1 LIMIT 1), 'unknown (OID=' || $1 || ')')`,
 			Info:              notUsableInfo,
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -968,13 +1013,13 @@ var pgBuiltins = map[string]builtinDefinition{
 				[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Bool, types.Int, types.Oid},
 				[]string{"start_value", "minimum_value", "maxmimum_value", "increment", "cycle_option", "cache_size", "data_type"},
 			)),
-			IsUDF: true,
 			Body: `SELECT COALESCE ((SELECT (seqstart, seqmin, seqmax, seqincrement, seqcycle, seqcache, seqtypid)
              FROM pg_catalog.pg_sequence WHERE seqrelid=$1 LIMIT 1),
              CASE WHEN crdb_internal.force_error('42P01', 'relation with OID ' || $1 || ' does not exist') > 0 THEN NULL ELSE NULL END)`,
 			Info:              notUsableInfo,
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -998,12 +1043,10 @@ var pgBuiltins = map[string]builtinDefinition{
 					typ, err = evalCtx.Planner.ResolveTypeByOID(ctx, oid)
 					if err != nil {
 						// If the error is a descriptor does not exist error, then swallow it.
-						unknown := tree.NewDString(fmt.Sprintf("unknown (OID=%s)", oidArg))
 						switch {
-						case errors.Is(err, catalog.ErrDescriptorNotFound):
-							return unknown, nil
-						case pgerror.GetPGCode(err) == pgcode.UndefinedObject:
-							return unknown, nil
+						case sqlerrors.IsMissingDescriptorError(err),
+							errors.Is(err, catalog.ErrDescriptorNotFound):
+							return tree.NewDString(fmt.Sprintf("unknown (OID=%s)", oidArg)), nil
 						default:
 							return nil, err
 						}
@@ -1027,7 +1070,6 @@ var pgBuiltins = map[string]builtinDefinition{
 
 	"col_description": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "table_oid", Typ: types.Oid}, {Name: "column_number", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			// Note: the following is equivalent to:
@@ -1039,7 +1081,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			// on pg_description and let predicate push-down do its job.
 			Body: fmt.Sprintf(
 				`SELECT comment
-         FROM system.comments c
+				 FROM system.public.comments c
 				 WHERE c.type=%[1]d
 				 AND c.object_id=$1::int
 				 AND c.sub_id=$2::int
@@ -1053,12 +1095,12 @@ var pgBuiltins = map[string]builtinDefinition{
 				"(obj_description cannot be used for table columns, since columns do not have OIDs of their own.)",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
 	"obj_description": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT description
@@ -1071,9 +1113,9 @@ var pgBuiltins = map[string]builtinDefinition{
 				"therefore, the wrong comment might be returned.",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}, {Name: "catalog_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT d.description
@@ -1091,12 +1133,12 @@ var pgBuiltins = map[string]builtinDefinition{
 				"For example, obj_description(123456, 'pg_class') would retrieve the comment for the table with OID 123456.",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
 	"shobj_description": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}, {Name: "catalog_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT d.description
@@ -1113,6 +1155,7 @@ var pgBuiltins = map[string]builtinDefinition{
 				"This is just like obj_description except that it is used for retrieving comments on shared objects (e.g. databases). ",
 			Volatility:        volatility.Stable,
 			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -1201,7 +1244,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_function_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
@@ -1212,6 +1254,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			CalledOnNullInput: true,
 			Info:              "Returns whether the function with the given OID belongs to one of the schemas on the search path.",
 			Volatility:        volatility.Stable,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 	// pg_table_is_visible returns true if the input oid corresponds to a table
@@ -1219,7 +1262,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_table_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
@@ -1230,6 +1272,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			CalledOnNullInput: true,
 			Info:              "Returns whether the table with the given OID belongs to one of the schemas on the search path.",
 			Volatility:        volatility.Stable,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -1241,7 +1284,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_type_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
@@ -1252,6 +1294,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			CalledOnNullInput: true,
 			Info:              "Returns whether the type with the given OID belongs to one of the schemas on the search path.",
 			Volatility:        volatility.Stable,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 
@@ -2038,7 +2081,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://github.com/postgres/postgres/blob/master/src/backend/catalog/information_schema.sql
 	"information_schema._pg_index_position": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF: true,
 			Types: tree.ParamTypes{
 				{Name: "oid", Typ: types.Oid},
 				{Name: "col", Typ: types.Int2},
@@ -2050,6 +2092,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			       WHERE (ss.a).x = $2`,
 			Info:       notUsableInfo,
 			Volatility: volatility.Stable,
+			Language:   tree.RoutineLangSQL,
 		},
 	),
 
@@ -2137,6 +2180,31 @@ var pgBuiltins = map[string]builtinDefinition{
 			},
 			Info:       "Returns the scale of the given type with type modifier",
 			Volatility: volatility.Immutable,
+		},
+	),
+
+	"nameconcatoid": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySystemInfo,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "name", Typ: types.String}, {Name: "oid", Typ: types.Oid}},
+			ReturnType: tree.FixedReturnType(types.Name),
+			Body: `
+SELECT
+  CASE WHEN length($1::text || '_' || $2::text) > 63
+	THEN (substring($1 from 1 for 63 - length($2::text) - 1) || '_' || $2::text)::name
+	ELSE ($1::text || '_' || $2::text)::name
+	END
+`,
+			Info: "Used in the information_schema to produce specific_name " +
+				"columns, which are supposed to be unique per schema. " +
+				"The result is the same as ($1::text || '_' || $2::text)::name " +
+				"except that, if it would not fit in 63 characters, we make it do so " +
+				"by truncating the name input (not the oid).",
+			Volatility:        volatility.Immutable,
+			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
 		},
 	),
 }

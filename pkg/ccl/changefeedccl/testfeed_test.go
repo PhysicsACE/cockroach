@@ -16,8 +16,6 @@ import (
 	"encoding/base64"
 	gojson "encoding/json"
 	"fmt"
-	"io"
-	"math"
 	"math/rand"
 	"net/url"
 	"os"
@@ -29,6 +27,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	pubsubv1 "cloud.google.com/go/pubsub/apiv1"
+	pb "cloud.google.com/go/pubsub/apiv1/pubsubpb"
+	"cloud.google.com/go/pubsub/pstest"
 	"github.com/Shopify/sarama"
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
@@ -39,47 +40,54 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
-	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/parquet"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	goparquet "github.com/fraugster/parquet-go"
 	"github.com/jackc/pgx/v4"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type sinklessFeedFactory struct {
-	s           serverutils.TestTenantInterface
-	sink        url.URL
+	s serverutils.ApplicationLayerInterface
+	// postgres url used for creating sinkless changefeeds. This may be the same as
+	// the rootURL.
+	sink url.URL
+	// postgres url for the root user, used for test internals.
+	rootURL     url.URL
 	sinkForUser sinkForUser
-	currentDB   func(db *string) error
 }
 
 // makeSinklessFeedFactory returns a TestFeedFactory implementation using the
 // `experimental-sql` uri.
 func makeSinklessFeedFactory(
-	s serverutils.TestTenantInterface, sink url.URL, sinkForUser sinkForUser,
+	s serverutils.ApplicationLayerInterface, sink url.URL, rootConn url.URL, sinkForUser sinkForUser,
 ) cdctest.TestFeedFactory {
-	return &sinklessFeedFactory{s: s, sink: sink, sinkForUser: sinkForUser}
+	return &sinklessFeedFactory{s: s, sink: sink, rootURL: rootConn, sinkForUser: sinkForUser}
 }
 
+// AsUser executes fn as the specified user.
 func (f *sinklessFeedFactory) AsUser(user string, fn func(*sqlutils.SQLRunner)) error {
 	prevSink := f.sink
 	password := `hunter2`
-	if err := setPassword(user, password, f.sink); err != nil {
+	if err := f.setPassword(user, password); err != nil {
 		return err
 	}
 	defer func() { f.sink = prevSink }()
@@ -102,8 +110,8 @@ func (f *sinklessFeedFactory) AsUser(user string, fn func(*sqlutils.SQLRunner)) 
 	return nil
 }
 
-func setPassword(user, password string, uri url.URL) error {
-	rootDB, err := gosql.Open("postgres", uri.String())
+func (f *sinklessFeedFactory) setPassword(user, password string) error {
+	rootDB, err := gosql.Open("postgres", f.rootURL.String())
 	if err != nil {
 		return err
 	}
@@ -116,13 +124,6 @@ func setPassword(user, password string, uri url.URL) error {
 func (f *sinklessFeedFactory) Feed(create string, args ...interface{}) (cdctest.TestFeed, error) {
 	sink := f.sink
 	sink.RawQuery = sink.Query().Encode()
-	if f.currentDB == nil {
-		sink.Path = `d`
-	} else {
-		if err := f.currentDB(&sink.Path); err != nil {
-			return nil, err
-		}
-	}
 	// Use pgx directly instead of database/sql so we can close the conn
 	// (instead of returning it to the pool).
 	pgxConfig, err := pgx.ParseConfig(sink.String())
@@ -139,7 +140,7 @@ func (f *sinklessFeedFactory) Feed(create string, args ...interface{}) (cdctest.
 }
 
 // Server implements the TestFeedFactory interface.
-func (f *sinklessFeedFactory) Server() serverutils.TestTenantInterface {
+func (f *sinklessFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return f.s
 }
 
@@ -157,6 +158,9 @@ func (t seenTrackerMap) markSeen(m *cdctest.TestFeedMessage) (isNew bool) {
 	// Fixme.
 	seenKey := m.Topic + m.Partition + string(m.Key) + string(m.Value)
 	if _, ok := t[seenKey]; ok {
+		if log.V(1) {
+			log.Infof(context.Background(), "skip dup %s", seenKey)
+		}
 		return false
 	}
 	t[seenKey] = struct{}{}
@@ -299,7 +303,6 @@ func (e *externalConnectionFeedFactory) Feed(
 	createStmt.SinkURI = tree.NewStrVal(`external://` + randomExternalConnectionName)
 
 	return e.TestFeedFactory.Feed(createStmt.String(), args...)
-
 }
 
 func setURI(
@@ -346,13 +349,6 @@ func (r *reportErrorResumer) OnFailOrCancel(
 ) error {
 	defer r.jobFailed()
 	return r.wrapped.OnFailOrCancel(ctx, execCtx, jobErr)
-}
-
-// OnPauseRequest implements PauseRequester interface.
-func (r *reportErrorResumer) OnPauseRequest(
-	ctx context.Context, execCtx interface{}, txn isql.Txn, details *jobspb.Progress,
-) error {
-	return r.wrapped.(*changefeedResumer).OnPauseRequest(ctx, execCtx, txn, details)
 }
 
 type wrapSinkFn func(sink Sink) Sink
@@ -459,10 +455,11 @@ func (f *jobFeed) Resume() error {
 
 // Details implements FeedJob interface.
 func (f *jobFeed) Details() (*jobspb.ChangefeedDetails, error) {
+	stmt := fmt.Sprintf(`
+SELECT payload FROM (%s)
+`, jobutils.InternalSystemJobsBaseQuery)
 	var payloadBytes []byte
-	if err := f.db.QueryRow(
-		`SELECT payload FROM system.jobs WHERE id=$1`, f.jobID,
-	).Scan(&payloadBytes); err != nil {
+	if err := f.db.QueryRow(stmt, f.jobID).Scan(&payloadBytes); err != nil {
 		return nil, errors.Wrapf(err, "Details for job %d", f.jobID)
 	}
 	var payload jobspb.Payload
@@ -474,10 +471,11 @@ func (f *jobFeed) Details() (*jobspb.ChangefeedDetails, error) {
 
 // HighWaterMark implements FeedJob interface.
 func (f *jobFeed) HighWaterMark() (hlc.Timestamp, error) {
+	stmt := fmt.Sprintf(`
+SELECT progress FROM (%s)
+`, jobutils.InternalSystemJobsBaseQuery)
 	var details []byte
-	if err := f.db.QueryRow(
-		`SELECT progress FROM system.jobs WHERE id=$1`, f.jobID,
-	).Scan(&details); err != nil {
+	if err := f.db.QueryRow(stmt, f.jobID).Scan(&details); err != nil {
 		return hlc.Timestamp{}, errors.Wrapf(err, "HighWaterMark for job %d", f.jobID)
 	}
 	var progress jobspb.Progress
@@ -502,7 +500,7 @@ func (f *jobFeed) TickHighWaterMark(minHWM hlc.Timestamp) error {
 		if minHWM.Less(current) {
 			return nil
 		}
-		return errors.New("waiting to tick")
+		return errors.Newf("waiting to tick: current=%s min=%s", current, minHWM)
 	}, 10*time.Second)
 }
 
@@ -628,10 +626,11 @@ func (s *notifyFlushSink) EncodeAndEmitRow(
 	prevRow cdcevent.Row,
 	topic TopicDescriptor,
 	updated, mvcc hlc.Timestamp,
+	encodingOpts changefeedbase.EncodingOptions,
 	alloc kvevent.Alloc,
 ) error {
 	if sinkWithEncoder, ok := s.Sink.(SinkWithEncoder); ok {
-		return sinkWithEncoder.EncodeAndEmitRow(ctx, updatedRow, prevRow, topic, updated, mvcc, alloc)
+		return sinkWithEncoder.EncodeAndEmitRow(ctx, updatedRow, prevRow, topic, updated, mvcc, encodingOpts, alloc)
 	}
 	return errors.AssertionFailedf("Expected a sink with encoder for, found %T", s.Sink)
 }
@@ -639,7 +638,7 @@ func (s *notifyFlushSink) EncodeAndEmitRow(
 var _ Sink = (*notifyFlushSink)(nil)
 
 // feedInjectable is the subset of the
-// TestServerInterface/TestTenantInterface needed for depInjector to
+// TestServerInterface/ApplicationLayerInterface needed for depInjector to
 // work correctly.
 type feedInjectable interface {
 	JobRegistry() interface{}
@@ -676,18 +675,18 @@ func newDepInjector(srvs ...feedInjectable) *depInjector {
 			}
 
 		// Arrange for error reporting resumer to be used.
-		s.JobRegistry().(*jobs.Registry).TestingResumerCreationKnobs =
-			map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-				jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
-					f := di.getJobFeed(raw.(*changefeedResumer).job.ID())
-					return &reportErrorResumer{
-						wrapped: raw,
-						jobFailed: func() {
-							f.jobFailed(f.FetchTerminalJobErr())
-						},
-					}
-				},
-			}
+		s.JobRegistry().(*jobs.Registry).TestingWrapResumerConstructor(
+			jobspb.TypeChangefeed,
+			func(raw jobs.Resumer) jobs.Resumer {
+				f := di.getJobFeed(raw.(*changefeedResumer).job.ID())
+				return &reportErrorResumer{
+					wrapped: raw,
+					jobFailed: func() {
+						f.jobFailed(f.FetchTerminalJobErr())
+					},
+				}
+			},
+		)
 	}
 
 	return di
@@ -740,25 +739,27 @@ func (di *depInjector) getJobFeed(jobID jobspb.JobID) *jobFeed {
 }
 
 type enterpriseFeedFactory struct {
-	s      serverutils.TestTenantInterface
-	di     *depInjector
-	db     *gosql.DB
+	s  serverutils.ApplicationLayerInterface
+	di *depInjector
+	// db is used for creating changefeeds. This may be the same as rootDB.
+	db *gosql.DB
+	// rootDB is used for test internals.
 	rootDB *gosql.DB
 }
 
+func (e *enterpriseFeedFactory) configureUserDB(db *gosql.DB) {
+	e.db = db
+}
+
 func (e *enterpriseFeedFactory) jobsTableConn() *gosql.DB {
-	if e.rootDB == nil {
-		return e.db
-	}
 	return e.rootDB
 }
 
-// AsUser uses the previous (assumed to be root) connection to ensure
+// AsUser uses the previous connection to ensure
 // the user has the ability to authenticate, and saves it to poll
 // job status, then implements TestFeedFactory.AsUser().
 func (e *enterpriseFeedFactory) AsUser(user string, fn func(*sqlutils.SQLRunner)) error {
 	prevDB := e.db
-	e.rootDB = e.db
 	defer func() { e.db = prevDB }()
 	password := `password`
 	_, err := e.rootDB.Exec(fmt.Sprintf(`ALTER USER %s WITH PASSWORD '%s'`, user, password))
@@ -801,9 +802,11 @@ type tableFeedFactory struct {
 	uri url.URL
 }
 
-func getInjectables(srvOrCluster interface{}) (serverutils.TestTenantInterface, []feedInjectable) {
+func getInjectables(
+	srvOrCluster interface{},
+) (serverutils.ApplicationLayerInterface, []feedInjectable) {
 	switch t := srvOrCluster.(type) {
-	case serverutils.TestTenantInterface:
+	case serverutils.ApplicationLayerInterface:
 		t.PGServer()
 		return t, []feedInjectable{t}
 	case serverutils.TestClusterInterface:
@@ -820,14 +823,15 @@ func getInjectables(srvOrCluster interface{}) (serverutils.TestTenantInterface, 
 // makeTableFeedFactory returns a TestFeedFactory implementation using the
 // `experimental-sql` uri.
 func makeTableFeedFactory(
-	srvOrCluster interface{}, db *gosql.DB, sink url.URL,
+	srvOrCluster interface{}, rootDB *gosql.DB, sink url.URL,
 ) cdctest.TestFeedFactory {
 	s, injectables := getInjectables(srvOrCluster)
 	return &tableFeedFactory{
 		enterpriseFeedFactory: enterpriseFeedFactory{
-			s:  s,
-			di: newDepInjector(injectables...),
-			db: db,
+			s:      s,
+			di:     newDepInjector(injectables...),
+			db:     rootDB,
+			rootDB: rootDB,
 		},
 		uri: sink,
 	}
@@ -883,7 +887,7 @@ func (f *tableFeedFactory) Feed(
 }
 
 // Server implements the TestFeedFactory interface.
-func (f *tableFeedFactory) Server() serverutils.TestTenantInterface {
+func (f *tableFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return f.s
 }
 
@@ -924,7 +928,7 @@ func (c *tableFeed) Next() (*cdctest.TestFeedMessage, error) {
 			return toSend, nil
 		}
 
-		if err := contextutil.RunWithTimeout(
+		if err := timeutil.RunWithTimeout(
 			context.Background(), timeoutOp("tableFeed.Next", c.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
@@ -1019,14 +1023,15 @@ type cloudFeedFactory struct {
 // makeCloudFeedFactory returns a TestFeedFactory implementation using the cloud
 // storage uri.
 func makeCloudFeedFactory(
-	srvOrCluster interface{}, db *gosql.DB, dir string,
+	srvOrCluster interface{}, rootDB *gosql.DB, dir string,
 ) cdctest.TestFeedFactory {
 	s, injectables := getInjectables(srvOrCluster)
 	return &cloudFeedFactory{
 		enterpriseFeedFactory: enterpriseFeedFactory{
-			s:  s,
-			di: newDepInjector(injectables...),
-			db: db,
+			s:      s,
+			di:     newDepInjector(injectables...),
+			db:     rootDB,
+			rootDB: rootDB,
 		},
 		dir: dir,
 	}
@@ -1050,41 +1055,48 @@ func (f *cloudFeedFactory) Feed(
 			tree.KVOption{Key: changefeedbase.OptKeyInValue},
 		)
 	}
-	// Determine if we can enable parquet output if the changefeed is compatible
-	// with parquet format, if no format is specified. If it is, we will use
-	// parquet format with a probability of 0.4. The rest of the time json is used
-	parquetPossible := true
 
+	formatSpecified := false
+	explicitEnvelope := false
 	for _, opt := range createStmt.Options {
 		if string(opt.Key) == changefeedbase.OptFormat {
-			parquetPossible = false
-			break
+			formatSpecified = true
 		}
-		for o := range changefeedbase.InitialScanOnlyUnsupportedOptions {
-			if o == string(opt.Key) {
-				parquetPossible = false
-				break
+		if string(opt.Key) == changefeedbase.OptEnvelope {
+			explicitEnvelope = true
+		}
+	}
+
+	if !formatSpecified {
+		// Determine if we can enable the parquet format if the changefeed is not
+		// being created with incompatible options. If it can be enabled, we will use
+		// parquet format with a probability of 0.4.
+		parquetPossible := includeParquestTestMetadata
+		for _, opt := range createStmt.Options {
+			for o := range changefeedbase.ParquetFormatUnsupportedOptions {
+				if o == string(opt.Key) {
+					parquetPossible = false
+					break
+				}
 			}
 		}
-	}
-	randNum := rand.Intn(5)
-	if randNum < 3 {
-		parquetPossible = false
-	}
-	if parquetPossible {
-		TestingSetIncludeParquetMetadata()
-		log.Infof(context.Background(), "Using parquet format")
-		createStmt.Options = append(
-			createStmt.Options,
-			tree.KVOption{
-				Key:   changefeedbase.OptFormat,
-				Value: tree.NewStrVal(string(changefeedbase.OptFormatParquet)),
-			},
-		)
+		randNum := rand.Intn(5)
+		if randNum < 3 {
+			parquetPossible = false
+		}
+		if parquetPossible {
+			createStmt.Options = append(
+				createStmt.Options,
+				tree.KVOption{
+					Key:   changefeedbase.OptFormat,
+					Value: tree.NewStrVal(string(changefeedbase.OptFormatParquet)),
+				},
+			)
+		}
 	}
 
 	feedDir := feedSubDir()
-	sinkURI := `nodelocal://0/` + feedDir
+	sinkURI := `nodelocal://1/` + feedDir
 	// TODO(dan): This is a pretty unsatisfying way to test that the uri passes
 	// through params it doesn't understand to ExternalStorage.
 	sinkURI += `?should_be=ignored`
@@ -1109,7 +1121,7 @@ func (f *cloudFeedFactory) Feed(
 		ss:             ss,
 		seenTrackerMap: make(map[string]struct{}),
 		dir:            feedDir,
-		isBare:         createStmt.Select != nil,
+		isBare:         createStmt.Select != nil && !explicitEnvelope,
 	}
 	if err := f.startFeedJob(c.jobFeed, createStmt.String(), args...); err != nil {
 		return nil, err
@@ -1118,7 +1130,7 @@ func (f *cloudFeedFactory) Feed(
 }
 
 // Server implements the TestFeedFactory interface.
-func (f *cloudFeedFactory) Server() serverutils.TestTenantInterface {
+func (f *cloudFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return f.s
 }
 
@@ -1129,8 +1141,9 @@ type cloudFeed struct {
 	dir    string
 	isBare bool
 
-	resolved string
-	rows     []*cdctest.TestFeedMessage
+	resolved  string
+	seenFiles map[string]struct{}
+	rows      []*cdctest.TestFeedMessage
 }
 
 var _ cdctest.TestFeed = (*cloudFeed)(nil)
@@ -1173,19 +1186,19 @@ func extractFieldFromJSONValue(
 
 	if isBare {
 		meta := make(map[string]gojson.RawMessage)
-		if metaVal, haveMeta := parsed[jsonMetaSentinel]; haveMeta {
+		if metaVal, haveMeta := parsed[metaSentinel]; haveMeta {
 			if err := gojson.Unmarshal(metaVal, &meta); err != nil {
 				return nil, nil, errors.Wrapf(err, "unmarshalling json %v", metaVal)
 			}
 			field = meta[fieldName]
 			delete(meta, fieldName)
 			if len(meta) == 0 {
-				delete(parsed, jsonMetaSentinel)
+				delete(parsed, metaSentinel)
 			} else {
 				if metaVal, err = reformatJSON(meta); err != nil {
 					return nil, nil, err
 				}
-				parsed[jsonMetaSentinel] = metaVal
+				parsed[metaSentinel] = metaVal
 			}
 		}
 	} else {
@@ -1214,199 +1227,140 @@ func extractKeyFromJSONValue(isBare bool, wrapped []byte) (key []byte, value []b
 	return key, value, nil
 }
 
-func (c *cloudFeed) decodeParquetValueAsJSON(value interface{}) (interface{}, error) {
-	switch vv := value.(type) {
-	case []byte:
-		// Currently, for encoding from CRDB data type to Parquet data type, for
-		// any complex structure (that is, other than ints and floats), it is
-		// always a byte array which is the string representation of that datum
-		// (except for arrays, see below). Therefore, if the parquet reader
-		// decodes a column value as a Go native byte array, then we can be sure
-		// that it is the equivalent string representation of the CRDB datum.
-		// Hence, we can use this value to construct the final JSON object which
-		// will be used by assertPayload to compare actual and expected JSON
-		// objects.
-
-		// Ideally there should be no need to convert byte array to string but
-		// JSON encoder will encode byte arrays as base 64 encoded strings.
-		// Hence, we need to convert to string to tell Marshal to decode it as a
-		// string. For every other Go native type, we can use the type as is and
-		// json.Marhsal will work correctly.
-		return string(vv), nil
-	case map[string]interface{}:
-		// This is CRDB ARRAY data type (only data type for which we use parquet
-		// LIST logical type. For all other CRDB types, it's either a byte array
-		// or a primitive parquet type). See importer.NewParquetColumn for
-		// details on how CRDB Array is encoded to parquet. (read it before
-		// reading the rest of the comments). Ideally, the parquet reader should
-		// decode the encoded CRDB array datum as a go native list type. But we
-		// use a low level API provided by the vendor which decodes parquet's
-		// LIST logical data type
-		// (https://github.com/apache/parquet-format/blob/master/LogicalTypes.md)
-		// into this weird map structure in Go (It actually makes a lot of sense
-		// why this is done if you understand the parquet LIST logical data
-		// type). A higher level API would convert this map data structure into
-		// go native list type which is what the code below does. This would
-		// probably need to be changed if the parquet vendor is changed.
-
-		// TODO(ganeshb): Make sure that the library is indeed decoding parquet lists
-		// into this weird map format and it is not because of the way we encode
-		vtemp := make([]interface{}, 0)
-		if castedValue, ok := vv["list"].([]map[string]interface{}); ok {
-			for _, ele := range castedValue {
-				if elementVal, ok := ele["element"]; ok {
-					if byteTypeElement, ok := elementVal.([]byte); ok {
-						vtemp = append(vtemp, string(byteTypeElement))
-					} else {
-						// Primitive types
-						vtemp = append(vtemp, ele["element"])
-					}
-				} else {
-					return nil, errors.Errorf("Data structure returned by parquet vendor for CRDB ARRAY type is not as expected.")
-				}
-			}
-		} else {
-			return nil, errors.Errorf("Data structure returned by parquet vendor for CRDB ARRAY type is not as expected.")
-		}
-		return vtemp, nil
-	default:
-		// int's, float's and other primitive types
-		if floatVal, ok := vv.(float64); ok {
-			// gojson cannot encode NaN values
-			// https://github.com/golang/go/issues/25721
-			if math.IsNaN(floatVal) {
-				return "NaN", nil
-			}
-		}
-		return vv, nil
-	}
-}
-
-// appendParquetTestFeedMessages function reads the parquet file and converts each row to its JSON
-// equivalent and appends it to the cloudfeed's row object.
+// appendParquetTestFeedMessages function reads the parquet file and converts
+// each row to its JSON equivalent and appends it to the cloudfeed's row object.
 func (c *cloudFeed) appendParquetTestFeedMessages(
 	path string, topic string, envelopeType changefeedbase.EnvelopeType,
-) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	fr, err := goparquet.NewFileReader(f)
+) (err error) {
+	meta, datums, err := parquet.ReadFile(path)
 	if err != nil {
 		return err
 	}
 
-	primaryKeyColumnsString, ok := fr.MetaData()["primaryKeyNames"]
+	primaryKeyColumnsString, ok := meta.MetaFields["keyCols"]
 	if !ok {
-		return errors.Errorf("Did not find primary key column names in metadata of parquet file during testing")
+		return errors.Errorf("could not find primary key column names in parquet metadata")
 	}
 
-	columnsNamesString, ok := fr.MetaData()["columnNames"]
+	columnsNamesString, ok := meta.MetaFields["allCols"]
 	if !ok {
-		return errors.Errorf("Did not find column names in metadata of parquet file during testing")
-	}
-	columns := strings.Split(columnsNamesString, ",")
-	primaryKeys := strings.Split(primaryKeyColumnsString, ",")
-
-	columnNameSet := make(map[string]struct{})
-	primaryKeyColumnSet := make(map[string]struct{})
-
-	for _, key := range primaryKeys[:len(primaryKeys)-1] {
-		primaryKeyColumnSet[key] = struct{}{}
+		return errors.Errorf("could not find column names in parquet metadata")
 	}
 
-	for _, key := range columns[:len(columns)-1] {
-		columnNameSet[key] = struct{}{}
+	primaryKeysNamesOrdered, primaryKeyColumnSet, err := deserializeMap(primaryKeyColumnsString)
+	if err != nil {
+		return err
+	}
+	valueColumnNamesOrdered, columnNameSet, err := deserializeMap(columnsNamesString)
+	if err != nil {
+		return err
 	}
 
-	for {
-		row, err := fr.NextRow()
-		if err == io.EOF {
-			break
+	// Extract metadata columns into metaColumnNameSet.
+	extractMetaColumns := func(columnNameSet map[string]int) map[string]int {
+		metaColumnNameSet := make(map[string]int)
+		for colName, colIdx := range columnNameSet {
+			switch colName {
+			case parquetCrdbEventTypeColName:
+				metaColumnNameSet[colName] = colIdx
+			case parquetOptUpdatedTimestampColName:
+				metaColumnNameSet[colName] = colIdx
+			case parquetOptMVCCTimestampColName:
+				metaColumnNameSet[colName] = colIdx
+			case parquetOptDiffColName:
+				metaColumnNameSet[colName] = colIdx
+			default:
+			}
 		}
+		return metaColumnNameSet
+	}
+	metaColumnNameSet := extractMetaColumns(columnNameSet)
 
-		if err != nil {
-			return err
+	for _, row := range datums {
+		rowJSONBuilder := json.NewObjectBuilder(len(valueColumnNamesOrdered) - len(metaColumnNameSet))
+		keyJSONBuilder := json.NewArrayBuilder(len(primaryKeysNamesOrdered))
+
+		for _, primaryKeyColumnName := range primaryKeysNamesOrdered {
+			datum := row[primaryKeyColumnSet[primaryKeyColumnName]]
+			j, err := tree.AsJSON(datum, sessiondatapb.DataConversionConfig{}, time.UTC)
+			if err != nil {
+				return err
+			}
+			keyJSONBuilder.Add(j)
+
 		}
-
-		// Holds column to its value mapping for a row and the entire thing will be
-		// JSON encoded later.
-		value := make(map[string]interface{})
-
-		// Holds the mapping of primary keys and its values.
-		key := make(map[string]interface{}, 0)
-		isDeleted := false
-
-		for k, v := range row {
-			if k == parquetCrdbEventTypeColName {
-				if string(v.([]byte)) == parquetEventDelete {
-					isDeleted = true
-				}
+		for _, valueColumnName := range valueColumnNamesOrdered {
+			if _, isMeta := metaColumnNameSet[valueColumnName]; isMeta {
 				continue
 			}
 
-			if _, ok := columnNameSet[k]; ok {
-				value[k], err = c.decodeParquetValueAsJSON(v)
-				if err != nil {
-					return err
-				}
+			datum := row[columnNameSet[valueColumnName]]
+			j, err := tree.AsJSON(datum, sessiondatapb.DataConversionConfig{}, time.UTC)
+			if err != nil {
+				return err
 			}
-
-			if _, ok := primaryKeyColumnSet[k]; ok {
-				decodedKeyVal, err := c.decodeParquetValueAsJSON(v)
-				if err != nil {
-					return err
-				}
-				key[k] = decodedKeyVal
-			}
+			rowJSONBuilder.Add(valueColumnName, j)
 		}
 
-		if !isDeleted {
-			for col := range columnNameSet {
-				if _, ok := value[col]; !ok {
-					value[col] = nil
-				}
-			}
-		} else {
-			for k := range primaryKeyColumnSet {
-				delete(value, k)
-			}
-		}
+		var valueWithAfter *json.ObjectBuilder
 
-		valueWithAfter := make(map[string]interface{})
+		isDeleted := *(row[metaColumnNameSet[parquetCrdbEventTypeColName]].(*tree.DString)) == *parquetEventDelete.DString()
 
 		if envelopeType == changefeedbase.OptEnvelopeBare {
-			valueWithAfter = value
+			valueWithAfter = rowJSONBuilder
 		} else {
+			valueWithAfter = json.NewObjectBuilder(1)
+			if err != nil {
+				return err
+			}
 			if isDeleted {
-				valueWithAfter["after"] = nil
+				nullJSON, err := tree.AsJSON(tree.DNull, sessiondatapb.DataConversionConfig{}, time.UTC)
+				if err != nil {
+					return err
+				}
+				valueWithAfter.Add("after", nullJSON)
 			} else {
-				valueWithAfter["after"] = value
+				vbJson := rowJSONBuilder.Build()
+				valueWithAfter.Add("after", vbJson)
+			}
+
+			if updatedColIdx, updated := metaColumnNameSet[parquetOptUpdatedTimestampColName]; updated {
+				j, err := tree.AsJSON(row[updatedColIdx], sessiondatapb.DataConversionConfig{}, time.UTC)
+				if err != nil {
+					return err
+				}
+				valueWithAfter.Add(changefeedbase.OptUpdatedTimestamps, j)
+			}
+			if mvccColIdx, mvcc := metaColumnNameSet[parquetOptMVCCTimestampColName]; mvcc {
+				j, err := tree.AsJSON(row[mvccColIdx], sessiondatapb.DataConversionConfig{}, time.UTC)
+				if err != nil {
+					return err
+				}
+				valueWithAfter.Add(changefeedbase.OptMVCCTimestamps, j)
+			}
+			if mvccColIdx, mvcc := metaColumnNameSet[parquetOptDiffColName]; mvcc {
+				j, err := tree.AsJSON(row[mvccColIdx], sessiondatapb.DataConversionConfig{}, time.UTC)
+				if err != nil {
+					return err
+				}
+				valueWithAfter.Add("before", j)
 			}
 		}
 
-		orderedKey := make([]interface{}, 0)
-		for _, k := range primaryKeys[:len(primaryKeys)-1] {
-			orderedKey = append(orderedKey, key[k])
-		}
+		keyJSON := keyJSONBuilder.Build()
 
-		// Sorts the keys
-		jsonValue, err := reformatJSON(valueWithAfter)
-		if err != nil {
-			return err
-		}
+		rowJSON := valueWithAfter.Build()
 
-		jsonKey, err := reformatJSON(orderedKey)
-		if err != nil {
-			return err
-		}
+		var keyBuf bytes.Buffer
+		keyJSON.Format(&keyBuf)
+
+		var rowBuf bytes.Buffer
+		rowJSON.Format(&rowBuf)
 
 		m := &cdctest.TestFeedMessage{
 			Topic: topic,
-			Value: jsonValue,
-			Key:   jsonKey,
+			Value: rowBuf.Bytes(),
+			Key:   keyBuf.Bytes(),
 		}
 
 		if isNew := c.markSeen(m); !isNew {
@@ -1419,6 +1373,29 @@ func (c *cloudFeed) appendParquetTestFeedMessages(
 	return nil
 }
 
+// readParquetResolvedPayload reads a resolved timestamp value from the
+// specified parquet file and returns it encoded as JSON.
+func (c *cloudFeed) readParquetResolvedPayload(path string) ([]byte, error) {
+	meta, datums, err := parquet.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if meta.NumRows != 1 || meta.NumCols != 1 {
+		return nil, errors.AssertionFailedf("expected one row with one col containing the resolved timestamp")
+	}
+
+	resolvedDatum := datums[0][0]
+
+	resolved := resolvedRaw{Resolved: resolvedDatum.String()}
+	resolvedBytes, err := gojson.Marshal(resolved)
+	if err != nil {
+		return nil, err
+	}
+
+	return resolvedBytes, nil
+}
+
 // Next implements the TestFeed interface.
 func (c *cloudFeed) Next() (*cdctest.TestFeedMessage, error) {
 	for {
@@ -1428,7 +1405,7 @@ func (c *cloudFeed) Next() (*cdctest.TestFeedMessage, error) {
 			return e, nil
 		}
 
-		if err := contextutil.RunWithTimeout(
+		if err := timeutil.RunWithTimeout(
 			context.Background(), timeoutOp("cloudfeed.Next", c.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
@@ -1476,27 +1453,37 @@ func (c *cloudFeed) walkDir(path string, info os.FileInfo, err error) error {
 		return nil
 	}
 
-	tsFromPath := func(p string) string {
-		return strings.Split(filepath.Base(p), "-")[0]
+	// Skip files we processed before.
+	if c.seenFiles == nil {
+		c.seenFiles = make(map[string]struct{})
 	}
-
-	// Skip files with timestamp greater than the previously observed timestamp.
-	// Note: theoretically, we should be able to skip any file with timestamp
-	// greater *or equal* to the previously observed timestamp.  However, alter
-	// changefeed pose a problem, since a table maybe added with initial scan
-	// option, causing new events (possibly including resolved event) to be
-	// emitted as of previously emitted timestamp.
-	// See https://github.com/cockroachdb/cockroach/issues/84102
-	if strings.Compare(tsFromPath(c.resolved), tsFromPath(path)) >= 0 {
-		// Already output this in a previous walkDir.
+	if _, seen := c.seenFiles[path]; seen {
+		log.Infof(context.Background(), "Skip file %s", path)
 		return nil
 	}
+	c.seenFiles[path] = struct{}{}
+
+	details, err := c.Details()
+	if err != nil {
+		return err
+	}
+	format := changefeedbase.FormatType(details.Opts[changefeedbase.OptFormat])
 
 	if strings.HasSuffix(path, `RESOLVED`) {
-		resolvedPayload, err := os.ReadFile(path)
-		if err != nil {
-			return err
+		var resolvedPayload []byte
+		var err error
+		if format == changefeedbase.OptFormatParquet {
+			resolvedPayload, err = c.readParquetResolvedPayload(path)
+			if err != nil {
+				return err
+			}
+		} else {
+			resolvedPayload, err = os.ReadFile(path)
+			if err != nil {
+				return err
+			}
 		}
+
 		resolvedEntry := &cdctest.TestFeedMessage{Resolved: resolvedPayload}
 		c.rows = append(c.rows, resolvedEntry)
 		c.resolved = path
@@ -1518,12 +1505,6 @@ func (c *cloudFeed) walkDir(path string, info os.FileInfo, err error) error {
 		return err
 	}
 	defer f.Close()
-	details, err := c.Details()
-	if err != nil {
-		return err
-	}
-
-	format := changefeedbase.FormatType(details.Opts[changefeedbase.OptFormat])
 
 	if format == changefeedbase.OptFormatParquet {
 		envelopeType := changefeedbase.EnvelopeType(details.Opts[changefeedbase.OptEnvelope])
@@ -1717,6 +1698,7 @@ func (s *fakeKafkaSink) Dial() error {
 				}
 				select {
 				case s.feedCh <- m:
+				case <-kafka.stopWorkerCh:
 				case <-s.tg.done:
 				}
 				return nil
@@ -1753,14 +1735,15 @@ func mustBeKafkaFeedFactory(f cdctest.TestFeedFactory) *kafkaFeedFactory {
 }
 
 // makeKafkaFeedFactory returns a TestFeedFactory implementation using the `kafka` uri.
-func makeKafkaFeedFactory(srvOrCluster interface{}, db *gosql.DB) cdctest.TestFeedFactory {
+func makeKafkaFeedFactory(srvOrCluster interface{}, rootDB *gosql.DB) cdctest.TestFeedFactory {
 	s, injectables := getInjectables(srvOrCluster)
 	return &kafkaFeedFactory{
 		knobs: &sinkKnobs{},
 		enterpriseFeedFactory: enterpriseFeedFactory{
-			s:  s,
-			db: db,
-			di: newDepInjector(injectables...),
+			s:      s,
+			db:     rootDB,
+			rootDB: rootDB,
+			di:     newDepInjector(injectables...),
 		},
 	}
 }
@@ -1845,7 +1828,7 @@ func (k *kafkaFeedFactory) Feed(create string, args ...interface{}) (cdctest.Tes
 }
 
 // Server implements TestFeedFactory
-func (k *kafkaFeedFactory) Server() serverutils.TestTenantInterface {
+func (k *kafkaFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return k.s
 }
 
@@ -1872,7 +1855,7 @@ func (k *kafkaFeed) Partitions() []string {
 func (k *kafkaFeed) Next() (*cdctest.TestFeedMessage, error) {
 	for {
 		var msg *sarama.ProducerMessage
-		if err := contextutil.RunWithTimeout(
+		if err := timeutil.RunWithTimeout(
 			context.Background(), timeoutOp("kafka.Next", k.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
@@ -1953,14 +1936,15 @@ type webhookFeedFactory struct {
 var _ cdctest.TestFeedFactory = (*webhookFeedFactory)(nil)
 
 // makeWebhookFeedFactory returns a TestFeedFactory implementation using the `webhook-webhooks` uri.
-func makeWebhookFeedFactory(srvOrCluster interface{}, db *gosql.DB) cdctest.TestFeedFactory {
+func makeWebhookFeedFactory(srvOrCluster interface{}, rootDB *gosql.DB) cdctest.TestFeedFactory {
 	s, injectables := getInjectables(srvOrCluster)
 	useSecure := rand.Float32() < 0.5
 	return &webhookFeedFactory{
 		enterpriseFeedFactory: enterpriseFeedFactory{
-			s:  s,
-			db: db,
-			di: newDepInjector(injectables...),
+			s:      s,
+			db:     rootDB,
+			rootDB: rootDB,
+			di:     newDepInjector(injectables...),
 		},
 		useSecureServer: useSecure,
 	}
@@ -2024,11 +2008,18 @@ func (f *webhookFeedFactory) Feed(create string, args ...interface{}) (cdctest.T
 		return &notifyFlushSink{Sink: s, sync: ss}
 	}
 
+	explicitEnvelope := false
+	for _, opt := range createStmt.Options {
+		if string(opt.Key) == changefeedbase.OptEnvelope {
+			explicitEnvelope = true
+		}
+	}
+
 	c := &webhookFeed{
 		jobFeed:        newJobFeed(f.jobsTableConn(), wrapSink),
 		seenTrackerMap: make(map[string]struct{}),
 		ss:             ss,
-		isBare:         createStmt.Select != nil,
+		isBare:         createStmt.Select != nil && !explicitEnvelope,
 		mockSink:       sinkDest,
 	}
 	if err := f.startFeedJob(c.jobFeed, createStmt.String(), args...); err != nil {
@@ -2038,7 +2029,7 @@ func (f *webhookFeedFactory) Feed(create string, args ...interface{}) (cdctest.T
 	return c, nil
 }
 
-func (f *webhookFeedFactory) Server() serverutils.TestTenantInterface {
+func (f *webhookFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return f.s
 }
 
@@ -2158,7 +2149,7 @@ func (f *webhookFeed) Next() (*cdctest.TestFeedMessage, error) {
 			return m, nil
 		}
 
-		if err := contextutil.RunWithTimeout(
+		if err := timeutil.RunWithTimeout(
 			context.Background(), timeoutOp("webhook.Next", f.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
@@ -2190,15 +2181,14 @@ func (f *webhookFeed) Close() error {
 
 type mockPubsubMessage struct {
 	data string
-	// TODO: implement error injection
-	// err error
 }
-type mockPubsubMessageBuffer struct {
+
+type deprecatedMockPubsubMessageBuffer struct {
 	mu   syncutil.Mutex
 	rows []mockPubsubMessage
 }
 
-func (p *mockPubsubMessageBuffer) pop() *mockPubsubMessage {
+func (p *deprecatedMockPubsubMessageBuffer) pop() *mockPubsubMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.rows) == 0 {
@@ -2209,63 +2199,134 @@ func (p *mockPubsubMessageBuffer) pop() *mockPubsubMessage {
 	return &head
 }
 
-func (p *mockPubsubMessageBuffer) push(m mockPubsubMessage) {
+func (p *deprecatedMockPubsubMessageBuffer) push(m mockPubsubMessage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.rows = append(p.rows, m)
 }
 
-type fakePubsubClient struct {
-	buffer *mockPubsubMessageBuffer
+type deprecatedFakePubsubClient struct {
+	buffer *deprecatedMockPubsubMessageBuffer
 }
 
-var _ pubsubClient = (*fakePubsubClient)(nil)
+var _ deprecatedPubsubClient = (*deprecatedFakePubsubClient)(nil)
 
-func (p *fakePubsubClient) init() error {
+func (p *deprecatedFakePubsubClient) init() error {
 	return nil
 }
 
-func (p *fakePubsubClient) closeTopics() {
+func (p *deprecatedFakePubsubClient) closeTopics() {
 }
 
 // sendMessage sends a message to the topic
-func (p *fakePubsubClient) sendMessage(m []byte, _ string, _ string) error {
+func (p *deprecatedFakePubsubClient) sendMessage(m []byte, _ string, _ string) error {
 	message := mockPubsubMessage{data: string(m)}
 	p.buffer.push(message)
 	return nil
 }
 
-func (p *fakePubsubClient) sendMessageToAllTopics(m []byte) error {
+func (p *deprecatedFakePubsubClient) sendMessageToAllTopics(m []byte) error {
 	message := mockPubsubMessage{data: string(m)}
 	p.buffer.push(message)
 	return nil
 }
 
-func (p *fakePubsubClient) flushTopics() {
+func (p *deprecatedFakePubsubClient) flushTopics() {
 }
 
-type fakePubsubSink struct {
+type deprecatedFakePubsubSink struct {
 	Sink
-	client *fakePubsubClient
+	client *deprecatedFakePubsubClient
 	sync   *sinkSynchronizer
 }
 
-var _ Sink = (*fakePubsubSink)(nil)
+var _ Sink = (*deprecatedFakePubsubSink)(nil)
 
-func (p *fakePubsubSink) Dial() error {
-	s := p.Sink.(*pubsubSink)
+func (p *deprecatedFakePubsubSink) Dial() error {
+	s := p.Sink.(*deprecatedPubsubSink)
 	s.client = p.client
 	s.setupWorkers()
 	return nil
 }
 
-func (p *fakePubsubSink) Flush(ctx context.Context) error {
+func (p *deprecatedFakePubsubSink) Flush(ctx context.Context) error {
 	defer p.sync.addFlush()
 	return p.Sink.Flush(ctx)
 }
 
-func (p *fakePubsubClient) connectivityErrorLocked() error {
+func (p *deprecatedFakePubsubClient) connectivityErrorLocked() error {
 	return nil
+}
+
+type fakePubsubServer struct {
+	srv *pstest.Server
+	mu  struct {
+		syncutil.Mutex
+		buffer []mockPubsubMessage
+		notify chan struct{}
+	}
+}
+
+func makeFakePubsubServer() *fakePubsubServer {
+	mockServer := fakePubsubServer{}
+	mockServer.mu.buffer = make([]mockPubsubMessage, 0)
+	mockServer.srv = pstest.NewServer(pstest.ServerReactorOption{
+		FuncName: "Publish",
+		Reactor:  &mockServer,
+	})
+	return &mockServer
+}
+
+var _ pstest.Reactor = (*fakePubsubServer)(nil)
+
+func (ps *fakePubsubServer) React(req interface{}) (handled bool, ret interface{}, err error) {
+	publishReq, ok := req.(*pb.PublishRequest)
+	if ok {
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+		for _, msg := range publishReq.Messages {
+			ps.mu.buffer = append(ps.mu.buffer, mockPubsubMessage{data: string(msg.Data)})
+		}
+		if ps.mu.notify != nil {
+			notifyCh := ps.mu.notify
+			ps.mu.notify = nil
+			close(notifyCh)
+		}
+	}
+
+	return false, nil, nil
+}
+
+func (s *fakePubsubServer) NotifyMessage() chan struct{} {
+	c := make(chan struct{})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.mu.buffer) > 0 {
+		close(c)
+	} else {
+		s.mu.notify = c
+	}
+	return c
+}
+
+func (ps *fakePubsubServer) Dial() (*grpc.ClientConn, error) {
+	return grpc.Dial(ps.srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+}
+
+func (ps *fakePubsubServer) Pop() *mockPubsubMessage {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if len(ps.mu.buffer) == 0 {
+		return nil
+	}
+	var head mockPubsubMessage
+	head, ps.mu.buffer = ps.mu.buffer[0], ps.mu.buffer[1:]
+	return &head
+}
+
+func (ps *fakePubsubServer) Close() error {
+	ps.srv.Wait()
+	return ps.srv.Close()
 }
 
 type pubsubFeedFactory struct {
@@ -2275,13 +2336,25 @@ type pubsubFeedFactory struct {
 var _ cdctest.TestFeedFactory = (*pubsubFeedFactory)(nil)
 
 // makePubsubFeedFactory returns a TestFeedFactory implementation using the `pubsub` uri.
-func makePubsubFeedFactory(srvOrCluster interface{}, db *gosql.DB) cdctest.TestFeedFactory {
+func makePubsubFeedFactory(srvOrCluster interface{}, rootDB *gosql.DB) cdctest.TestFeedFactory {
 	s, injectables := getInjectables(srvOrCluster)
+
+	switch t := srvOrCluster.(type) {
+	case serverutils.ApplicationLayerInterface:
+		t.DistSQLServer().(*distsql.ServerImpl).TestingKnobs.Changefeed.(*TestingKnobs).PubsubClientSkipClientCreation = true
+	case serverutils.TestClusterInterface:
+		servers := make([]feedInjectable, t.NumServers())
+		for i := range servers {
+			t.Server(i).DistSQLServer().(*distsql.ServerImpl).TestingKnobs.Changefeed.(*TestingKnobs).PubsubClientSkipClientCreation = true
+		}
+	}
+
 	return &pubsubFeedFactory{
 		enterpriseFeedFactory: enterpriseFeedFactory{
-			s:  s,
-			db: db,
-			di: newDepInjector(injectables...),
+			s:      s,
+			db:     rootDB,
+			rootDB: rootDB,
+			di:     newDepInjector(injectables...),
 		},
 	}
 }
@@ -2298,49 +2371,63 @@ func (p *pubsubFeedFactory) Feed(create string, args ...interface{}) (cdctest.Te
 	if err != nil {
 		return nil, err
 	}
-	ss := &sinkSynchronizer{}
 
-	client := &fakePubsubClient{
-		buffer: &mockPubsubMessageBuffer{
+	mockServer := makeFakePubsubServer()
+
+	deprecatedClient := &deprecatedFakePubsubClient{
+		buffer: &deprecatedMockPubsubMessageBuffer{
 			rows: make([]mockPubsubMessage, 0),
 		},
 	}
 
+	ss := &sinkSynchronizer{}
+	var mu syncutil.Mutex
 	wrapSink := func(s Sink) Sink {
-		return &fakePubsubSink{
-			Sink:   s,
-			client: client,
-			sync:   ss,
+		mu.Lock() // Called concurrently due to getEventSink and getResolvedTimestampSink
+		defer mu.Unlock()
+		if batchingSink, ok := s.(*batchingSink); ok {
+			if sinkClient, ok := batchingSink.client.(*pubsubSinkClient); ok {
+				conn, _ := mockServer.Dial()
+				mockClient, _ := pubsubv1.NewPublisherClient(context.Background(), option.WithGRPCConn(conn))
+				sinkClient.client = mockClient
+			}
+			return &notifyFlushSink{Sink: s, sync: ss}
+		} else if _, ok := s.(*deprecatedPubsubSink); ok {
+			return &deprecatedFakePubsubSink{
+				Sink:   s,
+				client: deprecatedClient,
+				sync:   ss,
+			}
 		}
+		return s
 	}
 
 	c := &pubsubFeed{
-		jobFeed:        newJobFeed(p.jobsTableConn(), wrapSink),
-		seenTrackerMap: make(map[string]struct{}),
-		ss:             ss,
-		client:         client,
+		jobFeed:          newJobFeed(p.jobsTableConn(), wrapSink),
+		seenTrackerMap:   make(map[string]struct{}),
+		ss:               ss,
+		mockServer:       mockServer,
+		deprecatedClient: deprecatedClient,
 	}
 
 	if err := p.startFeedJob(c.jobFeed, createStmt.String(), args...); err != nil {
-		return nil, err
-	}
-
-	if err != nil {
+		_ = mockServer.Close()
 		return nil, err
 	}
 	return c, nil
 }
 
 // Server implements TestFeedFactory
-func (p *pubsubFeedFactory) Server() serverutils.TestTenantInterface {
+func (p *pubsubFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return p.s
 }
 
 type pubsubFeed struct {
 	*jobFeed
 	seenTrackerMap
-	ss     *sinkSynchronizer
-	client *fakePubsubClient
+	ss               *sinkSynchronizer
+	mockServer       *fakePubsubServer
+	deprecatedClient *deprecatedFakePubsubClient
 }
 
 var _ cdctest.TestFeed = (*pubsubFeed)(nil)
@@ -2375,7 +2462,10 @@ func extractJSONMessagePubsub(wrapped []byte) (value []byte, key []byte, topic s
 // Next implements TestFeed
 func (p *pubsubFeed) Next() (*cdctest.TestFeedMessage, error) {
 	for {
-		msg := p.client.buffer.pop()
+		msg := p.mockServer.Pop()
+		if msg == nil {
+			msg = p.deprecatedClient.buffer.pop()
+		}
 		if msg != nil {
 			details, err := p.Details()
 			if err != nil {
@@ -2410,13 +2500,15 @@ func (p *pubsubFeed) Next() (*cdctest.TestFeedMessage, error) {
 			return m, nil
 		}
 
-		if err := contextutil.RunWithTimeout(
+		if err := timeutil.RunWithTimeout(
 			context.Background(), timeoutOp("pubsub.Next", p.jobID), timeout(),
 			func(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
 				case <-p.ss.eventReady():
+					return nil
+				case <-p.mockServer.NotifyMessage():
 					return nil
 				case <-p.shutdown:
 					return p.terminalJobError()
@@ -2434,6 +2526,7 @@ func (p *pubsubFeed) Close() error {
 	if err != nil {
 		return err
 	}
+	_ = p.mockServer.Close()
 	return nil
 }
 

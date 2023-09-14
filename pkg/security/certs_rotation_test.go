@@ -67,13 +67,17 @@ func TestRotateCerts(t *testing.T) {
 	params := base.TestServerArgs{
 		SSLCertsDir:       certsDir,
 		InsecureWebAccess: true,
+
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(110007),
 	}
-	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, params)
+	defer srv.Stopper().Stop(context.Background())
+
+	s := srv.ApplicationLayer()
 
 	// Client test function.
 	clientTest := func(httpClient http.Client) error {
-		req, err := http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+		req, err := http.NewRequest("GET", s.AdminURL().WithPath("/_status/metrics/local").String(), nil)
 		if err != nil {
 			return errors.Wrap(err, "could not create request")
 		}
@@ -91,7 +95,7 @@ func TestRotateCerts(t *testing.T) {
 
 	// Create a client by calling sql.Open which loads the certificates but do not use it yet.
 	createTestClient := func() *gosql.DB {
-		pgUrl := makeSecurePGUrl(s.ServingSQLAddr(), username.RootUser, certsDir, certnames.EmbeddedCACert, certnames.EmbeddedRootCert, certnames.EmbeddedRootKey)
+		pgUrl := makeSecurePGUrl(s.AdvSQLAddr(), username.RootUser, certsDir, certnames.EmbeddedCACert, certnames.EmbeddedRootCert, certnames.EmbeddedRootKey)
 		goDB, err := gosql.Open("postgres", pgUrl)
 		if err != nil {
 			t.Fatal(err)
@@ -104,13 +108,12 @@ func TestRotateCerts(t *testing.T) {
 	const kBadCertificate = "tls: bad certificate"
 
 	// Test client with the same certs.
-	clientContext := testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
+	clientContext := rpc.SecurityContextOptions{SSLCertsDir: certsDir}
 	firstSCtx := rpc.NewSecurityContext(
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	firstClient, err := firstSCtx.GetHTTPClient()
 	if err != nil {
@@ -140,14 +143,13 @@ func TestRotateCerts(t *testing.T) {
 	// Setup a second http client. It will load the new certs.
 	// We need to use a new context as it keeps the certificate manager around.
 	// Fails on crypto errors.
-	clientContext = testutils.NewNodeTestBaseContext()
 	clientContext.SSLCertsDir = certsDir
 
 	secondSCtx := rpc.NewSecurityContext(
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	secondClient, err := secondSCtx.GetHTTPClient()
 	if err != nil {
@@ -201,7 +203,7 @@ func TestRotateCerts(t *testing.T) {
 	// the moment the structured logging event is actually
 	// written to the log file.
 	testutils.SucceedsSoon(t, func() error {
-		log.Flush()
+		log.FlushFiles()
 		entries, err := log.FetchEntriesFromFiles(beforeReload.UnixNano(),
 			math.MaxInt64, 10000, cmLogRe, log.WithMarkedSensitiveData)
 		if err != nil {
@@ -255,13 +257,12 @@ func TestRotateCerts(t *testing.T) {
 	// Setup a third http client. It will load the new certs.
 	// We need to use a new context as it keeps the certificate manager around.
 	// This is HTTP and succeeds because we do not ask for or verify client certificates.
-	clientContext = testutils.NewNodeTestBaseContext()
 	clientContext.SSLCertsDir = certsDir
 	thirdSCtx := rpc.NewSecurityContext(
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	thirdClient, err := thirdSCtx.GetHTTPClient()
 	if err != nil {

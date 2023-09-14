@@ -29,12 +29,6 @@ const (
 	txnLogFile = "transactions.ndjson"
 )
 
-type randomLoadBenchSpec struct {
-	Nodes       int
-	Ops         int
-	Concurrency int
-}
-
 func registerSchemaChangeRandomLoad(r registry.Registry) {
 	geoZones := []string{"us-east1-b", "us-west1-b", "europe-west2-b"}
 	if r.MakeClusterSpec(1).Cloud == spec.AWS {
@@ -42,13 +36,15 @@ func registerSchemaChangeRandomLoad(r registry.Registry) {
 	}
 	geoZonesStr := strings.Join(geoZones, ",")
 	r.Add(registry.TestSpec{
-		Name:  "schemachange/random-load",
-		Owner: registry.OwnerSQLSchema,
+		Name:      "schemachange/random-load",
+		Owner:     registry.OwnerSQLFoundations,
+		Benchmark: true,
 		Cluster: r.MakeClusterSpec(
 			3,
 			spec.Geo(),
 			spec.Zones(geoZonesStr),
 		),
+		Leases:     registry.MetamorphicLeases,
 		NativeLibs: registry.LibGEOS,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			maxOps := 5000
@@ -58,44 +54,6 @@ func registerSchemaChangeRandomLoad(r registry.Registry) {
 				concurrency = 2
 			}
 			runSchemaChangeRandomLoad(ctx, t, c, maxOps, concurrency)
-		},
-	})
-
-	// Run a few representative scbench specs in CI.
-	registerRandomLoadBenchSpec(r, randomLoadBenchSpec{
-		Nodes:       3,
-		Ops:         2000,
-		Concurrency: 1,
-	})
-
-	registerRandomLoadBenchSpec(r, randomLoadBenchSpec{
-		Nodes:       3,
-		Ops:         10000,
-		Concurrency: 20,
-	})
-}
-
-func registerRandomLoadBenchSpec(r registry.Registry, b randomLoadBenchSpec) {
-	nameParts := []string{
-		"scbench",
-		"randomload",
-		fmt.Sprintf("nodes=%d", b.Nodes),
-		fmt.Sprintf("ops=%d", b.Ops),
-		fmt.Sprintf("conc=%d", b.Concurrency),
-	}
-	name := strings.Join(nameParts, "/")
-
-	r.Add(registry.TestSpec{
-		Name:       name,
-		Owner:      registry.OwnerSQLSchema,
-		Cluster:    r.MakeClusterSpec(b.Nodes),
-		NativeLibs: registry.LibGEOS,
-		Skip:       "https://github.com/cockroachdb/cockroach/issues/56230",
-		// This is set while development is still happening on the workload and we
-		// fix (or bypass) minor schema change bugs that are discovered.
-		NonReleaseBlocker: true,
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runSchemaChangeRandomLoad(ctx, t, c, b.Ops, b.Concurrency)
 		},
 	})
 }

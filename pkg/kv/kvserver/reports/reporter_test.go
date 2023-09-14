@@ -48,9 +48,11 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 	// don't make progress.
 	skip.UnderStressRace(t)
 	skip.UnderRace(t, "takes >1min under race")
+	// Similarly, skip the test under deadlock builds.
+	skip.UnderDeadlock(t, "takes >1min under deadlock")
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 5, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "r1"}}}},
 			1: {Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "r1"}}}},
@@ -67,6 +69,7 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Create a table and a zone config for it.
 	// The zone will be configured with a constraints that can't be satisfied
@@ -127,7 +130,7 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	// 2 regions, 3 dcs per region.
-	tc := serverutils.StartNewTestCluster(t, 6, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 6, base.TestClusterArgs{
 		// We're going to do our own replication.
 		// All the system ranges will start with a single replica on node 1.
 		ReplicationMode: base.ReplicationManual,
@@ -172,6 +175,7 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Since we're using ReplicationManual, all the ranges will start with a
 	// single replica on node 1. So, the node's dc and the node's region are
@@ -308,7 +312,7 @@ func TestReplicationStatusReportIntegration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 4, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 4, base.TestClusterArgs{
 		// We're going to do our own replication.
 		// All the system ranges will start with a single replica on node 1.
 		ReplicationMode: base.ReplicationManual,
@@ -321,6 +325,7 @@ func TestReplicationStatusReportIntegration(t *testing.T) {
 	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Create a table with a dummy zone config. Configuring the zone is useful
 	// only for creating the zone; we don't actually care about the configuration.
@@ -386,7 +391,9 @@ func TestMeta2RangeIter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	// First make an interator with a large page size and use it to determine the numner of ranges.
@@ -422,7 +429,9 @@ func TestRetriableErrorWhenGenerationReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	cfg := s.ExecutorConfig().(sql.ExecutorConfig).SystemConfig.GetSystemConfig()
@@ -460,7 +469,7 @@ func (it *erroryRangeIterator) Next(ctx context.Context) (roachpb.RangeDescripto
 
 		var err error
 		err = kvpb.NewTransactionRetryWithProtoRefreshError(
-			"injected err", uuid.Nil, roachpb.Transaction{})
+			"injected err", uuid.Nil, 0 /* prevTxnEpoch */, roachpb.Transaction{})
 		// Let's wrap the error to check the unwrapping.
 		err = errors.Wrap(err, "dummy wrapper")
 		// Feed the error to the underlying iterator to reset it.
@@ -565,7 +574,8 @@ func TestZoneChecker(t *testing.T) {
 		splits[i].key = ranges[i].split
 	}
 	keyScanner := keysutils.MakePrettyScannerForNamedTables(
-		map[string]int{"t1": t1ID} /* tableNameToID */, nil /* idxNameToID */)
+		roachpb.SystemTenantID, map[string]int{"t1": t1ID} /* tableNameToID */, nil, /* idxNameToID */
+	)
 	rngs, err := processSplits(keyScanner, splits, nil /* stores */)
 	require.NoError(t, err)
 
@@ -633,7 +643,11 @@ func TestRangeIteration(t *testing.T) {
 	compiled, err := compileTestCase(schema)
 	require.NoError(t, err)
 	v := recordingRangeVisitor{}
-	require.NoError(t, visitRanges(ctx, &compiled.iter, compiled.cfg, &v))
+	// In addition to the meat of the test, we'll surround v with
+	// error-injecting range visitors as a regression test for index out of
+	// bounds when removing visitors that encountered errors (#104788).
+	var extraVisitor1, extraVisitor2 errorRangeVisitor
+	require.Error(t, visitRanges(ctx, &compiled.iter, compiled.cfg, &extraVisitor1, &v, &extraVisitor2))
 
 	type entry struct {
 		newZone bool
@@ -684,4 +698,26 @@ func (r *recordingRangeVisitor) reset(ctx context.Context) {
 type visitorEntry struct {
 	newZone bool
 	rng     roachpb.RangeDescriptor
+}
+
+// errorRangeVisitor always returns an error on visitNewZone call.
+type errorRangeVisitor struct {
+	errorReturned bool
+}
+
+var _ rangeVisitor = &errorRangeVisitor{}
+
+func (e *errorRangeVisitor) visitNewZone(context.Context, *roachpb.RangeDescriptor) error {
+	e.errorReturned = true
+	return errors.New("an error")
+}
+
+func (e *errorRangeVisitor) visitSameZone(context.Context, *roachpb.RangeDescriptor) {}
+
+func (e *errorRangeVisitor) failed() bool {
+	return e.errorReturned
+}
+
+func (e *errorRangeVisitor) reset(context.Context) {
+	e.errorReturned = false
 }

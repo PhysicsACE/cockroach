@@ -19,14 +19,19 @@ import {
   randomTablePrivilege,
 } from "src/storybook/fixtures";
 import { DatabaseTablePage, DatabaseTablePageProps } from "./databaseTablePage";
-import moment from "moment";
+import moment from "moment-timezone";
 import * as H from "history";
+import { indexUnusedDuration } from "src/util/constants";
 const history = H.createHashHistory();
 
 const withLoadingIndicator: DatabaseTablePageProps = {
   databaseName: randomName(),
   name: randomName(),
   automaticStatsCollectionEnabled: true,
+  schemaName: randomName(),
+  indexUsageStatsEnabled: false,
+  showIndexRecommendations: false,
+  csIndexUnusedDuration: indexUnusedDuration,
   details: {
     loading: true,
     loaded: false,
@@ -39,11 +44,6 @@ const withLoadingIndicator: DatabaseTablePageProps = {
     livePercentage: 2.7,
     liveBytes: 12345,
     totalBytes: 456789,
-  },
-  stats: {
-    loading: true,
-    loaded: false,
-    lastError: undefined,
     sizeInBytes: 0,
     rangeCount: 0,
   },
@@ -63,7 +63,6 @@ const withLoadingIndicator: DatabaseTablePageProps = {
     params: {},
   },
   refreshTableDetails: () => {},
-  refreshTableStats: () => {},
   refreshIndexStats: () => {},
   resetIndexUsageStats: () => {},
   refreshSettings: () => {},
@@ -76,6 +75,10 @@ const withData: DatabaseTablePageProps = {
   databaseName: randomName(),
   name: name,
   automaticStatsCollectionEnabled: true,
+  schemaName: randomName(),
+  indexUsageStatsEnabled: true,
+  showIndexRecommendations: true,
+  csIndexUnusedDuration: indexUnusedDuration,
   details: {
     loading: false,
     loaded: true,
@@ -105,17 +108,10 @@ const withData: DatabaseTablePageProps = {
     livePercentage: 2.7,
     liveBytes: 12345,
     totalBytes: 456789,
-  },
-  showNodeRegionsSection: true,
-  stats: {
-    loading: false,
-    loaded: true,
-    lastError: null,
     sizeInBytes: 44040192,
     rangeCount: 4200,
-    nodesByRegionString:
-      "gcp-europe-west1(n8), gcp-us-east1(n1), gcp-us-west1(n6)",
   },
+  showNodeRegionsSection: true,
   indexStats: {
     loading: false,
     loaded: true,
@@ -167,7 +163,6 @@ const withData: DatabaseTablePageProps = {
     params: {},
   },
   refreshTableDetails: () => {},
-  refreshTableStats: () => {},
   refreshIndexStats: () => {},
   resetIndexUsageStats: () => {},
   refreshSettings: () => {},

@@ -12,13 +12,12 @@ package colflow
 
 import (
 	"context"
+	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
@@ -32,8 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/stretchr/testify/require"
@@ -47,6 +46,8 @@ type callbackRemoteComponentCreator struct {
 var _ remoteComponentCreator = &callbackRemoteComponentCreator{}
 
 func (c callbackRemoteComponentCreator) newOutbox(
+	_ *execinfra.FlowCtx,
+	_ int32,
 	allocator *colmem.Allocator,
 	converterMemAcc *mon.BoundAccount,
 	input colexecargs.OpWithMetaInfo,
@@ -219,7 +220,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 			require.Len(t, input.MetadataSources, 1)
 			inbox := colexec.MaybeUnwrapInvariantsChecker(input.MetadataSources[0].(colexecop.Operator)).(*colrpc.Inbox)
 			require.Len(t, inboxToNumInputTypes[inbox], numInputTypesToOutbox)
-			return colrpc.NewOutbox(allocator, converterMemAcc, input, typs, nil /* getStats */)
+			return colrpc.NewOutbox(&execinfra.FlowCtx{Gateway: false}, 0 /* processorID */, allocator, converterMemAcc, input, typs, nil /* getStats */)
 		},
 		newInboxFn: func(allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID) (*colrpc.Inbox, error) {
 			inbox, err := colrpc.NewInbox(allocator, typs, streamID)
@@ -232,22 +233,28 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	evalCtx := eval.MakeTestingEvalContext(st)
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
-	f := &flowinfra.FlowBase{
-		FlowCtx: execinfra.FlowCtx{
+	flowBase := flowinfra.NewFlowBase(
+		execinfra.FlowCtx{
 			Cfg:     &execinfra.ServerConfig{},
 			EvalCtx: &evalCtx,
 			Mon:     evalCtx.TestingMon,
 			NodeID:  base.TestingIDContainer,
 		},
-	}
-	var wg sync.WaitGroup
+		nil,                     /* sp */
+		nil,                     /* flowReg */
+		&execinfra.RowChannel{}, /* rowSyncFlowConsumer */
+		nil,                     /* batchSyncFlowConsumer */
+		nil,                     /* localProcessors */
+		nil,                     /* localVectorSources */
+		nil,                     /* onFlowCleanupEnd */
+		"",                      /* statementSQL */
+	)
 	vfc := newVectorizedFlowCreator(
-		&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, false, &wg, &execinfra.RowChannel{},
-		nil /* batchSyncFlowConsumer */, nil /* podNodeDialer */, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
-		nil /* fdSemaphore */, descs.DistSQLTypeResolver{}, admission.WorkInfo{},
+		flowBase, componentCreator, false, /* recordingStats */
+		colcontainer.DiskQueueCfg{}, nil, /* fdSemaphore */
 	)
 
-	_, _, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, nil /* localProcessors */, flowinfra.FuseNormally)
+	_, _, err := vfc.setupFlow(ctx, procs, flowinfra.FuseNormally)
 	defer vfc.cleanup(ctx)
 	require.NoError(t, err)
 
@@ -260,6 +267,7 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 // subtests for a more thorough explanation.
 func TestVectorizedFlowTempDirectory(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := eval.MakeTestingEvalContext(st)
@@ -364,12 +372,12 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 		errCh := make(chan error)
 		go func() {
 			createTempDir(ctx)
-			errCh <- ngn.MkdirAll(filepath.Join(vf.GetPath(ctx), "async"))
+			errCh <- ngn.MkdirAll(filepath.Join(vf.GetPath(ctx), "async"), os.ModePerm)
 		}()
 		createTempDir(ctx)
 		// Both goroutines should be able to create their subdirectories within the
 		// flow's temporary directory.
-		require.NoError(t, ngn.MkdirAll(filepath.Join(vf.GetPath(ctx), "main_goroutine")))
+		require.NoError(t, ngn.MkdirAll(filepath.Join(vf.GetPath(ctx), "main_goroutine"), os.ModePerm))
 		require.NoError(t, <-errCh)
 		vf.Cleanup(ctx)
 		checkDirs(t, 0)

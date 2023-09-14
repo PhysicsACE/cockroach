@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -108,6 +109,19 @@ type loggingT struct {
 
 	allSinkInfos sinkInfoRegistry
 	allLoggers   loggerRegistry
+	metrics      LogMetrics
+}
+
+// SetLogMetrics injects an initialized implementation of
+// the LogMetrics interface into the logging package. The
+// implementation must be injected to avoid a dependency
+// cycle.
+//
+// Should be called within the init() function of the
+// implementing package to avoid the possibility of a nil
+// LogMetrics during server startups.
+func SetLogMetrics(m LogMetrics) {
+	logging.metrics = m
 }
 
 func init() {
@@ -257,9 +271,9 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 
 		switch traceback {
 		case tracebackSingle:
-			entry.stacks = getStacks(false)
+			entry.stacks = debug.Stack()
 		case tracebackAll:
-			entry.stacks = getStacks(true)
+			entry.stacks = allstacks.Get()
 		}
 
 		for _, s := range l.sinkInfos {
@@ -356,7 +370,7 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 				// The sink was not accepting entries at this level. Nothing to do.
 				continue
 			}
-			if err := s.sink.output(bufs.b[i].Bytes(), sinkOutputOptions{extraFlush: extraFlush, forceSync: isFatal}); err != nil {
+			if err := s.sink.output(bufs.b[i].Bytes(), sinkOutputOptions{extraFlush: extraFlush, tryForceSync: isFatal}); err != nil {
 				if !s.criticality {
 					// An error on this sink is not critical. Just report
 					// the error and move on.
@@ -404,7 +418,7 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 // output, and also to stderr if the remainder of the logs don't go to
 // stderr by default.
 func DumpStacks(ctx context.Context, reason redact.RedactableString) {
-	allStacks := getStacks(true)
+	allStacks := allstacks.Get()
 	// TODO(knz): This should really be a "debug" level, not "info".
 	Shoutf(ctx, severity.INFO, "%s. stack traces:\n%s", reason, allStacks)
 }
@@ -416,6 +430,11 @@ func setActive() {
 		logging.mu.active = true
 		logging.mu.firstUseStack = string(debug.Stack())
 	}
+}
+
+// ShowLogs returns whether -show-logs was passed (used for testing).
+func ShowLogs() bool {
+	return logging.showLogs
 }
 
 const fatalErrorPostamble = `

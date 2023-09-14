@@ -37,6 +37,8 @@ import (
 
 func TestWindowerAccountingForResults(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	monitor := mon.NewMonitorWithLimit(
@@ -95,11 +97,11 @@ func TestWindowerAccountingForResults(t *testing.T) {
 		types.OneIntCol, nil, distsqlutils.RowBufferArgs{},
 	)
 
-	d, err := newWindower(ctx, flowCtx, 0 /* processorID */, &spec, input, post, output)
+	d, err := newWindower(ctx, flowCtx, 0 /* processorID */, &spec, input, post)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.Run(ctx)
+	d.Run(ctx, output)
 	for {
 		row, meta := output.Next()
 		if row != nil {
@@ -255,11 +257,11 @@ func BenchmarkWindower(b *testing.B) {
 				b.SetBytes(int64(8 * numRows * numCols))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					d, err := newWindower(ctx, flowCtx, 0 /* processorID */, &spec, input, post, disposer)
+					d, err := newWindower(ctx, flowCtx, 0 /* processorID */, &spec, input, post)
 					if err != nil {
 						b.Fatal(err)
 					}
-					d.Run(ctx)
+					d.Run(ctx, disposer)
 					input.Reset()
 				}
 				b.StopTimer()

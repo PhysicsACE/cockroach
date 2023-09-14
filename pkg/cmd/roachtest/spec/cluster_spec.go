@@ -36,15 +36,39 @@ const (
 	Zfs fileSystemType = 1
 )
 
+type MemPerCPU int
+
+const (
+	Auto MemPerCPU = iota
+	Standard
+	High
+	Low
+)
+
+func (m MemPerCPU) String() string {
+	switch m {
+	case Auto:
+		return "auto"
+	case Standard:
+		return "standard"
+	case High:
+		return "high"
+	case Low:
+		return "low"
+	}
+	return "unknown"
+}
+
 // ClusterSpec represents a test's description of what its cluster needs to
 // look like. It becomes part of a clusterConfig when the cluster is created.
 type ClusterSpec struct {
 	Cloud        string
-	InstanceType string // auto-chosen if left empty
+	Arch         vm.CPUArch // CPU architecture; auto-chosen if left empty
+	InstanceType string     // auto-chosen if left empty
 	NodeCount    int
 	// CPUs is the number of CPUs per node.
 	CPUs                 int
-	HighMem              bool
+	Mem                  MemPerCPU
 	SSDs                 int
 	RAID0                bool
 	VolumeSize           int
@@ -62,6 +86,17 @@ type ClusterSpec struct {
 	RandomlyUseZfs bool
 
 	GatherCores bool
+
+	// GCE-specific arguments.
+	//
+	// TODO(irfansharif): This cluster spec type suffers the curse of
+	// generality. Make it easier to just inject cloud-specific arguments.
+	GCEMinCPUPlatform string
+	GCEVolumeType     string
+	// AWS-specific arguments.
+	//
+	// AWSVolumeThroughput is the min provisioned EBS volume throughput.
+	AWSVolumeThroughput int
 }
 
 // MakeClusterSpec makes a ClusterSpec.
@@ -85,8 +120,13 @@ func ClustersCompatible(s1, s2 ClusterSpec) bool {
 // String implements fmt.Stringer.
 func (s ClusterSpec) String() string {
 	str := fmt.Sprintf("n%dcpu%d", s.NodeCount, s.CPUs)
-	if s.HighMem {
-		str += "m"
+	switch s.Mem {
+	case Standard:
+		str += "sm"
+	case High:
+		str += "hm"
+	case Low:
+		str += "lm"
 	}
 	if s.Geo {
 		str += "-Geo"
@@ -104,10 +144,15 @@ func awsMachineSupportsSSD(machineType string) bool {
 	return false
 }
 
-func getAWSOpts(machineType string, zones []string, volumeSize int, localSSD bool) vm.ProviderOpts {
+func getAWSOpts(
+	machineType string, zones []string, volumeSize, ebsThroughput int, localSSD bool,
+) vm.ProviderOpts {
 	opts := aws.DefaultProviderOpts()
 	if volumeSize != 0 {
 		opts.DefaultEBSVolume.Disk.VolumeSize = volumeSize
+	}
+	if ebsThroughput != 0 {
+		opts.DefaultEBSVolume.Disk.Throughput = ebsThroughput
 	}
 	if localSSD {
 		opts.SSDMachineType = machineType
@@ -127,6 +172,7 @@ func getGCEOpts(
 	localSSD bool,
 	RAID0 bool,
 	terminateOnMigration bool,
+	minCPUPlatform, volumeType string,
 ) vm.ProviderOpts {
 	opts := gce.DefaultProviderOpts()
 	opts.MachineType = machineType
@@ -145,6 +191,10 @@ func getGCEOpts(
 		opts.UseMultipleDisks = !RAID0
 	}
 	opts.TerminateOnMigration = terminateOnMigration
+	opts.MinCPUPlatform = minCPUPlatform
+	if volumeType != "" {
+		opts.PDVolumeType = volumeType
+	}
 
 	return opts
 }
@@ -161,10 +211,12 @@ func getAzureOpts(machineType string, zones []string) vm.ProviderOpts {
 // RoachprodOpts returns the opts to use when calling `roachprod.Create()`
 // in order to create the cluster described in the spec.
 func (s *ClusterSpec) RoachprodOpts(
-	clusterName string, useIOBarrier bool,
+	clusterName string, useIOBarrier bool, arch vm.CPUArch,
 ) (vm.CreateOpts, vm.ProviderOpts, error) {
 
 	createVMOpts := vm.DefaultCreateOpts()
+	// N.B. We set "usage=roachtest" as the default, custom label for billing tracking.
+	createVMOpts.CustomLabels = map[string]string{"usage": "roachtest"}
 	createVMOpts.ClusterName = clusterName
 	if s.Lifetime != 0 {
 		createVMOpts.Lifetime = s.Lifetime
@@ -192,29 +244,41 @@ func (s *ClusterSpec) RoachprodOpts(
 	}
 
 	createVMOpts.GeoDistributed = s.Geo
+	createVMOpts.Arch = string(arch)
 	machineType := s.InstanceType
 	ssdCount := s.SSDs
+
 	if s.CPUs != 0 {
 		// Default to the user-supplied machine type, if any.
 		// Otherwise, pick based on requested CPU count.
+		var selectedArch vm.CPUArch
+
 		if len(machineType) == 0 {
 			// If no machine type was specified, choose one
 			// based on the cloud and CPU count.
 			switch s.Cloud {
 			case AWS:
-				machineType = AWSMachineType(s.CPUs, s.HighMem)
+				machineType, selectedArch = AWSMachineType(s.CPUs, s.Mem, arch)
 			case GCE:
-				machineType = GCEMachineType(s.CPUs, s.HighMem)
+				machineType, selectedArch = GCEMachineType(s.CPUs, s.Mem, arch)
 			case Azure:
-				machineType = AzureMachineType(s.CPUs, s.HighMem)
+				machineType = AzureMachineType(s.CPUs, s.Mem)
 			}
+		}
+		if selectedArch != "" && selectedArch != arch {
+			// TODO(srosenberg): we need a better way to monitor the rate of this mismatch, i.e.,
+			// other than grepping cluster creation logs.
+			fmt.Printf("WARN: requested arch %s for machineType %s, but selected %s\n", arch, machineType, selectedArch)
+			createVMOpts.Arch = string(selectedArch)
 		}
 
 		// Local SSD can only be requested
 		// - if configured to prefer doing so,
 		// - if no particular volume size is requested, and,
 		// - on AWS, if the machine type supports it.
-		if s.PreferLocalSSD && s.VolumeSize == 0 && (s.Cloud != AWS || awsMachineSupportsSSD(machineType)) {
+		// - on GCE, if the machine type is not ARM64.
+		if s.PreferLocalSSD && s.VolumeSize == 0 && (s.Cloud != AWS || awsMachineSupportsSSD(machineType)) &&
+			(s.Cloud != GCE || selectedArch != vm.ArchARM64) {
 			// Ensure SSD count is at least 1 if UseLocalSSD is true.
 			if ssdCount == 0 {
 				ssdCount = 1
@@ -247,13 +311,21 @@ func (s *ClusterSpec) RoachprodOpts(
 		}
 	}
 
+	if createVMOpts.Arch == string(vm.ArchFIPS) && !(s.Cloud == GCE || s.Cloud == AWS) {
+		return vm.CreateOpts{}, nil, errors.Errorf(
+			"FIPS not yet supported on %s", s.Cloud,
+		)
+	}
 	var providerOpts vm.ProviderOpts
 	switch s.Cloud {
 	case AWS:
-		providerOpts = getAWSOpts(machineType, zones, s.VolumeSize, createVMOpts.SSDOpts.UseLocalSSD)
+		providerOpts = getAWSOpts(machineType, zones, s.VolumeSize, s.AWSVolumeThroughput,
+			createVMOpts.SSDOpts.UseLocalSSD)
 	case GCE:
 		providerOpts = getGCEOpts(machineType, zones, s.VolumeSize, ssdCount,
-			createVMOpts.SSDOpts.UseLocalSSD, s.RAID0, s.TerminateOnMigration)
+			createVMOpts.SSDOpts.UseLocalSSD, s.RAID0, s.TerminateOnMigration,
+			s.GCEMinCPUPlatform, s.GCEVolumeType,
+		)
 	case Azure:
 		providerOpts = getAzureOpts(machineType, zones)
 	}

@@ -90,6 +90,11 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 		}
 	}
 
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
+		return nil, err
+	}
+
 	return &createIndexNode{tableDesc: tableDesc, n: n}, nil
 }
 
@@ -162,6 +167,7 @@ func makeIndexDescriptor(
 
 	// Replace expression index elements with hidden virtual computed columns.
 	// The virtual columns are added as mutation columns to tableDesc.
+	activeVersion := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
 	if err := replaceExpressionElemsWithVirtualCols(
 		params.ctx,
 		tableDesc,
@@ -170,7 +176,7 @@ func makeIndexDescriptor(
 		n.Inverted,
 		false, /* isNewTable */
 		params.p.SemaCtx(),
-		params.ExecCfg().Settings.Version.ActiveVersion(params.ctx),
+		activeVersion,
 	); err != nil {
 		return nil, err
 	}
@@ -189,17 +195,22 @@ func makeIndexDescriptor(
 		return nil, pgerror.Newf(pgcode.DuplicateRelation, "index with name %q already exists", n.Name)
 	}
 
-	if err := checkIndexColumns(tableDesc, columns, n.Storing, n.Inverted); err != nil {
+	if err := checkIndexColumns(tableDesc, columns, n.Storing, n.Inverted, params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)); err != nil {
 		return nil, err
 	}
 
+	if !activeVersion.IsActive(clusterversion.V23_2_PartiallyVisibleIndexes) &&
+		n.Invisibility.Value > 0.0 && n.Invisibility.Value < 1.0 {
+		return nil, unimplemented.New("partially visible indexes", "partially visible indexes are not yet supported")
+	}
 	indexDesc := descpb.IndexDescriptor{
 		Name:              string(n.Name),
 		Unique:            n.Unique,
 		StoreColumnNames:  n.Storing.ToStrings(),
 		CreatedExplicitly: true,
 		CreatedAtNanos:    params.EvalContext().GetTxnTimestamp(time.Microsecond).UnixNano(),
-		NotVisible:        n.NotVisible,
+		NotVisible:        n.Invisibility.Value != 0.0,
+		Invisibility:      n.Invisibility.Value,
 	}
 
 	if n.Inverted {
@@ -308,9 +319,14 @@ func makeIndexDescriptor(
 }
 
 func checkIndexColumns(
-	desc catalog.TableDescriptor, columns tree.IndexElemList, storing tree.NameList, inverted bool,
+	desc catalog.TableDescriptor,
+	columns tree.IndexElemList,
+	storing tree.NameList,
+	inverted bool,
+	version clusterversion.ClusterVersion,
 ) error {
 	for i, colDef := range columns {
+		lastCol := i == len(columns)-1
 		col, err := catalog.MustFindColumnByTreeName(desc, colDef.Column)
 		if err != nil {
 			return errors.Wrapf(err, "finding column %d", i)
@@ -325,6 +341,20 @@ func checkIndexColumns(
 			return pgerror.New(pgcode.DatatypeMismatch,
 				"operator classes are only allowed for the last column of an inverted index")
 		}
+
+		// Checking if JSON Columns can be forward indexed for a given cluster version.
+		if col.GetType().Family() == types.JsonFamily && (!inverted || !lastCol) && !version.IsActive(clusterversion.V23_2) {
+			return errors.WithHint(
+				pgerror.Newf(
+					pgcode.InvalidTableDefinition,
+					"index element %s of type %s is not indexable in a non-inverted index",
+					col.GetName(),
+					col.GetType().Name(),
+				),
+				"you may want to create an inverted index instead. See the documentation for inverted indexes: "+docs.URL("inverted-indexes.html"),
+			)
+		}
+
 	}
 	for i, colName := range storing {
 		col, err := catalog.MustFindColumnByTreeName(desc, colName)
@@ -530,6 +560,18 @@ func replaceExpressionElemsWithVirtualCols(
 						elem.Expr.String(),
 					),
 					"consider adding a type cast to the expression",
+				)
+			}
+
+			if typ.Family() == types.JsonFamily && !version.IsActive(clusterversion.V23_2) {
+				return errors.WithHint(
+					pgerror.Newf(
+						pgcode.InvalidTableDefinition,
+						"index element %s of type %s is not indexable in a non-inverted index",
+						elem.Expr.String(),
+						typ.Name(),
+					),
+					"you may want to create an inverted index instead. See the documentation for inverted indexes: "+docs.URL("inverted-indexes.html"),
 				)
 			}
 
@@ -901,10 +943,9 @@ func (p *planner) configureZoneConfigForNewIndexPartitioning(
 
 		if err := ApplyZoneConfigForMultiRegionTable(
 			ctx,
-			p.Txn(),
+			p.InternalSQLTxn(),
 			p.ExecCfg(),
 			p.extendedEvalCtx.Tracing.KVTracingEnabled(),
-			p.Descriptors(),
 			regionConfig,
 			tableDesc,
 			applyZoneConfigForMultiRegionTableOptionNewIndexes(indexIDs...),

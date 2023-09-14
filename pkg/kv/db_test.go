@@ -21,9 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -112,6 +114,19 @@ func TestDB_GetForUpdate(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	result, err := db.GetForUpdate(context.Background(), "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResult(t, []byte(""), result.ValueBytes())
+}
+
+func TestDB_GetForShare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	result, err := db.GetForShare(context.Background(), "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,6 +385,32 @@ func TestDB_ScanForUpdate(t *testing.T) {
 	checkLen(t, len(expected), len(rows))
 }
 
+func TestDB_ScanForShare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Put("aa", "1")
+	b.Put("ab", "2")
+	b.Put("bb", "3")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.ScanForShare(context.Background(), "a", "b", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]byte{
+		"aa": []byte("1"),
+		"ab": []byte("2"),
+	}
+
+	checkRows(t, expected, rows)
+	checkLen(t, len(expected), len(rows))
+}
+
 func TestDB_ReverseScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -410,6 +451,32 @@ func TestDB_ReverseScanForUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows, err := db.ReverseScanForUpdate(context.Background(), "ab", "c", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]byte{
+		"bb": []byte("3"),
+		"ab": []byte("2"),
+	}
+
+	checkRows(t, expected, rows)
+	checkLen(t, len(expected), len(rows))
+}
+
+func TestDB_ReverseScanForShare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	defer s.Stopper().Stop(context.Background())
+
+	b := &kv.Batch{}
+	b.Put("aa", "1")
+	b.Put("ab", "2")
+	b.Put("bb", "3")
+	if err := db.Run(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.ReverseScanForShare(context.Background(), "ab", "c", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,10 +626,11 @@ func TestDB_DelRange(t *testing.T) {
 func TestTxn_Commit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	s, db := setup(t)
-	defer s.Stopper().Stop(context.Background())
+	defer s.Stopper().Stop(ctx)
 
-	err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		b := txn.NewBatch()
 		b.Put("aa", "1")
 		b.Put("ab", "2")
@@ -575,7 +643,7 @@ func TestTxn_Commit(t *testing.T) {
 	b := &kv.Batch{}
 	b.Get("aa")
 	b.Get("ab")
-	if err := db.Run(context.Background(), b); err != nil {
+	if err := db.Run(ctx, b); err != nil {
 		t.Fatal(err)
 	}
 	expected := map[string][]byte{
@@ -583,6 +651,27 @@ func TestTxn_Commit(t *testing.T) {
 		"ab": []byte("2"),
 	}
 	checkResults(t, expected, b.Results)
+}
+
+func TestTxn_Rollback(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	s, db := setup(t)
+	defer s.Stopper().Stop(ctx)
+
+	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		if err := txn.Put(ctx, "a", "1"); err != nil {
+			return err
+		}
+		return txn.Rollback(ctx)
+	})
+	require.NoError(t, err)
+
+	// Check that the transaction was rolled back.
+	r, err := db.Get(ctx, "a")
+	require.NoError(t, err)
+	require.False(t, r.Exists())
 }
 
 func TestDB_Put_insecure(t *testing.T) {
@@ -712,20 +801,31 @@ func TestDBDecommissionedOperations(t *testing.T) {
 	}
 }
 
-// TestGenerateForcedRetryableError verifies that GenerateForcedRetryableError
-// returns an error with a transaction that had the epoch bumped (and not epoch 0).
+// TestGenerateForcedRetryableError verifies that GenerateForcedRetryableErr
+// returns an error with a transaction that had the epoch bumped (and not epoch
+// 0) for isolation levels that cannot move their read timestamp between
+// operations.
 func TestGenerateForcedRetryableError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	s, db := setup(t)
-	defer s.Stopper().Stop(context.Background())
-	txn := db.NewTxn(ctx, "test: TestGenerateForcedRetryableError")
-	require.Equal(t, 0, int(txn.Epoch()))
-	err := txn.GenerateForcedRetryableError(ctx, "testing TestGenerateForcedRetryableError")
-	var retryErr *kvpb.TransactionRetryWithProtoRefreshError
-	require.True(t, errors.As(err, &retryErr))
-	require.Equal(t, 1, int(retryErr.Transaction.Epoch))
+	isolation.RunEachLevel(t, func(t *testing.T, isoLevel isolation.Level) {
+		ctx := context.Background()
+		s, db := setup(t)
+		defer s.Stopper().Stop(context.Background())
+		txn := db.NewTxn(ctx, "test: TestGenerateForcedRetryableError")
+		require.NoError(t, txn.SetIsoLevel(isoLevel))
+		require.Equal(t, 0, int(txn.Epoch()))
+		err := txn.GenerateForcedRetryableErr(ctx, "testing TestGenerateForcedRetryableError")
+		var retryErr *kvpb.TransactionRetryWithProtoRefreshError
+		require.True(t, errors.As(err, &retryErr))
+		var expEpoch enginepb.TxnEpoch
+		if isoLevel == isolation.ReadCommitted {
+			expEpoch = 0 // partial retry
+		} else {
+			expEpoch = 1 // full retry
+		}
+		require.Equal(t, expEpoch, retryErr.NextTransaction.Epoch)
+	})
 }
 
 // Get a retryable error within a db.Txn transaction and verify the retry
@@ -736,77 +836,83 @@ func TestGenerateForcedRetryableError(t *testing.T) {
 func TestDB_TxnRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	isolation.RunEachLevel(t, func(t *testing.T, isoLevel isolation.Level) {
+		testutils.RunTrueAndFalse(t, "returnNil", func(t *testing.T, returnNil bool) {
+			testDBTxnRetry(t, isoLevel, returnNil)
+		})
+	})
+}
+
+func testDBTxnRetry(t *testing.T, isoLevel isolation.Level, returnNil bool) {
 	s, db := setup(t)
 	defer s.Stopper().Stop(context.Background())
+	keyA := fmt.Sprintf("a_return_nil_%t", returnNil)
+	keyB := fmt.Sprintf("b_return_nil_%t", returnNil)
+	runNumber := 0
+	err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+		require.NoError(t, txn.SetIsoLevel(isoLevel))
+		require.NoError(t, txn.Put(ctx, keyA, "1"))
+		require.NoError(t, txn.Put(ctx, keyB, "1"))
 
-	testutils.RunTrueAndFalse(t, "returnNil", func(t *testing.T, returnNil bool) {
-		keyA := fmt.Sprintf("a_return_nil_%t", returnNil)
-		keyB := fmt.Sprintf("b_return_nil_%t", returnNil)
-		runNumber := 0
-		err := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
-			require.NoError(t, txn.Put(ctx, keyA, "1"))
-			require.NoError(t, txn.Put(ctx, keyB, "1"))
-
-			{
-				// High priority txn - will abort the other txn.
-				hpTxn := kv.NewTxn(ctx, db, 0)
-				require.NoError(t, hpTxn.SetUserPriority(roachpb.MaxUserPriority))
-				// Only write if we have not written before, because otherwise we will keep aborting
-				// the other txn forever.
-				r, err := hpTxn.Get(ctx, keyA)
-				require.NoError(t, err)
-				if !r.Exists() {
-					require.Zero(t, runNumber)
-					require.NoError(t, hpTxn.Put(ctx, keyA, "hp txn"))
-					require.NoError(t, hpTxn.Commit(ctx))
-				} else {
-					// We already wrote to keyA, meaning this is a retry, no need to write again.
-					require.Equal(t, 1, runNumber)
-					require.NoError(t, hpTxn.Rollback(ctx))
-				}
-			}
-
-			// Read, so that we'll get a retryable error.
-			r, err := txn.Get(ctx, keyA)
-			if runNumber == 0 {
-				// First run, we should get a retryable error.
+		{
+			// High priority txn - will abort the other txn.
+			hpTxn := kv.NewTxn(ctx, db, 0)
+			require.NoError(t, hpTxn.SetUserPriority(roachpb.MaxUserPriority))
+			// Only write if we have not written before, because otherwise we will keep aborting
+			// the other txn forever.
+			r, err := hpTxn.Get(ctx, keyA)
+			require.NoError(t, err)
+			if !r.Exists() {
 				require.Zero(t, runNumber)
-				require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
-				require.Equal(t, []byte(nil), r.ValueBytes())
-
-				// At this point txn is poisoned, and any op returns the same (poisoning) error.
-				r, err = txn.Get(ctx, keyB)
-				require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
-				require.Equal(t, []byte(nil), r.ValueBytes())
+				require.NoError(t, hpTxn.Put(ctx, keyA, "hp txn"))
+				require.NoError(t, hpTxn.Commit(ctx))
 			} else {
-				// The retry should succeed.
+				// We already wrote to keyA, meaning this is a retry, no need to write again.
 				require.Equal(t, 1, runNumber)
-				require.NoError(t, err)
-				require.Equal(t, []byte("1"), r.ValueBytes())
+				require.NoError(t, hpTxn.Rollback(ctx))
 			}
-			runNumber++
+		}
 
-			if returnNil {
-				return nil
-			}
-			// Return the retryable error.
-			return err
-		})
-		require.NoError(t, err)
-		require.Equal(t, 2, runNumber)
+		// Read, so that we'll get a retryable error.
+		r, err := txn.Get(ctx, keyA)
+		if runNumber == 0 {
+			// First run, we should get a retryable error.
+			require.Zero(t, runNumber)
+			require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
+			require.Equal(t, []byte(nil), r.ValueBytes())
 
-		err1 := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
-			// The high priority txn was overwritten by the successful retry.
-			kv, e1 := txn.Get(ctx, keyA)
-			require.NoError(t, e1)
-			require.Equal(t, []byte("1"), kv.ValueBytes())
-			kv, e2 := txn.Get(ctx, keyB)
-			require.NoError(t, e2)
-			require.Equal(t, []byte("1"), kv.ValueBytes())
+			// At this point txn is poisoned, and any op returns the same (poisoning) error.
+			r, err = txn.Get(ctx, keyB)
+			require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
+			require.Equal(t, []byte(nil), r.ValueBytes())
+		} else {
+			// The retry should succeed.
+			require.Equal(t, 1, runNumber)
+			require.NoError(t, err)
+			require.Equal(t, []byte("1"), r.ValueBytes())
+		}
+		runNumber++
+
+		if returnNil {
 			return nil
-		})
-		require.NoError(t, err1)
+		}
+		// Return the retryable error.
+		return err
 	})
+	require.NoError(t, err)
+	require.Equal(t, 2, runNumber)
+
+	err1 := db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
+		// The high priority txn was overwritten by the successful retry.
+		kv, e1 := txn.Get(ctx, keyA)
+		require.NoError(t, e1)
+		require.Equal(t, []byte("1"), kv.ValueBytes())
+		kv, e2 := txn.Get(ctx, keyB)
+		require.NoError(t, e2)
+		require.Equal(t, []byte("1"), kv.ValueBytes())
+		return nil
+	})
+	require.NoError(t, err1)
 }
 
 func TestPreservingSteppingOnSenderReplacement(t *testing.T) {
@@ -844,16 +950,16 @@ func TestPreservingSteppingOnSenderReplacement(t *testing.T) {
 		require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
 		pErr := (*kvpb.TransactionRetryWithProtoRefreshError)(nil)
 		require.ErrorAs(t, err, &pErr)
-		require.Equal(t, txn.ID(), pErr.TxnID)
+		require.Equal(t, txn.ID(), pErr.PrevTxnID)
 
 		// The transaction was aborted, therefore we should have a new transaction ID.
-		require.NotEqual(t, pErr.TxnID, pErr.Transaction.ID)
+		require.NotEqual(t, pErr.PrevTxnID, pErr.NextTransaction.ID)
 
 		// Reset the handle in order to get a new sender.
-		txn.PrepareForRetry(ctx)
+		require.NoError(t, txn.PrepareForRetry(ctx))
 
 		// Make sure we have a new txn ID.
-		require.NotEqual(t, pErr.TxnID, txn.ID())
+		require.NotEqual(t, pErr.PrevTxnID, txn.ID())
 
 		// Using ConfigureStepping() to read the current state.
 		require.Equal(t, expectedStepping, txn.ConfigureStepping(ctx, expectedStepping))

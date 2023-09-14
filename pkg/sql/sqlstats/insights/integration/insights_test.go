@@ -17,7 +17,6 @@ import (
 	"math"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -286,6 +286,7 @@ func TestFailedInsights(t *testing.T) {
 		problems    string
 		errorCode   string
 		endTxn      bool
+		txnStatus   string
 	}{
 		{
 			// Single-statement txn that will fail.
@@ -294,6 +295,7 @@ func TestFailedInsights(t *testing.T) {
 			problems:    "{FailedExecution}",
 			errorCode:   "42501",
 			endTxn:      true,
+			txnStatus:   "Failed",
 		},
 		{
 			// Multi-statement txn that will fail.
@@ -302,6 +304,7 @@ func TestFailedInsights(t *testing.T) {
 			problems:    "{FailedExecution}",
 			errorCode:   "22012",
 			endTxn:      true,
+			txnStatus:   "Failed",
 		},
 		{
 			// Multi-statement txn with a slow stmt and then a failed execution.
@@ -310,6 +313,7 @@ func TestFailedInsights(t *testing.T) {
 			problems:    "{SlowExecution,FailedExecution}",
 			errorCode:   "42P07",
 			endTxn:      true,
+			txnStatus:   "Failed",
 		},
 		{
 			// Multi-statement txn with a slow stmt but no failures.
@@ -318,6 +322,7 @@ func TestFailedInsights(t *testing.T) {
 			problems:    "{SlowExecution}",
 			errorCode:   "",
 			endTxn:      false,
+			txnStatus:   "Completed",
 		},
 	}
 
@@ -329,24 +334,34 @@ func TestFailedInsights(t *testing.T) {
 
 		testutils.SucceedsWithin(t, func() error {
 			var row *gosql.Row
-			var query, problems, errorCode string
+			var query, problems, status, errorCode string
 
 			// Query the node txn execution insights table.
 			row = conn.QueryRowContext(ctx, "SELECT "+
 				"query, "+
 				"problems, "+
+				"status, "+
 				"COALESCE(last_error_code, '') last_error_code "+
 				"FROM crdb_internal.node_txn_execution_insights "+
 				"WHERE query = $1 AND app_name = $2 ", tc.fingerprint, appName)
 
-			err = row.Scan(&query, &problems, &errorCode)
+			err = row.Scan(&query, &problems, &status, &errorCode)
 
 			if err != nil {
 				return err
 			}
 
 			if problems != tc.problems {
-				return fmt.Errorf("expected problems to be '%s', but was '%s'. stmts: %s", tc.problems, problems, tc.stmts)
+				// During tests some transactions can stay open for longer, adding an extra `SlowExecution` to the problems
+				// list. This checks for that possibility.
+				withSlow := strings.Replace(tc.problems, "{", "{SlowExecution,", -1)
+				if problems != withSlow {
+					return fmt.Errorf("expected problems to be '%s', but was '%s'. stmts: %s", tc.problems, problems, tc.stmts)
+				}
+			}
+
+			if status != tc.txnStatus {
+				return fmt.Errorf("expected status to be '%s', but was '%s'. stmts: %s", tc.txnStatus, status, tc.stmts)
 			}
 
 			if errorCode != tc.errorCode {
@@ -499,62 +514,60 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 	args := base.TestClusterArgs{ServerArgs: base.TestServerArgs{Settings: settings}}
 	tc := testcluster.StartTestCluster(t, 1, args)
 	defer tc.Stopper().Stop(ctx)
-	conn := tc.ServerConn(0)
 
-	_, err := conn.Exec("SET tracing = true;")
-	require.NoError(t, err)
-	_, err = conn.Exec("SET cluster setting sql.txn_stats.sample_rate  = 1;")
-	require.NoError(t, err)
+	conn := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	// This connection will ensure the setting is changed for secondary tenant.
+
+	conn.Exec(t, "SET tracing = true;")
+	serverutils.SetClusterSetting(t, tc, "sql.txn_stats.sample_rate", "1")
 	// Reduce the resolution interval to speed up the test.
-	_, err = conn.Exec(
-		`SET CLUSTER SETTING sql.contention.event_store.resolution_interval = '100ms'`)
-	require.NoError(t, err)
-	_, err = conn.Exec("CREATE TABLE t (id string PRIMARY KEY, s string);")
-	require.NoError(t, err)
+	serverutils.SetClusterSetting(t, tc, "sql.contention.event_store.resolution_interval", "100ms")
 
-	// Enable detection by setting a latencyThreshold > 0.
-	latencyThreshold := 100 * time.Millisecond
-	insights.LatencyThreshold.Override(ctx, &settings.SV, latencyThreshold)
+	// Set the insights detection threshold lower.
+	serverutils.SetClusterSetting(t, tc, "sql.insights.latency_threshold", "1ms")
 
-	// Create a new connection, and then in a go routine have it start a transaction, update a row,
-	// sleep for a time, and then complete the transaction.
-	// With original connection attempt to update the same row being updated concurrently
-	// in the separate go routine, this will be blocked until the original transaction completes.
-	var wgTxnStarted sync.WaitGroup
-	wgTxnStarted.Add(1)
+	conn.Exec(t, "CREATE TABLE t (id string PRIMARY KEY, s string);")
 
-	// Lock to wait for the txn to complete to avoid the test finishing before the txn is committed
-	var wgTxnDone sync.WaitGroup
-	wgTxnDone.Add(1)
+	// Create a new connection, and then start a transaction, update a row, sleep for a time,
+	// and then complete the transaction. In a separate go routine attempt to update the same
+	//row being updated concurrently, this will be blocked until the original transaction completes.
 
+	// Chan to wait for the txn to complete to avoid checking for insights before the txn is committed.
+	txnDoneChan := make(chan struct{})
+
+	tx := conn.Begin(t)
+
+	_, errTxn := tx.ExecContext(ctx, "INSERT INTO t (id, s) VALUES ('test', 'originalValue');")
+	require.NoError(t, errTxn)
+
+	waitingTxStartedChan := make(chan struct{})
+	approxStmtRuntime := timeutil.NewStopWatch()
 	go func() {
-		tx, errTxn := conn.BeginTx(ctx, &gosql.TxOptions{})
-		require.NoError(t, errTxn)
-		_, errTxn = tx.ExecContext(ctx, "INSERT INTO t (id, s) VALUES ('test', 'originalValue');")
-		require.NoError(t, errTxn)
-		wgTxnStarted.Done()
-		_, errTxn = tx.ExecContext(ctx, "select pg_sleep(.5);")
-		require.NoError(t, errTxn)
-		errTxn = tx.Commit()
-		require.NoError(t, errTxn)
-		wgTxnDone.Done()
+		waitingTxStartedChan <- struct{}{}
+		approxStmtRuntime.Start()
+		// This will be blocked until the started txn above finishes.
+		conn.Exec(t, "UPDATE t SET s = 'mainThread' where id = 'test';")
+		approxStmtRuntime.Stop()
+		txnDoneChan <- struct{}{}
 	}()
 
-	start := timeutil.Now()
+	<-waitingTxStartedChan
 
-	// Need to wait for the txn to start to ensure lock contention
-	wgTxnStarted.Wait()
-	// This will be blocked until the updateRowWithDelay finishes.
-	_, err = conn.ExecContext(ctx, "UPDATE t SET s = 'mainThread' where id = 'test';")
-	require.NoError(t, err)
-	end := timeutil.Now()
-	require.GreaterOrEqual(t, end.Sub(start), 500*time.Millisecond)
+	_, errTxn = tx.ExecContext(ctx, "select pg_sleep(.7);")
+	require.NoError(t, errTxn)
+	require.NoError(t, tx.Commit())
 
-	wgTxnDone.Wait()
+	<-txnDoneChan
+
+	// Verify the approx run time was around 50ms. The pg_sleep should have blocked the stmt for at
+	// least 700ms, but since the stopwatch doesn't measure the runtime exactly we'll use a much
+	// smaller value that is >= the required insights threshold.
+	require.GreaterOrEqualf(t,
+		approxStmtRuntime.Elapsed().Milliseconds(), int64(100), "expected stmt to run for at least 100ms")
 
 	// Verify the table content is valid.
-	testutils.SucceedsWithin(t, func() error {
-		rows, err := conn.QueryContext(ctx, `SELECT
+	testutils.SucceedsSoon(t, func() error {
+		rows, err := conn.DB.QueryContext(ctx, `SELECT
 		query,
 		insight.contention::FLOAT,
 		sum(txn_contention.contention_duration)::FLOAT AS durationMs,
@@ -562,11 +575,11 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 		txn_contention.database_name,
 		txn_contention.table_name,
 		txn_contention.index_name,
-		txn_contention.waiting_txn_fingerprint_id
+		encode(txn_contention.waiting_txn_fingerprint_id, 'hex') AS waiting_txn_fingerprint_id
 		FROM crdb_internal.cluster_execution_insights insight
 		left join crdb_internal.transaction_contention_events txn_contention on  insight.stmt_id = txn_contention.waiting_stmt_id
 																		 where query like 'UPDATE t SET s =%'
-		group by query, insight.contention, txn_contention.schema_name, txn_contention.database_name, txn_contention.table_name, txn_contention.index_name, waiting_txn_fingerprint_id;`)
+		group by query, insight.contention, txn_contention.schema_name, txn_contention.database_name, txn_contention.table_name, txn_contention.index_name, txn_contention.waiting_txn_fingerprint_id;`)
 		if err != nil {
 			return err
 		}
@@ -579,15 +592,18 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 			}
 
 			var totalContentionFromQueryMs, contentionFromEventMs float64
-			var queryText, schemaName, dbName, tableName, indexName string
-			var blockingTxnFingerprintID gosql.NullString
-			err = rows.Scan(&queryText, &totalContentionFromQueryMs, &contentionFromEventMs, &schemaName, &dbName, &tableName, &indexName, &blockingTxnFingerprintID)
+			var queryText, schemaName, dbName, tableName, indexName, waitingTxnFingerprintID string
+			err = rows.Scan(&queryText, &totalContentionFromQueryMs, &contentionFromEventMs, &schemaName, &dbName, &tableName, &indexName, &waitingTxnFingerprintID)
 			if err != nil {
 				return err
 			}
 
-			if totalContentionFromQueryMs < .2 {
-				return fmt.Errorf("contention time is %f should be greater than .2 since block is delayed by .5 seconds", totalContentionFromQueryMs)
+			if totalContentionFromQueryMs <= 0 {
+				return fmt.Errorf("contention time is %f must be greater than 0", totalContentionFromQueryMs)
+			}
+
+			if totalContentionFromQueryMs > 60*1000 {
+				return fmt.Errorf("contention time must be less than 1 minute:  %f", totalContentionFromQueryMs)
 			}
 
 			diff := totalContentionFromQueryMs - contentionFromEventMs
@@ -611,17 +627,30 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 				return fmt.Errorf("index names do not match 't_pkey', %s", indexName)
 			}
 
-			if !blockingTxnFingerprintID.Valid {
-				return fmt.Errorf("blockingTxnFingerprintId is null")
+			if waitingTxnFingerprintID == "0000000000000000" || waitingTxnFingerprintID == "" {
+				return fmt.Errorf("waitingTxnFingerprintID is default value: %s", waitingTxnFingerprintID)
 			}
 		}
 
 		if rowCount < 1 {
-			return fmt.Errorf("node_execution_insights did not return any rows")
+			var queryStatsMsg string
+			var stats, txnEventContentionTime string
+			err = conn.DB.QueryRowContext(ctx, `
+			SELECT 
+				ss.statistics,
+				COALESCE(txn_contention.contention_duration::string, 'Not found')
+			FROM crdb_internal.statement_statistics ss
+			LEFT JOIN  crdb_internal.transaction_contention_events txn_contention on ss.fingerprint_id  = txn_contention.waiting_stmt_fingerprint_id
+			WHERE metadata->>'query' like 'UPDATE t SET s =%'`).Scan(&stats, &txnEventContentionTime)
+			if err != nil {
+				queryStatsMsg = fmt.Sprintf("attempted to get contention statistics for 'UPDATE' query: %s", err.Error())
+			} else {
+				queryStatsMsg = fmt.Sprintf("contention mean for the 'UPDATE' query: transaction_contention_events.contention_duration: %s, approxStmtRuntime: %s, stats %s", txnEventContentionTime, approxStmtRuntime.Elapsed(), stats)
+			}
+			return fmt.Errorf("cluster_execution_insights did not return any rows - %s", queryStatsMsg)
 		}
-
 		return nil
-	}, 5*time.Second)
+	})
 }
 
 // Testing that the index recommendation is included

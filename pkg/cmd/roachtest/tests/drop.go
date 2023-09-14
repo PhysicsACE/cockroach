@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -86,7 +87,7 @@ func registerDrop(r registry.Registry) {
 			}
 
 			for j := 1; j <= nodes; j++ {
-				size, err := getDiskUsageInBytes(ctx, c, t.L(), j)
+				size, err := roachtestutil.GetDiskUsageInBytes(ctx, c, t.L(), j)
 				if err != nil {
 					return err
 				}
@@ -125,7 +126,7 @@ func registerDrop(r registry.Registry) {
 				sizeReport = ""
 				allNodesSpaceCleared = true
 				for j := 1; j <= nodes; j++ {
-					size, err := getDiskUsageInBytes(ctx, c, t.L(), j)
+					size, err := roachtestutil.GetDiskUsageInBytes(ctx, c, t.L(), j)
 					if err != nil {
 						return err
 					}
@@ -164,6 +165,7 @@ func registerDrop(r registry.Registry) {
 		Name:    fmt.Sprintf("drop/tpcc/w=%d,nodes=%d", warehouses, numNodes),
 		Owner:   registry.OwnerKV,
 		Cluster: r.MakeClusterSpec(numNodes),
+		Leases:  registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			// NB: this is likely not going to work out in `-local` mode. Edit the
 			// numbers during iteration.

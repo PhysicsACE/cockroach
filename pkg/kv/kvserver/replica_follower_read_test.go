@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -83,10 +84,12 @@ func TestCanServeFollowerRead(t *testing.T) {
 			txn := roachpb.MakeTransaction(
 				"test",
 				key,
+				isolation.Serializable,
 				roachpb.NormalUserPriority,
 				test.readTimestamp,
 				clock.MaxOffset().Nanoseconds(),
 				0, // coordinatorNodeID
+				0,
 			)
 
 			ba := &kvpb.BatchRequest{}
@@ -163,10 +166,12 @@ func TestCheckExecutionCanProceedAllowsFollowerReadWithInvalidLease(t *testing.T
 	txn := roachpb.MakeTransaction(
 		"test",
 		key,
+		isolation.Serializable,
 		roachpb.NormalUserPriority,
 		tsBelowClosedTimestamp,
 		clock.MaxOffset().Nanoseconds(),
 		0, // coordinatorNodeID
+		0,
 	)
 
 	ba := &kvpb.BatchRequest{}

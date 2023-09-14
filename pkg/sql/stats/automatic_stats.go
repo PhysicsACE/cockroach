@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -26,8 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -44,7 +43,7 @@ var AutomaticStatisticsClusterMode = settings.RegisterBoolSetting(
 	catpb.AutoStatsEnabledSettingName,
 	"automatic statistics collection mode",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // UseStatisticsOnSystemTables controls the cluster setting for enabling
 // statistics usage by the optimizer for planning queries involving system
@@ -54,7 +53,7 @@ var UseStatisticsOnSystemTables = settings.RegisterBoolSetting(
 	catpb.UseStatsOnSystemTables,
 	"when true, enables use of statistics on system tables by the query optimizer",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // AutomaticStatisticsOnSystemTables controls the cluster setting for enabling
 // automatic statistics collection on system tables. Auto stats must be enabled
@@ -65,7 +64,7 @@ var AutomaticStatisticsOnSystemTables = settings.RegisterBoolSetting(
 	catpb.AutoStatsOnSystemTables,
 	"when true, enables automatic collection of statistics on system tables",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // MultiColumnStatisticsClusterMode controls the cluster setting for enabling
 // automatic collection of multi-column statistics.
@@ -74,7 +73,7 @@ var MultiColumnStatisticsClusterMode = settings.RegisterBoolSetting(
 	"sql.stats.multi_column_collection.enabled",
 	"multi-column statistics collection mode",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // AutomaticStatisticsMaxIdleTime controls the maximum fraction of time that
 // the sampler processors will be idle when scanning large tables for automatic
@@ -85,45 +84,55 @@ var AutomaticStatisticsMaxIdleTime = settings.RegisterFloatSetting(
 	"sql.stats.automatic_collection.max_fraction_idle",
 	"maximum fraction of time that automatic statistics sampler processors are idle",
 	0.9,
-	func(val float64) error {
-		if val < 0 || val >= 1 {
-			return pgerror.Newf(pgcode.InvalidParameterValue,
-				"sql.stats.automatic_collection.max_fraction_idle must be >= 0 and < 1 but found: %v", val)
-		}
-		return nil
-	},
+	settings.FractionUpperExclusive,
 )
 
 // AutomaticStatisticsFractionStaleRows controls the cluster setting for
 // the target fraction of rows in a table that should be stale before
 // statistics on that table are refreshed, in addition to the constant value
 // AutomaticStatisticsMinStaleRows.
-var AutomaticStatisticsFractionStaleRows = func() *settings.FloatSetting {
-	s := settings.RegisterFloatSetting(
-		settings.TenantWritable,
-		catpb.AutoStatsFractionStaleSettingName,
-		"target fraction of stale rows per table that will trigger a statistics refresh",
-		0.2,
-		settings.NonNegativeFloat,
-	)
-	s.SetVisibility(settings.Public)
-	return s
-}()
+var AutomaticStatisticsFractionStaleRows = settings.RegisterFloatSetting(
+	settings.TenantWritable,
+	catpb.AutoStatsFractionStaleSettingName,
+	"target fraction of stale rows per table that will trigger a statistics refresh",
+	0.2,
+	settings.NonNegativeFloat,
+	settings.WithPublic,
+)
 
 // AutomaticStatisticsMinStaleRows controls the cluster setting for the target
 // number of rows that should be updated before a table is refreshed, in
 // addition to the fraction AutomaticStatisticsFractionStaleRows.
-var AutomaticStatisticsMinStaleRows = func() *settings.IntSetting {
-	s := settings.RegisterIntSetting(
-		settings.TenantWritable,
-		catpb.AutoStatsMinStaleSettingName,
-		"target minimum number of stale rows per table that will trigger a statistics refresh",
-		500,
-		settings.NonNegativeInt,
-	)
-	s.SetVisibility(settings.Public)
-	return s
-}()
+var AutomaticStatisticsMinStaleRows = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	catpb.AutoStatsMinStaleSettingName,
+	"target minimum number of stale rows per table that will trigger a statistics refresh",
+	500,
+	settings.NonNegativeInt,
+	settings.WithPublic,
+)
+
+// statsGarbageCollectionInterval controls the interval between running an
+// internal query to delete stats for dropped tables.
+var statsGarbageCollectionInterval = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"sql.stats.garbage_collection_interval",
+	"interval between deleting stats for dropped tables, set to 0 to disable",
+	time.Hour,
+	settings.NonNegativeDuration,
+)
+
+// statsGarbageCollectionLimit controls the limit on the number of dropped
+// tables that we delete stats for as part of the single "garbage sweep" (those
+// beyond the limit will need to wait out statsGarbageCollectionInterval until
+// the next "sweep").
+var statsGarbageCollectionLimit = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"sql.stats.garbage_collection_limit",
+	"limit on the number of dropped tables that stats are deleted for as part of a single statement",
+	1000,
+	settings.PositiveInt,
+)
 
 // DefaultRefreshInterval is the frequency at which the Refresher will check if
 // the stats for each table should be refreshed. It is mutable for testing.
@@ -242,6 +251,15 @@ type Refresher struct {
 
 	// numTablesEnsured is an internal counter for testing ensureAllTables.
 	numTablesEnsured int
+
+	// drainAutoStats is a channel that is closed when the server starts
+	// to shut down gracefully.
+	drainAutoStats chan struct{}
+	setDraining    sync.Once
+
+	// startedTasksWG is a sync group that tracks the auto-stats
+	// background tasks.
+	startedTasksWG sync.WaitGroup
 }
 
 // mutation contains metadata about a SQL mutation and is the message passed to
@@ -284,6 +302,7 @@ func MakeRefresher(
 		extraTime:        time.Duration(rand.Int63n(int64(time.Hour))),
 		mutationCounts:   make(map[descpb.ID]int64, 16),
 		settingOverrides: make(map[descpb.ID]catpb.AutoStatsSettings),
+		drainAutoStats:   make(chan struct{}),
 	}
 }
 
@@ -364,6 +383,23 @@ func (r *Refresher) getTableDescriptor(
 	return desc
 }
 
+// WaitForAutoStatsShutdown waits for all auto-stats tasks to shut down.
+func (r *Refresher) WaitForAutoStatsShutdown(ctx context.Context) {
+	log.Infof(ctx, "starting to wait for auto-stats tasks to shut down")
+	defer log.Infof(ctx, "auto-stats tasks successfully shut down")
+	r.startedTasksWG.Wait()
+}
+
+// SetDraining informs the job system if the node is draining.
+//
+// NB: Check the implementation of drain before adding code that would
+// make this block.
+func (r *Refresher) SetDraining() {
+	r.setDraining.Do(func() {
+		close(r.drainAutoStats)
+	})
+}
+
 // Start starts the stats refresher thread, which polls for messages about
 // new SQL mutations and refreshes the table statistics with probability
 // proportional to the percentage of rows affected.
@@ -371,7 +407,10 @@ func (r *Refresher) Start(
 	ctx context.Context, stopper *stop.Stopper, refreshInterval time.Duration,
 ) error {
 	bgCtx := r.AnnotateCtx(context.Background())
-	_ = stopper.RunAsyncTask(bgCtx, "refresher", func(ctx context.Context) {
+	r.startedTasksWG.Add(1)
+	if err := stopper.RunAsyncTask(bgCtx, "refresher", func(ctx context.Context) {
+		defer r.startedTasksWG.Done()
+
 		// We always sleep for r.asOfTime at the beginning of each refresh, so
 		// subtract it from the refreshInterval.
 		refreshInterval -= r.asOfTime
@@ -416,8 +455,11 @@ func (r *Refresher) Start(
 					}
 				}
 
+				r.startedTasksWG.Add(1)
 				if err := stopper.RunAsyncTask(
 					ctx, "stats.Refresher: maybeRefreshStats", func(ctx context.Context) {
+						defer r.startedTasksWG.Done()
+
 						// Record the start time of processing this batch of tables.
 						start := timeutil.Now()
 
@@ -428,6 +470,8 @@ func (r *Refresher) Start(
 						select {
 						case <-timerAsOf.C:
 							break
+						case <-r.drainAutoStats:
+							return
 						case <-stopper.ShouldQuiesce():
 							return
 						}
@@ -470,19 +514,23 @@ func (r *Refresher) Start(
 									explicitSettings = &settings
 								}
 							}
-							r.maybeRefreshStats(ctx, tableID, explicitSettings, rowsAffected, r.asOfTime)
+							r.maybeRefreshStats(ctx, stopper, tableID, explicitSettings, rowsAffected, r.asOfTime)
 
 							select {
 							case <-stopper.ShouldQuiesce():
 								// Don't bother trying to refresh the remaining tables if we
 								// are shutting down.
 								return
+							case <-r.drainAutoStats:
+								// Ditto.
+								return
 							default:
 							}
 						}
 						timer.Reset(refreshInterval)
 					}); err != nil {
-					log.Errorf(ctx, "failed to refresh stats: %v", err)
+					r.startedTasksWG.Done()
+					log.Errorf(ctx, "failed to start async stats task: %v", err)
 				}
 				// This clears out any tables that may have been added to the
 				// mutationCounts map by ensureAllTables and any mutation counts that
@@ -503,12 +551,73 @@ func (r *Refresher) Start(
 			case clusterSettingOverride := <-r.settings:
 				r.settingOverrides[clusterSettingOverride.tableID] = clusterSettingOverride.settings
 
+			case <-r.drainAutoStats:
+				log.Infof(ctx, "draining auto stats refresher")
+				return
 			case <-stopper.ShouldQuiesce():
 				log.Info(ctx, "quiescing auto stats refresher")
 				return
 			}
 		}
-	})
+	}); err != nil {
+		r.startedTasksWG.Done()
+		log.Warningf(ctx, "refresher task failed to start: %v", err)
+	}
+	// Start another task that will periodically run an internal query to delete
+	// stats for dropped tables.
+	r.startedTasksWG.Add(1)
+	if err := stopper.RunAsyncTask(bgCtx, "stats-garbage-collector", func(ctx context.Context) {
+		defer r.startedTasksWG.Done()
+		// This is a buffered channel because we will be sending on it from the
+		// callback when the corresponding setting changes. The buffer size of 1
+		// should be sufficient, but we use a larger buffer out of caution (in
+		// case the cluster setting is updated rapidly) - in order to not block
+		// the goroutine that is updating the settings.
+		intervalChangedCh := make(chan struct{}, 4)
+		// The stats-garbage-collector task is started only once globally, so
+		// we'll only add a single OnChange callback.
+		statsGarbageCollectionInterval.SetOnChange(&r.st.SV, func(ctx context.Context) {
+			select {
+			case intervalChangedCh <- struct{}{}:
+			default:
+			}
+		})
+		for {
+			interval := statsGarbageCollectionInterval.Get(&r.st.SV)
+			if interval == 0 {
+				// Zero interval disables the stats garbage collector, so we
+				// block until either it is enabled again or the node is
+				// quiescing.
+				select {
+				case <-intervalChangedCh:
+					continue
+				case <-r.drainAutoStats:
+					log.Infof(ctx, "draining stats garbage collector")
+					return
+				case <-stopper.ShouldQuiesce():
+					log.Infof(ctx, "quiescing stats garbage collector")
+					return
+				}
+			}
+			select {
+			case <-time.After(interval):
+			case <-intervalChangedCh:
+				continue
+			case <-r.drainAutoStats:
+				log.Infof(ctx, "draining stats garbage collector")
+				return
+			case <-stopper.ShouldQuiesce():
+				log.Infof(ctx, "quiescing stats garbage collector")
+				return
+			}
+			if err := deleteStatsForDroppedTables(ctx, r.ex, statsGarbageCollectionLimit.Get(&r.st.SV)); err != nil {
+				log.Warningf(ctx, "stats-garbage-collector encountered an error when deleting stats: %v", err)
+			}
+		}
+	}); err != nil {
+		r.startedTasksWG.Done()
+		log.Warningf(ctx, "stats-garbage-collector task failed to start: %v", err)
+	}
 	return nil
 }
 
@@ -522,11 +631,12 @@ FROM
 		AS OF SYSTEM TIME '-%s'
 WHERE
 	tbl.database_name IS NOT NULL
-	AND tbl.table_id NOT IN (%d, %d, %d, %d)  -- excluded system tables
+	AND tbl.table_id NOT IN (%d, %d, %d)  -- excluded system tables
 	AND tbl.drop_time IS NULL
 	AND (
 			crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', d.descriptor, false)->'table'->>'viewQuery'
 		) IS NULL
+	%s
 	%s`
 
 	explicitlyEnabledTablesPredicate = `AND
@@ -540,6 +650,10 @@ WHERE
 	 OR crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor',
 		d.descriptor, false)->'table'->'autoStatsSettings' ->> 'enabled' = 'true'
 	)`
+
+	autoStatsOnSystemTablesEnabledPredicate = `AND TRUE`
+
+	autoStatsOnSystemTablesDisabledPredicate = `AND tbl.database_name != 'system'`
 )
 
 func (r *Refresher) getApplicableTables(
@@ -585,29 +699,24 @@ func (r *Refresher) getApplicableTables(
 func (r *Refresher) ensureAllTables(
 	ctx context.Context, settings *settings.Values, initialTableCollectionDelay time.Duration,
 ) {
+	// A table-level setting of sql_stats_automatic_collection_enabled of null,
+	// meaning not set, or true qualifies rows we're interested in.
+	autoStatsPredicate := autoStatsEnabledOrNotSpecifiedPredicate
 	if !AutomaticStatisticsClusterMode.Get(settings) {
-		// Use a historical read so as to disable txn contention resolution.
-		// A table-level setting of sql_stats_automatic_collection_enabled=true is
-		// checked and only those tables are included in this scan.
-		getTablesWithAutoStatsExplicitlyEnabledQuery := fmt.Sprintf(
-			getAllTablesTemplateSQL,
-			initialTableCollectionDelay,
-			keys.TableStatisticsTableID, keys.LeaseTableID, keys.JobsTableID, keys.ScheduledJobsTableID,
-			explicitlyEnabledTablesPredicate,
-		)
-		r.getApplicableTables(ctx, getTablesWithAutoStatsExplicitlyEnabledQuery,
-			"get-tables-with-autostats-explicitly-enabled", false)
-		return
+		autoStatsPredicate = explicitlyEnabledTablesPredicate
+	}
+
+	systemTablesPredicate := autoStatsOnSystemTablesEnabledPredicate
+	if !AutomaticStatisticsOnSystemTables.Get(settings) {
+		systemTablesPredicate = autoStatsOnSystemTablesDisabledPredicate
 	}
 
 	// Use a historical read so as to disable txn contention resolution.
-	// A table-level setting of sql_stats_automatic_collection_enabled of null,
-	// meaning not set, or true qualifies rows we're interested in.
 	getAllTablesQuery := fmt.Sprintf(
 		getAllTablesTemplateSQL,
 		initialTableCollectionDelay,
-		keys.TableStatisticsTableID, keys.LeaseTableID, keys.JobsTableID, keys.ScheduledJobsTableID,
-		autoStatsEnabledOrNotSpecifiedPredicate,
+		keys.TableStatisticsTableID, keys.LeaseTableID, keys.ScheduledJobsTableID,
+		autoStatsPredicate, systemTablesPredicate,
 	)
 	r.getApplicableTables(ctx, getAllTablesQuery,
 		"get-tables", false)
@@ -676,6 +785,7 @@ func (r *Refresher) NotifyMutation(table catalog.TableDescriptor, rowsAffected i
 // for this table.
 func (r *Refresher) maybeRefreshStats(
 	ctx context.Context,
+	stopper *stop.Stopper,
 	tableID descpb.ID,
 	explicitSettings *catpb.AutoStatsSettings,
 	rowsAffected int64,
@@ -734,6 +844,7 @@ func (r *Refresher) maybeRefreshStats(
 		if errors.Is(err, ConcurrentCreateStatsError) {
 			// Another stats job was already running. Attempt to reschedule this
 			// refresh.
+			var newEvent mutation
 			if mustRefresh {
 				// For the cases where mustRefresh=true (stats don't yet exist or it
 				// has been 2x the average time since a refresh), we want to make sure
@@ -741,16 +852,29 @@ func (r *Refresher) maybeRefreshStats(
 				// cycle so that we have another chance to trigger a refresh. We pass
 				// rowsAffected=0 so that we don't force a refresh if another node has
 				// already done it.
-				r.mutations <- mutation{tableID: tableID, rowsAffected: 0}
+				newEvent = mutation{tableID: tableID, rowsAffected: 0}
 			} else {
 				// If this refresh was caused by a "dice roll", we want to make sure
 				// that the refresh is rescheduled so that we adhere to the
 				// AutomaticStatisticsFractionStaleRows statistical ideal. We
 				// ensure that the refresh is triggered during the next cycle by
 				// passing a very large number for rowsAffected.
-				r.mutations <- mutation{tableID: tableID, rowsAffected: math.MaxInt32}
+				newEvent = mutation{tableID: tableID, rowsAffected: math.MaxInt32}
 			}
-			return
+			select {
+			case r.mutations <- newEvent:
+				return
+			case <-r.drainAutoStats:
+				// Shutting down due to a graceful drain.
+				// We don't want to force a write to the mutations here
+				// otherwise we could block the graceful shutdown.
+				err = errors.New("server is shutting down")
+			case <-stopper.ShouldQuiesce():
+				// Shutting down due to direct stopper Stop call.
+				// This is not strictly required for correctness but
+				// helps avoiding log spam.
+				err = errors.New("server is shutting down")
+			}
 		}
 
 		// Log other errors but don't automatically reschedule the refresh, since
@@ -762,17 +886,19 @@ func (r *Refresher) maybeRefreshStats(
 
 func (r *Refresher) refreshStats(ctx context.Context, tableID descpb.ID, asOf time.Duration) error {
 	// Create statistics for all default column sets on the given table.
+	stmt := fmt.Sprintf(
+		"CREATE STATISTICS %s FROM [%d] WITH OPTIONS THROTTLING %g AS OF SYSTEM TIME '-%s'",
+		jobspb.AutoStatsName,
+		tableID,
+		AutomaticStatisticsMaxIdleTime.Get(&r.st.SV),
+		asOf.String(),
+	)
+	log.Infof(ctx, "automatically executing %q", stmt)
 	_ /* rows */, err := r.ex.Exec(
 		ctx,
 		"create-stats",
 		nil, /* txn */
-		fmt.Sprintf(
-			"CREATE STATISTICS %s FROM [%d] WITH OPTIONS THROTTLING %g AS OF SYSTEM TIME '-%s'",
-			jobspb.AutoStatsName,
-			tableID,
-			AutomaticStatisticsMaxIdleTime.Get(&r.st.SV),
-			asOf.String(),
-		),
+		stmt,
 	)
 	return err
 }

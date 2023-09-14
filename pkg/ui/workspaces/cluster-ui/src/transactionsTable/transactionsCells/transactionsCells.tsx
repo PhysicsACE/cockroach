@@ -25,22 +25,22 @@ const textWrapper = ownCellStyles("text-wrapper");
 const hoverAreaClassName = ownCellStyles("hover-area");
 
 interface TextCellProps {
+  appName: string;
   transactionText: string;
   transactionSummary: string;
-  aggregatedTs: string;
   transactionFingerprintId: string;
   search: string;
 }
 
 export const transactionLink = ({
+  appName,
   transactionText,
   transactionSummary,
-  aggregatedTs,
   transactionFingerprintId,
   search,
 }: TextCellProps): React.ReactElement => {
   const linkProps = {
-    aggregatedTs,
+    application: appName,
     transactionFingerprintId,
   };
 

@@ -69,9 +69,6 @@ func newAlterSchedulesTestHelper(t *testing.T) (*alterSchedulesTestHelper, func(
 
 	args := base.TestServerArgs{
 		ExternalIODir: dir,
-		// Some scheduled backup tests fail when run within a tenant. More
-		// investigation is required. Tracked with #76378.
-		DisableDefaultTestTenant: true,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: knobs,
 		},
@@ -81,7 +78,9 @@ func newAlterSchedulesTestHelper(t *testing.T) (*alterSchedulesTestHelper, func(
 	th.sqlDB = sqlutils.MakeSQLRunner(db)
 	th.server = s
 	th.sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '1MiB'`)
-	th.sqlDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`) // speeds up test
+	sysDB := sqlutils.MakeSQLRunner(s.SystemLayer().SQLConn(t, ""))
+	sysDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`) // speeds up test
+	sysDB.Exec(t, `ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
 
 	return th, func() {
 		dirCleanupFn()
@@ -105,7 +104,7 @@ INSERT INTO t1 values (1), (10), (100);
 `)
 
 	rows := th.sqlDB.Query(t,
-		`CREATE SCHEDULE FOR BACKUP t1 INTO 'nodelocal://0/backup/alter-schedule' RECURRING '@daily';`)
+		`CREATE SCHEDULE FOR BACKUP t1 INTO 'nodelocal://1/backup/alter-schedule' RECURRING '@daily';`)
 	require.NoError(t, rows.Err())
 
 	var scheduleID int64
@@ -136,8 +135,8 @@ INSERT INTO t1 values (1), (10), (100);
 	require.Equal(t, []string{"PAUSED: Waiting for initial backup to complete", "ACTIVE"}, statuses)
 	require.Equal(t, []string{"@daily", "@weekly"}, schedules)
 	require.Equal(t, []string{
-		"BACKUP TABLE mydb.public.t1 INTO LATEST IN 'nodelocal://0/backup/alter-schedule' WITH detached",
-		"BACKUP TABLE mydb.public.t1 INTO 'nodelocal://0/backup/alter-schedule' WITH detached",
+		"BACKUP TABLE mydb.public.t1 INTO LATEST IN 'nodelocal://1/backup/alter-schedule' WITH OPTIONS (detached)",
+		"BACKUP TABLE mydb.public.t1 INTO 'nodelocal://1/backup/alter-schedule' WITH OPTIONS (detached)",
 	},
 		backupStmts)
 

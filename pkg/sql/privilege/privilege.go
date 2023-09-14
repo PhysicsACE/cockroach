@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package privilege outlines the basic privilege system for cockroach.
 package privilege
 
 import (
@@ -18,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
+	"github.com/cockroachdb/redact/interfaces"
 )
 
 //go:generate stringer -type=Kind -linecomment
@@ -25,6 +28,11 @@ import (
 // Kind defines a privilege. This is output by the parser,
 // and used to generate the privilege bitfields in the PrivilegeDescriptor.
 type Kind uint32
+
+var _ redact.SafeValue = Kind(0)
+
+// SafeValue makes Kind a redact.SafeValue.
+func (k Kind) SafeValue() {}
 
 // List of privileges. ALL is specifically encoded so that it will automatically
 // pick up new privileges.
@@ -61,7 +69,19 @@ const (
 	CHANGEFEED               Kind = 26
 	VIEWJOB                  Kind = 27
 	MODIFYSQLCLUSTERSETTING  Kind = 28
+	REPLICATION              Kind = 29
+	MANAGETENANT             Kind = 30
+	VIEWSYSTEMTABLE          Kind = 31
+	CREATEROLE               Kind = 32
+	CREATELOGIN              Kind = 33
+	CREATEDB                 Kind = 34
+	CONTROLJOB               Kind = 35
+	largestKind                   = CONTROLJOB
 )
+
+var isDeprecatedKind = map[Kind]bool{
+	DEPRECATEDGRANT: true,
+}
 
 // Privilege represents a privilege parsed from an Access Privilege Inquiry
 // Function's privilege string argument.
@@ -74,8 +94,20 @@ type Privilege struct {
 	GrantOption bool
 }
 
+var _ redact.SafeFormatter = Privilege{}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (k Privilege) SafeFormat(s interfaces.SafePrinter, _ rune) {
+	s.Printf("[kind=%s grantOption=%t]", k.Kind, k.GrantOption)
+}
+
 // ObjectType represents objects that can have privileges.
 type ObjectType string
+
+var _ redact.SafeValue = ObjectType("")
+
+// SafeValue makes ObjectType a redact.SafeValue.
+func (k ObjectType) SafeValue() {}
 
 const (
 	// Any represents any object type.
@@ -114,7 +146,8 @@ var isDescriptorBacked = map[ObjectType]bool{
 
 // Predefined sets of privileges.
 var (
-	AllPrivileges         = List{ALL, CHANGEFEED, CONNECT, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, EXECUTE, BACKUP, RESTORE, EXTERNALIOIMPLICITACCESS, VIEWJOB}
+	// AllPrivileges is populated during init.
+	AllPrivileges         List
 	ReadData              = List{SELECT}
 	ReadWriteData         = List{SELECT, INSERT, DELETE, UPDATE}
 	ReadWriteSequenceData = List{SELECT, UPDATE, USAGE}
@@ -127,8 +160,12 @@ var (
 	// before v22.2 we treated Sequences the same as Tables. This is to avoid making
 	// certain privileges unavailable after upgrade migration.
 	// Note that "CREATE, CHANGEFEED, INSERT, DELETE, ZONECONFIG" are no-op privileges on sequences.
-	SequencePrivileges           = List{ALL, USAGE, SELECT, UPDATE, CREATE, CHANGEFEED, DROP, INSERT, DELETE, ZONECONFIG}
-	GlobalPrivileges             = List{ALL, BACKUP, RESTORE, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED, VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, VIEWCLUSTERMETADATA, VIEWDEBUG, EXTERNALIOIMPLICITACCESS, VIEWJOB, MODIFYSQLCLUSTERSETTING}
+	SequencePrivileges = List{ALL, USAGE, SELECT, UPDATE, CREATE, CHANGEFEED, DROP, INSERT, DELETE, ZONECONFIG}
+	GlobalPrivileges   = List{
+		ALL, BACKUP, RESTORE, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED,
+		VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, VIEWCLUSTERMETADATA, VIEWDEBUG, EXTERNALIOIMPLICITACCESS, VIEWJOB,
+		MODIFYSQLCLUSTERSETTING, REPLICATION, MANAGETENANT, VIEWSYSTEMTABLE, CREATEROLE, CREATELOGIN, CREATEDB, CONTROLJOB,
+	}
 	VirtualTablePrivileges       = List{ALL, SELECT}
 	ExternalConnectionPrivileges = List{ALL, USAGE, DROP}
 )
@@ -143,39 +180,25 @@ func (k Kind) IsSetIn(bits uint64) bool {
 	return bits&k.Mask() != 0
 }
 
-// ByName is a map of string -> kind value.
-var ByName = map[string]Kind{
-	"ALL":                      ALL,
-	"CHANGEFEED":               CHANGEFEED,
-	"CONNECT":                  CONNECT,
-	"CREATE":                   CREATE,
-	"DROP":                     DROP,
-	"SELECT":                   SELECT,
-	"INSERT":                   INSERT,
-	"DELETE":                   DELETE,
-	"UPDATE":                   UPDATE,
-	"ZONECONFIG":               ZONECONFIG,
-	"USAGE":                    USAGE,
-	"RULE":                     RULE,
-	"MODIFYCLUSTERSETTING":     MODIFYCLUSTERSETTING,
-	"EXTERNALCONNECTION":       EXTERNALCONNECTION,
-	"VIEWACTIVITY":             VIEWACTIVITY,
-	"VIEWACTIVITYREDACTED":     VIEWACTIVITYREDACTED,
-	"VIEWCLUSTERSETTING":       VIEWCLUSTERSETTING,
-	"CANCELQUERY":              CANCELQUERY,
-	"NOSQLLOGIN":               NOSQLLOGIN,
-	"EXECUTE":                  EXECUTE,
-	"VIEWCLUSTERMETADATA":      VIEWCLUSTERMETADATA,
-	"VIEWDEBUG":                VIEWDEBUG,
-	"BACKUP":                   BACKUP,
-	"RESTORE":                  RESTORE,
-	"EXTERNALIOIMPLICITACCESS": EXTERNALIOIMPLICITACCESS,
-	"VIEWJOB":                  VIEWJOB,
-	"MODIFYSQLCLUSTERSETTING":  MODIFYSQLCLUSTERSETTING,
-}
+// ByName is a map of string -> kind value. It is populated by init.
+var ByName map[string]Kind
 
 // List is a list of privileges.
 type List []Kind
+
+var _ redact.SafeFormatter = List{}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (pl List) SafeFormat(s interfaces.SafePrinter, _ rune) {
+	s.SafeString("[")
+	for i, p := range pl {
+		if i > 0 {
+			s.SafeString(",")
+		}
+		s.Print(p)
+	}
+	s.SafeString("]")
+}
 
 // Len, Swap, and Less implement the Sort interface.
 func (pl List) Len() int {
@@ -254,25 +277,33 @@ func (pl List) Contains(k Kind) bool {
 
 // ListFromBitField takes a bitfield of privileges and a ObjectType
 // returns a List. It is ordered in increasing value of privilege.Kind.
-func ListFromBitField(m uint64, objectType ObjectType) List {
+func ListFromBitField(m uint64, objectType ObjectType) (List, error) {
 	ret := List{}
 
-	privileges := GetValidPrivilegesForObject(objectType)
+	privileges, err := GetValidPrivilegesForObject(objectType)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, p := range privileges {
 		if m&p.Mask() != 0 {
 			ret = append(ret, p)
 		}
 	}
-	return ret
+	return ret, nil
 }
 
 // PrivilegesFromBitFields takes a bitfield of privilege kinds, a bitfield of grant options, and an ObjectType
 // returns a List. It is ordered in increasing value of privilege.Kind.
-func PrivilegesFromBitFields(kindBits, grantOptionBits uint64, objectType ObjectType) []Privilege {
+func PrivilegesFromBitFields(
+	kindBits, grantOptionBits uint64, objectType ObjectType,
+) ([]Privilege, error) {
 	var ret []Privilege
 
-	kinds := GetValidPrivilegesForObject(objectType)
+	kinds, err := GetValidPrivilegesForObject(objectType)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, kind := range kinds {
 		if mask := kind.Mask(); kindBits&mask != 0 {
@@ -282,21 +313,41 @@ func PrivilegesFromBitFields(kindBits, grantOptionBits uint64, objectType Object
 			})
 		}
 	}
-	return ret
+	return ret, nil
 }
+
+// Origin indicates the origin of the privileges being parsed in
+// ListFromStrings.
+type Origin bool
+
+const (
+	// OriginFromUserInput indicates that the privilege name came from user
+	// input and should be validated to make sure it refers to a real privilege.
+	OriginFromUserInput Origin = false
+
+	// OriginFromSystemTable indicates that the privilege name came from a
+	// system table and should be ignored if it does not refer to a real
+	// privilege.
+	OriginFromSystemTable Origin = true
+)
 
 // ListFromStrings takes a list of strings and attempts to build a list of Kind.
 // We convert each string to uppercase and search for it in the ByName map.
-// If an entry is not found in ByName, it is ignored.
-func ListFromStrings(strs []string) (List, error) {
+// If an entry is not found in ByName, it is either ignored or reports an error
+// depending on the purpose.
+func ListFromStrings(strs []string, origin Origin) (List, error) {
 	ret := make(List, len(strs))
 	for i, s := range strs {
 		k, ok := ByName[strings.ToUpper(s)]
 		if !ok {
-			// Ignore an unknown privilege name. This is so that it is possible to
-			// backport new privileges onto older release branches, without causing
-			// mixed-version compatibility issues.
-			continue
+			// Ignore an unknown privilege name if it came from a system table. This
+			// is so that it is possible to backport new privileges onto older release
+			// branches, without causing mixed-version compatibility issues.
+			if origin == OriginFromSystemTable {
+				continue
+			} else if origin == OriginFromUserInput {
+				return nil, errors.Errorf("not a valid privilege: %q", s)
+			}
 		}
 		ret[i] = k
 	}
@@ -306,7 +357,10 @@ func ListFromStrings(strs []string) (List, error) {
 // ValidatePrivileges returns an error if any privilege in
 // privileges cannot be granted on the given objectType.
 func ValidatePrivileges(privileges List, objectType ObjectType) error {
-	validPrivs := GetValidPrivilegesForObject(objectType)
+	validPrivs, err := GetValidPrivilegesForObject(objectType)
+	if err != nil {
+		return err
+	}
 	for _, priv := range privileges {
 		if validPrivs.ToBitField()&priv.Mask() == 0 {
 			return pgerror.Newf(pgcode.InvalidGrantOperation,
@@ -319,30 +373,30 @@ func ValidatePrivileges(privileges List, objectType ObjectType) error {
 
 // GetValidPrivilegesForObject returns the list of valid privileges for the
 // specified object type.
-func GetValidPrivilegesForObject(objectType ObjectType) List {
+func GetValidPrivilegesForObject(objectType ObjectType) (List, error) {
 	switch objectType {
 	case Table:
-		return TablePrivileges
+		return TablePrivileges, nil
 	case Schema:
-		return SchemaPrivileges
+		return SchemaPrivileges, nil
 	case Database:
-		return DBPrivileges
+		return DBPrivileges, nil
 	case Type:
-		return TypePrivileges
+		return TypePrivileges, nil
 	case Sequence:
-		return SequencePrivileges
+		return SequencePrivileges, nil
 	case Any:
-		return AllPrivileges
+		return AllPrivileges, nil
 	case Function:
-		return FunctionPrivileges
+		return FunctionPrivileges, nil
 	case Global:
-		return GlobalPrivileges
+		return GlobalPrivileges, nil
 	case VirtualTable:
-		return VirtualTablePrivileges
+		return VirtualTablePrivileges, nil
 	case ExternalConnection:
-		return ExternalConnectionPrivileges
+		return ExternalConnectionPrivileges, nil
 	default:
-		panic(errors.AssertionFailedf("unknown object type %s", objectType))
+		return nil, errors.AssertionFailedf("unknown object type %s", objectType)
 	}
 }
 
@@ -366,19 +420,26 @@ var orderedPrivs = List{CREATE, USAGE, INSERT, CONNECT, DELETE, SELECT, UPDATE, 
 // See: https://www.postgresql.org/docs/13/ddl-priv.html#PRIVILEGE-ABBREVS-TABLE
 //
 //	for privileges and their ACL abbreviations.
-func (pl List) ListToACL(grantOptions List, objectType ObjectType) string {
+func (pl List) ListToACL(grantOptions List, objectType ObjectType) (string, error) {
 	privileges := pl
 	// If ALL is present, explode ALL into the underlying privileges.
 	if pl.Contains(ALL) {
-		privileges = GetValidPrivilegesForObject(objectType)
+		var err error
+		privileges, err = GetValidPrivilegesForObject(objectType)
+		if err != nil {
+			return "", err
+		}
 		if grantOptions.Contains(ALL) {
-			grantOptions = GetValidPrivilegesForObject(objectType)
+			grantOptions, err = GetValidPrivilegesForObject(objectType)
+			if err != nil {
+				return "", err
+			}
 		}
 	}
 	chars := make([]string, len(privileges))
 	for _, privilege := range orderedPrivs {
 		if _, ok := privToACL[privilege]; !ok {
-			panic(errors.AssertionFailedf("unknown privilege type %s", privilege.String()))
+			return "", errors.AssertionFailedf("unknown privilege type %s", privilege.String())
 		}
 		if privileges.Contains(privilege) {
 			chars = append(chars, privToACL[privilege])
@@ -388,7 +449,7 @@ func (pl List) ListToACL(grantOptions List, objectType ObjectType) string {
 		}
 	}
 
-	return strings.Join(chars, "")
+	return strings.Join(chars, ""), nil
 
 }
 
@@ -407,4 +468,17 @@ type Object interface {
 	// GetName returns the name of the object. For example, the name of a
 	// table, schema or database.
 	GetName() string
+}
+
+func init() {
+	AllPrivileges = make([]Kind, 0, largestKind)
+	ByName = make(map[string]Kind)
+
+	for kind := ALL; kind <= largestKind; kind++ {
+		if isDeprecatedKind[kind] {
+			continue
+		}
+		AllPrivileges = append(AllPrivileges, kind)
+		ByName[kind.String()] = kind
+	}
 }

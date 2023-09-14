@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -34,7 +35,8 @@ func declareKeysGC(
 	rs ImmutableRangeState,
 	header *kvpb.Header,
 	req kvpb.Request,
-	latchSpans, _ *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
 ) {
 	gcr := req.(*kvpb.GCRequest)
@@ -278,9 +280,12 @@ func GC(
 		if !hint.IsEmpty() {
 			if hint.LatestRangeDeleteTimestamp.LessEq(gcThreshold) {
 				hint.ResetLatestRangeDeleteTimestamp()
-				res.Replicated.State = &kvserverpb.ReplicaState{
-					GCHint: hint,
+				// NB: Replicated.State can already contain GCThreshold from above. Make
+				// sure we don't accidentally remove it.
+				if res.Replicated.State == nil {
+					res.Replicated.State = &kvserverpb.ReplicaState{}
 				}
+				res.Replicated.State.GCHint = hint
 				if _, err := sl.SetGCHint(ctx, readWriter, cArgs.Stats, hint); err != nil {
 					return result.Result{}, err
 				}

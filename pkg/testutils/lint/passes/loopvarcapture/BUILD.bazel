@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -25,6 +24,18 @@ go_test(
     data = glob(["testdata/**"]) + [
         "@go_sdk//:files",
     ],
+    # N.B. We must disable CGO owing to a rather obscure failure [1].
+    #      It's surmised that the root cause is the missing CGO metadata
+    #      inside the test's runfiles directory. By disabling CGO, we're
+    #      allowing the go type checker to create a dummy object [2] without
+    #      causing a (type) resolution error.
+    #
+    # [1] https://github.com/golang/go/issues/36547
+    # [2] https://github.com/golang/tools/blob/master/go/packages/packages.go#L1056-L1064
+    #
+    env = {
+        "CGO_ENABLED": "0",
+    },
     deps = [
         ":loopvarcapture",
         "//pkg/build/bazel",
@@ -33,5 +44,3 @@ go_test(
         "@org_golang_x_tools//go/analysis/analysistest",
     ],
 )
-
-get_x_data(name = "get_x_data")

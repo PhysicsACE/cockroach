@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -81,7 +80,7 @@ var LoadBasedRebalancingMode = settings.RegisterEnumSetting(
 		int64(LBRebalancingLeasesOnly):        "leases",
 		int64(LBRebalancingLeasesAndReplicas): "leases and replicas",
 	},
-).WithPublic()
+	settings.WithPublic)
 
 // LBRebalancingMode controls if and when we do store-level rebalancing
 // based on load.
@@ -117,6 +116,17 @@ const (
 	RebalanceTargetFound
 )
 
+const (
+	// minLeaseLoadFraction is the minimum fraction of the local store's load a
+	// lease must contribute, in order to consider it worthwhile rebalancing when
+	// overfull.
+	minLeaseLoadFraction = 0.005
+	// minReplicaLoadFraction is the minimum fraction of the local store's load a
+	// replica (lease included) must contribute, in order to consider it
+	// worthwhile rebalancing when overfull.
+	minReplicaLoadFraction = 0.02
+)
+
 // StoreRebalancer is responsible for examining how the associated store's load
 // compares to the load on other stores in the cluster and transferring leases
 // or replicas away if the local store is overloaded.
@@ -129,16 +139,17 @@ const (
 // will best accomplish the store-level goals.
 type StoreRebalancer struct {
 	log.AmbientContext
-	metrics           StoreRebalancerMetrics
-	st                *cluster.Settings
-	storeID           roachpb.StoreID
-	allocator         allocatorimpl.Allocator
-	storePool         storepool.AllocatorStorePool
-	rr                RangeRebalancer
-	replicaRankings   *ReplicaRankings
-	getRaftStatusFn   func(replica CandidateReplica) *raft.Status
-	processTimeoutFn  func(replica CandidateReplica) time.Duration
-	objectiveProvider RebalanceObjectiveProvider
+	metrics                 StoreRebalancerMetrics
+	st                      *cluster.Settings
+	storeID                 roachpb.StoreID
+	allocator               allocatorimpl.Allocator
+	storePool               storepool.AllocatorStorePool
+	rr                      RangeRebalancer
+	replicaRankings         *ReplicaRankings
+	getRaftStatusFn         func(replica CandidateReplica) *raft.Status
+	processTimeoutFn        func(replica CandidateReplica) time.Duration
+	objectiveProvider       RebalanceObjectiveProvider
+	subscribedToSpanConfigs func() bool
 }
 
 // NewStoreRebalancer creates a StoreRebalancer to work in tandem with the
@@ -170,6 +181,17 @@ func NewStoreRebalancer(
 			return rq.processTimeoutFunc(st, replica.Repl())
 		},
 		objectiveProvider: objectiveProvider,
+		subscribedToSpanConfigs: func() bool {
+			// The store rebalancer makes use of span configs. Wait until we've
+			// established subscription.
+			if rq.store.cfg.SpanConfigSubscriber == nil {
+				// Testing-only branch. testContext-style tests do not configure a
+				// SpanConfigSubscriber, so they always return false from this function.
+				// This has the effect of disabling the StoreRebalancer.
+				return false
+			}
+			return !rq.store.cfg.SpanConfigSubscriber.LastUpdated().IsEmpty()
+		},
 	}
 	sr.AddLogTag("store-rebalancer", nil)
 	rq.store.metrics.registry.AddMetricStruct(&sr.metrics)
@@ -266,8 +288,14 @@ func (sr *StoreRebalancer) Start(ctx context.Context, stopper *stop.Stopper) {
 			if mode == LBRebalancingOff {
 				continue
 			}
-			hottestRanges := sr.replicaRankings.TopLoad()
+			if !sr.subscribedToSpanConfigs() {
+				continue
+			}
 			objective := sr.RebalanceObjective()
+			sr.AddLogTag("obj", objective)
+			ctx = sr.AnnotateCtx(ctx)
+
+			hottestRanges := sr.replicaRankings.TopLoad(objective.ToDimension())
 			options := sr.scorerOptions(ctx, objective.ToDimension())
 			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, mode)
 			sr.rebalanceStore(ctx, rctx)
@@ -476,7 +504,7 @@ func (sr *StoreRebalancer) applyLeaseRebalance(
 	ctx context.Context, candidateReplica CandidateReplica, target roachpb.ReplicaDescriptor,
 ) bool {
 	timeout := sr.processTimeoutFn(candidateReplica)
-	if err := contextutil.RunWithTimeout(ctx, "transfer lease", timeout, func(ctx context.Context) error {
+	if err := timeutil.RunWithTimeout(ctx, "transfer lease", timeout, func(ctx context.Context) error {
 		return sr.rr.TransferLease(
 			ctx,
 			candidateReplica,
@@ -485,7 +513,7 @@ func (sr *StoreRebalancer) applyLeaseRebalance(
 			candidateReplica.RangeUsageInfo(),
 		)
 	}); err != nil {
-		log.KvDistribution.Errorf(ctx, "unable to transfer lease to s%d: %+v", target.StoreID, err)
+		log.KvDistribution.Infof(ctx, "unable to transfer lease to s%d: %v", target.StoreID, err)
 		return false
 	}
 	return true
@@ -583,6 +611,7 @@ func (sr *StoreRebalancer) LogRangeRebalanceOutcome(ctx context.Context, rctx *R
 			"ran out of replicas worth transferring and load %s is still above desired threshold %s; will check again soon",
 			rctx.LocalDesc.Capacity.Load(), rctx.maxThresholds)
 		sr.metrics.ImbalancedStateOverfullOptionsExhausted.Inc(1)
+		return
 	}
 
 	// We successfully rebalanced below or equal to the max threshold,
@@ -614,9 +643,6 @@ func (sr *StoreRebalancer) RebalanceRanges(
 	)
 
 	if candidateReplica == nil {
-		log.KvDistribution.Infof(ctx,
-			"ran out of replicas worth transferring and load %s is still above desired threshold %s; will check again soon",
-			rctx.LocalDesc.Capacity.Load(), rctx.maxThresholds)
 		return NoRebalanceTarget, candidateReplica, voterTargets, nonVoterTargets
 	}
 
@@ -629,9 +655,8 @@ func (sr *StoreRebalancer) applyRangeRebalance(
 	voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
 ) bool {
 	descBeforeRebalance, _ := candidateReplica.DescAndSpanConfig()
-	log.KvDistribution.VEventf(
+	log.KvDistribution.Infof(
 		ctx,
-		1,
 		"rebalancing r%d (%s load) to better balance load: voters from %v to %v; non-voters from %v to %v",
 		candidateReplica.GetRangeID(),
 		candidateReplica.RangeUsageInfo().Load(),
@@ -642,7 +667,7 @@ func (sr *StoreRebalancer) applyRangeRebalance(
 	)
 
 	timeout := sr.processTimeoutFn(candidateReplica)
-	if err := contextutil.RunWithTimeout(ctx, "relocate range", timeout, func(ctx context.Context) error {
+	if err := timeutil.RunWithTimeout(ctx, "relocate range", timeout, func(ctx context.Context) error {
 		return sr.rr.RelocateRange(
 			ctx,
 			descBeforeRebalance.StartKey.AsRawKey(),
@@ -707,9 +732,8 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 		// Don't bother moving leases whose load is below some small fraction of the
 		// store's load. It's just unnecessary churn with no benefit to move leases
 		// responsible for, for example, 1 load unit on a store with 5000 load units.
-		const minLoadFraction = .001
 		if candidateReplica.RangeUsageInfo().TransferImpact().Dim(rctx.loadDimension) <
-			rctx.LocalDesc.Capacity.Load().Dim(rctx.loadDimension)*minLoadFraction {
+			rctx.LocalDesc.Capacity.Load().Dim(rctx.loadDimension)*minLeaseLoadFraction {
 			log.KvDistribution.VEventf(ctx, 3, "r%d's %s load is too little to matter relative to s%d's %s total load",
 				candidateReplica.GetRangeID(), candidateReplica.RangeUsageInfo().TransferImpact(),
 				rctx.LocalDesc.StoreID, rctx.LocalDesc.Capacity.Load())
@@ -734,6 +758,7 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 		candidate := sr.allocator.TransferLeaseTarget(
 			ctx,
 			sr.storePool,
+			desc,
 			conf,
 			candidates,
 			candidateReplica,
@@ -775,9 +800,8 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 			continue
 		}
 		if targetStore, ok := rctx.allStoresList.FindStoreByID(candidate.StoreID); ok {
-			log.KvDistribution.VEventf(
+			log.KvDistribution.Infof(
 				ctx,
-				1,
 				"transferring lease for r%d load=%s to store s%d load=%s from local store s%d load=%s",
 				desc.RangeID,
 				candidateReplica.RangeUsageInfo().TransferImpact(),
@@ -829,20 +853,11 @@ func (sr *StoreRebalancer) chooseRangeToRebalance(
 		// Don't bother moving ranges whose load is below some small fraction of the
 		// store's load. It's just unnecessary churn with no benefit to move ranges
 		// responsible for, for example, 1 load unit on a store with 5000 load units.
-		const minLoadFraction = .001
 		if candidateReplica.RangeUsageInfo().Load().Dim(rctx.loadDimension) <
-			rctx.LocalDesc.Capacity.Load().Dim(rctx.loadDimension)*minLoadFraction {
+			rctx.LocalDesc.Capacity.Load().Dim(rctx.loadDimension)*minReplicaLoadFraction {
 			log.KvDistribution.VEventf(
 				ctx,
 				5,
-				"r%d's %s load is too little to matter relative to s%d's %s total load",
-				candidateReplica.GetRangeID(),
-				candidateReplica.RangeUsageInfo().Load(),
-				rctx.LocalDesc.StoreID,
-				rctx.LocalDesc.Capacity.Load(),
-			)
-			log.KvDistribution.Infof(
-				ctx,
 				"r%d's %s load is too little to matter relative to s%d's %s total load",
 				candidateReplica.GetRangeID(),
 				candidateReplica.RangeUsageInfo().Load(),
@@ -946,6 +961,7 @@ func (sr *StoreRebalancer) chooseRangeToRebalance(
 		validTargets := sr.allocator.ValidLeaseTargets(
 			ctx,
 			sr.storePool,
+			rebalanceCtx.rangeDesc,
 			rebalanceCtx.conf,
 			targetVoterRepls,
 			rebalanceCtx.candidateReplica,

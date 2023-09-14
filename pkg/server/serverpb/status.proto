@@ -1,4 +1,4 @@
-// Copyright 2016 The Cockroach Authors.
+ // Copyright 2016 The Cockroach Authors.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt.
@@ -753,7 +753,7 @@ message GetFilesResponse {
 }
 
 message ProfileRequest {
-  // node_id is a string so that "local" can be used to specify that no
+  // node_id is a string so that "local" or "all" can be used to specify that no
   // forwarding is necessary. node_id translates to a KV node ID on a storage
   // server and SQL instance ID on a SQL only server.
   string node_id = 1;
@@ -771,7 +771,27 @@ message ProfileRequest {
   Type type = 5;
 
   int32 seconds = 6; // applies only to Type=CPU, defaults to 30
-  bool labels = 7; // applies only to Type=CPU, defaults to false
+
+  // Labels can be specified for Type=CPU or Type=GOROUTINE.
+  //
+  // - If true for CPU profiles, we request a CPU profile with pprof labels.
+  //
+  // - If true for GOROUTINE profiles, we request an aggregated goroutine
+  // profile with debug=1.
+  bool labels = 7;
+
+  // LabelFilter only applies to Type=GOROUTINE. Only goroutines with a pprof
+  // label matching the filter will be returned.
+  string label_filter = 9;
+
+  // SenderServerVersion is the server version of the node sending the Profile
+  // request. If this field is set then the node processing the request will
+  // only collect the profile if its server version is equal to the sender's
+  // server version.
+  //
+  // Currently, this is only used when collecting profiles that will be merged
+  // using pprof.Merge as all the samples must be from the same binary version.
+  cockroach.roachpb.Version sender_server_version = 8;
 }
 
 message MetricsRequest {
@@ -871,6 +891,9 @@ message TxnInfo {
   // Time elapsed since this transaction started execution.
   google.protobuf.Duration elapsed_time = 16
   [ (gogoproto.nullable) = false, (gogoproto.stdduration) = true ];
+
+  // The isolation level of the transaction.
+  string isolation_level = 17;
 }
 
 // ActiveQuery represents a query in flight on some Session.
@@ -1136,11 +1159,6 @@ message ListDistSQLFlowsRequest {}
 // same physical plan. The gateway node that initiated the execution of the plan
 // isn't included.
 message DistSQLRemoteFlows {
-  enum Status {
-    RUNNING = 0;
-    QUEUED = 1;
-  }
-
   // Info contains an information about a single DistSQL remote flow.
   message Info {
     // NodeID is the node on which this remote flow is either running or queued.
@@ -1152,9 +1170,7 @@ message DistSQLRemoteFlows {
       (gogoproto.nullable) = false, (gogoproto.stdtime) = true
     ];
 
-    // Status is the current status of this remote flow.
-    // TODO(yuzefovich): remove this in 23.2.
-    Status status = 3;
+    reserved 3;
 
     // Stmt is the SQL statement for which this flow is executing.
     string stmt = 4;
@@ -1595,6 +1611,11 @@ message StatementsResponse {
     uint64 id = 3 [(gogoproto.customname) = "ID",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.StmtFingerprintID"];
     cockroach.sql.StatementStatistics stats = 2 [(gogoproto.nullable) = false];
+    // In 23.1 we expect the response to only group on fingerprint_id and app_name
+    // in the overview page. We now return the aggregated list of unique txn fingerprint ids,
+    // leaving the txn_fingerprint_id field in the key empty.
+   repeated uint64 txn_fingerprint_ids = 4 [(gogoproto.customname) = "TxnFingerprintIDs",
+     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.TransactionFingerprintID"];
   }
 
   repeated CollectedStatementStatistics statements = 1 [(gogoproto.nullable) = false];
@@ -1613,12 +1634,70 @@ message StatementsResponse {
   // Transactions is transaction-level statistics for the collection of
   // statements in this response.
   repeated ExtendedCollectedTransactionStatistics transactions = 5 [(gogoproto.nullable) = false];
+
+  float stmts_total_runtime_secs = 6;
+
+  float txns_total_runtime_secs = 7;
+
+  // OldestAggregatedTsReturned is the timestamp of the oldest entry returned,
+  // or null if there is no data returned.
+  google.protobuf.Timestamp oldest_aggregated_ts_returned = 8 [(gogoproto.stdtime) = true];
+
+  // StmtsSourceTable returns the table used to return the statements data.
+  string stmts_source_table = 9;
+
+  // TxnsSourceTable returns the table used to return the transactions data.
+  string txns_source_table = 10;
 }
 
+enum StatsSortOptions {
+  // Sort options that exist on the top Activity tables.
+  SERVICE_LAT = 0;
+  CPU_TIME = 1;
+  EXECUTION_COUNT = 2;
+  P99_STMTS_ONLY = 3;
+  CONTENTION_TIME = 4;
+  PCT_RUNTIME = 5;
+  // Sort options only available on default stats tables.
+  LATENCY_INFO_P50 = 6;
+  LATENCY_INFO_P90 = 7;
+  LATENCY_INFO_MIN = 8;
+  LATENCY_INFO_MAX = 9;
+  ROWS_PROCESSED = 10;
+  MAX_MEMORY = 11;
+  NETWORK = 12;
+  RETRIES = 13;
+  LAST_EXEC = 14;
+}
 message CombinedStatementsStatsRequest {
+  enum StatsType {
+    StmtStatsOnly = 0;
+    TxnStatsOnly = 1;
+  }
+
+  message FetchMode {
+    StatsType stats_type = 1;
+    StatsSortOptions sort = 2;
+  }
+
   // Unix time range for aggregated statements.
   int64 start = 1 [(gogoproto.nullable) = true];
   int64 end = 2 [(gogoproto.nullable) = true];
+
+  // Note that if fetch_mode is set to transactions only, we will also
+  // include the statement statistics for the stmts in the transactions
+  // response. This is more of a hack-y method to get the complete stats
+  // for txns, because in the client we need to fill in some txn stats info
+  // from its stmt stats, such as the query string.
+  //
+  // We prefer this hackier method right now to reduce surface area for backporting
+  // these changes, but in the future we will introduce more endpoints to properly
+  // organize these differing requests.
+  // TODO (xinhaoz) - Split this API into stmts and txns properly instead of using
+  //  this param.
+  FetchMode fetch_mode = 5 [(gogoproto.nullable) = true];
+
+  int64 limit = 6;
 }
 
 // StatementDetailsRequest requests the details of a Statement, based on its keys.
@@ -1731,6 +1810,17 @@ message CreateStatementDiagnosticsReportRequest {
   // likelihood? Or provide a hint for how long T is for the currently chosen
   // sampling probability.
   double sampling_probability = 4;
+  // PlanGist, when set, indicates a particular plan that we want collect
+  // diagnostics for. This can be useful when a single fingerprint can result in
+  // multiple plans.
+  //
+  // There is a caveat to using this filtering: since the plan gist for a
+  // running query is only available after the optimizer has done its part, the
+  // trace will only include things after the optimizer is done.
+  string plan_gist = 5;
+  // AntiPlanGist, when set, indicates that any plan not matching PlanGist will
+  // do.
+  bool anti_plan_gist = 6;
 }
 
 message CreateStatementDiagnosticsReportResponse {
@@ -1844,7 +1934,7 @@ message TableIndexStatsResponse {
     // create_statement is the SQL statement that would re-create the
     // current index if executed.
     string create_statement = 4;
-    // CreatedAt is an approximate timestamp at which the index was created.
+    // created_at is an approximate timestamp at which the index was created.
     // Note that it may not always be populated.
     google.protobuf.Timestamp created_at = 5 [(gogoproto.stdtime) = true];
     // index_id is the ID of the index.
@@ -1936,6 +2026,79 @@ message CriticalNodesResponse {
   repeated roachpb.NodeDescriptor critical_nodes = 1 [(gogoproto.nullable) = false];
   roachpb.SpanConfigConformanceReport report = 2 [(gogoproto.nullable) = false];
 }
+
+message NetworkConnectivityRequest {
+  string node_id = 1 [
+    (gogoproto.customname) = "NodeID"
+  ];
+}
+
+message NetworkConnectivityResponse {
+  enum ConnectionStatus {
+    // Indicates that system couldn't get information about nodes connection.
+    UNKNOWN = 0;
+    // Source node established connection to target node.
+    ESTABLISHED = 1;
+    // Indicates that node is attempting to establish connection to target node for the first time.
+    ESTABLISHING = 2;
+    // Indicates that connection state is unhealthy.
+    ERROR = 3;
+  }
+
+  message Peer {
+    google.protobuf.Duration latency = 1 [
+      (gogoproto.nullable) = false,
+      (gogoproto.stdduration) = true
+    ];
+    ConnectionStatus status = 2;
+    string address = 4;
+    roachpb.Locality locality = 5;
+    string error = 6;
+  }
+
+  message Connectivity {
+    map<int32, Peer> peers = 1 [
+      (gogoproto.nullable) = false,
+      (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
+    ];
+  }
+
+  map<int32, Connectivity> connections = 1 [
+    (gogoproto.nullable) = false,
+    (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"
+  ];
+
+  // errors contains any errors that occurred during fan-out calls to other nodes.
+  map<int32, string> errors_by_node_id = 2 [
+    (gogoproto.castkey) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID",
+    (gogoproto.customname) = "ErrorsByNodeID",
+    (gogoproto.nullable) = false
+  ];
+}
+
+message RequestJobProfilerExecutionDetailsRequest {
+  int64 job_id = 1;
+}
+
+message RequestJobProfilerExecutionDetailsResponse {}
+
+ message GetJobProfilerExecutionDetailRequest {
+   int64 job_id = 1;
+   string filename = 2;
+ }
+
+ message GetJobProfilerExecutionDetailResponse {
+   bytes data = 1;
+ }
+
+ message ListJobProfilerExecutionDetailsRequest {
+  int64 job_id = 1;
+ }
+
+ message ListJobProfilerExecutionDetailsResponse {
+   repeated string files = 1;
+ }
+
 
 service Status {
   // Certificates retrieves a copy of the TLS certificates.
@@ -2300,6 +2463,7 @@ service Status {
       get: "/_status/combinedstmts"
     };
   }
+
   rpc StatementDetails(StatementDetailsRequest) returns (StatementDetailsResponse) {
     option (google.api.http) = {
       get: "/_status/stmtdetails/{fingerprint_id}"
@@ -2398,4 +2562,30 @@ service Status {
   // ListExecutionInsights returns potentially problematic statements cluster-wide,
   // along with actions we suggest the application developer might take to remedy them.
   rpc ListExecutionInsights(ListExecutionInsightsRequest) returns (ListExecutionInsightsResponse) {}
+
+  rpc NetworkConnectivity(NetworkConnectivityRequest) returns (NetworkConnectivityResponse) {
+    option (google.api.http) = {
+      get: "/_status/connectivity"
+    };
+  }
+
+  rpc RequestJobProfilerExecutionDetails(RequestJobProfilerExecutionDetailsRequest) returns(RequestJobProfilerExecutionDetailsResponse) {
+    option (google.api.http) = {
+      get: "/_status/request_job_profiler_execution_details/{job_id}"
+    };
+  }
+
+
+  rpc GetJobProfilerExecutionDetails(GetJobProfilerExecutionDetailRequest) returns (GetJobProfilerExecutionDetailResponse) {
+    option (google.api.http) = {
+      get: "/_status/job_profiler_execution_details/{job_id}"
+    };
+  }
+
+  rpc ListJobProfilerExecutionDetails(ListJobProfilerExecutionDetailsRequest) returns
+    (ListJobProfilerExecutionDetailsResponse) {
+    option (google.api.http) = {
+      get: "/_status/list_job_profiler_execution_details/{job_id}"
+    };
+  }
 }

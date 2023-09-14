@@ -112,9 +112,11 @@ type CreatePartitioningCCLCallback func(
 // - errors are panicked;
 // - caches are avoided at all times, we read straight from storage;
 // - MayResolve* methods return zero values if nothing could be found;
-// - MayResolve* methods ignore dropped or offline descriptors;
-// - MustReadDescriptor does not;
+// - MayResolve* methods ignore dropped and offline descriptors*;
+// - MustReadDescriptor searches all public, offline, and dropped descriptors;
 // - MustReadDescriptor panics if the descriptor was not found.
+//
+// *: MayResolveSchema allows us to resolve an offline schema descriptor if needed.
 type CatalogReader interface {
 	tree.TypeReferenceResolver
 	tree.QualifiedNameResolver
@@ -124,12 +126,13 @@ type CatalogReader interface {
 	MayResolveDatabase(ctx context.Context, name tree.Name) catalog.DatabaseDescriptor
 
 	// MayResolveSchema looks up a schema by name.
-	MayResolveSchema(ctx context.Context, name tree.ObjectNamePrefix) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
+	// If withOffline is set, we include offline schema descs into our search.
+	MayResolveSchema(ctx context.Context, name tree.ObjectNamePrefix, withOffline bool) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
 
-	// MustResolvePrefix looks up a database and schema given the prefix at best
+	// MayResolvePrefix looks up a database and schema given the prefix at best
 	// effort, meaning the prefix may not have explicit catalog and schema name.
 	// It fails if the db or schema represented by the prefix does not exist.
-	MustResolvePrefix(ctx context.Context, name tree.ObjectNamePrefix) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
+	MayResolvePrefix(ctx context.Context, name tree.ObjectNamePrefix) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
 
 	// MayResolveTable looks up a table by name.
 	MayResolveTable(ctx context.Context, name tree.UnresolvedObjectName) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor)
@@ -244,3 +247,12 @@ type ReferenceProvider interface {
 type ReferenceProviderFactory interface {
 	NewReferenceProvider(ctx context.Context, stmt tree.Statement) (ReferenceProvider, error)
 }
+
+// Export dependency interfaces.
+// These are defined in the scbuildstmts package instead of scbuild to avoid
+// circular import dependencies.
+type (
+	// FeatureChecker contains operations for checking if a schema change
+	// feature is allowed by the database administrator.
+	FeatureChecker = scbuildstmt.SchemaFeatureChecker
+)

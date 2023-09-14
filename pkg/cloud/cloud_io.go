@@ -39,14 +39,14 @@ var Timeout = settings.RegisterDurationSetting(
 	"cloudstorage.timeout",
 	"the timeout for import/export storage operations",
 	10*time.Minute,
-).WithPublic()
+	settings.WithPublic)
 
 var httpCustomCA = settings.RegisterStringSetting(
 	settings.TenantWritable,
 	"cloudstorage.http.custom_ca",
 	"custom root CA (appended to system's default CAs) for verifying certificates when interacting with HTTPS storage",
 	"",
-).WithPublic()
+	settings.WithPublic)
 
 // WriteChunkSize is used to control the size of each chunk that is buffered and
 // uploaded by the cloud storage client.
@@ -55,6 +55,13 @@ var WriteChunkSize = settings.RegisterByteSizeSetting(
 	"cloudstorage.write_chunk.size",
 	"controls the size of each file chunk uploaded by the cloud storage client",
 	8<<20,
+)
+
+var retryConnectionTimedOut = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"cloudstorage.connection_timed_out_retries.enabled",
+	"retry generic connection timed out errors; use with extreme caution",
+	false,
 )
 
 // HTTPRetryOptions defines the tunable settings which control the retry of HTTP
@@ -147,19 +154,40 @@ func IsResumableHTTPError(err error) bool {
 		sysutil.IsErrConnectionRefused(err)
 }
 
+// ResumingReaderRetryOnErrFnForSettings returns a function that can
+// be passed as a RetryOnErrFn to NewResumingReader.
+func ResumingReaderRetryOnErrFnForSettings(
+	ctx context.Context, st *cluster.Settings,
+) func(error) bool {
+	return func(err error) bool {
+		if IsResumableHTTPError(err) {
+			return true
+		}
+
+		retryTimeouts := retryConnectionTimedOut.Get(&st.SV)
+		if retryTimeouts && sysutil.IsErrTimedOut(err) {
+			log.Warningf(ctx, "retrying connection timed out because %s = true", retryConnectionTimedOut.Name())
+			return true
+		}
+		return false
+	}
+}
+
 // Maximum number of times we can attempt to retry reading from external storage,
 // without making any progress.
 const maxNoProgressReads = 3
 
 // ReaderOpenerAt describes a function that opens a ReadCloser at the passed
 // offset.
-type ReaderOpenerAt func(ctx context.Context, pos int64) (io.ReadCloser, error)
+type ReaderOpenerAt func(ctx context.Context, pos int64) (io.ReadCloser, int64, error)
 
 // ResumingReader is a reader which retries reads in case of a transient errors.
 type ResumingReader struct {
 	Opener       ReaderOpenerAt   // Get additional content
 	Reader       io.ReadCloser    // Currently opened reader
+	Filename     string           // Used for logging
 	Pos          int64            // How much data was received so far
+	Size         int64            // Total size of the file
 	RetryOnErrFn func(error) bool // custom retry-on-error function
 	// ErrFn injects a delay between retries on errors. nil means no delay.
 	ErrFn func(error) time.Duration
@@ -167,12 +195,17 @@ type ResumingReader struct {
 
 var _ ioctx.ReadCloserCtx = &ResumingReader{}
 
-// NewResumingReader returns a ResumingReader instance.
+// NewResumingReader returns a ResumingReader instance. Reader does not have to
+// be provided, and will be created with the opener if it's not provided. Size
+// can also be empty, and will be determined by the opener on the next open of
+// the file.
 func NewResumingReader(
 	ctx context.Context,
 	opener ReaderOpenerAt,
 	reader io.ReadCloser,
 	pos int64,
+	size int64,
+	filename string,
 	retryOnErrFn func(error) bool,
 	errFn func(error) time.Duration,
 ) *ResumingReader {
@@ -180,6 +213,8 @@ func NewResumingReader(
 		Opener:       opener,
 		Reader:       reader,
 		Pos:          pos,
+		Size:         size,
+		Filename:     filename,
 		RetryOnErrFn: retryOnErrFn,
 		ErrFn:        errFn,
 	}
@@ -192,10 +227,21 @@ func NewResumingReader(
 
 // Open opens the reader at its current offset.
 func (r *ResumingReader) Open(ctx context.Context) error {
+	if r.Size > 0 && r.Pos >= r.Size {
+		// Don't try to open a file if the size has been set and the position is
+		// at size. This generally results in an invalid range error for the
+		// request. Note that we still allow reads at Pos 0 even if Size is 0
+		// since this seems to be allowed in the cloud SDKs.
+		return io.EOF
+	}
+
 	return DelayedRetry(ctx, "Open", r.ErrFn, func() error {
 		var readErr error
-		r.Reader, readErr = r.Opener(ctx, r.Pos)
-		return readErr
+		r.Reader, r.Size, readErr = r.Opener(ctx, r.Pos)
+		if readErr != nil {
+			return errors.Wrapf(readErr, "open %s", r.Filename)
+		}
+		return nil
 	})
 }
 
@@ -204,6 +250,8 @@ func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
 	ctx, sp := tracing.ChildSpan(ctx, "cloud.ResumingReader.Read")
 	defer sp.Finish()
 
+	var read int
+
 	var lastErr error
 	for retries := 0; lastErr == nil; retries++ {
 		if r.Reader == nil {
@@ -211,24 +259,29 @@ func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
 		}
 
 		if lastErr == nil {
-			n, readErr := r.Reader.Read(p)
+			n, readErr := r.Reader.Read(p[read:])
+			read += n
+			r.Pos += int64(n)
 			if readErr == nil || readErr == io.EOF {
-				r.Pos += int64(n)
-				return n, readErr
+				return read, readErr
 			}
-			lastErr = readErr
+			if r.Size > 0 && r.Pos == r.Size {
+				log.Warningf(ctx, "read %s ignoring read error received after completed read (%d): %v", r.Filename, r.Pos, readErr)
+				return read, io.EOF
+			}
+			lastErr = errors.Wrapf(readErr, "read %s", r.Filename)
 		}
 
 		if !errors.IsAny(lastErr, io.EOF, io.ErrUnexpectedEOF) {
-			log.Errorf(ctx, "Read err: %s", lastErr)
+			log.Errorf(ctx, "%s", lastErr)
 		}
 
 		// Use the configured retry-on-error decider to check for a resumable error.
 		if r.RetryOnErrFn(lastErr) {
 			if retries >= maxNoProgressReads {
-				return 0, errors.Wrap(lastErr, "multiple Read calls return no data")
+				return read, errors.Wrapf(lastErr, "multiple Read calls (%d) return no data", retries)
 			}
-			log.Errorf(ctx, "Retry IO: error %s", lastErr)
+			log.Errorf(ctx, "Retry IO error: %s", lastErr)
 			lastErr = nil
 			if r.Reader != nil {
 				r.Reader.Close()
@@ -241,7 +294,7 @@ func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
 	// something with what was read before the error, but this mostly applies to
 	// err = EOF case which we handle above, so likely OK that we're discarding n
 	// here and pretending it was zero.
-	return 0, lastErr
+	return read, lastErr
 }
 
 // Close implements io.Closer.

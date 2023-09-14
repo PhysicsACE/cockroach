@@ -15,8 +15,15 @@ import {
   SortedTable,
   SortSetting,
 } from "src/sortedtable";
-import { DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT, Duration } from "src/util";
-import { InsightExecEnum, TxnInsightEvent } from "src/insights";
+import {
+  DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_TZ,
+  Duration,
+} from "src/util";
+import {
+  InsightExecEnum,
+  TransactionStatus,
+  TxnInsightEvent,
+} from "src/insights";
 import {
   InsightCell,
   insightsTableTitles,
@@ -25,6 +32,19 @@ import {
 } from "../util";
 import { Link } from "react-router-dom";
 import { TimeScale } from "../../../timeScaleDropdown";
+import { Badge } from "src/badge";
+import { Timestamp } from "../../../timestamp";
+
+function txnStatusToString(status: TransactionStatus) {
+  switch (status) {
+    case TransactionStatus.COMPLETED:
+      return "success";
+    case TransactionStatus.FAILED:
+      return "danger";
+    case TransactionStatus.CANCELLED:
+      return "info";
+  }
+}
 
 interface TransactionInsightsTable {
   data: TxnInsightEvent[];
@@ -51,7 +71,8 @@ export function makeTransactionInsightsColumns(): ColumnDescriptor<TxnInsightEve
     {
       name: "fingerprintID",
       title: insightsTableTitles.fingerprintID(execType),
-      cell: item => TransactionDetailsLink(item.transactionFingerprintID),
+      cell: item =>
+        TransactionDetailsLink(item.transactionFingerprintID, item.application),
       sort: item => item.transactionFingerprintID,
     },
     {
@@ -59,6 +80,15 @@ export function makeTransactionInsightsColumns(): ColumnDescriptor<TxnInsightEve
       title: insightsTableTitles.query(execType),
       cell: item => QueriesCell([item.query], 50),
       sort: item => item.query,
+    },
+    {
+      name: "status",
+      title: insightsTableTitles.status(execType),
+      cell: item => (
+        <Badge text={item.status} status={txnStatusToString(item.status)} />
+      ),
+      sort: item => item.status,
+      showByDefault: true,
     },
     {
       name: "insights",
@@ -73,8 +103,14 @@ export function makeTransactionInsightsColumns(): ColumnDescriptor<TxnInsightEve
       name: "startTime",
       title: insightsTableTitles.startTime(execType),
       cell: item =>
-        item.startTime?.format(DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT) ??
-        "N/A",
+        item.startTime ? (
+          <Timestamp
+            time={item.startTime}
+            format={DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_TZ}
+          />
+        ) : (
+          <>N/A</>
+        ),
       sort: item => item.startTime?.unix() || 0,
     },
     {

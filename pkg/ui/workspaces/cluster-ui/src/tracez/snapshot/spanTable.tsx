@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
-import moment from "moment";
+import moment from "moment-timezone";
 import React, { useState } from "react";
 import { Nodes, Caution, Plus, Minus } from "@cockroachlabs/icons";
 import { Span, Snapshot } from "src/api/tracezApi";
@@ -22,7 +22,6 @@ import ISpanTag = cockroach.server.serverpb.ISpanTag;
 import RecordingMode = cockroach.util.tracing.tracingpb.RecordingMode;
 import { CircleFilled } from "src/icon";
 import { Dropdown } from "src/dropdown";
-import "antd/lib/switch/style";
 import { Link } from "react-router-dom";
 import Long from "long";
 const cx = classNames.bind(styles);

@@ -23,12 +23,14 @@ import (
 )
 
 type issue struct {
-	testName   string
-	title      string
-	message    string
-	expRepro   string
-	mention    []string
-	hasProject bool
+	testName             string
+	title                string
+	message              string
+	expRepro             string
+	mention              []string
+	extraLabels          []string
+	hasProject           bool
+	skiplabelTestFailure bool
 }
 
 func init() {
@@ -89,6 +91,7 @@ func TestListFailuresFromJSON(t *testing.T) {
 	// Each test case expects a number of issues.
 	testCases := []struct {
 		pkgEnv    string
+		extraEnv  map[string]string
 		fileName  string
 		expPkg    string
 		expIssues []issue
@@ -99,11 +102,30 @@ func TestListFailuresFromJSON(t *testing.T) {
 			fileName: "implicit-pkg.json",
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/util/stop",
 			expIssues: []issue{{
-				testName:   "TestStopperWithCancelConcurrent",
-				title:      "util/stop: TestStopperWithCancelConcurrent failed",
-				message:    "this is just a testing issue",
-				mention:    []string{"@cockroachdb/kv"},
-				hasProject: true,
+				testName:    "TestStopperWithCancelConcurrent",
+				title:       "util/stop: TestStopperWithCancelConcurrent failed",
+				message:     "this is just a testing issue",
+				mention:     []string{"@cockroachdb/kv"},
+				extraLabels: []string{"T-kv"},
+				hasProject:  true,
+			}},
+			formatter: defaultFormatter,
+		},
+		{
+			// A clone of the above but configured to set SkipTestLabelTestFailure to
+			// true.
+			pkgEnv:   "",
+			extraEnv: map[string]string{"SKIP_LABEL_TEST_FAILURE": "1"},
+			fileName: "implicit-pkg.json",
+			expPkg:   "github.com/cockroachdb/cockroach/pkg/util/stop",
+			expIssues: []issue{{
+				testName:             "TestStopperWithCancelConcurrent",
+				title:                "util/stop: TestStopperWithCancelConcurrent failed",
+				message:              "this is just a testing issue",
+				mention:              []string{"@cockroachdb/kv"},
+				extraLabels:          []string{"T-kv"},
+				hasProject:           true,
+				skiplabelTestFailure: true,
 			}},
 			formatter: defaultFormatter,
 		},
@@ -112,11 +134,12 @@ func TestListFailuresFromJSON(t *testing.T) {
 			fileName: "stress-failure.json",
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv/kvserver",
 			expIssues: []issue{{
-				testName:   "TestReplicateQueueRebalance",
-				title:      "kv/kvserver: TestReplicateQueueRebalance failed",
-				message:    "replicate_queue_test.go:88: condition failed to evaluate within 45s: not balanced: [10 1 10 1 8]",
-				mention:    []string{"@cockroachdb/kv"},
-				hasProject: true,
+				testName:    "TestReplicateQueueRebalance",
+				title:       "kv/kvserver: TestReplicateQueueRebalance failed",
+				message:     "replicate_queue_test.go:88: condition failed to evaluate within 45s: not balanced: [10 1 10 1 8]",
+				mention:     []string{"@cockroachdb/kv"},
+				extraLabels: []string{"T-kv"},
+				hasProject:  true,
 			}},
 			formatter: defaultFormatter,
 		},
@@ -125,11 +148,12 @@ func TestListFailuresFromJSON(t *testing.T) {
 			fileName: "stress-fatal.json",
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv/kvserver",
 			expIssues: []issue{{
-				testName:   "TestGossipHandlesReplacedNode",
-				title:      "kv/kvserver: TestGossipHandlesReplacedNode failed",
-				message:    "F180711 20:13:15.826193 83 storage/replica.go:1877  [n?,s1,r1/1:/M{in-ax}] on-disk and in-memory state diverged:",
-				mention:    []string{"@cockroachdb/kv"},
-				hasProject: true,
+				testName:    "TestGossipHandlesReplacedNode",
+				title:       "kv/kvserver: TestGossipHandlesReplacedNode failed",
+				message:     "F180711 20:13:15.826193 83 storage/replica.go:1877  [n?,s1,r1/1:/M{in-ax}] on-disk and in-memory state diverged:",
+				mention:     []string{"@cockroachdb/kv"},
+				extraLabels: []string{"T-kv"},
+				hasProject:  true,
 			}},
 			formatter: defaultFormatter,
 		},
@@ -138,11 +162,12 @@ func TestListFailuresFromJSON(t *testing.T) {
 			fileName: "stress-unknown.json",
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/storage",
 			expIssues: []issue{{
-				testName:   "(unknown)",
-				title:      "storage: package failed",
-				message:    "make: *** [bin/.submodules-initialized] Error 1",
-				mention:    []string{"@cockroachdb/test-eng"},
-				hasProject: true,
+				testName:    "(unknown)",
+				title:       "storage: package failed",
+				message:     "make: *** [bin/.submodules-initialized] Error 1",
+				mention:     []string{"@cockroachdb/test-eng"},
+				extraLabels: []string{"T-testeng"},
+				hasProject:  true,
 			}},
 			formatter: defaultFormatter,
 		},
@@ -169,11 +194,12 @@ func TestListFailuresFromJSON(t *testing.T) {
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord",
 			expIssues: []issue{
 				{
-					testName:   "TestTxnCoordSenderPipelining",
-					title:      "kv/kvclient/kvcoord: TestTxnCoordSenderPipelining failed",
-					message:    `injected failure`,
-					mention:    []string{"@cockroachdb/kv"},
-					hasProject: true,
+					testName:    "TestTxnCoordSenderPipelining",
+					title:       "kv/kvclient/kvcoord: TestTxnCoordSenderPipelining failed",
+					message:     `injected failure`,
+					mention:     []string{"@cockroachdb/kv"},
+					extraLabels: []string{"T-kv"},
+					hasProject:  true,
 				},
 				{
 					testName: "TestAbortReadOnlyTransaction",
@@ -185,8 +211,9 @@ TestTxnCoordSenderPipelining - 1.00s
 Slow passing tests:
 TestAnchorKey - 1.01s
 `,
-					mention:    []string{"@cockroachdb/kv"},
-					hasProject: true,
+					mention:     []string{"@cockroachdb/kv"},
+					extraLabels: []string{"T-kv"},
+					hasProject:  true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -208,8 +235,9 @@ TestXXX/sub3 - 0.50s
 Slow passing tests:
 TestXXA - 1.00s
 `,
-					mention:    []string{"@cockroachdb/test-eng"},
-					hasProject: true,
+					mention:     []string{"@cockroachdb/test-eng"},
+					extraLabels: []string{"T-testeng"},
+					hasProject:  true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -231,8 +259,9 @@ Slow passing tests:
 TestXXB - 1.01s
 TestXXA - 1.00s
 `,
-					mention:    []string{"@cockroachdb/test-eng"},
-					hasProject: true,
+					mention:     []string{"@cockroachdb/test-eng"},
+					extraLabels: []string{"T-testeng"},
+					hasProject:  true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -254,8 +283,9 @@ Slow passing tests:
 TestXXB - 1.01s
 TestXXA - 1.00s
 `,
-					mention:    []string{"@cockroachdb/test-eng"},
-					hasProject: true,
+					mention:     []string{"@cockroachdb/test-eng"},
+					extraLabels: []string{"T-testeng"},
+					hasProject:  true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -267,11 +297,12 @@ TestXXA - 1.00s
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv",
 			expIssues: []issue{
 				{
-					testName:   "TestXXX",
-					title:      "kv: TestXXX failed",
-					message:    `panic: induced panic`,
-					mention:    []string{"@cockroachdb/test-eng"},
-					hasProject: true,
+					testName:    "TestXXX",
+					title:       "kv: TestXXX failed",
+					message:     `panic: induced panic`,
+					mention:     []string{"@cockroachdb/test-eng"},
+					extraLabels: []string{"T-testeng"},
+					hasProject:  true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -283,11 +314,12 @@ TestXXA - 1.00s
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv",
 			expIssues: []issue{
 				{
-					testName:   "(unknown)",
-					title:      "kv: package failed",
-					message:    `panic: induced panic`,
-					mention:    []string{"@cockroachdb/test-eng"},
-					hasProject: true,
+					testName:    "(unknown)",
+					title:       "kv: package failed",
+					message:     `panic: induced panic`,
+					mention:     []string{"@cockroachdb/test-eng"},
+					extraLabels: []string{"T-testeng"},
+					hasProject:  true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -299,10 +331,11 @@ TestXXA - 1.00s
 			expPkg:   "internal/metamorphic",
 			expIssues: []issue{
 				{
-					testName: "TestMeta",
-					title:    "internal/metamorphic: TestMeta failed",
-					message:  "panic: induced panic",
-					expRepro: `go test -tags 'invariants' -exec 'stress -p 1' -timeout 0 -test.v -run TestMeta$ ./internal/metamorphic -seed 1600209371838097000 -ops "uniform:5000-10000"`,
+					testName:    "TestMeta",
+					title:       "internal/metamorphic: TestMeta failed",
+					message:     "panic: induced panic",
+					expRepro:    `go test -tags 'invariants' -exec 'stress -p 1' -timeout 0 -test.v -run TestMeta$ ./internal/metamorphic -seed 1600209371838097000 -ops "uniform:5000-10000"`,
+					extraLabels: []string{"metamorphic-failure"},
 				},
 			},
 			formatter: formatPebbleMetamorphicIssue,
@@ -310,8 +343,14 @@ TestXXA - 1.00s
 	}
 	for _, c := range testCases {
 		t.Run(c.fileName, func(t *testing.T) {
-			if err := os.Setenv("PKG", c.pkgEnv); err != nil {
-				t.Fatal(err)
+			if c.extraEnv == nil {
+				c.extraEnv = make(map[string]string)
+			}
+
+			c.extraEnv["PKG"] = c.pkgEnv
+
+			for k, v := range c.extraEnv {
+				t.Setenv(k, v)
 			}
 
 			file, err := os.Open(datapathutils.TestDataPath(t, c.fileName))
@@ -360,6 +399,8 @@ TestXXA - 1.00s
 				}
 				assert.Equal(t, c.expIssues[curIssue].mention, req.MentionOnCreate)
 				assert.Equal(t, c.expIssues[curIssue].hasProject, req.ProjectColumnID != 0)
+				assert.Equal(t, c.expIssues[curIssue].extraLabels, req.ExtraLabels)
+				assert.Equal(t, c.expIssues[curIssue].skiplabelTestFailure, req.SkipLabelTestFailure)
 				// On next invocation, we'll check the next expected issue.
 				curIssue++
 				return nil
@@ -432,6 +473,58 @@ func TestListFailuresFromTestXML(t *testing.T) {
 			if err := listFailuresFromTestXML(context.Background(), file, f); err != nil {
 				t.Fatal(err)
 			}
+			if curIssue != len(c.expIssues) {
+				t.Fatalf("expected %d issues, got: %d", len(c.expIssues), curIssue)
+			}
+		})
+	}
+}
+
+func TestPostGeneralFailure(t *testing.T) {
+	testCases := []struct {
+		fileName  string
+		expIssues []issue
+		formatter formatter
+	}{
+		{
+			fileName: "failed-build-output.txt",
+			expIssues: []issue{{
+				title:       "unexpected build failure",
+				mention:     []string{"@cockroachdb/unowned"},
+				extraLabels: []string{"T-testeng"},
+			}},
+			formatter: defaultFormatter,
+		},
+	}
+
+	for _, c := range testCases {
+		t.Run(c.fileName, func(t *testing.T) {
+			b, err := os.ReadFile(datapathutils.TestDataPath(t, c.fileName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			curIssue := 0
+			for _, issue := range c.expIssues {
+				issue.message = string(b)
+			}
+
+			f := func(ctx context.Context, f failure) error {
+				if t.Failed() {
+					return nil
+				}
+				if curIssue >= len(c.expIssues) {
+					t.Errorf("unexpected issue filed. title: %s", f.title)
+				}
+				if exp := c.expIssues[curIssue].title; exp != f.title {
+					t.Errorf("expected title %s, but got %s", exp, f.title)
+				}
+				if exp := c.expIssues[curIssue].message; !strings.Contains(f.testMessage, exp) {
+					t.Errorf("expected message containing %s, but got:\n%s", exp, f.testMessage)
+				}
+				curIssue++
+				return nil
+			}
+			postGeneralFailureImpl(string(b), f)
 			if curIssue != len(c.expIssues) {
 				t.Fatalf("expected %d issues, got: %d", len(c.expIssues), curIssue)
 			}

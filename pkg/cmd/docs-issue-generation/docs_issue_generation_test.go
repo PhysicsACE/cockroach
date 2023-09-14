@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -103,7 +104,7 @@ func TestConstructDocsIssues(t *testing.T) {
 		docsIssues   []docsIssue
 	}{
 		{
-			testName: "Single PR - 91345",
+			testName: "Single PR - 91345 - Epic: none",
 			cockroachPRs: []cockroachPR{{
 				Title:       "release-22.2: clusterversion: allow forcing release binary to dev version",
 				Number:      91345,
@@ -163,19 +164,19 @@ func TestConstructDocsIssues(t *testing.T) {
 				{
 					sourceCommitSha: "8d15073f329cf8d72e09977b34a3b339d1436000",
 					title:           "PR #91294 - ui: update filter labels",
-					body:            "Related PR: https://github.com/cockroachdb/cockroach/pull/91294\nCommit: https://github.com/cockroachdb/cockroach/commit/8d15073f329cf8d72e09977b34a3b339d1436000\nFixes: https://github.com/cockroachdb/cockroach/issues/87960\n\n---\n\nRelease note (ui change): Update filter labels from\n\"App\" to \"Application Name\" and from \"Username\" to\n\"User Name\" on SQL Activity pages.",
+					body:            "Related PR: https://github.com/cockroachdb/cockroach/pull/91294\nCommit: https://github.com/cockroachdb/cockroach/commit/8d15073f329cf8d72e09977b34a3b339d1436000\nFixes: CRDB-19614\n\n---\n\nRelease note (ui change): Update filter labels from\n\"App\" to \"Application Name\" and from \"Username\" to\n\"User Name\" on SQL Activity pages.",
 					labels:          []string{"C-product-change", "release-22.1"},
 				},
 				{
 					sourceCommitSha: "1829a72664f28ddfa50324c9ff5352380029560b",
 					title:           "PR #90381 - sql/ttl: rename num_active_ranges metrics",
-					body:            "Related PR: https://github.com/cockroachdb/cockroach/pull/90381\nCommit: https://github.com/cockroachdb/cockroach/commit/1829a72664f28ddfa50324c9ff5352380029560b\nFixes: https://github.com/cockroachdb/cockroach/issues/90094\n\n---\n\nRelease note (ops change): These TTL metrics have been renamed:\njobs.row_level_ttl.range_total_duration -> jobs.row_level_ttl.span_total_duration\njobs.row_level_ttl.num_active_ranges -> jobs.row_level_ttl.num_active_spans",
+					body:            "Related PR: https://github.com/cockroachdb/cockroach/pull/90381\nCommit: https://github.com/cockroachdb/cockroach/commit/1829a72664f28ddfa50324c9ff5352380029560b\nFixes: CRDB-20636\n\n---\n\nRelease note (ops change): These TTL metrics have been renamed:\njobs.row_level_ttl.range_total_duration -> jobs.row_level_ttl.span_total_duration\njobs.row_level_ttl.num_active_ranges -> jobs.row_level_ttl.num_active_spans",
 					labels:          []string{"C-product-change", "release-22.2.0"},
 				},
 				{
 					sourceCommitSha: "43de8ff30e3e6e1d9b2272ed4f62c543dc0a037c",
 					title:           "PR #89957 - opt/props: shallow-copy props.Histogram when applying selectivity",
-					body:            "Related PR: https://github.com/cockroachdb/cockroach/pull/89957\nCommit: https://github.com/cockroachdb/cockroach/commit/43de8ff30e3e6e1d9b2272ed4f62c543dc0a037c\nFixes: https://github.com/cockroachdb/cockroach/issues/89941\n\n---\n\nRelease note (performance improvement): The optimizer now does less\ncopying of histograms while planning queries, which will reduce memory\npressure a little.",
+					body:            "Related PR: https://github.com/cockroachdb/cockroach/pull/89957\nCommit: https://github.com/cockroachdb/cockroach/commit/43de8ff30e3e6e1d9b2272ed4f62c543dc0a037c\nFixes: CRDB-20505\n\n---\n\nRelease note (performance improvement): The optimizer now does less\ncopying of histograms while planning queries, which will reduce memory\npressure a little.",
 					labels:          []string{"C-product-change", "release-22.2"},
 				},
 			},
@@ -216,20 +217,33 @@ func TestConstructDocsIssues(t *testing.T) {
 			docsIssues: []docsIssue{{
 				sourceCommitSha: "aaada3e2ac3b1b7268accfb1dcbe5464e948e9d1",
 				title:           "PR #123456 - Epic extraction PR",
-				body:            "Related PR: https://github.com/cockroachdb/cockroach/pull/123456\nCommit: https://github.com/cockroachdb/cockroach/commit/aaada3e2ac3b1b7268accfb1dcbe5464e948e9d1\nEpic: https://cockroachlabs.atlassian.net/browse/CRDB-24680\n\n---\n\nRelease note (cli change): cli changes",
+				body:            "Related PR: https://github.com/cockroachdb/cockroach/pull/123456\nCommit: https://github.com/cockroachdb/cockroach/commit/aaada3e2ac3b1b7268accfb1dcbe5464e948e9d1\nEpic: CRDB-24680\n\n---\n\nRelease note (cli change): cli changes",
 				labels:          []string{"C-product-change", "master"},
 			}},
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
-			result := constructDocsIssues(tc.cockroachPRs)
+			defer testutils.TestingHook(&getJiraIssueFromGitHubIssue, func(org, repo string, issue int, token string) (string, error) {
+				// getJiraIssueFromGitHubIssue requires a network call to the GitHub GraphQL API to calculate the Jira issue given
+				// a GitHub org/repo/issue. To help eliminate the need of a network call and minimize the chances of this test
+				// flaking, we define a pre-built map that is used to mock the network call and allow the tests to run as expected.
+				var ghJiraIssueMap = make(map[string]map[string]map[int]string)
+				ghJiraIssueMap["cockroachdb"] = make(map[string]map[int]string)
+				ghJiraIssueMap["cockroachdb"]["cockroach"] = make(map[int]string)
+				ghJiraIssueMap["cockroachdb"]["cockroach"][87960] = "CRDB-19614"
+				ghJiraIssueMap["cockroachdb"]["cockroach"][90094] = "CRDB-20636"
+				ghJiraIssueMap["cockroachdb"]["cockroach"][89941] = "CRDB-20505"
+				return ghJiraIssueMap[org][repo][issue], nil
+			})()
+			result := constructDocsIssues(tc.cockroachPRs, "")
 			assert.Equal(t, tc.docsIssues, result)
 		})
 	}
 }
 
 func TestFormatReleaseNotes(t *testing.T) {
+
 	testCases := []struct {
 		prNum         string
 		prBody        string
@@ -259,7 +273,7 @@ columns, rather than resulting in an error. Any statistics in the JSON
 for existing columns will be injected successfully.`,
 			rns: []string{`Related PR: https://github.com/cockroachdb/cockroach/pull/79069
 Commit: https://github.com/cockroachdb/cockroach/commit/5ec9343b0e0a00bfd4603e55ca6533e2b77db2f9
-Informs: https://github.com/cockroachdb/cockroach/issues/68184
+Informs: CRDB-8919
 
 ---
 
@@ -346,11 +360,100 @@ This increases troubleshootability.
 Release note: None`,
 			rns: []string{},
 		},
+		{
+			prNum: "104265",
+			sha:   "d756dec1b9d7245305ab706e68e2ec3de0e61ffc",
+			commitMessage: `Release note (cli change): The log output formats ` + "`crdb-v1`" + ` and
+` + "`crdb-v2`" + ` now support the format option ` + "`timezone`" + `. When specified,
+the corresponding time zone is used to produce the timestamp column.
+
+For example:
+` + "```" + `yaml
+file-defaults:
+	format: crdb-v2
+	format-options: {timezone: america/new_york}
+` + "```" + `
+
+Example logging output:
+` + "```" + `
+I230606 12:43:01.553407-040000 1 1@cli/start.go:575 ⋮ [n?] 4  soft memory limit of Go runtime is set to 35 GiB
+^^^^^^^ indicates GMT-4 was used.
+` + "```" + `
+
+The timezone offset is also always included in the format if it is not
+zero (e.g. for non-UTC time zones). This is necessary to ensure that
+the times can be read back precisely.
+
+Release note (cli change): The command ` + "`cockroach debug merge-log`" + ` was
+adapted to understand time zones in input files read with format
+` + "`crdb-v1`" + ` or ` + "`crdb-v2`" + `.
+
+Release note (backward-incompatible change): When a deployment is
+configured to use a time zone (new feature) for log file output using
+formats ` + "`crdb-v1`" + ` or ` + "`crdb-v2`" + `, it becomes impossible to process the
+new output log files using the ` + "`cockroach debug merge-log`" + ` command
+from a previous version. The newest ` + "`cockroach debug merge-log`" + ` code
+must be used instead.`,
+			rns: []string{`Related PR: https://github.com/cockroachdb/cockroach/pull/104265
+Commit: https://github.com/cockroachdb/cockroach/commit/d756dec1b9d7245305ab706e68e2ec3de0e61ffc
+Related product changes: https://cockroachlabs.atlassian.net/issues/?jql=project%20%3D%20%22DOC%22%20and%20%22Doc%20Type%5BDropdown%5D%22%20%3D%20%22Product%20Change%22%20AND%20description%20~%20%22commit%2Fd756dec1b9d7245305ab706e68e2ec3de0e61ffc%22%20ORDER%20BY%20created%20DESC
+
+---
+
+Release note (cli change): The log output formats ` + "`crdb-v1`" + ` and
+` + "`crdb-v2`" + ` now support the format option ` + "`timezone`" + `. When specified,
+the corresponding time zone is used to produce the timestamp column.
+
+For example:
+` + "```" + `yaml
+file-defaults:
+	format: crdb-v2
+	format-options: {timezone: america/new_york}
+` + "```" + `
+
+Example logging output:
+` + "```" + `
+I230606 12:43:01.553407-040000 1 1@cli/start.go:575 ⋮ [n?] 4  soft memory limit of Go runtime is set to 35 GiB
+^^^^^^^ indicates GMT-4 was used.
+` + "```" + `
+
+The timezone offset is also always included in the format if it is not
+zero (e.g. for non-UTC time zones). This is necessary to ensure that
+the times can be read back precisely.`,
+				`Related PR: https://github.com/cockroachdb/cockroach/pull/104265
+Commit: https://github.com/cockroachdb/cockroach/commit/d756dec1b9d7245305ab706e68e2ec3de0e61ffc
+Related product changes: https://cockroachlabs.atlassian.net/issues/?jql=project%20%3D%20%22DOC%22%20and%20%22Doc%20Type%5BDropdown%5D%22%20%3D%20%22Product%20Change%22%20AND%20description%20~%20%22commit%2Fd756dec1b9d7245305ab706e68e2ec3de0e61ffc%22%20ORDER%20BY%20created%20DESC
+
+---
+
+Release note (cli change): The command ` + "`cockroach debug merge-log`" + ` was
+adapted to understand time zones in input files read with format
+` + "`crdb-v1`" + ` or ` + "`crdb-v2`" + `.`,
+				`Related PR: https://github.com/cockroachdb/cockroach/pull/104265
+Commit: https://github.com/cockroachdb/cockroach/commit/d756dec1b9d7245305ab706e68e2ec3de0e61ffc
+Related product changes: https://cockroachlabs.atlassian.net/issues/?jql=project%20%3D%20%22DOC%22%20and%20%22Doc%20Type%5BDropdown%5D%22%20%3D%20%22Product%20Change%22%20AND%20description%20~%20%22commit%2Fd756dec1b9d7245305ab706e68e2ec3de0e61ffc%22%20ORDER%20BY%20created%20DESC
+
+---
+
+Release note (backward-incompatible change): When a deployment is
+configured to use a time zone (new feature) for log file output using
+formats ` + "`crdb-v1`" + ` or ` + "`crdb-v2`" + `, it becomes impossible to process the
+new output log files using the ` + "`cockroach debug merge-log`" + ` command
+from a previous version. The newest ` + "`cockroach debug merge-log`" + ` code
+must be used instead.`},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.prNum, func(t *testing.T) {
+			defer testutils.TestingHook(&getJiraIssueFromGitHubIssue, func(org, repo string, issue int, token string) (string, error) {
+				var ghJiraIssueMap = make(map[string]map[string]map[int]string)
+				ghJiraIssueMap["cockroachdb"] = make(map[string]map[int]string)
+				ghJiraIssueMap["cockroachdb"]["cockroach"] = make(map[int]string)
+				ghJiraIssueMap["cockroachdb"]["cockroach"][68184] = "CRDB-8919"
+				return ghJiraIssueMap[org][repo][issue], nil
+			})()
 			prNumInt, _ := strconv.Atoi(tc.prNum)
-			result := formatReleaseNotes(tc.commitMessage, prNumInt, tc.prBody, tc.sha)
+			result := formatReleaseNotes(tc.commitMessage, prNumInt, tc.prBody, tc.sha, "")
 			assert.Equal(t, tc.rns, result)
 		})
 	}
@@ -426,40 +529,6 @@ func TestFormatTitle(t *testing.T) {
 		t.Run(tc.testName, func(t *testing.T) {
 			result := formatTitle(tc.message, tc.prNumber, tc.index, tc.totalLength)
 			assert.Equal(t, tc.title, result)
-		})
-	}
-}
-
-func TestGetUrlFromRef(t *testing.T) {
-	testCases := []struct {
-		ref    string
-		result string
-	}{
-		{
-			ref:    "#12345",
-			result: "https://github.com/cockroachdb/cockroach/issues/12345",
-		},
-		{
-			ref:    "CRDB-54321",
-			result: "https://cockroachlabs.atlassian.net/browse/CRDB-54321",
-		},
-		{
-			ref:    "cockroachlabs/release-staging#23456",
-			result: "https://github.com/cockroachlabs/release-staging/issues/23456",
-		},
-		{
-			ref:    "https://github.com/cockroachdb/cockroach/issues/98765",
-			result: "https://github.com/cockroachdb/cockroach/issues/98765",
-		},
-		{
-			ref:    "https://cockroachlabs.atlassian.net/browse/CRDB-56789",
-			result: "https://cockroachlabs.atlassian.net/browse/CRDB-56789",
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.ref, func(t *testing.T) {
-			result := getUrlFromRef(tc.ref)
-			assert.Equal(t, tc.result, result)
 		})
 	}
 }

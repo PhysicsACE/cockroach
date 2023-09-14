@@ -15,6 +15,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
 
+// DefaultCockroachPath is the path where the binary passed to the
+// `--cockroach` flag will be made available in every node in the
+// cluster.
+const DefaultCockroachPath = "./cockroach-default"
+
 // Test is the interface through which roachtests interact with the
 // test harness.
 type Test interface {
@@ -25,8 +30,9 @@ type Test interface {
 	Name() string
 	BuildVersion() *version.Version
 	IsBuildVersion(string) bool // "vXX.YY"
+	SnapshotPrefix() string
 	Helper()
-	// Spec() returns the *registry.TestSpec as an interface{}.
+	// Spec returns the *registry.TestSpec as an interface{}.
 	//
 	// TODO(tbg): cleaning this up is mildly tricky. TestSpec has the Run field
 	// which depends both on `test` (and `cluster`, though this matters less), so

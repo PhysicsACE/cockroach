@@ -483,6 +483,26 @@ func (d ReplicaSet) ReplicationTargets() (out []ReplicationTarget) {
 	return out
 }
 
+// Difference compares two sets of replicas, returning the replica descriptors
+// that were added and removed when going from one to the other. 'd' is the before
+// state, 'o' is the one after.
+func (d ReplicaSet) Difference(o ReplicaSet) (added, removed []ReplicaDescriptor) {
+	return o.Subtract(d), d.Subtract(o)
+}
+
+// Subtract one sets of replicas from another. This returning the replica
+// descriptors that were present in the original and not the other. 'd' is the
+// original set of descriptors, 'o' is the other.
+func (d ReplicaSet) Subtract(o ReplicaSet) []ReplicaDescriptor {
+	var repls []ReplicaDescriptor
+	for _, repl := range d.Descriptors() {
+		if _, found := o.GetReplicaDescriptorByID(repl.ReplicaID); !found {
+			repls = append(repls, repl)
+		}
+	}
+	return repls
+}
+
 // IsAddition returns true if `c` refers to a replica addition operation.
 func (c ReplicaChangeType) IsAddition() bool {
 	switch c {
@@ -507,12 +527,15 @@ func (c ReplicaChangeType) IsRemoval() bool {
 	}
 }
 
-var errReplicaNotFound = errors.Errorf(`replica not found in RangeDescriptor`)
+// ErrReplicaNotFound can be returned from CheckCanReceiveLease.
+//
+// See: https://github.com/cockroachdb/cockroach/issues/93163.
+var ErrReplicaNotFound = errors.New(`lease target replica not found in RangeDescriptor`)
 
 // ErrReplicaCannotHoldLease can be returned from CheckCanReceiveLease.
 //
-// See: https://github.com/cockroachdb/cockroach/issues/93163
-var ErrReplicaCannotHoldLease = errors.Errorf("replica cannot hold lease")
+// See: https://github.com/cockroachdb/cockroach/issues/93163.
+var ErrReplicaCannotHoldLease = errors.New(`lease target replica cannot hold lease`)
 
 // CheckCanReceiveLease checks whether `wouldbeLeaseholder` can receive a lease.
 // Returns an error if the respective replica is not eligible.
@@ -543,7 +566,7 @@ func CheckCanReceiveLease(
 ) error {
 	repDesc, ok := replDescs.GetReplicaDescriptorByID(wouldbeLeaseholder.ReplicaID)
 	if !ok {
-		return errReplicaNotFound
+		return ErrReplicaNotFound
 	}
 	if !(repDesc.IsVoterNewConfig() ||
 		(repDesc.IsVoterOldConfig() && replDescs.containsVoterIncoming() && wasLastLeaseholder)) {

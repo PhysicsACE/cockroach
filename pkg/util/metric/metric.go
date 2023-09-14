@@ -27,9 +27,14 @@ import (
 	"github.com/rcrowley/go-metrics"
 )
 
-// TestSampleInterval is passed to histograms during tests which don't
-// want to concern themselves with supplying a "correct" interval.
-const TestSampleInterval = time.Duration(math.MaxInt64)
+const (
+	// TestSampleInterval is passed to histograms during tests which don't
+	// want to concern themselves with supplying a "correct" interval.
+	TestSampleInterval = time.Duration(math.MaxInt64)
+	// WindowedHistogramWrapNum is the number of histograms to keep in rolling
+	// window.
+	WindowedHistogramWrapNum = 2
+)
 
 // Iterable provides a method for synchronized access to interior objects.
 type Iterable interface {
@@ -89,12 +94,20 @@ type PrometheusIterable interface {
 // and values at specific quantiles from "windowed" histograms and record that
 // data directly. These windows could be arbitrary and overlapping.
 type WindowedHistogram interface {
-	// TotalCountWindowed returns the number of samples in the current window.
-	TotalCountWindowed() int64
-	// TotalSumWindowed returns the number of samples in the current window.
-	TotalSumWindowed() float64
+	// TotalWindowed returns the number of samples and their sum (respectively)
+	// in the current window.
+	TotalWindowed() (int64, float64)
+	// Total returns the number of samples and their sum (respectively) in the
+	// cumulative histogram.
+	Total() (int64, float64)
+	// MeanWindowed returns the average of the samples in the current window.
+	MeanWindowed() float64
+	// Mean returns the average of the sample in the cumulative histogram.
+	Mean() float64
 	// ValueAtQuantileWindowed takes a quantile value [0,100] and returns the
 	// interpolated value at that quantile for the windowed histogram.
+	// Methods implementing this interface should the merge buckets, sums,
+	// and counts of previous and current windows.
 	ValueAtQuantileWindowed(q float64) float64
 }
 
@@ -193,6 +206,29 @@ func HdrEnabled() bool {
 	return hdrEnabled
 }
 
+// useNativeHistogramsEnvVar can be used to enable the Prometheus native
+// histogram feature, which represents a histogram as a single time series
+// rather than a collection of per-bucket counter series. If enabled, both
+// conventional and native histograms are exported.
+const useNativeHistogramsEnvVar = "COCKROACH_ENABLE_PROMETHEUS_NATIVE_HISTOGRAMS"
+
+var nativeHistogramsEnabled = envutil.EnvOrDefaultBool(useNativeHistogramsEnvVar, false)
+
+// nativeHistogramsBucketFactorEnvVar can be used to override the default
+// bucket size exponential factor for Prometheus native histograms, if enabled.
+// If not set, use the default factor of 1.1.
+const nativeHistogramsBucketFactorEnvVar = "COCKROACH_PROMETHEUS_NATIVE_HISTOGRAMS_BUCKET_FACTOR"
+
+var nativeHistogramsBucketFactor = envutil.EnvOrDefaultFloat64(nativeHistogramsBucketFactorEnvVar, 1.1)
+
+// nativeHistogramsBucketCountMultiplierEnvVar can be used to override the
+// default maximum bucket count for Prometheus native histograms, if enabled.
+// The maximum bucket count is set to the number of conventional buckets for
+// the histogram metric multiplied by the multiplier, which defaults to 1.0.
+const nativeHistogramsBucketCountMultiplierEnvVar = "COCKROACH_PROMETHEUS_NATIVE_HISTOGRAMS_BUCKET_COUNT_MULTIPLIER"
+
+var nativeHistogramsBucketCountMultiplier = envutil.EnvOrDefaultFloat64(nativeHistogramsBucketCountMultiplierEnvVar, 1)
+
 type HistogramMode byte
 
 const (
@@ -218,7 +254,10 @@ const (
 type HistogramOptions struct {
 	// Metadata is the metric Metadata associated with the histogram.
 	Metadata Metadata
-	// Duration is the histogram's window duration.
+	// Duration is the total duration of all windows in the histogram.
+	// The individual window duration is equal to the
+	// Duration/WindowedHistogramWrapNum (i.e., the number of windows
+	// in the histogram).
 	Duration time.Duration
 	// MaxVal is only relevant to the HdrHistogram, and represents the
 	// highest trackable value in the resulting histogram buckets.
@@ -230,12 +269,16 @@ type HistogramOptions struct {
 	// Buckets are only relevant to Prometheus histograms, and represent
 	// the pre-defined histogram bucket boundaries to be used.
 	Buckets []float64
+	// BucketConfig is only relevant to Prometheus histograms, and represents
+	// the pre-defined histogram bucket configuration used to generate buckets.
+	BucketConfig staticBucketConfig
 	// Mode defines the type of histogram to be used. See individual
 	// comments on each HistogramMode value for details.
 	Mode HistogramMode
 }
 
 func NewHistogram(opt HistogramOptions) IHistogram {
+	opt.Metadata.MetricType = prometheusgo.MetricType_HISTOGRAM
 	if hdrEnabled && opt.Mode != HistogramModePrometheus {
 		if opt.Mode == HistogramModePreferHdrLatency {
 			return NewHdrLatency(opt.Metadata, opt.Duration)
@@ -243,18 +286,30 @@ func NewHistogram(opt HistogramOptions) IHistogram {
 			return NewHdrHistogram(opt.Metadata, opt.Duration, opt.MaxVal, opt.SigFigs)
 		}
 	} else {
-		return newHistogram(opt.Metadata, opt.Duration, opt.Buckets)
+		return newHistogram(opt.Metadata, opt.Duration, opt.Buckets,
+			opt.BucketConfig)
 	}
 }
 
 // NewHistogram is a prometheus-backed histogram. Depending on the value of
 // opts.Buckets, this is suitable for recording any kind of quantity. Common
 // sensible choices are {IO,Network}LatencyBuckets.
-func newHistogram(meta Metadata, windowDuration time.Duration, buckets []float64) *Histogram {
+func newHistogram(
+	meta Metadata, duration time.Duration, buckets []float64, bucketConfig staticBucketConfig,
+) *Histogram {
 	// TODO(obs-inf): prometheus supports labeled histograms but they require more
 	// plumbing and don't fit into the PrometheusObservable interface any more.
+
+	// If no buckets are provided, generate buckets from bucket configuration
+	if buckets == nil && bucketConfig.count != 0 {
+		buckets = bucketConfig.GetBucketsFromBucketConfig()
+	}
 	opts := prometheus.HistogramOpts{
 		Buckets: buckets,
+	}
+	if bucketConfig.distribution == Exponential && nativeHistogramsEnabled {
+		opts.NativeHistogramBucketFactor = nativeHistogramsBucketFactor
+		opts.NativeHistogramMaxBucketNumber = uint32(float64(len(buckets)) * nativeHistogramsBucketCountMultiplier)
 	}
 	cum := prometheus.NewHistogram(opts)
 	h := &Histogram{
@@ -262,8 +317,11 @@ func newHistogram(meta Metadata, windowDuration time.Duration, buckets []float64
 		cum:      cum,
 	}
 	h.windowed.tickHelper = &tickHelper{
-		nextT:        now(),
-		tickInterval: windowDuration,
+		nextT: now(),
+		// We want to divide the total window duration by the number of windows
+		// because we need to rotate the windows at uniformly distributed
+		// intervals within a histogram's total duration.
+		tickInterval: duration / WindowedHistogramWrapNum,
 		onTick: func() {
 			h.windowed.prev = h.windowed.cur
 			h.windowed.cur = prometheus.NewHistogram(opts)
@@ -287,16 +345,13 @@ type Histogram struct {
 	Metadata
 	cum prometheus.Histogram
 
-	// TODO(obs-inf): the way we implement windowed histograms is not great. If
-	// the windowed histogram is pulled right after a tick, it will be mostly
-	// empty. We could add a third bucket and represent the merged view of the two
-	// most recent buckets to avoid that. Or we could "just" double the rotation
-	// interval (so that the histogram really collects for 20s when we expect to
-	// persist the contents every 10s). Really it would make more sense to
-	// explicitly rotate the histogram atomically with collecting its contents,
-	// but that is now how we have set it up right now. It should be doable
-	// though, since there is only one consumer of windowed histograms - our
-	// internal timeseries system.
+	// TODO(obs-inf): the way we implement windowed histograms is not great.
+	// We could "just" double the rotation interval (so that the histogram really
+	// collects for 20s when we expect to persist the contents every 10s).
+	// Really it would make more sense to explicitly rotate the histogram
+	// atomically with collecting its contents, but that is now how we have set
+	// it up right now. It should be doable though, since there is only one
+	// consumer of windowed histograms - our internal timeseries system.
 	windowed struct {
 		// prometheus.Histogram is thread safe, so we only
 		// need an RLock to record into it. But write lock
@@ -313,10 +368,7 @@ type IHistogram interface {
 	WindowedHistogram
 
 	RecordValue(n int64)
-	TotalCount() int64
-	TotalSum() float64
-	TotalCountWindowed() int64
-	TotalSumWindowed() float64
+	Total() (int64, float64)
 	Mean() float64
 }
 
@@ -365,15 +417,23 @@ func (h *Histogram) ToPrometheusMetric() *prometheusgo.Metric {
 	return m
 }
 
-// ToPrometheusMetricWindowed returns a filled-in prometheus metric of the right type.
+// ToPrometheusMetricWindowed returns a filled-in prometheus metric of the
+// right type.
 func (h *Histogram) ToPrometheusMetricWindowed() *prometheusgo.Metric {
 	h.windowed.Lock()
 	defer h.windowed.Unlock()
-	m := &prometheusgo.Metric{}
-	if err := h.windowed.cur.Write(m); err != nil {
+	cur := &prometheusgo.Metric{}
+	prev := &prometheusgo.Metric{}
+	if err := h.windowed.cur.Write(cur); err != nil {
 		panic(err)
 	}
-	return m
+	if h.windowed.prev != nil {
+		if err := h.windowed.prev.Write(prev); err != nil {
+			panic(err)
+		}
+		MergeWindowedHistogram(cur.Histogram, prev.Histogram)
+	}
+	return cur
 }
 
 // GetMetadata returns the metric's metadata including the Prometheus
@@ -390,30 +450,28 @@ func (h *Histogram) Inspect(f func(interface{})) {
 	f(h)
 }
 
-// TotalCount returns the (cumulative) number of samples.
-func (h *Histogram) TotalCount() int64 {
-	return int64(h.ToPrometheusMetric().Histogram.GetSampleCount())
+// Total returns the (cumulative) number of samples and the sum of all samples.
+func (h *Histogram) Total() (int64, float64) {
+	pHist := h.ToPrometheusMetric().Histogram
+	return int64(pHist.GetSampleCount()), pHist.GetSampleSum()
 }
 
-// TotalCountWindowed implements the WindowedHistogram interface.
-func (h *Histogram) TotalCountWindowed() int64 {
-	return int64(h.ToPrometheusMetricWindowed().Histogram.GetSampleCount())
-}
-
-// TotalSum returns the (cumulative) number of samples.
-func (h *Histogram) TotalSum() float64 {
-	return h.ToPrometheusMetric().Histogram.GetSampleSum()
-}
-
-// TotalSumWindowed implements the WindowedHistogram interface.
-func (h *Histogram) TotalSumWindowed() float64 {
-	return h.ToPrometheusMetricWindowed().Histogram.GetSampleSum()
+// TotalWindowed implements the WindowedHistogram interface.
+func (h *Histogram) TotalWindowed() (int64, float64) {
+	pHist := h.ToPrometheusMetricWindowed().Histogram
+	return int64(pHist.GetSampleCount()), pHist.GetSampleSum()
 }
 
 // Mean returns the (cumulative) mean of samples.
 func (h *Histogram) Mean() float64 {
 	pm := h.ToPrometheusMetric()
 	return pm.Histogram.GetSampleSum() / float64(pm.Histogram.GetSampleCount())
+}
+
+// MeanWindowed implements the WindowedHistogram interface.
+func (h *Histogram) MeanWindowed() float64 {
+	pHist := h.ToPrometheusMetricWindowed().Histogram
+	return pHist.GetSampleSum() / float64(pHist.GetSampleCount())
 }
 
 // ValueAtQuantileWindowed implements the WindowedHistogram interface.
@@ -427,7 +485,8 @@ func (h *Histogram) Mean() float64 {
 //  2. Since the prometheus client library ensures buckets are in a strictly
 //     increasing order at creation, we do not sort them.
 func (h *Histogram) ValueAtQuantileWindowed(q float64) float64 {
-	return ValueAtQuantileWindowed(h.ToPrometheusMetricWindowed().Histogram, q)
+	return ValueAtQuantileWindowed(h.ToPrometheusMetricWindowed().Histogram,
+		q)
 }
 
 var _ PrometheusExportable = (*ManualWindowHistogram)(nil)
@@ -436,45 +495,132 @@ var _ WindowedHistogram = (*ManualWindowHistogram)(nil)
 
 // NewManualWindowHistogram is a prometheus-backed histogram. Depending on the
 // value of the buckets parameter, this is suitable for recording any kind of
-// quantity. The histogram is very similar to Histogram produced by NewHistogram
-// with the main difference being that Histogram supports collecting values over
-// time using the Histogram.RecordValue whereas this histogram does not support
-// collecting values. Instead, this histogram supports replacing the cumulative
-// and windowed histogram. This means that it is the responsibility of the
-// creator of this histogram to replace the values by calling
-// ManualWindowHistogram.Update.
-func NewManualWindowHistogram(meta Metadata, buckets []float64) *ManualWindowHistogram {
+// quantity. The histogram is very similar to Histogram produced by
+// NewHistogram with the main difference being that Histogram supports
+// collecting values over time using the Histogram.RecordValue whereas this
+// histogram provides limited support RecordValue, the caller is responsible
+// for calling Rotate, after recording is complete or manually providing the
+// cumulative and current windowed histogram via Update. This means that it is
+// the responsibility of the creator of this histogram to replace the values by
+// either calling ManualWindowHistogram.Update or
+// ManualWindowHistogram.RecordValue and ManualWindowHistogram.Rotate. If
+// NewManualWindowHistogram is called withRotate as true, only the RecordValue
+// and Rotate method may be used; withRotate as false, only Update may be used.
+// TODO(kvoli,aadityasondhi): The two ways to use this histogram is a hack and
+// "temporary", rationalize the interface. Tracked in #98622.
+func NewManualWindowHistogram(
+	meta Metadata, buckets []float64, withRotate bool,
+) *ManualWindowHistogram {
 	opts := prometheus.HistogramOpts{
 		Buckets: buckets,
 	}
 	cum := prometheus.NewHistogram(opts)
-	h := &ManualWindowHistogram{
-		Metadata:          meta,
-		cum:               cum,
-		windowedHistogram: nil,
+	prev := &prometheusgo.Metric{}
+	if err := cum.Write(prev); err != nil {
+		panic(err.Error())
 	}
+
+	meta.MetricType = prometheusgo.MetricType_HISTOGRAM
+	h := &ManualWindowHistogram{
+		Metadata: meta,
+	}
+	h.mu.rotating = withRotate
+	h.mu.cum = cum
+	h.mu.prev = prev.GetHistogram()
+
 	return h
 }
 
 // ManualWindowHistogram is a prometheus-backed histogram. Internally there are
-// two sets of histograms: one is the cumulative set (i.e. data is never
-// evicted) which is a prometheus.Histogram and the other is the windowed set
-// (which keeps only recently collected samples) which is a
-// prometheusgo.Histogram. Both histograms must be updated by the client by
-// calling ManualWindowHistogram.Update.
+// three sets of histograms: one is the cumulative set (i.e. data is never
+// evicted) which is a prometheus.Histogram, the cumulative histogram value
+// when last rotated and the current histogram, which is windowed. Both the
+// previous and current histograms are prometheusgo.Histograms. Both histograms
+// must be updated by the client by calling either ManualWindowHistogram.Update
+// or ManualWindowHistogram.RecordValue and subsequently Rotate.
 type ManualWindowHistogram struct {
 	Metadata
-	syncutil.RWMutex
-	cum               prometheus.Histogram
-	windowedHistogram *prometheusgo.Histogram
+
+	mu struct {
+		// prometheus.Histogram is thread safe, so we only need an RLock to
+		// RecordValue. When calling Update or Rotate, we require a WLock since we
+		// swap out fields.
+		syncutil.RWMutex
+		rotating  bool
+		cum       prometheus.Histogram
+		prev, cur *prometheusgo.Histogram
+	}
 }
 
-// Update replaces the cumulative and window histograms.
-func (mwh *ManualWindowHistogram) Update(cum prometheus.Histogram, window *prometheusgo.Histogram) {
-	mwh.Lock()
-	defer mwh.Unlock()
-	mwh.cum = cum
-	mwh.windowedHistogram = window
+// Update replaces the cumulative and current windowed histograms.
+func (mwh *ManualWindowHistogram) Update(cum prometheus.Histogram, cur *prometheusgo.Histogram) {
+	mwh.mu.Lock()
+	defer mwh.mu.Unlock()
+
+	if mwh.mu.rotating {
+		panic("Unexpected call to Update with rotate enabled")
+	}
+
+	mwh.mu.cum = cum
+	mwh.mu.cur = cur
+}
+
+// RecordValue records a value to the cumulative histogram. The value is only
+// added to the current window histogram once Rotate is called.
+func (mwh *ManualWindowHistogram) RecordValue(val float64) {
+	mwh.mu.RLock()
+	defer mwh.mu.RUnlock()
+
+	if !mwh.mu.rotating {
+		panic("Unexpected call to RecordValue with rotate disabled")
+	}
+	mwh.mu.cum.Observe(val)
+}
+
+// SubtractPrometheusHistograms subtracts the prev histogram from the cur
+// histogram, in place modifying the cur histogram. The bucket boundaries must
+// be identical for both prev and cur.
+func SubtractPrometheusHistograms(cur *prometheusgo.Histogram, prev *prometheusgo.Histogram) {
+	prevBuckets := prev.GetBucket()
+	curBuckets := cur.GetBucket()
+
+	*cur.SampleCount -= prev.GetSampleCount()
+	*cur.SampleSum -= prev.GetSampleSum()
+
+	for idx, v := range prevBuckets {
+		if *curBuckets[idx].UpperBound != *v.UpperBound {
+			panic("Bucket Upperbounds don't match")
+		}
+		*curBuckets[idx].CumulativeCount -= *v.CumulativeCount
+	}
+}
+
+// Rotate sets the current windowed histogram (cur) to be the delta of the
+// cumulative histogram at the last rotation (prev) and the cumulative
+// histogram currently (cum).
+func (mwh *ManualWindowHistogram) Rotate() error {
+	mwh.mu.Lock()
+	defer mwh.mu.Unlock()
+
+	if !mwh.mu.rotating {
+		panic("Unexpected call to Rotate with rotate disabled")
+	}
+
+	cur := &prometheusgo.Metric{}
+	if err := mwh.mu.cum.Write(cur); err != nil {
+		return err
+	}
+
+	SubtractPrometheusHistograms(cur.GetHistogram(), mwh.mu.prev)
+	mwh.mu.cur = cur.GetHistogram()
+	prev := &prometheusgo.Metric{}
+
+	if err := mwh.mu.cum.Write(prev); err != nil {
+		return err
+	}
+	mwh.mu.prev = prev.GetHistogram()
+
+	return nil
 }
 
 // GetMetadata returns the metric's metadata including the Prometheus
@@ -495,25 +641,53 @@ func (mwh *ManualWindowHistogram) GetType() *prometheusgo.MetricType {
 
 // ToPrometheusMetric returns a filled-in prometheus metric of the right type.
 func (mwh *ManualWindowHistogram) ToPrometheusMetric() *prometheusgo.Metric {
+	mwh.mu.RLock()
+	defer mwh.mu.RUnlock()
+
 	m := &prometheusgo.Metric{}
-	if err := mwh.cum.Write(m); err != nil {
+	if err := mwh.mu.cum.Write(m); err != nil {
 		panic(err)
 	}
 	return m
 }
 
-// TotalCountWindowed implements the WindowedHistogram interface.
-func (mwh *ManualWindowHistogram) TotalCountWindowed() int64 {
-	mwh.RLock()
-	defer mwh.RUnlock()
-	return int64(mwh.windowedHistogram.GetSampleCount())
+// ToPrometheusMetricWindowedLocked returns a filled-in prometheus metric of the
+// right type.
+func (mwh *ManualWindowHistogram) ToPrometheusMetricWindowedLocked() *prometheusgo.Metric {
+	cur := &prometheusgo.Metric{}
+	if err := mwh.mu.cum.Write(cur); err != nil {
+		panic(err)
+	}
+	if mwh.mu.prev != nil {
+		MergeWindowedHistogram(cur.Histogram, mwh.mu.prev)
+	}
+	return cur
 }
 
-// TotalSumWindowed implements the WindowedHistogram interface.
-func (mwh *ManualWindowHistogram) TotalSumWindowed() float64 {
-	mwh.RLock()
-	defer mwh.RUnlock()
-	return mwh.windowedHistogram.GetSampleSum()
+// TotalWindowed implements the WindowedHistogram interface.
+func (mwh *ManualWindowHistogram) TotalWindowed() (int64, float64) {
+	mwh.mu.RLock()
+	defer mwh.mu.RUnlock()
+	pHist := mwh.ToPrometheusMetricWindowedLocked().Histogram
+	return int64(pHist.GetSampleCount()), pHist.GetSampleSum()
+}
+
+// Total implements the WindowedHistogram interface.
+func (mwh *ManualWindowHistogram) Total() (int64, float64) {
+	h := mwh.ToPrometheusMetric().Histogram
+	return int64(h.GetSampleCount()), h.GetSampleSum()
+}
+
+func (mwh *ManualWindowHistogram) MeanWindowed() float64 {
+	mwh.mu.RLock()
+	defer mwh.mu.RUnlock()
+	pHist := mwh.ToPrometheusMetricWindowedLocked().Histogram
+	return pHist.GetSampleSum() / float64(pHist.GetSampleCount())
+}
+
+func (mwh *ManualWindowHistogram) Mean() float64 {
+	h := mwh.ToPrometheusMetric().Histogram
+	return h.GetSampleSum() / float64(h.GetSampleCount())
 }
 
 // ValueAtQuantileWindowed implements the WindowedHistogram interface.
@@ -521,12 +695,12 @@ func (mwh *ManualWindowHistogram) TotalSumWindowed() float64 {
 // This function is very similar to Histogram.ValueAtQuantileWindowed. Thus see
 // Histogram.ValueAtQuantileWindowed for a more in-depth description.
 func (mwh *ManualWindowHistogram) ValueAtQuantileWindowed(q float64) float64 {
-	mwh.RLock()
-	defer mwh.RUnlock()
-	if mwh.windowedHistogram == nil {
+	mwh.mu.RLock()
+	defer mwh.mu.RUnlock()
+	if mwh.mu.cur == nil {
 		return 0
 	}
-	return ValueAtQuantileWindowed(mwh.windowedHistogram, q)
+	return ValueAtQuantileWindowed(mwh.ToPrometheusMetricWindowedLocked().Histogram, q)
 }
 
 // A Counter holds a single mutable atomic value.
@@ -781,6 +955,21 @@ func (g *GaugeFloat64) GetMetadata() Metadata {
 	return baseMetadata
 }
 
+// MergeWindowedHistogram adds the bucket counts, sample count, and sample sum
+// from the previous windowed histogram to those of the current windowed
+// histogram.
+// NB: Buckets on each histogram must be the same
+func MergeWindowedHistogram(cur *prometheusgo.Histogram, prev *prometheusgo.Histogram) {
+	for i, bucket := range cur.Bucket {
+		count := *bucket.CumulativeCount + *prev.Bucket[i].CumulativeCount
+		*bucket.CumulativeCount = count
+	}
+	sampleCount := *cur.SampleCount + *prev.SampleCount
+	*cur.SampleCount = sampleCount
+	sampleSum := *cur.SampleSum + *prev.SampleSum
+	*cur.SampleSum = sampleSum
+}
+
 // ValueAtQuantileWindowed takes a quantile value [0,100] and returns the
 // interpolated value at that quantile for the given histogram.
 func ValueAtQuantileWindowed(histogram *prometheusgo.Histogram, q float64) float64 {
@@ -838,4 +1027,24 @@ func ValueAtQuantileWindowed(histogram *prometheusgo.Histogram, q float64) float
 	}
 
 	return val
+}
+
+// Quantile is a quantile along with a string suffix to be attached to the metric
+// name upon recording into the internal TSDB.
+type Quantile struct {
+	Suffix   string
+	Quantile float64
+}
+
+// RecordHistogramQuantiles are the quantiles at which (windowed) histograms
+// are recorded into the internal TSDB.
+var RecordHistogramQuantiles = []Quantile{
+	{"-max", 100},
+	{"-p99.999", 99.999},
+	{"-p99.99", 99.99},
+	{"-p99.9", 99.9},
+	{"-p99", 99},
+	{"-p90", 90},
+	{"-p75", 75},
+	{"-p50", 50},
 }

@@ -14,10 +14,10 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"math/rand"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
@@ -37,10 +36,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -110,7 +107,7 @@ func descExists(sqlDB *gosql.DB, exists bool, id descpb.ID) error {
 func TestDropDatabase(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	ctx, cancel := context.WithCancel(context.Background())
 	params.Knobs.GCJob = &sql.GCJobTestingKnobs{
 		RunBeforeResume: func(jobID jobspb.JobID) error {
@@ -225,10 +222,11 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 func TestDropDatabaseEmpty(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+
 	ctx := context.Background()
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	codec := s.ApplicationLayer().Codec()
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -236,7 +234,7 @@ CREATE DATABASE t;
 		t.Fatal(err)
 	}
 
-	dKey := catalogkeys.EncodeNameKey(keys.SystemSQLCodec, descpb.NameInfo{Name: "t"})
+	dKey := catalogkeys.EncodeNameKey(codec, descpb.NameInfo{Name: "t"})
 	r, err := kvDB.Get(ctx, dKey)
 	if err != nil {
 		t.Fatal(err)
@@ -269,17 +267,21 @@ CREATE DATABASE t;
 func TestDropDatabaseDeleteData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	params, _ := createTestServerParams()
+	// Speed up mvcc queue scan.
+	params.ScanMaxIdleTime = time.Millisecond
 
-	skip.WithIssue(t, 85876)
-
-	defer gcjob.SetSmallMaxGCIntervalForTest()()
-
-	params, _ := tests.CreateTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 	ctx := context.Background()
 
-	sqltestutils.SetShortRangeFeedIntervals(t, sqlDB)
+	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+	require.NoError(t, err)
+
+	// Refresh protected timestamp cache immediately to make MVCC GC queue to
+	// process GC immediately.
+	_, err = sqlDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
+	require.NoError(t, err)
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
@@ -323,20 +325,14 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		t.Fatal(err)
 	}
 
-	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
-	tests.CheckKeyCount(t, kvDB, table2Span, 6)
+	tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, 6)
+	tests.CheckKeyCountIncludingTombstoned(t, s, table2Span, 6)
 
-	// TODO (lucy): Maybe this test API should use an offset starting
-	// from the most recent job instead.
-	const migrationJobOffset = 0
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset,
+	if err := jobutils.VerifySystemJob(t, sqlRun, 0,
 		jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
 			Username:    username.RootUserName(),
 			Description: "DROP DATABASE t CASCADE",
-			DescriptorIDs: descpb.IDs{
-				tbDesc.GetID(), tb2Desc.GetID(), dbDesc.GetID(), dbDesc.GetSchemaID(tree.PublicSchema),
-			},
 		}); err != nil {
 		t.Fatal(err)
 	}
@@ -351,13 +347,12 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		if err := descExists(sqlDB, false, tbDesc.GetID()); err != nil {
 			return err
 		}
-
 		return zoneExists(sqlDB, nil, tbDesc.GetID())
 	})
 
 	// Table 1 data is deleted.
-	tests.CheckKeyCount(t, kvDB, tableSpan, 0)
-	tests.CheckKeyCount(t, kvDB, table2Span, 6)
+	tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, 0)
+	tests.CheckKeyCountIncludingTombstoned(t, s, table2Span, 6)
 
 	def := zonepb.DefaultZoneConfig()
 	if err := zoneExists(sqlDB, &def, dbDesc.GetID()); err != nil {
@@ -390,7 +385,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	})
 
 	// Table 2 data is deleted.
-	tests.CheckKeyCount(t, kvDB, table2Span, 0)
+	tests.CheckKeyCountIncludingTombstoned(t, s, table2Span, 0)
 
 	testutils.SucceedsSoon(t, func() error {
 		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
@@ -412,9 +407,8 @@ func TestDropIndex(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 85876)
 	const chunkSize = 200
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: chunkSize,
@@ -447,19 +441,26 @@ func TestDropIndex(t *testing.T) {
 	if _, err := catalog.MustFindIndexByName(tableDesc, "foo"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
-	// TODO (lucy): Maybe this test API should use an offset starting
-	// from the most recent job instead.
-	const migrationJobOffset = 0
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset+1, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
 		Username:    username.RootUserName(),
 		Description: `DROP INDEX t.public.kv@foo`,
-		DescriptorIDs: descpb.IDs{
-			tableDesc.GetID(),
-		},
 	}); err != nil {
 		t.Fatal(err)
 	}
+
+	testutils.SucceedsSoon(t, func() error {
+		if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 1, jobspb.TypeSchemaChangeGC, sql.RunningStatusWaitingForMVCCGC, jobs.Record{
+			Username:    username.NodeUserName(),
+			Description: `GC for DROP INDEX t.public.kv@foo`,
+			DescriptorIDs: descpb.IDs{
+				tableDesc.GetID(),
+			},
+		}); err != nil {
+			return err
+		}
+		return nil
+	})
 
 	if _, err := sqlDB.Exec(`CREATE INDEX foo on t.kv (v);`); err != nil {
 		t.Fatal(err)
@@ -471,37 +472,18 @@ func TestDropIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	newIdxSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, newIdx.GetID())
-	testutils.SucceedsSoon(t, func() error {
-		return jobutils.VerifySystemJob(t, sqlRun, migrationJobOffset+1, jobspb.TypeSchemaChange, jobs.StatusRunning, jobs.Record{
-			Username:    username.RootUserName(),
-			Description: `DROP INDEX t.public.kv@foo`,
-			DescriptorIDs: descpb.IDs{
-				tableDesc.GetID(),
-			},
-			RunningStatus: "waiting for MVCC GC",
-		})
-	})
 
 	testutils.SucceedsSoon(t, func() error {
-		if err := jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusRunning, jobs.Record{
-			Username:    username.RootUserName(),
-			Description: `GC for temporary index used during index backfill`,
+		if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 2, jobspb.TypeSchemaChangeGC, sql.RunningStatusWaitingForMVCCGC, jobs.Record{
+			Username:    username.NodeUserName(),
+			Description: `GC for CREATE INDEX foo ON t.public.kv (v)`,
 			DescriptorIDs: descpb.IDs{
 				tableDesc.GetID(),
 			},
-			RunningStatus: "waiting for MVCC GC",
 		}); err != nil {
 			return err
 		}
-
-		return jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeSchemaChangeGC, jobs.StatusRunning, jobs.Record{
-			Username:    username.RootUserName(),
-			Description: `GC for DROP INDEX t.public.kv@foo`,
-			DescriptorIDs: descpb.IDs{
-				tableDesc.GetID(),
-			},
-			RunningStatus: "waiting for MVCC GC",
-		})
+		return nil
 	})
 
 	tests.CheckKeyCount(t, kvDB, newIdxSpan, numRows)
@@ -516,7 +498,7 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	const chunkSize = 200
 	const numRows = 2*chunkSize + 1
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{BackfillChunkSize: chunkSize},
 	}
@@ -542,8 +524,8 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	// required" error.
 	zoneConfig := zonepb.ZoneConfig{
 		Subzones: []zonepb.Subzone{
-			{IndexID: uint32(tableDesc.GetPrimaryIndexID()), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
-			{IndexID: uint32(index.GetID()), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
+			{IndexID: uint32(tableDesc.GetPrimaryIndexID()), Config: s.DefaultZoneConfig()},
+			{IndexID: uint32(index.GetID()), Config: s.DefaultZoneConfig()},
 		},
 	}
 	zoneConfigBytes, err := protoutil.Marshal(&zoneConfig)
@@ -579,7 +561,7 @@ func TestDropTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	ctx, cancel := context.WithCancel(context.Background())
 	params.Knobs.GCJob = &sql.GCJobTestingKnobs{
 		RunBeforeResume: func(jobID jobspb.JobID) error {
@@ -679,19 +661,19 @@ func TestDropTable(t *testing.T) {
 func TestDropTableDeleteData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 85876)
-	params, _ := tests.CreateTestServerParams()
-
-	defer gcjob.SetSmallMaxGCIntervalForTest()()
+	params, _ := createTestServerParams()
+	// Speed up mvcc queue scan.
+	params.ScanMaxIdleTime = time.Millisecond
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
-	ctx := context.Background()
+
+	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+	require.NoError(t, err)
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
 	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
-	sqltestutils.SetShortRangeFeedIntervals(t, sqlDB)
 
 	const numRows = 2*row.TableTruncateChunkSize + 1
 	const numKeys = 3 * numRows
@@ -723,7 +705,14 @@ func TestDropTableDeleteData(t *testing.T) {
 
 		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
 		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
-		if _, err := sqlDB.Exec(fmt.Sprintf(`DROP TABLE t.%s`, tableName)); err != nil {
+
+		if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descs[i].GetID()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i := 0; i < numTables; i++ {
+		if _, err := sqlDB.Exec(fmt.Sprintf(`DROP TABLE t.%s`, descs[i].GetName())); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -735,54 +724,45 @@ func TestDropTableDeleteData(t *testing.T) {
 			t.Fatal(err)
 		}
 		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
-		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
+		tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, numKeys)
 
-		if err := jobutils.VerifySystemJob(t, sqlRun, i,
+		if err := jobutils.VerifySystemJob(t, sqlRun, numTables+i,
 			jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
 				Username:    username.RootUserName(),
 				Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
-				DescriptorIDs: descpb.IDs{
-					descs[i].GetID(),
-				},
 			}); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	// The closure pushes a zone config reducing the TTL to 0 for descriptor i.
-	pushZoneCfg := func(i int) {
-		if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descs[i].GetID()); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// Refresh protected timestamp cache immediately to make MVCC GC queue to
+	// process GC immediately.
+	_, err = sqlDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
+	require.NoError(t, err)
 
 	checkTableGCed := func(i int) {
 		testutils.SucceedsSoon(t, func() error {
 			if err := descExists(sqlDB, false, descs[i].GetID()); err != nil {
 				return err
 			}
-
 			return zoneExists(sqlDB, nil, descs[i].GetID())
 		})
+
 		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
-		tests.CheckKeyCount(t, kvDB, tableSpan, 0)
+		tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, 0)
 
 		// Ensure that the job is marked as succeeded.
-		if err := jobutils.VerifySystemJob(t, sqlRun, i,
+		if err := jobutils.VerifySystemJob(t, sqlRun, numTables+i,
 			jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
 				Username:    username.RootUserName(),
 				Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
-				DescriptorIDs: descpb.IDs{
-					descs[i].GetID(),
-				},
 			}); err != nil {
 			t.Fatal(err)
 		}
 
-		// Ensure that the job is marked as succeeded.
-		// Note that this 2*i+1 nonsense comes
+		// Ensure that the gc job is marked as succeeded.
 		testutils.SucceedsSoon(t, func() error {
-			return jobutils.VerifySystemJob(t, sqlRun, 2*i+1,
+			return jobutils.VerifySystemJob(t, sqlRun, numTables+i,
 				jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
 					Username:    username.NodeUserName(),
 					Description: fmt.Sprintf(`GC for DROP TABLE t.public.%s`, descs[i].GetName()),
@@ -793,36 +773,18 @@ func TestDropTableDeleteData(t *testing.T) {
 		})
 	}
 
-	// Push a new zone config for a few tables with TTL=0 so the data
-	// is deleted immediately.
-	barrier := rand.Intn(numTables)
-	for i := 0; i < barrier; i++ {
-		pushZoneCfg(i)
-	}
-
-	// Check GC worked!
 	for i := 0; i < numTables; i++ {
-		if i < barrier {
-			checkTableGCed(i)
-		} else {
-			// Data still present for tables past barrier.
-			tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
-			tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
-		}
-	}
-
-	// Push the rest of the zone configs and check all the data gets GC-ed.
-	for i := barrier; i < numTables; i++ {
-		pushZoneCfg(i)
-	}
-	for i := barrier; i < numTables; i++ {
 		checkTableGCed(i)
 	}
 }
 
 func writeTableDesc(ctx context.Context, db *kv.DB, tableDesc *tabledesc.Mutable) error {
 	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		tableDesc.ModificationTime = txn.CommitTimestamp()
+		var err error
+		tableDesc.ModificationTime, err = txn.CommitTimestamp()
+		if err != nil {
+			return err
+		}
 		return txn.Put(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), tableDesc.DescriptorProto())
 	})
 }
@@ -837,15 +799,19 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 85876)
 	ctx := context.Background()
 
-	defer gcjob.SetSmallMaxGCIntervalForTest()()
-
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
+	params.ScanMaxIdleTime = time.Millisecond
 	s, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(sqlDBRaw)
+
+	sqlDB.Exec(t, `SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+
+	// Refresh protected timestamp cache immediately to make MVCC GC queue to
+	// process GC immediately.
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
@@ -863,7 +829,12 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	}
 
 	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
-	tests.CheckKeyCount(t, kvDB, tableSpan, numRows)
+	testutils.SucceedsSoon(t, func() error {
+		if err := tests.CheckKeyCountIncludingTombstonedE(t, s, tableSpan, numRows); err != nil {
+			return errors.Wrap(err, "failed to verify expected amount of keys")
+		}
+		return nil
+	})
 
 	sqlDB.Exec(t, `DROP TABLE test.t`)
 
@@ -898,13 +869,13 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		return descExists(sqlDBRaw, false, tableDesc.ID)
 	})
-	tests.CheckKeyCount(t, kvDB, tableSpan, 0)
+	tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, 0)
 }
 
 func TestDropTableInTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
@@ -941,7 +912,7 @@ CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
 func TestDropAndCreateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.UseDatabase = "test"
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
@@ -985,7 +956,7 @@ func TestCommandsWhileTableBeingDropped(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	// Block schema changers so that the table we're about to DROP is not
 	// actually dropped; it will be left in the "deleted" state.
 	params.Knobs = base.TestingKnobs{
@@ -1177,10 +1148,10 @@ func TestDropIndexOnHashShardedIndexWithStoredShardColumn(t *testing.T) {
 
 	// Start a test server and connect to it with notice handler (so we can get and check notices from running queries).
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, _, _ := serverutils.StartServer(t, params)
+	params, _ := createTestServerParams()
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
-	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 	base, err := pq.NewConnector(url.String())
 	if err != nil {
@@ -1259,15 +1230,22 @@ func TestDropIndexOnHashShardedIndexWithStoredShardColumn(t *testing.T) {
 // entire database.
 func TestDropDatabaseWithForeignKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 85876)
 	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
 	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
 
-	_, err := sqlDB.Exec(`
+	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+	require.NoError(t, err)
+
+	// Refresh protected timestamp cache immediately to make MVCC GC queue to
+	// process GC immediately.
+	_, err = sqlDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
+	require.NoError(t, err)
+
+	_, err = sqlDB.Exec(`
 CREATE DATABASE t;
 CREATE TABLE t.parent(k INT PRIMARY KEY);
 CREATE TABLE t.child(k INT PRIMARY KEY REFERENCES t.parent);
@@ -1300,8 +1278,8 @@ ORDER BY
 	)
 
 	// Check that the data was cleaned up.
-	tests.CheckKeyCount(t, kvDB, parentDesc.TableSpan(keys.SystemSQLCodec), 0)
-	tests.CheckKeyCount(t, kvDB, childDesc.TableSpan(keys.SystemSQLCodec), 0)
+	tests.CheckKeyCountIncludingTombstoned(t, s, parentDesc.TableSpan(keys.SystemSQLCodec), 0)
+	tests.CheckKeyCountIncludingTombstoned(t, s, childDesc.TableSpan(keys.SystemSQLCodec), 0)
 }
 
 // Test that non-physical table deletions like DROP VIEW are immediate instead
@@ -1309,7 +1287,7 @@ ORDER BY
 func TestDropPhysicalTableGC(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())

@@ -107,7 +107,8 @@ func InitDefaultPrivilegesForRole(
 	if role.ForAllRoles {
 		defaultPrivilegesRole = &DefaultPrivilegesForRole_ForAllRoles{
 			ForAllRoles: &DefaultPrivilegesForRole_ForAllRolesPseudoRole{
-				PublicHasUsageOnTypes: true,
+				PublicHasUsageOnTypes:       true,
+				PublicHasExecuteOnFunctions: true,
 			},
 		}
 		return DefaultPrivilegesForRole{
@@ -121,6 +122,7 @@ func InitDefaultPrivilegesForRole(
 			ExplicitRole: &DefaultPrivilegesForRole_ExplicitRole{
 				UserProto:                       role.Role.EncodeProto(),
 				PublicHasUsageOnTypes:           true,
+				PublicHasExecuteOnFunctions:     true,
 				RoleHasAllPrivilegesOnTables:    true,
 				RoleHasAllPrivilegesOnSequences: true,
 				RoleHasAllPrivilegesOnSchemas:   true,
@@ -171,10 +173,18 @@ func (p *DefaultPrivilegeDescriptor) Validate() error {
 		}
 		for objectType, defaultPrivileges := range defaultPrivilegesForRole.DefaultPrivilegesPerObject {
 			privilegeObjectType := objectType.ToObjectType()
-			valid, u, remaining := defaultPrivileges.IsValidPrivilegesForObjectType(privilegeObjectType)
+			valid, u, remaining, err := defaultPrivileges.IsValidPrivilegesForObjectType(privilegeObjectType)
+			if err != nil {
+				return err
+			}
 			if !valid {
+				privList, err := privilege.ListFromBitField(remaining, privilege.Any)
+				if err != nil {
+					return err
+				}
 				return errors.AssertionFailedf("user %s must not have %s privileges on %s",
-					u.User(), privilege.ListFromBitField(remaining, privilege.Any), privilegeObjectType)
+					u.User(), privList, privilegeObjectType,
+				)
 			}
 		}
 	}

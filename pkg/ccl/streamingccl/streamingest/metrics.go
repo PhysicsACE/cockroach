@@ -128,6 +128,12 @@ var (
 		Measurement: "Ranges",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaDistSQLReplanCount = metric.Metadata{
+		Name:        "replication.distsql_replan_count",
+		Help:        "Total number of dist sql replanning events",
+		Measurement: "Events",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // Metrics are for production monitoring of stream ingestion jobs.
@@ -138,6 +144,7 @@ type Metrics struct {
 	Flushes                     *metric.Counter
 	JobProgressUpdates          *metric.Counter
 	ResolvedEvents              *metric.Counter
+	ReplanCount                 *metric.Counter
 	FlushHistNanos              metric.IHistogram
 	CommitLatency               metric.IHistogram
 	AdmitLatency                metric.IHistogram
@@ -162,26 +169,27 @@ func MakeMetrics(histogramWindow time.Duration) metric.Struct {
 		Flushes:              metric.NewCounter(metaReplicationFlushes),
 		ResolvedEvents:       metric.NewCounter(metaReplicationResolvedEventsIngested),
 		JobProgressUpdates:   metric.NewCounter(metaJobProgressUpdates),
+		ReplanCount:          metric.NewCounter(metaDistSQLReplanCount),
 		FlushHistNanos: metric.NewHistogram(metric.HistogramOptions{
-			Metadata: metaReplicationFlushHistNanos,
-			Duration: histogramWindow,
-			Buckets:  metric.BatchProcessLatencyBuckets,
-			MaxVal:   streamingFlushHistMaxLatency.Nanoseconds(),
-			SigFigs:  1,
+			Metadata:     metaReplicationFlushHistNanos,
+			Duration:     histogramWindow,
+			BucketConfig: metric.BatchProcessLatencyBuckets,
+			MaxVal:       streamingFlushHistMaxLatency.Nanoseconds(),
+			SigFigs:      1,
 		}),
 		CommitLatency: metric.NewHistogram(metric.HistogramOptions{
-			Metadata: metaReplicationCommitLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.BatchProcessLatencyBuckets,
-			MaxVal:   streamingCommitLatencyMaxValue.Nanoseconds(),
-			SigFigs:  1,
+			Metadata:     metaReplicationCommitLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.BatchProcessLatencyBuckets,
+			MaxVal:       streamingCommitLatencyMaxValue.Nanoseconds(),
+			SigFigs:      1,
 		}),
 		AdmitLatency: metric.NewHistogram(metric.HistogramOptions{
-			Metadata: metaReplicationAdmitLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.BatchProcessLatencyBuckets,
-			MaxVal:   streamingAdmitLatencyMaxValue.Nanoseconds(),
-			SigFigs:  1,
+			Metadata:     metaReplicationAdmitLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.BatchProcessLatencyBuckets,
+			MaxVal:       streamingAdmitLatencyMaxValue.Nanoseconds(),
+			SigFigs:      1,
 		}),
 		RunningCount:                metric.NewGauge(metaStreamsRunning),
 		EarliestDataCheckpointSpan:  metric.NewGauge(metaEarliestDataCheckpointSpan),

@@ -43,7 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/stretchr/testify/require"
 )
@@ -318,7 +318,7 @@ func setupKeysWithIntent(
 				putTxn = &otherTxn
 			}
 			key := makeKey(nil, j)
-			require.NoError(b, MVCCPut(context.Background(), batch, nil, key, ts, hlc.ClockTimestamp{}, value, putTxn))
+			require.NoError(b, MVCCPut(context.Background(), batch, key, ts, value, MVCCWriteOptions{Txn: putTxn}))
 		}
 		require.NoError(b, batch.Commit(true))
 		batch.Close()
@@ -368,10 +368,13 @@ func BenchmarkIntentScan(b *testing.B) {
 					setupKeysWithIntent(b, eng, numVersions, numFlushedVersions, false, /* resolveAll */
 						1, false /* resolveIntentForLatestVersionWhenNotLockUpdate */)
 					lower := makeKey(nil, 0)
-					iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+					iter, err := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
 						LowerBound: lower,
 						UpperBound: makeKey(nil, numIntentKeys),
 					})
+					if err != nil {
+						b.Fatal(err)
+					}
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
 						valid, err := iter.Valid()
@@ -454,10 +457,13 @@ func BenchmarkScanAllIntentsResolved(b *testing.B) {
 							// practice, so we don't want it to happen in this Benchmark
 							// either.
 							b.StopTimer()
-							iter = eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+							iter, err = eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
 								LowerBound: lower,
 								UpperBound: makeKey(nil, numIntentKeys),
 							})
+							if err != nil {
+								b.Fatal(err)
+							}
 							b.StartTimer()
 							iter.SeekGE(MVCCKey{Key: lower})
 						} else {
@@ -499,10 +505,13 @@ func BenchmarkScanOneAllIntentsResolved(b *testing.B) {
 					buf := append([]byte(nil), lower...)
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						iter := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+						iter, err := eng.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
 							LowerBound: buf,
 							UpperBound: upper,
 						})
+						if err != nil {
+							b.Fatal(err)
+						}
 						iter.SeekGE(MVCCKey{Key: buf})
 						valid, err := iter.Valid()
 						if err != nil {
@@ -714,7 +723,7 @@ func loadTestData(dir string, numKeys, numBatches, batchTimeSpan, valueBytes int
 		timestamp := hlc.Timestamp{WallTime: minWallTime + rand.Int63n(int64(batchTimeSpan))}
 		value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, valueBytes))
 		value.InitChecksum(key)
-		if err := MVCCPut(ctx, batch, nil, key, timestamp, hlc.ClockTimestamp{}, value, nil); err != nil {
+		if err := MVCCPut(ctx, batch, key, timestamp, value, MVCCWriteOptions{}); err != nil {
 			return nil, err
 		}
 	}
@@ -889,7 +898,7 @@ func runMVCCPut(
 		for j := 0; j < versions; j++ {
 			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 			ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-			if err := MVCCPut(ctx, rw, nil, key, ts, hlc.ClockTimestamp{}, value, nil); err != nil {
+			if err := MVCCPut(ctx, rw, key, ts, value, MVCCWriteOptions{}); err != nil {
 				b.Fatalf("failed put: %+v", err)
 			}
 		}
@@ -912,7 +921,7 @@ func runMVCCBlindPut(ctx context.Context, b *testing.B, emk engineMaker, valueSi
 	for i := 0; i < b.N; i++ {
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		if err := MVCCBlindPut(ctx, eng, nil, key, ts, hlc.ClockTimestamp{}, value, nil); err != nil {
+		if err := MVCCBlindPut(ctx, eng, key, ts, value, MVCCWriteOptions{}); err != nil {
 			b.Fatalf("failed put: %+v", err)
 		}
 	}
@@ -936,7 +945,7 @@ func runMVCCConditionalPut(
 		for i := 0; i < b.N; i++ {
 			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 			ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-			if err := MVCCPut(ctx, eng, nil, key, ts, hlc.ClockTimestamp{}, value, nil); err != nil {
+			if err := MVCCPut(ctx, eng, key, ts, value, MVCCWriteOptions{}); err != nil {
 				b.Fatalf("failed put: %+v", err)
 			}
 		}
@@ -948,7 +957,7 @@ func runMVCCConditionalPut(
 	for i := 0; i < b.N; i++ {
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		if err := MVCCConditionalPut(ctx, eng, nil, key, ts, hlc.ClockTimestamp{}, value, expected, CPutFailIfMissing, nil); err != nil {
+		if err := MVCCConditionalPut(ctx, eng, key, ts, value, expected, CPutFailIfMissing, MVCCWriteOptions{}); err != nil {
 			b.Fatalf("failed put: %+v", err)
 		}
 	}
@@ -971,7 +980,7 @@ func runMVCCBlindConditionalPut(ctx context.Context, b *testing.B, emk engineMak
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		if err := MVCCBlindConditionalPut(
-			ctx, eng, nil, key, ts, hlc.ClockTimestamp{}, value, nil, CPutFailIfMissing, nil,
+			ctx, eng, key, ts, value, nil, CPutFailIfMissing, MVCCWriteOptions{},
 		); err != nil {
 			b.Fatalf("failed put: %+v", err)
 		}
@@ -994,7 +1003,7 @@ func runMVCCInitPut(ctx context.Context, b *testing.B, emk engineMaker, valueSiz
 	for i := 0; i < b.N; i++ {
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		if err := MVCCInitPut(ctx, eng, nil, key, ts, hlc.ClockTimestamp{}, value, false, nil); err != nil {
+		if err := MVCCInitPut(ctx, eng, key, ts, value, false, MVCCWriteOptions{}); err != nil {
 			b.Fatalf("failed put: %+v", err)
 		}
 	}
@@ -1016,7 +1025,7 @@ func runMVCCBlindInitPut(ctx context.Context, b *testing.B, emk engineMaker, val
 	for i := 0; i < b.N; i++ {
 		key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(i)))
 		ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		if err := MVCCBlindInitPut(ctx, eng, nil, key, ts, hlc.ClockTimestamp{}, value, false, nil); err != nil {
+		if err := MVCCBlindInitPut(ctx, eng, key, ts, value, false, MVCCWriteOptions{}); err != nil {
 			b.Fatalf("failed put: %+v", err)
 		}
 	}
@@ -1046,7 +1055,7 @@ func runMVCCBatchPut(ctx context.Context, b *testing.B, emk engineMaker, valueSi
 		for j := i; j < end; j++ {
 			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(j)))
 			ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-			if err := MVCCPut(ctx, batch, nil, key, ts, hlc.ClockTimestamp{}, value, nil); err != nil {
+			if err := MVCCPut(ctx, batch, key, ts, value, MVCCWriteOptions{}); err != nil {
 				b.Fatalf("failed put: %+v", err)
 			}
 		}
@@ -1179,13 +1188,18 @@ func runMVCCDeleteRange(ctx context.Context, b *testing.B, valueBytes int) {
 			if _, _, _, err := MVCCDeleteRange(
 				ctx,
 				eng,
-				&enginepb.MVCCStats{},
 				keys.LocalMax,
 				roachpb.KeyMax,
 				math.MaxInt64,
 				hlc.MaxTimestamp,
-				hlc.ClockTimestamp{},
-				nil,
+				MVCCWriteOptions{
+					// NB: Though we don't capture the stats object, passing nil would
+					// disable stats computations, which should be included in benchmarks.
+					// This cost is not always negligible, e.g. in some cases such as
+					// with MVCC range tombstones where additional seeks to find boundary
+					// conditions are involved.
+					Stats: &enginepb.MVCCStats{},
+				},
 				false,
 			); err != nil {
 				b.Fatal(err)
@@ -1268,7 +1282,7 @@ func runClearRange(
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		batch := eng.NewUnindexedBatch(false /* writeOnly */)
+		batch := eng.NewUnindexedBatch()
 		if err := clearRange(eng, batch, MVCCKey{Key: keys.LocalMax}, MVCCKeyMax); err != nil {
 			b.Fatal(err)
 		}
@@ -1432,8 +1446,7 @@ func runMVCCGarbageCollect(
 				break
 			}
 			for _, key := range pointKeys {
-				if err := MVCCPut(ctx, batch, nil, key, pts, hlc.ClockTimestamp{}, val,
-					nil); err != nil {
+				if err := MVCCPut(ctx, batch, key, pts, val, MVCCWriteOptions{}); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -1487,13 +1500,13 @@ func runBatchApplyBatchRepr(
 			})
 		}
 
-		batch := eng.NewUnindexedBatch(true /* writeOnly */)
+		batch := eng.NewWriteBatch()
 		defer batch.Close() // NB: hold open so batch.Repr() doesn't get reused
 
 		for i := 0; i < batchSize; i++ {
 			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(order[i])))
 			ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-			if err := MVCCBlindPut(ctx, batch, nil, key, ts, hlc.ClockTimestamp{}, value, nil); err != nil {
+			if err := MVCCBlindPut(ctx, batch, key, ts, value, MVCCWriteOptions{}); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -1504,9 +1517,9 @@ func runBatchApplyBatchRepr(
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		var batch Batch
+		var batch WriteBatch
 		if !indexed {
-			batch = eng.NewUnindexedBatch(true /* writeOnly */)
+			batch = eng.NewWriteBatch()
 		} else {
 			batch = eng.NewBatch()
 		}
@@ -1902,7 +1915,7 @@ func BenchmarkMVCCScannerWithIntentsAndVersions(b *testing.B) {
 		// Put the keys for this iteration.
 		for j := 0; j < numKeys; j++ {
 			key := makeKey(nil, j)
-			require.NoError(b, MVCCPut(ctx, batch, nil, key, ts, hlc.ClockTimestamp{}, value, &txn))
+			require.NoError(b, MVCCPut(ctx, batch, key, ts, value, MVCCWriteOptions{Txn: &txn}))
 		}
 		numPrevKeys = numKeys
 		// Read the keys from the Batch and write them to a sstable to ingest.
@@ -1927,33 +1940,36 @@ func BenchmarkMVCCScannerWithIntentsAndVersions(b *testing.B) {
 			return cmp < 0
 		})
 		sstFileName := fmt.Sprintf("tmp-ingest-%d", i)
-		sstFile, err := eng.fs.Create(sstFileName)
+		sstFile, err := eng.Create(sstFileName)
 		require.NoError(b, err)
 		// No improvement with v3 since the multiple versions are in different
 		// files.
 		format := sstable.TableFormatPebblev2
 		opts := DefaultPebbleOptions().MakeWriterOptions(0, format)
-		writer := sstable.NewWriter(objstorage.NewFileWritable(sstFile), opts)
+		writer := sstable.NewWriter(objstorageprovider.NewFileWritable(sstFile), opts)
 		for _, kv := range kvPairs {
 			require.NoError(b, writer.Add(
 				pebble.InternalKey{UserKey: kv.key, Trailer: uint64(kv.kind)}, kv.value))
 		}
 		require.NoError(b, writer.Close())
 		batch.Close()
-		require.NoError(b, eng.IngestExternalFiles(ctx, []string{sstFileName}))
+		require.NoError(b, eng.IngestLocalFiles(ctx, []string{sstFileName}))
 	}
 	for i := 0; i < b.N; i++ {
 		rw := eng.NewReadOnly(StandardDurability)
 		ts := hlc.Timestamp{WallTime: int64(numVersions) + 5}
 		startKey := makeKey(nil, 0)
 		endKey := makeKey(nil, totalNumKeys+1)
-		iter := newMVCCIterator(
+		iter, err := newMVCCIterator(
 			rw, ts, false, false, IterOptions{
 				KeyTypes:   IterKeyTypePointsAndRanges,
 				LowerBound: startKey,
 				UpperBound: endKey,
 			},
 		)
+		if err != nil {
+			b.Fatal(err)
+		}
 		res, err := mvccScanToKvs(ctx, iter, startKey, endKey,
 			hlc.Timestamp{WallTime: int64(numVersions) + 5}, MVCCScanOptions{})
 		if err != nil {

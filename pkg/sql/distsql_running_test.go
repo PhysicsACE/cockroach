@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -31,8 +32,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgtest"
@@ -41,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/datadriven"
@@ -75,13 +79,14 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 
 	// Plan a statement.
 	execCfg := s.ExecutorConfig().(ExecutorConfig)
+	sd := NewInternalSessionData(ctx, execCfg.Settings, "test")
 	internalPlanner, cleanup := NewInternalPlanner(
 		"test",
 		kv.NewTxn(ctx, db, s.NodeID()),
 		username.RootUserName(),
 		&MemoryMetrics{},
 		&execCfg,
-		sessiondatapb.SessionData{},
+		sd,
 	)
 	defer cleanup()
 	p := internalPlanner.(*planner)
@@ -194,6 +199,209 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 	}
 	if tracing.FindMsgInRecording(getRecAndFinish(), clientRejectedMsg) == -1 {
 		t.Fatalf("didn't find expected message in trace: %s", clientRejectedMsg)
+	}
+}
+
+// TestDistSQLRunningParallelFKChecksAfterAbort simulates a SQL transaction
+// that writes two rows required to validate a FK check and then proceeds to
+// write a third row that would actually trigger this check. The transaction is
+// aborted after the third row is written but before the FK check is performed.
+// We assert that this construction doesn't throw a FK violation; instead, the
+// transaction should be able to retry.
+// This test serves as a regression test for the hazard identified in
+// https://github.com/cockroachdb/cockroach/issues/97141.
+func TestDistSQLRunningParallelFKChecksAfterAbort(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	mu := struct {
+		syncutil.Mutex
+		abortTxn func(uuid uuid.UUID)
+	}{}
+
+	s, conn, db := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			DistSQL: &execinfra.TestingKnobs{
+				RunBeforeCascadesAndChecks: func(txnID uuid.UUID) {
+					mu.Lock()
+					defer mu.Unlock()
+					if mu.abortTxn != nil {
+						mu.abortTxn(txnID)
+					}
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+	sqlDB := sqlutils.MakeSQLRunner(conn)
+
+	// Set up schemas for the test. We want a construction that results in 2 FK
+	// checks, of which 1 is done in parallel.
+	sqlDB.Exec(t, "create database test")
+	sqlDB.Exec(t, "create table test.parent1(a INT PRIMARY KEY)")
+	sqlDB.Exec(t, "create table test.parent2(b INT PRIMARY KEY)")
+	sqlDB.Exec(
+		t,
+		"create table test.child(a INT, b INT, FOREIGN KEY (a) REFERENCES test.parent1(a), FOREIGN KEY (b) REFERENCES test.parent2(b))",
+	)
+	key := roachpb.Key("a")
+
+	setupQueries := []string{
+		"insert into test.parent1 VALUES(1)",
+		"insert into test.parent2 VALUES(2)",
+	}
+	query := "insert into test.child VALUES(1, 2)"
+
+	createPlannerAndRunQuery := func(ctx context.Context, txn *kv.Txn, query string) error {
+		execCfg := s.ExecutorConfig().(ExecutorConfig)
+		// TODO(sql-queries): This sessiondata contains zero-values for most fields,
+		// meaning DistSQLMode is DistSQLOff. Is this correct?
+		sd := &sessiondata.SessionData{
+			SessionData:   sessiondatapb.SessionData{},
+			SearchPath:    sessiondata.DefaultSearchPathForUser(username.RootUserName()),
+			SequenceState: sessiondata.NewSequenceState(),
+			Location:      time.UTC,
+		}
+		// Plan the statement.
+		internalPlanner, cleanup := NewInternalPlanner(
+			"test",
+			txn,
+			username.RootUserName(),
+			&MemoryMetrics{},
+			&execCfg,
+			sd,
+		)
+		defer cleanup()
+		p := internalPlanner.(*planner)
+		stmt, err := parser.ParseOne(query)
+		require.NoError(t, err)
+
+		rw := NewCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
+			return nil
+		})
+		recv := MakeDistSQLReceiver(
+			ctx,
+			rw,
+			stmt.AST.StatementReturnType(),
+			execCfg.RangeDescriptorCache,
+			txn,
+			execCfg.Clock,
+			p.ExtendedEvalContext().Tracing,
+		)
+
+		p.stmt = makeStatement(stmt, clusterunique.ID{})
+		if err := p.makeOptimizerPlan(ctx); err != nil {
+			t.Fatal(err)
+		}
+		defer p.curPlan.close(ctx)
+
+		evalCtx := p.ExtendedEvalContext()
+		planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, txn, DistributionTypeNone)
+		planCtx.stmtType = recv.stmtType
+
+		evalCtxFactory := func(bool) *extendedEvalContext {
+			factoryEvalCtx := extendedEvalContext{Tracing: evalCtx.Tracing}
+			factoryEvalCtx.Context = evalCtx.Context
+			return &factoryEvalCtx
+		}
+		err = execCfg.DistSQLPlanner.PlanAndRunAll(ctx, evalCtx, planCtx, p, recv, evalCtxFactory)
+		if err != nil {
+			return err
+		}
+		return rw.Err()
+	}
+
+	push := func(ctx context.Context, key roachpb.Key) error {
+		// Conflicting transaction that pushes another transaction.
+		conflictTxn := kv.NewTxn(ctx, db, 0 /* gatewayNodeID */)
+		// We need to explicitly set a high priority for the push to happen.
+		if err := conflictTxn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
+			return err
+		}
+		// Push through a Put, as opposed to a Get, so that the pushee gets aborted.
+		if err := conflictTxn.Put(ctx, key, "pusher was here"); err != nil {
+			return err
+		}
+		err := conflictTxn.Commit(ctx)
+		require.NoError(t, err)
+		t.Log(conflictTxn.Rollback(ctx))
+		return err
+	}
+
+	// Make a db with a short heartbeat interval, so that the aborted txn finds
+	// out quickly.
+	ambient := s.AmbientCtx()
+	tsf := kvcoord.NewTxnCoordSenderFactory(
+		kvcoord.TxnCoordSenderFactoryConfig{
+			AmbientCtx: ambient,
+			// Short heartbeat interval.
+			HeartbeatInterval: time.Millisecond,
+			Settings:          s.ClusterSettings(),
+			Clock:             s.Clock(),
+			Stopper:           s.Stopper(),
+		},
+		s.DistSenderI().(*kvcoord.DistSender),
+	)
+	shortDB := kv.NewDB(ambient, tsf, s.Clock(), s.Stopper())
+
+	iter := 0
+	// We'll trace to make sure the test isn't fooling itself.
+	tr := s.TracerI().(*tracing.Tracer)
+	runningCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "test")
+	defer getRecAndFinish()
+	err := shortDB.Txn(runningCtx, func(ctx context.Context, txn *kv.Txn) error {
+		iter++
+
+		// set up the test.
+		for _, query := range setupQueries {
+			err := createPlannerAndRunQuery(ctx, txn, query)
+			require.NoError(t, err)
+		}
+
+		if iter == 1 {
+			// On the first iteration, abort the txn by setting the abortTxn function.
+			mu.Lock()
+			mu.abortTxn = func(txnID uuid.UUID) {
+				if txnID != txn.ID() {
+					return // not our txn
+				}
+				if err := txn.Put(ctx, key, "val"); err != nil {
+					t.Fatal(err)
+				}
+				if err := push(ctx, key); err != nil {
+					t.Fatal(err)
+				}
+				// Now wait until the heartbeat loop notices that the transaction is aborted.
+				testutils.SucceedsSoon(t, func() error {
+					if txn.Sender().(*kvcoord.TxnCoordSender).IsTracking() {
+						return fmt.Errorf("txn heartbeat loop running")
+					}
+					return nil
+				})
+			}
+			mu.Unlock()
+			defer func() {
+				// clear the abortTxn function before returning.
+				mu.Lock()
+				mu.abortTxn = nil
+				mu.Unlock()
+			}()
+		}
+
+		// Execute the FK checks.
+		return createPlannerAndRunQuery(ctx, txn, query)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, iter, 2)
+	if tracing.FindMsgInRecording(getRecAndFinish(), clientRejectedMsg) == -1 {
+		t.Fatalf("didn't find expected message in trace: %s", clientRejectedMsg)
+	}
+	concurrentFKChecksLogMessage := fmt.Sprintf(executingParallelAndSerialChecks, 1, 1)
+	if tracing.FindMsgInRecording(getRecAndFinish(), concurrentFKChecksLogMessage) == -1 {
+		t.Fatalf("didn't find expected message in trace: %s", concurrentFKChecksLogMessage)
 	}
 }
 
@@ -396,17 +604,17 @@ func TestDistSQLReceiverDrainsMeta(t *testing.T) {
 	const numNodes = 3
 	const testQuery = "SELECT * FROM foo"
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			UseDatabase: "test",
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &ExecutorTestingKnobs{
-					DistSQLReceiverPushCallbackFactory: func(query string) func(rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
+					DistSQLReceiverPushCallbackFactory: func(query string) func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata) {
 						if query != testQuery {
 							return nil
 						}
-						return func(row rowenc.EncDatumRow, meta *execinfrapb.ProducerMetadata) {
+						return func(_ rowenc.EncDatumRow, _ coldata.Batch, meta *execinfrapb.ProducerMetadata) {
 							if meta != nil {
 								accumulatedMeta = append(accumulatedMeta, *meta)
 							}
@@ -439,7 +647,15 @@ func TestDistSQLReceiverDrainsMeta(t *testing.T) {
 	)
 
 	// Connect to the cluster via the PGWire client.
-	p, err := pgtest.NewPGTest(ctx, tc.Server(0).ServingSQLAddr(), username.RootUser)
+	p, err := pgtest.NewPGTest(ctx, tc.Server(0).AdvSQLAddr(), username.RootUser)
+	require.NoError(t, err)
+
+	// We disable multiple active portals here as it only supports local-only plan.
+	// TODO(sql-sessions): remove this line when we finish
+	// https://github.com/cockroachdb/cockroach/issues/100822.
+	require.NoError(t, p.SendOneLine(`Query {"String": "SET multiple_active_portals_enabled = false"}`))
+	until := pgtest.ParseMessages("ReadyForQuery")
+	_, err = p.Until(false /* keepErrMsg */, until...)
 	require.NoError(t, err)
 
 	// Execute the test query asking for at most 25 rows.
@@ -452,7 +668,7 @@ func TestDistSQLReceiverDrainsMeta(t *testing.T) {
 	// Retrieve all of the results. We need to receive until two 'ReadyForQuery'
 	// messages are returned (the first one for "USE test" query and the second
 	// one is for the limited portal execution).
-	until := pgtest.ParseMessages("ReadyForQuery\nReadyForQuery")
+	until = pgtest.ParseMessages("ReadyForQuery\nReadyForQuery")
 	msgs, err := p.Until(false /* keepErrMsg */, until...)
 	require.NoError(t, err)
 	received := pgtest.MsgsToJSONWithIgnore(msgs, &datadriven.TestData{})
@@ -617,7 +833,7 @@ func TestSetupFlowRPCError(t *testing.T) {
 		queries[1]: 3, // error on n3
 		queries[2]: 0, // no error
 	}
-	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
@@ -755,5 +971,127 @@ CREATE TABLE child (
 			continue
 		}
 		sqlDB.Exec(t, fmt.Sprintf(`%[1]sINSERT INTO child VALUES (%[2]d, %[2]d, %[2]d)`, prefix, id))
+	}
+}
+
+// TestDistributedQueryErrorIsRetriedLocally verifies that if a query with a
+// distributed plan results in a SQL retryable error, then it is rerun as local
+// transparently.
+func TestDistributedQueryErrorIsRetriedLocally(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Start a 3 node cluster where we can inject an error for SetupFlow RPC on
+	// the server side for the queries in question.
+	const numNodes = 3
+	getError := func(nodeID base.SQLInstanceID) error {
+		return errors.Newf("connection refused: n%d", nodeID)
+	}
+	// Assert that the injected error is in the allow-list of errors that are
+	// retried transparently.
+	if err := getError(base.SQLInstanceID(0)); !pgerror.IsSQLRetryableError(err) {
+		t.Fatalf("expected error to be in the allow-list for a retry: %v", err)
+	}
+
+	// We use different queries to simplify handling the node ID on which the
+	// error should be injected (i.e. we avoid the need for synchronization in
+	// the test). In particular, the difficulty comes from the fact that some of
+	// the SetupFlow RPCs might not be issued at all while others are served
+	// after the corresponding flow on the gateway has exited.
+	queries := []string{
+		"SELECT k FROM test.foo",
+		"SELECT v FROM test.foo",
+		"SELECT * FROM test.foo",
+	}
+	stmtToNodeIDForError := map[string]base.SQLInstanceID{
+		queries[0]: 2, // error on n2
+		queries[1]: 3, // error on n3
+		queries[2]: 0, // no error
+	}
+	tc := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				DistSQL: &execinfra.TestingKnobs{
+					SetupFlowCb: func(_ context.Context, nodeID base.SQLInstanceID, req *execinfrapb.SetupFlowRequest) error {
+						nodeIDForError, ok := stmtToNodeIDForError[req.StatementSQL]
+						if !ok || nodeIDForError != nodeID {
+							return nil
+						}
+						return getError(nodeID)
+					},
+				},
+			},
+		},
+	})
+	defer tc.Stopper().Stop(context.Background())
+
+	// Create a table with 30 rows, split them into 3 ranges with each node
+	// having one.
+	db := tc.ServerConn(0)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlutils.CreateTable(
+		t, db, "foo",
+		"k INT PRIMARY KEY, v INT",
+		30,
+		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(2)),
+	)
+	sqlDB.Exec(t, "ALTER TABLE test.foo SPLIT AT VALUES (10), (20)")
+	sqlDB.Exec(
+		t,
+		fmt.Sprintf("ALTER TABLE test.foo EXPERIMENTAL_RELOCATE VALUES (ARRAY[%d], 0), (ARRAY[%d], 10), (ARRAY[%d], 20)",
+			tc.Server(0).GetFirstStoreID(),
+			tc.Server(1).GetFirstStoreID(),
+			tc.Server(2).GetFirstStoreID(),
+		),
+	)
+
+	for _, query := range queries {
+		nodeID := stmtToNodeIDForError[query]
+		injectError := nodeID != base.SQLInstanceID(0)
+		if injectError {
+			t.Logf("running %q with error being injected on n%d", query, nodeID)
+		} else {
+			t.Logf("running %q without error being injected", query)
+		}
+		sqlDB.Exec(t, "SET TRACING=on;")
+		_, err := db.Exec(query)
+		// We expect that the query was retried as local which should succeed.
+		require.NoError(t, err)
+		sqlDB.Exec(t, "SET TRACING=off;")
+		trace := sqlDB.QueryStr(t, "SELECT message FROM [SHOW TRACE FOR SESSION]")
+		// Inspect the trace to ensure that the query was, indeed, initially run
+		// as distributed but hit a retryable error and was rerun as local.
+		var foundDistributed, foundLocal bool
+		for _, message := range trace {
+			if strings.Contains(message[0], "creating DistSQL plan with isLocal=false") {
+				foundDistributed = true
+			} else if strings.Contains(message[0], "encountered an error when running the distributed plan, re-running it as local") {
+				foundLocal = true
+			}
+		}
+		if injectError {
+			if !foundDistributed || !foundLocal {
+				t.Fatalf("with remote error injection, foundDistributed=%t, foundLocal=%t\ntrace:%s", foundDistributed, foundLocal, trace)
+			}
+		} else {
+			// When no error is injected, the query should succeed right away
+			// when run in distributed fashion.
+			if !foundDistributed || foundLocal {
+				t.Fatalf("without remote error injection, foundDistributed=%t, foundLocal=%t\ntrace:%s", foundDistributed, foundLocal, trace)
+			}
+		}
+	}
+
+	// Now disable the retry mechanism and ensure that when remote error is
+	// injected, it is returned as the query result.
+	sqlDB.Exec(t, "SET CLUSTER SETTING sql.distsql.distributed_query_rerun_locally.enabled = false;")
+	for _, query := range queries[:2] {
+		nodeID := stmtToNodeIDForError[query]
+		t.Logf("running %q with error being injected on n%d but local retry disabled", query, nodeID)
+		_, err := db.Exec(query)
+		require.NotNil(t, err)
+		// lib/pq wraps the error, so we cannot use errors.Is() check.
+		require.True(t, strings.Contains(err.Error(), getError(nodeID).Error()))
 	}
 }

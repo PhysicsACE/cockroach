@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"runtime/pprof"
 	"sort"
 	"testing"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -37,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -136,7 +139,7 @@ func TestBootstrapNewStore(t *testing.T) {
 
 	// Start server with persisted store so that it gets bootstrapped.
 	{
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{Path: path},
 			},
@@ -149,7 +152,7 @@ func TestBootstrapNewStore(t *testing.T) {
 		{InMemory: true},
 		{InMemory: true},
 	}
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		StoreSpecs: specs,
 	})
 	defer s.Stopper().Stop(ctx)
@@ -200,7 +203,7 @@ func TestNodeJoin(t *testing.T) {
 
 	numNodes := len(perNode)
 
-	s := serverutils.StartNewTestCluster(t, numNodes, args)
+	s := serverutils.StartCluster(t, numNodes, args)
 	defer s.Stopper().Stop(ctx)
 
 	// Verify all stores are initialized.
@@ -218,8 +221,8 @@ func TestNodeJoin(t *testing.T) {
 	// Verify node1 sees node2 via gossip and vice versa.
 	node1Key := gossip.MakeNodeIDKey(s.Server(0).NodeID())
 	node2Key := gossip.MakeNodeIDKey(s.Server(1).NodeID())
-	server1Addr := s.Server(0).ServingRPCAddr()
-	server2Addr := s.Server(1).ServingRPCAddr()
+	server1Addr := s.Server(0).AdvRPCAddr()
+	server2Addr := s.Server(1).AdvRPCAddr()
 	testutils.SucceedsSoon(t, func() error {
 		var nodeDesc1 roachpb.NodeDescriptor
 		if err := s.Server(0).GossipI().(*gossip.Gossip).GetInfoProto(node2Key, &nodeDesc1); err != nil {
@@ -269,7 +272,7 @@ func TestCorruptedClusterID(t *testing.T) {
 		StoreID:   1,
 	}
 	if err := storage.MVCCPutProto(
-		ctx, e, nil /* ms */, keys.StoreIdentKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil /* txn */, &sIdent,
+		ctx, e, keys.StoreIdentKey(), hlc.Timestamp{}, &sIdent, storage.MVCCWriteOptions{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -287,14 +290,17 @@ func TestCorruptedClusterID(t *testing.T) {
 // And that UpdatedAt has increased.
 // The latest actual stats are returned.
 func compareNodeStatus(
-	t *testing.T, ts *TestServer, expectedNodeStatus *statuspb.NodeStatus, testNumber int,
+	t *testing.T,
+	ts serverutils.TestServerInterface,
+	expectedNodeStatus *statuspb.NodeStatus,
+	testNumber int,
 ) *statuspb.NodeStatus {
 	// ========================================
 	// Read NodeStatus from server and validate top-level fields.
 	// ========================================
-	nodeStatusKey := keys.NodeStatusKey(ts.node.Descriptor.NodeID)
+	nodeStatusKey := keys.NodeStatusKey(ts.NodeID())
 	nodeStatus := &statuspb.NodeStatus{}
-	if err := ts.db.GetProto(context.Background(), nodeStatusKey, nodeStatus); err != nil {
+	if err := ts.DB().GetProto(context.Background(), nodeStatusKey, nodeStatus); err != nil {
 		t.Fatalf("%d: failure getting node status: %s", testNumber, err)
 	}
 
@@ -406,15 +412,15 @@ func TestNodeStatusWritten(t *testing.T) {
 	// ========================================
 	// Start test server and wait for full initialization.
 	// ========================================
-	srv, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
-		DisableEventLog: true,
+	ts, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		DisableEventLog:   true,
 	})
-	defer srv.Stopper().Stop(context.Background())
-	ts := srv.(*TestServer)
+	defer ts.Stopper().Stop(context.Background())
 	ctx := context.Background()
 
 	// Retrieve the first store from the Node.
-	s, err := ts.node.stores.GetStore(roachpb.StoreID(1))
+	s, err := ts.GetStores().(*kvserver.Stores).GetStore(roachpb.StoreID(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +436,9 @@ func TestNodeStatusWritten(t *testing.T) {
 	}
 
 	// Wait for full replication of initial ranges.
-	initialRanges, err := ExpectedInitialRangeCount(keys.SystemSQLCodec, &ts.cfg.DefaultZoneConfig, &ts.cfg.DefaultSystemZoneConfig)
+	zcfg := ts.DefaultZoneConfig()
+	szcfg := ts.DefaultSystemZoneConfig()
+	initialRanges, err := ExpectedInitialRangeCount(keys.SystemSQLCodec, &zcfg, &szcfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +456,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	// status produced by the server.
 	// ========================================
 	expectedNodeStatus := &statuspb.NodeStatus{
-		Desc:      ts.node.Descriptor,
+		Desc:      ts.Node().(*Node).Descriptor,
 		StartedAt: 0,
 		UpdatedAt: 0,
 		Metrics: map[string]float64{
@@ -458,7 +466,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	}
 
 	expectedStoreStatuses := make(map[roachpb.StoreID]statuspb.StoreStatus)
-	if err := ts.node.stores.VisitStores(func(s *kvserver.Store) error {
+	if err := ts.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 		desc, err := s.Descriptor(ctx, false /* useCached */)
 		if err != nil {
 			t.Fatal(err)
@@ -493,7 +501,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	// were multiple replicas, more care would need to be taken in the initial
 	// syncFeed().
 	forceWriteStatus := func() {
-		if err := ts.node.computeMetricsPeriodically(ctx, map[*kvserver.Store]*storage.MetricsForInterval{}, 0); err != nil {
+		if err := ts.Node().(*Node).computeMetricsPeriodically(ctx, map[*kvserver.Store]*storage.MetricsForInterval{}, 0); err != nil {
 			t.Fatalf("error publishing store statuses: %s", err)
 		}
 
@@ -517,10 +525,10 @@ func TestNodeStatusWritten(t *testing.T) {
 	rightKey := "c"
 
 	// Write some values left and right of the proposed split key.
-	if err := ts.db.Put(ctx, leftKey, content); err != nil {
+	if err := kvDB.Put(ctx, leftKey, content); err != nil {
 		t.Fatal(err)
 	}
-	if err := ts.db.Put(ctx, rightKey, content); err != nil {
+	if err := kvDB.Put(ctx, rightKey, content); err != nil {
 		t.Fatal(err)
 	}
 
@@ -547,7 +555,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	// ========================================
 
 	// Split the range.
-	if err := ts.db.AdminSplit(
+	if err := kvDB.AdminSplit(
 		context.Background(),
 		splitKey,
 		hlc.MaxTimestamp, /* expirationTime */
@@ -557,10 +565,10 @@ func TestNodeStatusWritten(t *testing.T) {
 
 	// Write on both sides of the split to ensure that the raft machinery
 	// is running.
-	if err := ts.db.Put(ctx, leftKey, content); err != nil {
+	if err := kvDB.Put(ctx, leftKey, content); err != nil {
 		t.Fatal(err)
 	}
-	if err := ts.db.Put(ctx, rightKey, content); err != nil {
+	if err := kvDB.Put(ctx, rightKey, content); err != nil {
 		t.Fatal(err)
 	}
 
@@ -592,7 +600,7 @@ func TestStartNodeWithLocality(t *testing.T) {
 		args := base.TestServerArgs{
 			Locality: locality,
 		}
-		s, _, _ := serverutils.StartServer(t, args)
+		s := serverutils.StartServerOnly(t, args)
 		defer s.Stopper().Stop(ctx)
 
 		// Check that the locality is present both on the Node and was also
@@ -658,15 +666,80 @@ func TestNodeSendUnknownBatchRequest(t *testing.T) {
 	}
 }
 
+// TestNodeBatchRequestPProfLabels tests that node.Batch copies pprof labels
+// from the BatchRequest and applies them to the root context if CPU profiling
+// with labels is enabled.
+func TestNodeBatchRequestPProfLabels(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	observedProfileLabels := make(map[string]string)
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, _ *kvpb.BatchResponse) *kvpb.Error {
+					var foundBatch bool
+					for _, ru := range ba.Requests {
+						switch r := ru.GetInner().(type) {
+						case *kvpb.PutRequest:
+							if r.Header().Key.Equal(roachpb.Key("a")) {
+								foundBatch = true
+							}
+						}
+					}
+					if foundBatch {
+						pprof.ForLabels(ctx, func(key, value string) bool {
+							observedProfileLabels[key] = value
+							return true
+						})
+					}
+					return nil
+				},
+			},
+		},
+	})
+	defer ts.Stopper().Stop(context.Background())
+	n := ts.Node().(*Node)
+
+	var ba kvpb.BatchRequest
+	ba.RangeID = 1
+	ba.Replica.StoreID = 1
+	expectedProfileLabels := map[string]string{"key": "value", "key2": "value2"}
+	ba.ProfileLabels = func() []string {
+		var labels []string
+		for k, v := range expectedProfileLabels {
+			labels = append(labels, k, v)
+		}
+		return labels
+	}()
+
+	gr := kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking)
+	pr := kvpb.NewPut(gr.Header().Key, roachpb.Value{})
+	ba.Add(gr, pr)
+
+	// If CPU profiling with labels is not enabled, we should not observe any
+	// pprof labels on the context.
+	ctx := context.Background()
+	_, _ = n.Batch(ctx, &ba)
+	require.Equal(t, map[string]string{}, observedProfileLabels)
+
+	require.NoError(t, ts.ClusterSettings().SetCPUProfiling(cluster.CPUProfileWithLabels))
+	_, _ = n.Batch(ctx, &ba)
+
+	require.Len(t, observedProfileLabels, 3)
+	// Delete the labels for the range_str.
+	delete(observedProfileLabels, "range_str")
+	require.Equal(t, expectedProfileLabels, observedProfileLabels)
+}
+
 func TestNodeBatchRequestMetricsInc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer srv.Stopper().Stop(context.Background())
-	ts := srv.(*TestServer)
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer ts.Stopper().Stop(context.Background())
 
-	n := ts.GetNode()
+	n := ts.Node().(*Node)
 	bCurr := n.metrics.BatchCount.Count()
 	getCurr := n.metrics.MethodCounts[kvpb.Get].Count()
 	putCurr := n.metrics.MethodCounts[kvpb.Put].Count()
@@ -675,7 +748,7 @@ func TestNodeBatchRequestMetricsInc(t *testing.T) {
 	ba.RangeID = 1
 	ba.Replica.StoreID = 1
 
-	gr := kvpb.NewGet(roachpb.Key("a"), false)
+	gr := kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking)
 	pr := kvpb.NewPut(gr.Header().Key, roachpb.Value{})
 	ba.Add(gr, pr)
 
@@ -689,6 +762,78 @@ func TestNodeBatchRequestMetricsInc(t *testing.T) {
 	require.GreaterOrEqual(t, n.metrics.MethodCounts[kvpb.Put].Count(), putCurr)
 }
 
+// TestNodeCrossLocalityMetrics verifies that
+// updateCrossLocalityMetricsOnBatch{Request|Response} correctly updates
+// cross-region, cross-zone byte count metrics for batch requests sent and batch
+// responses received.
+func TestNodeCrossLocalityMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	const expectedInc = 10
+
+	metricsNames := []string{
+		"batch_requests.bytes",
+		"batch_requests.cross_region.bytes",
+		"batch_requests.cross_zone.bytes",
+		"batch_responses.bytes",
+		"batch_responses.cross_region.bytes",
+		"batch_responses.cross_zone.bytes"}
+	for _, tc := range []struct {
+		crossLocalityType    roachpb.LocalityComparisonType
+		expectedMetricChange [6]int64
+		forRequest           bool
+	}{
+		{crossLocalityType: roachpb.LocalityComparisonType_CROSS_REGION,
+			expectedMetricChange: [6]int64{expectedInc, expectedInc, 0, 0, 0, 0},
+			forRequest:           true,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_SAME_REGION_CROSS_ZONE,
+			expectedMetricChange: [6]int64{expectedInc, 0, expectedInc, 0, 0, 0},
+			forRequest:           true,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_SAME_REGION_SAME_ZONE,
+			expectedMetricChange: [6]int64{expectedInc, 0, 0, 0, 0, 0},
+			forRequest:           true,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_CROSS_REGION,
+			expectedMetricChange: [6]int64{0, 0, 0, expectedInc, expectedInc, 0},
+			forRequest:           false,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_SAME_REGION_CROSS_ZONE,
+			expectedMetricChange: [6]int64{0, 0, 0, expectedInc, 0, expectedInc},
+			forRequest:           false,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_SAME_REGION_SAME_ZONE,
+			expectedMetricChange: [6]int64{0, 0, 0, expectedInc, 0, 0},
+			forRequest:           false,
+		},
+	} {
+		t.Run(fmt.Sprintf("%-v", tc.crossLocalityType), func(t *testing.T) {
+			metrics := makeNodeMetrics(metric.NewRegistry(), 1)
+			beforeMetrics, err := metrics.getNodeCounterMetrics(metricsNames)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.forRequest {
+				metrics.updateCrossLocalityMetricsOnBatchRequest(tc.crossLocalityType, expectedInc)
+			} else {
+				metrics.updateCrossLocalityMetricsOnBatchResponse(tc.crossLocalityType, expectedInc)
+			}
+
+			afterMetrics, err := metrics.getNodeCounterMetrics(metricsNames)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metricsDiff := getMapsDiff(beforeMetrics, afterMetrics)
+			expectedDiff := make(map[string]int64, 6)
+			for i, inc := range tc.expectedMetricChange {
+				expectedDiff[metricsNames[i]] = inc
+			}
+			require.Equal(t, metricsDiff, expectedDiff)
+		})
+	}
+}
+
 func TestGetTenantWeights(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -698,7 +843,7 @@ func TestGetTenantWeights(t *testing.T) {
 		{InMemory: true},
 		{InMemory: true},
 	}
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		StoreSpecs: specs,
 	})
 	defer s.Stopper().Stop(ctx)
@@ -796,8 +941,8 @@ func TestDiskStatsMap(t *testing.T) {
 	engineIDs := []roachpb.StoreID{10, 5}
 	for i := range engines {
 		ident := roachpb.StoreIdent{StoreID: engineIDs[i]}
-		require.NoError(t, storage.MVCCBlindPutProto(ctx, engines[i], nil, keys.StoreIdentKey(),
-			hlc.Timestamp{}, hlc.ClockTimestamp{}, &ident, nil))
+		require.NoError(t, storage.MVCCBlindPutProto(ctx, engines[i], keys.StoreIdentKey(),
+			hlc.Timestamp{}, &ident, storage.MVCCWriteOptions{}))
 	}
 	var dsm diskStatsMap
 	clusterProvisionedBW := int64(150)

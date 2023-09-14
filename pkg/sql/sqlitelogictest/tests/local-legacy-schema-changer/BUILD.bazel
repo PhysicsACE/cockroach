@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_test")
 
 go_test(
@@ -10,9 +9,15 @@ go_test(
         "//c-deps:libgeos",  # keep
         "@com_github_cockroachdb_sqllogictest//:testfiles",  # keep
     ],
-    shard_count = 16,
-    tags = ["cpu:1"],
+    exec_properties = {
+        "Pool": "large",
+    },
+    shard_count = 48,
+    tags = [
+        "cpu:1",
+    ],
     deps = [
+        "//pkg/base",
         "//pkg/build/bazel",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
@@ -26,5 +31,3 @@ go_test(
         "//pkg/util/randutil",
     ],
 )
-
-get_x_data(name = "get_x_data")

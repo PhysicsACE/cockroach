@@ -80,7 +80,6 @@ func newProjectSetProcessor(
 	spec *execinfrapb.ProjectSetSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*projectSetProcessor, error) {
 	outputTypes := append(input.OutputTypes(), spec.GeneratedColumns...)
 	ps := &projectSetProcessor{
@@ -99,7 +98,6 @@ func newProjectSetProcessor(
 		outputTypes,
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ps.input},
@@ -183,6 +181,14 @@ func (ps *projectSetProcessor) nextInputRow() (
 				gen, err = eval.GetFuncGenerator(ps.Ctx(), ps.EvalCtx, t)
 			case *tree.RoutineExpr:
 				gen, err = eval.GetRoutineGenerator(ps.Ctx(), ps.EvalCtx, t)
+				if err == nil && gen == nil && t.MultiColOutput && !t.Generator {
+					// If the routine will return multiple output columns, we expect the
+					// routine to return nulls for each column type instead of no rows, so
+					// we can't use the empty generator. Set-returning routines
+					// (i.e., Generators), have different behavior and are handled
+					// separately.
+					gen, err = builtins.NullGenerator(t.ResolvedType())
+				}
 			default:
 				return nil, nil, errors.AssertionFailedf("unexpected expression in project-set: %T", fn)
 			}

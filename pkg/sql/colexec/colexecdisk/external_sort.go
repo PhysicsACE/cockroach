@@ -117,6 +117,8 @@ type externalSorter struct {
 	colexecop.InitHelper
 	colexecop.NonExplainable
 	colexecop.CloserHelper
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
 
 	// mergeUnlimitedAllocator is used to track the memory under the batches
 	// dequeued from partitions during the merge operation.
@@ -191,6 +193,7 @@ type externalSorter struct {
 		acquiredFDs int
 	}
 
+	merger  colexecop.ClosableOperator
 	emitter colexecop.Operator
 
 	testingKnobs struct {
@@ -220,6 +223,8 @@ var _ colexecop.ClosableOperator = &externalSorter{}
 // the partitioned disk queue acquire file descriptors instead of acquiring
 // them up front in Next. This should only be true in tests.
 func NewExternalSorter(
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	sortUnlimitedAllocator *colmem.Allocator,
 	mergeUnlimitedAllocator *colmem.Allocator,
 	outputUnlimitedAllocator *colmem.Allocator,
@@ -298,6 +303,8 @@ func NewExternalSorter(
 	}
 	es := &externalSorter{
 		OneInputNode:             colexecop.NewOneInputNode(inMemSorter),
+		flowCtx:                  flowCtx,
+		processorID:              processorID,
 		mergeUnlimitedAllocator:  mergeUnlimitedAllocator,
 		outputUnlimitedAllocator: outputUnlimitedAllocator,
 		mergeMemoryLimit:         mergeMemoryLimit,
@@ -423,13 +430,19 @@ func (s *externalSorter) Next() coldata.Batch {
 				}
 				n++
 			}
-			merger := s.createMergerForPartitions(n)
-			merger.Init(s.Ctx)
+			// Store the merger in the external sort to make sure it's always
+			// closed correctly. In the happy path, it'll be closed after being
+			// exhausted in the loop below, but in case a panic is thrown (e.g.
+			// due to context cancellation), the merger will be cleaned up in
+			// Close. (In the happy path Close will be called twice on the last
+			// created merger, and that's ok because the interface allows it.)
+			s.merger = s.createMergerForPartitions(n)
+			s.merger.Init(s.Ctx)
 			s.numPartitions -= n
-			for b := merger.Next(); ; b = merger.Next() {
+			for b := s.merger.Next(); ; b = s.merger.Next() {
 				partitionDone := s.enqueue(b)
 				if b.Length() == 0 || partitionDone {
-					if err := merger.Close(s.Ctx); err != nil {
+					if err := s.merger.Close(s.Ctx); err != nil {
 						colexecerror.InternalError(err)
 					}
 					break
@@ -633,6 +646,11 @@ func (s *externalSorter) Close(ctx context.Context) error {
 		lastErr = s.partitioner.Close(ctx)
 		s.partitioner = nil
 	}
+	if s.merger != nil {
+		if err := s.merger.Close(ctx); err != nil {
+			lastErr = err
+		}
+	}
 	if c, ok := s.emitter.(colexecop.Closer); ok {
 		if err := c.Close(ctx); err != nil {
 			lastErr = err
@@ -711,8 +729,8 @@ func (s *externalSorter) createMergerForPartitions(n int) *colexec.OrderedSynchr
 		outputBatchMemSize = minOutputBatchMemSize
 	}
 	return colexec.NewOrderedSynchronizer(
-		s.outputUnlimitedAllocator, outputBatchMemSize, syncInputs,
-		s.inputTypes, s.columnOrdering, tuplesToMerge,
+		s.flowCtx, s.processorID, s.outputUnlimitedAllocator, outputBatchMemSize,
+		syncInputs, s.inputTypes, s.columnOrdering, tuplesToMerge,
 	)
 }
 

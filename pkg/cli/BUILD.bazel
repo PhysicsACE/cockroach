@@ -1,13 +1,12 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "cli",
     srcs = [
-        "absolute_fs.go",
         "auth.go",
+        "auto_decrypt_fs.go",
         "cert.go",
         "cli.go",
         "client_url.go",
@@ -57,7 +56,6 @@ go_library(
         "start_windows.go",
         "statement_bundle.go",
         "statement_diag.go",
-        "swappable_fs.go",
         "testutils.go",
         "tsdump.go",
         "userfile.go",
@@ -119,6 +117,7 @@ go_library(
         "//pkg/cloud/userfile",
         "//pkg/clusterversion",
         "//pkg/config",
+        "//pkg/configprofiles",
         "//pkg/docs",
         "//pkg/geo/geos",
         "//pkg/gossip",
@@ -128,6 +127,7 @@ go_library(
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/gc",
+        "//pkg/kv/kvserver/kvserverpb",
         "//pkg/kv/kvserver/kvstorage",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/kv/kvserver/loqrecovery",
@@ -143,8 +143,11 @@ go_library(
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
+        "//pkg/server/authserver",
+        "//pkg/server/autoconfig/acprovider",
         "//pkg/server/pgurl",
         "//pkg/server/profiler",
+        "//pkg/server/serverctl",
         "//pkg/server/serverpb",
         "//pkg/server/status",
         "//pkg/server/status/statuspb",
@@ -160,6 +163,7 @@ go_library(
         "//pkg/sql/execinfrapb",
         "//pkg/sql/lexbase",
         "//pkg/sql/parser",
+        "//pkg/sql/parser/statements",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/protoreflect",
         "//pkg/sql/row",
@@ -176,13 +180,15 @@ go_library(
         "//pkg/storage",
         "//pkg/storage/enginepb",
         "//pkg/storage/fs",
+        "//pkg/testutils/bazelcodecover",
         "//pkg/testutils/serverutils",
         "//pkg/ts",
         "//pkg/ts/tspb",
+        "//pkg/ts/tsutil",
         "//pkg/upgrade/upgrades",
         "//pkg/util",
+        "//pkg/util/buildutil",
         "//pkg/util/cgroups",
-        "//pkg/util/contextutil",
         "//pkg/util/encoding",
         "//pkg/util/envutil",
         "//pkg/util/flagutil",
@@ -201,7 +207,6 @@ go_library(
         "//pkg/util/log/severity",
         "//pkg/util/netutil/addr",
         "//pkg/util/protoutil",
-        "//pkg/util/randutil",
         "//pkg/util/retry",
         "//pkg/util/sdnotify",
         "//pkg/util/stop",
@@ -232,11 +237,14 @@ go_library(
         "@com_github_cockroachdb_errors//hintdetail",
         "@com_github_cockroachdb_errors//oserror",
         "@com_github_cockroachdb_logtags//:logtags",
+        "@com_github_cockroachdb_pebble//:pebble",
+        "@com_github_cockroachdb_pebble//objstorage/remote",
         "@com_github_cockroachdb_pebble//tool",
         "@com_github_cockroachdb_pebble//vfs",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_cockroachdb_ttycolor//:ttycolor",
         "@com_github_dustin_go_humanize//:go-humanize",
+        "@com_github_fsnotify_fsnotify//:fsnotify",
         "@com_github_gogo_protobuf//jsonpb",
         "@com_github_jackc_pgconn//:pgconn",
         "@com_github_jackc_pgtype//:pgtype",
@@ -301,6 +309,7 @@ go_test(
     name = "cli_test",
     size = "large",
     srcs = [
+        "auto_decrypt_fs_test.go",
         "cert_test.go",
         "cli_debug_test.go",
         "cli_test.go",
@@ -347,7 +356,6 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/build",
-        "//pkg/ccl/kvccl/kvtenantccl",
         "//pkg/cli/clicfg",
         "//pkg/cli/clierror",
         "//pkg/cli/clierrorplus",
@@ -357,20 +365,22 @@ go_test(
         "//pkg/cli/clisqlexec",
         "//pkg/cli/democluster",
         "//pkg/cli/exit",
+        "//pkg/cloud",
         "//pkg/clusterversion",
         "//pkg/gossip",
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvclient/kvtenant",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
-        "//pkg/kv/kvserver/allocator/storepool",
+        "//pkg/kv/kvserver/liveness",
         "//pkg/kv/kvserver/liveness/livenesspb",
+        "//pkg/kv/kvserver/loqrecovery",
         "//pkg/kv/kvserver/loqrecovery/loqrecoverypb",
         "//pkg/kv/kvserver/stateloader",
         "//pkg/roachpb",
-        "//pkg/rpc",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",
@@ -383,11 +393,10 @@ go_test(
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/isql",
         "//pkg/sql/protoreflect",
-        "//pkg/sql/tests",
         "//pkg/storage",
         "//pkg/testutils",
-        "//pkg/testutils/buildutil",
         "//pkg/testutils/datapathutils",
+        "//pkg/testutils/listenerutil",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
@@ -398,7 +407,9 @@ go_test(
         "//pkg/util/log",
         "//pkg/util/log/logconfig",
         "//pkg/util/log/logpb",
+        "//pkg/util/netutil/addr",
         "//pkg/util/protoutil",
+        "//pkg/util/randutil",
         "//pkg/util/stop",
         "//pkg/util/timeutil",
         "//pkg/util/tracing",
@@ -418,6 +429,7 @@ go_test(
 stringer(
     name = "gen-keytype-stringer",
     src = "flags_util.go",
+    additional_args = ["--stringtovaluemapname=_keyTypes"],
     typ = "keyType",
 )
 
@@ -425,14 +437,6 @@ filegroup(
     name = "interactive_tests",
     srcs = glob(
         ["interactive_tests/**"],
-        # TODO(rail): The following tests fail under bazel.
-        # https://github.com/cockroachdb/cockroach/issues/71932, aka
-        # "broken_in_bazel"
-        exclude = [
-            "*/test_multiline_statements.tcl",
-            "*/test_pretty.tcl",
-            "*/test_server_sig.tcl",
-        ],
     ),
     visibility = ["//visibility:public"],
 )
@@ -449,5 +453,3 @@ disallowed_imports_test(
         #"pkg/testutils",
     ],
 )
-
-get_x_data(name = "get_x_data")

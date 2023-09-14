@@ -336,7 +336,7 @@ func getNodeCount(ctx context.Context, sqlDB *gosql.DB) (int, error) {
 	if err := sqlDB.QueryRow(numNodesQuery).Scan(&numNodes); err != nil {
 		// If the query is unsupported because we're in
 		// multi-tenant mode, use the sql_instances table.
-		if !strings.Contains(err.Error(), errorutil.UnsupportedWithMultiTenancyMessage) {
+		if !strings.Contains(err.Error(), errorutil.UnsupportedUnderClusterVirtualizationMessage) {
 			return 0, err
 
 		}
@@ -599,7 +599,7 @@ func RestoreFixture(
 		table := table
 		g.GoCtx(func(ctx context.Context) error {
 			start := timeutil.Now()
-			restoreStmt := fmt.Sprintf(`RESTORE %s.%s FROM $1 WITH into_db=$2`, genName, table.TableName)
+			restoreStmt := fmt.Sprintf(`RESTORE %s.%s FROM $1 WITH into_db=$2, unsafe_restore_incompatible_version`, genName, table.TableName)
 			log.Infof(ctx, "Restoring from %s", table.BackupURI)
 			var rows, index, tableBytes int64
 			var discard interface{}

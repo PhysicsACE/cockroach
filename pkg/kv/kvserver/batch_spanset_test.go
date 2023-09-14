@@ -72,7 +72,7 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 	}
 
 	t.Run("writes before range", func(t *testing.T) {
-		if err := batch.ClearUnversioned(outsideKey.Key); !isWriteSpanErr(err) {
+		if err := batch.ClearUnversioned(outsideKey.Key, storage.ClearOptions{}); !isWriteSpanErr(err) {
 			t.Errorf("ClearUnversioned: unexpected error %v", err)
 		}
 		if err := batch.ClearRawRange(outsideKey.Key, outsideKey2.Key, true, true); !isWriteSpanErr(err) {
@@ -93,7 +93,7 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 	})
 
 	t.Run("writes after range", func(t *testing.T) {
-		if err := batch.ClearUnversioned(outsideKey3.Key); !isWriteSpanErr(err) {
+		if err := batch.ClearUnversioned(outsideKey3.Key, storage.ClearOptions{}); !isWriteSpanErr(err) {
 			t.Errorf("ClearUnversioned: unexpected error %v", err)
 		}
 		if err := batch.ClearRawRange(insideKey2.Key, outsideKey4.Key, true, true); !isWriteSpanErr(err) {
@@ -154,7 +154,10 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 	})
 
 	t.Run("forward scans", func(t *testing.T) {
-		iter := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		// MVCCIterators check boundaries on seek and next/prev
@@ -171,20 +174,20 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 		if ok, err := iter.Valid(); !ok || err != nil {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), insideKey) {
-			t.Fatalf("expected key %s, got %s", insideKey, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), insideKey) {
+			t.Fatalf("expected key %s, got %s", insideKey, iter.UnsafeKey())
 		}
 		iter.Next()
 		if ok, err := iter.Valid(); !ok || err != nil {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), insideKey2) {
-			t.Fatalf("expected key %s, got %s", insideKey2, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), insideKey2) {
+			t.Fatalf("expected key %s, got %s", insideKey2, iter.UnsafeKey())
 		}
 		// Scan out of bounds.
 		iter.Next()
 		if ok, err := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		} else if err != nil {
 			// Scanning out of bounds sets Valid() to false but is not an error.
 			t.Errorf("unexpected error on iterator: %+v", err)
@@ -199,7 +202,12 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 	}
 
 	t.Run("reverse scans", func(t *testing.T) {
-		iter := spanset.NewIterator(eng.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax}), &ss)
+		innerIter, err := eng.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := spanset.NewIterator(innerIter, &ss)
+
 		defer iter.Close()
 		iter.SeekLT(outsideKey4)
 		if _, err := iter.Valid(); !isReadSpanErr(err) {
@@ -210,20 +218,20 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 		if ok, err := iter.Valid(); !ok || err != nil {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), insideKey2) {
-			t.Fatalf("expected key %s, got %s", insideKey2, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), insideKey2) {
+			t.Fatalf("expected key %s, got %s", insideKey2, iter.UnsafeKey())
 		}
 		iter.Prev()
 		if ok, err := iter.Valid(); !ok || err != nil {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), insideKey) {
-			t.Fatalf("expected key %s, got %s", insideKey, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), insideKey) {
+			t.Fatalf("expected key %s, got %s", insideKey, iter.UnsafeKey())
 		}
 		// Scan out of bounds.
 		iter.Prev()
 		if ok, err := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		} else if err != nil {
 			t.Errorf("unexpected error on iterator: %+v", err)
 		}
@@ -236,7 +244,7 @@ func TestSpanSetBatchBoundaries(t *testing.T) {
 		// SeekLT to the lower bound is invalid.
 		iter.SeekLT(insideKey)
 		if ok, err := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		} else if !isReadSpanErr(err) {
 			t.Fatalf("SeekLT: unexpected error %v", err)
 		}
@@ -303,7 +311,7 @@ func TestSpanSetBatchTimestamps(t *testing.T) {
 	}
 
 	for _, batch := range []storage.Batch{batchBefore, batchNonMVCC} {
-		if err := batch.ClearUnversioned(wkey.Key); !isWriteSpanErr(err) {
+		if err := batch.ClearUnversioned(wkey.Key, storage.ClearOptions{}); !isWriteSpanErr(err) {
 			t.Errorf("ClearUnversioned: unexpected error %v", err)
 		}
 		{
@@ -383,66 +391,78 @@ func TestSpanSetIteratorTimestamps(t *testing.T) {
 
 	func() {
 		// When accessing at t=1, we're able to read through latches declared at t=1 and t=2.
-		iter := batchAt1.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batchAt1.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		iter.SeekGE(k1)
 		if ok, err := iter.Valid(); !ok {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), k1) {
-			t.Fatalf("expected key %s, got %s", k1, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), k1) {
+			t.Fatalf("expected key %s, got %s", k1, iter.UnsafeKey())
 		}
 
 		iter.Next()
 		if ok, err := iter.Valid(); !ok {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), k2) {
-			t.Fatalf("expected key %s, got %s", k2, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), k2) {
+			t.Fatalf("expected key %s, got %s", k2, iter.UnsafeKey())
 		}
 	}()
 
 	func() {
 		// When accessing at t=2, we're only able to read through the latch declared at t=2.
-		iter := batchAt2.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batchAt2.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		iter.SeekGE(k1)
 		if ok, _ := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		}
 
 		iter.SeekGE(k2)
 		if ok, err := iter.Valid(); !ok {
 			t.Fatalf("expected valid iterator, err=%v", err)
 		}
-		if !reflect.DeepEqual(iter.Key(), k2) {
-			t.Fatalf("expected key %s, got %s", k2, iter.Key())
+		if !reflect.DeepEqual(iter.UnsafeKey(), k2) {
+			t.Fatalf("expected key %s, got %s", k2, iter.UnsafeKey())
 		}
 	}()
 
 	for _, batch := range []storage.Batch{batchAt3, batchNonMVCC} {
 		// When accessing at t=3, we're unable to read through any of the declared latches.
 		// Same is true when accessing without a timestamp.
-		iter := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		iter.SeekGE(k1)
 		if ok, _ := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		}
 
 		iter.SeekGE(k2)
 		if ok, _ := iter.Valid(); ok {
-			t.Fatalf("expected invalid iterator; found valid at key %s", iter.Key())
+			t.Fatalf("expected invalid iterator; found valid at key %s", iter.UnsafeKey())
 		}
 	}
 
 	// The behavior is the same as above for an EngineIterator.
 	func() {
 		// When accessing at t=1, we're able to read through latches declared at t=1 and t=2.
-		iter := batchAt1.NewEngineIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batchAt1.NewEngineIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		if ok, err := iter.SeekEngineKeyGE(k1e); !ok {
@@ -470,7 +490,10 @@ func TestSpanSetIteratorTimestamps(t *testing.T) {
 
 	func() {
 		// When accessing at t=2, we're only able to read through the latch declared at t=2.
-		iter := batchAt2.NewEngineIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+		iter, err := batchAt2.NewEngineIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+		if err != nil {
+			t.Fatal(err)
+		}
 		defer iter.Close()
 
 		if ok, _ := iter.SeekEngineKeyGE(k1e); ok {
@@ -545,12 +568,10 @@ func TestSpanSetMVCCResolveWriteIntentRange(t *testing.T) {
 	if err := storage.MVCCPut(
 		ctx,
 		eng,
-		nil, // ms
 		roachpb.Key("b"),
 		hlc.Timestamp{WallTime: 10}, // irrelevant
-		hlc.ClockTimestamp{},        // irrelevant
 		value,
-		nil, // txn
+		storage.MVCCWriteOptions{}, // irrelevant
 	); err != nil {
 		t.Fatal(err)
 	}

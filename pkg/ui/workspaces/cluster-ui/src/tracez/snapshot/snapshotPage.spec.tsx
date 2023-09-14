@@ -23,7 +23,6 @@ import {
 } from "src/api/tracezApi";
 import GetTracingSnapshotResponse = cockroach.server.serverpb.GetTracingSnapshotResponse;
 import Long from "long";
-import { getByTestId } from "@testing-library/dom/types/queries";
 
 const getMockSnapshotPageProps = (): SnapshotPageProps => {
   const history = H.createHashHistory();
@@ -44,30 +43,32 @@ const getMockSnapshotPageProps = (): SnapshotPageProps => {
     rawTrace: undefined,
     rawTraceLoading: false,
     refreshNodes: () => void {},
-    refreshRawTrace: (req: {
-      nodeID: string;
-      snapshotID: number;
-      traceID: Long;
-    }) => void {},
-    refreshSnapshot: (req: { nodeID: string; snapshotID: number }): void => {},
-    refreshSnapshots: (id: string): void => {},
-    setSort: (value: SortSetting): void => {},
+    refreshRawTrace: () => void {},
+    refreshSnapshot: (_req: { nodeID: string; snapshotID: number }): void => {},
+    refreshSnapshots: (_id: string): void => {},
+    setSort: (_value: SortSetting): void => {},
     setTraceRecordingType: (
-      nodeID: string,
-      traceID: Long,
-      recordingMode: RecordingMode,
+      _nodeID: string,
+      _traceID: Long,
+      _recordingMode: RecordingMode,
     ): Promise<SetTraceRecordingTypeResponse> => {
       return Promise.resolve(undefined);
     },
-    snapshot: GetTracingSnapshotResponse.fromObject({
+    snapshot: new GetTracingSnapshotResponse({
       snapshot: {
-        spans: [{ span_id: 1, operation: "spanny" }],
+        spans: [
+          new cockroach.server.serverpb.TracingSpan({
+            span_id: Long.fromInt(1),
+            parent_span_id: Long.fromInt(0),
+            operation: "spanny",
+          }),
+        ],
       },
     }),
     snapshotLoading: false,
     snapshotsLoading: false,
     sort: undefined,
-    takeSnapshot: (nodeID: string): Promise<TakeTracingSnapshotResponse> => {
+    takeSnapshot: (_nodeID: string): Promise<TakeTracingSnapshotResponse> => {
       return Promise.resolve(undefined);
     },
   };

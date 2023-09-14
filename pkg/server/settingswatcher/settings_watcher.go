@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -53,8 +54,8 @@ type SettingsWatcher struct {
 		syncutil.Mutex
 
 		updater   settings.Updater
-		values    map[string]settingsValue
-		overrides map[string]settings.EncodedValue
+		values    map[settings.InternalKey]settingsValue
+		overrides map[settings.InternalKey]settings.EncodedValue
 		// storageClusterVersion is the cache of the storage cluster version
 		// inside secondary tenants. It will be uninitialized in a system
 		// tenant.
@@ -138,21 +139,30 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 		}
 	}
 
-	s.mu.values = make(map[string]settingsValue)
+	s.mu.values = make(map[settings.InternalKey]settingsValue)
 
 	if s.overridesMonitor != nil {
-		s.mu.overrides = make(map[string]settings.EncodedValue) // Initialize the overrides. We want to do this before processing the
-		// settings table, otherwise we could see temporary transitions to the value
-		// in the table.
-		s.updateOverrides(ctx)
+		// Initialize the overrides. We want to do this before processing
+		// the settings table, otherwise we could see temporary
+		// transitions to the value in the table.
+		s.mu.overrides = make(map[settings.InternalKey]settings.EncodedValue)
+		// Wait for the overrides monitor to be ready, which also ensures
+		// it has received initial data from the KV layer.
+		if err := s.overridesMonitor.WaitForStart(ctx); err != nil {
+			return err
+		}
+		// Fetch the overrides once initially, synchronously with the
+		// `Start` call. This ensures that all the overrides have been
+		// applied by the time the `Start` call completes.
+		overridesCh := s.updateOverrides(ctx)
+		log.Infof(ctx, "applied initial setting overrides")
 
-		// Set up a worker to watch the monitor.
+		// Set up a worker to watch the monitor asynchronously.
 		if err := s.stopper.RunAsyncTask(ctx, "setting-overrides", func(ctx context.Context) {
-			overridesCh := s.overridesMonitor.RegisterOverridesChannel()
 			for {
 				select {
 				case <-overridesCh:
-					s.updateOverrides(ctx)
+					overridesCh = s.updateOverrides(ctx)
 
 				case <-s.stopper.ShouldQuiesce():
 					return
@@ -237,28 +247,31 @@ func (s *SettingsWatcher) handleKV(
 	ctx context.Context, kv *kvpb.RangeFeedValue,
 ) rangefeedbuffer.Event {
 	var alloc tree.DatumAlloc
-	name, val, tombstone, err := s.dec.DecodeRow(roachpb.KeyValue{
+	settingKeyS, val, tombstone, err := s.dec.DecodeRow(roachpb.KeyValue{
 		Key:   kv.Key,
 		Value: kv.Value,
 	}, &alloc)
 	if err != nil {
-		log.Warningf(ctx, "failed to decode settings row %v: %v", kv.Key, err)
+		// This should never happen: the rangefeed should only ever deliver valid SQL rows.
+		err = errors.NewAssertionErrorWithWrappedErrf(err, "failed to decode settings row %v", kv.Key)
+		logcrash.ReportOrPanic(ctx, &s.settings.SV, "%w", err)
 		return nil
 	}
+	settingKey := settings.InternalKey(settingKeyS)
 
 	if !s.codec.ForSystemTenant() {
-		setting, ok := settings.LookupForLocalAccess(name, s.codec.ForSystemTenant())
+		setting, ok := settings.LookupForLocalAccessByKey(settingKey, s.codec.ForSystemTenant())
 		if !ok {
-			log.Warningf(ctx, "unknown setting %s, skipping update", redact.Safe(name))
+			log.Warningf(ctx, "unknown setting %s, skipping update", settingKey)
 			return nil
 		}
 		if setting.Class() != settings.TenantWritable {
-			log.Warningf(ctx, "ignoring read-only setting %s", redact.Safe(name))
+			log.Warningf(ctx, "ignoring read-only setting %s", settingKey)
 			return nil
 		}
 	}
 
-	s.maybeSet(ctx, name, settingsValue{
+	s.maybeSet(ctx, settingKey, settingsValue{
 		val:       val,
 		ts:        kv.Value.Timestamp,
 		tombstone: tombstone,
@@ -271,7 +284,9 @@ func (s *SettingsWatcher) handleKV(
 
 // maybeSet will update the stored value and the corresponding setting
 // in response to a kv event, assuming that event is new.
-func (s *SettingsWatcher) maybeSet(ctx context.Context, name string, sv settingsValue) {
+func (s *SettingsWatcher) maybeSet(
+	ctx context.Context, key settings.InternalKey, sv settingsValue,
+) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Skip updates which have an earlier timestamp to avoid regressing on the
@@ -280,19 +295,19 @@ func (s *SettingsWatcher) maybeSet(ctx context.Context, name string, sv settings
 	// the underlying rangefeed restarts. When that happens, we'll construct a
 	// new settings updater and expect to re-process every setting which is
 	// currently set.
-	if existing, ok := s.mu.values[name]; ok && sv.ts.Less(existing.ts) {
+	if existing, ok := s.mu.values[key]; ok && sv.ts.Less(existing.ts) {
 		return
 	}
-	_, hasOverride := s.mu.overrides[name]
-	s.mu.values[name] = sv
+	_, hasOverride := s.mu.overrides[key]
+	s.mu.values[key] = sv
 	if sv.tombstone {
 		// This event corresponds to a deletion.
 		if !hasOverride {
-			s.setDefaultLocked(ctx, name)
+			s.setDefaultLocked(ctx, key)
 		}
 	} else {
 		if !hasOverride {
-			s.setLocked(ctx, name, sv.val)
+			s.setLocked(ctx, key, sv.val, settings.OriginExplicitlySet)
 		}
 	}
 }
@@ -309,23 +324,41 @@ type settingsValue struct {
 const versionSettingKey = "version"
 
 // set the current value of a setting.
-func (s *SettingsWatcher) setLocked(ctx context.Context, key string, val settings.EncodedValue) {
-	// The system tenant (i.e. the KV layer) does not use the SettingsWatcher
-	// to propagate cluster version changes (it uses the BumpClusterVersion
-	// RPC). However, secondary tenants get word of the new cluster version
-	// below. This is to handle the case where there are multiple SQL pods
-	// working on behalf of the same secondary tenant. If one pod performs the
-	// upgrade, we want to make the other SQL pods aware of the fact that the
-	// upgrade occurred.
+func (s *SettingsWatcher) setLocked(
+	ctx context.Context,
+	key settings.InternalKey,
+	val settings.EncodedValue,
+	origin settings.ValueOrigin,
+) {
+	// Both the system tenant and secondary tenants no longer use this code
+	// path to propagate cluster version changes (they rely on
+	// BumpClusterVersion instead). The secondary tenants however, still rely
+	// on the initial pass through this code (in settingsWatcher.Start()) to
+	// bootstrap the initial cluster version on tenant startup. In all other
+	// instances, this code should no-op (either because we're in the system
+	// tenant, or because the new version <= old version).
 	if key == versionSettingKey && !s.codec.ForSystemTenant() {
 		var newVersion clusterversion.ClusterVersion
-		oldVersion := s.settings.Version.ActiveVersion(ctx)
+		oldVersion := s.settings.Version.ActiveVersionOrEmpty(ctx)
 		if err := protoutil.Unmarshal([]byte(val.Value), &newVersion); err != nil {
 			log.Warningf(ctx, "failed to set cluster version: %s", err.Error())
-		} else if err := s.settings.Version.SetActiveVersion(ctx, newVersion); err != nil {
-			log.Warningf(ctx, "failed to set cluster version: %s", err.Error())
-		} else if newVersion != oldVersion {
-			log.Infof(ctx, "set cluster version to: %v", newVersion)
+		} else if newVersion.LessEq(oldVersion.Version) {
+			// Nothing to do.
+		} else {
+			// Check if cluster version setting is initialized. If it is empty then it is not
+			// initialized.
+			if oldVersion.Version.Equal(roachpb.Version{}) {
+				// Cluster version setting not initialized.
+				if err := clusterversion.Initialize(ctx, newVersion.Version, &s.settings.SV); err != nil {
+					log.Fatalf(ctx, "failed to initialize cluster version setting: %s", err.Error())
+					return
+				}
+			}
+			if err := s.settings.Version.SetActiveVersion(ctx, newVersion); err != nil {
+				log.Warningf(ctx, "failed to set cluster version: %s", err.Error())
+			} else {
+				log.Infof(ctx, "set cluster version from %v to: %v", oldVersion, newVersion)
+			}
 		}
 		return
 	}
@@ -333,11 +366,12 @@ func (s *SettingsWatcher) setLocked(ctx context.Context, key string, val setting
 	if err := s.mu.updater.Set(ctx, key, val); err != nil {
 		log.Warningf(ctx, "failed to set setting %s to %s: %v", redact.Safe(key), val.Value, err)
 	}
+	s.mu.updater.SetValueOrigin(ctx, key, origin)
 }
 
 // setDefaultLocked sets a setting to its default value.
-func (s *SettingsWatcher) setDefaultLocked(ctx context.Context, key string) {
-	setting, ok := settings.LookupForLocalAccess(key, s.codec.ForSystemTenant())
+func (s *SettingsWatcher) setDefaultLocked(ctx context.Context, key settings.InternalKey) {
+	setting, ok := settings.LookupForLocalAccessByKey(key, s.codec.ForSystemTenant())
 	if !ok {
 		log.Warningf(ctx, "failed to find setting %s, skipping update", redact.Safe(key))
 		return
@@ -346,13 +380,14 @@ func (s *SettingsWatcher) setDefaultLocked(ctx context.Context, key string) {
 		Value: setting.EncodedDefault(),
 		Type:  setting.Typ(),
 	}
-	s.setLocked(ctx, key, val)
+	s.setLocked(ctx, key, val, settings.OriginDefault)
 }
 
 // updateOverrides updates the overrides map and updates any settings
 // accordingly.
-func (s *SettingsWatcher) updateOverrides(ctx context.Context) {
-	newOverrides := s.overridesMonitor.Overrides()
+func (s *SettingsWatcher) updateOverrides(ctx context.Context) (updateCh <-chan struct{}) {
+	var newOverrides map[settings.InternalKey]settings.EncodedValue
+	newOverrides, updateCh = s.overridesMonitor.Overrides()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -361,8 +396,9 @@ func (s *SettingsWatcher) updateOverrides(ctx context.Context) {
 		if key == versionSettingKey {
 			var newVersion clusterversion.ClusterVersion
 			if err := protoutil.Unmarshal([]byte(val.Value), &newVersion); err != nil {
-				log.Warningf(ctx, "ignoring invalid cluster version: %newVersion - "+
-					"the lack of a refreshed storage cluster version in a secondary tenant may prevent tenant upgrade", err)
+				log.Warningf(ctx, "ignoring invalid cluster version: %s - %v\n"+
+					"Note: the lack of a refreshed storage cluster version in a secondary tenant may prevent tenant upgrade.",
+					newVersion, err)
 			} else {
 				// We don't want to fully process the override in the case
 				// where we're dealing with the "version" setting, as we want
@@ -382,7 +418,7 @@ func (s *SettingsWatcher) updateOverrides(ctx context.Context) {
 		}
 		// A new override was added or an existing override has changed.
 		s.mu.overrides[key] = val
-		s.setLocked(ctx, key, val)
+		s.setLocked(ctx, key, val, settings.OriginExternallySet)
 	}
 
 	// Clean up any overrides that were removed.
@@ -393,12 +429,14 @@ func (s *SettingsWatcher) updateOverrides(ctx context.Context) {
 			// Reset the setting to the value in the settings table (or the default
 			// value).
 			if sv, ok := s.mu.values[key]; ok && !sv.tombstone {
-				s.setLocked(ctx, key, sv.val)
+				s.setLocked(ctx, key, sv.val, settings.OriginExplicitlySet)
 			} else {
 				s.setDefaultLocked(ctx, key)
 			}
 		}
 	}
+
+	return updateCh
 }
 
 func (s *SettingsWatcher) resetUpdater() {
@@ -413,21 +451,21 @@ func (s *SettingsWatcher) SetTestingKnobs(knobs *rangefeedcache.TestingKnobs) {
 }
 
 // IsOverridden implements cluster.OverridesInformer.
-func (s *SettingsWatcher) IsOverridden(settingName string) bool {
+func (s *SettingsWatcher) IsOverridden(settingKey settings.InternalKey) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, exists := s.mu.overrides[settingName]
+	_, exists := s.mu.overrides[settingKey]
 	return exists
 }
 
-// GetStorageClusterVersion returns the storage cluster version cached in the
-// SettingsWatcher. The storage cluster version info in the settings watcher is
-// populated by a cluster settings override sent from the system tenant to all
-// tenants, anytime the storage cluster version changes (or when a new cluster
-// is initialized in version 23.1 or later). In cases where the storage cluster
-// version is not initialized, we assume that it's running version 22.2,
+// GetStorageClusterActiveVersion returns the storage cluster version cached in
+// the SettingsWatcher. The storage cluster version info in the settings watcher
+// is populated by a cluster settings override sent from the system tenant to
+// all tenants, anytime the storage cluster version changes (or when a new
+// cluster is initialized in version 23.1 or later). In cases where the storage
+// cluster version is not initialized, we assume that it's running version 22.2,
 // the last version which did not properly initialize this value.
-func (s *SettingsWatcher) GetStorageClusterVersion() clusterversion.ClusterVersion {
+func (s *SettingsWatcher) GetStorageClusterActiveVersion() clusterversion.ClusterVersion {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.mu.storageClusterVersion.Equal(clusterversion.ClusterVersion{Version: roachpb.Version{Major: 0, Minor: 0}}) {
@@ -441,6 +479,10 @@ func (s *SettingsWatcher) GetStorageClusterVersion() clusterversion.ClusterVersi
 	return s.mu.storageClusterVersion
 }
 
+// errVersionSettingNotFound is returned by GetClusterVersionFromStorage if the
+// 'version' setting is not present in the system.settings table.
+var errVersionSettingNotFound = errors.New("got nil value for tenant cluster version row")
+
 // GetClusterVersionFromStorage reads the cluster version from the storage via
 // the given transaction.
 func (s *SettingsWatcher) GetClusterVersionFromStorage(
@@ -453,7 +495,7 @@ func (s *SettingsWatcher) GetClusterVersionFromStorage(
 		return clusterversion.ClusterVersion{}, err
 	}
 	if row.Value == nil {
-		return clusterversion.ClusterVersion{}, errors.New("got nil value for tenant cluster version row")
+		return clusterversion.ClusterVersion{}, errVersionSettingNotFound
 	}
 	_, val, _, err := s.dec.DecodeRow(roachpb.KeyValue{Key: row.Key, Value: *row.Value}, nil /* alloc */)
 	if err != nil {
@@ -464,4 +506,8 @@ func (s *SettingsWatcher) GetClusterVersionFromStorage(
 		return clusterversion.ClusterVersion{}, err
 	}
 	return version, nil
+}
+
+func (s *SettingsWatcher) GetTenantClusterVersion() clusterversion.Handle {
+	return s.settings.Version
 }

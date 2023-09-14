@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
 	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -226,6 +227,7 @@ func (o *observedWrite) isDelete() bool {
 
 type observedRead struct {
 	Key        roachpb.Key
+	SkipLocked bool
 	Value      roachpb.Value
 	ValidTimes disjointTimeSpans
 }
@@ -236,6 +238,7 @@ type observedScan struct {
 	Span          roachpb.Span
 	IsDeleteRange bool
 	Reverse       bool
+	SkipLocked    bool
 	KVs           []roachpb.KeyValue
 	Valid         multiKeyTimeSpan
 }
@@ -356,17 +359,7 @@ func transferLeaseResultIsIgnorable(res Result) bool {
 		return false
 	}
 	return kvserver.IsLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(err) ||
-		// Only VOTER (_FULL, _INCOMING, sometimes _OUTGOING) replicas can
-		// hold a range lease. Attempts to transfer to lease to any other
-		// replica type are rejected. See CheckCanReceiveLease.
-		resultIsErrorStr(res, `replica cannot hold lease`) ||
-		// Only replicas that are part of the range can be given
-		// the lease. This case is hit if a TransferLease op races
-		// with a ChangeReplicas op.
-		resultIsErrorStr(res, `replica not found in RangeDescriptor`) ||
-		// A lease transfer that races with a replica removal may find that
-		// the store it was targeting is no longer part of the range.
-		resultIsErrorStr(res, `unable to find store \d+ in range`) ||
+		kvserver.IsLeaseTransferRejectedBecauseTargetCannotReceiveLease(err) ||
 		// A lease transfer is not permitted while a range merge is in its
 		// critical phase.
 		resultIsErrorStr(res, `cannot transfer lease while merge in progress`) ||
@@ -402,8 +395,9 @@ func (v *validator) processOp(op Operation) {
 			break
 		}
 		read := &observedRead{
-			Key:   t.Key,
-			Value: roachpb.Value{RawBytes: t.Result.Value},
+			Key:        t.Key,
+			SkipLocked: t.SkipLocked,
+			Value:      roachpb.Value{RawBytes: t.Result.Value},
 		}
 		v.curObservations = append(v.curObservations, read)
 
@@ -574,9 +568,8 @@ func (v *validator) processOp(op Operation) {
 			break
 		}
 		err := func() error {
-			// TODO(erikgrinaker): This should handle range tombstones too.
 			iter, err := storage.NewMemSSTIterator(t.Data, false /* verify */, storage.IterOptions{
-				KeyTypes:   storage.IterKeyTypePointsOnly,
+				KeyTypes:   storage.IterKeyTypePointsAndRanges,
 				LowerBound: keys.MinKey,
 				UpperBound: keys.MaxKey,
 			})
@@ -588,7 +581,51 @@ func (v *validator) processOp(op Operation) {
 				if ok, err := iter.Valid(); !ok {
 					return err
 				}
-				key := iter.Key().Key
+				if iter.RangeKeyChanged() {
+					hasPoint, hasRange := iter.HasPointAndRange()
+					if hasRange {
+						rangeKeys := iter.RangeKeys().Clone()
+						// AddSSTable can only write at a single timestamp, so there
+						// can't be overlapping range keys. Assert this.
+						if rangeKeys.Len() != 1 {
+							return errors.AssertionFailedf("got AddSSTable with overlapping range keys: %s",
+								rangeKeys)
+						}
+						rangeKey := rangeKeys.AsRangeKey(rangeKeys.Versions[0])
+						mvccValue, err := storage.DecodeMVCCValue(rangeKeys.Versions[0].Value)
+						if err != nil {
+							return err
+						}
+						seq := mvccValue.KVNemesisSeq.Get()
+						svs, _ := v.tryConsumeRangedWrite(seq, rangeKey.StartKey, rangeKey.EndKey)
+						var unobserved roachpb.SpanGroup
+						unobserved.Add(roachpb.Span{Key: rangeKey.StartKey, EndKey: rangeKey.EndKey})
+						for _, sv := range svs {
+							unobserved.Sub(sv.Span)
+							write := &observedWrite{
+								Key:       sv.Key,
+								EndKey:    sv.EndKey,
+								Seq:       seq,
+								Timestamp: sv.Timestamp,
+							}
+							v.curObservations = append(v.curObservations, write)
+						}
+						// Add unmaterialized versions of the write for any gaps.
+						for _, sp := range unobserved.Slice() {
+							write := &observedWrite{
+								Key:    sp.Key,
+								EndKey: sp.EndKey,
+								Seq:    t.Seq,
+							}
+							v.curObservations = append(v.curObservations, write)
+						}
+					}
+					if !hasPoint { // can only happen at range key start bounds
+						continue
+					}
+				}
+
+				key := iter.UnsafeKey().Clone().Key
 				rawValue, err := iter.Value()
 				if err != nil {
 					return err
@@ -624,8 +661,9 @@ func (v *validator) processOp(op Operation) {
 				Key:    t.Key,
 				EndKey: t.EndKey,
 			},
-			KVs:     make([]roachpb.KeyValue, len(t.Result.Values)),
-			Reverse: t.Reverse,
+			Reverse:    t.Reverse,
+			SkipLocked: t.SkipLocked,
+			KVs:        make([]roachpb.KeyValue, len(t.Result.Values)),
 		}
 		for i, kv := range t.Result.Values {
 			scan.KVs[i] = roachpb.KeyValue{
@@ -677,7 +715,15 @@ func (v *validator) processOp(op Operation) {
 		for _, op := range ops {
 			v.processOp(op)
 		}
-		v.checkAtomic(`txn`, t.Result)
+		prevFailures := v.failures
+		atomicTxnType := fmt.Sprintf(`%s txn`, t.IsoLevel.StringLower())
+		v.checkAtomic(atomicTxnType, t.Result)
+		if t.IsoLevel != isolation.Serializable {
+			// TODO(nvanbenschoten): for now, we run snapshot and read committed
+			// transactions in the mix but don't validate their results. Doing so
+			// is non-trivial. See #100169 and #100170
+			v.failures = prevFailures
+		}
 	case *SplitOperation:
 		execTimestampStrictlyOptional = true
 		v.failIfError(op, t.Result) // splits should never return *any* error
@@ -730,7 +776,6 @@ func (v *validator) processOp(op Operation) {
 			ignore = kvserver.IsRetriableReplicationChangeError(err) ||
 				kvserver.IsIllegalReplicationChangeError(err) ||
 				kvserver.IsReplicationChangeInProgressError(err) ||
-				errors.Is(err, roachpb.ErrReplicaCannotHoldLease) ||
 				transferLeaseResultIsIgnorable(t.Result) // replication changes can transfer leases
 		}
 		if !ignore {
@@ -1000,7 +1045,7 @@ func (v *validator) checkAtomicCommitted(
 				}
 			}
 		case *observedRead:
-			o.ValidTimes = validReadTimes(batch, o.Key, o.Value.RawBytes)
+			o.ValidTimes = validReadTimes(batch, o.Key, o.Value.RawBytes, o.SkipLocked /* missingKeyValid */)
 		case *observedScan:
 			// All kvs should be within scan boundary.
 			for _, kv := range o.KVs {
@@ -1021,7 +1066,7 @@ func (v *validator) checkAtomicCommitted(
 			if !sort.IsSorted(orderedKVs) {
 				failure = `scan result not ordered correctly`
 			}
-			o.Valid = validScanTime(batch, o.Span, o.KVs)
+			o.Valid = validScanTime(batch, o.Span, o.KVs, o.SkipLocked /* missingKeysValid */)
 		default:
 			panic(errors.AssertionFailedf(`unknown observedOp: %T %s`, observation, observation))
 		}
@@ -1189,6 +1234,9 @@ func (v *validator) checkNonAmbError(
 func (v *validator) failIfError(
 	op Operation, r Result, exceptions ...func(err error) bool,
 ) (ambiguous, hasError bool) {
+	exceptions = append(exceptions[:len(exceptions):len(exceptions)], func(err error) bool {
+		return errors.Is(err, errInjected)
+	})
 	switch r.Type {
 	case ResultType_Unknown:
 		err := errors.AssertionFailedf(`unknown result %s`, op)
@@ -1260,15 +1308,26 @@ func mustGetStringValue(value []byte) string {
 	return string(b)
 }
 
-func validReadTimes(b *pebble.Batch, key roachpb.Key, value []byte) disjointTimeSpans {
+func validReadTimes(
+	b *pebble.Batch, key roachpb.Key, value []byte, missingKeyValid bool,
+) disjointTimeSpans {
+	if len(value) == 0 && missingKeyValid {
+		// If no value was returned for the key and this is allowed, all times are
+		// valid for this read.
+		return disjointTimeSpans{{Start: hlc.MinTimestamp, End: hlc.MaxTimestamp}}
+	}
+
 	var hist []storage.MVCCValue
 	lowerBound := storage.EncodeMVCCKey(storage.MVCCKey{Key: key})
 	upperBound := storage.EncodeMVCCKey(storage.MVCCKey{Key: key.Next()})
-	iter := b.NewIter(&pebble.IterOptions{
+	iter, err := b.NewIter(&pebble.IterOptions{
 		KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		LowerBound: lowerBound,
 		UpperBound: upperBound,
 	})
+	if err != nil {
+		panic(err)
+	}
 	defer func() { _ = iter.Close() }()
 
 	iter.SeekGE(lowerBound)
@@ -1350,7 +1409,9 @@ func validReadTimes(b *pebble.Batch, key roachpb.Key, value []byte) disjointTime
 	return validTimes
 }
 
-func validScanTime(b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue) multiKeyTimeSpan {
+func validScanTime(
+	b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue, missingKeysValid bool,
+) multiKeyTimeSpan {
 	valid := multiKeyTimeSpan{
 		Gaps: disjointTimeSpans{{Start: hlc.MinTimestamp, End: hlc.MaxTimestamp}},
 	}
@@ -1365,7 +1426,7 @@ func validScanTime(b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue) m
 		// NB: we use value uniqueness here, but we could also use seqnos, so this
 		// is only a left-over of past times rather than an actual reliance on
 		// unique values.
-		validTimes := validReadTimes(b, kv.Key, kv.Value.RawBytes)
+		validTimes := validReadTimes(b, kv.Key, kv.Value.RawBytes, missingKeysValid)
 		if len(validTimes) > 1 {
 			panic(errors.AssertionFailedf(
 				`invalid number of read time spans for a (key,non-nil-value) pair in scan results: %s->%s: %v`,
@@ -1392,7 +1453,10 @@ func validScanTime(b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue) m
 	// Note that this iterator ignores MVCC range deletions. We use this iterator
 	// only to *discover* point keys; we then invoke validReadTimes for each of
 	// them which *does* take into account MVCC range deletions.
-	iter := b.NewIter(nil)
+	iter, err := b.NewIter(nil)
+	if err != nil {
+		panic(err)
+	}
 	defer func() { _ = iter.Close() }()
 
 	iter.SeekGE(storage.EncodeMVCCKey(storage.MVCCKey{Key: span.Key}))
@@ -1413,7 +1477,7 @@ func validScanTime(b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue) m
 		if _, ok := missingKeys[string(mvccKey.Key)]; !ok {
 			// Key not in scan response. Only valid if scan was before key's time, or
 			// at a time when the key was deleted.
-			missingKeys[string(mvccKey.Key)] = validReadTimes(b, mvccKey.Key, nil)
+			missingKeys[string(mvccKey.Key)] = validReadTimes(b, mvccKey.Key, nil, missingKeysValid)
 		}
 	}
 
@@ -1456,7 +1520,11 @@ func printObserved(observedOps ...observedOp) string {
 					opCode, o.Key, o.EndKey, ts, mustGetStringValue(o.Value.RawBytes), o.Seq)
 			}
 		case *observedRead:
-			fmt.Fprintf(&buf, "[r]%s:", o.Key)
+			opCode := "r"
+			if o.SkipLocked {
+				opCode += "(skip-locked)"
+			}
+			fmt.Fprintf(&buf, "[%s]%s:", opCode, o.Key)
 			validTimes := o.ValidTimes
 			if len(validTimes) == 0 {
 				validTimes = append(validTimes, timeSpan{})
@@ -1475,6 +1543,9 @@ func printObserved(observedOps ...observedOp) string {
 			}
 			if o.Reverse {
 				opCode = "rs"
+			}
+			if o.SkipLocked {
+				opCode += "(skip-locked)"
 			}
 			var kvs strings.Builder
 			for i, kv := range o.KVs {

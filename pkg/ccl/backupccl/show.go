@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -370,7 +371,7 @@ func showBackupPlanHook(
 			p.ExecCfg().InternalDB,
 			p.User(),
 		)
-		showEncErr := `If you are running SHOW BACKUP exclusively on an incremental backup, 
+		showEncErr := `If you are running SHOW BACKUP exclusively on an incremental backup,
 you must pass the 'encryption_info_dir' parameter that points to the directory of your full backup`
 		if showStmt.Options.EncryptionPassphrase != nil {
 			passphrase, err := exprEval.String(ctx, showStmt.Options.EncryptionPassphrase)
@@ -428,13 +429,16 @@ you must pass the 'encryption_info_dir' parameter that points to the directory o
 				return err
 			}
 		}
-		collection, computedSubdir := backupdest.CollectionAndSubdir(dest[0], subdir)
+		collections, computedSubdir, err := backupdest.CollectionsAndSubdir(dest, subdir)
+		if err != nil {
+			return err
+		}
 		fullyResolvedIncrementalsDirectory, err := backupdest.ResolveIncrementalsBackupLocation(
 			ctx,
 			p.User(),
 			p.ExecCfg(),
 			explicitIncPaths,
-			[]string{collection},
+			collections,
 			computedSubdir,
 		)
 		if err != nil {
@@ -728,8 +732,8 @@ func backupShowerHeaders(showSchemas bool, opts tree.ShowBackupOptions) colinfo.
 		{Name: "object_name", Typ: types.String},
 		{Name: "object_type", Typ: types.String},
 		{Name: "backup_type", Typ: types.String},
-		{Name: "start_time", Typ: types.Timestamp},
-		{Name: "end_time", Typ: types.Timestamp},
+		{Name: "start_time", Typ: types.TimestampTZ},
+		{Name: "end_time", Typ: types.TimestampTZ},
 		{Name: "size_bytes", Typ: types.Int},
 		{Name: "rows", Typ: types.Int},
 		{Name: "is_full_cluster", Typ: types.Bool},
@@ -827,21 +831,25 @@ func backupShowerDefault(
 					fileSizes = info.fileSizes[layer]
 				}
 
-				tableSizes, err := getTableSizes(ctx, info.layerToIterFactory[layer], fileSizes)
-				if err != nil {
-					return nil, err
+				var tableSizes map[catid.DescID]descriptorSize
+				if !opts.SkipSize {
+					tableSizes, err = getTableSizes(ctx, info.layerToIterFactory[layer], fileSizes)
+					if err != nil {
+						return nil, err
+					}
 				}
+
 				backupType := tree.NewDString("full")
 				if manifest.IsIncremental() {
 					backupType = tree.NewDString("incremental")
 				}
 				start := tree.DNull
-				end, err := tree.MakeDTimestamp(timeutil.Unix(0, manifest.EndTime.WallTime), time.Nanosecond)
+				end, err := tree.MakeDTimestampTZ(timeutil.Unix(0, manifest.EndTime.WallTime), time.Nanosecond)
 				if err != nil {
 					return nil, err
 				}
 				if manifest.StartTime.WallTime != 0 {
-					start, err = tree.MakeDTimestamp(timeutil.Unix(0, manifest.StartTime.WallTime), time.Nanosecond)
+					start, err = tree.MakeDTimestampTZ(timeutil.Unix(0, manifest.StartTime.WallTime), time.Nanosecond)
 					if err != nil {
 						return nil, err
 					}
@@ -933,7 +941,11 @@ func backupShowerDefault(
 						row = append(row, createStmtDatum)
 					}
 					if opts.Privileges {
-						row = append(row, tree.NewDString(showPrivileges(ctx, desc)))
+						showPrivs, err := showPrivileges(ctx, desc)
+						if err != nil {
+							return nil, err
+						}
+						row = append(row, tree.NewDString(showPrivs))
 						owner := desc.GetPrivileges().Owner().SQLIdentifier()
 						row = append(row, tree.NewDString(owner))
 					}
@@ -956,12 +968,16 @@ func backupShowerDefault(
 					}
 					rows = append(rows, row)
 				}
-				for _, t := range manifest.GetTenants() {
+				for _, t := range manifest.Tenants {
+					tenantID, err := roachpb.MakeTenantID(t.ID)
+					if err != nil {
+						return nil, err
+					}
 					row := tree.Datums{
-						tree.DNull, // Database
-						tree.DNull, // Schema
-						tree.NewDString(roachpb.MustMakeTenantID(t.ID).String()), // Object Name
-						tree.NewDString("TENANT"),                                // Object Type
+						tree.DNull,                         // Database
+						tree.DNull,                         // Schema
+						tree.NewDString(tenantID.String()), // Object Name
+						tree.NewDString("TENANT"),          // Object Type
 						backupType,
 						start,
 						end,
@@ -1150,7 +1166,7 @@ func showRegions(typeDesc catalog.TypeDescriptor, dbname string) (string, error)
 	return regionsStringBuilder.String(), nil
 }
 
-func showPrivileges(ctx context.Context, desc catalog.Descriptor) string {
+func showPrivileges(ctx context.Context, desc catalog.Descriptor) (string, error) {
 	ctx, span := tracing.ChildSpan(ctx, "backupccl.showPrivileges")
 	defer span.Finish()
 	_ = ctx // ctx is currently unused, but this new ctx should be used below in the future.
@@ -1158,14 +1174,18 @@ func showPrivileges(ctx context.Context, desc catalog.Descriptor) string {
 	var privStringBuilder strings.Builder
 
 	if desc == nil {
-		return ""
+		return "", nil
 	}
 	privDesc := desc.GetPrivileges()
 	objectType := desc.GetObjectType()
 	if privDesc == nil {
-		return ""
+		return "", nil
 	}
-	for _, userPriv := range privDesc.Show(objectType, false /* showImplicitOwnerPrivs */) {
+	showList, err := privDesc.Show(objectType, false /* showImplicitOwnerPrivs */)
+	if err != nil {
+		return "", err
+	}
+	for _, userPriv := range showList {
 		privs := userPriv.Privileges
 		if len(privs) == 0 {
 			continue
@@ -1207,7 +1227,7 @@ func showPrivileges(ctx context.Context, desc catalog.Descriptor) string {
 		}
 	}
 
-	return privStringBuilder.String()
+	return privStringBuilder.String(), nil
 }
 
 var backupShowerRanges = backupShower{

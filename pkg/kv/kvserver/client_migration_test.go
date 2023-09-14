@@ -86,7 +86,7 @@ func TestStorePurgeOutdatedReplicas(t *testing.T) {
 
 			for _, node := range []int{n2, n3} {
 				ts := tc.Servers[node]
-				store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+				store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 				if pErr != nil {
 					t.Fatal(pErr)
 				}
@@ -108,7 +108,7 @@ func TestStorePurgeOutdatedReplicas(t *testing.T) {
 			}
 
 			ts := tc.Servers[n2]
-			store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+			store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 			if pErr != nil {
 				t.Fatal(pErr)
 			}
@@ -139,7 +139,7 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
 	ltk.storeKnobs.DisableRaftSnapshotQueue = true // we'll control it ourselves
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		// We'll want a signal for when the snapshot was received by the sender.
 		once.Do(func() { close(blockUntilSnapshotCh) })
 
@@ -220,7 +220,7 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 
 	for _, node := range []int{n1, n2} {
 		ts := tc.Servers[node]
-		store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -274,7 +274,7 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 
 	for _, node := range []int{n1, n2, n3} {
 		ts := tc.Servers[node]
-		store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -307,7 +307,7 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 
 	for _, node := range []int{n1, n2, n3} {
 		ts := tc.Servers[node]
-		store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if pErr != nil {
 			t.Fatal(pErr)
 		}

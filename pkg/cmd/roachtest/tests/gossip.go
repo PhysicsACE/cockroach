@@ -144,6 +144,7 @@ SELECT node_id
 		Name:    "gossip/chaos/nodes=9",
 		Owner:   registry.OwnerKV,
 		Cluster: r.MakeClusterSpec(9),
+		Leases:  registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runGossipChaos(ctx, t, c)
 		},
@@ -285,6 +286,7 @@ func runGossipPeerings(ctx context.Context, t test.Test, c cluster.Cluster) {
 	deadline := timeutil.Now().Add(time.Minute)
 
 	for i := 1; timeutil.Now().Before(deadline); i++ {
+		WaitForReady(ctx, t, c, c.All())
 		if err := g.check(ctx, c, g.hasPeers(c.Spec().NodeCount)); err != nil {
 			t.Fatal(err)
 		}
@@ -308,8 +310,6 @@ func runGossipPeerings(ctx context.Context, t test.Test, c cluster.Cluster) {
 }
 
 func runGossipRestart(ctx context.Context, t test.Test, c cluster.Cluster) {
-	t.Skip("skipping flaky acceptance/gossip/restart", "https://github.com/cockroachdb/cockroach/issues/48423")
-
 	c.Put(ctx, t.Cockroach(), "./cockroach")
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
@@ -322,6 +322,7 @@ func runGossipRestart(ctx context.Context, t test.Test, c cluster.Cluster) {
 	deadline := timeutil.Now().Add(time.Minute)
 
 	for i := 1; timeutil.Now().Before(deadline); i++ {
+		WaitForReady(ctx, t, c, c.All())
 		g.checkConnectedAndFunctional(ctx, t, c)
 		t.L().Printf("%d: OK\n", i)
 
@@ -432,8 +433,9 @@ SELECT count(replicas)
 	err := c.RunE(ctx, c.Node(1),
 		` ./cockroach start --insecure --background --store={store-dir} `+
 			`--log-dir={log-dir} --cache=10% --max-sql-memory=10% `+
-			`--listen-addr=:$[{pgport:1}+10000] --http-port=$[{pgport:1}+1] `+
-			`--join={pghost:1}:{pgport:1}`+
+			`--listen-addr=:$[{pgport:1}+1000] --http-port=$[{pgport:1}+1] `+
+			`--join={pghost:1}:{pgport:1} `+
+			`--advertise-addr={pghost:1}:$[{pgport:1}+1000] `+
 			`> {log-dir}/cockroach.stdout 2> {log-dir}/cockroach.stderr`)
 	if err != nil {
 		t.Fatal(err)
@@ -471,7 +473,7 @@ SELECT count(replicas)
 		if err != nil {
 			t.Fatal(err)
 		}
-		url.Host = fmt.Sprintf("%s:%d", host, v+10000)
+		url.Host = fmt.Sprintf("%s:%d", host, v+1000)
 		db, err := gosql.Open("postgres", url.String())
 		if err != nil {
 			t.Fatal(err)

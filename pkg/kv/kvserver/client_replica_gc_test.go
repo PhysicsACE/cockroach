@@ -12,6 +12,7 @@ package kvserver_test
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -90,7 +91,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	require.NoError(t, tc.WaitForVoters(k, tc.Target(1), tc.Target(2)))
 
 	ts := tc.Servers[1]
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+	store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -112,7 +113,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 		if dir == "" {
 			t.Fatal("no sideloaded directory")
 		}
-		if err := eng.MkdirAll(dir); err != nil {
+		if err := eng.MkdirAll(dir, os.ModePerm); err != nil {
 			t.Fatal(err)
 		}
 		if err := fs.WriteFile(eng, filepath.Join(dir, "i1000000.t100000"), []byte("foo")); err != nil {
@@ -170,7 +171,7 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	defer tc.Stopper().Stop(context.Background())
 
 	ts := tc.Servers[1]
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+	store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 	if pErr != nil {
 		t.Fatal(pErr)
 	}

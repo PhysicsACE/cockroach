@@ -29,9 +29,11 @@ import (
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/keysbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -496,7 +498,7 @@ func (v *Value) SetProto(msg protoutil.Message) error {
 	// directly into the Value.RawBytes field instead of allocating a separate
 	// []byte and copying.
 	v.ensureRawBytes(headerSize + msg.Size())
-	if _, err := protoutil.MarshalTo(msg, v.RawBytes[headerSize:]); err != nil {
+	if _, err := protoutil.MarshalToSizedBuffer(msg, v.RawBytes[headerSize:]); err != nil {
 		return err
 	}
 	// Special handling for timeseries data.
@@ -809,10 +811,18 @@ func (v Value) computeChecksum(key []byte) uint32 {
 // In `1:3:Float/6.28`, the `1` is the column id diff as stored, `3` is the
 // computed (i.e. not stored) actual column id, `Float` is the type, and `6.28`
 // is the encoded value.
-func (v Value) PrettyPrint() string {
+func (v Value) PrettyPrint() (ret string) {
 	if len(v.RawBytes) == 0 {
 		return "/<empty>"
 	}
+	// In certain cases untagged bytes could be malformed because they are
+	// coming from user input, in which case recover with an error instead
+	// of crashing.
+	defer func() {
+		if r := recover(); r != nil {
+			ret = fmt.Sprintf("/<err: paniced parsing with %v>", r)
+		}
+	}()
 	var buf bytes.Buffer
 	t := v.GetTag()
 	buf.WriteRune('/')
@@ -935,10 +945,12 @@ func (TransactionStatus) SafeValue() {}
 func MakeTransaction(
 	name string,
 	baseKey Key,
+	isoLevel isolation.Level,
 	userPriority UserPriority,
 	now hlc.Timestamp,
 	maxOffsetNs int64,
 	coordinatorNodeID int32,
+	admissionPriority admissionpb.WorkPriority,
 ) Transaction {
 	u := uuid.FastMakeV4()
 	// TODO(nvanbenschoten): technically, gul should be a synthetic timestamp.
@@ -950,6 +962,7 @@ func MakeTransaction(
 		TxnMeta: enginepb.TxnMeta{
 			Key:               baseKey,
 			ID:                u,
+			IsoLevel:          isoLevel,
 			WriteTimestamp:    now,
 			MinTimestamp:      now,
 			Priority:          MakePriority(userPriority),
@@ -960,6 +973,7 @@ func MakeTransaction(
 		LastHeartbeat:          now,
 		ReadTimestamp:          now,
 		GlobalUncertaintyLimit: gul,
+		AdmissionPriority:      int32(admissionPriority),
 	}
 }
 
@@ -1157,7 +1171,7 @@ func (t *Transaction) Restart(
 	// Reset all epoch-scoped state.
 	t.Sequence = 0
 	t.WriteTooOld = false
-	t.CommitTimestampFixed = false
+	t.ReadTimestampFixed = false
 	t.LockSpans = nil
 	t.InFlightWrites = nil
 	t.IgnoredSeqNums = nil
@@ -1170,12 +1184,34 @@ func (t *Transaction) BumpEpoch() {
 	t.Epoch++
 }
 
-// Refresh reconfigures a transaction to account for a read refresh up to the
-// specified timestamp. For details about transaction read refreshes, see the
-// comment on txnSpanRefresher.
-func (t *Transaction) Refresh(timestamp hlc.Timestamp) {
-	t.WriteTimestamp.Forward(timestamp)
-	t.ReadTimestamp.Forward(t.WriteTimestamp)
+// BumpReadTimestamp forwards the transaction's read timestamp to the provided
+// timestamp. It also forwards its write timestamp, if necessary, to ensure that
+// its write timestamp is always greater than or equal to its read timestamp.
+//
+// A transaction's write timestamp serves as a lower bound on its commit
+// timestamp. It is free to advance over the course of the transaction's
+// lifetime when experiencing read-write or write-write contention. The write
+// timestamp can advance without restraint or prior validation.
+//
+// A transaction's read timestamp establishes the consistent read snapshot that
+// the transaction observes when reading data. Unlike the write timestamp, the
+// read timestamp is not free to advance, except in specific circumstances.
+// Movement of the read timestamp outside these circumstances would break the
+// consistent view of data that the transaction is meaning to provide. The read
+// can be advanced in three situations:
+//   - When a transaction restarts and moves to a new epoch. At this time, the
+//     reads and writes performed in the prior epoch(s) are considered invalid
+//     and the read snapshot can be re-established using a new read timestamp.
+//   - When a transaction performs a read refresh, having validated that all
+//     prior reads are equivalent at the old and new read timestamp. For details
+//     about transaction read refreshes, see the comment on txnSpanRefresher.
+//   - When the transaction reaches a statement boundary, if the transaction's
+//     isolation level permits it to observe a different read snapshot on each
+//     statement. For more, see the comment on isolation.Level.
+func (t *Transaction) BumpReadTimestamp(timestamp hlc.Timestamp) {
+	t.ReadTimestamp.Forward(timestamp)
+	t.WriteTimestamp.Forward(t.ReadTimestamp)
+	// TODO(nvanbenschoten): remove this when the WriteTooOld flag is removed.
 	t.WriteTooOld = false
 }
 
@@ -1183,28 +1219,36 @@ func (t *Transaction) Refresh(timestamp hlc.Timestamp) {
 // others) for the transaction. If t.ID is empty, then the transaction is
 // copied from o.
 func (t *Transaction) Update(o *Transaction) {
+	ctx := context.TODO()
 	if o == nil {
 		return
 	}
-	o.AssertInitialized(context.TODO())
+	o.AssertInitialized(ctx)
 	if t.ID == (uuid.UUID{}) {
 		*t = *o
 		return
 	} else if t.ID != o.ID {
-		log.Fatalf(context.Background(), "updating txn %s with different txn %s", t.String(), o.String())
+		log.Fatalf(ctx, "updating txn %s with different txn %s", t.String(), o.String())
 		return
 	}
 	if len(t.Key) == 0 {
 		t.Key = o.Key
 	}
+	t.IsoLevel = o.IsoLevel
 
 	// Update epoch-scoped state, depending on the two transactions' epochs.
 	if t.Epoch < o.Epoch {
+		// Ensure that the transaction status makes sense. If the transaction
+		// has already been finalized, then it should remain finalized.
+		if !t.Status.IsFinalized() {
+			t.Status = o.Status
+		} else if t.Status == COMMITTED {
+			log.Warningf(ctx, "updating COMMITTED txn %s with txn at later epoch %s", t.String(), o.String())
+		}
 		// Replace all epoch-scoped state.
 		t.Epoch = o.Epoch
-		t.Status = o.Status
 		t.WriteTooOld = o.WriteTooOld
-		t.CommitTimestampFixed = o.CommitTimestampFixed
+		t.ReadTimestampFixed = o.ReadTimestampFixed
 		t.Sequence = o.Sequence
 		t.LockSpans = o.LockSpans
 		t.InFlightWrites = o.InFlightWrites
@@ -1220,7 +1264,7 @@ func (t *Transaction) Update(o *Transaction) {
 			}
 		case ABORTED:
 			if o.Status == COMMITTED {
-				log.Warningf(context.Background(), "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
+				log.Warningf(ctx, "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
 			}
 		case COMMITTED:
 			// Nothing to do.
@@ -1230,7 +1274,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// If neither of the transactions has a bumped ReadTimestamp, then the
 			// WriteTooOld flag is cumulative.
 			t.WriteTooOld = t.WriteTooOld || o.WriteTooOld
-			t.CommitTimestampFixed = t.CommitTimestampFixed || o.CommitTimestampFixed
+			t.ReadTimestampFixed = t.ReadTimestampFixed || o.ReadTimestampFixed
 		} else if t.ReadTimestamp.Less(o.ReadTimestamp) {
 			// If `o` has a higher ReadTimestamp (i.e. it's the result of a refresh,
 			// which refresh generally clears the WriteTooOld field), then it dictates
@@ -1238,7 +1282,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// concurrently with any requests whose response's WriteTooOld field
 			// matters.
 			t.WriteTooOld = o.WriteTooOld
-			t.CommitTimestampFixed = o.CommitTimestampFixed
+			t.ReadTimestampFixed = o.ReadTimestampFixed
 		}
 		// If t has a higher ReadTimestamp, than it gets to dictate the
 		// WriteTooOld field - so there's nothing to update.
@@ -1265,7 +1309,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// aborted.
 			t.Status = ABORTED
 		case COMMITTED:
-			log.Warningf(context.Background(), "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
+			log.Warningf(ctx, "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
 		}
 	}
 
@@ -1291,6 +1335,10 @@ func (t *Transaction) Update(o *Transaction) {
 
 	// Ratchet the transaction priority.
 	t.UpgradePriority(o.Priority)
+	// Defensive, since AdmissionPriority does not change. We have already
+	// handled the case of t being uninitialized at the beginning of this
+	// function.
+	t.AdmissionPriority = o.AdmissionPriority
 }
 
 // UpgradePriority sets transaction priority to the maximum of current
@@ -1737,7 +1785,7 @@ func (crt ChangeReplicasTrigger) Removed() []ReplicaDescriptor {
 }
 
 // LeaseSequence is a custom type for a lease sequence number.
-type LeaseSequence int64
+type LeaseSequence uint64
 
 // SafeValue implements the redact.SafeValue interface.
 func (s LeaseSequence) SafeValue() {}
@@ -1933,17 +1981,42 @@ func (l *Lease) Equal(that interface{}) bool {
 	return true
 }
 
-// MakeIntent makes an intent with the given txn and key.
-// This is suitable for use when constructing WriteIntentError.
-func MakeIntent(txn *enginepb.TxnMeta, key Key) Intent {
-	var i Intent
-	i.Key = key
-	i.Txn = *txn
-	return i
+// MakeLock makes a lock with the given txn, key, and strength.
+// This is suitable for use when constructing LockConflictError.
+func MakeLock(txn *enginepb.TxnMeta, key Key, str lock.Strength) Lock {
+	var l Lock
+	l.Txn = *txn
+	l.Key = key
+	l.Strength = str
+	return l
 }
 
-// AsIntents takes a transaction and a slice of keys and
-// returns it as a slice of intents.
+// Intent is an intent-strength lock. The type is a specialization of Lock and
+// should be constructed using MakeIntent.
+type Intent Lock
+
+// MakeIntent makes an intent-strength lock with the given txn and key.
+func MakeIntent(txn *enginepb.TxnMeta, key Key) Intent {
+	return Intent(MakeLock(txn, key, lock.Intent))
+}
+
+// AsLock casts an Intent to a Lock.
+func (i Intent) AsLock() Lock {
+	return Lock(i)
+}
+
+// AsLockPtr casts a *Intent to a *Lock.
+func (i *Intent) AsLockPtr() *Lock {
+	return (*Lock)(i)
+}
+
+// AsLocks casts a slice of Intents to a slice of Locks.
+func AsLocks(s []Intent) []Lock {
+	return *(*[]Lock)(unsafe.Pointer(&s))
+}
+
+// AsIntents takes a transaction and a slice of keys and returns it as a slice
+// of intent-strength locks.
 func AsIntents(txn *enginepb.TxnMeta, keys []Key) []Intent {
 	ret := make([]Intent, len(keys))
 	for i := range keys {
@@ -1953,9 +2026,17 @@ func AsIntents(txn *enginepb.TxnMeta, keys []Key) []Intent {
 }
 
 // MakeLockAcquisition makes a lock acquisition message from the given
-// txn, key, and durability level.
-func MakeLockAcquisition(txn *Transaction, key Key, dur lock.Durability) LockAcquisition {
-	return LockAcquisition{Span: Span{Key: key}, Txn: txn.TxnMeta, Durability: dur}
+// txn, key, durability level, and lock strength.
+func MakeLockAcquisition(
+	txn *Transaction, key Key, dur lock.Durability, str lock.Strength,
+) LockAcquisition {
+	return LockAcquisition{
+		Span:           Span{Key: key},
+		Txn:            txn.TxnMeta,
+		Durability:     dur,
+		Strength:       str,
+		IgnoredSeqNums: txn.IgnoredSeqNums,
+	}
 }
 
 // MakeLockUpdate makes a lock update from the given txn and span.
@@ -2466,4 +2547,14 @@ func (r *RowCount) Add(other RowCount) {
 	r.DataSize += other.DataSize
 	r.Rows += other.Rows
 	r.IndexEntries += other.IndexEntries
+}
+
+func (tid *TenantID) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var id uint64
+	if err := unmarshal(&id); err == nil {
+		tid.InternalValue = id
+		return nil
+	} else {
+		return unmarshal(tid)
+	}
 }

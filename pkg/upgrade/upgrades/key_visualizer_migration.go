@@ -17,11 +17,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	// Import keyvisjob so that it's init function will be called.
+	// Import keyvisjob so that its init function will be called.
 	_ "github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvisjob"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 )
@@ -47,6 +48,8 @@ func keyVisualizerTablesMigration(
 		}
 	}
 
+	// These migrations are skipped for backup tests because these tables are not part
+	// of the backup.
 	shouldBootstrapJob := true
 	shouldConfigureTTL := true
 
@@ -79,25 +82,9 @@ func keyVisualizerTablesMigration(
 			NonCancelable: true, // The job can't be canceled, but it can be paused.
 		}
 
-		// Make sure job with id doesn't already exist in system.jobs.
-		row, err := d.DB.Executor().QueryRowEx(
-			ctx,
-			"check for existing key visualizer job",
-			nil,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-			"SELECT * FROM system.jobs WHERE id = $1",
-			record.JobID,
-		)
-		if err != nil {
-			return err
-		}
-
-		// If there isn't a row for the key visualizer job, create the job.
-		if row == nil {
-			if _, err := d.JobRegistry.CreateAdoptableJobWithTxn(ctx, record, record.JobID, nil); err != nil {
-				return err
-			}
-		}
+		return d.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			return d.JobRegistry.CreateIfNotExistAdoptableJobWithTxn(ctx, record, txn)
+		})
 	}
 
 	return nil

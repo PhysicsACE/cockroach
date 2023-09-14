@@ -119,6 +119,11 @@ type diagnosticsBundle struct {
 	// Stores any error in the collection, building, or insertion of the bundle.
 	collectionErr error
 
+	// errorStrings are all non-critical errors that we ran into when collecting
+	// the bundle. "Non-critical" in this context means that most of the bundle
+	// was still collected to be useful, but some parts might be missing.
+	errorStrings []string
+
 	// diagID is the diagnostics instance ID, populated by insert().
 	diagID stmtdiagnostics.CollectedInstanceID
 }
@@ -138,6 +143,7 @@ func buildStatementBundle(
 	placeholders *tree.PlaceholderInfo,
 	queryErr, payloadErr, commErr error,
 	sv *settings.Values,
+	c inFlightTraceCollector,
 ) diagnosticsBundle {
 	if plan == nil {
 		return diagnosticsBundle{collectionErr: errors.AssertionFailedf("execution terminated early")}
@@ -150,14 +156,15 @@ func buildStatementBundle(
 	b.addDistSQLDiagrams()
 	b.addExplainVec()
 	b.addTrace()
+	b.addInFlightTrace(c)
 	b.addEnv(ctx)
 	b.addErrors(queryErr, payloadErr, commErr)
 
 	buf, err := b.finalize()
 	if err != nil {
-		return diagnosticsBundle{collectionErr: err}
+		return diagnosticsBundle{collectionErr: err, errorStrings: b.errorStrings}
 	}
-	return diagnosticsBundle{zip: buf.Bytes()}
+	return diagnosticsBundle{zip: buf.Bytes(), errorStrings: b.errorStrings}
 }
 
 // insert the bundle in statement diagnostics. Sets bundle.diagID and (in error
@@ -203,6 +210,9 @@ type stmtBundleBuilder struct {
 	trace        tracingpb.Recording
 	placeholders *tree.PlaceholderInfo
 	sv           *settings.Values
+
+	// errorStrings are non-critical errors encountered so far.
+	errorStrings []string
 
 	z memzipper.Zipper
 }
@@ -283,10 +293,6 @@ func (b *stmtBundleBuilder) addStatement() {
 // addOptPlans adds the EXPLAIN (OPT) variants as files opt.txt, opt-v.txt,
 // opt-vv.txt.
 func (b *stmtBundleBuilder) addOptPlans(ctx context.Context) {
-	if b.flags.RedactValues {
-		return
-	}
-
 	if b.plan.mem == nil || b.plan.mem.RootExpr() == nil {
 		// No optimizer plans; an error must have occurred during planning.
 		b.z.AddFile("opt.txt", noPlan)
@@ -296,9 +302,13 @@ func (b *stmtBundleBuilder) addOptPlans(ctx context.Context) {
 	}
 
 	formatOptPlan := func(flags memo.ExprFmtFlags) string {
-		f := memo.MakeExprFmtCtx(ctx, flags, b.plan.mem, b.plan.catalog)
+		f := memo.MakeExprFmtCtx(ctx, flags, b.flags.RedactValues, b.plan.mem, b.plan.catalog)
 		f.FormatExpr(b.plan.mem.RootExpr())
-		return f.Buffer.String()
+		output := f.Buffer.String()
+		if b.flags.RedactValues {
+			output = string(redact.RedactableString(output).Redact())
+		}
+		return output
 	}
 
 	b.z.AddFile("opt.txt", formatOptPlan(memo.ExprFmtHideAll))
@@ -388,10 +398,46 @@ Jaeger can be started using docker with: docker run -d --name jaeger -p 16686:16
 The UI can then be accessed at http://localhost:16686/search`, b.stmt)
 	jaegerJSON, err := b.trace.ToJaegerJSON(b.stmt, comment, "")
 	if err != nil {
+		b.errorStrings = append(b.errorStrings, fmt.Sprintf("error getting jaeger trace: %v", err))
 		b.z.AddFile("trace-jaeger.txt", err.Error())
 	} else {
 		b.z.AddFile("trace-jaeger.json", jaegerJSON)
 	}
+}
+
+func (b *stmtBundleBuilder) addInFlightTrace(c inFlightTraceCollector) {
+	if b.flags.RedactValues {
+		return
+	}
+	for _, trace := range c.trace {
+		b.z.AddFile(fmt.Sprintf("inflight-trace-n%d.txt", trace.nodeID), trace.trace)
+		b.z.AddFile(fmt.Sprintf("inflight-trace-jaeger-n%d.json", trace.nodeID), trace.jaeger)
+	}
+	if len(c.trace) == 0 && len(c.errors) > 0 {
+		// Include all errors accumulated throughout the in-flight tracing if we
+		// weren't able to get even a single trace.
+		var sb strings.Builder
+		for j, err := range c.errors {
+			if j > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(err.Error())
+		}
+		b.z.AddFile("inflight-trace-errors.txt", sb.String())
+	}
+	// Include the timeout trace if available.
+	for _, trace := range c.timeoutTrace {
+		b.z.AddFile(fmt.Sprintf("timeout-trace-n%d.txt", trace.nodeID), trace.trace)
+		b.z.AddFile(fmt.Sprintf("timeout-trace-jaeger-n%d.json", trace.nodeID), trace.jaeger)
+	}
+}
+
+// printError writes the given error string into buf (with a newline appended)
+// as well as accumulates the string into b.errorStrings. The method should only
+// be used for non-critical errors.
+func (b *stmtBundleBuilder) printError(errString string, buf *bytes.Buffer) {
+	fmt.Fprintf(buf, errString+"\n")
+	b.errorStrings = append(b.errorStrings, errString)
 }
 
 func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
@@ -399,27 +445,22 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 
 	var buf bytes.Buffer
 	if err := c.PrintVersion(&buf); err != nil {
-		fmt.Fprintf(&buf, "-- error getting version: %v\n", err)
+		b.printError(fmt.Sprintf("-- error getting version: %v", err), &buf)
 	}
 	fmt.Fprintf(&buf, "\n")
 
 	// Show the values of session variables that can impact planning decisions.
 	if err := c.PrintSessionSettings(&buf, b.sv); err != nil {
-		fmt.Fprintf(&buf, "-- error getting session settings: %v\n", err)
+		b.printError(fmt.Sprintf("-- error getting session settings: %v", err), &buf)
 	}
 
 	fmt.Fprintf(&buf, "\n")
 
 	if err := c.PrintClusterSettings(&buf); err != nil {
-		fmt.Fprintf(&buf, "-- error getting cluster settings: %v\n", err)
+		b.printError(fmt.Sprintf("-- error getting cluster settings: %v", err), &buf)
 	}
 
 	b.z.AddFile("env.sql", buf.String())
-
-	if b.flags.RedactValues {
-		b.z.AddFile("schema.sql", "-- schema redacted\n")
-		return
-	}
 
 	mem := b.plan.mem
 	if mem == nil {
@@ -440,7 +481,9 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 		return err
 	})
 	if err != nil {
-		b.z.AddFile("schema.sql", fmt.Sprintf("-- error getting data source names: %v\n", err))
+		errString := fmt.Sprintf("-- error getting data source names: %v", err)
+		b.errorStrings = append(b.errorStrings, errString)
+		b.z.AddFile("schema.sql", errString+"\n")
 		return
 	}
 
@@ -456,24 +499,36 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	}
 	blankLine()
 	if err := c.printCreateAllSchemas(&buf); err != nil {
-		fmt.Fprintf(&buf, "-- error getting all schemas: %v\n", err)
+		b.printError(fmt.Sprintf("-- error getting all schemas: %v", err), &buf)
 	}
 	for i := range sequences {
 		blankLine()
 		if err := c.PrintCreateSequence(&buf, &sequences[i]); err != nil {
-			fmt.Fprintf(&buf, "-- error getting schema for sequence %s: %v\n", sequences[i].String(), err)
+			b.printError(fmt.Sprintf("-- error getting schema for sequence %s: %v", sequences[i].String(), err), &buf)
+		}
+	}
+	// Get all user-defined types. If redaction is a
+	blankLine()
+	if err := c.PrintCreateEnum(&buf, b.flags.RedactValues); err != nil {
+		b.printError(fmt.Sprintf("-- error getting schema for enums: %v", err), &buf)
+	}
+	if mem.Metadata().HasUserDefinedFunctions() {
+		// Get all relevant user-defined functions.
+		blankLine()
+		if err := c.PrintRelevantCreateUdf(&buf, strings.ToLower(b.stmt), b.flags.RedactValues, &b.errorStrings); err != nil {
+			b.printError(fmt.Sprintf("-- error getting schema for udfs: %v", err), &buf)
 		}
 	}
 	for i := range tables {
 		blankLine()
-		if err := c.PrintCreateTable(&buf, &tables[i]); err != nil {
-			fmt.Fprintf(&buf, "-- error getting schema for table %s: %v\n", tables[i].String(), err)
+		if err := c.PrintCreateTable(&buf, &tables[i], b.flags.RedactValues); err != nil {
+			b.printError(fmt.Sprintf("-- error getting schema for table %s: %v", tables[i].String(), err), &buf)
 		}
 	}
 	for i := range views {
 		blankLine()
-		if err := c.PrintCreateView(&buf, &views[i]); err != nil {
-			fmt.Fprintf(&buf, "-- error getting schema for view %s: %v\n", views[i].String(), err)
+		if err := c.PrintCreateView(&buf, &views[i], b.flags.RedactValues); err != nil {
+			b.printError(fmt.Sprintf("-- error getting schema for view %s: %v", views[i].String(), err), &buf)
 		}
 	}
 	if buf.Len() == 0 {
@@ -482,8 +537,9 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	b.z.AddFile("schema.sql", buf.String())
 	for i := range tables {
 		buf.Reset()
-		if err := c.PrintTableStats(&buf, &tables[i], false /* hideHistograms */); err != nil {
-			fmt.Fprintf(&buf, "-- error getting statistics for table %s: %v\n", tables[i].String(), err)
+		hideHistograms := b.flags.RedactValues
+		if err := c.PrintTableStats(&buf, &tables[i], hideHistograms); err != nil {
+			b.printError(fmt.Sprintf("-- error getting statistics for table %s: %v", tables[i].String(), err), &buf)
 		}
 		b.z.AddFile(fmt.Sprintf("stats-%s.sql", tables[i].String()), buf.String())
 	}
@@ -494,13 +550,16 @@ func (b *stmtBundleBuilder) addErrors(queryErr, payloadErr, commErr error) {
 		return
 	}
 
-	if queryErr == nil && payloadErr == nil && commErr == nil {
+	if queryErr == nil && payloadErr == nil && commErr == nil && len(b.errorStrings) == 0 {
 		return
 	}
 	output := fmt.Sprintf(
-		"query error:\n%v\n\npayload error:\n%v\n\ncomm error:\n%v\n",
+		"query error:\n%v\n\npayload error:\n%v\n\ncomm error:\n%v\n\n",
 		queryErr, payloadErr, commErr,
 	)
+	for _, errString := range b.errorStrings {
+		output += errString + "\n"
+	}
 	b.z.AddFile("errors.txt", output)
 }
 
@@ -702,6 +761,7 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer, sv *settings.Values
 		{sessionSetting: "testing_optimizer_disable_rule_probability"},
 		{sessionSetting: "testing_optimizer_random_seed"},
 		{sessionSetting: "timezone"},
+		{sessionSetting: "unbounded_parallel_scans"},
 		{sessionSetting: "unconstrained_non_covering_index_scan_enabled"},
 		{sessionSetting: "vectorize", clusterSetting: VectorizeClusterMode, convFunc: vectorizeConv},
 	}
@@ -771,9 +831,15 @@ func (c *stmtEnvCollector) PrintClusterSettings(w io.Writer) error {
 	return nil
 }
 
-func (c *stmtEnvCollector) PrintCreateTable(w io.Writer, tn *tree.TableName) error {
+func (c *stmtEnvCollector) PrintCreateTable(
+	w io.Writer, tn *tree.TableName, redactValues bool,
+) error {
+	var formatOption string
+	if redactValues {
+		formatOption = " WITH REDACT"
+	}
 	createStatement, err := c.query(
-		fmt.Sprintf("SELECT create_statement FROM [SHOW CREATE TABLE %s]", tn.String()),
+		fmt.Sprintf("SELECT create_statement FROM [SHOW CREATE TABLE %s%s]", tn.String(), formatOption),
 	)
 	if err != nil {
 		return err
@@ -793,9 +859,65 @@ func (c *stmtEnvCollector) PrintCreateSequence(w io.Writer, tn *tree.TableName) 
 	return nil
 }
 
-func (c *stmtEnvCollector) PrintCreateView(w io.Writer, tn *tree.TableName) error {
+func (c *stmtEnvCollector) PrintCreateEnum(w io.Writer, redactValues bool) error {
+	qry := "SELECT create_statement FROM [SHOW CREATE ALL TYPES]"
+	if redactValues {
+		qry = "SELECT crdb_internal.redact(crdb_internal.redactable_sql_constants(create_statement)) FROM [SHOW CREATE ALL TYPES]"
+
+	}
+	createStatement, err := c.queryRows(qry)
+	if err != nil {
+		return err
+	}
+	for _, cs := range createStatement {
+		fmt.Fprintf(w, "%s\n", cs)
+	}
+	return nil
+}
+
+func (c *stmtEnvCollector) PrintRelevantCreateUdf(
+	w io.Writer, stmt string, redactValues bool, errorStrings *[]string,
+) error {
+	// The select function_name returns a DOidWrapper,
+	// we need to cast it to string for queryRows function to process.
+	// TODO: consider getting the udf sql body statements from the memo metadata.
+	functionNameQuery := "SELECT function_name::STRING as function_name_str FROM [SHOW FUNCTIONS]"
+	udfNames, err := c.queryRows(functionNameQuery)
+	if err != nil {
+		return err
+	}
+	for _, name := range udfNames {
+		if strings.Contains(stmt, name) {
+			createFunctionQuery := fmt.Sprintf(
+				"SELECT create_statement FROM [ SHOW CREATE FUNCTION \"%s\" ]", name,
+			)
+			if redactValues {
+				createFunctionQuery = fmt.Sprintf(
+					"SELECT crdb_internal.redact(crdb_internal.redactable_sql_constants(create_statement)) FROM [ SHOW CREATE FUNCTION \"%s\" ]", name,
+				)
+			}
+			createStatement, err := c.query(createFunctionQuery)
+			if err != nil {
+				errString := fmt.Sprintf("-- error getting user defined function %s: %s", name, err)
+				fmt.Fprint(w, errString+"\n")
+				*errorStrings = append(*errorStrings, errString)
+				continue
+			}
+			fmt.Fprintf(w, "%s\n", createStatement)
+		}
+	}
+	return nil
+}
+
+func (c *stmtEnvCollector) PrintCreateView(
+	w io.Writer, tn *tree.TableName, redactValues bool,
+) error {
+	var formatOption string
+	if redactValues {
+		formatOption = " WITH REDACT"
+	}
 	createStatement, err := c.query(fmt.Sprintf(
-		"SELECT create_statement FROM [SHOW CREATE VIEW %s]", tn.String(),
+		"SELECT create_statement FROM [SHOW CREATE VIEW %s%s]", tn.String(), formatOption,
 	))
 	if err != nil {
 		return err

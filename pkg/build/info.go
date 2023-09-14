@@ -19,6 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
@@ -30,19 +31,26 @@ const TimeFormat = "2006/01/02 15:04:05"
 var (
 	// These variables are initialized by Bazel via the linker -X flag
 	// when compiling release binaries.
-	utcTime         string // Build time in UTC (year/month/day hour:min:sec)
-	rev             string // SHA-1 of this build (git rev-parse)
-	cgoCompiler     = cgoVersion()
-	cgoTargetTriple string
-	platform        = fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH)
+	utcTime          string // Build time in UTC (year/month/day hour:min:sec)
+	rev              string // SHA-1 of this build (git rev-parse)
+	buildTagOverride string
+	cgoCompiler      = cgoVersion()
+	cgoTargetTriple  string
+	platform         = fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH)
 	// Distribution is changed by the CCL init-time hook in non-APL builds.
-	Distribution = "OSS"
-	typ          string // Type of this build: <empty>, "development", or "release"
-	channel      string
-	envChannel   = envutil.EnvOrDefaultString("COCKROACH_CHANNEL", "unknown")
+	Distribution      = "OSS"
+	typ               string // Type of this build: <empty>, "development", or "release"
+	channel           string
+	envChannel        = envutil.EnvOrDefaultString("COCKROACH_CHANNEL", "unknown")
+	enabledAssertions = buildutil.CrdbTestBuild
 	//go:embed version.txt
 	cockroachVersion string
 	binaryVersion    = computeBinaryVersion(cockroachVersion, rev)
+)
+
+const (
+	DefaultTelemetryChannel = "official-binary"
+	FIPSTelemetryChannel    = "official-fips-binary"
 )
 
 // IsRelease returns true if the binary was produced by a "release" build.
@@ -53,10 +61,13 @@ func IsRelease() bool {
 // SeemsOfficial reports whether this binary is likely to have come from an
 // official release channel.
 func SeemsOfficial() bool {
-	return channel == "official-binary"
+	return channel == DefaultTelemetryChannel || channel == FIPSTelemetryChannel
 }
 
 func computeBinaryVersion(versionTxt, revision string) string {
+	if buildTagOverride != "" {
+		return buildTagOverride
+	}
 	txt := strings.TrimSuffix(versionTxt, "\n")
 	v, err := version.Parse(txt)
 	if err != nil {
@@ -118,7 +129,8 @@ func (b Info) Long() string {
 	fmt.Fprintf(tw, "Go Version:       %s\n", b.GoVersion)
 	fmt.Fprintf(tw, "C Compiler:       %s\n", b.CgoCompiler)
 	fmt.Fprintf(tw, "Build Commit ID:  %s\n", b.Revision)
-	fmt.Fprintf(tw, "Build Type:       %s", b.Type) // No final newline: cobra prints one for us.
+	fmt.Fprintf(tw, "Build Type:       %s\n", b.Type)
+	fmt.Fprintf(tw, "Enabled Assertions: %t", b.EnabledAssertions) // No final newline: cobra prints one for us.
 	_ = tw.Flush()
 	return buf.String()
 }
@@ -148,17 +160,18 @@ func GetInfo() Info {
 		ch = "unknown"
 	}
 	return Info{
-		GoVersion:       runtime.Version(),
-		Tag:             binaryVersion,
-		Time:            utcTime,
-		Revision:        rev,
-		CgoCompiler:     cgoCompiler,
-		CgoTargetTriple: cgoTargetTriple,
-		Platform:        platform,
-		Distribution:    Distribution,
-		Type:            typ,
-		Channel:         ch,
-		EnvChannel:      envChannel,
+		GoVersion:         runtime.Version(),
+		Tag:               binaryVersion,
+		Time:              utcTime,
+		Revision:          rev,
+		CgoCompiler:       cgoCompiler,
+		CgoTargetTriple:   cgoTargetTriple,
+		Platform:          platform,
+		Distribution:      Distribution,
+		Type:              typ,
+		Channel:           ch,
+		EnvChannel:        envChannel,
+		EnabledAssertions: enabledAssertions,
 	}
 }
 

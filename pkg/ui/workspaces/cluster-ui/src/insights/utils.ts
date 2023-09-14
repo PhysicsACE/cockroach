@@ -72,7 +72,13 @@ export const filterTransactionInsights = (
 
     filteredTransactions = filteredTransactions.filter(
       txn =>
-        txn.transactionExecutionID.toLowerCase()?.includes(search) ||
+        [
+          txn.transactionExecutionID,
+          txn.transactionFingerprintID,
+          txn.sessionID,
+        ]
+          .concat(txn.stmtExecutionIDs)
+          .some(id => id.toLowerCase()?.includes(search)) ||
         txn.query.toLowerCase().includes(search),
     );
   }
@@ -220,12 +226,20 @@ export const filterStatementInsights = (
       ),
     );
   }
+
   if (search) {
     search = search.toLowerCase();
     filteredStatements = filteredStatements.filter(
       stmt =>
         !search ||
-        stmt.statementExecutionID.toLowerCase()?.includes(search) ||
+        // Search results in all ID columns of StmtInsightEvent.
+        [
+          stmt.sessionID,
+          stmt.transactionExecutionID,
+          stmt.transactionFingerprintID,
+          stmt.statementExecutionID,
+          stmt.statementFingerprintID,
+        ].some(s => s.toLowerCase()?.includes(search)) ||
         stmt.query?.toLowerCase().includes(search),
     );
   }
@@ -382,6 +396,7 @@ export function getStmtInsightRecommendations(
   if (!insightDetails) return [];
 
   const execDetails: ExecutionDetails = {
+    application: insightDetails.application,
     statement: insightDetails.query,
     fingerprintID: insightDetails.statementFingerprintID,
     retries: insightDetails.retries,
@@ -392,6 +407,8 @@ export function getStmtInsightRecommendations(
     statementExecutionID: insightDetails.statementExecutionID,
     transactionExecutionID: insightDetails.transactionExecutionID,
     execType: InsightExecEnum.STATEMENT,
+    errorCode: insightDetails.errorCode,
+    status: insightDetails.status,
   };
 
   const recs: InsightRecommendation[] = insightDetails.insights?.map(insight =>
@@ -407,11 +424,13 @@ export function getTxnInsightRecommendations(
   if (!insightDetails) return [];
 
   const execDetails: ExecutionDetails = {
+    application: insightDetails.application,
     transactionExecutionID: insightDetails.transactionExecutionID,
     retries: insightDetails.retries,
     contentionTimeMs: insightDetails.contentionTime.asMilliseconds(),
     elapsedTimeMillis: insightDetails.elapsedTimeMillis,
     execType: InsightExecEnum.TRANSACTION,
+    errorCode: insightDetails.errorCode,
   };
   const recs: InsightRecommendation[] = [];
 

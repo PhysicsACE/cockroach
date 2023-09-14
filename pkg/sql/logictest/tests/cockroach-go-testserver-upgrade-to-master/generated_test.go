@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
@@ -29,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 19
+const configIdx = 18
 
 var logicTestDir string
 
@@ -50,6 +51,11 @@ func TestMain(m *testing.M) {
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
+
+	defer serverutils.TestingSetDefaultTenantSelectionOverride(
+		base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(76378),
+	)()
+
 	os.Exit(m.Run())
 }
 
@@ -79,6 +85,13 @@ func TestLogic_mixed_version_can_login(
 	runLogicTest(t, "mixed_version_can_login")
 }
 
+func TestLogic_mixed_version_database_role_settings_role_id(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_database_role_settings_role_id")
+}
+
 func TestLogic_mixed_version_external_connections_owner_id(
 	t *testing.T,
 ) {
@@ -86,9 +99,51 @@ func TestLogic_mixed_version_external_connections_owner_id(
 	runLogicTest(t, "mixed_version_external_connections_owner_id")
 }
 
+func TestLogic_mixed_version_insights_queries(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_insights_queries")
+}
+
+func TestLogic_mixed_version_new_system_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_new_system_privileges")
+}
+
+func TestLogic_mixed_version_partially_visible_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_partially_visible_index")
+}
+
+func TestLogic_mixed_version_range_tombstones(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_range_tombstones")
+}
+
 func TestLogic_mixed_version_role_members_user_ids(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "mixed_version_role_members_user_ids")
+}
+
+func TestLogic_mixed_version_system_privileges_user_id(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_system_privileges_user_id")
+}
+
+func TestLogic_mixed_version_upgrade_repair_descriptors(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_upgrade_repair_descriptors")
 }

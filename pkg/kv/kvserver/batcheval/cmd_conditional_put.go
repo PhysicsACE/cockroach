@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -29,7 +30,8 @@ func declareKeysConditionalPut(
 	rs ImmutableRangeState,
 	header *kvpb.Header,
 	req kvpb.Request,
-	latchSpans, lockSpans *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
 ) {
 	args := req.(*kvpb.ConditionalPutRequest)
@@ -55,19 +57,24 @@ func ConditionalPut(
 	}
 
 	handleMissing := storage.CPutMissingBehavior(args.AllowIfDoesNotExist)
+
+	opts := storage.MVCCWriteOptions{
+		Txn:                            h.Txn,
+		LocalTimestamp:                 cArgs.Now,
+		Stats:                          cArgs.Stats,
+		ReplayWriteTimestampProtection: h.AmbiguousReplayProtection,
+	}
+
 	var err error
 	if args.Blind {
 		err = storage.MVCCBlindConditionalPut(
-			ctx, readWriter, cArgs.Stats, args.Key, ts, cArgs.Now, args.Value, args.ExpBytes, handleMissing, h.Txn)
+			ctx, readWriter, args.Key, ts, args.Value, args.ExpBytes, handleMissing, opts)
 	} else {
 		err = storage.MVCCConditionalPut(
-			ctx, readWriter, cArgs.Stats, args.Key, ts, cArgs.Now, args.Value, args.ExpBytes, handleMissing, h.Txn)
+			ctx, readWriter, args.Key, ts, args.Value, args.ExpBytes, handleMissing, opts)
 	}
-	// NB: even if MVCC returns an error, it may still have written an intent
-	// into the batch. This allows callers to consume errors like WriteTooOld
-	// without re-evaluating the batch. This behavior isn't particularly
-	// desirable, but while it remains, we need to assume that an intent could
-	// have been written even when an error is returned. This is harmless if the
-	// error is not consumed by the caller because the result will be discarded.
-	return result.FromAcquiredLocks(h.Txn, args.Key), err
+	if err != nil {
+		return result.Result{}, err
+	}
+	return result.FromAcquiredLocks(h.Txn, args.Key), nil
 }

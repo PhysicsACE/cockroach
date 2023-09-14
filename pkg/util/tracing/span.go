@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/petermattis/goid"
 	"go.opentelemetry.io/otel/attribute"
@@ -178,7 +179,7 @@ func (sp *Span) detectUseAfterFinish() bool {
 		} else {
 			finishStack = sp.finishStack
 		}
-		panic(fmt.Sprintf("use of Span after Finish. Span: %s. Finish previously called at: %s",
+		panic(errors.AssertionFailedf("use of Span after Finish. Span: %s. Finish previously called at: %s",
 			sp.i.OperationName(), finishStack))
 	}
 
@@ -201,13 +202,13 @@ func (sp *Span) incRef() {
 func (sp *Span) decRef() bool {
 	refCnt := atomic.AddInt32(&sp.refCnt, -1)
 	if refCnt < 0 {
-		panic(fmt.Sprintf("refCnt below 0: %s", sp))
+		panic(errors.AssertionFailedf("refCnt below 0: %s", sp))
 	}
 	// If this was the last reference, make the span available for re-use.
 	if refCnt == 0 {
 		alreadyFinished := atomic.LoadInt32(&sp.finished) != 0
 		if !alreadyFinished {
-			panic("Span reference count dropped to zero before the span was Finish()ed")
+			panic(errors.AssertionFailedf("Span reference count dropped to zero before the span was Finish()ed"))
 		}
 		if detectSpanRefLeaks {
 			sp.setFinalizer(nil)
@@ -229,7 +230,7 @@ func (sp *Span) String() string {
 	return sp.OperationName()
 }
 
-// Redactable returns true if this Span's tracer is marked redactable
+// Redactable returns true if this Span's tracer is marked redactable.
 func (sp *Span) Redactable() bool {
 	if sp == nil || sp.i.isNoop() {
 		return false
@@ -520,6 +521,19 @@ func (sp *Span) SetLazyTag(key string, value interface{}) {
 	sp.i.SetLazyTag(key, value)
 }
 
+// SetLazyTagLocked is the same as SetLazyTag but assumes that the mutex of sp
+// is being held.
+//
+// Deprecated: this method should not be used because it's introduced only to go
+// around some tech debt (#100438). Once that issue is addressed, this method
+// should be removed.
+func (sp *Span) SetLazyTagLocked(key string, value interface{}) {
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	sp.i.setLazyTagLocked(key, value)
+}
+
 // GetLazyTag returns the value of the tag with the given key. If that tag doesn't
 // exist, the bool retval is false.
 func (sp *Span) GetLazyTag(key string) (interface{}, bool) {
@@ -535,12 +549,26 @@ type EventListener interface {
 	// Notify is invoked on every Structured event recorded by the span and its
 	// children, recursively.
 	//
-	// Note that this method should not run for a long time as it will hold up the
-	// span recording Structured events during traced operations.
+	// The caller holds the mutex of the span.
 	//
 	// Notify will not be called concurrently on the same span.
-	Notify(event Structured)
+	Notify(event Structured) EventConsumptionStatus
 }
+
+// EventConsumptionStatus describes whether the structured event has been "consumed"
+// by the EventListener.
+type EventConsumptionStatus int
+
+const (
+	// EventNotConsumed indicates that the event wasn't "consumed" by the
+	// EventListener, so other listeners as well as any ancestor spans should be
+	// notified about the event.
+	EventNotConsumed EventConsumptionStatus = iota
+	// EventConsumed indicates that the event has been "consumed" by the
+	// EventListener, so neither other listeners for the span nor the ancestor
+	// spans should be notified about it.
+	EventConsumed
+)
 
 // TraceID retrieves a span's trace ID.
 func (sp *Span) TraceID() tracingpb.TraceID {
@@ -615,13 +643,13 @@ func (sp *Span) reset(
 ) {
 	if sp.i.crdb == nil {
 		// We assume that spans being reset have come from the sync.Pool.
-		panic("unexpected reset of no-op Spans")
+		panic(errors.AssertionFailedf("unexpected reset of no-op Spans"))
 	}
 
 	if refCnt := sp.refCnt; refCnt != 0 {
 		// The span should not have been made available for reuse with live
 		// references.
-		panic(fmt.Sprintf("expected 0 refCnt but found %d: %s", refCnt, sp))
+		panic(errors.AssertionFailedf("expected 0 refCnt but found %d: %s", refCnt, sp))
 	}
 
 	// Take a self-reference. This will be held until Finish(), ensuring that the
@@ -643,7 +671,7 @@ func (sp *Span) reset(
 			if sp.i.Tracer().closed() {
 				return
 			}
-			panic(fmt.Sprintf("Span not finished or references not released; "+
+			panic(errors.AssertionFailedf("Span not finished or references not released; "+
 				"span: %s, finished: %t, refCnt: %d.\n"+
 				"If running multiple tests, it's possible that the leaked span came from a previous "+
 				"test. In particular, if a previous test failed, the failure might have caused some unclean "+
@@ -668,48 +696,49 @@ func (sp *Span) reset(
 	c.startTime = startTime
 	c.logTags = logTags
 	if len(c.eventListeners) != 0 {
-		panic(fmt.Sprintf("unexpected event listeners in span being reset: %v", c.eventListeners))
+		panic(errors.AssertionFailedf("unexpected event listeners in span being reset: %v", c.eventListeners))
 	}
 	c.eventListeners = eventListeners
 	{
 		// Nobody is supposed to have a reference to the span at this point, but let's
 		// take the lock anyway to protect against buggy clients accessing the span
 		// after Finish().
-		c.mu.Lock()
-		if len(c.mu.openChildren) != 0 {
-			panic(fmt.Sprintf("unexpected children in span being reset: %v", c.mu.openChildren))
-		}
-		if len(c.mu.tags) != 0 {
-			panic(fmt.Sprintf("unexpected tags in span being reset: %v", c.mu.tags))
-		}
-		if !c.mu.recording.finishedChildren.Empty() {
-			panic(fmt.Sprintf("unexpected finished children in span being reset: %v", c.mu.recording.finishedChildren))
-		}
-		if c.mu.recording.structured.Len() != 0 {
-			panic("unexpected structured recording in span being reset")
-		}
-		if c.mu.recording.logs.Len() != 0 {
-			panic("unexpected logs in span being reset")
-		}
+		func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if len(c.mu.openChildren) != 0 {
+				panic(errors.AssertionFailedf("unexpected children in span being reset: %v", c.mu.openChildren))
+			}
+			if len(c.mu.tags) != 0 {
+				panic(errors.AssertionFailedf("unexpected tags in span being reset: %v", c.mu.tags))
+			}
+			if !c.mu.recording.finishedChildren.Empty() {
+				panic(errors.AssertionFailedf("unexpected finished children in span being reset: %v", c.mu.recording.finishedChildren))
+			}
+			if c.mu.recording.structured.Len() != 0 {
+				panic(errors.AssertionFailedf("unexpected structured recording in span being reset"))
+			}
+			if c.mu.recording.logs.Len() != 0 {
+				panic(errors.AssertionFailedf("unexpected logs in span being reset"))
+			}
+			h := sp.helper
+			c.mu.crdbSpanMu = crdbSpanMu{
+				duration:     -1, // unfinished
+				openChildren: h.childrenAlloc[:0],
+				goroutineID:  goroutineID,
+				recording: recordingState{
+					logs:             makeSizeLimitedBuffer[*tracingpb.LogRecord](maxLogBytesPerSpan, nil /* scratch */),
+					structured:       makeSizeLimitedBuffer[*tracingpb.StructuredRecord](maxStructuredBytesPerSpan, h.structuredEventsAlloc[:]),
+					childrenMetadata: h.childrenMetadataAlloc,
+					finishedChildren: MakeTrace(tracingpb.RecordedSpan{}),
+				},
+				tags: h.tagsAlloc[:0],
+			}
 
-		h := sp.helper
-		c.mu.crdbSpanMu = crdbSpanMu{
-			duration:     -1, // unfinished
-			openChildren: h.childrenAlloc[:0],
-			goroutineID:  goroutineID,
-			recording: recordingState{
-				logs:             makeSizeLimitedBuffer[*tracingpb.LogRecord](maxLogBytesPerSpan, nil /* scratch */),
-				structured:       makeSizeLimitedBuffer[*tracingpb.StructuredRecord](maxStructuredBytesPerSpan, h.structuredEventsAlloc[:]),
-				childrenMetadata: h.childrenMetadataAlloc,
-				finishedChildren: MakeTrace(tracingpb.RecordedSpan{}),
-			},
-			tags: h.tagsAlloc[:0],
-		}
-
-		if kind != oteltrace.SpanKindUnspecified {
-			c.setTagLocked(SpanKindTagKey, attribute.StringValue(kind.String()))
-		}
-		c.mu.Unlock()
+			if kind != oteltrace.SpanKindUnspecified {
+				c.setTagLocked(SpanKindTagKey, attribute.StringValue(kind.String()))
+			}
+		}()
 	}
 
 	// We only mark the span as not finished at the end so that accesses to the

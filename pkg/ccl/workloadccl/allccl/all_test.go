@@ -90,9 +90,9 @@ func TestAllRegisteredImportFixture(t *testing.T) {
 			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 				// The test tenant needs to be disabled for this test until
 				// we address #75449.
-				DisableDefaultTestTenant: true,
-				UseDatabase:              "d",
-				SQLMemoryPoolSize:        sqlMemoryPoolSize,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				UseDatabase:       "d",
+				SQLMemoryPoolSize: sqlMemoryPoolSize,
 			})
 			defer s.Stopper().Stop(ctx)
 			sqlutils.MakeSQLRunner(db).Exec(t, `CREATE DATABASE d`)
@@ -153,12 +153,12 @@ func TestAllRegisteredSetup(t *testing.T) {
 			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 				// Need to disable the test tenant here until we resolve
 				// #75449 as this test makes use of import through a fixture.
-				DisableDefaultTestTenant: true,
-				UseDatabase:              "d",
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				UseDatabase:       "d",
 			})
 			defer s.Stopper().Stop(ctx)
 			sqlutils.MakeSQLRunner(db).Exec(t, `CREATE DATABASE d`)
-			sqlutils.MakeSQLRunner(db).Exec(t, `SET CLUSTER SETTING kv.range_merge.queue_enabled = false`)
+			sqlutils.MakeSQLRunner(db).Exec(t, `SET CLUSTER SETTING kv.range_merge.queue.enabled = false`)
 
 			var l workloadsql.InsertsDataLoader
 			if _, err := workloadsql.Setup(ctx, db, gen, l); err != nil {
@@ -265,7 +265,7 @@ func TestDeterministicInitialData(t *testing.T) {
 	// TODO(dan): We're starting to accumulate these various lists, bigInitialData
 	// is another. Consider moving them to be properties on the workload.Meta.
 	fingerprintGoldens := map[string]uint64{
-		`bank`:       0x7b4d519ed8bd07ce,
+		`bank`:       0xb9065bb21c3594a2,
 		`bulkingest`: 0xcf3e4028ac084aea,
 		`indexes`:    0xcbf29ce484222325,
 		`intro`:      0x81c6a8cfd9c3452a,

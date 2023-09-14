@@ -6,6 +6,7 @@
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
+// Package backupccl implements backup logic.
 package backupccl
 
 import (
@@ -86,7 +87,7 @@ var featureBackupEnabled = settings.RegisterBoolSetting(
 	"feature.backup.enabled",
 	"set to true to enable backups, false to disable; default is true",
 	featureflag.FeatureFlagEnabledDefault,
-).WithPublic()
+	settings.WithPublic)
 
 // includeTableSpans returns true if the backup should include spans for the
 // given table descriptor.
@@ -197,6 +198,7 @@ func resolveOptionsForBackupJobDescription(
 	newOpts := tree.BackupOptions{
 		CaptureRevisionHistory: opts.CaptureRevisionHistory,
 		Detached:               opts.Detached,
+		ExecutionLocality:      opts.ExecutionLocality,
 	}
 
 	if opts.EncryptionPassphrase != nil {
@@ -519,7 +521,7 @@ func backupTypeCheck(
 		exprutil.Strings{
 			backupStmt.Subdir,
 			backupStmt.Options.EncryptionPassphrase,
-			backupStmt.Options.CoordinatorLocality,
+			backupStmt.Options.ExecutionLocality,
 		},
 		exprutil.StringArrays{
 			tree.Exprs(backupStmt.To),
@@ -602,14 +604,14 @@ func backupPlanHook(
 		}
 	}
 
-	var coordinatorLocality roachpb.Locality
-	if backupStmt.Options.CoordinatorLocality != nil {
-		s, err := exprEval.String(ctx, backupStmt.Options.CoordinatorLocality)
+	var executionLocality roachpb.Locality
+	if backupStmt.Options.ExecutionLocality != nil {
+		s, err := exprEval.String(ctx, backupStmt.Options.ExecutionLocality)
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 		if s != "" {
-			if err := coordinatorLocality.Set(s); err != nil {
+			if err := executionLocality.Set(s); err != nil {
 				return nil, nil, nil, false, err
 			}
 		}
@@ -680,7 +682,7 @@ func backupPlanHook(
 		}
 
 		if includeAllSecondaryTenants && backupStmt.Coverage() != tree.AllDescriptors {
-			return errors.New("the include_all_secondary_tenants option is only supported for full cluster backups")
+			return errors.New("the include_all_virtual_clusters option is only supported for full cluster backups")
 		}
 
 		var asOfInterval int64
@@ -742,8 +744,8 @@ func backupPlanHook(
 		}
 
 		// Check that a node will currently be able to run this before we create it.
-		if coordinatorLocality.NonEmpty() {
-			if _, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, coordinatorLocality); err != nil {
+		if executionLocality.NonEmpty() {
+			if _, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, executionLocality); err != nil {
 				return err
 			}
 		}
@@ -760,7 +762,7 @@ func backupPlanHook(
 			AsOfInterval:               asOfInterval,
 			Detached:                   detached,
 			ApplicationName:            p.SessionData().ApplicationName,
-			CoordinatorLocation:        coordinatorLocality,
+			ExecutionLocality:          executionLocality,
 		}
 		if backupStmt.CreatedByInfo != nil && backupStmt.CreatedByInfo.Name == jobs.CreatedByScheduledJobs {
 			initialDetails.ScheduleID = backupStmt.CreatedByInfo.ID
@@ -802,7 +804,11 @@ func backupPlanHook(
 			if !p.ExecCfg().Codec.ForSystemTenant() {
 				return pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can backup other tenants")
 			}
-			initialDetails.SpecificTenantIds = []roachpb.TenantID{roachpb.MustMakeTenantID(backupStmt.Targets.TenantID.ID)}
+			tid, err := roachpb.MakeTenantID(backupStmt.Targets.TenantID.ID)
+			if err != nil {
+				return err
+			}
+			initialDetails.SpecificTenantIds = []roachpb.TenantID{tid}
 		}
 
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
@@ -1230,17 +1236,23 @@ func getReintroducedSpans(
 	return tableSpans, nil
 }
 
-func getProtectedTimestampTargetForBackup(backupManifest *backuppb.BackupManifest) *ptpb.Target {
+func getProtectedTimestampTargetForBackup(
+	backupManifest *backuppb.BackupManifest,
+) (*ptpb.Target, error) {
 	if backupManifest.DescriptorCoverage == tree.AllDescriptors {
-		return ptpb.MakeClusterTarget()
+		return ptpb.MakeClusterTarget(), nil
 	}
 
 	if len(backupManifest.Tenants) > 0 {
-		tenantID := make([]roachpb.TenantID, 0)
+		tenantID := make([]roachpb.TenantID, 0, len(backupManifest.Tenants))
 		for _, tenant := range backupManifest.Tenants {
-			tenantID = append(tenantID, roachpb.MustMakeTenantID(tenant.ID))
+			tid, err := roachpb.MakeTenantID(tenant.ID)
+			if err != nil {
+				return nil, err
+			}
+			tenantID = append(tenantID, tid)
 		}
-		return ptpb.MakeTenantsTarget(tenantID)
+		return ptpb.MakeTenantsTarget(tenantID), nil
 	}
 
 	// ResolvedCompleteDBs contains all the "complete" databases being backed up.
@@ -1249,7 +1261,7 @@ func getProtectedTimestampTargetForBackup(backupManifest *backuppb.BackupManifes
 	// result of `BACKUP TABLE db.*`. In both cases we want to write a protected
 	// timestamp record that covers the entire database.
 	if len(backupManifest.CompleteDbs) > 0 {
-		return ptpb.MakeSchemaObjectsTarget(backupManifest.CompleteDbs)
+		return ptpb.MakeSchemaObjectsTarget(backupManifest.CompleteDbs), nil
 	}
 
 	// At this point we are dealing with a `BACKUP TABLE`, so we write a protected
@@ -1261,7 +1273,7 @@ func getProtectedTimestampTargetForBackup(backupManifest *backuppb.BackupManifes
 			tableIDs = append(tableIDs, t.GetID())
 		}
 	}
-	return ptpb.MakeSchemaObjectsTarget(tableIDs)
+	return ptpb.MakeSchemaObjectsTarget(tableIDs), nil
 }
 
 func protectTimestampForBackup(
@@ -1278,7 +1290,10 @@ func protectTimestampForBackup(
 
 	// Resolve the target that the PTS record will protect as part of this
 	// backup.
-	target := getProtectedTimestampTargetForBackup(backupManifest)
+	target, err := getProtectedTimestampTargetForBackup(backupManifest)
+	if err != nil {
+		return err
+	}
 
 	// Records written by the backup job should be ignored when making GC
 	// decisions on any table that has been marked as
@@ -1407,6 +1422,9 @@ func getTenantInfo(
 		)
 	}
 	for i := range tenants {
+		// NB: We use MustMakeTenantID here since the data is
+		// coming from the tenants table and we should only
+		// ever have valid tenant IDs returned to us.
 		prefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenants[i].ID))
 		spans = append(spans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
 	}

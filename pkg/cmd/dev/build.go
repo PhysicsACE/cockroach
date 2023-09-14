@@ -29,10 +29,12 @@ import (
 )
 
 const (
-	crossFlag       = "cross"
-	nogoDisableFlag = "--//build/toolchains:nogo_disable_flag"
-	geosTarget      = "//c-deps:libgeos"
-	devTarget       = "//pkg/cmd/dev:dev"
+	crossFlag          = "cross"
+	cockroachTargetOss = "//pkg/cmd/cockroach-oss:cockroach-oss"
+	cockroachTarget    = "//pkg/cmd/cockroach:cockroach"
+	nogoDisableFlag    = "--//build/toolchains:nogo_disable_flag"
+	geosTarget         = "//c-deps:libgeos"
+	devTarget          = "//pkg/cmd/dev:dev"
 )
 
 type buildTarget struct {
@@ -65,6 +67,7 @@ func makeBuildCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Com
 	buildCmd.Flags().String(volumeFlag, "bzlhome", "the Docker volume to use as the container home directory (only used for cross builds)")
 	buildCmd.Flags().String(crossFlag, "", "cross-compiles using the builder image (options: linux, linuxarm, macos, macosarm, windows)")
 	buildCmd.Flags().Lookup(crossFlag).NoOptDefVal = "linux"
+	buildCmd.Flags().StringArray(dockerArgsFlag, []string{}, "additional arguments to pass to Docker (only used for cross builds)")
 	addCommonBuildFlags(buildCmd)
 	return buildCmd
 }
@@ -76,9 +79,9 @@ var buildTargetMapping = map[string]string{
 	"bazel-remote":         bazelRemoteTarget,
 	"buildifier":           "@com_github_bazelbuild_buildtools//buildifier:buildifier",
 	"buildozer":            "@com_github_bazelbuild_buildtools//buildozer:buildozer",
-	"cockroach":            "//pkg/cmd/cockroach:cockroach",
+	"cockroach":            cockroachTarget,
 	"cockroach-sql":        "//pkg/cmd/cockroach-sql:cockroach-sql",
-	"cockroach-oss":        "//pkg/cmd/cockroach-oss:cockroach-oss",
+	"cockroach-oss":        cockroachTargetOss,
 	"cockroach-short":      "//pkg/cmd/cockroach-short:cockroach-short",
 	"crlfmt":               "@com_github_cockroachdb_crlfmt//:crlfmt",
 	"dev":                  devTarget,
@@ -94,7 +97,7 @@ var buildTargetMapping = map[string]string{
 	"obsservice":           "//pkg/obsservice/cmd/obsservice:obsservice",
 	"optgen":               "//pkg/sql/opt/optgen/cmd/optgen:optgen",
 	"optfmt":               "//pkg/sql/opt/optgen/cmd/optfmt:optfmt",
-	"oss":                  "//pkg/cmd/cockroach-oss:cockroach-oss",
+	"oss":                  cockroachTargetOss,
 	"reduce":               "//pkg/cmd/reduce:reduce",
 	"roachprod":            "//pkg/cmd/roachprod:roachprod",
 	"roachprod-stress":     "//pkg/cmd/roachprod-stress:roachprod-stress",
@@ -105,7 +108,6 @@ var buildTargetMapping = map[string]string{
 	"smithcmp":             "//pkg/cmd/smithcmp:smithcmp",
 	"smithtest":            "//pkg/cmd/smithtest:smithtest",
 	"staticcheck":          "@co_honnef_go_tools//cmd/staticcheck:staticcheck",
-	"stress":               stressTarget,
 	"swagger":              "@com_github_go_swagger_go_swagger//cmd/swagger:swagger",
 	"tests":                "//pkg:all_tests",
 	"workload":             "//pkg/cmd/workload:workload",
@@ -134,7 +136,7 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 	defer func() {
 		if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil {
 			// Retry.
-			if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil {
+			if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil && d.debug {
 				log.Printf("Internal Error: Sending BEP file to beaver hub failed - %v", err)
 			}
 		}
@@ -145,6 +147,7 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 	targets, additionalBazelArgs := splitArgsAtDash(cmd, commandLine)
 	ctx := cmd.Context()
 	cross := mustGetFlagString(cmd, crossFlag)
+	dockerArgs := mustGetFlagStringArray(cmd, dockerArgsFlag)
 
 	// Set up dev cache unless it's disabled via the environment variable or the
 	// testing knob.
@@ -168,6 +171,12 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 		return err
 	}
 	args = append(args, additionalBazelArgs...)
+	configArgs := getConfigArgs(args)
+	configArgs = append(configArgs, getConfigArgs(additionalBazelArgs)...)
+
+	if err := d.assertNoLinkedNpmDeps(buildTargets); err != nil {
+		return err
+	}
 
 	if cross == "" {
 		// Do not log --build_event_binary_file=... because it is not relevant to the actual call
@@ -181,19 +190,24 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 		if err := d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...); err != nil {
 			return err
 		}
-		return d.stageArtifacts(ctx, buildTargets)
+		return d.stageArtifacts(ctx, buildTargets, configArgs)
 	}
 	volume := mustGetFlagString(cmd, volumeFlag)
 	cross = "cross" + cross
-	return d.crossBuild(ctx, args, buildTargets, cross, volume)
+	return d.crossBuild(ctx, args, buildTargets, cross, volume, dockerArgs)
 }
 
 func (d *dev) crossBuild(
-	ctx context.Context, bazelArgs []string, targets []buildTarget, crossConfig string, volume string,
+	ctx context.Context,
+	bazelArgs []string,
+	targets []buildTarget,
+	crossConfig string,
+	volume string,
+	dockerArgs []string,
 ) error {
-	bazelArgs = append(bazelArgs, fmt.Sprintf("--config=%s", crossConfig), "--config=ci")
+	bazelArgs = append(bazelArgs, fmt.Sprintf("--config=%s", crossConfig), "--config=ci", "-c", "opt")
 	configArgs := getConfigArgs(bazelArgs)
-	dockerArgs, err := d.getDockerRunArgs(ctx, volume, false)
+	dockerArgs, err := d.getDockerRunArgs(ctx, volume, false, dockerArgs)
 	if err != nil {
 		return err
 	}
@@ -202,12 +216,6 @@ func (d *dev) crossBuild(
 	var script strings.Builder
 	script.WriteString("set -euxo pipefail\n")
 	script.WriteString(fmt.Sprintf("bazel %s\n", shellescape.QuoteCommand(bazelArgs)))
-	for _, arg := range bazelArgs {
-		if arg == "--config=with_ui" {
-			script.WriteString("bazel run @yarn//:yarn -- --check-files --cwd pkg/ui --offline\n")
-			break
-		}
-	}
 	var bazelBinSet bool
 	script.WriteString("set +x\n")
 	for _, target := range targets {
@@ -219,8 +227,9 @@ func (d *dev) crossBuild(
 				libDir = "bin"
 			}
 			script.WriteString(fmt.Sprintf("for LIB in `ls $EXECROOT/external/archived_cdep_libgeos_%s/%s`; do\n", strings.TrimPrefix(crossConfig, "cross"), libDir))
-			script.WriteString(fmt.Sprintf("cp $EXECROOT/external/archived_cdep_libgeos_%s/%s/$LIB /artifacts\n", strings.TrimPrefix(crossConfig, "cross"), libDir))
-			script.WriteString("chmod a+w -R /artifacts/$LIB\n")
+			script.WriteString(fmt.Sprintf("cp $EXECROOT/external/archived_cdep_libgeos_%s/%s/$LIB /tmp\n", strings.TrimPrefix(crossConfig, "cross"), libDir))
+			script.WriteString("chmod a+w /tmp/$LIB\n")
+			script.WriteString("mv /tmp/$LIB /artifacts\n")
 			script.WriteString(fmt.Sprintf("echo \"Successfully built target %s at artifacts/$LIB\"\n", target.fullName))
 			script.WriteString("done")
 			continue
@@ -232,8 +241,9 @@ func (d *dev) crossBuild(
 			}
 			output := bazelutil.OutputOfBinaryRule(target.fullName, strings.Contains(crossConfig, "windows"))
 			baseOutput := filepath.Base(output)
-			script.WriteString(fmt.Sprintf("cp -R $BAZELBIN/%s /artifacts\n", output))
-			script.WriteString(fmt.Sprintf("chmod a+w /artifacts/%s\n", baseOutput))
+			script.WriteString(fmt.Sprintf("cp -R $BAZELBIN/%s /tmp\n", output))
+			script.WriteString(fmt.Sprintf("chmod a+w /tmp/%s\n", baseOutput))
+			script.WriteString(fmt.Sprintf("mv /tmp/%s /artifacts\n\n", baseOutput))
 			script.WriteString(fmt.Sprintf("echo \"Successfully built target %s at artifacts/%s\"\n", target.fullName, baseOutput))
 			continue
 		}
@@ -243,15 +253,18 @@ func (d *dev) crossBuild(
 		// going to have some extra garbage. We grep ^/ to select out
 		// only the filename we're looking for.
 		script.WriteString(fmt.Sprintf("BIN=$(bazel run %s %s --run_under=realpath | grep ^/ | tail -n1)\n", target.fullName, shellescape.QuoteCommand(configArgs)))
-		script.WriteString("cp $BIN /artifacts\n")
-		script.WriteString("chmod a+w /artifacts/$(basename $BIN)\n")
+		script.WriteString("cp $BIN /tmp\n")
+		script.WriteString("chmod a+w /tmp/$(basename $BIN)\n")
+		script.WriteString("mv /tmp/$(basename $BIN) /artifacts\n")
 		script.WriteString(fmt.Sprintf("echo \"Successfully built binary for target %s at artifacts/$(basename $BIN)\"\n", target.fullName))
 	}
 	_, err = d.exec.CommandContextWithInput(ctx, script.String(), "docker", dockerArgs...)
 	return err
 }
 
-func (d *dev) stageArtifacts(ctx context.Context, targets []buildTarget) error {
+func (d *dev) stageArtifacts(
+	ctx context.Context, targets []buildTarget, configArgs []string,
+) error {
 	workspace, err := d.getWorkspace(ctx)
 	if err != nil {
 		return err
@@ -260,7 +273,7 @@ func (d *dev) stageArtifacts(ctx context.Context, targets []buildTarget) error {
 	if err = d.os.MkdirAll(path.Join(workspace, "bin")); err != nil {
 		return err
 	}
-	bazelBin, err := d.getBazelBin(ctx)
+	bazelBin, err := d.getBazelBin(ctx, configArgs)
 	if err != nil {
 		return err
 	}
@@ -443,15 +456,6 @@ func (d *dev) getBasicBuildArgs(
 		}
 	}
 
-	// Add --config=with_ui iff we're building a target that needs it.
-	for _, target := range buildTargets {
-		if target.fullName == buildTargetMapping["cockroach"] ||
-			target.fullName == buildTargetMapping["cockroach-oss"] ||
-			target.fullName == buildTargetMapping["obsservice"] {
-			args = append(args, "--config=with_ui")
-			break
-		}
-	}
 	if shouldBuildWithTestConfig {
 		args = append(args, "--config=test")
 	}
@@ -461,11 +465,19 @@ func (d *dev) getBasicBuildArgs(
 	return args, buildTargets, nil
 }
 
-// Given a list of Bazel arguments, find the ones starting with --config= and
-// return them.
+// Given a list of Bazel arguments, find the ones that represent a "config"
+// (either --config or -c) and return all of these. This is used to find
+// the appropriate bazel-bin for any invocation.
 func getConfigArgs(args []string) (ret []string) {
+	var addNext bool
 	for _, arg := range args {
-		if strings.HasPrefix(arg, "--config=") {
+		if addNext {
+			ret = append(ret, arg)
+			addNext = false
+		} else if arg == "--config" || arg == "--compilation_mode" || arg == "-c" {
+			ret = append(ret, arg)
+			addNext = true
+		} else if strings.HasPrefix(arg, "--config=") || strings.HasPrefix(arg, "--compilation_mode=") {
 			ret = append(ret, arg)
 		}
 	}

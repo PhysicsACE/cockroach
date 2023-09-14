@@ -96,15 +96,14 @@ func newTxnKVFetcher(
 		lockTimeout:                lockTimeout,
 		acc:                        acc,
 		forceProductionKVBatchSize: forceProductionKVBatchSize,
+		kvPairsRead:                new(int64),
 		batchRequestsIssued:        &batchRequestsIssued,
 	}
-	if txn != nil {
-		// In most cases, the txn is non-nil; however, in some code paths (e.g.
-		// when executing EXPLAIN (VEC)) it might be nil, so we need to have
-		// this check.
-		fetcherArgs.requestAdmissionHeader = txn.AdmissionHeader()
-		fetcherArgs.responseAdmissionQ = txn.DB().SQLKVResponseAdmissionQ
-	}
+	fetcherArgs.admission.requestHeader = txn.AdmissionHeader()
+	fetcherArgs.admission.responseQ = txn.DB().SQLKVResponseAdmissionQ
+	fetcherArgs.admission.pacerFactory = txn.DB().AdmissionPacerFactory
+	fetcherArgs.admission.settingsValues = txn.DB().SettingsValues
+
 	return newTxnKVFetcherInternal(fetcherArgs)
 }
 
@@ -177,15 +176,17 @@ func NewStreamingKVFetcher(
 	diskBuffer kvstreamer.ResultDiskBuffer,
 	kvFetcherMemAcc *mon.BoundAccount,
 ) *KVFetcher {
+	var kvPairsRead int64
 	var batchRequestsIssued int64
 	streamer := kvstreamer.NewStreamer(
 		distSender,
 		stopper,
 		txn,
 		st,
-		getWaitPolicy(lockWaitPolicy),
+		GetWaitPolicy(lockWaitPolicy),
 		streamerBudgetLimit,
 		streamerBudgetAcc,
+		&kvPairsRead,
 		&batchRequestsIssued,
 		GetKeyLockingStrength(lockStrength),
 	)
@@ -202,7 +203,7 @@ func NewStreamingKVFetcher(
 		maxKeysPerRow,
 		diskBuffer,
 	)
-	return newKVFetcher(newTxnKVStreamer(streamer, lockStrength, kvFetcherMemAcc, &batchRequestsIssued))
+	return newKVFetcher(newTxnKVStreamer(streamer, lockStrength, kvFetcherMemAcc, &kvPairsRead, &batchRequestsIssued))
 }
 
 func newKVFetcher(batchFetcher KVBatchFetcher) *KVFetcher {
@@ -325,13 +326,18 @@ func (f *KVFetcher) SetupNextFetch(
 	spanIDs []int,
 	batchBytesLimit rowinfra.BytesLimit,
 	firstBatchKeyLimit rowinfra.KeyLimit,
+	spansCanOverlap bool,
 ) error {
 	f.kvs = nil
 	f.batchResponse = nil
 	f.spanID = 0
 	return f.KVBatchFetcher.SetupNextFetch(
-		ctx, spans, spanIDs, batchBytesLimit, firstBatchKeyLimit,
+		ctx, spans, spanIDs, batchBytesLimit, firstBatchKeyLimit, spansCanOverlap,
 	)
+}
+
+func (f *KVFetcher) reset(b KVBatchFetcher) {
+	*f = KVFetcher{KVBatchFetcher: b}
 }
 
 // KVProvider is a KVBatchFetcher that returns a set slice of kvs.
@@ -356,13 +362,18 @@ func (f *KVProvider) NextBatch(context.Context) (KVBatchFetcherResponse, error) 
 
 // SetupNextFetch implements the KVBatchFetcher interface.
 func (f *KVProvider) SetupNextFetch(
-	context.Context, roachpb.Spans, []int, rowinfra.BytesLimit, rowinfra.KeyLimit,
+	context.Context, roachpb.Spans, []int, rowinfra.BytesLimit, rowinfra.KeyLimit, bool,
 ) error {
 	return nil
 }
 
 // GetBytesRead implements the KVBatchFetcher interface.
 func (f *KVProvider) GetBytesRead() int64 {
+	return 0
+}
+
+// GetKVPairsRead implements the KVBatchFetcher interface.
+func (f *KVProvider) GetKVPairsRead() int64 {
 	return 0
 }
 

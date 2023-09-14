@@ -54,6 +54,7 @@ func newTxnKVStreamer(
 	streamer *kvstreamer.Streamer,
 	lockStrength descpb.ScanLockingStrength,
 	acc *mon.BoundAccount,
+	kvPairsRead *int64,
 	batchRequestsIssued *int64,
 ) KVBatchFetcher {
 	f := &txnKVStreamer{
@@ -61,7 +62,7 @@ func newTxnKVStreamer(
 		keyLocking: GetKeyLockingStrength(lockStrength),
 		acc:        acc,
 	}
-	f.kvBatchFetcherHelper.init(f.nextBatch, batchRequestsIssued)
+	f.kvBatchFetcherHelper.init(f.nextBatch, kvPairsRead, batchRequestsIssued)
 	return f
 }
 
@@ -72,6 +73,7 @@ func (f *txnKVStreamer) SetupNextFetch(
 	spanIDs []int,
 	bytesLimit rowinfra.BytesLimit,
 	_ rowinfra.KeyLimit,
+	_ bool,
 ) error {
 	if bytesLimit != rowinfra.NoBytesLimit {
 		return errors.AssertionFailedf("unexpected non-zero bytes limit for txnKVStreamer")
@@ -212,5 +214,6 @@ func (f *txnKVStreamer) reset(ctx context.Context) {
 func (f *txnKVStreamer) Close(ctx context.Context) {
 	f.reset(ctx)
 	f.streamer.Close(ctx)
-	*f = txnKVStreamer{}
+	// Preserve observability-related fields.
+	*f = txnKVStreamer{kvBatchFetcherHelper: f.kvBatchFetcherHelper}
 }

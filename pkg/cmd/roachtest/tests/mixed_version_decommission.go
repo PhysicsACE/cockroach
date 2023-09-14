@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
@@ -21,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
+	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
@@ -29,19 +32,22 @@ import (
 // runDecommissionMixedVersions runs through randomized
 // decommission/recommission processes in mixed-version clusters.
 func runDecommissionMixedVersions(
-	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
+	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion *version.Version,
 ) {
-	predecessorVersion, err := version.PredecessorVersion(buildVersion)
+	predecessorVersion, err := release.LatestPredecessor(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	h := newDecommTestHelper(t, c)
 
-	// The v20.2 CLI can only be run against servers running v20.2. For this
-	// reason, we grab a handle on a specific server slated for an upgrade.
 	pinnedUpgrade := h.getRandNode()
 	t.L().Printf("pinned n%d for upgrade", pinnedUpgrade)
+
+	// NB: The suspect duration must be at least 10s, as versions 23.2 and
+	// beyond will reset to the default of 30s if it fails validation, even if
+	// set by a previous version.
+	const suspectDuration = 10 * time.Second
 
 	allNodes := c.All()
 	u := newVersionUpgradeTest(c,
@@ -53,13 +59,18 @@ func runDecommissionMixedVersions(
 		startVersion(allNodes, predecessorVersion),
 		waitForUpgradeStep(allNodes),
 		preventAutoUpgradeStep(h.nodeIDs[0]),
+		suspectLivenessSettingsStep(h.nodeIDs[0], suspectDuration),
 
 		preloadDataStep(pinnedUpgrade),
 
-		// We upgrade a pinnedUpgrade and one other random node of the cluster to v20.2.
+		// We upgrade a pinned node and one other random node of the cluster to the current version.
 		binaryUpgradeStep(c.Node(pinnedUpgrade), clusterupgrade.MainVersion),
 		binaryUpgradeStep(c.Node(h.getRandNodeOtherThan(pinnedUpgrade)), clusterupgrade.MainVersion),
 		checkAllMembership(pinnedUpgrade, "active"),
+
+		// After upgrading, which restarts the nodes, ensure that nodes are not
+		// considered suspect unnecessarily.
+		sleepStep(2*suspectDuration),
 
 		// Partially decommission a random node from another random node. We
 		// use the predecessor CLI to do so.
@@ -82,6 +93,9 @@ func runDecommissionMixedVersions(
 		allowAutoUpgradeStep(1),
 		waitForUpgradeStep(allNodes),
 
+		// Again ensure that nodes are not considered suspect unnecessarily.
+		sleepStep(2*suspectDuration),
+
 		// Fully decommission a random node. Note that we can no longer use the
 		// predecessor cli, as the cluster has upgraded and won't allow connections
 		// from the predecessor version binary.
@@ -89,7 +103,7 @@ func runDecommissionMixedVersions(
 		// Note also that this has to remain the last step unless we want this test to
 		// handle the fact that the decommissioned node will no longer be able
 		// to communicate with the cluster (i.e. most commands against it will fail).
-		// This is also why we're making sure to avoid decommissioning pinnedUpgrade
+		// This is also why we're making sure to avoid decommissioning the pinned node
 		// itself, as we use it to check the membership after.
 		fullyDecommissionStep(h.getRandNodeOtherThan(pinnedUpgrade), h.getRandNode(), ""),
 		checkOneMembership(pinnedUpgrade, "decommissioned"),
@@ -105,6 +119,18 @@ func cockroachBinaryPath(version string) string {
 		return "./cockroach"
 	}
 	return fmt.Sprintf("./v%s/cockroach", version)
+}
+
+// suspectLivenessSettingsStep sets the duration a node is considered "suspect"
+// after it becomes unavailable.
+func suspectLivenessSettingsStep(target int, suspectDuration time.Duration) versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		db := u.conn(ctx, t, target)
+		_, err := db.ExecContext(ctx, `SET CLUSTER SETTING server.time_after_store_suspect = $1`, suspectDuration.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // preloadDataStep load data into cluster to ensure we have a large enough
@@ -130,7 +156,7 @@ func partialDecommissionStep(target, from int, binaryVersion string) versionStep
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		c := u.c
 		c.Run(ctx, c.Node(from), cockroachBinaryPath(binaryVersion), "node", "decommission",
-			"--wait=none", "--insecure", strconv.Itoa(target))
+			"--wait=none", "--insecure", strconv.Itoa(target), "--port", fmt.Sprintf("{pgport:%d}", from))
 	}
 }
 
@@ -141,7 +167,7 @@ func recommissionAllStep(from int, binaryVersion string) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		c := u.c
 		c.Run(ctx, c.Node(from), cockroachBinaryPath(binaryVersion), "node", "recommission",
-			"--insecure", c.All().NodeIDsString())
+			"--insecure", c.All().NodeIDsString(), "--port", fmt.Sprintf("{pgport:%d}", from))
 	}
 }
 
@@ -151,13 +177,45 @@ func fullyDecommissionStep(target, from int, binaryVersion string) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		c := u.c
 		c.Run(ctx, c.Node(from), cockroachBinaryPath(binaryVersion), "node", "decommission",
-			"--wait=all", "--checks=skip", "--insecure", strconv.Itoa(target))
+			"--wait=all", "--insecure", strconv.Itoa(target), "--port", fmt.Sprintf("{pgport:%d}", from))
+
+		// If we are decommissioning a target node from the same node, the drain
+		// step will be skipped. In this case, we should not consider the step done
+		// until the health check for the node returns non-200 OK.
+		// TODO(sarkesian): This could be removed after 23.2, as in these versions
+		// the "decommissioned" state is considered in the health check.
+		if target == from {
+			t.L().Printf("waiting for n%d to fail health check after decommission")
+			var healthCheckURL string
+			if addrs, err := c.ExternalAdminUIAddr(ctx, t.L(), c.Node(target)); err != nil {
+				t.Fatalf("failed to get admin ui addresses: %v", err)
+			} else {
+				healthCheckURL = fmt.Sprintf(`http://%s/health?ready=1`, addrs[0])
+			}
+
+			if err := retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
+				resp, err := httputil.Get(ctx, healthCheckURL)
+				if err != nil {
+					return errors.Wrapf(err, "failed to get n%d /health?ready=1 HTTP endpoint", target)
+				}
+				if resp.StatusCode == 200 {
+					return errors.Errorf("n%d /health?ready=1 status=%d %s "+
+						"(expected 503 service unavailable after decommission)",
+						target, resp.StatusCode, resp.Status)
+				}
+
+				t.L().Printf("n%d /health?ready=1 status=%d %s", target, resp.StatusCode, resp.Status)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 
 // checkOneDecommissioning checks against the `decommissioning` column in
 // crdb_internal.gossip_liveness, asserting that only one node is marked as
-// decommissioning. This check can be run against both v20.1 and v20.2 servers.
+// decommissioning.
 func checkOneDecommissioning(from int) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		// We use a retry block here (and elsewhere) because we're consulting
@@ -190,7 +248,7 @@ func checkOneDecommissioning(from int) versionStep {
 
 // checkNoDecommissioning checks against the `decommissioning` column in
 // crdb_internal.gossip_liveness, asserting that only no nodes are marked as
-// decommissioning. This check can be run against both v20.1 and v20.2 servers.
+// decommissioning.
 func checkNoDecommissioning(from int) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		if err := retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
@@ -213,8 +271,7 @@ func checkNoDecommissioning(from int) versionStep {
 
 // checkOneMembership checks against the `membership` column in
 // crdb_internal.gossip_liveness, asserting that only one node is marked with
-// the specified membership status. This check can be only be run against
-// servers running v20.2 and beyond.
+// the specified membership status.
 func checkOneMembership(from int, membership string) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		if err := retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
@@ -244,8 +301,7 @@ func checkOneMembership(from int, membership string) versionStep {
 
 // checkAllMembership checks against the `membership` column in
 // crdb_internal.gossip_liveness, asserting that all nodes are marked with
-// the specified membership status. This check can be only be run against
-// servers running v20.2 and beyond.
+// the specified membership status.
 func checkAllMembership(from int, membership string) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		if err := retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {

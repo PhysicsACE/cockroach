@@ -1,8 +1,8 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "sqltestutils",
+    testonly = 1,
     srcs = [
         "large_schema.go",
         "show_create_table.go",
@@ -24,10 +24,11 @@ go_library(
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/desctestutils",
         "//pkg/sql/parser",
+        "//pkg/sql/parser/statements",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sem/catconstants",
-        "//pkg/sql/tests",
+        "//pkg/sql/sqlstats/persistedsqlstats",
         "//pkg/testutils",
         "//pkg/testutils/diagutils",
         "//pkg/testutils/serverutils",
@@ -57,5 +58,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

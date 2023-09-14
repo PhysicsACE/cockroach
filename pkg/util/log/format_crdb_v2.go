@@ -7,12 +7,22 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
+//
+// This file is also published under the Apache License; use either
+// one of BSL and Apache:
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
 
 package log
 
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"regexp"
 	"strconv"
@@ -21,9 +31,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/base/serverident"
-	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -31,19 +39,77 @@ import (
 )
 
 // formatCrdbV2 is the canonical log format.
-type formatCrdbV2 struct{}
-
-func (formatCrdbV2) formatterName() string { return "crdb-v2" }
-
-func (formatCrdbV2) formatEntry(entry logEntry) *buffer {
-	return formatLogEntryInternalV2(entry, nil)
+type formatCrdbV2 struct {
+	// colorProfile is used to colorize the output.
+	colorProfile ttycolor.Profile
+	// colorProfileName is the name of the color profile, used for
+	// documentation purposes.
+	colorProfileName string
+	// loc is the time zone to use. When non-nil, it forces the
+	// presentation of a time zone specification after the time stamp.
+	// The corresponding code path is much slower.
+	loc *time.Location
 }
 
-func (formatCrdbV2) doc() string { return formatCrdbV2CommonDoc() }
+func (f *formatCrdbV2) setOption(k string, v string) error {
+	switch k {
+	case "colors":
+		switch v {
+		case "none":
+			f.colorProfile = nil
+		case "auto":
+			f.colorProfile = ttycolor.StderrProfile
+		case "ansi":
+			f.colorProfile = ttycolor.Profile8
+		case "256color":
+			f.colorProfile = ttycolor.Profile256
+		default:
+			return errors.WithHint(
+				errors.Newf("unknown colors value: %q", redact.Safe(v)),
+				"Possible values: none, auto, ansi, 256color.")
+		}
+		f.colorProfileName = v
+		return nil
+
+	case "timezone":
+		l, err := timeutil.LoadLocation(v)
+		if err != nil {
+			return errors.Wrapf(err, "invalid timezone: %q", v)
+		}
+		if l == time.UTC {
+			// Avoid triggering the slow path in the entry formatter.
+			l = nil
+		}
+		f.loc = l
+		return nil
+
+	default:
+		return errors.Newf("unknown format option: %q", redact.Safe(k))
+	}
+}
+
+func (f formatCrdbV2) formatterName() string {
+	var buf strings.Builder
+	buf.WriteString("crdb-v2")
+	if f.colorProfileName != "none" {
+		buf.WriteString("-tty")
+	}
+	return buf.String()
+}
 
 func (formatCrdbV2) contentType() string { return "text/plain" }
 
-func formatCrdbV2CommonDoc() string {
+func (f formatCrdbV2) doc() string {
+	if f.formatterName() != "crdb-v2" {
+		var buf strings.Builder
+		fmt.Fprintf(&buf, `This format name is an alias for 'crdb-v2' with
+the following format option defaults:
+
+- `+"`colors: %v`"+`
+`, f.colorProfileName)
+		return buf.String()
+	}
+
 	var buf strings.Builder
 
 	buf.WriteString(`This is the main file format used from CockroachDB v21.1.
@@ -167,144 +233,67 @@ Finally, in the previous format, structured entries
 were prefixed with the string ` + "`" + structuredEntryPrefix + "`" + `. In
 the new format, they are prefixed by the ` + "`=`" + ` continuation
 indicator.
+
+
+Additional options recognized via ` + "`format-options`" + `:
+
+| Option | Description |
+|--------|-------------|
+| ` + "`colors`" + ` | The color profile to use. Possible values: none, auto, ansi, 256color. Default is auto. |
+| ` + "`timezone`" + ` | The timezone to use for the timestamp column. The value can be any timezone name recognized by the Go standard library. Default is ` + "`UTC`" + ` |
+
 `)
 
 	return buf.String()
 }
 
-// formatCrdbV2TTY is like formatCrdbV2 and includes VT color codes if
-// the stderr output is a TTY and -nocolor is not passed on the
-// command line.
-type formatCrdbV2TTY struct{}
+const emptyTagMarker = "-"
 
-func (formatCrdbV2TTY) formatterName() string { return "crdb-v2-tty" }
-
-func (formatCrdbV2TTY) formatEntry(entry logEntry) *buffer {
-	cp := ttycolor.StderrProfile
-	if logging.stderrSink.noColor.Get() {
-		cp = nil
-	}
-	return formatLogEntryInternalV2(entry, cp)
-}
-
-func (formatCrdbV2TTY) doc() string {
-	return "Same textual format as `" + formatCrdbV2{}.formatterName() + "`." + ttyFormatDoc
-}
-
-func (formatCrdbV2TTY) contentType() string { return "text/plain" }
-
-// formatEntryInternalV2 renders a log entry.
-// Log lines are colorized depending on severity.
-// It uses a newly allocated *buffer. The caller is responsible
-// for calling putBuffer() afterwards.
-//
-// Note: the prefix up to and including the logging tags
-// needs to remain the same as in crdb-v1, so as to
-// preserve cross-version compatibility with at least
-// one version backwards.
-func formatLogEntryInternalV2(entry logEntry, cp ttycolor.Profile) *buffer {
+func (f formatCrdbV2) formatEntry(entry logEntry) *buffer {
+	// Note: the prefix up to and including the logging tags
+	// needs to remain the same as in crdb-v1, so as to
+	// preserve cross-version compatibility with at least
+	// one version backwards.
 	buf := getBuffer()
-	if entry.line < 0 {
-		entry.line = 0 // not a real line number, but acceptable to someDigits
-	}
-	if entry.sev > severity.FATAL || entry.sev <= severity.UNKNOWN {
-		entry.sev = severity.INFO // for safety.
-	}
+	cp := f.colorProfile
+	writeCrdbHeader(buf, cp, entry.sev, entry.ch, entry.file, entry.line, entry.ts, f.loc, int(entry.gid), entry.payload.redactable)
 
-	tmp := buf.tmp[:len(buf.tmp)]
-	var n int
-	var prefix []byte
-	switch entry.sev {
-	case severity.INFO:
-		prefix = cp[ttycolor.Cyan]
-	case severity.WARNING:
-		prefix = cp[ttycolor.Yellow]
-	case severity.ERROR, severity.FATAL:
-		prefix = cp[ttycolor.Red]
-	}
-	n += copy(tmp, prefix)
-	// Avoid Fprintf, for speed. The format is so simple that we can do it quickly by hand.
-	// It's worth about 3X. Fprintf is hard.
-	now := timeutil.Unix(0, entry.ts)
-	year, month, day := now.Date()
-	hour, minute, second := now.Clock()
-	// Lyymmdd hh:mm:ss.uuuuuu file:line
-	tmp[n] = severityChar[entry.sev-1]
-	n++
-	if year < 2000 {
-		year = 2000
-	}
-	n += buf.twoDigits(n, year-2000)
-	n += buf.twoDigits(n, int(month))
-	n += buf.twoDigits(n, day)
-	n += copy(tmp[n:], cp[ttycolor.Gray]) // gray for time, file & line
-	tmp[n] = ' '
-	n++
-	n += buf.twoDigits(n, hour)
-	tmp[n] = ':'
-	n++
-	n += buf.twoDigits(n, minute)
-	tmp[n] = ':'
-	n++
-	n += buf.twoDigits(n, second)
-	tmp[n] = '.'
-	n++
-	n += buf.nDigits(6, n, now.Nanosecond()/1000, '0')
-	tmp[n] = ' '
-	n++
-	n += buf.someDigits(n, int(entry.gid))
-	tmp[n] = ' '
-	n++
-	if entry.ch != channel.DEV {
-		// Prefix the filename with the channel number.
-		n += buf.someDigits(n, int(entry.ch))
-		tmp[n] = '@'
-		n++
-	}
-	buf.Write(tmp[:n])
-	buf.WriteString(entry.file)
-	tmp[0] = ':'
-	n = buf.someDigits(1, entry.line)
-	n++
-	// Reset the color to default.
-	n += copy(tmp[n:], cp[ttycolor.Reset])
-	tmp[n] = ' '
-	n++
-	// If redaction is enabled, indicate that the current entry has
-	// markers. This indicator is used in the log parser to determine
-	// which redaction strategy to adopt.
-	if entry.payload.redactable {
-		copy(tmp[n:], redactableIndicatorBytes)
-		n += len(redactableIndicatorBytes)
-	}
-	// Note: when the redactable indicator is not introduced
-	// there are two spaces next to each other. This is intended
-	// and should be preserved for backward-compatibility with
-	// 3rd party log parsers.
-	tmp[n] = ' '
-	n++
-	buf.Write(tmp[:n])
+	hasTenantLabel, tenantLabelLength := checkTenantLabel(entry.TenantID, entry.TenantName)
+	hasTags := len(entry.payload.tags) > 0
 
 	// The remainder is variable-length and could exceed
 	// the static size of tmp. But we do have a best-case upper bound.
-	buf.Grow(20 + len(entry.payload.message))
+	//
+	// We optimistically count 3 times the size of entry.Tags to have
+	// one character for the key, one character for the value and one
+	// for the comma.
+	buf.Grow(len(entry.payload.tags)*3 + 20 + tenantLabelLength + len(entry.payload.message))
 
 	// Display the tags if set.
 	buf.Write(cp[ttycolor.Blue])
-	// We must always tag with tenant ID.
-	buf.WriteByte('[')
-	writeTagToBuffer(buf, tenantIDLogTagBytePrefix, []byte(entry.TenantID()))
-	if entry.payload.tags != nil {
-		buf.WriteByte(',')
-		entry.payload.tags.formatToBuffer(buf)
+	// We must always tag with tenant ID if present.
+	if hasTenantLabel || hasTags {
+		buf.WriteByte('[')
+		if hasTenantLabel {
+			writeTenantLabel(buf, entry.TenantID, entry.TenantName)
+			if hasTags {
+				buf.WriteByte(',')
+			}
+		}
+		if hasTags {
+			entry.payload.tags.formatToBuffer(buf)
+		}
+		buf.WriteByte(']')
+	} else {
+		buf.WriteString("[" + emptyTagMarker + "]")
 	}
-	buf.WriteByte(']')
 	buf.Write(cp[ttycolor.Reset])
 	buf.WriteByte(' ')
 
 	// Display the counter if set and enabled.
 	if entry.counter > 0 {
-		n = buf.someDigits(0, int(entry.counter))
+		tmp := buf.tmp[:len(buf.tmp)]
+		n := buf.someDigits(0, int(entry.counter))
 		buf.Write(cp[ttycolor.Cyan])
 		buf.Write(tmp[:n])
 		buf.Write(cp[ttycolor.Reset])
@@ -476,7 +465,7 @@ var (
 	entryREV2 = regexp.MustCompile(
 		`(?m)^` +
 			/* Severity                 */ `(?P<severity>[` + severityChar + `])` +
-			/* Date and time            */ `(?P<datetime>\d{6} \d{2}:\d{2}:\d{2}.\d{6}) ` +
+			/* Date and time            */ `(?P<datetime>\d{6} \d{2}:\d{2}:\d{2}.\d{6}(?:[---+]\d{6})?) ` +
 			/* Goroutine ID             */ `(?:(?P<goroutine>\d+) )` +
 			/* Go standard library flag */ `(\(gostd\) )?` +
 			/* Channel                  */ `(?:(?P<channel>\d+)@)?` +
@@ -499,9 +488,11 @@ var (
 	v2CounterIdx               = entryREV2.SubexpIndex("counter")
 	v2ContinuationIdx          = entryREV2.SubexpIndex("continuation")
 	v2MsgIdx                   = entryREV2.SubexpIndex("msg")
-	tenantIDLogTagStringPrefix = string(TenantIDLogTagKey)
-	tenantIDLogTagBytePrefix   = []byte{TenantIDLogTagKey}
+	tenantIDLogTagBytePrefix   = []byte{tenantIDLogTagKey}
+	tenantNameLogTagBytePrefix = []byte{tenantNameLogTagKey}
 )
+
+const tenantDetailsTags = string(tenantIDLogTagKey) + string(tenantNameLogTagKey)
 
 type entryDecoderV2 struct {
 	lines           int // number of lines read from reader
@@ -621,6 +612,7 @@ func (d *entryDecoderV2) initEntryFromFirstLine(
 	entry *logpb.Entry, m entryDecoderV2Fragment,
 ) (err error) {
 	// Erase all the fields, to be sure.
+	tenantID, tenantName := m.getTenantDetails()
 	*entry = logpb.Entry{
 		Severity:   m.getSeverity(),
 		Time:       m.getTimestamp(),
@@ -630,7 +622,8 @@ func (d *entryDecoderV2) initEntryFromFirstLine(
 		Line:       m.getLine(),
 		Redactable: m.isRedactable(),
 		Tags:       m.getTags(d.sensitiveEditor),
-		TenantID:   m.getTenantID(),
+		TenantID:   tenantID,
+		TenantName: tenantName,
 		Counter:    m.getCounter(),
 	}
 	if m.isStructured() {
@@ -670,11 +663,11 @@ func (f entryDecoderV2Fragment) getGoroutine() int64 {
 }
 
 func (f entryDecoderV2Fragment) getTimestamp() (unixNano int64) {
-	t, err := time.Parse(MessageTimeFormat, string(f[v2DateTimeIdx]))
+	t, err := decodeTimestamp(f[v2DateTimeIdx])
 	if err != nil {
 		panic(err)
 	}
-	return t.UnixNano()
+	return t
 }
 
 func (f entryDecoderV2Fragment) getChannel() logpb.Channel {
@@ -697,40 +690,47 @@ func (f entryDecoderV2Fragment) isRedactable() bool {
 }
 
 func (f entryDecoderV2Fragment) getTags(editor redactEditor) string {
-	tagsStr := string(f[v2TagsIdx])
-	if strings.HasPrefix(tagsStr, tenantIDLogTagStringPrefix) {
-		firstCommaIndex := strings.IndexByte(tagsStr, ',')
-		if firstCommaIndex >= 0 {
-			tagsStr = tagsStr[firstCommaIndex+1:]
-		} else {
-			tagsStr = tagsStr[len(tagsStr):]
-		}
-	}
-	switch tagsStr {
-	case "":
-		fallthrough
-	case "-":
+	origTags := f[v2TagsIdx]
+	remainingTags := skipTags(origTags, tenantDetailsTags)
+	if len(remainingTags) == 0 || bytes.Equal(origTags, []byte(emptyTagMarker)) {
 		return ""
-	default:
-		r := editor(redactablePackage{
-			msg:        []byte(tagsStr),
-			redactable: f.isRedactable(),
-		})
-		return string(r.msg)
+	}
+
+	r := editor(redactablePackage{
+		msg:        remainingTags,
+		redactable: f.isRedactable(),
+	})
+	return string(r.msg)
+}
+
+// skipTags advances tags to skip over the one-character tags
+// in skip.
+func skipTags(tags []byte, skip string) []byte {
+	for {
+		if len(tags) == 0 || len(skip) == 0 {
+			return tags
+		}
+		if tags[0] != skip[0] {
+			return tags
+		}
+		tags = tags[1:]
+		skip = skip[1:]
+		indexComma := bytes.IndexByte(tags, ',')
+		if indexComma < 0 {
+			return nil
+		}
+		tags = tags[indexComma+1:]
 	}
 }
 
-func (f entryDecoderV2Fragment) getTenantID() string {
-	out := serverident.SystemTenantID
-	switch tagsStr := string(f[v2TagsIdx]); tagsStr {
-	case "-":
-	default:
-		tags := string(f[v2TagsIdx])
-		if strings.HasPrefix(tags, tenantIDLogTagStringPrefix) {
-			out = strings.Split(tags, ",")[0][1:]
-		}
+func (f entryDecoderV2Fragment) getTenantDetails() (tenantID, tenantName string) {
+	tags := f[v2TagsIdx]
+	if bytes.Equal(tags, []byte(emptyTagMarker)) {
+		return serverident.SystemTenantID, ""
 	}
-	return out
+
+	tenantID, tenantName, _ = maybeReadTenantDetails(tags)
+	return tenantID, tenantName
 }
 
 func (f entryDecoderV2Fragment) getCounter() uint64 {

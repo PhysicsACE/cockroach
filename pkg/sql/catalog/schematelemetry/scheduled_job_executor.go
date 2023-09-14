@@ -27,20 +27,20 @@ import (
 )
 
 type schemaTelemetryExecutor struct {
-	metrics schemaTelemetryMetrics
+	metrics schemaTelemetryJobMetrics
 }
 
 var _ jobs.ScheduledJobController = (*schemaTelemetryExecutor)(nil)
 var _ jobs.ScheduledJobExecutor = (*schemaTelemetryExecutor)(nil)
 
-type schemaTelemetryMetrics struct {
+type schemaTelemetryJobMetrics struct {
 	*jobs.ExecutorMetrics
 }
 
-var _ metric.Struct = &schemaTelemetryMetrics{}
+var _ metric.Struct = &schemaTelemetryJobMetrics{}
 
 // MetricStruct is part of the metric.Struct interface.
-func (m *schemaTelemetryMetrics) MetricStruct() {}
+func (m *schemaTelemetryJobMetrics) MetricStruct() {}
 
 // OnDrop is part of the jobs.ScheduledJobController interface.
 func (s schemaTelemetryExecutor) OnDrop(
@@ -71,7 +71,7 @@ func (s schemaTelemetryExecutor) ExecuteJob(
 			s.metrics.NumFailed.Inc(1)
 		}
 	}()
-	p, cleanup := cfg.PlanHookMaker("invoke-schema-telemetry", txn.KV(), username.NodeUserName())
+	p, cleanup := cfg.PlanHookMaker(ctx, "invoke-schema-telemetry", txn.KV(), username.NodeUserName())
 	defer cleanup()
 	jr := p.(sql.PlanHookState).ExecCfg().JobRegistry
 	r := schematelemetrycontroller.CreateSchemaTelemetryJobRecord(jobs.CreatedByScheduledJobs, sj.ScheduleID())
@@ -120,7 +120,7 @@ func init() {
 		func() (jobs.ScheduledJobExecutor, error) {
 			m := jobs.MakeExecutorMetrics(tree.ScheduledSchemaTelemetryExecutor.InternalName())
 			return &schemaTelemetryExecutor{
-				metrics: schemaTelemetryMetrics{
+				metrics: schemaTelemetryJobMetrics{
 					ExecutorMetrics: &m,
 				},
 			}, nil

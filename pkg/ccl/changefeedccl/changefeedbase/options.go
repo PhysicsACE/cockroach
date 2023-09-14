@@ -73,32 +73,35 @@ const (
 
 // Constants for the options.
 const (
-	OptAvroSchemaPrefix         = `avro_schema_prefix`
-	OptConfluentSchemaRegistry  = `confluent_schema_registry`
-	OptCursor                   = `cursor`
-	OptEndTime                  = `end_time`
-	OptEnvelope                 = `envelope`
-	OptFormat                   = `format`
-	OptFullTableName            = `full_table_name`
-	OptKeyInValue               = `key_in_value`
-	OptTopicInValue             = `topic_in_value`
-	OptResolvedTimestamps       = `resolved`
-	OptMinCheckpointFrequency   = `min_checkpoint_frequency`
-	OptUpdatedTimestamps        = `updated`
-	OptMVCCTimestamps           = `mvcc_timestamp`
-	OptDiff                     = `diff`
-	OptCompression              = `compression`
-	OptSchemaChangeEvents       = `schema_change_events`
-	OptSchemaChangePolicy       = `schema_change_policy`
-	OptSplitColumnFamilies      = `split_column_families`
-	OptProtectDataFromGCOnPause = `protect_data_from_gc_on_pause`
-	OptExpirePTSAfter           = `gc_protect_expires_after`
-	OptWebhookAuthHeader        = `webhook_auth_header`
-	OptWebhookClientTimeout     = `webhook_client_timeout`
-	OptOnError                  = `on_error`
-	OptMetricsScope             = `metrics_label`
-	OptUnordered                = `unordered`
-	OptVirtualColumns           = `virtual_columns`
+	OptAvroSchemaPrefix             = `avro_schema_prefix`
+	OptConfluentSchemaRegistry      = `confluent_schema_registry`
+	OptCursor                       = `cursor`
+	OptCustomKeyColumn              = `key_column`
+	OptEndTime                      = `end_time`
+	OptEnvelope                     = `envelope`
+	OptFormat                       = `format`
+	OptFullTableName                = `full_table_name`
+	OptKeyInValue                   = `key_in_value`
+	OptTopicInValue                 = `topic_in_value`
+	OptResolvedTimestamps           = `resolved`
+	OptMinCheckpointFrequency       = `min_checkpoint_frequency`
+	OptUpdatedTimestamps            = `updated`
+	OptMVCCTimestamps               = `mvcc_timestamp`
+	OptDiff                         = `diff`
+	OptCompression                  = `compression`
+	OptSchemaChangeEvents           = `schema_change_events`
+	OptSchemaChangePolicy           = `schema_change_policy`
+	OptSplitColumnFamilies          = `split_column_families`
+	OptExpirePTSAfter               = `gc_protect_expires_after`
+	OptWebhookAuthHeader            = `webhook_auth_header`
+	OptWebhookClientTimeout         = `webhook_client_timeout`
+	OptOnError                      = `on_error`
+	OptMetricsScope                 = `metrics_label`
+	OptUnordered                    = `unordered`
+	OptVirtualColumns               = `virtual_columns`
+	OptExecutionLocality            = `execution_locality`
+	OptLaggingRangesThreshold       = `lagging_ranges_threshold`
+	OptLaggingRangesPollingInterval = `lagging_ranges_polling_interval`
 
 	OptVirtualColumnsOmitted VirtualColumnVisibility = `omitted`
 	OptVirtualColumnsNull    VirtualColumnVisibility = `null`
@@ -161,13 +164,22 @@ const (
 	DeprecatedSinkSchemeCloudStorageNodelocal = `experimental-nodelocal`
 	DeprecatedSinkSchemeCloudStorageS3        = `experimental-s3`
 
+	// DeprecatedSinkSchemeHTTP is interpreted as cloudstorage over HTTP PUT.
+	DeprecatedSinkSchemeHTTP = `http`
+	// DeprecatedSinkSchemeHTTPS is interpreted as cloudstorage over HTTPS PUT.
+	DeprecatedSinkSchemeHTTPS = `https`
+
 	// OptKafkaSinkConfig is a JSON configuration for kafka sink (kafkaSinkConfig).
 	OptKafkaSinkConfig   = `kafka_sink_config`
+	OptPubsubSinkConfig  = `pubsub_sink_config`
 	OptWebhookSinkConfig = `webhook_sink_config`
 
 	// OptSink allows users to alter the Sink URI of an existing changefeed.
 	// Note that this option is only allowed for alter changefeed statements.
 	OptSink = `sink`
+
+	// Deprecated options.
+	DeprecatedOptProtectDataFromGCOnPause = `protect_data_from_gc_on_pause`
 
 	SinkParamCACert                 = `ca_cert`
 	SinkParamClientCert             = `client_cert`
@@ -181,13 +193,11 @@ const (
 	SinkParamTopicName              = `topic_name`
 	SinkSchemeCloudStorageAzure     = `azure`
 	SinkSchemeCloudStorageGCS       = `gs`
-	SinkSchemeCloudStorageHTTP      = `http`
-	SinkSchemeCloudStorageHTTPS     = `https`
+	SinkSchemeCloudStorageHTTP      = `file-http`
+	SinkSchemeCloudStorageHTTPS     = `file-https`
 	SinkSchemeCloudStorageNodelocal = `nodelocal`
 	SinkSchemeCloudStorageS3        = `s3`
 	SinkSchemeExperimentalSQL       = `experimental-sql`
-	SinkSchemeHTTP                  = `http`
-	SinkSchemeHTTPS                 = `https`
 	SinkSchemeKafka                 = `kafka`
 	SinkSchemeNull                  = `null`
 	SinkSchemeWebhookHTTP           = `webhook-http`
@@ -198,6 +208,11 @@ const (
 	SinkParamSASLUser               = `sasl_user`
 	SinkParamSASLPassword           = `sasl_password`
 	SinkParamSASLMechanism          = `sasl_mechanism`
+	SinkParamSASLClientID           = `sasl_client_id`
+	SinkParamSASLClientSecret       = `sasl_client_secret`
+	SinkParamSASLTokenURL           = `sasl_token_url`
+	SinkParamSASLScopes             = `sasl_scopes`
+	SinkParamSASLGrantType          = `sasl_grant_type`
 
 	RegistryParamCACert     = `ca_cert`
 	RegistryParamClientCert = `client_cert`
@@ -301,37 +316,42 @@ var jsonOption = OptionPermittedValues{Type: OptionTypeJSON}
 // ChangefeedOptionExpectValues is used to parse changefeed options using
 // PlanHookState.TypeAsStringOpts().
 var ChangefeedOptionExpectValues = map[string]OptionPermittedValues{
-	OptAvroSchemaPrefix:         stringOption,
-	OptConfluentSchemaRegistry:  stringOption,
-	OptCursor:                   timestampOption,
-	OptEndTime:                  timestampOption,
-	OptEnvelope:                 enum("row", "key_only", "wrapped", "deprecated_row", "bare"),
-	OptFormat:                   enum("json", "avro", "csv", "experimental_avro", "parquet"),
-	OptFullTableName:            flagOption,
-	OptKeyInValue:               flagOption,
-	OptTopicInValue:             flagOption,
-	OptResolvedTimestamps:       durationOption.thatCanBeZero().orEmptyMeans("0"),
-	OptMinCheckpointFrequency:   durationOption.thatCanBeZero(),
-	OptUpdatedTimestamps:        flagOption,
-	OptMVCCTimestamps:           flagOption,
-	OptDiff:                     flagOption,
-	OptCompression:              enum("gzip", "zstd"),
-	OptSchemaChangeEvents:       enum("column_changes", "default"),
-	OptSchemaChangePolicy:       enum("backfill", "nobackfill", "stop", "ignore"),
-	OptSplitColumnFamilies:      flagOption,
-	OptInitialScan:              enum("yes", "no", "only").orEmptyMeans("yes"),
-	OptNoInitialScan:            flagOption,
-	OptInitialScanOnly:          flagOption,
-	OptProtectDataFromGCOnPause: flagOption,
-	OptExpirePTSAfter:           durationOption.thatCanBeZero(),
-	OptKafkaSinkConfig:          jsonOption,
-	OptWebhookSinkConfig:        jsonOption,
-	OptWebhookAuthHeader:        stringOption,
-	OptWebhookClientTimeout:     durationOption,
-	OptOnError:                  enum("pause", "fail"),
-	OptMetricsScope:             stringOption,
-	OptUnordered:                flagOption,
-	OptVirtualColumns:           enum("omitted", "null"),
+	OptAvroSchemaPrefix:                   stringOption,
+	OptConfluentSchemaRegistry:            stringOption,
+	OptCursor:                             timestampOption,
+	OptCustomKeyColumn:                    stringOption,
+	OptEndTime:                            timestampOption,
+	OptEnvelope:                           enum("row", "key_only", "wrapped", "deprecated_row", "bare"),
+	OptFormat:                             enum("json", "avro", "csv", "experimental_avro", "parquet"),
+	OptFullTableName:                      flagOption,
+	OptKeyInValue:                         flagOption,
+	OptTopicInValue:                       flagOption,
+	OptResolvedTimestamps:                 durationOption.thatCanBeZero().orEmptyMeans("0"),
+	OptMinCheckpointFrequency:             durationOption.thatCanBeZero(),
+	OptUpdatedTimestamps:                  flagOption,
+	OptMVCCTimestamps:                     flagOption,
+	OptDiff:                               flagOption,
+	OptCompression:                        enum("gzip", "zstd"),
+	OptSchemaChangeEvents:                 enum("column_changes", "default"),
+	OptSchemaChangePolicy:                 enum("backfill", "nobackfill", "stop", "ignore"),
+	OptSplitColumnFamilies:                flagOption,
+	OptInitialScan:                        enum("yes", "no", "only").orEmptyMeans("yes"),
+	OptNoInitialScan:                      flagOption,
+	OptInitialScanOnly:                    flagOption,
+	DeprecatedOptProtectDataFromGCOnPause: flagOption,
+	OptExpirePTSAfter:                     durationOption.thatCanBeZero(),
+	OptKafkaSinkConfig:                    jsonOption,
+	OptPubsubSinkConfig:                   jsonOption,
+	OptWebhookSinkConfig:                  jsonOption,
+	OptWebhookAuthHeader:                  stringOption,
+	OptWebhookClientTimeout:               durationOption,
+	OptOnError:                            enum("pause", "fail"),
+	OptMetricsScope:                       stringOption,
+	OptUnordered:                          flagOption,
+	OptVirtualColumns:                     enum("omitted", "null"),
+	OptExecutionLocality:                  stringOption,
+	OptLaggingRangesThreshold:             durationOption,
+	OptLaggingRangesPollingInterval:       durationOption,
 }
 
 // CommonOptions is options common to all sinks
@@ -341,9 +361,11 @@ var CommonOptions = makeStringSet(OptCursor, OptEndTime, OptEnvelope,
 	OptResolvedTimestamps, OptUpdatedTimestamps,
 	OptMVCCTimestamps, OptDiff, OptSplitColumnFamilies,
 	OptSchemaChangeEvents, OptSchemaChangePolicy,
-	OptProtectDataFromGCOnPause, OptOnError,
-	OptInitialScan, OptNoInitialScan, OptInitialScanOnly, OptUnordered,
-	OptMinCheckpointFrequency, OptMetricsScope, OptVirtualColumns, Topics, OptExpirePTSAfter)
+	OptOnError,
+	OptInitialScan, OptNoInitialScan, OptInitialScanOnly, OptUnordered, OptCustomKeyColumn,
+	OptMinCheckpointFrequency, OptMetricsScope, OptVirtualColumns, Topics, OptExpirePTSAfter,
+	OptExecutionLocality, OptLaggingRangesThreshold, OptLaggingRangesPollingInterval,
+)
 
 // SQLValidOptions is options exclusive to SQL sink
 var SQLValidOptions map[string]struct{} = nil
@@ -358,7 +380,7 @@ var CloudStorageValidOptions = makeStringSet(OptCompression)
 var WebhookValidOptions = makeStringSet(OptWebhookAuthHeader, OptWebhookClientTimeout, OptWebhookSinkConfig)
 
 // PubsubValidOptions is options exclusive to pubsub sink
-var PubsubValidOptions = makeStringSet()
+var PubsubValidOptions = makeStringSet(OptPubsubSinkConfig)
 
 // ExternalConnectionValidOptions is options exclusive to the external
 // connection sink.
@@ -371,6 +393,9 @@ var ExternalConnectionValidOptions = unionStringSets(SQLValidOptions, KafkaValid
 // CaseInsensitiveOpts options which supports case Insensitive value
 var CaseInsensitiveOpts = makeStringSet(OptFormat, OptEnvelope, OptCompression, OptSchemaChangeEvents,
 	OptSchemaChangePolicy, OptOnError, OptInitialScan)
+
+// RetiredOptions are the options which are no longer active.
+var RetiredOptions = makeStringSet(DeprecatedOptProtectDataFromGCOnPause)
 
 // redactionFunc is a function applied to a string option which returns its redacted value.
 type redactionFunc func(string) (string, error)
@@ -410,10 +435,17 @@ var NoLongerExperimental = map[string]string{
 	DeprecatedSinkSchemeCloudStorageS3:        SinkSchemeCloudStorageS3,
 }
 
+// OptionsSet is a test of changefeed option strings.
+type OptionsSet map[string]struct{}
+
 // InitialScanOnlyUnsupportedOptions is options that are not supported with the
 // initial scan only option
-var InitialScanOnlyUnsupportedOptions = makeStringSet(OptEndTime, OptResolvedTimestamps, OptDiff,
+var InitialScanOnlyUnsupportedOptions OptionsSet = makeStringSet(OptEndTime, OptResolvedTimestamps, OptDiff,
 	OptMVCCTimestamps, OptUpdatedTimestamps)
+
+// ParquetFormatUnsupportedOptions is options that are not supported with the
+// parquet format.
+var ParquetFormatUnsupportedOptions OptionsSet = makeStringSet(OptTopicInValue)
 
 // AlterChangefeedUnsupportedOptions are changefeed options that we do not allow
 // users to alter.
@@ -421,7 +453,7 @@ var InitialScanOnlyUnsupportedOptions = makeStringSet(OptEndTime, OptResolvedTim
 // and the end_time option. However, there are instances in which it should be
 // allowed to alter either of these options. We need to support the alteration
 // of these fields.
-var AlterChangefeedUnsupportedOptions = makeStringSet(OptCursor, OptInitialScan,
+var AlterChangefeedUnsupportedOptions OptionsSet = makeStringSet(OptCursor, OptInitialScan,
 	OptNoInitialScan, OptInitialScanOnly, OptEndTime)
 
 // AlterChangefeedOptionExpectValues is used to parse alter changefeed options
@@ -442,11 +474,17 @@ var AlterChangefeedTargetOptions = map[string]OptionPermittedValues{
 	OptNoInitialScan: flagOption,
 }
 
-type incompatibleOptions struct {
+type optionRelationship struct {
 	opt1   string
 	opt2   string
 	reason string
 }
+
+// opt1 and opt2 cannot both be set.
+type incompatibleOptions optionRelationship
+
+// if opt1 is set, opt2 must also be set.
+type dependentOption optionRelationship
 
 func makeInvertedIndex(pairs []incompatibleOptions) map[string][]incompatibleOptions {
 	m := make(map[string][]incompatibleOptions, len(pairs)*2)
@@ -457,8 +495,20 @@ func makeInvertedIndex(pairs []incompatibleOptions) map[string][]incompatibleOpt
 	return m
 }
 
+func makeDirectedInvertedIndex(pairs []dependentOption) map[string][]dependentOption {
+	m := make(map[string][]dependentOption, len(pairs))
+	for _, p := range pairs {
+		m[p.opt1] = append(m[p.opt1], p)
+	}
+	return m
+}
+
 var incompatibleOptionsMap = makeInvertedIndex([]incompatibleOptions{
 	{opt1: OptUnordered, opt2: OptResolvedTimestamps, reason: `resolved timestamps cannot be guaranteed to be correct in unordered mode`},
+})
+
+var dependentOptionsMap = makeDirectedInvertedIndex([]dependentOption{
+	{opt1: OptCustomKeyColumn, opt2: OptUnordered, reason: `using a value other than the primary key as the message key means end-to-end ordering cannot be preserved`},
 })
 
 // MakeStatementOptions wraps and canonicalizes the options we get
@@ -498,11 +548,16 @@ func (s StatementOptions) IsSet(key string) bool {
 }
 
 // DeprecationWarnings checks for options in forms we still support and serialize,
-// but should be replaced with a new form. Currently hardcoded to just check format.
+// but should be replaced with a new form.
 func (s StatementOptions) DeprecationWarnings() []string {
 	if newFormat, ok := NoLongerExperimental[s.m[OptFormat]]; ok {
 		return []string{fmt.Sprintf(`%[1]s is no longer experimental, use %[2]s=%[1]s`,
 			newFormat, OptFormat)}
+	}
+	for retiredOpt := range RetiredOptions {
+		if _, isSet := s.m[retiredOpt]; isSet {
+			return []string{fmt.Sprintf("%s option is no longer needed", retiredOpt)}
+		}
 	}
 
 	return []string{}
@@ -566,6 +621,8 @@ func (s StatementOptions) getEnumValue(k string) (string, error) {
 	return rawVal, nil
 }
 
+// getDurationValue validates that the option `k` was supplied with a
+// valid duration.
 func (s StatementOptions) getDurationValue(k string) (*time.Duration, error) {
 	v, ok := s.m[k]
 	if !ok {
@@ -672,16 +729,21 @@ func (s StatementOptions) ShouldUseFullStatementTimeName() bool {
 type CanHandle struct {
 	MultipleColumnFamilies bool
 	VirtualColumns         bool
+	RequiredColumns        []string
 }
 
 // GetCanHandle returns a populated CanHandle.
 func (s StatementOptions) GetCanHandle() CanHandle {
 	_, families := s.m[OptSplitColumnFamilies]
 	_, virtual := s.m[OptVirtualColumns]
-	return CanHandle{
+	h := CanHandle{
 		MultipleColumnFamilies: families,
 		VirtualColumns:         virtual,
 	}
+	if s.IsSet(OptCustomKeyColumn) {
+		h.RequiredColumns = append(h.RequiredColumns, s.m[OptCustomKeyColumn])
+	}
+	return h
 }
 
 // EncodingOptions describe how events are encoded when
@@ -698,6 +760,7 @@ type EncodingOptions struct {
 	AvroSchemaPrefix  string
 	SchemaRegistryURI string
 	Compression       string
+	CustomKeyColumn   string
 }
 
 // GetEncodingOptions populates and validates an EncodingOptions.
@@ -743,6 +806,7 @@ func (s StatementOptions) GetEncodingOptions() (EncodingOptions, error) {
 	o.SchemaRegistryURI = s.m[OptConfluentSchemaRegistry]
 	o.AvroSchemaPrefix = s.m[OptAvroSchemaPrefix]
 	o.Compression = s.m[OptCompression]
+	o.CustomKeyColumn = s.m[OptCustomKeyColumn]
 
 	s.cache.EncodingOptions = o
 	return o, o.Validate()
@@ -852,6 +916,12 @@ func (s StatementOptions) GetKafkaConfigJSON() SinkSpecificJSONConfig {
 	return s.getJSONValue(OptKafkaSinkConfig)
 }
 
+// GetPubsubConfigJSON returns arbitrary json to be interpreted
+// by the pubsub sink.
+func (s StatementOptions) GetPubsubConfigJSON() SinkSpecificJSONConfig {
+	return s.getJSONValue(OptPubsubSinkConfig)
+}
+
 // GetResolvedTimestampInterval gets the best-effort interval at which resolved timestamps
 // should be emitted. Nil or 0 means emit as often as possible. False means do not emit at all.
 // Returns an error for negative or invalid duration value.
@@ -869,6 +939,34 @@ func (s StatementOptions) GetResolvedTimestampInterval() (*time.Duration, bool, 
 func (s StatementOptions) GetMetricScope() (string, bool) {
 	v, ok := s.m[OptMetricsScope]
 	return v, ok
+}
+
+// GetLaggingRangesConfig returns the threshold and polling rate to use for
+// lagging ranges metrics.
+func (s StatementOptions) GetLaggingRangesConfig() (
+	threshold time.Duration,
+	pollingInterval time.Duration,
+	e error,
+) {
+	threshold = DefaultLaggingRangesThreshold
+	pollingInterval = DefaultLaggingRangesPollingInterval
+	_, ok := s.m[OptLaggingRangesThreshold]
+	if ok {
+		t, err := s.getDurationValue(OptLaggingRangesThreshold)
+		if err != nil {
+			return threshold, pollingInterval, err
+		}
+		threshold = *t
+	}
+	_, ok = s.m[OptLaggingRangesPollingInterval]
+	if ok {
+		i, err := s.getDurationValue(OptLaggingRangesPollingInterval)
+		if err != nil {
+			return threshold, pollingInterval, err
+		}
+		pollingInterval = *i
+	}
+	return threshold, pollingInterval, nil
 }
 
 // IncludeVirtual returns true if we need to set placeholder nulls for virtual columns.
@@ -995,16 +1093,21 @@ func (s StatementOptions) ValidateForCreateChangefeed(isPredicateChangefeed bool
 	if err != nil {
 		return err
 	}
-	validateInitialScanUnsupportedOptions := func(errMsg string) error {
-		for o := range InitialScanOnlyUnsupportedOptions {
+
+	// validateUnsupportedOptions returns an error if any of the supplied are
+	// in the statement options. The error string should be the string
+	// representation of the option (ex. "key_in_value", or "initial_scan='only'").
+	validateUnsupportedOptions := func(unsupportedOptions OptionsSet, errorStr string) error {
+		for o := range unsupportedOptions {
 			if _, ok := s.m[o]; ok {
-				return errors.Newf(`cannot specify both %s='only' and %s`, OptInitialScan, o)
+				return errors.Newf(`cannot specify both %s and %s`, errorStr, o)
 			}
 		}
 		return nil
 	}
 	if scanType == OnlyInitialScan {
-		if err := validateInitialScanUnsupportedOptions(fmt.Sprintf("%s='only'", OptInitialScan)); err != nil {
+		if err := validateUnsupportedOptions(InitialScanOnlyUnsupportedOptions,
+			fmt.Sprintf("%s='only'", OptInitialScan)); err != nil {
 			return err
 		}
 	} else {
@@ -1014,23 +1117,21 @@ func (s StatementOptions) ValidateForCreateChangefeed(isPredicateChangefeed bool
 	}
 	// Right now parquet does not support any of these options
 	if s.m[OptFormat] == string(OptFormatParquet) {
-		if isPredicateChangefeed {
-			// Diff option is allowed when using predicate changefeeds with parquet format.
-			for o := range InitialScanOnlyUnsupportedOptions {
-				if _, ok := s.m[o]; ok && o != OptDiff {
-					return errors.Newf(`cannot specify both format='%s' and %s`, OptFormatParquet, o)
-				}
-			}
-		} else {
-			if err := validateInitialScanUnsupportedOptions(string(OptFormatParquet)); err != nil {
-				return err
-			}
+		if err := validateUnsupportedOptions(ParquetFormatUnsupportedOptions, fmt.Sprintf("format=%s", OptFormatParquet)); err != nil {
+			return err
 		}
 	}
 	for o := range s.m {
 		for _, pair := range incompatibleOptionsMap[o] {
 			if s.IsSet(pair.opt1) && s.IsSet(pair.opt2) {
 				return errors.Newf(`%s is not usable with %s because %s`, pair.opt1, pair.opt2, pair.reason)
+			}
+		}
+	}
+	for o := range s.m {
+		for _, pair := range dependentOptionsMap[o] {
+			if s.IsSet(pair.opt1) && !s.IsSet(pair.opt2) {
+				return errors.Newf(`%s requires the %s option because %s`, pair.opt1, pair.opt2, pair.reason)
 			}
 		}
 	}

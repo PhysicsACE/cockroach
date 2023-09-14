@@ -1,20 +1,25 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "tenantcapabilitiesauthorizer",
     srcs = [
+        "allow_everything.go",
+        "allow_nothing.go",
         "authorizer.go",
-        "noop.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/clusterversion",
         "//pkg/kv/kvpb",
         "//pkg/multitenant/tenantcapabilities",
+        "//pkg/multitenant/tenantcapabilities/tenantcapabilitiespb",
         "//pkg/roachpb",
+        "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/util/log",
+        "//pkg/util/log/logcrash",
+        "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
@@ -26,14 +31,15 @@ go_test(
     data = glob(["testdata/**"]),
     embed = [":tenantcapabilitiesauthorizer"],
     deps = [
+        "//pkg/kv/kvpb",
         "//pkg/multitenant/tenantcapabilities",
+        "//pkg/multitenant/tenantcapabilities/tenantcapabilitiespb",
         "//pkg/multitenant/tenantcapabilities/tenantcapabilitiestestutils",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/testutils/datapathutils",
         "//pkg/util/leaktest",
         "@com_github_cockroachdb_datadriven//:datadriven",
+        "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

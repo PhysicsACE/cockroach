@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,12 +13,13 @@ go_library(
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/types",
         "//pkg/util/bufalloc",
+        "//pkg/util/randutil",
         "//pkg/util/timeutil",
         "//pkg/workload",
         "//pkg/workload/histogram",
         "@com_github_cockroachdb_errors//:errors",
-        "@com_github_jackc_pgconn//:pgconn",
-        "@com_github_jackc_pgx_v4//:pgx",
+        "@com_github_jackc_pgx_v5//:pgx",
+        "@com_github_jackc_pgx_v5//pgconn",
         "@com_github_spf13_pflag//:pflag",
     ],
 )
@@ -31,5 +31,3 @@ go_test(
     embed = [":kv"],
     deps = ["@com_github_stretchr_testify//require"],
 )
-
-get_x_data(name = "get_x_data")

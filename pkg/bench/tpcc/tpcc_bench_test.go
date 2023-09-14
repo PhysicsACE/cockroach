@@ -67,7 +67,7 @@ func BenchmarkTPCC(b *testing.B) {
 			}, cleanup
 		}),
 		setupStmt(`
-SET CLUSTER SETTING kv.raft_log.disable_synchronization_unsafe = true`),
+SET CLUSTER SETTING kv.raft_log.synchronization.disabled = true`),
 	}
 
 	for _, opts := range []options{
@@ -147,7 +147,7 @@ func (bm *benchmark) startCockroach(b testing.TB) {
 	}
 
 	pgURL, cleanup, err := sqlutils.PGUrlE(
-		s.ServingSQLAddr(), b.TempDir(), url.User("root"),
+		s.AdvSQLAddr(), b.TempDir(), url.User("root"),
 	)
 	require.NoError(b, err)
 	pgURL.Path = databaseName

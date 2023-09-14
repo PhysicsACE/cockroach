@@ -22,9 +22,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules/current"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules/release_22_2"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules/release_23_1"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraph"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scstage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -32,6 +34,9 @@ import (
 
 // Params holds the arguments for planning.
 type Params struct {
+	// context.Context for planning.
+	Ctx context.Context
+
 	// ActiveVersion contains the version currently active in the cluster.
 	ActiveVersion clusterversion.ClusterVersion
 
@@ -52,6 +57,12 @@ type Params struct {
 	// SkipPlannerSanityChecks, if false, strictly enforces sanity checks in the
 	// declarative schema changer planner.
 	SkipPlannerSanityChecks bool
+
+	// MemAcc returns the injected bound account that
+	// tracks memory allocations that long-live `scplan.MakePlan` function.
+	// It is currently only used to track memory allocation for EXPLAIN(DDL)
+	// output, as it's considered a continuation of the planning process.
+	MemAcc *mon.BoundAccount
 }
 
 // Exported internal types
@@ -148,7 +159,8 @@ type rulesForRelease struct {
 // rulesForRelease supported rules for each release, this is an ordered array
 // with the newest supported version first.
 var rulesForReleases = []rulesForRelease{
-	{activeVersion: clusterversion.V23_1, rulesRegistry: current.GetRegistry()},
+	{activeVersion: clusterversion.V23_2, rulesRegistry: current.GetRegistry()},
+	{activeVersion: clusterversion.V23_1, rulesRegistry: release_23_1.GetRegistry()},
 	{activeVersion: clusterversion.V22_2, rulesRegistry: release_22_2.GetRegistry()},
 }
 
@@ -207,6 +219,9 @@ func getMinValidVersionForRules(
 	return activeVersion
 }
 
+// Deprecated.
+//
+// TODO(postamar): remove once the release_22_2 ruleset is also removed
 func applyOpRules(
 	ctx context.Context, activeVersion clusterversion.ClusterVersion, g *scgraph.Graph,
 ) (*scgraph.Graph, error) {

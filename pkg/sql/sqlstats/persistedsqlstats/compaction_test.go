@@ -21,23 +21,26 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
@@ -47,8 +50,10 @@ func TestSQLStatsCompactorNilTestingKnobCheck(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	server, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer server.Stopper().Stop(ctx)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	server := srv.ApplicationLayer()
 
 	statsCompactor := persistedsqlstats.NewStatsCompactor(
 		server.ClusterSettings(),
@@ -68,7 +73,6 @@ func TestSQLStatsCompactorNilTestingKnobCheck(t *testing.T) {
 func TestSQLStatsCompactor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
 	ctx := context.Background()
 
 	testCases := []struct {
@@ -117,39 +121,64 @@ func TestSQLStatsCompactor(t *testing.T) {
 		},
 	}
 
-	kvInterceptor := kvScanInterceptor{}
-	cleanupInterceptor := cleanupInterceptor{}
-
-	server, conn, _ := serverutils.StartServer(
-		t, base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				SQLStatsKnobs: &sqlstats.TestingKnobs{
-					AOSTClause: "AS OF SYSTEM TIME '-1us'",
-					StubTimeNow: func() time.Time {
-						return timeutil.Now().Add(-2 * time.Hour)
-					},
-				},
-				Store: &kvserver.StoreTestingKnobs{
-					TestingRequestFilter: kvInterceptor.intercept,
-				},
-			},
-		},
-	)
-
-	defer server.Stopper().Stop(ctx)
-
-	sqlConn := sqlutils.MakeSQLRunner(conn)
-	internalExecutor := server.InternalExecutor().(isql.Executor)
-
-	// Disable automatic flush since the test will handle the flush manually.
-	sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.flush.interval = '24h'")
-
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("stmtCount=%d/maxPersistedRowLimit=%d/rowsDeletePerTxn=%d",
 			tc.stmtCount,
 			tc.maxPersistedRowLimit,
 			tc.rowsToDeletePerTxn,
 		), func(t *testing.T) {
+			kvInterceptor := kvScanInterceptor{}
+			cleanupInterceptor := cleanupInterceptor{}
+
+			knobs := sqlstats.CreateTestingKnobs()
+			knobs.StubTimeNow = func() time.Time {
+				return timeutil.Now().Add(-2 * time.Hour)
+			}
+			srv, conn, _ := serverutils.StartServer(
+				t, base.TestServerArgs{
+					Knobs: base.TestingKnobs{
+						SQLStatsKnobs: knobs,
+						Store: &kvserver.StoreTestingKnobs{
+							TestingRequestFilter:      kvInterceptor.intercept,
+							DisableLoadBasedSplitting: true,
+						},
+					},
+				},
+			)
+			defer srv.Stopper().Stop(ctx)
+			server := srv.ApplicationLayer()
+
+			sqlConn := sqlutils.MakeSQLRunner(conn)
+			internalExecutor := server.InternalExecutor().(isql.Executor)
+
+			func() {
+				// Determine the actual ID of the stat tables.
+				sID, err := server.QueryTableID(ctx, username.RootUserName(),
+					"system", string(catconstants.StatementStatisticsTableName))
+				require.NoError(t, err)
+				tID, err := server.QueryTableID(ctx, username.RootUserName(),
+					"system", string(catconstants.TransactionStatisticsTableName))
+				require.NoError(t, err)
+
+				// Configure the KV interceptor. We also need the codec from
+				// the live server, which determines the tenant ID prefix to
+				// strip.
+				kvInterceptor.mu.Lock()
+				defer kvInterceptor.mu.Unlock()
+
+				kvInterceptor.mu.codec = server.Codec()
+				kvInterceptor.mu.stmtStatsTableID = uint32(sID)
+				kvInterceptor.mu.txnStatsTableID = uint32(tID)
+			}()
+
+			// Disable automatic flush since the test will handle the flush manually.
+			sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.flush.interval = '24h'")
+			// Disable activity update flush which also does a scan on the stats table
+			sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.activity.flush.enabled = false")
+			// Change the automatic compaction job to avoid it running during the test.
+			// Test creates a new compactor and calls it directly.
+			sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.cleanup.recurrence = '@yearly';")
+
 			_, err := internalExecutor.ExecEx(
 				ctx,
 				"truncate-stmt-stats",
@@ -185,17 +214,13 @@ func TestSQLStatsCompactor(t *testing.T) {
 			generateFingerprints(t, sqlConn, tc.stmtCount)
 			serverSQLStats.Flush(ctx)
 
+			sqlStatsKnobs := sqlstats.CreateTestingKnobs()
+			sqlStatsKnobs.OnCleanupStartForShard = cleanupInterceptor.intercept
 			statsCompactor := persistedsqlstats.NewStatsCompactor(
 				server.ClusterSettings(),
 				server.InternalDB().(isql.DB),
 				metric.NewCounter(metric.Metadata{}),
-				&sqlstats.TestingKnobs{
-					AOSTClause:             "AS OF SYSTEM TIME '-1us'",
-					OnCleanupStartForShard: cleanupInterceptor.intercept,
-					StubTimeNow: func() time.Time {
-						return timeutil.Now()
-					},
-				},
+				sqlStatsKnobs,
 			)
 
 			// Initial compaction should remove the all the oldest entries.
@@ -206,32 +231,29 @@ func TestSQLStatsCompactor(t *testing.T) {
 			require.Equal(t, tc.maxPersistedRowLimit, len(expectedDeletedStmtFingerprints))
 			require.Equal(t, tc.maxPersistedRowLimit, len(expectedDeletedTxnFingerprints))
 
-			run := func() {
-				// The two interceptors (kvInterceptor and cleanupInterceptor) are
-				// injected into kvserver and StatsCompactor respectively.
-				// The cleanupInterceptor calculates the number of expected "wide scan"
-				// that should be issued by the StatsCompactor.
-				// The kvInterceptor counts the number of actual "wide scan" KV Request
-				// issued.
-				kvInterceptor.reset()
-				cleanupInterceptor.reset()
-				kvInterceptor.enable()
-				defer kvInterceptor.disable()
+			// The two interceptors (kvInterceptor and cleanupInterceptor) are
+			// injected into kvserver and StatsCompactor respectively.
+			// The cleanupInterceptor calculates the number of expected "wide scan"
+			// that should be issued by the StatsCompactor.
+			// The kvInterceptor counts the number of actual "wide scan" KV Request
+			// issued.
+			kvInterceptor.reset()
+			cleanupInterceptor.reset()
+			kvInterceptor.enable()
 
-				err := statsCompactor.DeleteOldestEntries(ctx)
-				require.NoError(t, err)
+			err = statsCompactor.DeleteOldestEntries(ctx)
+			kvInterceptor.disable()
+			expectedNumberOfWideScans := cleanupInterceptor.getExpectedNumberOfWideScans()
+			require.NoError(t, err)
 
-				expectedNumberOfWideScans := cleanupInterceptor.getExpectedNumberOfWideScans()
-				actualNumberOfWideScans := kvInterceptor.getTotalWideScans()
+			actualNumberOfWideScans := kvInterceptor.getTotalWideScans()
 
-				require.Equal(t,
-					expectedNumberOfWideScans,
-					actualNumberOfWideScans,
-					"expected %d number of wide scans issued, but %d number of "+
-						"wide scan issued", expectedNumberOfWideScans, actualNumberOfWideScans,
-				)
-			}
-			run()
+			require.Equal(t,
+				expectedNumberOfWideScans,
+				actualNumberOfWideScans,
+				"expected %d number of wide scans issued, but %d number of "+
+					"wide scan issued", expectedNumberOfWideScans, actualNumberOfWideScans,
+			)
 
 			actualStmtFingerprints, actualTxnFingerprints :=
 				getTopSortedFingerprints(t, sqlConn, 0 /* limit */)
@@ -265,22 +287,22 @@ func TestSQLStatsCompactionJobMarkedAsAutomatic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 
+	t.Logf("starting test server")
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 3 /* numNodes */, base.TestClusterArgs{
-		ServerArgs: params,
-	})
-	defer tc.Stopper().Stop(ctx)
+	server, conn, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(ctx)
+	s := server.ApplicationLayer()
 
-	server := tc.Server(0 /* idx */)
-	conn := tc.ServerConn(0 /* idx */)
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
-	jobID, err := launchSQLStatsCompactionJob(server)
+	t.Logf("launching the stats compaction job")
+	jobID, err := launchSQLStatsCompactionJob(s)
 	require.NoError(t, err)
 
+	t.Logf("checking the job status")
 	// Ensure the sqlstats job is hidden from the SHOW JOBS command.
 	sqlDB.CheckQueryResults(
 		t,
@@ -294,9 +316,13 @@ func TestSQLStatsCompactionJobMarkedAsAutomatic(t *testing.T) {
 		fmt.Sprintf("SELECT count(*) FROM [SHOW AUTOMATIC JOBS] WHERE job_id = %d", jobID),
 		[][]string{{"1"}},
 	)
+
+	t.Logf("test complete")
 }
 
-func launchSQLStatsCompactionJob(server serverutils.TestServerInterface) (jobspb.JobID, error) {
+func launchSQLStatsCompactionJob(
+	server serverutils.ApplicationLayerInterface,
+) (jobspb.JobID, error) {
 	return persistedsqlstats.CreateCompactionJob(
 		context.Background(), nil /* createdByInfo */, nil, /* txn */
 		server.JobRegistry().(*jobs.Registry),
@@ -365,16 +391,19 @@ func generateFingerprints(t *testing.T, sqlConn *sqlutils.SQLRunner, distinctFin
 	}
 }
 
-const (
-	stmtStatsTableID = 42
-	txnStatsTableID  = 43
-)
-
-var kvReqWideScanStartKeyPattern = regexp.MustCompile("/Table/(42|43)/[0-9]{1,2}/[0-9]$")
+var kvReqWideScanStartKeyPattern = regexp.MustCompile(`(/Tenant/\d+)?/Table/\d+/[0-9]{1,2}/[0-9]$`)
 
 type kvScanInterceptor struct {
 	totalWideScan int64
 	enabled       int32
+
+	mu struct {
+		syncutil.Mutex
+
+		stmtStatsTableID uint32
+		txnStatsTableID  uint32
+		codec            keys.SQLCodec
+	}
 }
 
 func (k *kvScanInterceptor) reset() {
@@ -393,13 +422,18 @@ func (k *kvScanInterceptor) disable() {
 	atomic.StoreInt32(&k.enabled, 0)
 }
 
-func (k *kvScanInterceptor) intercept(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+func (k *kvScanInterceptor) intercept(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 	if atomic.LoadInt32(&k.enabled) == 0 {
 		return nil
 	}
 	if req, ok := ba.GetArg(kvpb.Scan); ok {
-		_, tableID, _ := encoding.DecodeUvarintAscending(req.(*kvpb.ScanRequest).Key)
-		if tableID == stmtStatsTableID || tableID == txnStatsTableID {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		_, tableID, err := k.mu.codec.DecodeTablePrefix(req.(*kvpb.ScanRequest).Key)
+		if err != nil {
+			log.Warningf(ctx, "unable to decode prefix: %v", err)
+		}
+		if tableID == k.mu.stmtStatsTableID || tableID == k.mu.txnStatsTableID {
 			prettyKey := roachpb.PrettyPrintKey([]encoding.Direction{}, req.(*kvpb.ScanRequest).Key)
 
 			keyMatchedWideScan := kvReqWideScanStartKeyPattern.MatchString(prettyKey)

@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 filegroup(
@@ -10,6 +9,7 @@ filegroup(
 go_library(
     name = "importer",
     srcs = [
+        "export_base.go",
         "exportcsv.go",
         "exportparquet.go",
         "import_job.go",
@@ -40,8 +40,10 @@ go_library(
         "//pkg/geo",
         "//pkg/geo/geopb",
         "//pkg/jobs",
+        "//pkg/jobs/ingeststopped",
         "//pkg/jobs/joberror",
         "//pkg/jobs/jobspb",
+        "//pkg/jobs/jobsprofiler",
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvpb",
@@ -86,6 +88,7 @@ go_library(
         "//pkg/sql/rowenc",
         "//pkg/sql/rowexec",
         "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/catconstants",
         "//pkg/sql/sem/catid",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
@@ -108,6 +111,8 @@ go_library(
         "//pkg/util/log",
         "//pkg/util/log/eventpb",
         "//pkg/util/log/logutil",
+        "//pkg/util/mon",
+        "//pkg/util/parquet",
         "//pkg/util/protoutil",
         "//pkg/util/retry",
         "//pkg/util/syncutil",
@@ -121,7 +126,6 @@ go_library(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
         "@com_github_cockroachdb_redact//:redact",
-        "@com_github_fraugster_parquet_go//:parquet-go",
         "@com_github_fraugster_parquet_go//parquet",
         "@com_github_fraugster_parquet_go//parquetschema",
         "@com_github_lib_pq//oid",
@@ -170,6 +174,7 @@ go_test(
         "//pkg/cloud/impl:cloudimpl",
         "//pkg/cloud/nodelocal",
         "//pkg/cloud/userfile",
+        "//pkg/col/coldata",
         "//pkg/config",
         "//pkg/config/zonepb",
         "//pkg/jobs",
@@ -181,8 +186,11 @@ go_test(
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/kvserverbase",
+        "//pkg/kv/kvserver/protectedts",
+        "//pkg/multitenant/tenantcapabilities",
         "//pkg/roachpb",
         "//pkg/rpc",
+        "//pkg/rpc/nodedialer",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",
@@ -212,6 +220,7 @@ go_test(
         "//pkg/sql/row",
         "//pkg/sql/rowenc",
         "//pkg/sql/rowexec",
+        "//pkg/sql/sem/catconstants",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
@@ -227,6 +236,7 @@ go_test(
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util",
+        "//pkg/util/circuit",
         "//pkg/util/ctxgroup",
         "//pkg/util/encoding/csv",
         "//pkg/util/envutil",
@@ -235,6 +245,8 @@ go_test(
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/log/eventpb",
+        "//pkg/util/mon",
+        "//pkg/util/parquet",
         "//pkg/util/protoutil",
         "//pkg/util/randutil",
         "//pkg/util/retry",
@@ -247,7 +259,6 @@ go_test(
         "//pkg/workload/workloadsql",
         "@com_github_cockroachdb_cockroach_go_v2//crdb",
         "@com_github_cockroachdb_errors//:errors",
-        "@com_github_fraugster_parquet_go//:parquet-go",
         "@com_github_fraugster_parquet_go//parquet",
         "@com_github_go_sql_driver_mysql//:mysql",
         "@com_github_gogo_protobuf//proto",
@@ -261,5 +272,3 @@ go_test(
         "@io_vitess_vitess//go/vt/sqlparser",
     ],
 )
-
-get_x_data(name = "get_x_data")

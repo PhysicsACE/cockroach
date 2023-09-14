@@ -12,7 +12,12 @@ const path = require("path");
 const webpack = require("webpack");
 const WebpackBar = require("webpackbar");
 const MomentLocalesPlugin = require("moment-locales-webpack-plugin");
+const MomentTimezoneDataPlugin = require("moment-timezone-data-webpack-plugin")
 const { ESBuildMinifyPlugin } = require("esbuild-loader");
+
+const { CopyEmittedFilesPlugin } = require("./build/webpack/copyEmittedFilesPlugin");
+
+const currentYear = new Date().getFullYear();
 
 // tslint:disable:object-literal-sort-keys
 module.exports = (env, argv) => {
@@ -168,6 +173,30 @@ module.exports = (env, argv) => {
         /node_modules\/antd\/lib\/style\/index\.less/,
         path.resolve(__dirname, "src/core/antd-patch.less"),
       ),
+
+      // Use MomentTimezoneDataPlugin to remove timezone data that we don't need.
+      new MomentTimezoneDataPlugin({
+        matchZones: ['Etc/UTC', 'America/New_York'],
+        startYear: 2021,
+        endYear: currentYear + 10,
+        // We have to tell the plugin where to store the pruned file
+        // otherwise webpack can't find it.
+        cacheDir: path.resolve(__dirname, "timezones"),
+      }),
+
+      // When requested with --env.copy-to=foo, copy all emitted files to
+      // arbitrary destination(s). Note that multiple destinations are supported
+      // but providing --env.copy-to multiple times at the command-line.
+      // This plugin does nothing in one-shot (i.e. non-watch) builds, or when
+      // no destinations are provided.
+      new CopyEmittedFilesPlugin({
+        destinations: (function() {
+          const copyTo = env["copy-to"] || [];
+          return typeof copyTo === "string"
+            ? [copyTo]
+            : copyTo;
+        })(),
+      }),
     ],
 
     // When importing a module whose path matches one of the following, just

@@ -14,7 +14,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
@@ -51,11 +50,17 @@ WHERE name = %s
 		return nil, err
 	}
 
-	return parse(fmt.Sprintf(showCreateQuery, lexbase.EscapeSQLString(n.Name.Object())))
+	return d.parse(fmt.Sprintf(showCreateQuery, lexbase.EscapeSQLString(n.Name.Object())))
 }
 
 func (d *delegator) delegateShowCreateTable(n *tree.ShowCreate) (tree.Statement, error) {
-	const showCreateQuery = `
+	createField := "create_statement"
+	switch n.FmtOpt {
+	case tree.ShowCreateFormatOptionRedactedValues:
+		createField = "crdb_internal.redact(create_redactable)"
+	}
+
+	showCreateQuery := `
 WITH zone_configs AS (
 		SELECT
 			string_agg(
@@ -77,7 +82,7 @@ WITH zone_configs AS (
 )
 SELECT
     %[3]s AS table_name,
-    concat(create_statement,
+    concat(` + createField + `,
         CASE
 				WHEN is_multi_region THEN
 					CASE
@@ -89,7 +94,7 @@ SELECT
         WHEN NOT has_partitions
           THEN NULL
 				ELSE
-					e'\n-- Warning: Partitioned table with no zone configurations.'
+					e'\n-- Warning: Partitioned table with no zone configurations.\n'
         END
     ) AS create_statement
 FROM
@@ -149,7 +154,8 @@ SELECT
     direction,
     storing::BOOL,
     implicit::BOOL,
-    is_visible::BOOL AS visible`
+    is_visible::BOOL AS visible,
+    visibility`
 
 	if n.WithComment {
 		getIndexesQuery += `,
@@ -274,7 +280,7 @@ func (d *delegator) delegateShowCreateAllTables() (tree.Statement, error) {
 		lexbase.EscapeSQLString(databaseLiteral),
 	)
 
-	return parse(query)
+	return d.parse(query)
 }
 
 // showTableDetails returns the AST of a query which extracts information about
@@ -290,18 +296,11 @@ func (d *delegator) delegateShowCreateAllTables() (tree.Statement, error) {
 func (d *delegator) showTableDetails(
 	name *tree.UnresolvedObjectName, query string,
 ) (tree.Statement, error) {
-	// We avoid the cache so that we can observe the details without
-	// taking a lease, like other SHOW commands.
-	flags := cat.Flags{AvoidDescriptorCaches: true, NoTableStats: true}
-	tn := name.ToTableName()
-	dataSource, resName, err := d.catalog.ResolveDataSource(d.ctx, flags, &tn)
+
+	dataSource, resName, err := d.resolveAndModifyUnresolvedObjectName(name)
 	if err != nil {
 		return nil, err
 	}
-	if err := d.catalog.CheckAnyPrivilege(d.ctx, dataSource); err != nil {
-		return nil, err
-	}
-
 	fullQuery := fmt.Sprintf(query,
 		lexbase.EscapeSQLString(resName.Catalog()),
 		lexbase.EscapeSQLString(resName.Table()),
@@ -311,5 +310,5 @@ func (d *delegator) showTableDetails(
 		dataSource.PostgresDescriptorID(),
 	)
 
-	return parse(fullQuery)
+	return d.parse(fullQuery)
 }

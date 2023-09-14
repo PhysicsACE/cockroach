@@ -8,6 +8,8 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package colfetcher implements logic for fetching kv's and forming table rows
+// for an arbitrary number of tables.
 package colfetcher
 
 import (
@@ -17,7 +19,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -237,18 +238,19 @@ type cFetcher struct {
 	// stableKVs indicates whether the KVs returned by nextKVer are stable (i.e.
 	// are not invalidated) across NextKV() calls.
 	stableKVs bool
-	// bytesRead and batchRequestsIssued store the total number of bytes read
-	// and of BatchRequests issued, respectively, by this cFetcher throughout
-	// its lifetime in case when the underlying row.KVFetcher has already been
-	// closed and nil-ed out.
+	// bytesRead, kvPairsRead, and batchRequestsIssued store the total number of
+	// bytes read, key-values pairs read, and of BatchRequests issued,
+	// respectively, by this cFetcher throughout its lifetime in case when the
+	// underlying row.KVFetcher has already been closed and nil-ed out.
 	//
 	// The fields should not be accessed directly by the users of the cFetcher -
-	// getBytesRead() and getBatchRequestsIssued() should be used instead.
+	// getBytesRead(), getKVPairsRead(), and getBatchRequestsIssued() should be
+	// used instead.
 	bytesRead           int64
+	kvPairsRead         int64
 	batchRequestsIssued int64
 	// cpuStopWatch tracks the CPU time spent by this cFetcher while fulfilling KV
-	// requests *in the current goroutine*. It should only be accessed through
-	// getKVCPUTime().
+	// requests *in the current goroutine*.
 	cpuStopWatch *timeutil.CPUStopWatch
 
 	// machine contains fields that get updated during the run of the fetcher.
@@ -557,7 +559,7 @@ func (cf *cFetcher) StartScan(
 	cf.machine.state[0] = stateResetBatch
 	cf.machine.state[1] = stateInitFetch
 	return cf.fetcher.SetupNextFetch(
-		ctx, spans, nil /* spanIDs */, batchBytesLimit, firstBatchLimit,
+		ctx, spans, nil /* spanIDs */, batchBytesLimit, firstBatchLimit, false, /* spansCanOverlap */
 	)
 }
 
@@ -1361,10 +1363,13 @@ func (cf *cFetcher) getBytesRead() int64 {
 	return cf.bytesRead
 }
 
-// getKVCPUTime returns the amount of CPU time spent in the current goroutine
-// while fulfilling KV requests.
-func (cf *cFetcher) getKVCPUTime() time.Duration {
-	return cf.cpuStopWatch.Elapsed()
+// getKVPairsRead returns the number of key-value pairs read by the cFetcher
+// throughout its lifetime so far.
+func (cf *cFetcher) getKVPairsRead() int64 {
+	if cf.fetcher != nil {
+		return cf.fetcher.GetKVPairsRead()
+	}
+	return cf.kvPairsRead
 }
 
 // getBatchRequestsIssued returns the number of BatchRequests issued by the
@@ -1402,6 +1407,7 @@ func (cf *cFetcher) Close(ctx context.Context) {
 		cf.nextKVer = nil
 		if cf.fetcher != nil {
 			cf.bytesRead = cf.fetcher.GetBytesRead()
+			cf.kvPairsRead = cf.fetcher.GetKVPairsRead()
 			cf.batchRequestsIssued = cf.fetcher.GetBatchRequestsIssued()
 			cf.fetcher.Close(ctx)
 			cf.fetcher = nil

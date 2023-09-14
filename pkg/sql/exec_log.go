@@ -11,26 +11,24 @@
 package sql
 
 import (
-	"bytes"
 	"context"
-	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
 
@@ -45,46 +43,25 @@ import (
 // using structured events. The payload of structured events
 // is also auto-documented; see the corresponding event definitions
 // for details.
-//
-// When the cluster setting `sql.log.unstructured_entries.enabled` is set
-// (pre-v21.1 compatibility format, obsolete), the event payloads include
-// the following fields:
-//
-//  - a label indicating where the data was generated - useful for troubleshooting.
-//    - distinguishes e.g. exec, prepare, internal-exec, etc.
-//  - the current value of `application_name`
-//    - required for auditing, also helps filter out messages from a specific app.
-//  - the logging trigger.
-//    - "{}" for execution logs: any activity is worth logging in the exec log
-//  - the full text of the query.
-//  - the placeholder values. Useful for queries using placeholders.
-//    - "{}" when there are no placeholders.
-//  - the query execution time in milliseconds. For troubleshooting.
-//  - the number of rows that were produced. For troubleshooting.
-//  - the status of the query (OK for success, ERROR or full error
-//    message upon error). Needed for auditing and troubleshooting.
-//  - the number of times the statement was retried automatically
-//    by the server so far.
-//
-// TODO(knz): Remove this documentation for the obsolete format when
-// support for the format is removed, post-v21.1.
 
 // logStatementsExecuteEnabled causes the Executor to log executed
 // statements and, if any, resulting errors.
 var logStatementsExecuteEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"sql.trace.log_statement_execute",
-	"set to true to enable logging of executed statements",
+	"set to true to enable logging of all executed statements",
 	false,
-).WithPublic()
+	settings.WithName("sql.log.all_statements.enabled"),
+	settings.WithPublic)
 
-var slowQueryLogThreshold = settings.RegisterPublicDurationSettingWithExplicitUnit(
+var slowQueryLogThreshold = settings.RegisterDurationSettingWithExplicitUnit(
 	settings.TenantWritable,
 	"sql.log.slow_query.latency_threshold",
 	"when set to non-zero, log statements whose service latency exceeds "+
 		"the threshold to a secondary logger on each node",
 	0,
 	settings.NonNegativeDuration,
+	settings.WithPublic,
 )
 
 var slowInternalQueryLogEnabled = settings.RegisterBoolSetting(
@@ -94,7 +71,7 @@ var slowInternalQueryLogEnabled = settings.RegisterBoolSetting(
 		"are logged to a separate log. Must have the slow query log enabled for this "+
 		"setting to have any effect.",
 	false,
-).WithPublic()
+	settings.WithPublic)
 
 var slowQueryLogFullTableScans = settings.RegisterBoolSetting(
 	settings.TenantWritable,
@@ -103,14 +80,7 @@ var slowQueryLogFullTableScans = settings.RegisterBoolSetting(
 		"slow query log even if they do not meet the latency threshold. Must have the slow query "+
 		"log enabled for this setting to have any effect.",
 	false,
-).WithPublic()
-
-var unstructuredQueryLog = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"sql.log.unstructured_entries.enabled",
-	"when set, SQL execution and audit logs use the pre-v21.1 unstrucured format",
-	false,
-)
+	settings.WithPublic)
 
 var adminAuditLogEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
@@ -130,7 +100,7 @@ var telemetryLoggingEnabled = settings.RegisterBoolSetting(
 	// setting directly after tenant creation without significant overhead in terms
 	// of time and code.
 	envutil.EnvOrDefaultBool("COCKROACH_SQL_TELEMETRY_QUERY_SAMPLING_ENABLED", false),
-).WithPublic()
+	settings.WithPublic)
 
 type executorType int
 
@@ -148,16 +118,12 @@ var logLabels = []string{"exec", "exec-internal"}
 // logLabel returns the log label for the given executor type.
 func (s executorType) logLabel() string { return logLabels[s] }
 
-var sqlPerfLogger log.ChannelLogger = log.SqlPerf
-var sqlPerfInternalLogger log.ChannelLogger = log.SqlInternalPerf
-
 // maybeLogStatement conditionally records the current statement
 // (p.curPlan) to the exec / audit logs.
 func (p *planner) maybeLogStatement(
 	ctx context.Context,
 	execType executorType,
-	isCopy bool,
-	numRetries, txnCounter, rows int,
+	numRetries, txnCounter, rows, stmtCount int,
 	bulkJobId uint64,
 	err error,
 	queryReceived time.Time,
@@ -165,27 +131,27 @@ func (p *planner) maybeLogStatement(
 	telemetryLoggingMetrics *TelemetryLoggingMetrics,
 	stmtFingerprintID appstatspb.StmtFingerprintID,
 	queryStats *topLevelQueryStats,
+	statsCollector sqlstats.StatsCollector,
 ) {
-	p.maybeLogStatementInternal(ctx, execType, isCopy, numRetries, txnCounter,
-		rows, bulkJobId, err, queryReceived, hasAdminRoleCache,
-		telemetryLoggingMetrics, stmtFingerprintID, queryStats,
+	p.maybeAuditRoleBasedAuditEvent(ctx, execType)
+	p.maybeLogStatementInternal(ctx, execType, numRetries, txnCounter,
+		rows, stmtCount, bulkJobId, err, queryReceived, hasAdminRoleCache,
+		telemetryLoggingMetrics, stmtFingerprintID, queryStats, statsCollector,
 	)
 }
-
-var errTxnIsNotOpen = errors.New("txn is already committed or rolled back")
 
 func (p *planner) maybeLogStatementInternal(
 	ctx context.Context,
 	execType executorType,
-	isCopy bool,
-	numRetries, txnCounter, rows int,
+	numRetries, txnCounter, rows, stmtCount int,
 	bulkJobId uint64,
 	err error,
 	startTime time.Time,
 	hasAdminRoleCache *HasAdminRoleCache,
 	telemetryMetrics *TelemetryLoggingMetrics,
 	stmtFingerprintID appstatspb.StmtFingerprintID,
-	queryStats *topLevelQueryStats,
+	topLevelQueryStats *topLevelQueryStats,
+	statsCollector sqlstats.StatsCollector,
 ) {
 	// Note: if you find the code below crashing because p.execCfg == nil,
 	// do not add a test "if p.execCfg == nil { do nothing }" !
@@ -197,11 +163,14 @@ func (p *planner) maybeLogStatementInternal(
 	slowLogFullTableScans := slowQueryLogFullTableScans.Get(&p.execCfg.Settings.SV)
 	slowQueryLogEnabled := slowLogThreshold != 0
 	slowInternalQueryLogEnabled := slowInternalQueryLogEnabled.Get(&p.execCfg.Settings.SV)
-	auditEventsDetected := len(p.curPlan.auditEvents) != 0
-	maxEventFrequency := TelemetryMaxEventFrequency.Get(&p.execCfg.Settings.SV)
+	auditEventsDetected := len(p.curPlan.auditEventBuilders) != 0
+	logConsoleQuery := telemetryInternalConsoleQueriesEnabled.Get(&p.execCfg.Settings.SV) &&
+		strings.HasPrefix(p.SessionData().ApplicationName, "$ internal-console")
 
-	// We only consider non-internal SQL statements for telemetry logging.
-	telemetryLoggingEnabled := telemetryLoggingEnabled.Get(&p.execCfg.Settings.SV) && execType != executorTypeInternal
+	// We only consider non-internal SQL statements for telemetry logging unless
+	// the telemetryInternalQueriesEnabled is true.
+	telemetryLoggingEnabled := telemetryLoggingEnabled.Get(&p.execCfg.Settings.SV) &&
+		(execType == executorTypeExec || telemetryInternalQueriesEnabled.Get(&p.execCfg.Settings.SV) || logConsoleQuery)
 
 	// If hasAdminRoleCache IsSet is true iff AdminAuditLog is enabled.
 	shouldLogToAdminAuditLog := hasAdminRoleCache.IsSet && hasAdminRoleCache.HasAdminRole
@@ -219,8 +188,6 @@ func (p *planner) maybeLogStatementInternal(
 
 	// Compute the pieces of data that are going to be included in logged events.
 
-	// The session's application_name.
-	appName := p.EvalContext().SessionData().ApplicationName
 	// The duration of the query so far. Age is the duration expressed in milliseconds.
 	queryDuration := timeutil.Since(startTime)
 	age := float32(queryDuration.Nanoseconds()) / 1e6
@@ -232,74 +199,6 @@ func (p *planner) maybeLogStatementInternal(
 	}
 	// The type of execution context (execute/prepare).
 	lbl := execType.logLabel()
-
-	if unstructuredQueryLog.Get(&p.execCfg.Settings.SV) {
-		// This entire branch exists for the sake of backward
-		// compatibility with log parsers for v20.2 and prior. This format
-		// is obsolete and so this branch can be removed in v21.2.
-		//
-		// Look at the code "below" this if case for the main (default)
-		// logging output.
-
-		// The statement being executed.
-		stmtStr := p.curPlan.stmt.AST.String()
-		plStr := p.extendedEvalCtx.Placeholders.Values.String()
-
-		if logV {
-			// Copy to the debug log.
-			log.VEventf(ctx, execType.vLevel(), "%s %q %q %s %.3f %d %q %d",
-				lbl, appName, stmtStr, plStr, age, rows, execErrStr, numRetries)
-		}
-
-		// Now log!
-		if auditEventsDetected {
-			auditErrStr := "OK"
-			if err != nil {
-				auditErrStr = "ERROR"
-			}
-
-			var buf bytes.Buffer
-			buf.WriteByte('{')
-			sep := ""
-			for _, ev := range p.curPlan.auditEvents {
-				mode := "READ"
-				if ev.writing {
-					mode = "READWRITE"
-				}
-				fmt.Fprintf(&buf, "%s%q[%d]:%s", sep, ev.desc.GetName(), ev.desc.GetID(), mode)
-				sep = ", "
-			}
-			buf.WriteByte('}')
-			logTrigger := buf.String()
-
-			log.SensitiveAccess.Infof(ctx, "%s %q %s %q %s %.3f %d %s %d",
-				lbl, appName, logTrigger, stmtStr, plStr, age, rows, auditErrStr, numRetries)
-		}
-		if slowQueryLogEnabled && (queryDuration > slowLogThreshold || slowLogFullTableScans) {
-			logReason, shouldLog := p.slowQueryLogReason(queryDuration, slowLogThreshold)
-
-			var logger log.ChannelLogger
-			// Non-internal queries are always logged to the slow query log.
-			if execType == executorTypeExec {
-				logger = sqlPerfLogger
-			}
-			// Internal queries that surpass the slow query log threshold should only
-			// be logged to the slow-internal-only log if the cluster setting dictates.
-			if execType == executorTypeInternal && slowInternalQueryLogEnabled {
-				logger = sqlPerfInternalLogger
-			}
-
-			if logger != nil && shouldLog {
-				logger.Infof(ctx, "%.3fms %s %q {} %q %s %d %q %d %s",
-					age, lbl, appName, stmtStr, plStr, rows, execErrStr, numRetries, logReason)
-			}
-		}
-		if logExecuteEnabled {
-			log.SqlExec.Infof(ctx, "%s %q {} %q %s %.3f %d %q %d",
-				lbl, appName, stmtStr, plStr, age, rows, execErrStr, numRetries)
-		}
-		return
-	}
 
 	// New logging format in v21.1.
 	sqlErrState := ""
@@ -318,6 +217,7 @@ func (p *planner) maybeLogStatementInternal(
 		FullTableScan: p.curPlan.flags.IsSet(planFlagContainsFullTableScan),
 		FullIndexScan: p.curPlan.flags.IsSet(planFlagContainsFullIndexScan),
 		TxnCounter:    uint32(txnCounter),
+		StmtPosInTxn:  uint32(stmtCount),
 	}
 
 	// Note that for bulk job query (IMPORT, BACKUP and RESTORE), we don't
@@ -332,41 +232,12 @@ func (p *planner) maybeLogStatementInternal(
 
 	if auditEventsDetected {
 		// TODO(knz): re-add the placeholders and age into the logging event.
-		entries := make([]logpb.EventPayload, len(p.curPlan.auditEvents))
-		for i, ev := range p.curPlan.auditEvents {
-			mode := "r"
-			if ev.writing {
-				mode = "rw"
-			}
-			tableName := ""
-			var tn *tree.TableName
-			// We only have a valid *table* name if the object being
-			// audited is table-like (includes view, sequence etc). For
-			// now, this is sufficient because the auditing feature can
-			// only audit tables. If/when the mechanisms are extended to
-			// audit databases and schema, we need more logic here to
-			// extract a name to include in the logging events.
-			if p.txn != nil && p.txn.IsOpen() {
-				// Only open txn accepts further commands.
-				tn, err = p.getQualifiedTableName(ctx, ev.desc)
-			} else {
-				err = errTxnIsNotOpen
-			}
-			if err != nil {
-				log.Warningf(ctx, "name for audited table ID %d not found: %v", ev.desc.GetID(), err)
-			} else {
-				tableName = tn.FQString()
-			}
-			entries[i] = &eventpb.SensitiveTableAccess{
-				CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
-					DescriptorID: uint32(ev.desc.GetID()),
-				},
-				CommonSQLExecDetails: execDetails,
-				TableName:            tableName,
-				AccessMode:           mode,
-			}
+		entries := make([]logpb.EventPayload, len(p.curPlan.auditEventBuilders))
+		for idx, builder := range p.curPlan.auditEventBuilders {
+			auditEvent := builder.BuildAuditEvent(ctx, p, eventpb.CommonSQLEventDetails{}, execDetails)
+			entries[idx] = auditEvent
 		}
-		p.logEventsOnlyExternally(ctx, isCopy, entries...)
+		p.logEventsOnlyExternally(ctx, entries...)
 	}
 
 	if slowQueryLogEnabled && (
@@ -378,12 +249,12 @@ func (p *planner) maybeLogStatementInternal(
 		switch {
 		case execType == executorTypeExec:
 			// Non-internal queries are always logged to the slow query log.
-			p.logEventsOnlyExternally(ctx, isCopy, &eventpb.SlowQuery{CommonSQLExecDetails: execDetails})
+			p.logEventsOnlyExternally(ctx, &eventpb.SlowQuery{CommonSQLExecDetails: execDetails})
 
 		case execType == executorTypeInternal && slowInternalQueryLogEnabled:
 			// Internal queries that surpass the slow query log threshold should only
 			// be logged to the slow-internal-only log if the cluster setting dictates.
-			p.logEventsOnlyExternally(ctx, isCopy, &eventpb.SlowQueryInternal{CommonSQLExecDetails: execDetails})
+			p.logEventsOnlyExternally(ctx, &eventpb.SlowQueryInternal{CommonSQLExecDetails: execDetails})
 		}
 	}
 
@@ -398,44 +269,81 @@ func (p *planner) maybeLogStatementInternal(
 				// see a copy of the execution on the DEV Channel.
 				dst:               LogExternally | LogToDevChannelIfVerbose,
 				verboseTraceLevel: execType.vLevel(),
-				isCopy:            isCopy,
 			},
 			&eventpb.QueryExecute{CommonSQLExecDetails: execDetails})
 	}
 
 	if shouldLogToAdminAuditLog {
-		p.logEventsOnlyExternally(ctx, isCopy, &eventpb.AdminQuery{CommonSQLExecDetails: execDetails})
+		p.logEventsOnlyExternally(ctx, &eventpb.AdminQuery{CommonSQLExecDetails: execDetails})
 	}
 
 	if telemetryLoggingEnabled && !p.SessionData().TroubleshootingMode {
 		// We only log to the telemetry channel if enough time has elapsed from
 		// the last event emission.
-		requiredTimeElapsed := 1.0 / float64(maxEventFrequency)
 		tracingEnabled := telemetryMetrics.isTracing(p.curPlan.instrumentation.Tracing())
-		// Always sample if the current statement is not of type DML or tracing
-		// is enabled for this statement.
-		if p.stmt.AST.StatementType() != tree.TypeDML || tracingEnabled {
-			requiredTimeElapsed = 0
+
+		isStmtMode := telemetrySamplingMode.Get(&p.execCfg.Settings.SV) == telemetryModeStatement
+
+		// Always sample if one of the scenarios is true:
+		// - on 'statement' sampling and the current statement is not of type DML
+		// - on 'transaction' sampling mode and the current statement is not of type DML and is not a COMMIT
+		// - tracing is enabled for this statement
+		// - this is a query emitted by our console (application_name starts with `$ internal-console`) and
+		// the cluster setting to log console queries is enabled
+		forceLog := (p.stmt.AST.StatementType() != tree.TypeDML &&
+			(isStmtMode || p.stmt.AST.StatementTag() != "COMMIT")) ||
+			tracingEnabled || logConsoleQuery
+
+		var txnID string
+		// p.txn can be nil for COPY.
+		if p.txn != nil {
+			txnID = p.txn.ID().String()
 		}
-		if telemetryMetrics.maybeUpdateLastEmittedTime(telemetryMetrics.timeNow(), requiredTimeElapsed) {
-			var txnID string
-			// p.txn can be nil for COPY.
-			if p.txn != nil {
-				txnID = p.txn.ID().String()
+
+		if telemetryMetrics.shouldEmitLog(telemetryMetrics.timeNow(), txnID, forceLog, stmtCount) {
+			var queryLevelStats execstats.QueryLevelStats
+			if stats, ok := p.instrumentation.GetQueryLevelStats(); ok {
+				queryLevelStats = *stats
 			}
 
-			var stats execstats.QueryLevelStats
-			if queryLevelStats, ok := p.instrumentation.GetQueryLevelStats(); ok {
-				stats = *queryLevelStats
-			}
-
-			stats = telemetryMetrics.getQueryLevelStats(stats)
+			queryLevelStats = telemetryMetrics.getQueryLevelStats(queryLevelStats)
 			indexRecs := make([]string, 0, len(p.curPlan.instrumentation.indexRecs))
 			for _, rec := range p.curPlan.instrumentation.indexRecs {
 				indexRecs = append(indexRecs, rec.SQL)
 			}
 
+			phaseTimes := statsCollector.PhaseTimes()
+
+			// Collect the statistics.
+			idleLatRaw := phaseTimes.GetIdleLatency(statsCollector.PreviousPhaseTimes())
+			idleLatNanos := idleLatRaw.Nanoseconds()
+			runLatRaw := phaseTimes.GetRunLatency()
+			runLatNanos := runLatRaw.Nanoseconds()
+			parseLatNanos := phaseTimes.GetParsingLatency().Nanoseconds()
+			planLatNanos := phaseTimes.GetPlanningLatency().Nanoseconds()
+			// We want to exclude any overhead to reduce possible confusion.
+			svcLatRaw := phaseTimes.GetServiceLatencyNoOverhead()
+			svcLatNanos := svcLatRaw.Nanoseconds()
+
+			// processing latency: contributing towards SQL results.
+			processingLatNanos := parseLatNanos + planLatNanos + runLatNanos
+
+			// overhead latency: txn/retry management, error checking, etc
+			execOverheadNanos := svcLatNanos - processingLatNanos
+
 			skippedQueries := telemetryMetrics.resetSkippedQueryCount()
+
+			var sqlInstanceIDs []int32
+			if len(queryLevelStats.SqlInstanceIds) > 0 {
+				sqlInstanceIDs = make([]int32, 0, len(queryLevelStats.SqlInstanceIds))
+				for sqlId := range queryLevelStats.SqlInstanceIds {
+					sqlInstanceIDs = append(sqlInstanceIDs, int32(sqlId))
+				}
+				sort.Slice(sqlInstanceIDs, func(i, j int) bool {
+					return sqlInstanceIDs[i] < sqlInstanceIDs[j]
+				})
+			}
+
 			sampledQuery := eventpb.SampledQuery{
 				CommonSQLExecDetails:                  execDetails,
 				SkippedQueries:                        skippedQueries,
@@ -452,9 +360,9 @@ func (p *planner) maybeLogStatementInternal(
 				OutputRowsEstimate:                    p.curPlan.instrumentation.outputRows,
 				StatsAvailable:                        p.curPlan.instrumentation.statsAvailable,
 				NanosSinceStatsCollected:              int64(p.curPlan.instrumentation.nanosSinceStatsCollected),
-				BytesRead:                             queryStats.bytesRead,
-				RowsRead:                              queryStats.rowsRead,
-				RowsWritten:                           queryStats.rowsWritten,
+				BytesRead:                             topLevelQueryStats.bytesRead,
+				RowsRead:                              topLevelQueryStats.rowsRead,
+				RowsWritten:                           topLevelQueryStats.rowsWritten,
 				InnerJoinCount:                        int64(p.curPlan.instrumentation.joinTypeCounts[descpb.InnerJoin]),
 				LeftOuterJoinCount:                    int64(p.curPlan.instrumentation.joinTypeCounts[descpb.LeftOuterJoin]),
 				FullOuterJoinCount:                    int64(p.curPlan.instrumentation.joinTypeCounts[descpb.FullOuterJoin]),
@@ -470,14 +378,19 @@ func (p *planner) maybeLogStatementInternal(
 				InvertedJoinCount:                     int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.InvertedJoin]),
 				ApplyJoinCount:                        int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ApplyJoin]),
 				ZigZagJoinCount:                       int64(p.curPlan.instrumentation.joinAlgorithmCounts[exec.ZigZagJoin]),
-				ContentionNanos:                       stats.ContentionTime.Nanoseconds(),
-				Regions:                               p.curPlan.instrumentation.regions,
-				NetworkBytesSent:                      stats.NetworkBytesSent,
-				MaxMemUsage:                           stats.MaxMemUsage,
-				MaxDiskUsage:                          stats.MaxDiskUsage,
-				KVBytesRead:                           stats.KVBytesRead,
-				KVRowsRead:                            stats.KVRowsRead,
-				NetworkMessages:                       stats.NetworkMessages,
+				ContentionNanos:                       queryLevelStats.ContentionTime.Nanoseconds(),
+				Regions:                               queryLevelStats.Regions,
+				SQLInstanceIDs:                        sqlInstanceIDs,
+				NetworkBytesSent:                      queryLevelStats.NetworkBytesSent,
+				MaxMemUsage:                           queryLevelStats.MaxMemUsage,
+				MaxDiskUsage:                          queryLevelStats.MaxDiskUsage,
+				KVBytesRead:                           queryLevelStats.KVBytesRead,
+				KVPairsRead:                           queryLevelStats.KVPairsRead,
+				KVRowsRead:                            queryLevelStats.KVRowsRead,
+				KvTimeNanos:                           queryLevelStats.KVTime.Nanoseconds(),
+				KvGrpcCalls:                           queryLevelStats.KVBatchRequestsIssued,
+				NetworkMessages:                       queryLevelStats.NetworkMessages,
+				CpuTimeNanos:                          queryLevelStats.CPUTime.Nanoseconds(),
 				IndexRecommendations:                  indexRecs,
 				Indexes:                               p.curPlan.instrumentation.indexesUsed,
 				ScanCount:                             int64(p.curPlan.instrumentation.scanCounts[exec.ScanCount]),
@@ -485,22 +398,41 @@ func (p *planner) maybeLogStatementInternal(
 				ScanWithStatsForecastCount:            int64(p.curPlan.instrumentation.scanCounts[exec.ScanWithStatsForecastCount]),
 				TotalScanRowsWithoutForecastsEstimate: p.curPlan.instrumentation.totalScanRowsWithoutForecasts,
 				NanosSinceStatsForecasted:             int64(p.curPlan.instrumentation.nanosSinceStatsForecasted),
+				IdleLatencyNanos:                      idleLatNanos,
+				ServiceLatencyNanos:                   svcLatNanos,
+				RunLatencyNanos:                       runLatNanos,
+				PlanLatencyNanos:                      planLatNanos,
+				ParseLatencyNanos:                     parseLatNanos,
+				OverheadLatencyNanos:                  execOverheadNanos,
+				MvccBlockBytes:                        queryLevelStats.MvccBlockBytes,
+				MvccBlockBytesInCache:                 queryLevelStats.MvccBlockBytesInCache,
+				MvccKeyBytes:                          queryLevelStats.MvccKeyBytes,
+				MvccPointCount:                        queryLevelStats.MvccPointCount,
+				MvccPointsCoveredByRangeTombstones:    queryLevelStats.MvccPointsCoveredByRangeTombstones,
+				MvccRangeKeyContainedPoints:           queryLevelStats.MvccRangeKeyContainedPoints,
+				MvccRangeKeyCount:                     queryLevelStats.MvccRangeKeyCount,
+				MvccRangeKeySkippedPoints:             queryLevelStats.MvccRangeKeySkippedPoints,
+				MvccSeekCountInternal:                 queryLevelStats.MvccSeeksInternal,
+				MvccSeekCount:                         queryLevelStats.MvccSeeks,
+				MvccStepCountInternal:                 queryLevelStats.MvccStepsInternal,
+				MvccStepCount:                         queryLevelStats.MvccSteps,
+				MvccValueBytes:                        queryLevelStats.MvccValueBytes,
+				SchemaChangerMode:                     p.curPlan.instrumentation.schemaChangerMode.String(),
 			}
-			p.logOperationalEventsOnlyExternally(ctx, isCopy, &sampledQuery)
+
+			p.logOperationalEventsOnlyExternally(ctx, &sampledQuery)
 		} else {
 			telemetryMetrics.incSkippedQueryCount()
 		}
 	}
 }
 
-func (p *planner) logEventsOnlyExternally(
-	ctx context.Context, isCopy bool, entries ...logpb.EventPayload,
-) {
+func (p *planner) logEventsOnlyExternally(ctx context.Context, entries ...logpb.EventPayload) {
 	// The API contract for logEventsWithOptions() is that it returns
 	// no error when system.eventlog is not written to.
 	_ = p.logEventsWithOptions(ctx,
 		2, /* depth: we want to use the caller location */
-		eventLogOptions{dst: LogExternally, isCopy: isCopy},
+		eventLogOptions{dst: LogExternally},
 		entries...)
 }
 
@@ -508,65 +440,12 @@ func (p *planner) logEventsOnlyExternally(
 // options to omit SQL Name redaction. This is used when logging to
 // the telemetry channel when we want additional metadata available.
 func (p *planner) logOperationalEventsOnlyExternally(
-	ctx context.Context, isCopy bool, entries ...logpb.EventPayload,
+	ctx context.Context, entries ...logpb.EventPayload,
 ) {
 	// The API contract for logEventsWithOptions() is that it returns
 	// no error when system.eventlog is not written to.
 	_ = p.logEventsWithOptions(ctx,
 		2, /* depth: we want to use the caller location */
-		eventLogOptions{dst: LogExternally, isCopy: isCopy, rOpts: redactionOptions{omitSQLNameRedaction: true}},
+		eventLogOptions{dst: LogExternally, rOpts: redactionOptions{omitSQLNameRedaction: true}},
 		entries...)
-}
-
-// maybeAudit marks the current plan being constructed as flagged
-// for auditing if the table being touched has an auditing mode set.
-// This is later picked up by maybeLogStatement() above.
-//
-// It is crucial that this gets checked reliably -- we don't want to
-// miss any statements! For now, we call this from CheckPrivilege(),
-// as this is the function most likely to be called reliably from any
-// caller that also uses a descriptor. Future changes that move the
-// call to this method elsewhere must find a way to ensure that
-// contributors who later add features do not have to remember to call
-// this to get it right.
-func (p *planner) maybeAudit(privilegeObject privilege.Object, priv privilege.Kind) {
-	tableDesc, ok := privilegeObject.(catalog.TableDescriptor)
-	if !ok || tableDesc.GetAuditMode() == descpb.TableDescriptor_DISABLED {
-		return
-	}
-	switch priv {
-	case privilege.INSERT, privilege.DELETE, privilege.UPDATE:
-		p.curPlan.auditEvents = append(p.curPlan.auditEvents, auditEvent{desc: tableDesc, writing: true})
-	default:
-		p.curPlan.auditEvents = append(p.curPlan.auditEvents, auditEvent{desc: tableDesc, writing: false})
-	}
-}
-
-func (p *planner) slowQueryLogReason(
-	queryDuration time.Duration, slowLogThreshold time.Duration,
-) (reason string, shouldLog bool) {
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	sep := " "
-	if slowLogThreshold != 0 && queryDuration > slowLogThreshold {
-		fmt.Fprintf(&buf, "%sLATENCY_THRESHOLD", sep)
-	}
-	if p.curPlan.flags.IsSet(planFlagContainsFullTableScan) {
-		fmt.Fprintf(&buf, "%sFULL_TABLE_SCAN", sep)
-	}
-	if p.curPlan.flags.IsSet(planFlagContainsFullIndexScan) {
-		fmt.Fprintf(&buf, "%sFULL_SECONDARY_INDEX_SCAN", sep)
-	}
-	buf.WriteByte(' ')
-	buf.WriteByte('}')
-	reason = buf.String()
-	return reason, reason != "{ }"
-}
-
-// auditEvent represents an audit event for a single table.
-type auditEvent struct {
-	// The descriptor being audited.
-	desc catalog.TableDescriptor
-	// Whether the event was for INSERT/DELETE/UPDATE.
-	writing bool
 }

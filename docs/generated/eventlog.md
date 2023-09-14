@@ -438,6 +438,43 @@ is directly or indirectly a member of the admin role) executes a query.
 | `FullIndexScan` | Whether the query contains a full secondary index scan of a non-partial index. | no |
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 | `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
+| `StmtPosInTxn` | The statement's index in the transaction, starting at 1. | no |
+
+### `role_based_audit_event`
+
+An event of type `role_based_audit_event` is an audit event recorded when an executed query belongs to a user whose role
+membership(s) correspond to any role that is enabled to emit an audit log via the sql.log.user_audit
+cluster setting.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Role` | The configured audit role that emitted this log. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | no |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `ExecMode` | How the statement was being executed (exec/prepare, etc.) | no |
+| `NumRows` | Number of rows returned. For mutation statements (INSERT, etc) that do not produce result rows, this field reports the number of rows affected. | no |
+| `SQLSTATE` | The SQLSTATE code for the error, if an error was encountered. Empty/omitted if no error. | no |
+| `ErrorText` | The text of the error if any. | partially |
+| `Age` | Age of the query in milliseconds. | no |
+| `NumRetries` | Number of retries, when the txn was reretried automatically by the server. | no |
+| `FullTableScan` | Whether the query contains a full table scan. | no |
+| `FullIndexScan` | Whether the query contains a full secondary index scan of a non-partial index. | no |
+| `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
+| `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
+| `StmtPosInTxn` | The statement's index in the transaction, starting at 1. | no |
 
 ### `sensitive_table_access`
 
@@ -473,6 +510,7 @@ a table marked as audited.
 | `FullIndexScan` | Whether the query contains a full secondary index scan of a non-partial index. | no |
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 | `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
+| `StmtPosInTxn` | The statement's index in the transaction, starting at 1. | no |
 
 ## SQL Execution Log
 
@@ -488,7 +526,7 @@ Events in this category are logged to the `SQL_EXEC` channel.
 ### `query_execute`
 
 An event of type `query_execute` is recorded when a query is executed,
-and the cluster setting `sql.trace.log_statement_execute` is set.
+and the cluster setting `sql.log.all_statements.enabled` is set.
 
 
 
@@ -515,6 +553,7 @@ and the cluster setting `sql.trace.log_statement_execute` is set.
 | `FullIndexScan` | Whether the query contains a full secondary index scan of a non-partial index. | no |
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 | `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
+| `StmtPosInTxn` | The statement's index in the transaction, starting at 1. | no |
 
 ## SQL Logical Schema Changes
 
@@ -730,7 +769,8 @@ AlterIndex is recorded when an index visibility is altered.
 |--|--|--|
 | `TableName` | The name of the table containing the affected index. | yes |
 | `IndexName` | The name of the affected index. | yes |
-| `NotVisible` | Set true if index is not visible. | no |
+| `NotVisible` | Set true if index is not visible. NOTE: THIS FIELD IS DEPRECATED in favor of invisibility. | no |
+| `Invisibility` | The new invisibility of the affected index. | no |
 
 
 #### Common fields
@@ -2092,7 +2132,7 @@ Events of this type are only emitted when the cluster setting
 | Field | Description | Sensitive |
 |--|--|--|
 | `Reason` | The reason for the authentication failure. See below for possible values for type `AuthFailReason`. | no |
-| `Detail` | The detailed error for the authentication failure. | yes |
+| `Detail` | The detailed error for the authentication failure. | partially |
 | `Method` | The authentication method used. | no |
 
 
@@ -2105,6 +2145,7 @@ Events of this type are only emitted when the cluster setting
 | `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `SessionID` | The connection's hex encoded session id. | no |
 | `Transport` | The connection type after transport negotiation. | no |
 | `User` | The database username the session is for. This username will have undergone case-folding and Unicode normalization. | yes |
 | `SystemIdentity` | The original system identity provided by the client, if an identity mapping was used per Host-Based Authentication rules. This may be a GSSAPI or X.509 principal or any other external value, so no specific assumptions should be made about the contents of this field. | yes |
@@ -2133,6 +2174,7 @@ Events of this type are only emitted when the cluster setting
 | `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `SessionID` | The connection's hex encoded session id. | no |
 | `Transport` | The connection type after transport negotiation. | no |
 | `User` | The database username the session is for. This username will have undergone case-folding and Unicode normalization. | yes |
 | `SystemIdentity` | The original system identity provided by the client, if an identity mapping was used per Host-Based Authentication rules. This may be a GSSAPI or X.509 principal or any other external value, so no specific assumptions should be made about the contents of this field. | yes |
@@ -2160,6 +2202,7 @@ Events of this type are only emitted when the cluster setting
 | `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `SessionID` | The connection's hex encoded session id. | no |
 | `Transport` | The connection type after transport negotiation. | no |
 | `User` | The database username the session is for. This username will have undergone case-folding and Unicode normalization. | yes |
 | `SystemIdentity` | The original system identity provided by the client, if an identity mapping was used per Host-Based Authentication rules. This may be a GSSAPI or X.509 principal or any other external value, so no specific assumptions should be made about the contents of this field. | yes |
@@ -2188,6 +2231,7 @@ Events of this type are only emitted when the cluster setting
 | `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `SessionID` | The connection's hex encoded session id. | no |
 
 ### `client_connection_start`
 
@@ -2210,6 +2254,7 @@ Events of this type are only emitted when the cluster setting
 | `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `SessionID` | The connection's hex encoded session id. | no |
 
 ### `client_session_end`
 
@@ -2234,6 +2279,7 @@ Events of this type are only emitted when the cluster setting
 | `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
 | `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
 | `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `SessionID` | The connection's hex encoded session id. | no |
 | `Transport` | The connection type after transport negotiation. | no |
 | `User` | The database username the session is for. This username will have undergone case-folding and Unicode normalization. | yes |
 | `SystemIdentity` | The original system identity provided by the client, if an identity mapping was used per Host-Based Authentication rules. This may be a GSSAPI or X.509 principal or any other external value, so no specific assumptions should be made about the contents of this field. | yes |
@@ -2308,6 +2354,7 @@ set to a non-zero value, AND
 | `FullIndexScan` | Whether the query contains a full secondary index scan of a non-partial index. | no |
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 | `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
+| `StmtPosInTxn` | The statement's index in the transaction, starting at 1. | no |
 
 ### `txn_rows_read_limit`
 
@@ -2428,6 +2475,7 @@ the "slow query" condition.
 | `FullIndexScan` | Whether the query contains a full secondary index scan of a non-partial index. | no |
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 | `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
+| `StmtPosInTxn` | The statement's index in the transaction, starting at 1. | no |
 
 ### `txn_rows_read_limit_internal`
 
@@ -2669,6 +2717,10 @@ Note that because stats are scoped to the lifetime of the process, counters
 | `CompactionNumInProgress` | compactions_num_in_progress is the number of compactions in progress (gauge). | no |
 | `CompactionMarkedFiles` | compaction_marked_files is the count of files marked for compaction (gauge). | no |
 | `FlushCount` | flush_count is the number of flushes (counter). | no |
+| `FlushIngestCount` |  | no |
+| `FlushIngestTableCount` |  | no |
+| `FlushIngestTableBytes` |  | no |
+| `IngestCount` | ingest_count is the number of successful ingest operations (counter). | no |
 | `MemtableSize` | memtable_size is the total size allocated to all memtables and (large) batches, in bytes (gauge). | no |
 | `MemtableCount` | memtable_count is the count of memtables (gauge). | no |
 | `MemtableZombieCount` | memtable_zombie_count is the count of memtables no longer referenced by the current DB state, but still in use by an iterator (gauge). | no |
@@ -2798,6 +2850,34 @@ ChangefeedFailed events.
 | `InitialScan` | The desired behavior of initial scans (ex: yes, no, only) | no |
 | `Format` | The data format being emitted (ex: JSON, Avro). | no |
 
+### `hot_ranges_stats`
+
+An event of type `hot_ranges_stats`
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `RangeID` |  | no |
+| `Qps` |  | no |
+| `DatabaseName` | DatabaseName is the name of the database in which the index was created. | yes |
+| `TableName` | TableName is the name of the table on which the index was created. | yes |
+| `IndexName` | IndexName is the name of the index within the scope of the given table. | yes |
+| `SchemaName` | SchemaName is the name of the schema in which the index was created. | yes |
+| `LeaseholderNodeID` | LeaseholderNodeID indicates the Node ID that is the current leaseholder for the given range. | no |
+| `WritesPerSecond` | Writes per second is the recent number of keys written per second on this range. | no |
+| `ReadsPerSecond` | Reads per second is the recent number of keys read per second on this range. | no |
+| `WriteBytesPerSecond` | Write bytes per second is the recent number of bytes written per second on this range. | no |
+| `ReadBytesPerSecond` | Read bytes per second is the recent number of bytes read per second on this range. | no |
+| `CPUTimePerSecond` | CPU time per second is the recent cpu usage in nanoseconds of this range. | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+
 ### `recovery_event`
 
 An event of type `recovery_event` is an event that is logged on every invocation of BACKUP,
@@ -2889,6 +2969,7 @@ contains common SQL event/execution details.
 | `MaxMemUsage` | The maximum amount of memory usage by nodes for this query. | no |
 | `MaxDiskUsage` | The maximum amount of disk usage by nodes for this query. | no |
 | `KVBytesRead` | The number of bytes read at the KV layer for this query. | no |
+| `KVPairsRead` | The number of key-value pairs read at the KV layer for this query. | no |
 | `KVRowsRead` | The number of rows read at the KV layer for this query. | no |
 | `NetworkMessages` | The number of network messages sent by nodes for this query. | no |
 | `IndexRecommendations` | Generated index recommendations for this query. | no |
@@ -2898,6 +2979,30 @@ contains common SQL event/execution details.
 | `TotalScanRowsWithoutForecastsEstimate` | Total number of rows read by all scans in the query, as estimated by the optimizer without using forecasts. | no |
 | `NanosSinceStatsForecasted` | The greatest quantity of nanoseconds that have passed since the forecast time (or until the forecast time, if it is in the future, in which case it will be negative) for any table with forecasted stats scanned by this query. | no |
 | `Indexes` | The list of indexes used by this query. | no |
+| `CpuTimeNanos` | Collects the cumulative CPU time spent executing SQL operations in nanoseconds. Currently, it is only collected for statements without mutations that have a vectorized plan. | no |
+| `KvGrpcCalls` | The number of grpc calls done to get data form KV nodes | no |
+| `KvTimeNanos` | Cumulated time spent waiting for a KV request. This includes disk IO time and potentially network time (if any of the keys are not local). | no |
+| `ServiceLatencyNanos` | The time to service the query, from start of parse to end of execute. | no |
+| `OverheadLatencyNanos` | The difference between service latency and the sum of parse latency + plan latency + run latency . | no |
+| `RunLatencyNanos` | The time to run the query and fetch or compute the result rows. | no |
+| `PlanLatencyNanos` | The time to transform the AST into a logical query plan. | no |
+| `IdleLatencyNanos` | The time between statement executions in a transaction | no |
+| `ParseLatencyNanos` | The time to transform the SQL string into an abstract syntax tree (AST). | no |
+| `MvccStepCount` | StepCount collects the number of times the iterator moved forward or backward over the DB's underlying storage keyspace. For details, see pkg/storage/engine.go and pkg/sql/opt/exec/factory.go. | no |
+| `MvccStepCountInternal` | StepCountInternal collects the number of times the iterator moved forward or backward over LSM internal keys. For details, see pkg/storage/engine.go and pkg/sql/opt/exec/factory.go. | no |
+| `MvccSeekCount` | SeekCount collects the number of times the iterator moved to a specific key/value pair in the DB's underlying storage keyspace. For details, see pkg/storage/engine.go and pkg/sql/opt/exec/factory.go. | no |
+| `MvccSeekCountInternal` | SeekCountInternal collects the number of times the iterator moved to a specific LSM internal key. For details, see pkg/storage/engine.go and pkg/sql/opt/exec/factory.go. | no |
+| `MvccBlockBytes` | BlockBytes collects the bytes in the loaded SSTable data blocks. For details, see pebble.InternalIteratorStats. | no |
+| `MvccBlockBytesInCache` | BlockBytesInCache collects the subset of BlockBytes in the block cache. For details, see pebble.InternalIteratorStats. | no |
+| `MvccKeyBytes` | KeyBytes collects the bytes in keys that were iterated over. For details, see pebble.InternalIteratorStats. | no |
+| `MvccValueBytes` | ValueBytes collects the bytes in values that were iterated over. For details, see pebble.InternalIteratorStats. | no |
+| `MvccPointCount` | PointCount collects the count of point keys iterated over. For details, see pebble.InternalIteratorStats. | no |
+| `MvccPointsCoveredByRangeTombstones` | PointsCoveredByRangeTombstones collects the count of point keys that were iterated over that were covered by range tombstones. For details, see pebble.InternalIteratorStats and https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/mvcc-range-tombstones.md. | no |
+| `MvccRangeKeyCount` | RangeKeyCount collects the count of range keys encountered during iteration. For details, see pebble.RangeKeyIteratorStats and https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/mvcc-range-tombstones.md. | no |
+| `MvccRangeKeyContainedPoints` | RangeKeyContainedPoints collects the count of point keys encountered within the bounds of a range key. For details, see pebble.RangeKeyIteratorStats and https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/mvcc-range-tombstones.md. | no |
+| `MvccRangeKeySkippedPoints` | RangeKeySkippedPoints collects the count of the subset of ContainedPoints point keys that were skipped during iteration due to range-key masking. For details, see pkg/storage/engine.go, pebble.RangeKeyIteratorStats, and https://github.com/cockroachdb/cockroach/blob/master/docs/tech-notes/mvcc-range-tombstones.md. | no |
+| `SchemaChangerMode` | SchemaChangerMode is the mode that was used to execute the schema change, if any. | no |
+| `SQLInstanceIDs` | SQLInstanceIDs is a list of all the SQL instance id used in this statements execution. | no |
 
 
 #### Common fields
@@ -2922,6 +3027,7 @@ contains common SQL event/execution details.
 | `FullIndexScan` | Whether the query contains a full secondary index scan of a non-partial index. | no |
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 | `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
+| `StmtPosInTxn` | The statement's index in the transaction, starting at 1. | no |
 
 ### `schema_descriptor`
 
@@ -3058,6 +3164,7 @@ authentication failure.
 | 5 | PRE_HOOK_ERROR | occurs when the authentication handshake encountered a protocol error. |
 | 6 | CREDENTIALS_INVALID | occurs when the client-provided credentials were invalid. |
 | 7 | CREDENTIALS_EXPIRED | occur when the credentials provided by the client are expired. |
+| 8 | NO_REPLICATION_ROLEOPTION | occurs when the connection requires a replication role option, but the user does not have it. |
 
 
 

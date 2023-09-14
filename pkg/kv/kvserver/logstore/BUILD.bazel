@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,7 +13,9 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverbase",
+        "//pkg/kv/kvserver/kvserverpb",
         "//pkg/kv/kvserver/raftentry",
         "//pkg/kv/kvserver/raftlog",
         "//pkg/roachpb",
@@ -52,6 +53,7 @@ go_test(
     args = ["-test.timeout=295s"],
     embed = [":logstore"],
     deps = [
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/kv/kvserver/kvserverpb",
         "//pkg/kv/kvserver/raftentry",
@@ -74,5 +76,3 @@ go_test(
         "@org_golang_x_time//rate",
     ],
 )
-
-get_x_data(name = "get_x_data")

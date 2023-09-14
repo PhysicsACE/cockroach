@@ -27,23 +27,19 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/acl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/balancer"
-	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/denylist"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenantdirsvr"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -55,14 +51,12 @@ import (
 	"github.com/jackc/pgconn"
 	pgproto3 "github.com/jackc/pgproto3/v2"
 	pgx "github.com/jackc/pgx/v4"
+	proxyproto "github.com/pires/go-proxyproto"
+	"github.com/pires/go-proxyproto/tlvparse"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"gopkg.in/yaml.v3"
 )
-
-// To ensure tenant startup code is included.
-var _ = kvtenantccl.Connector{}
 
 const frontendError = "Frontend error!"
 const backendError = "Backend error!"
@@ -70,6 +64,457 @@ const backendError = "Backend error!"
 // notFoundTenantID is used to trigger a NotFound error when it is requested in
 // the test directory server.
 const notFoundTenantID = 99
+
+func TestProxyHandler_ValidateConnection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stop := stop.NewStopper()
+	defer stop.Stop(ctx)
+
+	// Create the directory server.
+	tds := tenantdirsvr.NewTestStaticDirectoryServer(stop, nil /* timeSource */)
+	invalidTenantID := roachpb.MustMakeTenantID(99)
+	tenantID := roachpb.MustMakeTenantID(10)
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:    tenantID.ToUint64(),
+		ClusterName: "my-tenant",
+	})
+	tenantWithoutNameID := roachpb.MustMakeTenantID(20)
+	tds.CreateTenant(tenantWithoutNameID, &tenant.Tenant{
+		TenantID: tenantWithoutNameID.ToUint64(),
+	})
+	require.NoError(t, tds.Start(ctx))
+
+	options := &ProxyOptions{}
+	options.testingKnobs.directoryServer = tds
+	s, _, _ := newSecureProxyServer(ctx, t, stop, options)
+
+	t.Run("not found/no cluster name", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, invalidTenantID, "")
+		require.Regexp(t, "codeParamsRoutingFailed: cluster -99 not found", err.Error())
+	})
+	t.Run("not found", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, invalidTenantID, "foo-bar")
+		require.Regexp(t, "codeParamsRoutingFailed: cluster foo-bar-99 not found", err.Error())
+	})
+	t.Run("found/tenant without name", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, tenantWithoutNameID, "foo-bar")
+		require.NoError(t, err)
+	})
+	t.Run("found/tenant name matches", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, tenantID, "my-tenant")
+		require.NoError(t, err)
+	})
+	t.Run("found/connection without name", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, tenantID, "")
+		require.Regexp(t, "codeParamsRoutingFailed: cluster -10 not found", err.Error())
+	})
+	t.Run("found/tenant name mismatch", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, tenantID, "foo-bar")
+		require.Regexp(t, "codeParamsRoutingFailed: cluster foo-bar-10 not found", err.Error())
+	})
+
+	// Stop the directory server.
+	tds.Stop(ctx)
+
+	// Directory hasn't started
+	t.Run("directory error", func(t *testing.T) {
+		// Use a new tenant ID here to force GetTenant.
+		err := s.handler.validateConnection(ctx, roachpb.MustMakeTenantID(100), "")
+		require.Regexp(t, "directory server has not been started", err.Error())
+	})
+}
+
+func TestProxyProtocol(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	te := newTester()
+	defer te.Close()
+
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+
+	ts := sql.ApplicationLayer()
+	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	pgs := ts.PGServer().(*pgwire.Server)
+	pgs.TestingEnableAuthLogging()
+	defer sql.Stopper().Stop(ctx)
+
+	// Create a default user.
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
+
+	var validateFn func(h *proxyproto.Header) error
+	withProxyProtocol := func(p bool) (server *Server, addr, httpAddr string) {
+		options := &ProxyOptions{
+			RoutingRule:          ts.AdvSQLAddr(),
+			SkipVerify:           true,
+			RequireProxyProtocol: p,
+		}
+		options.testingKnobs.validateProxyHeader = func(h *proxyproto.Header) error {
+			return validateFn(h)
+		}
+		return newSecureProxyServer(ctx, t, sql.Stopper(), options)
+	}
+
+	timeout := 3 * time.Second
+	proxyDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{Timeout: timeout}).Dial(network, addr)
+		if err != nil {
+			return nil, err
+		}
+		header := &proxyproto.Header{
+			Version:           2,
+			Command:           proxyproto.PROXY,
+			TransportProtocol: proxyproto.TCPv4,
+			SourceAddr: &net.TCPAddr{
+				// Use a dummy address so we can check on that.
+				IP:   net.ParseIP("10.20.30.40"),
+				Port: 4242,
+			},
+			DestinationAddr: conn.RemoteAddr(),
+		}
+		if err := conn.SetWriteDeadline(timeutil.Now().Add(timeout)); err != nil {
+			return nil, err
+		}
+		_, err = header.WriteTo(conn)
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
+
+	makeHttpReq := func(t *testing.T, client *http.Client, addr string, success bool) {
+		resp, err := client.Get(fmt.Sprintf("http://%s/_status/healthz/", addr))
+		if err != nil && !success {
+			// It appears that if we make a bad request to the server (e.g.
+			// sending a PROXY header when the server does not expect one),
+			// there's a possibility where the server returns a response that
+			// the client doesn't understand, which is reasonable. In that case,
+			// just assert that we have an error, and we're done here.
+			return
+		}
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		if success {
+			require.Equal(t, "200 OK", resp.Status)
+		} else {
+			require.Equal(t, "400 Bad Request", resp.Status)
+		}
+	}
+
+	s, sqlAddr, httpAddr := withProxyProtocol(true)
+
+	defer testutils.TestingHook(&validateFn, func(h *proxyproto.Header) error {
+		if h.SourceAddr.String() != "10.20.30.40:4242" {
+			return errors.Newf("got source addr %s, expected 10.20.30.40:4242", h.SourceAddr)
+		}
+		return nil
+	})()
+
+	// Test SQL. Only request with PROXY should go through.
+	url := fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-42.defaultdb?sslmode=require", sqlAddr)
+	te.TestConnectWithPGConfig(
+		ctx, t, url,
+		func(c *pgx.ConnConfig) {
+			c.DialFunc = proxyDialer
+		},
+		func(conn *pgx.Conn) {
+			require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
+			require.NoError(t, runTestQuery(ctx, conn))
+		},
+	)
+	_ = te.TestConnectErr(ctx, t, url, codeClientReadFailed, "tls error")
+
+	// Test HTTP. Should support with or without PROXY.
+	client := http.Client{Timeout: timeout}
+	makeHttpReq(t, &client, httpAddr, true)
+	proxyClient := http.Client{Transport: &http.Transport{DialContext: proxyDialer}}
+	makeHttpReq(t, &proxyClient, httpAddr, true)
+}
+
+func TestPrivateEndpointsACL(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	te := newTester()
+	defer te.Close()
+
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer sql.Stopper().Stop(ctx)
+
+	ts := sql.ApplicationLayer()
+	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+
+	// Create a default user.
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
+
+	// Create the directory server.
+	tds := tenantdirsvr.NewTestStaticDirectoryServer(sql.Stopper(), nil /* timeSource */)
+	tenant10 := roachpb.MustMakeTenantID(10)
+	tenant20 := roachpb.MustMakeTenantID(20)
+	tenant30 := roachpb.MustMakeTenantID(30)
+	tds.CreateTenant(tenant10, &tenant.Tenant{
+		Version:                 "001",
+		TenantID:                tenant10.ToUint64(),
+		ClusterName:             "my-tenant",
+		AllowedPrivateEndpoints: []string{"vpce-abc123"},
+	})
+	tds.CreateTenant(tenant20, &tenant.Tenant{
+		Version:                 "002",
+		TenantID:                tenant20.ToUint64(),
+		ClusterName:             "other-tenant",
+		AllowedPrivateEndpoints: []string{"vpce-some-other-vpc"},
+	})
+	tds.CreateTenant(tenant30, &tenant.Tenant{
+		Version:     "003",
+		TenantID:    tenant30.ToUint64(),
+		ClusterName: "public-tenant",
+	})
+	// All tenants map to the same pod.
+	for _, tenID := range []roachpb.TenantID{tenant10, tenant20, tenant30} {
+		tds.AddPod(tenID, &tenant.Pod{
+			TenantID:       tenID.ToUint64(),
+			Addr:           ts.AdvSQLAddr(),
+			State:          tenant.RUNNING,
+			StateTimestamp: timeutil.Now(),
+		})
+	}
+	require.NoError(t, tds.Start(ctx))
+
+	options := &ProxyOptions{
+		SkipVerify:           true,
+		RequireProxyProtocol: true,
+		PollConfigInterval:   10 * time.Millisecond,
+	}
+	options.testingKnobs.directoryServer = tds
+	s, sqlAddr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), options)
+
+	timeout := 3 * time.Second
+	proxyDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{Timeout: timeout}).Dial(network, addr)
+		if err != nil {
+			return nil, err
+		}
+		header := &proxyproto.Header{
+			Version:           2,
+			Command:           proxyproto.PROXY,
+			TransportProtocol: proxyproto.TCPv4,
+			SourceAddr: &net.TCPAddr{
+				// Use a dummy address so we can check on that.
+				IP:   net.ParseIP("10.20.30.40"),
+				Port: 4242,
+			},
+			DestinationAddr: conn.RemoteAddr(),
+		}
+		if err := header.SetTLVs([]proxyproto.TLV{{
+			Type: tlvparse.PP2_TYPE_AWS,
+			// Points to "vpce-abc123" as endpoint ID.
+			Value: []byte{0x01, 0x76, 0x70, 0x63, 0x65, 0x2d, 0x61, 0x62, 0x63, 0x31, 0x32, 0x33},
+		}}); err != nil {
+			return nil, err
+		}
+		if err := conn.SetWriteDeadline(timeutil.Now().Add(timeout)); err != nil {
+			return nil, err
+		}
+		_, err = header.WriteTo(conn)
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
+	}
+
+	t.Run("private connection allowed", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/my-tenant-10.defaultdb?sslmode=require", sqlAddr)
+		te.TestConnectWithPGConfig(
+			ctx, t, url,
+			func(c *pgx.ConnConfig) {
+				c.DialFunc = proxyDialer
+			},
+			func(conn *pgx.Conn) {
+				// Initial connection.
+				require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
+				require.NoError(t, runTestQuery(ctx, conn))
+
+				// Remove endpoints and connection should be disconnected.
+				tds.UpdateTenant(tenant10, &tenant.Tenant{
+					Version:                 "010",
+					TenantID:                tenant10.ToUint64(),
+					ClusterName:             "my-tenant",
+					AllowedPrivateEndpoints: []string{},
+				})
+
+				// Wait until watcher has received the updated event.
+				testutils.SucceedsSoon(t, func() error {
+					ten, err := s.handler.directoryCache.LookupTenant(ctx, tenant10)
+					if err != nil {
+						return err
+					}
+					if ten.Version != "010" {
+						return errors.New("tenant is not up-to-date")
+					}
+					return nil
+				})
+
+				// Subsequent Exec calls will eventually fail.
+				var err error
+				require.Eventually(
+					t,
+					func() bool {
+						_, err = conn.Exec(ctx, "SELECT 1")
+						return err != nil
+					},
+					time.Second, 5*time.Millisecond,
+					"Expected the connection to eventually fail",
+				)
+				require.Error(t, err)
+				require.Regexp(t, "connection reset by peer|unexpected EOF", err.Error())
+				require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
+			},
+		)
+	})
+
+	t.Run("private connection disallowed on another tenant", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/other-tenant-20.defaultdb?sslmode=require", sqlAddr)
+		_ = te.TestConnectErrWithPGConfig(
+			ctx, t, url,
+			func(c *pgx.ConnConfig) {
+				c.DialFunc = proxyDialer
+			},
+			codeProxyRefusedConnection,
+			"connection refused",
+		)
+	})
+
+	t.Run("private connection disallowed on public tenant", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/public-tenant-30.defaultdb?sslmode=require", sqlAddr)
+		_ = te.TestConnectErrWithPGConfig(
+			ctx, t, url,
+			func(c *pgx.ConnConfig) {
+				c.DialFunc = proxyDialer
+			},
+			codeProxyRefusedConnection,
+			"connection refused",
+		)
+	})
+}
+
+func TestAllowedCIDRRangesACL(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	te := newTester()
+	defer te.Close()
+
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer sql.Stopper().Stop(ctx)
+
+	ts := sql.ApplicationLayer()
+	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+
+	// Create a default user.
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
+
+	// Create the directory server.
+	tds := tenantdirsvr.NewTestStaticDirectoryServer(sql.Stopper(), nil /* timeSource */)
+	tenant10 := roachpb.MustMakeTenantID(10)
+	tenant20 := roachpb.MustMakeTenantID(20)
+	tenant30 := roachpb.MustMakeTenantID(30)
+	tds.CreateTenant(tenant10, &tenant.Tenant{
+		Version:           "001",
+		TenantID:          tenant10.ToUint64(),
+		ClusterName:       "my-tenant",
+		AllowedCIDRRanges: []string{"127.0.0.1/32"},
+	})
+	tds.CreateTenant(tenant20, &tenant.Tenant{
+		Version:           "002",
+		TenantID:          tenant20.ToUint64(),
+		ClusterName:       "other-tenant",
+		AllowedCIDRRanges: []string{"10.0.0.8/32"},
+	})
+	tds.CreateTenant(tenant30, &tenant.Tenant{
+		Version:     "003",
+		TenantID:    tenant30.ToUint64(),
+		ClusterName: "private-tenant",
+	})
+	// All tenants map to the same pod.
+	for _, tenID := range []roachpb.TenantID{tenant10, tenant20, tenant30} {
+		tds.AddPod(tenID, &tenant.Pod{
+			TenantID:       tenID.ToUint64(),
+			Addr:           ts.AdvSQLAddr(),
+			State:          tenant.RUNNING,
+			StateTimestamp: timeutil.Now(),
+		})
+	}
+	require.NoError(t, tds.Start(ctx))
+
+	options := &ProxyOptions{
+		SkipVerify:         true,
+		PollConfigInterval: 10 * time.Millisecond,
+	}
+	options.testingKnobs.directoryServer = tds
+	s, sqlAddr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), options)
+
+	t.Run("public connection allowed", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/my-tenant-10.defaultdb?sslmode=require", sqlAddr)
+		te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
+			// Initial connection.
+			require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
+			require.NoError(t, runTestQuery(ctx, conn))
+
+			// Remove ranges and connection should be disconnected.
+			tds.UpdateTenant(tenant10, &tenant.Tenant{
+				Version:           "010",
+				TenantID:          tenant10.ToUint64(),
+				ClusterName:       "my-tenant",
+				AllowedCIDRRanges: []string{},
+			})
+
+			// Wait until watcher has received the updated event.
+			testutils.SucceedsSoon(t, func() error {
+				ten, err := s.handler.directoryCache.LookupTenant(ctx, tenant10)
+				if err != nil {
+					return err
+				}
+				if ten.Version != "010" {
+					return errors.New("tenant is not up-to-date")
+				}
+				return nil
+			})
+
+			// Subsequent Exec calls will eventually fail.
+			var err error
+			require.Eventually(
+				t,
+				func() bool {
+					_, err = conn.Exec(ctx, "SELECT 1")
+					return err != nil
+				},
+				time.Second, 5*time.Millisecond,
+				"Expected the connection to eventually fail",
+			)
+			require.Regexp(t, "connection reset by peer|unexpected EOF", err.Error())
+			require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
+		})
+	})
+
+	t.Run("public connection disallowed on another tenant", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/other-tenant-20.defaultdb?sslmode=require", sqlAddr)
+		_ = te.TestConnectErr(ctx, t, url, codeProxyRefusedConnection, "connection refused")
+	})
+
+	t.Run("public connection disallowed on private tenant", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/private-tenant-30.defaultdb?sslmode=require", sqlAddr)
+		_ = te.TestConnectErr(ctx, t, url, codeProxyRefusedConnection, "connection refused")
+	})
+}
 
 func TestLongDBName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -80,7 +525,7 @@ func TestLongDBName(t *testing.T) {
 	defer te.Close()
 
 	defer testutils.TestingHook(&BackendDial, func(
-		_ *pgproto3.StartupMessage, outgoingAddr string, _ *tls.Config,
+		_ context.Context, _ *pgproto3.StartupMessage, outgoingAddr string, _ *tls.Config,
 	) (net.Conn, error) {
 		require.Equal(t, outgoingAddr, "127.0.0.1:26257")
 		return nil, withCode(errors.New("boom"), codeParamsRoutingFailed)
@@ -119,14 +564,14 @@ func TestBackendDownRetry(t *testing.T) {
 
 	callCount := 0
 	defer testutils.TestingHook(&BackendDial, func(
-		_ *pgproto3.StartupMessage, outgoingAddr string, _ *tls.Config,
+		_ context.Context, _ *pgproto3.StartupMessage, outgoingAddr string, _ *tls.Config,
 	) (net.Conn, error) {
 		callCount++
 		// After 3 dials, we delete the tenant.
 		if callCount >= 3 {
 			directoryServer.DeleteTenant(roachpb.MustMakeTenantID(28))
 		}
-		return nil, withCode(errors.New("SQL pod is down"), codeBackendDown)
+		return nil, withCode(errors.New("SQL pod is down"), codeBackendDialFailed)
 	})()
 
 	// Valid connection, but no backend server running.
@@ -231,72 +676,107 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Insecure: false,
-		// Need to disable the test tenant here because it appears as though
-		// we're not able to establish the necessary connections from within
-		// it. More investigation required (tracked with #76378).
-		DisableDefaultTestTenant: true,
-	},
-	)
-	sql.(*server.TestServer).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
-	pgs := sql.(*server.TestServer).PGServer().(*pgwire.Server)
-	pgs.TestingEnableAuthLogging()
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
+
+	ts := sql.ApplicationLayer()
+	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	pgs := ts.PGServer().(*pgwire.Server)
+	pgs.TestingEnableAuthLogging()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
 
 	s, addr, _ := newSecureProxyServer(
-		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: sql.ServingSQLAddr(), SkipVerify: true},
+		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: ts.AdvSQLAddr(), SkipVerify: true},
 	)
 	_, port, err := net.SplitHostPort(addr)
 	require.NoError(t, err)
 
-	url := fmt.Sprintf("postgres://bob:wrong@%s/tenant-cluster-28.defaultdb?sslmode=require", addr)
-	_ = te.TestConnectErr(ctx, t, url, 0, "failed SASL auth")
-
-	url = fmt.Sprintf("postgres://bob@%s/tenant-cluster-28.defaultdb?sslmode=require", addr)
-	_ = te.TestConnectErr(ctx, t, url, 0, "failed SASL auth")
-
-	// SNI provides tenant ID.
-	url = fmt.Sprintf("postgres://bob:builder@tenant-cluster-28.blah:%s/defaultdb?sslmode=require", port)
-	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
-		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
-		require.NoError(t, runTestQuery(ctx, conn))
-	})
-
-	// SNI tried but doesn't parse to valid tenant ID and DB/Options not provided
-	url = fmt.Sprintf("postgres://bob:builder@tenant_cluster_28.blah:%s/defaultdb?sslmode=require", port)
-	_ = te.TestConnectErr(ctx, t, url, codeParamsRoutingFailed, "missing cluster identifier")
-
-	// Database provides valid ID
-	url = fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-28.defaultdb?sslmode=require", addr)
-	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
-		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
-		require.NoError(t, runTestQuery(ctx, conn))
-	})
-
-	// SNI and database provide tenant IDs that match.
-	url = fmt.Sprintf(
-		"postgres://bob:builder@tenant-cluster-28.blah:%s/tenant-cluster-28.defaultdb?sslmode=require", port,
-	)
-	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
-		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
-		require.NoError(t, runTestQuery(ctx, conn))
-	})
-
-	// SNI and database provide tenant IDs that don't match. SNI is ignored.
-	url = fmt.Sprintf(
-		"postgres://bob:builder@tick-data-28.blah:%s/tenant-cluster-29.defaultdb?sslmode=require", port,
-	)
-	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
-		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
-		require.NoError(t, runTestQuery(ctx, conn))
-	})
-
+	for _, tc := range []struct {
+		name    string
+		url     string
+		expCode errorCode
+		expErr  string
+	}{
+		{
+			name: "failed_SASL_auth_1",
+			url: fmt.Sprintf(
+				"postgres://bob:wrong@%s/tenant-cluster-28.defaultdb?sslmode=require",
+				addr,
+			),
+			expErr: "failed SASL auth",
+		},
+		{
+			name: "failed_SASL_auth_2",
+			url: fmt.Sprintf(
+				"postgres://bob@%s/tenant-cluster-28.defaultdb?sslmode=require",
+				addr,
+			),
+			expErr: "failed SASL auth",
+		},
+		{
+			// SNI tried but doesn't parse to valid tenant ID and DB/Options not provided.
+			name: "invalid_SNI",
+			url: fmt.Sprintf(
+				"postgres://bob:builder@tenant_cluster_28.blah:%s/defaultdb?sslmode=require",
+				port,
+			),
+			expCode: codeParamsRoutingFailed,
+			expErr:  "missing cluster identifier",
+		},
+		{
+			name: "SNI_provides_tenant_ID",
+			url: fmt.Sprintf(
+				"postgres://bob:builder@tenant-cluster-28.blah:%s/defaultdb?sslmode=require",
+				port,
+			),
+		},
+		{
+			name: "database_provides_tenant_ID",
+			url: fmt.Sprintf(
+				"postgres://bob:builder@%s/tenant-cluster-28.defaultdb?sslmode=require",
+				addr,
+			),
+		},
+		{
+			name: "SNI_and_database_provide_tenant_ID",
+			url: fmt.Sprintf(
+				"postgres://bob:builder@tenant-cluster-28.blah:%s/tenant-cluster-28.defaultdb?sslmode=require",
+				port,
+			),
+		},
+		{
+			// SNI and database provide tenant IDs that don't match. SNI is ignored.
+			name: "SNI_and_database_provided_but_SNI_ignored",
+			url: fmt.Sprintf(
+				"postgres://bob:builder@tick-data-28.blah:%s/tenant-cluster-29.defaultdb?sslmode=require",
+				port,
+			),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Ensure that CurConnCount is 0 before proceeding.
+			testutils.SucceedsSoon(t, func() error {
+				val := s.metrics.CurConnCount.Value()
+				if val != 0 {
+					return errors.Newf("CurConnCount is not 0, got %d", val)
+				}
+				return nil
+			})
+			if tc.expErr == "" {
+				te.TestConnect(ctx, t, tc.url, func(conn *pgx.Conn) {
+					require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
+					require.NoError(t, runTestQuery(ctx, conn))
+				})
+			} else {
+				_ = te.TestConnectErr(ctx, t, tc.url, tc.expCode, tc.expErr)
+			}
+		})
+	}
 	require.Equal(t, int64(4), s.metrics.SuccessfulConnCount.Count())
-	require.Equal(t, int64(4), s.metrics.ConnectionLatency.TotalCount())
+	count, _ := s.metrics.ConnectionLatency.Total()
+	require.Equal(t, int64(4), count)
 	require.Equal(t, int64(2), s.metrics.AuthFailedCount.Count())
 	require.Equal(t, int64(1), s.metrics.RoutingErrCount.Count())
 }
@@ -311,7 +791,7 @@ func TestProxyTLSConf(t *testing.T) {
 		defer te.Close()
 
 		defer testutils.TestingHook(&BackendDial, func(
-			_ *pgproto3.StartupMessage, _ string, tlsConf *tls.Config,
+			_ context.Context, _ *pgproto3.StartupMessage, _ string, tlsConf *tls.Config,
 		) (net.Conn, error) {
 			require.Nil(t, tlsConf)
 			return nil, withCode(errors.New("boom"), codeParamsRoutingFailed)
@@ -334,7 +814,7 @@ func TestProxyTLSConf(t *testing.T) {
 		defer te.Close()
 
 		defer testutils.TestingHook(&BackendDial, func(
-			_ *pgproto3.StartupMessage, _ string, tlsConf *tls.Config,
+			_ context.Context, _ *pgproto3.StartupMessage, _ string, tlsConf *tls.Config,
 		) (net.Conn, error) {
 			require.True(t, tlsConf.InsecureSkipVerify)
 			return nil, withCode(errors.New("boom"), codeParamsRoutingFailed)
@@ -358,7 +838,7 @@ func TestProxyTLSConf(t *testing.T) {
 		defer te.Close()
 
 		defer testutils.TestingHook(&BackendDial, func(
-			_ *pgproto3.StartupMessage, outgoingAddress string, tlsConf *tls.Config,
+			_ context.Context, _ *pgproto3.StartupMessage, outgoingAddress string, tlsConf *tls.Config,
 		) (net.Conn, error) {
 			outgoingHost, _, err := addr.SplitHostPort(outgoingAddress, "")
 			require.NoError(t, err)
@@ -393,19 +873,13 @@ func TestProxyTLSClose(t *testing.T) {
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t,
-		base.TestServerArgs{
-			Insecure: false,
-			// Need to disable the test tenant here because it appears as though
-			// we're not able to establish the necessary connections from within
-			// it. More investigation required (tracked with #76378).
-			DisableDefaultTestTenant: true,
-		},
-	)
-	sql.(*server.TestServer).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
-	pgs := sql.(*server.TestServer).PGServer().(*pgwire.Server)
-	pgs.TestingEnableAuthLogging()
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
+
+	ts := sql.ApplicationLayer()
+	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	pgs := ts.PGServer().(*pgwire.Server)
+	pgs.TestingEnableAuthLogging()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
@@ -420,7 +894,7 @@ func TestProxyTLSClose(t *testing.T) {
 	})()
 
 	s, addr, _ := newSecureProxyServer(
-		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: sql.ServingSQLAddr(), SkipVerify: true},
+		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: ts.AdvSQLAddr(), SkipVerify: true},
 	)
 
 	url := fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-28.defaultdb?sslmode=require", addr)
@@ -437,7 +911,8 @@ func TestProxyTLSClose(t *testing.T) {
 	_ = conn.Close(ctx)
 
 	require.Equal(t, int64(1), s.metrics.SuccessfulConnCount.Count())
-	require.Equal(t, int64(1), s.metrics.ConnectionLatency.TotalCount())
+	count, _ := s.metrics.ConnectionLatency.Total()
+	require.Equal(t, int64(1), count)
 	require.Equal(t, int64(0), s.metrics.AuthFailedCount.Count())
 }
 
@@ -449,19 +924,13 @@ func TestProxyModifyRequestParams(t *testing.T) {
 	te := newTester()
 	defer te.Close()
 
-	sql, sqlDB, _ := serverutils.StartServer(t,
-		base.TestServerArgs{
-			Insecure: false,
-			// Need to disable the test tenant here because it appears as though
-			// we're not able to establish the necessary connections from within
-			// it. More investigation required (tracked with #76378).
-			DisableDefaultTestTenant: true,
-		},
-	)
-	sql.(*server.TestServer).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
-	pgs := sql.(*server.TestServer).PGServer().(*pgwire.Server)
-	pgs.TestingEnableAuthLogging()
+	sql, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
+
+	ts := sql.ApplicationLayer()
+	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	pgs := ts.PGServer().(*pgwire.Server)
+	pgs.TestingEnableAuthLogging()
 
 	// Create some user with password authn.
 	_, err := sqlDB.Exec("CREATE USER testuser WITH PASSWORD 'foo123'")
@@ -477,7 +946,7 @@ func TestProxyModifyRequestParams(t *testing.T) {
 
 	originalBackendDial := BackendDial
 	defer testutils.TestingHook(&BackendDial, func(
-		msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
+		ctx context.Context, msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
 	) (net.Conn, error) {
 		params := msg.Parameters
 		authToken, ok := params["authToken"]
@@ -493,7 +962,7 @@ func TestProxyModifyRequestParams(t *testing.T) {
 		delete(params, "authToken")
 		params["user"] = "testuser"
 
-		return originalBackendDial(msg, sql.ServingSQLAddr(), proxyOutgoingTLSConfig)
+		return originalBackendDial(ctx, msg, ts.AdvSQLAddr(), proxyOutgoingTLSConfig)
 	})()
 
 	s, proxyAddr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), &ProxyOptions{})
@@ -513,26 +982,19 @@ func TestInsecureProxy(t *testing.T) {
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t,
-		base.TestServerArgs{
-			// Need to disable the test tenant here as the test below
-			// complains about not being able to find the user. This may be
-			// because of the connection through the proxy server. More
-			// investigation is required (tracked with #76378).
-			DisableDefaultTestTenant: true,
-			Insecure:                 false,
-		},
-	)
-	sql.(*server.TestServer).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
-	pgs := sql.(*server.TestServer).PGServer().(*pgwire.Server)
-	pgs.TestingEnableAuthLogging()
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
+
+	ts := sql.ApplicationLayer()
+	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	pgs := ts.PGServer().(*pgwire.Server)
+	pgs.TestingEnableAuthLogging()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
 
 	s, addr, _ := newProxyServer(
-		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: sql.ServingSQLAddr(), SkipVerify: true},
+		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: ts.AdvSQLAddr(), SkipVerify: true},
 	)
 
 	url := fmt.Sprintf("postgres://bob:wrong@%s?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addr)
@@ -542,9 +1004,18 @@ func TestInsecureProxy(t *testing.T) {
 	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
 		require.NoError(t, runTestQuery(ctx, conn))
 	})
-	require.Equal(t, int64(1), s.metrics.AuthFailedCount.Count())
-	require.Equal(t, int64(1), s.metrics.SuccessfulConnCount.Count())
-	require.Equal(t, int64(1), s.metrics.ConnectionLatency.TotalCount())
+	testutils.SucceedsSoon(t, func() error {
+		if s.metrics.AuthFailedCount.Count() != 1 ||
+			s.metrics.SuccessfulConnCount.Count() != 1 {
+			return errors.Newf("expected metrics to update, got: "+
+				"AuthFailedCount=%d, SuccessfulConnCount=%d",
+				s.metrics.AuthFailedCount.Count(), s.metrics.SuccessfulConnCount.Count(),
+			)
+		}
+		return nil
+	})
+	count, _ := s.metrics.ConnectionLatency.Total()
+	require.Equal(t, int64(1), count)
 }
 
 func TestErroneousFrontend(t *testing.T) {
@@ -614,7 +1085,7 @@ func TestErroneousBackend(t *testing.T) {
 	defer te.Close()
 
 	defer testutils.TestingHook(&BackendDial, func(
-		msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
+		_ context.Context, msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
 	) (net.Conn, error) {
 		return nil, errors.New(backendError)
 	})()
@@ -640,7 +1111,7 @@ func TestProxyRefuseConn(t *testing.T) {
 	defer te.Close()
 
 	defer testutils.TestingHook(&BackendDial, func(
-		msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
+		_ context.Context, msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
 	) (net.Conn, error) {
 		return nil, withCode(errors.New("too many attempts"), codeProxyRefusedConnection)
 	})()
@@ -653,7 +1124,8 @@ func TestProxyRefuseConn(t *testing.T) {
 	_ = te.TestConnectErr(ctx, t, url, codeProxyRefusedConnection, "too many attempts")
 	require.Equal(t, int64(1), s.metrics.RefusedConnCount.Count())
 	require.Equal(t, int64(0), s.metrics.SuccessfulConnCount.Count())
-	require.Equal(t, int64(0), s.metrics.ConnectionLatency.TotalCount())
+	count, _ := s.metrics.ConnectionLatency.Total()
+	require.Equal(t, int64(0), count)
 	require.Equal(t, int64(0), s.metrics.AuthFailedCount.Count())
 }
 
@@ -687,23 +1159,19 @@ func TestDenylistUpdate(t *testing.T) {
 	denyList, err := os.CreateTemp("", "*_denylist.yml")
 	require.NoError(t, err)
 	defer func() { _ = os.Remove(denyList.Name()) }()
-	dlf := denylist.File{Seq: 0}
-	bytes, err := dlf.Serialize()
+	dlf := acl.DenylistFile{Seq: 0}
+	bytes, err := yaml.Marshal(&dlf)
 	require.NoError(t, err)
 	_, err = denyList.Write(bytes)
 	require.NoError(t, err)
 
-	sql, sqlDB, _ := serverutils.StartServer(t,
-		base.TestServerArgs{
-			Insecure: false,
-			// Need to disable the test tenant here because it appears as though
-			// we're not able to establish the necessary connections from within
-			// it. More investigation required (tracked with #76378).
-			DisableDefaultTestTenant: true,
-		},
-	)
-	sql.(*server.TestServer).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
+	sql, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
+
+	ts := sql.ApplicationLayer()
+	ts.
+		PGPreServer().(*pgwire.PreServeConnHandler).
+		TestingSetTrustClientProvidedRemoteAddr(true)
 
 	// Create some user with password authn.
 	_, err = sqlDB.Exec("CREATE USER testuser WITH PASSWORD 'foo123'")
@@ -721,10 +1189,14 @@ func TestDenylistUpdate(t *testing.T) {
 	// Register one SQL pod in the directory server.
 	tenantID := serverutils.TestTenantID()
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(sql.Stopper(), nil /* timeSource */)
-	tds.CreateTenant(tenantID, "tenant-cluster")
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
-		Addr:           sql.ServingSQLAddr(),
+		Addr:           ts.AdvSQLAddr(),
 		State:          tenant.RUNNING,
 		StateTimestamp: timeutil.Now(),
 	})
@@ -732,9 +1204,9 @@ func TestDenylistUpdate(t *testing.T) {
 
 	originalBackendDial := BackendDial
 	defer testutils.TestingHook(&BackendDial, func(
-		msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
+		ctx context.Context, msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
 	) (net.Conn, error) {
-		return originalBackendDial(msg, sql.ServingSQLAddr(), proxyOutgoingTLSConfig)
+		return originalBackendDial(ctx, msg, ts.AdvSQLAddr(), proxyOutgoingTLSConfig)
 	})()
 
 	opts := &ProxyOptions{
@@ -761,14 +1233,14 @@ func TestDenylistUpdate(t *testing.T) {
 
 	// Once connection has been established, attempt to update denylist.
 	dlf.Seq++
-	dlf.Denylist = []*denylist.DenyEntry{
+	dlf.Denylist = []*acl.DenyEntry{
 		{
-			Entity:     denylist.DenyEntity{Type: denylist.IPAddrType, Item: "127.0.0.1"},
+			Entity:     acl.DenyEntity{Type: acl.IPAddrType, Item: "127.0.0.1"},
 			Expiration: timeutil.Now().Add(time.Minute),
 			Reason:     "test-denied",
 		},
 	}
-	bytes, err = dlf.Serialize()
+	bytes, err = yaml.Marshal(&dlf)
 	require.NoError(t, err)
 	_, err = denyList.Write(bytes)
 	require.NoError(t, err)
@@ -783,55 +1255,53 @@ func TestDenylistUpdate(t *testing.T) {
 		time.Second, 5*time.Millisecond,
 		"Expected the connection to eventually fail",
 	)
-	require.Regexp(t, "closed|bad connection", err.Error())
+	require.Error(t, err)
+	require.Regexp(t, "(connection reset by peer|closed|bad connection)", err.Error())
 	require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
 }
 
 func TestDirectoryConnect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	// TODO(jaylim-crl): This is a potential port reuse issue, so skip this
-	// under stress. See linked GitHub issue.
-	skip.UnderStress(t, "https://github.com/cockroachdb/cockroach/issues/76839")
-	skip.UnderDeadlockWithIssue(t, 71365)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	te := newTester()
 	defer te.Close()
 
-	srv, _, _ := serverutils.StartServer(t,
-		base.TestServerArgs{
-			Insecure: true,
-			// Need to disable the test tenant here because it appears as though
-			// we're not able to establish the necessary connections from within
-			// it. More investigation required (tracked with #76378).
-			DisableDefaultTestTenant: true,
-		},
-	)
-	srv.(*server.TestServer).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
-	defer srv.Stopper().Stop(ctx)
+	// Start KV server.
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
+	defer s.Stopper().Stop(ctx)
 
-	// Create tenant 28.
-	sqlConn := srv.InternalExecutor().(*sql.InternalExecutor)
-	_, err := sqlConn.Exec(ctx, "", nil, "SELECT crdb_internal.create_tenant(28)")
-	require.NoError(t, err)
+	// Start a SQL pod for the test tenant, and register it with the directory
+	// server. Use a custom stopper so we can stop the tenant later.
+	tenantStopper := stop.NewStopper()
+	defer tenantStopper.Stop(ctx)
+	tenantID := serverutils.TestTenantID()
+	tenants := startTestTenantPodsWithStopper(ctx, t, s, tenantID, 1, base.TestingKnobs{}, tenantStopper)
+	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	})
+	tds.AddPod(tenantID, &tenant.Pod{
+		TenantID:       tenantID.ToUint64(),
+		Addr:           tenants[0].SQLAddr(),
+		State:          tenant.RUNNING,
+		StateTimestamp: timeutil.Now(),
+	})
+	require.NoError(t, tds.Start(ctx))
 
-	// New test directory server.
-	tds1, tdsAddr := newDirectoryServer(ctx, t, srv, &net.TCPAddr{})
+	// Start the proxy server using the static directory server.
+	opts := &ProxyOptions{SkipVerify: true}
+	opts.testingKnobs.directoryServer = tds
+	_, addr, _ := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addr, tenantID)
 
-	// New proxy server using the directory. Define both the directory and the
-	// routing rule so that fallback to the routing rule can be tested.
-	opts := &ProxyOptions{
-		RoutingRule:   srv.ServingSQLAddr(),
-		DirectoryAddr: tdsAddr.String(),
-		Insecure:      true,
-	}
-	_, addr, _ := newProxyServer(ctx, t, srv.Stopper(), opts)
-
-	t.Run("fallback when tenant not found", func(t *testing.T) {
-		url := fmt.Sprintf(
-			"postgres://root:admin@%s/?sslmode=disable&options=--cluster=tenant-cluster-%d",
-			addr, notFoundTenantID)
+	t.Run("tenant not found", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%d", addr, notFoundTenantID)
 		_ = te.TestConnectErr(ctx, t, url, codeParamsRoutingFailed, "cluster tenant-cluster-99 not found")
 	})
 
@@ -839,69 +1309,73 @@ func TestDirectoryConnect(t *testing.T) {
 		// Retry the backend connection 3 times before permanent failure.
 		countFailures := 0
 		defer testutils.TestingHook(&BackendDial, func(
-			*pgproto3.StartupMessage, string, *tls.Config,
+			context.Context, *pgproto3.StartupMessage, string, *tls.Config,
 		) (net.Conn, error) {
 			countFailures++
 			if countFailures >= 3 {
 				return nil, withCode(errors.New("backend disconnected"), codeBackendDisconnected)
 			}
-			return nil, withCode(errors.New("backend down"), codeBackendDown)
+			return nil, withCode(errors.New("backend down"), codeBackendDialFailed)
 		})()
 
 		// Ensure that Directory.ReportFailure is being called correctly.
 		countReports := 0
 		defer testutils.TestingHook(&reportFailureToDirectoryCache, func(
-			ctx context.Context, tenantID roachpb.TenantID, addr string, directoryCache tenant.DirectoryCache,
+			ctx context.Context, tenID roachpb.TenantID, addr string, directoryCache tenant.DirectoryCache,
 		) error {
-			require.Equal(t, roachpb.MustMakeTenantID(28), tenantID)
-			pods, err := directoryCache.TryLookupTenantPods(ctx, tenantID)
+			require.Equal(t, tenantID, tenID)
+			pods, err := directoryCache.TryLookupTenantPods(ctx, tenID)
 			require.NoError(t, err)
 			require.Len(t, pods, 1)
 			require.Equal(t, pods[0].Addr, addr)
 
 			countReports++
-			err = directoryCache.ReportFailure(ctx, tenantID, addr)
+			err = directoryCache.ReportFailure(ctx, tenID, addr)
 			require.NoError(t, err)
 			return err
 		})()
 
-		url := fmt.Sprintf("postgres://root:admin@%s/?sslmode=disable&options=--cluster=tenant-cluster-28", addr)
-		_ = te.TestConnectErr(ctx, t, url, codeBackendDisconnected, "backend disconnected")
+		_ = te.TestConnectErr(ctx, t, connectionString, codeBackendDisconnected, "backend disconnected")
 		require.Equal(t, 3, countFailures)
 		require.Equal(t, 2, countReports)
 	})
 
 	t.Run("successful connection", func(t *testing.T) {
-		url := fmt.Sprintf("postgres://root:admin@%s/?sslmode=disable&options=--cluster=tenant-cluster-28", addr)
-		te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
+		te.TestConnect(ctx, t, connectionString, func(conn *pgx.Conn) {
 			require.NoError(t, runTestQuery(ctx, conn))
 		})
 	})
 
-	// Stop the directory server and the tenant SQL process started earlier. This
-	// tests whether the proxy can recover when the directory server and a SQL
-	// tenant pod restart.
-	tds1.Stopper().Stop(ctx)
+	// Drain the tenant server gracefully. This is a workaround for #106537.
+	// Draining the server allows the server to delete the sql instance row.
+	require.NoError(t, tenants[0].DrainClients(ctx))
 
-	// Pass the same tdsAddr used to start up the directory server previously,
-	// since it's not allowed to jump to a different address.
-	tds2, _ := newDirectoryServer(ctx, t, srv, tdsAddr)
-	defer tds2.Stopper().Stop(ctx)
+	// Stop the directory server and the tenant SQL process started earlier.
+	// This tests whether the proxy can recover when the directory server and
+	// SQL pod restarts.
+	tds.Stop(ctx)
+	tenantStopper.Stop(ctx)
+
+	// Drain the old pod and add a new one before starting the directory server.
+	tds.DrainPod(tenantID, tenants[0].SQLAddr())
+	tenants = startTestTenantPods(ctx, t, s, tenantID, 1, base.TestingKnobs{})
+	tds.AddPod(tenantID, &tenant.Pod{
+		TenantID:       tenantID.ToUint64(),
+		Addr:           tenants[0].SQLAddr(),
+		State:          tenant.RUNNING,
+		StateTimestamp: timeutil.Now(),
+	})
+	require.NoError(t, tds.Start(ctx))
 
 	t.Run("successful connection after restart", func(t *testing.T) {
-		// Try to connect through the proxy again. This may take several tries
-		// in order to clear the proxy directory of the old SQL tenant process
-		// address and replace with the new.
-		require.Eventually(t, func() bool {
-			url := fmt.Sprintf("postgres://root:admin@%s/?sslmode=disable&options=--cluster=tenant-cluster-28", addr)
-			conn, err := pgx.Connect(ctx, url)
+		testutils.SucceedsSoon(t, func() error {
+			conn, err := pgx.Connect(ctx, connectionString)
 			if err != nil {
-				return false
+				return err
 			}
 			defer func() { _ = conn.Close(ctx) }()
-			require.NoError(t, runTestQuery(ctx, conn))
-			return true
-		}, 30*time.Second, 100*time.Millisecond)
+			return runTestQuery(ctx, conn)
+		})
 	})
 }
 
@@ -911,8 +1385,9 @@ func TestConnectionRebalancingDisabled(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Start KV server, and enable session migration.
-	params, _ := tests.CreateTestServerParams()
-	s, mainDB, _ := serverutils.StartServer(t, params)
+	s, mainDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
 	_, err := mainDB.Exec("ALTER TENANT ALL SET CLUSTER SETTING server.user_login.session_revival_token.enabled = true")
 	require.NoError(t, err)
@@ -924,7 +1399,11 @@ func TestConnectionRebalancingDisabled(t *testing.T) {
 
 	// Register one SQL pod in the directory server.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
-	tds.CreateTenant(tenantID, "tenant-cluster")
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
 		Addr:           tenants[0].SQLAddr(),
@@ -994,8 +1473,9 @@ func TestCancelQuery(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Start KV server, and enable session migration.
-	params, _ := tests.CreateTestServerParams()
-	s, mainDB, _ := serverutils.StartServer(t, params)
+	s, mainDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
 	_, err := mainDB.Exec("ALTER TENANT ALL SET CLUSTER SETTING server.user_login.session_revival_token.enabled = true")
 	require.NoError(t, err)
@@ -1020,7 +1500,11 @@ func TestCancelQuery(t *testing.T) {
 
 	// Register one SQL pod in the directory server.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), timeSource)
-	tds.CreateTenant(tenantID, "tenant-cluster")
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
 		Addr:           tenants[0].SQLAddr(),
@@ -1336,8 +1820,9 @@ func TestPodWatcher(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Start KV server, and enable session migration.
-	params, _ := tests.CreateTestServerParams()
-	s, mainDB, _ := serverutils.StartServer(t, params)
+	s, mainDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
 	_, err := mainDB.Exec("ALTER TENANT ALL SET CLUSTER SETTING server.user_login.session_revival_token.enabled = true")
 	require.NoError(t, err)
@@ -1350,7 +1835,11 @@ func TestPodWatcher(t *testing.T) {
 	// Register only 3 SQL pods in the directory server. We will add the 4th
 	// once the watcher has been established.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
-	tds.CreateTenant(tenantID, "tenant-cluster")
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	})
 	for i := 0; i < 3; i++ {
 		tds.AddPod(tenantID, &tenant.Pod{
 			TenantID:       tenantID.ToUint64(),
@@ -1429,10 +1918,9 @@ func TestConnectionMigration(t *testing.T) {
 	ctx := context.Background()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	// Test must be run from the system tenant as it's altering tenants.
-	params.DisableDefaultTestTenant = true
-	s, mainDB, _ := serverutils.StartServer(t, params)
+	s, mainDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
 	tenantID := serverutils.TestTenantID()
 
@@ -1440,17 +1928,18 @@ func TestConnectionMigration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start first SQL pod.
-	tenant1, tenantDB1 := serverutils.StartTenant(t, s, tests.CreateTestTenantParams(tenantID))
-	tenant1.(*server.TestTenant).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
-	defer tenant1.Stopper().Stop(ctx)
+	tenant1, tenantDB1 := serverutils.StartTenant(t, s, base.TestTenantArgs{TenantID: tenantID})
+	tenant1.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	defer tenant1.AppStopper().Stop(ctx)
 	defer tenantDB1.Close()
 
 	// Start second SQL pod.
-	params2 := tests.CreateTestTenantParams(tenantID)
-	params2.DisableCreateTenant = true
-	tenant2, tenantDB2 := serverutils.StartTenant(t, s, params2)
-	tenant2.(*server.TestTenant).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
-	defer tenant2.Stopper().Stop(ctx)
+	tenant2, tenantDB2 := serverutils.StartTenant(t, s, base.TestTenantArgs{
+		TenantID:            tenantID,
+		DisableCreateTenant: true,
+	})
+	tenant2.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	defer tenant2.AppStopper().Stop(ctx)
 	defer tenantDB2.Close()
 
 	_, err = tenantDB1.Exec("CREATE USER testuser WITH PASSWORD 'hunter2'")
@@ -1476,10 +1965,10 @@ func TestConnectionMigration(t *testing.T) {
 			proxy.metrics.ConnMigrationErrorRecoverableCount.Count() +
 			proxy.metrics.ConnMigrationErrorFatalCount.Count()
 		require.Equal(t, totalAttempts, proxy.metrics.ConnMigrationAttemptedCount.Count())
-		require.Equal(t, totalAttempts,
-			proxy.metrics.ConnMigrationAttemptedLatency.TotalCount())
-		require.Equal(t, totalAttempts,
-			proxy.metrics.ConnMigrationTransferResponseMessageSize.TotalCount())
+		count, _ := proxy.metrics.ConnMigrationAttemptedLatency.Total()
+		require.Equal(t, totalAttempts, count)
+		count, _ = proxy.metrics.ConnMigrationTransferResponseMessageSize.Total()
+		require.Equal(t, totalAttempts, count)
 	}
 
 	transferConnWithRetries := func(t *testing.T, f *forwarder) error {
@@ -1575,6 +2064,7 @@ func TestConnectionMigration(t *testing.T) {
 
 			// Now attempt a transfer concurrently with requests.
 			initSuccessCount := f.metrics.ConnMigrationSuccessCount.Count()
+			initErrorRecoverableCount := f.metrics.ConnMigrationErrorRecoverableCount.Count()
 			subCtx, cancel := context.WithCancel(tCtx)
 			defer cancel()
 
@@ -1614,7 +2104,7 @@ func TestConnectionMigration(t *testing.T) {
 
 			// Check metrics.
 			require.True(t, f.metrics.ConnMigrationSuccessCount.Count() > initSuccessCount+4)
-			require.Equal(t, int64(0), f.metrics.ConnMigrationErrorRecoverableCount.Count())
+			require.Equal(t, initErrorRecoverableCount, f.metrics.ConnMigrationErrorRecoverableCount.Count())
 			require.Equal(t, int64(0), f.metrics.ConnMigrationErrorFatalCount.Count())
 
 			validateMiscMetrics(t)
@@ -1624,6 +2114,7 @@ func TestConnectionMigration(t *testing.T) {
 		// transfers should not close the connection.
 		t.Run("failed_transfers_with_tx", func(t *testing.T) {
 			initSuccessCount := f.metrics.ConnMigrationSuccessCount.Count()
+			initErrorRecoverableCount := f.metrics.ConnMigrationErrorRecoverableCount.Count()
 			initAddr := queryAddr(tCtx, t, db)
 
 			err = crdb.ExecuteTx(tCtx, db, nil /* txopts */, func(tx *gosql.Tx) error {
@@ -1658,7 +2149,8 @@ func TestConnectionMigration(t *testing.T) {
 			// still be active.
 			require.Nil(t, f.ctx.Err())
 			require.Equal(t, initSuccessCount, f.metrics.ConnMigrationSuccessCount.Count())
-			require.Equal(t, int64(5), f.metrics.ConnMigrationErrorRecoverableCount.Count())
+			require.Equal(t, initErrorRecoverableCount+5,
+				f.metrics.ConnMigrationErrorRecoverableCount.Count())
 			require.Equal(t, int64(0), f.metrics.ConnMigrationErrorFatalCount.Count())
 
 			// Once the transaction is closed, transfers should work.
@@ -1666,7 +2158,7 @@ func TestConnectionMigration(t *testing.T) {
 			require.NotEqual(t, initAddr, queryAddr(tCtx, t, db))
 			require.Nil(t, f.ctx.Err())
 			require.Equal(t, initSuccessCount+1, f.metrics.ConnMigrationSuccessCount.Count())
-			require.Equal(t, int64(5), f.metrics.ConnMigrationErrorRecoverableCount.Count())
+			require.True(t, f.metrics.ConnMigrationErrorRecoverableCount.Count() >= initErrorRecoverableCount+5)
 			require.Equal(t, int64(0), f.metrics.ConnMigrationErrorFatalCount.Count())
 
 			validateMiscMetrics(t)
@@ -1787,7 +2279,7 @@ func TestConnectionMigration(t *testing.T) {
 			t.Fatalf("require that pg_sleep query terminates")
 		case err = <-errCh:
 			require.Error(t, err)
-			require.Regexp(t, "(closed|bad connection)", err.Error())
+			require.Regexp(t, "(connection reset by peer|closed|bad connection)", err.Error())
 		}
 
 		require.EqualError(t, f.ctx.Err(), context.Canceled.Error())
@@ -1799,12 +2291,12 @@ func TestConnectionMigration(t *testing.T) {
 			f.metrics.ConnMigrationErrorRecoverableCount.Count() +
 			f.metrics.ConnMigrationErrorFatalCount.Count()
 		require.Equal(t, totalAttempts, f.metrics.ConnMigrationAttemptedCount.Count())
-		require.Equal(t, totalAttempts,
-			f.metrics.ConnMigrationAttemptedLatency.TotalCount())
+		count, _ := f.metrics.ConnMigrationAttemptedLatency.Total()
+		require.Equal(t, totalAttempts, count)
 		// Here, we get a transfer timeout in response, so the message size
 		// should not be recorded.
-		require.Equal(t, totalAttempts-1,
-			f.metrics.ConnMigrationTransferResponseMessageSize.TotalCount())
+		count, _ = f.metrics.ConnMigrationTransferResponseMessageSize.Total()
+		require.Equal(t, totalAttempts-1, count)
 	})
 
 	// All connections should eventually be terminated.
@@ -1823,8 +2315,9 @@ func TestAcceptedConnCountMetric(t *testing.T) {
 	ctx := context.Background()
 
 	// Start KV server.
-	params, _ := tests.CreateTestServerParams()
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	// Start a single SQL pod.
@@ -1833,7 +2326,11 @@ func TestAcceptedConnCountMetric(t *testing.T) {
 
 	// Register the SQL pod in the directory server.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
-	tds.CreateTenant(tenantID, "tenant-cluster")
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
 		Addr:           tenants[0].SQLAddr(),
@@ -1909,8 +2406,9 @@ func TestCurConnCountMetric(t *testing.T) {
 	ctx := context.Background()
 
 	// Start KV server.
-	params, _ := tests.CreateTestServerParams()
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	// Start a single SQL pod.
@@ -1919,7 +2417,11 @@ func TestCurConnCountMetric(t *testing.T) {
 
 	// Register the SQL pod in the directory server.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
-	tds.CreateTenant(tenantID, "tenant-cluster")
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
 		Addr:           tenants[0].SQLAddr(),
@@ -2292,6 +2794,16 @@ func (te *tester) setErrToClient(codeErr error) {
 // established connection. Use TestConnectErr if connection establishment isn't
 // expected to succeed.
 func (te *tester) TestConnect(ctx context.Context, t *testing.T, url string, fn func(*pgx.Conn)) {
+	te.TestConnectWithPGConfig(ctx, t, url, nil, fn)
+}
+
+// TestConnectWithPGConfig connects to the given URL and invokes the given
+// callbacks with the established connection. Unlike TestConnect, this takes in
+// a custom callback function that allows callers to modify the PG config before
+// making the connection.
+func (te *tester) TestConnectWithPGConfig(
+	ctx context.Context, t *testing.T, url string, configFn func(*pgx.ConnConfig), fn func(*pgx.Conn),
+) {
 	t.Helper()
 	te.setAuthenticated(false)
 	te.setErrToClient(nil)
@@ -2300,6 +2812,9 @@ func (te *tester) TestConnect(ctx context.Context, t *testing.T, url string, fn 
 	if !strings.EqualFold(connConfig.Host, "127.0.0.1") {
 		connConfig.TLSConfig.ServerName = connConfig.Host
 		connConfig.Host = "127.0.0.1"
+	}
+	if configFn != nil {
+		configFn(connConfig)
 	}
 	conn, err := pgx.ConnectConfig(ctx, connConfig)
 	require.NoError(t, err)
@@ -2314,6 +2829,20 @@ func (te *tester) TestConnect(ctx context.Context, t *testing.T, url string, fn 
 func (te *tester) TestConnectErr(
 	ctx context.Context, t *testing.T, url string, expCode errorCode, expErr string,
 ) error {
+	return te.TestConnectErrWithPGConfig(ctx, t, url, nil, expCode, expErr)
+}
+
+// TestConnectErrWithPGConfig is similar to TestConnectErr, but takes in a
+// custom callback to modify connection config parameters before establishing
+// the connection.
+func (te *tester) TestConnectErrWithPGConfig(
+	ctx context.Context,
+	t *testing.T,
+	url string,
+	configFn func(*pgx.ConnConfig),
+	expCode errorCode,
+	expErr string,
+) error {
 	t.Helper()
 	te.setAuthenticated(false)
 	te.setErrToClient(nil)
@@ -2325,6 +2854,9 @@ func (te *tester) TestConnectErr(
 	if !strings.EqualFold(cfg.Host, "127.0.0.1") && cfg.TLSConfig != nil {
 		cfg.TLSConfig.ServerName = cfg.Host
 		cfg.Host = "127.0.0.1"
+	}
+	if configFn != nil {
+		configFn(cfg)
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err == nil {
@@ -2393,49 +2925,6 @@ func runTestQuery(ctx context.Context, conn *pgx.Conn) error {
 	return nil
 }
 
-func newDirectoryServer(
-	ctx context.Context, t *testing.T, srv serverutils.TestServerInterface, addr *net.TCPAddr,
-) (*tenantdirsvr.TestDirectoryServer, *net.TCPAddr) {
-	// Start listening on port that the tenant directory server will use.
-	var listener *net.TCPListener
-	require.Eventually(t, func() bool {
-		var err error
-		listener, err = net.ListenTCP("tcp", addr)
-		return err == nil
-	}, 30*time.Second, time.Second)
-
-	// Create the tenant directory server.
-	tdsStopper := stop.NewStopper()
-	tds, err := tenantdirsvr.New(tdsStopper)
-	require.NoError(t, err)
-
-	// Override the tenant starter function to start a new tenant process using
-	// the TestServerInterface.
-	tds.TenantStarterFunc = func(ctx context.Context, tenantID uint64) (*tenantdirsvr.Process, error) {
-		// Recognize special tenant ID that triggers an error.
-		if tenantID == notFoundTenantID {
-			return nil, status.Error(codes.NotFound, "tenant not found")
-		}
-
-		tenantStopper := tenantdirsvr.NewSubStopper(tdsStopper)
-		ten, err := srv.StartTenant(ctx, base.TestTenantArgs{
-			TenantID:      roachpb.MustMakeTenantID(tenantID),
-			ForceInsecure: true,
-			Stopper:       tenantStopper,
-		})
-		require.NoError(t, err)
-		sqlAddr, err := net.ResolveTCPAddr("tcp", ten.SQLAddr())
-		require.NoError(t, err)
-		ten.(*server.TestTenant).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
-		return &tenantdirsvr.Process{SQL: sqlAddr, Stopper: tenantStopper}, nil
-	}
-
-	// Start serving on a background goroutine.
-	go func() { require.NoError(t, tds.Serve(listener)) }()
-
-	return tds, listener.Addr().(*net.TCPAddr)
-}
-
 // mustGetTestSimpleDirectoryServer returns the underlying simple directory
 // server. This can only be used with a routing rule.
 func mustGetTestSimpleDirectoryServer(
@@ -2477,19 +2966,35 @@ func startTestTenantPods(
 	tenantID roachpb.TenantID,
 	count int,
 	knobs base.TestingKnobs,
-) []serverutils.TestTenantInterface {
+) []serverutils.ApplicationLayerInterface {
+	return startTestTenantPodsWithStopper(ctx, t, ts, tenantID, count, knobs, nil)
+}
+
+// startTestTenantPodsWithStopper is similar to startTestTenantPods, but allows
+// a custom stopper
+func startTestTenantPodsWithStopper(
+	ctx context.Context,
+	t *testing.T,
+	ts serverutils.TestServerInterface,
+	tenantID roachpb.TenantID,
+	count int,
+	knobs base.TestingKnobs,
+	stopper *stop.Stopper,
+) []serverutils.ApplicationLayerInterface {
 	t.Helper()
 
-	var tenants []serverutils.TestTenantInterface
+	var tenants []serverutils.ApplicationLayerInterface
 	for i := 0; i < count; i++ {
-		params := tests.CreateTestTenantParams(tenantID)
-		params.TestingKnobs = knobs
-		tenant, tenantDB := serverutils.StartTenant(t, ts, params)
-		tenant.(*server.TestTenant).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
+		tenant, tenantDB := serverutils.StartTenant(t, ts, base.TestTenantArgs{
+			TenantID:     tenantID,
+			TestingKnobs: knobs,
+			Stopper:      stopper,
+		})
+		tenant.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 
 		// Create a test user. We only need to do it once.
 		if i == 0 {
-			_, err := tenantDB.Exec("CREATE USER testuser WITH PASSWORD 'hunter2'")
+			_, err := tenantDB.Exec("CREATE USER IF NOT EXISTS testuser WITH PASSWORD 'hunter2'")
 			require.NoError(t, err)
 			_, err = tenantDB.Exec("GRANT admin TO testuser")
 			require.NoError(t, err)

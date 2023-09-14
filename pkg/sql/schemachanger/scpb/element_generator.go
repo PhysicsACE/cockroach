@@ -62,43 +62,88 @@ func run(in, out string) error {
 
 package scpb
 
-type ElementStatusIterator interface {
-	ForEachElementStatus(fn func(current Status, target TargetStatus, e Element))
-}
+import "fmt"
 {{ range . }}
 
 func (e {{ . }}) element() {}
 
+// Element implements ElementGetter.
+func (e * ElementProto_{{ . }}) Element() Element {
+	return e.{{ . }}
+}
+
 // ForEach{{ . }} iterates over elements of type {{ . }}.
+// Deprecated
 func ForEach{{ . }}(
-	b ElementStatusIterator, fn func(current Status, target TargetStatus, e *{{ . }}),
+	c *ElementCollection[Element], fn func(current Status, target TargetStatus, e *{{ . }}),
 ) {
-  if b == nil {
-    return
-  }
-	b.ForEachElementStatus(func(current Status, target TargetStatus, e Element) {
-		if elt, ok := e.(*{{ . }}); ok {
-			fn(current, target, elt)
-		}
-	})
+  c.Filter{{ . }}().ForEach(fn)
 }
 
 // Find{{ . }} finds the first element of type {{ . }}.
-func Find{{ . }}(b ElementStatusIterator) (current Status, target TargetStatus, element *{{ . }}) {
-  if b == nil {
-    return current, target, element
-  }
-	b.ForEachElementStatus(func(c Status, t TargetStatus, e Element) {
-		if elt, ok := e.(*{{ . }}); ok {
-			element = elt
-			current = c
-			target = t
-		}
-	})
+// Deprecated
+func Find{{ . }}(
+	c *ElementCollection[Element],
+) (current Status, target TargetStatus, element *{{ . }}) {
+	if tc := c.Filter{{ . }}(); !tc.IsEmpty() {
+		var e Element
+		current, target, e = tc.Get(0)
+		element = e.(*{{ . }})
+	}
 	return current, target, element
 }
 
+// {{ . }}Elements filters elements of type {{ . }}.
+func (c *ElementCollection[E]) Filter{{ . }}() *ElementCollection[*{{ . }}] {
+	ret := c.genericFilter(func(_ Status, _ TargetStatus, e Element) bool {
+		_, ok := e.(*{{ . }})
+		return ok
+	})
+	return (*ElementCollection[*{{ . }}])(ret)
+}
+
 {{- end -}}
+//
+// SetElements sets the element inside the protobuf.
+func (e* ElementProto) SetElement(element Element) {
+	switch t := element.(type) {
+		default:
+			panic(fmt.Sprintf("unknown type %T", t))
+{{ range . }}
+		case *{{ . }}:
+			e.ElementOneOf = &ElementProto_{{ . }}{ {{ . }}: t}
+{{- end -}}
+	}
+}
+//
+// GetElementOneOfProtos returns all one of protos.
+func GetElementOneOfProtos() []interface{} {
+	return []interface{} {
+{{ range . }}
+	((*ElementProto_{{ . }})(nil)),
+{{- end -}}
+	}
+}
+//
+// GetElementTypes returns all element types. 
+func GetElementTypes() []interface{} {
+
+	return []interface{} {
+{{ range . }}
+	((*{{ . }})(nil)),
+{{- end -}}
+}
+}
+//
+// ForEachElementType loops over each element type
+func ForEachElementType(fn func(e Element) error) error {
+	for _, e := range GetElementTypes() {
+		if err := fn(e.(Element)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 `)).Execute(&buf, elementNames); err != nil {
 		return err
 	}
@@ -116,7 +161,7 @@ func getElementNames(inProtoFile string) (names []string, _ error) {
 		elementFieldPat     = `\s*(?P<type>\w+)\s+(?P<name>\w+)\s+=\s+\d+` +
 			elementProtoBufMeta + `;`
 		elementProtoRegexp = regexp.MustCompile(`(?s)message ElementProto {
-  option \(gogoproto.onlyone\) = true;
+  oneof element_one_of {
 (?P<fields>(` + elementFieldPat + "\n)+)" +
 			"\\s*}",
 		)

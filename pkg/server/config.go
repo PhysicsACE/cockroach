@@ -30,10 +30,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -54,14 +57,14 @@ import (
 
 // Context defaults.
 const (
-	// DefaultCacheSize is the default size of the RocksDB and Pebble caches. We
-	// default the cache size and SQL memory pool size to 128 MiB. Larger values
+	// DefaultCacheSize is the default size of the Pebble cache. We default the
+	// cache size to 128MiB and SQL memory pool size to 256 MiB. Larger values
 	// might provide significantly better performance, but we're not sure what
 	// type of system we're running on (development or production or some shared
 	// environment). Production users should almost certainly override these
 	// settings and we'll warn in the logs about doing so.
-	DefaultCacheSize         = 128 << 20 // 128 MB
-	defaultSQLMemoryPoolSize = 128 << 20 // 128 MB
+	DefaultCacheSize         = 128 << 20 // 128 MiB
+	defaultSQLMemoryPoolSize = 256 << 20 // 256 MiB
 	defaultScanInterval      = 10 * time.Minute
 	defaultScanMinIdleTime   = 10 * time.Millisecond
 	defaultScanMaxIdleTime   = 1 * time.Second
@@ -202,9 +205,6 @@ type BaseConfig struct {
 	// Environment Variable: COCKROACH_DISABLE_SPAN_CONFIGS
 	SpanConfigsDisabled bool
 
-	// Disables the default test tenant.
-	DisableDefaultTestTenant bool
-
 	// TestingKnobs is used for internal test controls only.
 	TestingKnobs base.TestingKnobs
 
@@ -234,6 +234,7 @@ type BaseConfig struct {
 
 	// SharedStorage is specified to enable disaggregated shared storage.
 	SharedStorage string
+	*cloud.ExternalStorageAccessor
 
 	// StartDiagnosticsReporting starts the asynchronous goroutine that
 	// checks for CockroachDB upgrades and periodically reports
@@ -257,6 +258,10 @@ type BaseConfig struct {
 	// These events are meant for the Observability Service, but they might pass
 	// through an OpenTelemetry Collector.
 	ObsServiceAddr string
+
+	// AutoConfigProvider provides auto-configuration tasks to apply on
+	// the cluster during server initialization.
+	AutoConfigProvider acprovider.Provider
 }
 
 // MakeBaseConfig returns a BaseConfig with default values.
@@ -280,8 +285,9 @@ func (cfg *BaseConfig) SetDefaults(
 	cfg.Tracer = tr
 	cfg.Settings = st
 	idsProvider := &idProvider{
-		clusterID: &base.ClusterIDContainer{},
-		serverID:  &base.NodeIDContainer{},
+		clusterID:  &base.ClusterIDContainer{},
+		serverID:   &base.NodeIDContainer{},
+		tenantName: roachpb.NewTenantNameContainer(""),
 	}
 	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
 	cfg.idProvider = idsProvider
@@ -296,6 +302,7 @@ func (cfg *BaseConfig) SetDefaults(
 	cfg.Stores = base.StoreSpecList{
 		Specs: []base.StoreSpec{storeSpec},
 	}
+	cfg.AutoConfigProvider = acprovider.NoTaskProvider{}
 	// We use the tag "n" here for both KV nodes and SQL instances,
 	// using the knowledge that the value part of a SQL instance ID
 	// container will prefix the value with the string "sql", resulting
@@ -303,6 +310,7 @@ func (cfg *BaseConfig) SetDefaults(
 	cfg.AmbientCtx.AddLogTag("n", cfg.IDContainer)
 	cfg.Config.InitDefaults()
 	cfg.InitTestingKnobs()
+	cfg.ExternalStorageAccessor = cloud.NewExternalStorageAccessor()
 }
 
 // InitTestingKnobs sets up any testing knobs based on e.g. envvars.
@@ -477,6 +485,9 @@ type SQLConfig struct {
 	// The tenant that the SQL server runs on the behalf of.
 	TenantID roachpb.TenantID
 
+	// If set, will to be called at server startup to obtain the tenant id.
+	DelayedSetTenantID func() (roachpb.TenantID, error)
+
 	// TempStorageConfig is used to configure temp storage, which stores
 	// ephemeral data when processing large queries.
 	TempStorageConfig base.TempStorageConfig
@@ -500,6 +511,10 @@ type SQLConfig struct {
 	//
 	// Only applies when the SQL server is deployed individually.
 	TenantKVAddrs []string
+
+	// TenantLoopbackAddr is the address to use for the tenant's loopback connection.
+	// It only applies when in a shared-process configuration.
+	TenantLoopbackAddr string
 
 	// The following values can only be set via environment variables and are
 	// for testing only. They are not meant to be set by the end user.
@@ -526,6 +541,10 @@ type LocalKVServerInfo struct {
 	InternalServer     kvpb.InternalServer
 	ServerInterceptors rpc.ServerInterceptorInfo
 	Tracer             *tracing.Tracer
+
+	// SameProcessCapabilityAuthorizer is the tenant capability authorizer to
+	// use for servers running in the same process as the KV node.
+	SameProcessCapabilityAuthorizer tenantcapabilities.Authorizer
 }
 
 // MakeSQLConfig returns a SQLConfig with default values.
@@ -730,28 +749,6 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
 
-		if spec.InMemory && spec.StickyInMemoryEngineID != "" {
-			if cfg.TestingKnobs.Server == nil {
-				return Engines{}, errors.AssertionFailedf("Could not create a sticky " +
-					"engine no server knobs available to get a registry. " +
-					"Please use Knobs.Server.StickyEngineRegistry to provide one.")
-			}
-			knobs := cfg.TestingKnobs.Server.(*TestingKnobs)
-			if knobs.StickyEngineRegistry == nil {
-				return Engines{}, errors.Errorf("Could not create a sticky " +
-					"engine no registry available. Please use " +
-					"Knobs.Server.StickyEngineRegistry to provide one.")
-			}
-			eng, err := knobs.StickyEngineRegistry.GetOrCreateStickyInMemEngine(ctx, cfg, spec)
-			if err != nil {
-				return Engines{}, err
-			}
-			detail(redact.Sprintf("store %d: %+v", i, eng.Properties()))
-			engines = append(engines, eng)
-			continue
-		}
-
-		var location storage.Location
 		storageConfigOpts := []storage.ConfigOption{
 			storage.Attributes(spec.Attributes),
 			storage.EncryptionAtRest(spec.EncryptionOptions),
@@ -764,8 +761,25 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			storageConfigOpts = append(storageConfigOpts, opt)
 		}
 
+		var location storage.Location
 		if spec.InMemory {
-			location = storage.InMemory()
+			if spec.StickyVFSID == "" {
+				location = storage.InMemory()
+			} else {
+				if cfg.TestingKnobs.Server == nil {
+					return Engines{}, errors.AssertionFailedf("Could not create a sticky " +
+						"engine no server knobs available to get a registry. " +
+						"Please use Knobs.Server.StickyVFSRegistry to provide one.")
+				}
+				knobs := cfg.TestingKnobs.Server.(*TestingKnobs)
+				if knobs.StickyVFSRegistry == nil {
+					return Engines{}, errors.Errorf("Could not create a sticky " +
+						"engine no registry available. Please use " +
+						"Knobs.Server.StickyVFSRegistry to provide one.")
+				}
+				location = storage.MakeLocation("", knobs.StickyVFSRegistry.Get(spec.StickyVFSID))
+			}
+
 			var sizeInBytes = spec.Size.InBytes
 			if spec.Size.Percent > 0 {
 				sysMem, err := status.GetTotalMemory(ctx)
@@ -808,6 +822,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			// TODO(radu): move up all remaining settings below so they apply to in-memory stores as well.
 			addCfgOpt(storage.MaxOpenFiles(int(openFileLimitPerStore)))
 			addCfgOpt(storage.MaxWriterConcurrency(2))
+			addCfgOpt(storage.RemoteStorageFactory(cfg.ExternalStorageAccessor))
 			if sharedStorage != nil {
 				addCfgOpt(storage.SharedStorage(sharedStorage))
 			}
@@ -881,7 +896,8 @@ func (cfg *Config) InitNode(ctx context.Context) error {
 		cfg.GossipBootstrapAddresses = addresses
 	}
 
-	cfg.BaseConfig.idProvider.SetTenant(roachpb.SystemTenantID)
+	cfg.BaseConfig.idProvider.SetTenantID(roachpb.SystemTenantID)
+	cfg.BaseConfig.idProvider.SetTenantName(catconstants.SystemTenantName)
 
 	return nil
 }
@@ -1007,6 +1023,9 @@ type idProvider struct {
 	// tenantStr is the memoized representation of tenantID.
 	tenantStr atomic.Value
 
+	// tenantName is the tenant name container for this server.
+	tenantName *roachpb.TenantNameContainer
+
 	// serverID contains the node ID for KV nodes (when tenantID.IsSet() ==
 	// false), or the SQL instance ID for SQL-only servers (when
 	// tenantID.IsSet() == true).
@@ -1016,11 +1035,6 @@ type idProvider struct {
 }
 
 var _ serverident.ServerIdentificationPayload = (*idProvider)(nil)
-
-// TenantID is part of the serverident.ServerIdentificationPayload interface.
-func (s *idProvider) TenantID() interface{} {
-	return s.tenantID
-}
 
 // ServerIdentityString implements the serverident.ServerIdentificationPayload interface.
 func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKey) string {
@@ -1038,16 +1052,7 @@ func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKe
 		return cs
 
 	case serverident.IdentifyTenantID:
-		t := s.tenantStr.Load()
-		ts, ok := t.(string)
-		if !ok {
-			tid := s.tenantID
-			if tid.IsSet() {
-				ts = strconv.FormatUint(tid.ToUint64(), 10)
-				s.tenantStr.Store(ts)
-			}
-		}
-		return ts
+		return s.maybeMemoizeTenantID()
 
 	case serverident.IdentifyInstanceID:
 		// If tenantID is not set, this is a KV node and it has no SQL
@@ -1060,10 +1065,13 @@ func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKe
 	case serverident.IdentifyKVNodeID:
 		// If tenantID is set, this is a SQL-only server and it has no
 		// node ID.
-		if s.tenantID.IsSet() {
+		if s.tenantID.IsSet() && !s.tenantID.IsSystem() {
 			return ""
 		}
 		return s.maybeMemoizeServerID()
+
+	case serverident.IdentifyTenantName:
+		return string(s.tenantName.Get())
 	}
 
 	return ""
@@ -1075,7 +1083,7 @@ func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKe
 // Note: this should not be called concurrently with logging which may
 // invoke the method from the serverident.ServerIdentificationPayload
 // interface.
-func (s *idProvider) SetTenant(tenantID roachpb.TenantID) {
+func (s *idProvider) SetTenantID(tenantID roachpb.TenantID) {
 	if !tenantID.IsSet() {
 		panic("programming error: invalid tenant ID")
 	}
@@ -1083,6 +1091,13 @@ func (s *idProvider) SetTenant(tenantID roachpb.TenantID) {
 		panic("programming error: provider already set for tenant server")
 	}
 	s.tenantID = tenantID
+}
+
+func (s *idProvider) SetTenantName(tenantName roachpb.TenantName) {
+	if s.tenantName.Get() != "" {
+		panic("programming error: tenant name already set")
+	}
+	s.tenantName.Set(tenantName)
 }
 
 // maybeMemoizeServerID saves the representation of serverID to
@@ -1098,4 +1113,19 @@ func (s *idProvider) maybeMemoizeServerID() string {
 		}
 	}
 	return sis
+}
+
+// maybeMemoizeTenantID saves the representation of tenantID to
+// tenantStr if the former is initialized.
+func (s *idProvider) maybeMemoizeTenantID() string {
+	t := s.tenantStr.Load()
+	ts, ok := t.(string)
+	if !ok {
+		tid := s.tenantID
+		if tid.IsSet() {
+			ts = strconv.FormatUint(tid.ToUint64(), 10)
+			s.tenantStr.Store(ts)
+		}
+	}
+	return ts
 }

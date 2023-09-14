@@ -53,6 +53,9 @@ func (m *SetTenantClusterSetting) LoggingChannel() logpb.Channel { return logpb.
 func (m *AdminQuery) LoggingChannel() logpb.Channel { return logpb.Channel_SENSITIVE_ACCESS }
 
 // LoggingChannel implements the EventPayload interface.
+func (m *RoleBasedAuditEvent) LoggingChannel() logpb.Channel { return logpb.Channel_SENSITIVE_ACCESS }
+
+// LoggingChannel implements the EventPayload interface.
 func (m *SensitiveTableAccess) LoggingChannel() logpb.Channel { return logpb.Channel_SENSITIVE_ACCESS }
 
 // LoggingChannel implements the EventPayload interface.
@@ -324,6 +327,9 @@ func (m *ChangefeedFailed) LoggingChannel() logpb.Channel { return logpb.Channel
 
 // LoggingChannel implements the EventPayload interface.
 func (m *CreateChangefeed) LoggingChannel() logpb.Channel { return logpb.Channel_TELEMETRY }
+
+// LoggingChannel implements the EventPayload interface.
+func (m *HotRangesStats) LoggingChannel() logpb.Channel { return logpb.Channel_TELEMETRY }
 
 // LoggingChannel implements the EventPayload interface.
 func (m *RecoveryEvent) LoggingChannel() logpb.Channel { return logpb.Channel_TELEMETRY }

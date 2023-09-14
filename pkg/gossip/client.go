@@ -17,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -65,15 +64,13 @@ func newClient(ambient log.AmbientContext, addr net.Addr, nodeMetrics Metrics) *
 	}
 }
 
+var logFailedStartEvery = log.Every(5 * time.Second)
+
 // start dials the remote addr and commences gossip once connected. Upon exit,
 // the client is sent on the disconnected channel. This method starts client
 // processing in a goroutine and returns immediately.
 func (c *client) startLocked(
-	g *Gossip,
-	disconnected chan *client,
-	rpcCtx *rpc.Context,
-	stopper *stop.Stopper,
-	breaker *circuit.Breaker,
+	g *Gossip, disconnected chan *client, rpcCtx *rpc.Context, stopper *stop.Stopper,
 ) {
 	// Add a placeholder for the new outgoing connection because we may not know
 	// the ID of the node we're connecting to yet. This will be resolved in
@@ -98,23 +95,26 @@ func (c *client) startLocked(
 			disconnected <- c
 		}()
 
-		consecFailures := breaker.ConsecFailures()
-		var stream Gossip_GossipClient
-		if err := breaker.Call(func() error {
+		stream, err := func() (Gossip_GossipClient, error) {
 			// Note: avoid using `grpc.WithBlock` here. This code is already
 			// asynchronous from the caller's perspective, so the only effect of
 			// `WithBlock` here is blocking shutdown - at the time of this writing,
 			// that ends ups up making `kv` tests take twice as long.
 			conn, err := rpcCtx.GRPCUnvalidatedDial(c.addr.String()).Connect(ctx)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			if stream, err = NewGossipClient(conn).Gossip(ctx); err != nil {
-				return err
+			stream, err := NewGossipClient(conn).Gossip(ctx)
+			if err != nil {
+				return nil, err
 			}
-			return c.requestGossip(g, stream)
-		}, 0); err != nil {
-			if consecFailures == 0 {
+			if err := c.requestGossip(g, stream); err != nil {
+				return nil, err
+			}
+			return stream, nil
+		}()
+		if err != nil {
+			if logFailedStartEvery.ShouldLog() {
 				log.Warningf(ctx, "failed to start gossip client to %s: %s", c.addr, err)
 			}
 			return
@@ -124,13 +124,16 @@ func (c *client) startLocked(
 		log.Infof(ctx, "started gossip client to n%d (%s)", c.peerID, c.addr)
 		if err := c.gossip(ctx, g, stream, stopper, &wg); err != nil {
 			if !grpcutil.IsClosedConnection(err) {
-				g.mu.RLock()
+				peerID, addr := func() (roachpb.NodeID, net.Addr) {
+					g.mu.RLock()
+					defer g.mu.RUnlock()
+					return c.peerID, c.addr
+				}()
 				if c.peerID != 0 {
-					log.Infof(ctx, "closing client to n%d (%s): %s", c.peerID, c.addr, err)
+					log.Infof(ctx, "closing client to n%d (%s): %s", peerID, addr, err)
 				} else {
-					log.Infof(ctx, "closing client to %s: %s", c.addr, err)
+					log.Infof(ctx, "closing client to %s: %s", addr, err)
 				}
-				g.mu.RUnlock()
 			}
 		}
 	}); err != nil {
@@ -151,14 +154,17 @@ func (c *client) close() {
 // supplying a map of this node's knowledge of other nodes' high water
 // timestamps.
 func (c *client) requestGossip(g *Gossip, stream Gossip_GossipClient) error {
-	g.mu.RLock()
+	nodeAddr, highWaterStamps := func() (util.UnresolvedAddr, map[roachpb.NodeID]int64) {
+		g.mu.RLock()
+		defer g.mu.RUnlock()
+		return g.mu.is.NodeAddr, g.mu.is.getHighWaterStamps()
+	}()
 	args := &Request{
 		NodeID:          g.NodeID.Get(),
-		Addr:            g.mu.is.NodeAddr,
-		HighWaterStamps: g.mu.is.getHighWaterStamps(),
+		Addr:            nodeAddr,
+		HighWaterStamps: highWaterStamps,
 		ClusterID:       g.clusterID.Get(),
 	}
-	g.mu.RUnlock()
 
 	bytesSent := int64(args.Size())
 	c.clientMetrics.BytesSent.Inc(bytesSent)
@@ -206,7 +212,6 @@ func (c *client) sendGossip(g *Gossip, stream Gossip_GossipClient, firstReq bool
 				log.Infof(ctx, "sending %s to %s", extractKeys(args.Delta), c.addr)
 			}
 		}
-
 		g.mu.Unlock()
 		return stream.Send(&args)
 	}

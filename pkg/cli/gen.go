@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/mozillazg/go-slugify"
+	slugify "github.com/mozillazg/go-slugify"
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
 )
@@ -195,8 +195,11 @@ The resulting key file will be 32 bytes (random key ID) + key_size in bytes.
 	},
 }
 
-var includeReservedSettings bool
+var includeAllSettings bool
 var excludeSystemSettings bool
+var showSettingClass bool
+var classHeaderLabel string
+var classLabels []string
 
 var genSettingsListCmd = &cobra.Command{
 	Use:   "settings-list",
@@ -212,11 +215,11 @@ Output the list of cluster settings known to this binary.
 			return s
 		}
 
-		wrapDivSlug := func(s string) string {
+		wrapDivSlug := func(key settings.InternalKey, name settings.SettingName) string {
 			if sqlExecCtx.TableDisplayFormat == clisqlexec.TableDisplayRawHTML {
-				return fmt.Sprintf(`<div id="setting-%s" class="anchored">%s</div>`, slugify.Slugify(s), wrapCode(s))
+				return fmt.Sprintf(`<div id="setting-%s" class="anchored">%s</div>`, slugify.Slugify(string(key)), wrapCode(string(name)))
 			}
-			return s
+			return string(name)
 		}
 
 		// Fill a Values struct with the defaults.
@@ -224,18 +227,18 @@ Output the list of cluster settings known to this binary.
 		settings.NewUpdater(&s.SV).ResetRemaining(context.Background())
 
 		var rows [][]string
-		for _, name := range settings.Keys(settings.ForSystemTenant) {
-			setting, ok := settings.LookupForLocalAccess(name, settings.ForSystemTenant)
+		for _, key := range settings.Keys(settings.ForSystemTenant) {
+			setting, ok := settings.LookupForLocalAccessByKey(key, settings.ForSystemTenant)
 			if !ok {
-				panic(fmt.Sprintf("could not find setting %q", name))
+				panic(fmt.Sprintf("could not find setting %q", key))
 			}
+			name := setting.Name()
 
 			if excludeSystemSettings && setting.Class() == settings.SystemOnly {
 				continue
 			}
 
-			if setting.Visibility() != settings.Public {
-				// We don't document non-public settings at this time.
+			if !includeAllSettings && setting.Visibility() != settings.Public {
 				continue
 			}
 
@@ -248,7 +251,7 @@ Output the list of cluster settings known to this binary.
 				defaultVal = sm.SettingsListDefault()
 			} else {
 				defaultVal = setting.String(&s.SV)
-				if override, ok := upgrades.SettingsDefaultOverrides[name]; ok {
+				if override, ok := upgrades.SettingsDefaultOverrides[key]; ok {
 					defaultVal = override
 				}
 			}
@@ -259,7 +262,7 @@ Output the list of cluster settings known to this binary.
 				settingDesc = html.EscapeString(settingDesc)
 				alterRoleLink = `<a href="alter-role.html"><code>ALTER ROLE... SET</code></a>`
 			}
-			if strings.Contains(name, "sql.defaults") {
+			if strings.Contains(string(name), "sql.defaults") || strings.Contains(string(key), "sql.defaults") {
 				settingDesc = fmt.Sprintf(`%s
 This cluster setting is being kept to preserve backwards-compatibility.
 This session variable default should now be configured using %s`,
@@ -268,12 +271,40 @@ This session variable default should now be configured using %s`,
 				)
 			}
 
-			row := []string{wrapDivSlug(name), typ, wrapCode(defaultVal), settingDesc}
+			row := []string{wrapDivSlug(key, name), typ, wrapCode(defaultVal), settingDesc}
+			if showSettingClass {
+				class := "unknown"
+				switch setting.Class() {
+				case settings.SystemOnly:
+					class = classLabels[0]
+				case settings.TenantReadOnly:
+					class = classLabels[1]
+				case settings.TenantWritable:
+					class = classLabels[2]
+				}
+				row = append(row, class)
+			}
+			if includeAllSettings {
+				if setting.Visibility() == settings.Public {
+					row = append(row, "public")
+				} else {
+					row = append(row, "reserved")
+				}
+			}
 			rows = append(rows, row)
 		}
 
-		sliceIter := clisqlexec.NewRowSliceIter(rows, "dddd")
 		cols := []string{"Setting", "Type", "Default", "Description"}
+		align := "dddd"
+		if showSettingClass {
+			cols = append(cols, classHeaderLabel)
+			align += "d"
+		}
+		if includeAllSettings {
+			cols = append(cols, "Visibility")
+			align += "d"
+		}
+		sliceIter := clisqlexec.NewRowSliceIter(rows, align)
 		return sqlExecCtx.PrintQueryOutput(os.Stdout, stderr, cols, sliceIter)
 	},
 }
@@ -306,10 +337,19 @@ func init() {
 		"AES key size for encryption at rest (one of: 128, 192, 256)")
 	GenEncryptionKeyCmd.PersistentFlags().BoolVar(&overwriteKey, "overwrite", false,
 		"Overwrite key if it exists")
-	genSettingsListCmd.PersistentFlags().BoolVar(&includeReservedSettings, "include-reserved", false,
-		"include undocumented 'reserved' settings")
-	genSettingsListCmd.PersistentFlags().BoolVar(&excludeSystemSettings, "without-system-only", false,
+
+	f := genSettingsListCmd.PersistentFlags()
+	f.BoolVar(&includeAllSettings, "all-settings", false,
+		"include undocumented 'internal' settings")
+	f.BoolVar(&excludeSystemSettings, "without-system-only", false,
 		"do not list settings only applicable to system tenant")
+	f.BoolVar(&showSettingClass, "show-class", false,
+		"show the setting class")
+	f.StringVar(&classHeaderLabel, "class-header-label", "Class",
+		"label to use in the output for the class column")
+	f.StringSliceVar(&classLabels, "class-labels",
+		[]string{"system-only", "tenant-ro", "tenant-rw"},
+		"label to use in the output for the various setting classes")
 
 	genCmd.AddCommand(genCmds...)
 }

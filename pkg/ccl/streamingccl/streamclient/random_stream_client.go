@@ -78,7 +78,8 @@ const (
 // TODO(dt): just make interceptors a singleton, not the whole client.
 var randomStreamClientSingleton = func() *RandomStreamClient {
 	c := RandomStreamClient{}
-	c.mu.tableID = 52
+	// Make the base tableID really large to prevent colliding with system table IDs.
+	c.mu.tableID = 5000
 	return &c
 }()
 
@@ -486,9 +487,11 @@ func (m *RandomStreamClient) Subscribe(
 
 	// rand is not thread safe, so create a random source for each partition.
 	rng, _ := randutil.NewPseudoRand()
-	m.mu.Lock()
-	reg, err := newRandomEventGenerator(rng, partitionURL, config, m.mu.sstMaker)
-	m.mu.Unlock()
+	reg, err := func() (*randomEventGenerator, error) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return newRandomEventGenerator(rng, partitionURL, config, m.mu.sstMaker)
+	}()
 	if err != nil {
 		return nil, err
 	}

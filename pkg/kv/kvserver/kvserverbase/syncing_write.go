@@ -19,10 +19,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/vfs"
 	"golang.org/x/time/rate"
 )
 
@@ -65,7 +65,7 @@ func LimitBulkIOWrite(ctx context.Context, limiter *rate.Limiter, cost int) erro
 
 // sstWriteSyncRate wraps "kv.bulk_sst.sync_size". 0 disables syncing.
 var sstWriteSyncRate = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.bulk_sst.sync_size",
 	"threshold after which non-Rocks SST writes must fsync (0 disables)",
 	BulkIOWriteBurst,
@@ -82,7 +82,7 @@ func WriteFileSyncing(
 	ctx context.Context,
 	filename string,
 	data []byte,
-	fs fs.FS,
+	fs vfs.FS,
 	perm os.FileMode,
 	settings *cluster.Settings,
 	limiter *rate.Limiter,

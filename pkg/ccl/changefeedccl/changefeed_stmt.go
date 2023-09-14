@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -51,6 +52,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -64,7 +67,7 @@ var featureChangefeedEnabled = settings.RegisterBoolSetting(
 	"feature.changefeed.enabled",
 	"set to true to enable changefeeds, false to disable; default is true",
 	featureflag.FeatureFlagEnabledDefault,
-).WithPublic()
+	settings.WithPublic)
 
 func init() {
 	sql.AddPlanHook("changefeed", changefeedPlanHook, changefeedTypeCheck)
@@ -173,8 +176,12 @@ func changefeedPlanHook(
 	rowFn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer span.Finish()
-
-		if err := validateSettings(ctx, p); err != nil {
+		opts := changefeedbase.MakeStatementOptions(rawOpts)
+		st, err := opts.GetInitialScanType()
+		if err != nil {
+			return err
+		}
+		if err := validateSettings(ctx, st != changefeedbase.OnlyInitialScan, p.ExecCfg()); err != nil {
 			return err
 		}
 
@@ -183,8 +190,6 @@ func changefeedPlanHook(
 			// already sent the wrong result column headers.
 			return errors.New(`omit the SINK clause for inline results`)
 		}
-
-		opts := changefeedbase.MakeStatementOptions(rawOpts)
 
 		jr, err := createChangefeedJobRecord(
 			ctx,
@@ -208,10 +213,6 @@ func changefeedPlanHook(
 		}
 
 		if details.SinkURI == `` {
-			p.ExtendedEvalContext().ChangefeedState = &coreChangefeedProgress{
-				progress: progress,
-			}
-
 			// If this is a sinkless changefeed, then we should not hold on to the
 			// descriptor leases accessed to plan the changefeed. If changes happen
 			// to descriptors, they will be addressed during the execution.
@@ -224,25 +225,7 @@ func changefeedPlanHook(
 			telemetry.Count(`changefeed.create.core`)
 			logChangefeedCreateTelemetry(ctx, jr, changefeedStmt.Select != nil)
 
-			var err error
-			for r := getRetry(ctx); r.Next(); {
-				if err = distChangefeedFlow(ctx, p, 0 /* jobID */, details, progress, resultsCh); err == nil {
-					return nil
-				}
-
-				if knobs, ok := p.ExecCfg().DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs); ok {
-					if knobs != nil && knobs.HandleDistChangefeedError != nil {
-						err = knobs.HandleDistChangefeedError(err)
-					}
-				}
-
-				if err = changefeedbase.AsTerminalError(ctx, p.ExecCfg().LeaseManager, err); err != nil {
-					break
-				}
-
-				// All other errors retry.
-				progress = p.ExtendedEvalContext().ChangefeedState.(*coreChangefeedProgress).progress
-			}
+			err := coreChangefeed(ctx, p, details, progress, resultsCh)
 			// TODO(yevgeniy): This seems wrong -- core changefeeds always terminate
 			// with an error.  Perhaps rename this telemetry to indicate number of
 			// completed feeds.
@@ -270,8 +253,8 @@ func changefeedPlanHook(
 				jobID,
 				AllTargets(details),
 				details.StatementTime,
-				progress.GetChangefeed(),
 			)
+			progress.GetChangefeed().ProtectedTimestampRecord = ptr.ID.GetUUID()
 
 			jr.Progress = *progress.GetChangefeed()
 
@@ -345,6 +328,41 @@ func changefeedPlanHook(
 		return err
 	}
 	return rowFnLogErrors, header, nil, avoidBuffering, nil
+}
+
+func coreChangefeed(
+	ctx context.Context,
+	p sql.PlanHookState,
+	details jobspb.ChangefeedDetails,
+	progress jobspb.Progress,
+	resultsCh chan<- tree.Datums,
+) error {
+	localState := &cachedState{progress: progress}
+	p.ExtendedEvalContext().ChangefeedState = localState
+	knobs, _ := p.ExecCfg().DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs)
+
+	for r := getRetry(ctx); r.Next(); {
+		if knobs != nil && knobs.BeforeDistChangefeed != nil {
+			knobs.BeforeDistChangefeed()
+		}
+
+		err := distChangefeedFlow(ctx, p, 0 /* jobID */, details, localState, resultsCh)
+		if err == nil {
+			return nil
+		}
+
+		if knobs != nil && knobs.HandleDistChangefeedError != nil {
+			err = knobs.HandleDistChangefeedError(err)
+		}
+
+		if err = changefeedbase.AsTerminalError(ctx, p.ExecCfg().LeaseManager, err); err != nil {
+			return err
+		}
+
+		// All other errors retry; but we'll use an up-to-date progress
+		// information which is saved in the localState.
+	}
+	return ctx.Err() // retry loop exits when context cancels.
 }
 
 func createChangefeedJobRecord(
@@ -506,10 +524,18 @@ func createChangefeedJobRecord(
 			}
 			opts.ForceDiff()
 		} else if opts.IsSet(changefeedbase.OptDiff) {
-			opts.ClearDiff()
-			p.BufferClientNotice(ctx, pgnotice.Newf(
-				"turning off unused %s option (expression <%s> does not use cdc_prev)",
-				changefeedbase.OptDiff, tree.AsString(normalized)))
+			// Expression didn't reference cdc_prev, but the diff option was specified.
+			// This only makes sense if we have wrapped envelope.
+			encopts, err := opts.GetEncodingOptions()
+			if err != nil {
+				return nil, err
+			}
+			if encopts.Envelope != changefeedbase.OptEnvelopeWrapped {
+				opts.ClearDiff()
+				p.BufferClientNotice(ctx, pgnotice.Newf(
+					"turning off unused %s option (expression <%s> does not use cdc_prev)",
+					changefeedbase.OptDiff, tree.AsString(normalized)))
+			}
 		}
 
 		// TODO: Set the default envelope to row here when using a sink and format
@@ -567,7 +593,8 @@ func createChangefeedJobRecord(
 	if err != nil {
 		return nil, err
 	}
-	if _, err := getEncoder(encodingOpts, AllTargets(details), makeExternalConnectionProvider(ctx, p.ExecCfg().InternalDB), nil); err != nil {
+	if _, err := getEncoder(encodingOpts, AllTargets(details), details.Select != "",
+		makeExternalConnectionProvider(ctx, p.ExecCfg().InternalDB), nil); err != nil {
 		return nil, err
 	}
 
@@ -607,7 +634,7 @@ func createChangefeedJobRecord(
 		if !status.ChildMetricsEnabled.Get(&p.ExecCfg().Settings.SV) {
 			p.BufferClientNotice(ctx, pgnotice.Newf(
 				"%s is set to false, metrics will only be published to the '%s' label when it is set to true",
-				status.ChildMetricsEnabled.Key(),
+				status.ChildMetricsEnabled.Name(),
 				scope,
 			))
 		}
@@ -665,22 +692,50 @@ func createChangefeedJobRecord(
 	}
 	details.Opts = opts.AsMap()
 
+	if locFilter := details.Opts[changefeedbase.OptExecutionLocality]; locFilter != "" {
+		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V23_1) {
+			return nil, pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"cannot create new changefeed with %s until upgrade to version %s is complete",
+				changefeedbase.OptExecutionLocality, clusterversion.V23_1.String(),
+			)
+		}
+		var executionLocality roachpb.Locality
+		if err := executionLocality.Set(locFilter); err != nil {
+			return nil, err
+		}
+		if _, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, executionLocality); err != nil {
+			return nil, err
+		}
+	}
+
 	ptsExpiration, err := opts.GetPTSExpiration()
 	if err != nil {
 		return nil, err
 	}
 
+	useDefaultExpiration := ptsExpiration == 0
+	if useDefaultExpiration {
+		ptsExpiration = changefeedbase.MaxProtectedTimestampAge.Get(&p.ExecCfg().Settings.SV)
+	}
+
 	if ptsExpiration > 0 && ptsExpiration < time.Hour {
 		// This threshold is rather arbitrary.  But we want to warn users about
 		// the potential impact of keeping this setting too low.
-		p.BufferClientNotice(ctx, pgnotice.Newf(
-			`the value of %s for changefeed option %s might be too low. Having a low
-			value for this option should not have adverse effect as long as changefeed
-			is running. However, should the changefeed be paused, it will need to be
-			resumed before expiration time. The value of this setting should reflect
-			how much time the changefeed may remain paused, before it is canceled. 
-			Few hours to a few days range are appropriate values for this option.
-`, ptsExpiration, changefeedbase.OptExpirePTSAfter, ptsExpiration))
+		const explainer = `Having a low protected timestamp expiration value should not have adverse effect
+as long as changefeed is running. However, should the changefeed be paused, it
+will need to be resumed before expiration time. The value of this setting should
+reflect how much time he changefeed may remain paused, before it is canceled.
+Few hours to a few days range are appropriate values for this option.`
+		if useDefaultExpiration {
+			p.BufferClientNotice(ctx, pgnotice.Newf(
+				`the value of %s for changefeed.protect_timestamp.max_age setting might be too low. %s`,
+				ptsExpiration, changefeedbase.OptExpirePTSAfter, explainer))
+		} else {
+			p.BufferClientNotice(ctx, pgnotice.Newf(
+				`the value of %s for changefeed option %s might be too low. %s`,
+				ptsExpiration, changefeedbase.OptExpirePTSAfter, explainer))
+		}
 	}
 
 	jr := &jobs.Record{
@@ -700,10 +755,10 @@ func createChangefeedJobRecord(
 	return jr, nil
 }
 
-func validateSettings(ctx context.Context, p sql.PlanHookState) error {
+func validateSettings(ctx context.Context, needsRangeFeed bool, execCfg *sql.ExecutorConfig) error {
 	if err := featureflag.CheckEnabled(
 		ctx,
-		p.ExecCfg(),
+		execCfg,
 		featureChangefeedEnabled,
 		"CHANGEFEED",
 	); err != nil {
@@ -712,7 +767,7 @@ func validateSettings(ctx context.Context, p sql.PlanHookState) error {
 
 	// Changefeeds are based on the Rangefeed abstraction, which
 	// requires the `kv.rangefeed.enabled` setting to be true.
-	if !kvserver.RangefeedEnabled.Get(&p.ExecCfg().Settings.SV) {
+	if needsRangeFeed && !kvserver.RangefeedEnabled.Get(&execCfg.Settings.SV) {
 		return errors.Errorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
 			docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	}
@@ -849,6 +904,25 @@ func validateSink(
 	if err != nil {
 		return err
 	}
+	u, err := url.Parse(details.SinkURI)
+	if err != nil {
+		return err
+	}
+
+	ambiguousSchemes := map[string][2]string{
+		changefeedbase.DeprecatedSinkSchemeHTTP:  {changefeedbase.SinkSchemeCloudStorageHTTP, changefeedbase.SinkSchemeWebhookHTTP},
+		changefeedbase.DeprecatedSinkSchemeHTTPS: {changefeedbase.SinkSchemeCloudStorageHTTPS, changefeedbase.SinkSchemeWebhookHTTPS},
+	}
+
+	if disambiguations, isAmbiguous := ambiguousSchemes[u.Scheme]; isAmbiguous {
+		p.BufferClientNotice(ctx, pgnotice.Newf(
+			`Interpreting deprecated URI scheme %s as %s. For webhook semantics, use %s.`,
+			u.Scheme,
+			disambiguations[0],
+			disambiguations[1],
+		))
+	}
+
 	var nilOracle timestampLowerBoundOracle
 	canarySink, err := getAndDialSink(ctx, &p.ExecCfg().DistSQLSrv.ServerConfig, details,
 		nilOracle, p.User(), jobID, sli)
@@ -1042,9 +1116,76 @@ func (b *changefeedResumer) Resume(ctx context.Context, execCtx interface{}) err
 	details := b.job.Details().(jobspb.ChangefeedDetails)
 	progress := b.job.Progress()
 
+	if err := b.ensureClusterIDMatches(ctx, jobExec.ExtendedEvalContext().ClusterID); err != nil {
+		return err
+	}
+
 	err := b.resumeWithRetries(ctx, jobExec, jobID, details, progress, execCfg)
 	if err != nil {
 		return b.handleChangefeedError(ctx, err, details, jobExec)
+	}
+	return nil
+}
+
+// ensureClusterIDMatches verifies that this job record matches
+// the cluster ID of this cluster.
+// This check ensures that if the job has been restored from the
+// full backup, or from streaming replication, then we will fail
+// this changefeed since resuming changefeed, from potentially
+// long "sleep", and attempting to write to existing bucket/topic,
+// is more undesirable and dangerous than just failing this job.
+func (b *changefeedResumer) ensureClusterIDMatches(ctx context.Context, clusterID uuid.UUID) error {
+	if createdBy := b.job.Payload().CreationClusterID; createdBy == uuid.Nil {
+		// This cluster was upgraded from a version that did not set clusterID
+		// in the job record -- rectify this issue.
+		if err := b.job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+			md.Payload.CreationClusterID = clusterID
+			ju.UpdatePayload(md.Payload)
+			return nil
+		}); err != nil {
+			return jobs.MarkAsRetryJobError(err)
+		}
+	} else if clusterID != createdBy {
+		return errors.Newf("this changefeed was originally created by cluster %s; "+
+			"it must be recreated on this cluster if this cluster is now expected "+
+			"to emit to the same destination", createdBy)
+	}
+	return nil
+}
+
+// TODO(dt): remove this copy pasta from backupResumer in favor of a shared func
+// somewhere in pkg/jobs or the job registry.
+func (b *changefeedResumer) maybeRelocateJobExecution(
+	ctx context.Context, p sql.JobExecContext, locality roachpb.Locality,
+) error {
+	if locality.NonEmpty() {
+		current, err := p.DistSQLPlanner().GetSQLInstanceInfo(p.ExecCfg().JobRegistry.ID())
+		if err != nil {
+			return err
+		}
+		if ok, missedTier := current.Locality.Matches(locality); !ok {
+			log.Infof(ctx,
+				"CHANGEFEED job %d initially adopted on instance %d but it does not match locality filter %s, finding a new coordinator",
+				b.job.ID(), current.NodeID, missedTier.String(),
+			)
+
+			instancesInRegion, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, locality)
+			if err != nil {
+				return err
+			}
+			rng, _ := randutil.NewPseudoRand()
+			dest := instancesInRegion[rng.Intn(len(instancesInRegion))]
+
+			var res error
+			if err := p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				var err error
+				res, err = p.ExecCfg().JobRegistry.RelocateLease(ctx, txn, b.job.ID(), dest.InstanceID, dest.SessionID)
+				return err
+			}); err != nil {
+				return errors.Wrapf(err, "failed to relocate job coordinator to %d", dest.InstanceID)
+			}
+			return res
+		}
 	}
 	return nil
 }
@@ -1055,6 +1196,11 @@ func (b *changefeedResumer) handleChangefeedError(
 	details jobspb.ChangefeedDetails,
 	jobExec sql.JobExecContext,
 ) error {
+	// Execution relocation errors just get returned immediately, as they indicate
+	// another node has taken over execution and this execution should end now.
+	if jobs.IsLeaseRelocationError(changefeedErr) {
+		return changefeedErr
+	}
 	opts := changefeedbase.MakeStatementOptions(details.Opts)
 	onError, errErr := opts.GetOnError()
 	if errErr != nil {
@@ -1074,10 +1220,6 @@ func (b *changefeedResumer) handleChangefeedError(
 			changefeedbase.OptOnError, changefeedbase.OptOnErrorPause)
 		return b.job.NoTxn().PauseRequestedWithFunc(ctx, func(ctx context.Context,
 			planHookState interface{}, txn isql.Txn, progress *jobspb.Progress) error {
-			err := b.OnPauseRequest(ctx, jobExec, txn, progress)
-			if err != nil {
-				return err
-			}
 			// directly update running status to avoid the running/reverted job status check
 			progress.RunningStatus = errorMessage
 			log.Warningf(ctx, errorFmt, changefeedErr, changefeedbase.OptOnError, changefeedbase.OptOnErrorPause)
@@ -1094,48 +1236,81 @@ func (b *changefeedResumer) resumeWithRetries(
 	jobExec sql.JobExecContext,
 	jobID jobspb.JobID,
 	details jobspb.ChangefeedDetails,
-	progress jobspb.Progress,
+	initialProgress jobspb.Progress,
 	execCfg *sql.ExecutorConfig,
 ) error {
+	// If execution needs to be and is relocated, the resulting error should be
+	// returned without retry, as it indicates _this_ execution should cease now
+	// that execution is elsewhere, so check this before the retry loop.
+	if filter := details.Opts[changefeedbase.OptExecutionLocality]; filter != "" {
+		var loc roachpb.Locality
+		if err := loc.Set(filter); err != nil {
+			return err
+		}
+		if err := b.maybeRelocateJobExecution(ctx, jobExec, loc); err != nil {
+			return err
+		}
+	}
+
+	// Grab a "reference" to this nodes job registry in order to make sure
+	// this resumer has enough time to persist up to date checkpoint in case
+	// of node drain.
+	drainCh, cleanup := execCfg.JobRegistry.OnDrain()
+	defer cleanup()
+
 	// We'd like to avoid failing a changefeed unnecessarily, so when an error
 	// bubbles up to this level, we'd like to "retry" the flow if possible. This
 	// could be because the sink is down or because a cockroach node has crashed
 	// or for many other reasons.
 	var lastRunStatusUpdate time.Time
 
-	for r := getRetry(ctx); r.Next(); {
-		err := maybeUpgradePreProductionReadyExpression(ctx, jobID, details, jobExec)
+	// Setup local state information.
+	// This information is used by dist flow process to communicate back
+	// the up-to-date checkpoint and node health information in case
+	// changefeed encounters transient error.
+	localState := &cachedState{progress: initialProgress}
+	jobExec.ExtendedEvalContext().ChangefeedState = localState
+	knobs, _ := execCfg.DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs)
 
-		if err == nil {
+	for r := getRetry(ctx); r.Next(); {
+		flowErr := maybeUpgradePreProductionReadyExpression(ctx, jobID, details, jobExec)
+
+		if flowErr == nil {
 			// startedCh is normally used to signal back to the creator of the job that
 			// the job has started; however, in this case nothing will ever receive
 			// on the channel, causing the changefeed flow to block. Replace it with
 			// a dummy channel.
 			startedCh := make(chan tree.Datums, 1)
-			err = distChangefeedFlow(ctx, jobExec, jobID, details, progress, startedCh)
-			if err == nil {
+			if knobs != nil && knobs.BeforeDistChangefeed != nil {
+				knobs.BeforeDistChangefeed()
+			}
+
+			flowErr = distChangefeedFlow(ctx, jobExec, jobID, details, localState, startedCh)
+			if flowErr == nil {
 				return nil // Changefeed completed -- e.g. due to initial_scan=only mode.
 			}
 
-			if knobs, ok := execCfg.DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs); ok {
-				if knobs != nil && knobs.HandleDistChangefeedError != nil {
-					err = knobs.HandleDistChangefeedError(err)
-				}
+			if knobs != nil && knobs.HandleDistChangefeedError != nil {
+				flowErr = knobs.HandleDistChangefeedError(flowErr)
 			}
 		}
 
 		// Terminate changefeed if needed.
-		if err := changefeedbase.AsTerminalError(ctx, jobExec.ExecCfg().LeaseManager, err); err != nil {
+		if err := changefeedbase.AsTerminalError(ctx, jobExec.ExecCfg().LeaseManager, flowErr); err != nil {
 			log.Infof(ctx, "CHANGEFEED %d shutting down (cause: %v)", jobID, err)
 			// Best effort -- update job status to make it clear why changefeed shut down.
 			// This won't always work if this node is being shutdown/drained.
-			b.setJobRunningStatus(ctx, time.Time{}, "shutdown due to %s", err)
+			if ctx.Err() == nil {
+				b.setJobRunningStatus(ctx, time.Time{}, "shutdown due to %s", err)
+			}
 			return err
 		}
 
 		// All other errors retry.
-		log.Warningf(ctx, `WARNING: CHANGEFEED job %d encountered retryable error: %v`, jobID, err)
-		lastRunStatusUpdate = b.setJobRunningStatus(ctx, lastRunStatusUpdate, "retryable error: %s", err)
+		log.Warningf(ctx, `Changefeed job %d encountered transient error: %v (attempt %d)`,
+			jobID, flowErr, 1+r.CurrentAttempt())
+		lastRunStatusUpdate = b.setJobRunningStatus(ctx, lastRunStatusUpdate, "transient error: %s", flowErr)
+
 		if metrics, ok := execCfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics); ok {
 			sli, err := metrics.getSLIMetrics(details.Opts[changefeedbase.OptMetricsScope])
 			if err != nil {
@@ -1143,22 +1318,115 @@ func (b *changefeedResumer) resumeWithRetries(
 			}
 			sli.ErrorRetries.Inc(1)
 		}
-		// Re-load the job in order to update our progress object, which may have
-		// been updated by the changeFrontier processor since the flow started.
-		reloadedJob, reloadErr := execCfg.JobRegistry.LoadClaimedJob(ctx, jobID)
-		if reloadErr != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+
+		if err := reconcileJobStateWithLocalState(ctx, jobID, localState, execCfg); err != nil {
+			// Any errors during reconciliation are retry-able.
+			// When retry-able error propagates to jobs registry, it will clear out
+			// claim information, and will restart this job somewhere else (though,
+			// it's possible that the job gets restarted on this node).
+			return jobs.MarkAsRetryJobError(err)
+		}
+
+		if errors.Is(flowErr, changefeedbase.ErrNodeDraining) {
+			select {
+			case <-drainCh:
+				// If this node is draining, there is no point in retrying.
+				return jobs.MarkAsRetryJobError(changefeedbase.ErrNodeDraining)
+			default:
+				// We know that some node (other than this one) is draining.
+				// When we retry, the planner ought to take into account
+				// this information.  However, there is a bit of a race here
+				// between draining node propagating information to this node,
+				// and this node restarting changefeed before this happens.
+				// We could come up with a mechanism to provide additional
+				// information to dist sql planner.  Or... we could just wait a bit.
+				log.Warningf(ctx, "Changefeed %d delaying restart due to %d node(s) (%v) draining",
+					jobID, len(localState.drainingNodes), localState.drainingNodes)
+				r.Next() // default config: ~5 sec delay, plus 10 sec on the retry loop.
 			}
-			log.Warningf(ctx, `CHANGEFEED job %d could not reload job progress; `+
-				`continuing from last known high-water of %s: %v`,
-				jobID, progress.GetHighWater(), reloadErr)
-		} else {
-			progress = reloadedJob.Progress()
-			details = reloadedJob.Details().(jobspb.ChangefeedDetails)
 		}
 	}
+
 	return errors.Wrap(ctx.Err(), `ran out of retries`)
+}
+
+// reconcileJobStateWithLocalState ensures that the job progress information
+// is consistent with the state present in the local state.
+func reconcileJobStateWithLocalState(
+	ctx context.Context, jobID jobspb.JobID, localState *cachedState, execCfg *sql.ExecutorConfig,
+) error {
+	// Re-load the job in order to update our progress object, which may have
+	// been updated by the changeFrontier processor since the flow started.
+	reloadedJob, reloadErr := execCfg.JobRegistry.LoadClaimedJob(ctx, jobID)
+	if reloadErr != nil {
+		log.Warningf(ctx, `CHANGEFEED job %d could not reload job progress (%s); `+
+			`job should be retried later`, jobID, reloadErr)
+		return reloadErr
+	}
+	knobs, _ := execCfg.DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs)
+	if knobs != nil && knobs.LoadJobErr != nil {
+		if err := knobs.LoadJobErr(); err != nil {
+			return err
+		}
+	}
+
+	localState.progress = reloadedJob.Progress()
+
+	// localState contains an up-to-date checkpoint information transmitted by
+	// aggregator when flow was terminated. To be safe, we don't blindly trust
+	// local state; instead, this checkpoint is applied to the reloaded job
+	// progress, and the resulting progress record persisted back to the jobs
+	// table.
+	var highWater hlc.Timestamp
+	if hw := localState.progress.GetHighWater(); hw != nil {
+		highWater = *hw
+	}
+
+	// Build frontier based on tracked spans.
+	sf, err := span.MakeFrontierAt(highWater, localState.trackedSpans...)
+	if err != nil {
+		return err
+	}
+	// Advance frontier based on the information received from the aggregators.
+	for _, s := range localState.aggregatorFrontier {
+		_, err := sf.Forward(s.Span, s.Timestamp)
+		if err != nil {
+			return err
+		}
+	}
+
+	maxBytes := changefeedbase.FrontierCheckpointMaxBytes.Get(&execCfg.Settings.SV)
+	checkpointSpans, checkpointTS := getCheckpointSpans(sf.Frontier(), func(forEachSpan span.Operation) {
+		for _, fs := range localState.aggregatorFrontier {
+			forEachSpan(fs.Span, fs.Timestamp)
+		}
+	}, maxBytes)
+
+	// Update checkpoint.
+	updateHW := highWater.Less(sf.Frontier())
+	updateSpanCheckpoint := len(checkpointSpans) > 0
+
+	if updateHW || updateSpanCheckpoint {
+		if updateHW {
+			localState.SetHighwater(sf.Frontier())
+		}
+		localState.SetCheckpoint(checkpointSpans, checkpointTS)
+		if log.V(1) {
+			log.Infof(ctx, "Applying checkpoint to job record:  hw=%v, cf=%v",
+				localState.progress.GetHighWater(), localState.progress.GetChangefeed())
+		}
+		return reloadedJob.NoTxn().Update(ctx,
+			func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+				if err := md.CheckRunningOrReverting(); err != nil {
+					return err
+				}
+				ju.UpdateProgress(&localState.progress)
+				return nil
+			},
+		)
+	}
+
+	return nil
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.
@@ -1203,47 +1471,6 @@ func (b *changefeedResumer) maybeCleanUpProtectedTimestamp(
 		// Log and move on.
 		log.Warningf(ctx, "failed to remove protected timestamp record %v: %v", ptsID, err)
 	}
-}
-
-var _ jobs.PauseRequester = (*changefeedResumer)(nil)
-
-// OnPauseRequest implements jobs.PauseRequester. If this changefeed is being
-// paused, we may want to clear the protected timestamp record.
-func (b *changefeedResumer) OnPauseRequest(
-	ctx context.Context, jobExec interface{}, txn isql.Txn, progress *jobspb.Progress,
-) error {
-	details := b.job.Details().(jobspb.ChangefeedDetails)
-
-	cp := progress.GetChangefeed()
-	execCfg := jobExec.(sql.JobExecContext).ExecCfg()
-
-	if _, shouldProtect := details.Opts[changefeedbase.OptProtectDataFromGCOnPause]; !shouldProtect {
-		// Release existing pts record to avoid a single changefeed left on pause
-		// resulting in storage issues
-		if cp.ProtectedTimestampRecord != uuid.Nil {
-			pts := execCfg.ProtectedTimestampProvider.WithTxn(txn)
-			if err := pts.Release(ctx, cp.ProtectedTimestampRecord); err != nil {
-				log.Warningf(ctx, "failed to release protected timestamp %v: %v", cp.ProtectedTimestampRecord, err)
-			} else {
-				cp.ProtectedTimestampRecord = uuid.Nil
-			}
-		}
-		return nil
-	}
-
-	if cp.ProtectedTimestampRecord == uuid.Nil {
-		resolved := progress.GetHighWater()
-		if resolved == nil {
-			return nil
-		}
-		pts := execCfg.ProtectedTimestampProvider.WithTxn(txn)
-		ptr := createProtectedTimestampRecord(
-			ctx, execCfg.Codec, b.job.ID(), AllTargets(details), *resolved, cp,
-		)
-		return pts.Protect(ctx, ptr)
-	}
-
-	return nil
 }
 
 // getQualifiedTableName returns the database-qualified name of the table

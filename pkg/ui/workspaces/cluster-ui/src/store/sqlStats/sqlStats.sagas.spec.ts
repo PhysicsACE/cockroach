@@ -27,7 +27,7 @@ import {
 import { actions, reducer, SQLStatsState } from "./sqlStats.reducer";
 import { actions as sqlDetailsStatsActions } from "../statementDetails/statementDetails.reducer";
 import Long from "long";
-import moment from "moment";
+import moment from "moment-timezone";
 
 const lastUpdated = moment();
 
@@ -41,10 +41,9 @@ describe("SQLStats sagas", () => {
     spy.mockRestore();
   });
 
-  const payload = new cockroach.server.serverpb.StatementsRequest({
+  const payload = new cockroach.server.serverpb.CombinedStatementsStatsRequest({
     start: Long.fromNumber(1596816675),
     end: Long.fromNumber(1596820675),
-    combined: true,
   });
   const sqlStatsResponse = new cockroach.server.serverpb.StatementsResponse({
     statements: [
@@ -79,9 +78,10 @@ describe("SQLStats sagas", () => {
         .withReducer(reducer)
         .hasFinalState<SQLStatsState>({
           data: sqlStatsResponse,
-          lastError: null,
+          error: null,
           valid: true,
           lastUpdated,
+          inFlight: false,
         })
         .run();
     });
@@ -94,9 +94,10 @@ describe("SQLStats sagas", () => {
         .withReducer(reducer)
         .hasFinalState<SQLStatsState>({
           data: null,
-          lastError: error,
+          error: error,
           valid: false,
           lastUpdated,
+          inFlight: false,
         })
         .run();
     });
@@ -107,31 +108,33 @@ describe("SQLStats sagas", () => {
       new cockroach.server.serverpb.ResetSQLStatsResponse();
 
     it("successfully resets SQL stats", () => {
-      return expectSaga(resetSQLStatsSaga, payload)
+      return expectSaga(resetSQLStatsSaga)
         .provide([[matchers.call.fn(resetSQLStats), resetSQLStatsResponse]])
         .put(sqlDetailsStatsActions.invalidateAll())
-        .put(actions.refresh())
+        .put(actions.invalidated())
         .withReducer(reducer)
         .hasFinalState<SQLStatsState>({
           data: null,
-          lastError: null,
+          error: null,
           valid: false,
           lastUpdated: null,
+          inFlight: false,
         })
         .run();
     });
 
     it("returns error on failed reset", () => {
       const err = new Error("failed to reset");
-      return expectSaga(resetSQLStatsSaga, payload)
+      return expectSaga(resetSQLStatsSaga)
         .provide([[matchers.call.fn(resetSQLStats), throwError(err)]])
         .put(actions.failed(err))
         .withReducer(reducer)
         .hasFinalState<SQLStatsState>({
           data: null,
-          lastError: err,
+          error: err,
           valid: false,
           lastUpdated,
+          inFlight: false,
         })
         .run();
     });

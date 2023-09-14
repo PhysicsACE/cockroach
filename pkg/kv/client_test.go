@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -123,7 +124,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 			},
 		},
 	}
-	s, _, _ := serverutils.StartServer(t, args)
+	s := serverutils.StartServerOnly(t, args)
 	defer s.Stopper().Stop(context.Background())
 
 	testCases := []struct {
@@ -239,7 +240,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 func TestClientRunTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -297,7 +298,7 @@ func TestClientRunTransaction(t *testing.T) {
 func TestClientGetAndPutProto(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -327,7 +328,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 func TestClientGetAndPut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -350,7 +351,7 @@ func TestClientGetAndPut(t *testing.T) {
 func TestClientPutInline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -374,7 +375,7 @@ func TestClientCPutInline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	db := createTestClient(t, s)
 	key := testUser + "/key"
@@ -443,7 +444,7 @@ func TestClientCPutInline(t *testing.T) {
 func TestClientEmptyValues(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -473,7 +474,7 @@ func TestClientEmptyValues(t *testing.T) {
 func TestClientBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 	ctx := context.Background()
@@ -730,7 +731,7 @@ func concurrentIncrements(db *kv.DB, t *testing.T) {
 func TestConcurrentIncrements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -817,7 +818,7 @@ func TestReadConsistencyTypes(t *testing.T) {
 func TestTxn_ReverseScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := createTestClient(t, s)
 
@@ -941,7 +942,9 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 		t.Run(fmt.Sprintf("direct-txn-%d", i), func(t *testing.T) {
 			db := setup(test.nodeID)
 			now := db.Clock().NowAsClockTimestamp()
-			kvTxn := roachpb.MakeTransaction("unnamed", nil /* baseKey */, roachpb.NormalUserPriority, now.ToTimestamp(), db.Clock().MaxOffset().Nanoseconds(), int32(test.nodeID))
+			kvTxn := roachpb.MakeTransaction(
+				"unnamed", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority,
+				now.ToTimestamp(), db.Clock().MaxOffset().Nanoseconds(), int32(test.nodeID), 0)
 			txn := kv.NewTxnFromProto(ctx, db, test.nodeID, now, test.typ, &kvTxn)
 			ots := txn.TestingCloneTxn().ObservedTimestamps
 			if (len(ots) == 1 && ots[0].NodeID == test.nodeID) != test.expObserved {

@@ -36,6 +36,12 @@ func (r *Registry) ApplyDepRules(ctx context.Context, g *scgraph.Graph) error {
 		start := timeutil.Now()
 		var added int
 		if err := dr.q.Iterate(g.Database(), func(r rel.Result) error {
+			// Applying the dep rules can be slow in some cases. Check for
+			// cancellation when applying the rules to ensure we don't spin for
+			// too long while the user is waiting for the task to exit cleanly.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			from := r.Var(dr.from).(*screl.Node)
 			to := r.Var(dr.to).(*screl.Node)
 			added++
@@ -44,12 +50,6 @@ func (r *Registry) ApplyDepRules(ctx context.Context, g *scgraph.Graph) error {
 			)
 		}); err != nil {
 			return errors.Wrapf(err, "applying dep rule %s", dr.name)
-		}
-		// Applying the dep rules can be slow in some cases. Check for
-		// cancellation when applying the rules to ensure we don't spin for
-		// too long while the user is waiting for the task to exit cleanly.
-		if ctx.Err() != nil {
-			return ctx.Err()
 		}
 		if log.ExpensiveLogEnabled(ctx, 2) {
 			log.Infof(
@@ -63,6 +63,10 @@ func (r *Registry) ApplyDepRules(ctx context.Context, g *scgraph.Graph) error {
 
 // ApplyOpRules marks op edges as no-op in a shallow copy of the graph according
 // to the registered rules.
+//
+// Deprecated.
+//
+// TODO(postamar): remove once release_22_2 is also removed
 func (r *Registry) ApplyOpRules(ctx context.Context, g *scgraph.Graph) (*scgraph.Graph, error) {
 	db := g.Database()
 	m := make(map[*screl.Node][]scgraph.RuleName)
@@ -132,6 +136,9 @@ type registeredDepRule struct {
 	kind     scgraph.DepEdgeKind
 }
 
+// Deprecated.
+//
+// TODO(postamar): remove once release_22_2 is also removed
 type registeredOpRule struct {
 	name scgraph.RuleName
 	from rel.Var
@@ -166,6 +173,10 @@ func (r *Registry) RegisterDepRule(
 // RegisterOpRule adds a graph q that will label as no-op the op edge originating
 // from this Node. There can only be one such edge per Node, as per the edge
 // definitions in opgen.
+//
+// Deprecated.
+//
+// TODO(postamar): remove once release_22_2 is also removed
 func (r *Registry) RegisterOpRule(rn scgraph.RuleName, from rel.Var, q *rel.Query) {
 	r.opRules = append(r.opRules, registeredOpRule{
 		name: rn,
@@ -303,6 +314,9 @@ func (r registeredDepRule) MarshalYAML() (interface{}, error) {
 	}, nil
 }
 
+// Deprecated.
+//
+// TODO(postamar): remove once release_22_2 is also removed
 func (r registeredOpRule) MarshalYAML() (interface{}, error) {
 	var query yaml.Node
 	if err := query.Encode(r.q.Clauses()); err != nil {

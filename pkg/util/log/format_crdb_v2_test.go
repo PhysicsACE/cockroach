@@ -23,26 +23,26 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/logtags"
 	"github.com/kr/pretty"
 )
 
 type testIDPayload struct {
-	tenantID string
+	tenantID   string
+	tenantName string
 }
 
 func (t testIDPayload) ServerIdentityString(key serverident.ServerIdentificationKey) string {
 	switch key {
 	case serverident.IdentifyTenantID:
 		return t.tenantID
+	case serverident.IdentifyTenantName:
+		return t.tenantName
 	default:
 		return ""
 	}
-}
-
-func (t testIDPayload) TenantID() interface{} {
-	return nil
 }
 
 var _ serverident.ServerIdentificationPayload = (*testIDPayload)(nil)
@@ -53,7 +53,20 @@ func TestFormatCrdbV2(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	tm2, err := time.Parse(MessageTimeFormatWithTZ, "060102 17:04:05.654321+020000")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tm.UnixNano() != tm2.UnixNano() {
+		t.Fatalf("expected same, got %q vs %q", tm.In(time.UTC), tm2.In(time.UTC))
+	}
+
+	emptyCtx := context.Background()
+
 	sysCtx := context.Background()
+	sysIDPayload := testIDPayload{tenantID: "1"}
+	sysCtx = context.WithValue(sysCtx, serverident.ServerIdentificationContextKey{}, sysIDPayload)
 	sysCtx = logtags.AddTag(sysCtx, "noval", nil)
 	sysCtx = logtags.AddTag(sysCtx, "s", "1")
 	sysCtx = logtags.AddTag(sysCtx, "long", "2")
@@ -64,6 +77,10 @@ func TestFormatCrdbV2(t *testing.T) {
 	tenantCtx = logtags.AddTag(tenantCtx, "noval", nil)
 	tenantCtx = logtags.AddTag(tenantCtx, "p", "3")
 	tenantCtx = logtags.AddTag(tenantCtx, "longKey", "456")
+
+	namedTenantIDPayload := tenantIDPayload
+	namedTenantIDPayload.tenantName = "abc"
+	namedTenantCtx := context.WithValue(tenantCtx, serverident.ServerIdentificationContextKey{}, namedTenantIDPayload)
 
 	defer func(prev int) { crdbV2LongLineLen.set(prev) }(int(crdbV2LongLineLen))
 	crdbV2LongLineLen.set(1024)
@@ -138,13 +155,29 @@ func TestFormatCrdbV2(t *testing.T) {
 		}),
 		// Unstructured with long stack trace.
 		withBigStack(makeUnstructuredEntry(sysCtx, severity.ERROR, channel.HEALTH, 0, true, "hello %s", "stack")),
-		// Secondary tenant entries
+		// Secondary tenant entries.
 		makeStructuredEntry(tenantCtx, severity.INFO, channel.DEV, 0, ev),
 		makeUnstructuredEntry(tenantCtx, severity.WARNING, channel.OPS, 0, false, "hello %s", "world"),
+		makeStructuredEntry(namedTenantCtx, severity.INFO, channel.DEV, 0, ev),
+		makeUnstructuredEntry(namedTenantCtx, severity.WARNING, channel.OPS, 0, false, "hello %s", "world"),
+		// Entries with empty ctx
+		makeStructuredEntry(emptyCtx, severity.INFO, channel.DEV, 0, ev),
+		makeUnstructuredEntry(emptyCtx, severity.WARNING, channel.OPS, 0, false, "hello %s", "world"),
 	}
 
 	// We only use the datadriven framework for the ability to rewrite the output.
-	datadriven.RunTest(t, "testdata/crdb_v2", func(t *testing.T, _ *datadriven.TestData) string {
+	datadriven.RunTest(t, "testdata/crdb_v2", func(t *testing.T, td *datadriven.TestData) string {
+		var loc *time.Location
+		if arg, ok := td.Arg("tz"); ok {
+			var err error
+			var tz string
+			arg.Scan(t, 0, &tz)
+			loc, err = timeutil.LoadLocation(tz)
+			if err != nil {
+				td.Fatalf(t, "invalid tz: %v", err)
+			}
+		}
+
 		var buf bytes.Buffer
 		for _, tc := range testCases {
 			// override non-deterministic fields to stabilize the expected output.
@@ -153,7 +186,7 @@ func TestFormatCrdbV2(t *testing.T) {
 			tc.gid = 11
 
 			buf.WriteString("#\n")
-			f := formatCrdbV2{}
+			f := formatCrdbV2{loc: loc}
 			b := f.formatEntry(tc)
 			fmt.Fprintf(&buf, "%s", b.String())
 			putBuffer(b)
@@ -178,6 +211,9 @@ func TestFormatCrdbV2LongLineBreaks(t *testing.T) {
 		crdbV2LongLineLen.set(maxLen)
 
 		entry := logEntry{
+			IDPayload: serverident.IDPayload{
+				TenantID: "1",
+			},
 			payload: entryPayload{
 				redactable: redactable,
 				message:    td.Input,

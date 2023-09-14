@@ -9,6 +9,7 @@
 // licenses/APL.txt.
 
 import { fetchDataJSON } from "./fetchData";
+import { getLogger } from "../util";
 
 export type SqlExecutionRequest = {
   statements: SqlStatement[];
@@ -17,6 +18,7 @@ export type SqlExecutionRequest = {
   application_name?: string; // Defaults to '$ api-v2-sql'
   database?: string; // Defaults to system
   max_result_size?: number; // Default 10kib
+  separate_txns?: boolean;
 };
 
 export type SqlStatement = {
@@ -57,7 +59,7 @@ export type SqlExecutionErrorMessage = {
   message: string;
   code: string;
   severity: string;
-  source: { file: string; line: number; function: "string" };
+  source: { file: string; line: number; function: string };
 };
 
 export type SqlApiResponse<ResultType> = {
@@ -65,7 +67,9 @@ export type SqlApiResponse<ResultType> = {
   results: ResultType;
 };
 
-export const SQL_API_PATH = "/api/v2/sql/";
+export type SqlApiQueryResponse<Result> = Result & { error?: Error };
+
+export const SQL_API_PATH = "api/v2/sql/";
 
 /**
  * executeSql executes the provided SQL statements in a single transaction
@@ -79,7 +83,7 @@ export function executeSql<RowType>(
   // TODO(maryliag) remove this part of code when cloud is updated with
   // a new CRDB release.
   if (!req.database) {
-    req.database = "system";
+    req.database = FALLBACK_DB;
   }
   return fetchDataJSON<SqlExecutionResponse<RowType>, SqlExecutionRequest>(
     SQL_API_PATH,
@@ -90,6 +94,7 @@ export function executeSql<RowType>(
 export const INTERNAL_SQL_API_APP = "$ internal-console";
 export const LONG_TIMEOUT = "300s";
 export const LARGE_RESULT_SIZE = 50000; // 50 kib
+export const FALLBACK_DB = "system";
 
 /**
  * executeInternalSql executes the provided SQL statements with
@@ -104,7 +109,7 @@ export const LARGE_RESULT_SIZE = 50000; // 50 kib
 export function executeInternalSql<RowType>(
   req: SqlExecutionRequest,
 ): Promise<SqlExecutionResponse<RowType>> {
-  if (!req.application_name) {
+  if (!req.application_name || req.application_name === INTERNAL_SQL_API_APP) {
     req.application_name = INTERNAL_SQL_API_APP;
   } else {
     req.application_name = `$ internal-${req.application_name}`;
@@ -123,10 +128,8 @@ export function sqlResultsAreEmpty(
   result: SqlExecutionResponse<unknown>,
 ): boolean {
   return (
-    !result.execution?.txn_results?.length ||
-    result.execution.txn_results.every(
-      txn => !txn.rows || txn.rows.length === 0,
-    )
+    !result?.execution?.txn_results?.length ||
+    result?.execution.txn_results.every(txn => txnResultIsEmpty(txn))
   );
 }
 
@@ -144,7 +147,7 @@ export function isUpgradeError(message: string): boolean {
 }
 
 /**
- * errorMessage cleans the error message returned by the sqlApi,
+ * sqlApiErrorMessage cleans the error message returned by the sqlApi,
  * removing information not useful for the user.
  * e.g. the error message
  * "$executing stmt 1: run-query-via-api: only users with either MODIFYCLUSTERSETTING
@@ -164,33 +167,88 @@ export function sqlApiErrorMessage(message: string): string {
 
   message = message.replace("run-query-via-api: ", "");
   if (message.includes(":")) {
-    return message.split(":")[1];
+    const idx = message.indexOf(":") + 1;
+    return idx < message.length ? message.substring(idx) : message;
   }
-
   return message;
+}
+
+export function createSqlExecutionRequest(
+  dbName: string,
+  statements: SqlStatement[],
+): SqlExecutionRequest {
+  return {
+    execute: true,
+    statements: statements,
+    database: dbName,
+    max_result_size: LARGE_RESULT_SIZE,
+    timeout: LONG_TIMEOUT,
+  };
+}
+
+export function isSeparateTxnError(message: string): boolean {
+  return !!message?.includes(
+    "separate transaction payload encountered transaction error",
+  );
 }
 
 export function isMaxSizeError(message: string): boolean {
   return !!message?.includes("max result size exceeded");
 }
 
-export function formatApiResult(
-  results: Array<any>,
+export function isPrivilegeError(code: string): boolean {
+  return code === "42501";
+}
+
+export function formatApiResult<ResultType>(
+  results: ResultType,
   error: SqlExecutionErrorMessage,
   errorMessageContext: string,
-): SqlApiResponse<any> {
+  shouldThrowOnQueryError = true,
+): SqlApiResponse<ResultType> {
   const maxSizeError = isMaxSizeError(error?.message);
 
   if (error && !maxSizeError) {
-    throw new Error(
-      `Error while ${errorMessageContext}: ${sqlApiErrorMessage(
-        error?.message,
-      )}`,
-    );
+    if (shouldThrowOnQueryError) {
+      throw new Error(
+        `Error while ${errorMessageContext}: ${sqlApiErrorMessage(
+          error?.message,
+        )}`,
+      );
+    } else {
+      // Otherwise, just log.
+      getLogger().warn(
+        `Error while ${errorMessageContext}: ${sqlApiErrorMessage(
+          error?.message,
+        )}`,
+      );
+    }
   }
 
   return {
     maxSizeReached: maxSizeError,
     results: results,
   };
+}
+
+export function combineQueryErrors(
+  errs: Error[],
+  sqlError?: SqlExecutionErrorMessage,
+): SqlExecutionErrorMessage {
+  if (errs.length === 0 && !sqlError) {
+    return;
+  }
+  const errMsgs = errs.map(err => `\n-` + sqlApiErrorMessage(err.message));
+  let sqlErrMsg = sqlError.message;
+  if (isSeparateTxnError(sqlErrMsg)) {
+    sqlErrMsg = "Encountered query error(s) fetching data:";
+  }
+  return {
+    ...sqlError,
+    message: [sqlErrMsg, ...errMsgs].join(``),
+  };
+}
+
+export function txnResultIsEmpty(txn_result: SqlTxnResult<unknown>): boolean {
+  return !txn_result.rows || txn_result.rows?.length === 0;
 }

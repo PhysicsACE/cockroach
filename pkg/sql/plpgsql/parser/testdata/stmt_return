@@ -1,0 +1,54 @@
+parse
+DECLARE
+BEGIN
+  RETURN 1+2;
+END
+----
+DECLARE
+BEGIN
+RETURN 1 + 2;
+END
+
+parse
+DECLARE
+BEGIN
+  x := 1 + 2;
+  RETURN x;
+END
+----
+DECLARE
+BEGIN
+x := 1 + 2;
+RETURN x;
+END
+
+
+parse
+DECLARE
+BEGIN
+  RETURN (1, 'string');
+END
+----
+DECLARE
+BEGIN
+RETURN (1, 'string');
+END
+
+
+
+parse
+DECLARE
+BEGIN
+  RETURN QUERY SELECT 1 + 1;
+END
+----
+at or near ";": syntax error: unimplemented: this syntax
+
+
+parse
+DECLARE
+BEGIN
+  RETURN QUERY EXECUTE a dynamic command;
+END
+----
+at or near ";": syntax error: unimplemented: this syntax

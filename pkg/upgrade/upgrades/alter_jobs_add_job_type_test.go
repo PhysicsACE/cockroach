@@ -23,13 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
@@ -100,11 +94,20 @@ func TestAlterSystemJobsTableAddJobTypeColumn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Set a small batch size so the migration uses more than one batch for testing.
+	// Reset it after the test completes.
+	prev := upgrades.JobsBackfillBatchSize_22_2_20
+	upgrades.JobsBackfillBatchSize_22_2_20 = 2
+	defer func() {
+		upgrades.JobsBackfillBatchSize_22_2_20 = prev
+	}()
+
 	clusterArgs := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
 					DisableAutomaticVersionUpgrade: make(chan struct{}),
+					BootstrapVersionKeyOverride:    clusterversion.V22_2,
 					BinaryVersionOverride: clusterversion.ByKey(
 						clusterversion.V23_1AddTypeColumnToJobsTable - 1),
 				},
@@ -128,8 +131,6 @@ func TestAlterSystemJobsTableAddJobTypeColumn(t *testing.T) {
 		}
 	)
 
-	// Inject the old copy of the descriptor and validate that the schema matches the old version.
-	upgrades.InjectLegacyTable(ctx, t, s, systemschema.JobsTable, getJobsTableDescriptorPriorToV23_1AddTypeColumnToJobsTable)
 	upgrades.ValidateSchemaExists(
 		ctx,
 		t,
@@ -144,15 +145,13 @@ func TestAlterSystemJobsTableAddJobTypeColumn(t *testing.T) {
 
 	// Start a job of each type.
 	registry := s.JobRegistry().(*jobs.Registry)
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{}
 	jobspb.ForEachType(func(typ jobspb.Type) {
 		// The upgrade creates migration and schemachange jobs, so we do not
 		// need to create more. We should not override resumers for these job types,
 		// otherwise the upgrade will hang.
 		if typ != jobspb.TypeMigration && typ != jobspb.TypeSchemaChange {
-			registry.TestingResumerCreationKnobs[typ] = func(r jobs.Resumer) jobs.Resumer {
-				return &fakeResumer{}
-			}
+			registry.TestingWrapResumerConstructor(
+				typ, func(r jobs.Resumer) jobs.Resumer { return &fakeResumer{} })
 
 			record := jobs.Record{
 				Details: jobspb.JobDetailsForEveryJobType[typ],
@@ -182,7 +181,7 @@ func TestAlterSystemJobsTableAddJobTypeColumn(t *testing.T) {
 	row := sqlDB.QueryRow("SELECT count(*) FROM system.jobs WHERE job_type IS NOT NULL")
 	err := row.Scan(&count)
 	require.NoError(t, err)
-	assert.Equal(t, count, 0)
+	assert.Equal(t, 0, count)
 
 	upgrades.ValidateSchemaExists(
 		ctx,
@@ -209,7 +208,7 @@ func TestAlterSystemJobsTableAddJobTypeColumn(t *testing.T) {
 	row = sqlDB.QueryRow("SELECT count(*) FROM system.jobs WHERE job_type IS NULL")
 	err = row.Scan(&count)
 	require.NoError(t, err)
-	assert.Equal(t, count, 0)
+	assert.Equal(t, 0, count)
 
 	var typStr string
 	rows, err := sqlDB.Query("SELECT distinct(job_type) FROM system.jobs")
@@ -223,101 +222,4 @@ func TestAlterSystemJobsTableAddJobTypeColumn(t *testing.T) {
 	jobspb.ForEachType(func(typ jobspb.Type) {
 		assert.True(t, seenTypes.Contains(int(typ)))
 	}, false)
-}
-
-func getJobsTableDescriptorPriorToV23_1AddTypeColumnToJobsTable() *descpb.TableDescriptor {
-	defaultID := "unique_rowid()"
-	defaultCreated := "now():::TIMESTAMP"
-	return &descpb.TableDescriptor{
-		Name:                    string(catconstants.JobsTableName),
-		ID:                      keys.JobsTableID,
-		ParentID:                keys.SystemDatabaseID,
-		UnexposedParentSchemaID: keys.PublicSchemaID,
-		Version:                 1,
-		Columns: []descpb.ColumnDescriptor{
-			{Name: "id", ID: 1, Type: types.Int, DefaultExpr: &defaultID},
-			{Name: "status", ID: 2, Type: types.String},
-			{Name: "created", ID: 3, Type: types.Timestamp, DefaultExpr: &defaultCreated},
-			{Name: "payload", ID: 4, Type: types.Bytes},
-			{Name: "progress", ID: 5, Type: types.Bytes},
-			{Name: "created_by_type", ID: 6, Type: types.String, Nullable: true},
-			{Name: "created_by_id", ID: 7, Type: types.Int, Nullable: true},
-			{Name: "claim_session_id", ID: 8, Type: types.Bytes, Nullable: true},
-			{Name: "claim_instance_id", ID: 9, Type: types.Int, Nullable: true},
-			{Name: "num_runs", ID: 10, Type: types.Int, Nullable: true},
-			{Name: "last_run", ID: 11, Type: types.Timestamp, Nullable: true},
-		},
-		NextColumnID: 12,
-		Families: []descpb.ColumnFamilyDescriptor{
-			{
-				Name:        "fam_0_id_status_created_payload",
-				ID:          0,
-				ColumnNames: []string{"id", "status", "created", "payload", "created_by_type", "created_by_id"},
-				ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 6, 7},
-			},
-			{
-				Name:            "progress",
-				ID:              1,
-				ColumnNames:     []string{"progress"},
-				ColumnIDs:       []descpb.ColumnID{5},
-				DefaultColumnID: 5,
-			},
-			{
-				Name:        "claim",
-				ID:          2,
-				ColumnNames: []string{"claim_session_id", "claim_instance_id", "num_runs", "last_run"},
-				ColumnIDs:   []descpb.ColumnID{8, 9, 10, 11},
-			},
-		},
-		NextFamilyID: 3,
-		PrimaryIndex: descpb.IndexDescriptor{
-			Name:                "id",
-			ID:                  1,
-			Unique:              true,
-			KeyColumnNames:      []string{"id"},
-			KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
-			KeyColumnIDs:        []descpb.ColumnID{1},
-		},
-		Indexes: []descpb.IndexDescriptor{
-			{
-				Name:                "jobs_status_created_idx",
-				ID:                  2,
-				Unique:              false,
-				KeyColumnNames:      []string{"status", "created"},
-				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
-				KeyColumnIDs:        []descpb.ColumnID{2, 3},
-				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
-			},
-			{
-				Name:                "jobs_created_by_type_created_by_id_idx",
-				ID:                  3,
-				Unique:              false,
-				KeyColumnNames:      []string{"created_by_type", "created_by_id"},
-				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
-				KeyColumnIDs:        []descpb.ColumnID{6, 7},
-				StoreColumnIDs:      []descpb.ColumnID{2},
-				StoreColumnNames:    []string{"status"},
-				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
-			},
-			{
-				Name:                "jobs_run_stats_idx",
-				ID:                  4,
-				Unique:              false,
-				KeyColumnNames:      []string{"claim_session_id", "status", "created"},
-				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
-				KeyColumnIDs:        []descpb.ColumnID{8, 2, 3},
-				StoreColumnNames:    []string{"last_run", "num_runs", "claim_instance_id"},
-				StoreColumnIDs:      []descpb.ColumnID{11, 10, 9},
-				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
-				Predicate:           systemschema.JobsRunStatsIdxPredicate,
-			},
-		},
-		NextIndexID:    5,
-		Privileges:     catpb.NewCustomSuperuserPrivilegeDescriptor(privilege.ReadWriteData, username.NodeUserName()),
-		NextMutationID: 1,
-		FormatVersion:  3,
-	}
 }

@@ -115,11 +115,11 @@ func (hi *hypotheticalIndex) IsInverted() bool {
 	return hi.inverted
 }
 
-// IsNotVisible is part of the cat.Index interface.
-func (hi *hypotheticalIndex) IsNotVisible() bool {
+// GetInvisibility is part of the cat.Index interface.
+func (hi *hypotheticalIndex) GetInvisibility() float64 {
 	// A hypotheticalIndex should not be invisible because there is no motivation
 	// to recommend a not visible index.
-	return false
+	return 0.0
 }
 
 // ColumnCount is part of the cat.Index interface.
@@ -252,13 +252,26 @@ func (hi *hypotheticalIndex) hasSameExplicitCols(existingIndex cat.Index, isInve
 	if existingIndex.ExplicitColumnCount() != len(indexCols) {
 		return false
 	}
-	for j, m := 0, existingIndex.ExplicitColumnCount(); j < m; j++ {
+	return hi.hasPrefixOfExplicitCols(existingIndex, isInverted)
+}
+
+// hasPrefixOfExplicitCols returns true if the explicit columns in the
+// hypothetical index are a prefix of the explicit columns in the given existing
+// index.
+func (hi *hypotheticalIndex) hasPrefixOfExplicitCols(
+	existingIndex cat.Index, isInverted bool,
+) bool {
+	indexCols := hi.cols
+	if existingIndex.ExplicitColumnCount() < len(indexCols) {
+		return false
+	}
+	for j, m := 0, len(indexCols); j < m; j++ {
 		// Compare every existingIndex columns with indexCols.
 		existingIndexCol := existingIndex.Column(j)
 		indexCol := indexCols[j]
 
-		if isInverted && existingIndex.IsInverted() && j == m-1 {
-			// If the column is inverted, compare the source columns.
+		if indexCol.Kind() == cat.Inverted && existingIndexCol.Kind() == cat.Inverted {
+			// If the columns are inverted, compare their source columns.
 			if existingIndexCol.InvertedSourceColumnOrdinal() != indexCol.InvertedSourceColumnOrdinal() {
 				return false
 			}

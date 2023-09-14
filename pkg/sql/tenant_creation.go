@@ -14,6 +14,7 @@ import (
 	"context"
 	gojson "encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -28,11 +29,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -59,18 +62,40 @@ func (p *planner) CreateTenant(
 			return tid, pgerror.WithCandidateCode(err, pgcode.Syntax)
 		}
 	}
-	return p.createTenantInternal(ctx, ctcfg)
+
+	if ctcfg.ID != nil && *ctcfg.ID > math.MaxUint32 {
+		// Tenant creation via this interface (which includes
+		// crdb_internal.create_tenant) should be prevented from gobbling
+		// up the entire tenant ID space by asking for too large values.
+		// Otherwise, CREATE VIRTUAL CLUSTER will not be possible any more.
+		return tid, pgerror.Newf(pgcode.ProgramLimitExceeded, "tenant ID %d out of range", *ctcfg.ID)
+	}
+
+	configTemplate := mtinfopb.TenantInfoWithUsage{}
+
+	return p.createTenantInternal(ctx, ctcfg, &configTemplate)
 }
 
 type createTenantConfig struct {
 	ID          *uint64 `json:"id,omitempty"`
 	Name        *string `json:"name,omitempty"`
 	ServiceMode *string `json:"service_mode,omitempty"`
+	IfNotExists bool    `json:"if_not_exists,omitempty"`
 }
 
 func (p *planner) createTenantInternal(
-	ctx context.Context, ctcfg createTenantConfig,
+	ctx context.Context, ctcfg createTenantConfig, configTemplate *mtinfopb.TenantInfoWithUsage,
 ) (tid roachpb.TenantID, err error) {
+	if p.EvalContext().TxnReadOnly {
+		return tid, readOnlyError("create_tenant()")
+	}
+	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, "create"); err != nil {
+		return tid, err
+	}
+	if err := CanManageTenant(ctx, p); err != nil {
+		return tid, err
+	}
+
 	var tenantID uint64
 	if ctcfg.ID != nil {
 		tenantID = *ctcfg.ID
@@ -88,28 +113,17 @@ func (p *planner) createTenantInternal(
 		serviceMode = v
 	}
 
-	// tenantID uint64, name roachpb.TenantName,
-	if p.EvalContext().TxnReadOnly {
-		return tid, readOnlyError("create_tenant()")
-	}
-	const op = "create tenant"
-	if err := p.RequireAdminRole(ctx, op); err != nil {
-		return tid, err
-	}
-	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, "create"); err != nil {
-		return tid, err
-	}
+	info := configTemplate
 
-	info := &mtinfopb.TenantInfoWithUsage{
-		SQLInfo: mtinfopb.SQLInfo{
-			ID: tenantID,
-			// We synchronously initialize the tenant's keyspace below, so
-			// we can skip the ADD state and go straight to the READY state.
-			DataState:   mtinfopb.DataStateReady,
-			Name:        name,
-			ServiceMode: serviceMode,
-		},
-	}
+	// Override the template fields for a fresh tenant. The other
+	// template fields remain unchanged (i.e. we reuse the template's
+	// configuration).
+	info.ID = tenantID
+	info.Name = name
+	// We synchronously initialize the tenant's keyspace below, so
+	// we can skip the ADD state and go straight to the READY state.
+	info.DataState = mtinfopb.DataStateReady
+	info.ServiceMode = serviceMode
 
 	initialTenantZoneConfig, err := GetHydratedZoneConfigForTenantsRange(ctx, p.Txn(), p.Descriptors())
 	if err != nil {
@@ -118,7 +132,7 @@ func (p *planner) createTenantInternal(
 
 	// Create the record. This also auto-allocates an ID if the
 	// tenantID was zero.
-	if _, err := CreateTenantRecord(
+	if resultTid, err := CreateTenantRecord(
 		ctx,
 		p.ExecCfg().Codec,
 		p.ExecCfg().Settings,
@@ -126,9 +140,16 @@ func (p *planner) createTenantInternal(
 		p.ExecCfg().SpanConfigKVAccessor.WithTxn(ctx, p.Txn()),
 		info,
 		initialTenantZoneConfig,
+		ctcfg.IfNotExists,
+		p.ExecCfg().TenantTestingKnobs,
 	); err != nil {
 		return tid, err
+	} else if !resultTid.IsSet() {
+		// No error but no valid tenant ID: there was an IF NOT EXISTS
+		// clause and the tenant already existed. Nothing else to do.
+		return tid, nil
 	}
+
 	// Retrieve the possibly auto-generated ID.
 	tenantID = info.ID
 	tid = roachpb.MustMakeTenantID(tenantID)
@@ -166,7 +187,7 @@ func (p *planner) createTenantInternal(
 		OverrideKey:             bootstrapVersionOverride,
 		Codec:                   codec,
 	}
-	kvs, splits, err = initialValuesOpts.GetInitialValuesCheckForOverrides()
+	kvs, splits, err = initialValuesOpts.GenerateInitialValues()
 	if err != nil {
 		return tid, err
 	}
@@ -239,6 +260,8 @@ func CreateTenantRecord(
 	spanConfigs spanconfig.KVAccessor,
 	info *mtinfopb.TenantInfoWithUsage,
 	initialTenantZoneConfig *zonepb.ZoneConfig,
+	ifNotExists bool,
+	testingKnobs *TenantTestingKnobs,
 ) (roachpb.TenantID, error) {
 	const op = "create"
 	if err := rejectIfCantCoordinateMultiTenancy(codec, op); err != nil {
@@ -258,12 +281,28 @@ func CreateTenantRecord(
 
 	tenID := info.ID
 	if tenID == 0 {
-		tenantID, err := getAvailableTenantID(ctx, info.Name, txn)
+		tenantID, err := getAvailableTenantID(ctx, info.Name, txn, settings, testingKnobs)
 		if err != nil {
+			if pgerror.GetPGCode(err) == pgcode.DuplicateObject && ifNotExists {
+				// IF NOT EXISTS: no error if the tenant already existed.
+				// We also don't have any more work to do.
+				return roachpb.TenantID{}, nil
+			}
 			return roachpb.TenantID{}, err
 		}
 		tenID = tenantID.ToUint64()
 		info.ID = tenID
+	}
+	if info.ID > roachpb.MaxTenantID.ToUint64() {
+		return roachpb.TenantID{}, pgerror.Newf(pgcode.ProgramLimitExceeded, "tenant ID %d out of range", info.ID)
+	}
+
+	// Update the ID sequence if available.
+	// We only keep the latest ID.
+	if settings.Version.IsActive(ctx, clusterversion.V23_1_TenantIDSequence) {
+		if err := updateTenantIDSequence(ctx, txn, info.ID); err != nil {
+			return roachpb.TenantID{}, err
+		}
 	}
 
 	if info.Name == "" {
@@ -321,15 +360,40 @@ func CreateTenantRecord(
 		query, args...,
 	); err != nil {
 		if pgerror.GetPGCode(err) == pgcode.UniqueViolation {
+			if ifNotExists {
+				// IF NOT EXISTS: no error if the tenant already existed.
+				// We also don't have any more work to do.
+				return roachpb.TenantID{}, nil
+			}
 			extra := redact.RedactableString("")
 			if info.Name != "" {
 				extra = redact.Sprintf(" or with name %q", info.Name)
 			}
-			return roachpb.TenantID{}, pgerror.Newf(pgcode.DuplicateObject, "a tenant with ID %d%s already exists", tenID, extra)
+			return roachpb.TenantID{}, pgerror.Newf(pgcode.DuplicateObject,
+				"a tenant with ID %d%s already exists", tenID, extra)
 		}
 		return roachpb.TenantID{}, errors.Wrap(err, "inserting new tenant")
 	} else if num != 1 {
 		logcrash.ReportOrPanic(ctx, &settings.SV, "inserting tenant %+v: unexpected number of rows affected: %d", info, num)
+	}
+
+	for _, so := range info.SettingOverrides {
+		var reason interface{}
+		if so.Reason != nil {
+			reason = *so.Reason
+		}
+		if _, err := txn.ExecEx(
+			ctx, "create-tenant-setting-override", txn.KV(), sessiondata.NodeUserSessionDataOverride,
+			`INSERT INTO system.tenant_settings (
+          tenant_id, name, value, value_type, reason)
+         VALUES ($1, $2, $3, $4, $5)`,
+			tenID, so.Name, so.Value, so.ValueType, reason); err != nil {
+			if pgerror.GetPGCode(err) == pgcode.UniqueViolation {
+				return roachpb.TenantID{}, pgerror.Newf(pgcode.DuplicateObject, "tenant \"%d\" already has an override for setting %q",
+					tenID, so.Name)
+			}
+			return roachpb.TenantID{}, errors.Wrap(err, "inserting tenant setting overrides")
+		}
 	}
 
 	if u := info.Usage; u != nil {
@@ -401,33 +465,35 @@ func CreateTenantRecord(
 	}
 	toUpsert := []spanconfig.Record{startRecord}
 
-	// We want to ensure we have a split at the non-inclusive end of the tenant's
-	// keyspace, which also happens to be the inclusive start of the next
-	// tenant's (with ID=ours+1). If we didn't do anything here, and we were the
-	// tenant with the highest ID thus far, our last range would extend to /Max.
-	// If a tenant with a higher ID was created, when installing its initial span
-	// config record, it would carve itself off (and our last range would only
-	// extend to that next tenant's boundary), but this is a bit awkward for code
-	// that wants to rely on the invariant that ranges for a tenant only extend
-	// to the tenant's well-defined end key.
+	// We want to ensure we have a split at the start of the next tenant's
+	// (with ID=ours+1) keyspace. This ensures our ranges do not straddle tenant
+	// boundaries, into the next one.
+	// We want to ensure our ranges do not straddle tenant boundaries, either into
+	// the next one or the previous one. Tenant's creation installs a span
+	// configuration at the start of a tenant's keyspace, above, so that handles
+	// the latter. The former only needs handling if the tenant we're creating
+	// here has the highest ID thus far. Such a tenant's range would extend until
+	// /Max. We've deemed this edge case undesirable, so we need to do something
+	// here. In particular, we choose to install a split point at the end of the
+	// tenant's keyspace. We do so by installing a span config record, the start
+	// key of which will serve as a split point.
 	//
-	// So how do we ensure this split at this tenant's non-inclusive end key?
-	// Hard splits are controlled by the start keys on span config records[^1],
-	// so we'll try insert one accordingly. But we cannot do this blindly. We
-	// cannot assume that tenants are created in ID order, so it's possible that
-	// the tenant with the next ID is already present + running. If so, it may
-	// already have span config records that start at the key at which we want
-	// to write a span config record for. Over-writing it blindly would be a
-	// mistake -- there's no telling what config that next tenant has associated
-	// for that span. So we'll do something simple -- we'll check transactionally
-	// whether there's anything written already, and if so, do nothing. We
-	// already have the split we need.
+	// Note that we need to be careful about which key to put in the record's
+	// start key here. The key needs to be such that it is safe to split at;
+	// otherwise. Notably, this makes tenantPrefix.PrefixEnd() an unsuitable
+	// candidate -- see https://github.com/cockroachdb/cockroach/issues/104928 for
+	// more context about why.
 	//
-	// [^1]: See ComputeSplitKey in spanconfig.StoreReader.
-	tenantPrefixEnd := tenantPrefix.PrefixEnd()
+	// Note that we're creating a span config record that controls the next
+	// tenant's keyspace here. If such a tenant exists, writing a span config
+	// record here blindly wouldn't be safe -- we could be clobbering something
+	// that tenant has already reconciled. We instead need to transactionally
+	// check if a record exists or not before writing one. If something already
+	// exists, we do nothing; otherwise, we write the record.
+	nextTenantPrefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenID + 1))
 	endRecordTarget := spanconfig.MakeTargetFromSpan(roachpb.Span{
-		Key:    tenantPrefixEnd,
-		EndKey: tenantPrefixEnd.Next(),
+		Key:    nextTenantPrefix,
+		EndKey: nextTenantPrefix.Next(),
 	})
 
 	// Check if a record exists for the next tenant's startKey from when the next
@@ -459,34 +525,167 @@ func CreateTenantRecord(
 func (p *planner) GetAvailableTenantID(
 	ctx context.Context, tenantName roachpb.TenantName,
 ) (roachpb.TenantID, error) {
-	return getAvailableTenantID(ctx, tenantName, p.InternalSQLTxn())
+	return getAvailableTenantID(ctx, tenantName, p.InternalSQLTxn(), p.ExecCfg().Settings, p.ExecCfg().TenantTestingKnobs)
 }
 
-// getAvailableTenantID returns the first available ID that can be assigned to
-// the created tenant. Note, this ID could have previously belonged to another
-// tenant that has since been dropped and gc'ed.
-func getAvailableTenantID(
+// getAvailableTenantIDWithReuse is a variant of getAvailableTenantID that
+// reuses tenant IDs that have been previously deleted. This is useful for
+// testing.
+func getAvailableTenantIDWithReuse(
 	ctx context.Context, tenantName roachpb.TenantName, txn isql.Txn,
 ) (roachpb.TenantID, error) {
-	// Find the first available ID that can be assigned to the created tenant.
-	// Note, this ID could have previously belonged to another tenant that has
-	// since been dropped and gc'ed.
+	// The WHERE clause is responsible for checking for duplicate names.
 	row, err := txn.QueryRowEx(ctx, "next-tenant-id", txn.KV(),
-		sessiondata.NodeUserSessionDataOverride, `
-   SELECT id+1 AS newid
+		sessiondata.NodeUserSessionDataOverride, `SELECT id+1 AS newid
     FROM (VALUES (1) UNION ALL SELECT id FROM system.tenants) AS u(id)
    WHERE NOT EXISTS (SELECT 1 FROM system.tenants t WHERE t.id=u.id+1)
      AND ($1 = '' OR NOT EXISTS (SELECT 1 FROM system.tenants t WHERE t.name=$1))
-   ORDER BY id LIMIT 1
-`, tenantName)
+   ORDER BY id LIMIT 1`, tenantName)
 	if err != nil {
 		return roachpb.TenantID{}, err
 	}
 	if row == nil {
-		return roachpb.TenantID{}, errors.Newf("tenant with name %q already exists", tenantName)
+		return roachpb.TenantID{}, pgerror.Newf(pgcode.DuplicateObject,
+			"tenant with name %q already exists", tenantName)
 	}
-	nextID := *row[0].(*tree.DInt)
-	return roachpb.MustMakeTenantID(uint64(nextID)), nil
+	nextIDFromTable := uint64(*row[0].(*tree.DInt))
+
+	return roachpb.MakeTenantID(nextIDFromTable)
+}
+
+// getAvailableTenantID returns the next available ID that can be assigned to
+// the created tenant.
+func getAvailableTenantID(
+	ctx context.Context,
+	tenantName roachpb.TenantName,
+	txn isql.Txn,
+	settings *cluster.Settings,
+	testingKnobs *TenantTestingKnobs,
+) (roachpb.TenantID, error) {
+	if testingKnobs != nil && testingKnobs.EnableTenantIDReuse {
+		return getAvailableTenantIDWithReuse(ctx, tenantName, txn)
+	}
+
+	// We really want to use different tenant IDs every time, to avoid
+	// tenant ID reuse. For this, we have a sequence system.tenant_id_seq.
+	//
+	// However, there are two obstacles that prevent us from using only the
+	// sequence.
+	//
+	// The first is that the sequence is added in a migration and at the
+	// point this function is called the migration may not have been
+	// run yet.
+	//
+	// Separately, we also have the function
+	// crdb_internal.create_tenant() which can define an arbitrary tenant
+	// ID.
+	//
+	// So we proceed as follows:
+	// - we find the maximum tenant ID that has been used so far. This covers
+	//   cases where the migration has not been run yet and also arbitrary
+	//   ID selection by create_tenant().
+	// - we also find the next value of the sequence, if it exists already.
+	// - we take the maximum of the two values (plus one) as the next ID.
+	// - we also update the sequence with the new value we've chosen (in
+	//   createTenantInternal above).
+	//
+
+	// The HAVING clause is responsible for checking for duplicate names.
+	row, err := txn.QueryRowEx(ctx, "next-tenant-id", txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
+		`SELECT max(id)+1 AS newid FROM system.tenants
+HAVING ($1 = '' OR NOT EXISTS (SELECT 1 FROM system.tenants t WHERE t.name = $1))`,
+		tenantName)
+	if err != nil {
+		return roachpb.TenantID{}, err
+	}
+	if row == nil {
+		return roachpb.TenantID{}, pgerror.Newf(pgcode.DuplicateObject,
+			"tenant with name %q already exists", tenantName)
+	}
+	nextIDFromTable := uint64(*row[0].(*tree.DInt))
+
+	// Is the sequence available yet?
+	var lastIDFromSequence int64
+	if settings.Version.IsActive(ctx, clusterversion.V23_1_TenantIDSequence) {
+		lastIDFromSequence, err = getTenantIDSequenceValue(ctx, txn)
+		if err != nil {
+			return roachpb.TenantID{}, err
+		}
+	}
+
+	nextID := nextIDFromTable
+	if uint64(lastIDFromSequence+1) > nextIDFromTable {
+		nextID = uint64(lastIDFromSequence + 1)
+	}
+
+	return roachpb.MakeTenantID(nextID)
+}
+
+var tenantIDSequenceFQN = tree.MakeTableNameWithSchema(catconstants.SystemDatabaseName, catconstants.PublicSchemaName, tree.Name(catconstants.TenantIDSequenceTableName))
+
+// getTenantIDSequenceDesc retrieves a leased descriptor for the
+// sequence system.tenant_id_seq.
+func getTenantIDSequenceDesc(ctx context.Context, txn isql.Txn) (catalog.TableDescriptor, error) {
+	// We piece through the isql.Txn here to get access to the
+	// descs.Collection, which provides caching and leasing. Without it,
+	// we'd need to do a raw namespace lookup, which is generally
+	// frowned upon.
+	//
+	// All this is needed because this function cannot be a method of
+	// planner, as it is called from the (standalone)
+	// CreateTenantRecord() function.
+	itxn, ok := txn.(*internalTxn)
+	if !ok {
+		return nil, errors.AssertionFailedf("expected internalTxn, got %T", txn)
+	}
+	coll := itxn.Descriptors()
+
+	// Full name of the sequence.
+	// Look up the sequence by name with lease.
+	_, desc, err := descs.PrefixAndTable(ctx, coll.ByNameWithLeased(txn.KV()).Get(), &tenantIDSequenceFQN)
+	if err != nil {
+		return nil, err
+	}
+	// Sanity check.
+	if !desc.IsSequence() {
+		return nil, errors.AssertionFailedf("tenant ID generator is not a sequence")
+	}
+	return desc, nil
+}
+
+// getTenantIDSequenceValue retrieves the current value of system.tenant_id_seq.
+func getTenantIDSequenceValue(ctx context.Context, txn isql.Txn) (int64, error) {
+	desc, err := getTenantIDSequenceDesc(ctx, txn)
+	if err != nil {
+		return 0, err
+	}
+	return getSequenceValueFromDesc(ctx, txn.KV(), keys.SystemSQLCodec, desc)
+}
+
+// updateTenantIDSequence sets the current value of
+// system.tenant_id_seq to the specified argument if it is currently
+// lower; otherwise is a no-op.
+func updateTenantIDSequence(ctx context.Context, txn isql.Txn, newID uint64) error {
+	desc, err := getTenantIDSequenceDesc(ctx, txn)
+	if err != nil {
+		return err
+	}
+	curVal, err := getSequenceValueFromDesc(ctx, txn.KV(), keys.SystemSQLCodec, desc)
+	if err != nil {
+		return err
+	}
+
+	if newID > uint64(curVal) {
+		seqValueKey, newVal, err := MakeSequenceKeyVal(keys.SystemSQLCodec, desc, int64(newID), true /* isCalled */)
+		if err != nil {
+			return err
+		}
+		if err := txn.KV().Put(ctx, seqValueKey, newVal); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // generateTenantClusterSettingKV generates the kv to be written to the store

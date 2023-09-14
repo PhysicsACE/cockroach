@@ -108,11 +108,8 @@ const (
 var enableTraceRedactable = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"trace.redactable.enabled",
-	"set to true to enable redactability for unstructured events "+
-		"in traces and to redact traces sent to tenants. "+
-		"Set to false to coarsely mark unstructured events as redactable "+
-		" and eliminate them from tenant traces.",
-	false,
+	"set to true to enable finer-grainer redactability for unstructured events in traces",
+	true,
 )
 
 var enableNetTrace = settings.RegisterBoolSetting(
@@ -120,56 +117,60 @@ var enableNetTrace = settings.RegisterBoolSetting(
 	"trace.debug.enable",
 	"if set, traces for recent requests can be seen at https://<ui>/debug/requests",
 	false,
-).WithPublic()
+	settings.WithName("trace.debug_http_endpoint.enabled"),
+	settings.WithPublic)
 
-var openTelemetryCollector = settings.RegisterValidatedStringSetting(
+var openTelemetryCollector = settings.RegisterStringSetting(
 	settings.TenantWritable,
 	"trace.opentelemetry.collector",
 	"address of an OpenTelemetry trace collector to receive "+
 		"traces using the otel gRPC protocol, as <host>:<port>. "+
 		"If no port is specified, 4317 will be used.",
 	envutil.EnvOrDefaultString("COCKROACH_OTLP_COLLECTOR", ""),
-	func(_ *settings.Values, s string) error {
+	settings.WithValidateString(func(_ *settings.Values, s string) error {
 		if s == "" {
 			return nil
 		}
 		_, _, err := addr.SplitHostPort(s, "4317")
 		return err
-	},
-).WithPublic()
+	}),
+	settings.WithPublic,
+)
 
-var jaegerAgent = settings.RegisterValidatedStringSetting(
+var jaegerAgent = settings.RegisterStringSetting(
 	settings.TenantWritable,
 	"trace.jaeger.agent",
 	"the address of a Jaeger agent to receive traces using the "+
 		"Jaeger UDP Thrift protocol, as <host>:<port>. "+
 		"If no port is specified, 6381 will be used.",
 	envutil.EnvOrDefaultString("COCKROACH_JAEGER", ""),
-	func(_ *settings.Values, s string) error {
+	settings.WithValidateString(func(_ *settings.Values, s string) error {
 		if s == "" {
 			return nil
 		}
 		_, _, err := addr.SplitHostPort(s, "6381")
 		return err
-	},
-).WithPublic()
+	}),
+	settings.WithPublic,
+)
 
 // ZipkinCollector is the cluster setting that specifies the Zipkin instance
 // to send traces to, if any.
-var ZipkinCollector = settings.RegisterValidatedStringSetting(
+var ZipkinCollector = settings.RegisterStringSetting(
 	settings.TenantWritable,
 	"trace.zipkin.collector",
 	"the address of a Zipkin instance to receive traces, as <host>:<port>. "+
 		"If no port is specified, 9411 will be used.",
 	envutil.EnvOrDefaultString("COCKROACH_ZIPKIN", ""),
-	func(_ *settings.Values, s string) error {
+	settings.WithValidateString(func(_ *settings.Values, s string) error {
 		if s == "" {
 			return nil
 		}
 		_, _, err := addr.SplitHostPort(s, "9411")
 		return err
-	},
-).WithPublic()
+	}),
+	settings.WithPublic,
+)
 
 // EnableActiveSpansRegistry controls Tracers configured as
 // WithTracingMode(TracingModeFromEnv) (which is the default). When enabled,
@@ -181,7 +182,7 @@ var EnableActiveSpansRegistry = settings.RegisterBoolSetting(
 	"trace.span_registry.enabled",
 	"if set, ongoing traces can be seen at https://<ui>/#/debug/tracez",
 	envutil.EnvOrDefaultBool("COCKROACH_REAL_SPANS", true),
-).WithPublic()
+	settings.WithPublic)
 
 var periodicSnapshotInterval = settings.RegisterDurationSetting(
 	settings.TenantWritable,
@@ -189,7 +190,7 @@ var periodicSnapshotInterval = settings.RegisterDurationSetting(
 	"if non-zero, interval at which background trace snapshots are captured",
 	0,
 	settings.NonNegativeDuration,
-).WithPublic()
+	settings.WithPublic)
 
 // panicOnUseAfterFinish, if set, causes use of a span after Finish() to panic
 // if detected.
@@ -250,7 +251,7 @@ var _ TracerOption = SpanReusePercentOpt(0)
 // environmental default.
 func WithSpanReusePercent(percent uint32) TracerOption {
 	if percent > 100 {
-		panic(fmt.Sprintf("invalid percent: %d", percent))
+		panic(errors.AssertionFailedf("invalid percent: %d", percent))
 	}
 	return SpanReusePercentOpt(percent)
 }
@@ -452,14 +453,9 @@ func (r *SpanRegistry) getSpanByID(id tracingpb.SpanID) RegistrySpan {
 // The callback should not hold on to the span after it returns.
 func (r *SpanRegistry) VisitRoots(visitor func(span RegistrySpan) error) error {
 	// Take a snapshot of the registry and release the lock.
-	r.mu.Lock()
-	spans := make([]spanRef, 0, len(r.mu.m))
-	for _, sp := range r.mu.m {
-		// We'll keep the spans alive while we're visiting them below.
-		spans = append(spans, makeSpanRef(sp.sp))
-	}
-	r.mu.Unlock()
+	spans := r.getSpanRefs()
 
+	// Keep the spans alive while visting them below.
 	defer func() {
 		for i := range spans {
 			spans[i].release()
@@ -488,14 +484,9 @@ func visitTrace(sp *crdbSpan, visitor func(sp RegistrySpan)) {
 // The callback should not hold on to the span after it returns.
 func (r *SpanRegistry) VisitSpans(visitor func(span RegistrySpan)) {
 	// Take a snapshot of the registry and release the lock.
-	r.mu.Lock()
-	spans := make([]spanRef, 0, len(r.mu.m))
-	for _, sp := range r.mu.m {
-		// We'll keep the spans alive while we're visiting them below.
-		spans = append(spans, makeSpanRef(sp.sp))
-	}
-	r.mu.Unlock()
+	spans := r.getSpanRefs()
 
+	// Keep the spans alive while visting them below.
 	defer func() {
 		for i := range spans {
 			spans[i].release()
@@ -505,6 +496,18 @@ func (r *SpanRegistry) VisitSpans(visitor func(span RegistrySpan)) {
 	for _, sp := range spans {
 		visitTrace(sp.Span.i.crdb, visitor)
 	}
+}
+
+// getSpanRefs collects references to all spans in the SpanRegistry map and
+// returns a slice of them.
+func (r *SpanRegistry) getSpanRefs() []spanRef {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	spans := make([]spanRef, 0, len(r.mu.m))
+	for _, sp := range r.mu.m {
+		spans = append(spans, makeSpanRef(sp.sp))
+	}
+	return spans
 }
 
 // testingAll returns (pointers to) all the spans in the registry, in an
@@ -530,17 +533,19 @@ func (r *SpanRegistry) testingAll() []*crdbSpan {
 // concurrently with this call. swap takes ownership of the spanRefs, and will
 // release() them.
 func (r *SpanRegistry) swap(parentID tracingpb.SpanID, children []spanRef) {
-	r.mu.Lock()
-	r.removeSpanLocked(parentID)
-	for _, c := range children {
-		sp := c.Span.i.crdb
-		sp.withLock(func() {
-			if !sp.mu.finished {
-				r.addSpanLocked(sp)
-			}
-		})
-	}
-	r.mu.Unlock()
+	func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.removeSpanLocked(parentID)
+		for _, c := range children {
+			sp := c.Span.i.crdb
+			sp.withLock(func() {
+				if !sp.mu.finished {
+					r.addSpanLocked(sp)
+				}
+			})
+		}
+	}()
 	for _, c := range children {
 		c.release()
 	}
@@ -750,8 +755,8 @@ func (o useAfterFinishOpt) apply(opt *tracerOptions) {
 // panicOnUseAfterFinish is not set.
 func WithUseAfterFinishOpt(panicOnUseAfterFinish, debugUseAfterFinish bool) TracerOption {
 	if debugUseAfterFinish && !panicOnUseAfterFinish {
-		panic("it is nonsensical to set debugUseAfterFinish when panicOnUseAfterFinish is not set, " +
-			"as the collected stacks will never be used")
+		panic(errors.AssertionFailedf("it is nonsensical to set debugUseAfterFinish when panicOnUseAfterFinish is not set, " +
+			"as the collected stacks will never be used"))
 	}
 	return useAfterFinishOpt{
 		panicOnUseAfterFinish: panicOnUseAfterFinish,
@@ -781,7 +786,7 @@ func (t *Tracer) configure(ctx context.Context, sv *settings.Values, tracingDefa
 		case TracingModeActiveSpansRegistry:
 			t.SetActiveSpansRegistryEnabled(true)
 		default:
-			panic(fmt.Sprintf("unrecognized tracing option: %v", tracingDefault))
+			panic(errors.AssertionFailedf("unrecognized tracing option: %v", tracingDefault))
 		}
 
 		t.SetRedactable(enableRedactable)
@@ -1035,14 +1040,16 @@ func (t *Tracer) releaseSpanToPool(sp *Span) {
 	// Nobody is supposed to have a reference to the span at this point, but let's
 	// take the lock anyway to protect against buggy clients accessing the span
 	// after Finish().
-	c.mu.Lock()
-	c.mu.openChildren = nil
-	c.mu.recording.finishedChildren = Trace{}
-	c.mu.tags = nil
-	c.mu.lazyTags = nil
-	c.mu.recording.logs.Discard()
-	c.mu.recording.structured.Discard()
-	c.mu.Unlock()
+	func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.mu.openChildren = nil
+		c.mu.recording.finishedChildren = Trace{}
+		c.mu.tags = nil
+		c.mu.lazyTags = nil
+		c.mu.recording.logs.Discard()
+		c.mu.recording.structured.Discard()
+	}()
 
 	// Zero out the spanAllocHelper buffers to make the elements inside the
 	// arrays, if any, available for GC.
@@ -1102,7 +1109,7 @@ func (t *Tracer) startSpanGeneric(
 	ctx context.Context, opName string, opts spanOptions,
 ) (context.Context, *Span) {
 	if opts.RefType != childOfRef && opts.RefType != followsFromRef {
-		panic(fmt.Sprintf("unexpected RefType %v", opts.RefType))
+		panic(errors.AssertionFailedf("unexpected RefType %v", opts.RefType))
 	}
 
 	if !opts.Parent.empty() {
@@ -1114,12 +1121,12 @@ func (t *Tracer) startSpanGeneric(
 		}
 
 		if !opts.RemoteParent.Empty() {
-			panic("can't specify both Parent and RemoteParent")
+			panic(errors.AssertionFailedf("can't specify both Parent and RemoteParent"))
 		}
 		if opts.Parent.i.sterile {
 			// A sterile parent should have been optimized away by
 			// WithParent.
-			panic("invalid sterile parent")
+			panic(errors.AssertionFailedf("invalid sterile parent"))
 		}
 		if s := opts.Parent.Tracer(); s != t {
 			// Creating a child with a different Tracer than the parent is not allowed
@@ -1128,7 +1135,7 @@ func (t *Tracer) startSpanGeneric(
 			// registry if the parent Finish()es before the child, and then it would
 			// be leaked because Finish()ing the child would attempt to remove the
 			// span from the child tracer's registry.
-			panic(fmt.Sprintf(`attempting to start span with parent from different Tracer.
+			panic(errors.AssertionFailedf(`attempting to start span with parent from different Tracer.
 parent operation: %s, tracer created at:
 
 %s
@@ -1232,7 +1239,7 @@ child operation: %s, tracer created at:
 
 			parent := opts.Parent.i.crdb
 			if s.i.crdb == parent {
-				panic(fmt.Sprintf("attempting to link a child to itself: %s", s.i.crdb.operation))
+				panic(errors.AssertionFailedf("attempting to link a child to itself: %s", s.i.crdb.operation))
 			}
 
 			// We're going to hold the parent's lock while we link both the parent
@@ -1504,7 +1511,7 @@ func (t *Tracer) SpanRegistry() *SpanRegistry {
 // Panics if the MaintainAllocationCounters testing knob was not set.
 func (t *Tracer) TestingGetStatsAndReset() (int, int) {
 	if !t.testing.MaintainAllocationCounters {
-		panic("GetStatsAndReset() needs the Tracer to have been configured with MaintainAllocationCounters")
+		panic(errors.AssertionFailedf("GetStatsAndReset() needs the Tracer to have been configured with MaintainAllocationCounters"))
 	}
 	created := atomic.SwapInt32(&t.spansCreated, 0)
 	allocs := atomic.SwapInt32(&t.spansAllocated, 0)
@@ -1662,7 +1669,7 @@ func makeOtelSpan(
 			Attributes:  followsFromAttribute,
 		}))
 	default:
-		panic(fmt.Sprintf("unsupported span reference type: %v", refType))
+		panic(errors.AssertionFailedf("unsupported span reference type: %v", refType))
 	}
 
 	_ /* ctx */, sp := otelTr.Start(ctx, opName, opts...)

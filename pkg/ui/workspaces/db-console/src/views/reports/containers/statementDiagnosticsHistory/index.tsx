@@ -11,7 +11,7 @@
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import moment from "moment";
+import moment from "moment-timezone";
 import { Link } from "react-router-dom";
 import { isUndefined } from "lodash";
 
@@ -46,6 +46,7 @@ import {
   SortSetting,
   ColumnDescriptor,
   util,
+  Timestamp,
 } from "@cockroachlabs/cluster-ui";
 import { cancelStatementDiagnosticsReportAction } from "src/redux/statements";
 import { trackCancelDiagnosticsBundleAction } from "src/redux/analyticsActions";
@@ -95,8 +96,9 @@ class StatementDiagnosticsHistoryView extends React.Component<
     {
       title: "Activated on",
       name: "activated_on",
-      cell: record =>
-        moment.utc(record.requested_at).format(util.DATE_FORMAT_24_UTC),
+      cell: record => (
+        <Timestamp time={record.requested_at} format={util.DATE_FORMAT_24_TZ} />
+      ),
       sort: record => {
         return moment.utc(record.requested_at).unix();
       },
@@ -247,6 +249,7 @@ class StatementDiagnosticsHistoryView extends React.Component<
         {this.renderTableTitle()}
         <StatementDiagnosticsHistoryTable
           className="statements-table"
+          tableWrapperClassName="sorted-table"
           data={dataSource}
           columns={this.columns}
           loading={loading}

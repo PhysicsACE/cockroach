@@ -19,7 +19,7 @@ stats_dir="$(date +"%Y%m%d")-${TC_BUILD_ID}"
 # Set up a function we'll invoke at the end.
 function upload_stats {
  if tc_release_branch; then
-      bucket="cockroach-nightly-${CLOUD}"
+      bucket="${ROACHTEST_BUCKET:-cockroach-nightly-${CLOUD}}"
       if [[ "${CLOUD}" == "gce" ]]; then
           # GCE, having been there first, gets an exemption.
           bucket="cockroach-nightly"
@@ -31,6 +31,10 @@ function upload_stats {
         # The master branch is special, as roachperf hard-codes
         # the location.
         remote_artifacts_dir="artifacts"
+      fi
+      # In FIPS-mode, keep artifacts separate by using the 'fips' suffix.
+      if [[ ${FIPS_ENABLED:-0} == 1 ]]; then
+        remote_artifacts_dir="${remote_artifacts_dir}-fips"
       fi
 
       # The stats.json files need some path translation:
@@ -57,16 +61,20 @@ trap upload_stats EXIT
 PARALLELISM=16
 CPUQUOTA=1024
 TESTS="${TESTS-}"
+FILTER="${FILTER-}"
 case "${CLOUD}" in
   gce)
+      # Confusing due to how we've handled tags in the past where it has been assumed that all tests should
+      # be run on GCE. Now with refactoring of how tags are handled, we need:
+      # - "default" to ensure we select tests that don't have any user specified tags (preserve old behavior)
+      # - "aws" to ensure we select tests that now no longer have "default" because they have the "aws" tag
+      # Ideally, refactor the tags themselves to be explicit about what cloud they are for and when they can run.
+      # https://github.com/cockroachdb/cockroach/issues/100605
+      FILTER="tag:aws tag:default"
     ;;
   aws)
-    PARALLELISM=3
-    CPUQUOTA=384
-    if [ -z "${TESTS}" ]; then
-      # NB: anchor ycsb to beginning of line to avoid matching `zfs/ycsb/*` which
-      # isn't supported on AWS at time of writing.
-      TESTS="awsdms|kv(0|95)|^ycsb|tpcc/(headroom/n4cpu16)|tpccbench/(nodes=3/cpu=16)|scbench/randomload/(nodes=3/ops=2000/conc=1)|backup/(KMS/AWS/n3cpu4)|restore/tpce|restore/pause"
+    if [ -z "${FILTER}" ]; then
+      FILTER="tag:aws"
     fi
     ;;
   *)

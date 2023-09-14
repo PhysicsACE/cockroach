@@ -530,8 +530,9 @@ func TestResolveIndex(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 
 	tDB.Exec(t, `
@@ -606,17 +607,19 @@ CREATE TABLE c (a INT, INDEX idx2(a));`,
 		},
 	}
 
-	var sessionData sessiondatapb.SessionData
-	{
-		var sessionSerialized []byte
-		tDB.QueryRow(t, "SELECT crdb_internal.serialize_session()").Scan(&sessionSerialized)
-		require.NoError(t, protoutil.Unmarshal(sessionSerialized, &sessionData))
-	}
+	var m sessiondatapb.MigratableSession
+	var sessionSerialized []byte
+	tDB.QueryRow(t, "SELECT crdb_internal.serialize_session()").Scan(&sessionSerialized)
+	require.NoError(t, protoutil.Unmarshal(sessionSerialized, &m))
+	sd, err := sessiondata.UnmarshalNonLocal(m.SessionData)
+	require.NoError(t, err)
+	sd.SessionData = m.SessionData
+	sd.LocalOnlySessionData = m.LocalOnlySessionData
 
-	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
+			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
 		)
 		defer cleanup()
 
@@ -665,8 +668,9 @@ func TestResolveIndexWithOfflineTable(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 
 	tDB.Exec(t, `
@@ -687,17 +691,19 @@ CREATE INDEX baz_idx ON baz (s);
 	})
 	require.NoError(t, err)
 
-	var sessionData sessiondatapb.SessionData
-	{
-		var sessionSerialized []byte
-		tDB.QueryRow(t, "SELECT crdb_internal.serialize_session()").Scan(&sessionSerialized)
-		require.NoError(t, protoutil.Unmarshal(sessionSerialized, &sessionData))
-	}
+	var m sessiondatapb.MigratableSession
+	var sessionSerialized []byte
+	tDB.QueryRow(t, "SELECT crdb_internal.serialize_session()").Scan(&sessionSerialized)
+	require.NoError(t, protoutil.Unmarshal(sessionSerialized, &m))
+	sd, err := sessiondata.UnmarshalNonLocal(m.SessionData)
+	require.NoError(t, err)
+	sd.SessionData = m.SessionData
+	sd.LocalOnlySessionData = m.LocalOnlySessionData
 
 	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData,
+			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
 		)
 		defer cleanup()
 

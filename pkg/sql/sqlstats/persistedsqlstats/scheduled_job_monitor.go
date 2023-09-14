@@ -12,6 +12,7 @@ package persistedsqlstats
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -59,6 +61,7 @@ var longIntervalWarningThreshold = time.Hour * 24
 // periodically every scanInterval (subject to jittering).
 type jobMonitor struct {
 	st           *cluster.Settings
+	clusterID    func() uuid.UUID
 	db           isql.DB
 	scanInterval time.Duration
 	jitterFn     func(time.Duration) time.Duration
@@ -67,8 +70,13 @@ type jobMonitor struct {
 	}
 }
 
-func (j *jobMonitor) start(ctx context.Context, stopper *stop.Stopper) {
-	_ = stopper.RunAsyncTask(ctx, "sql-stats-scheduled-compaction-job-monitor", func(ctx context.Context) {
+func (j *jobMonitor) start(
+	ctx context.Context, stopper *stop.Stopper, drain chan struct{}, tasksWG *sync.WaitGroup,
+) {
+	tasksWG.Add(1)
+	err := stopper.RunAsyncTask(ctx, "sql-stats-scheduled-compaction-job-monitor", func(ctx context.Context) {
+		defer tasksWG.Done()
+
 		nextJobScheduleCheck := timeutil.Now()
 		currentRecurrence := SQLStatsCleanupRecurrence.Get(&j.st.SV)
 
@@ -93,7 +101,11 @@ func (j *jobMonitor) start(ctx context.Context, stopper *stop.Stopper) {
 			select {
 			case <-timer.C:
 				timer.Read = true
+			case <-drain:
+				// Graceful shutdown.
+				return
 			case <-stopCtx.Done():
+				// Expedited shutdown.
 				return
 			}
 
@@ -109,6 +121,10 @@ func (j *jobMonitor) start(ctx context.Context, stopper *stop.Stopper) {
 			timer.Reset(updateCheckInterval)
 		}
 	})
+	if err != nil {
+		tasksWG.Done()
+		log.Warningf(ctx, "error starting sql stats scheduled compaction job monitor: %v", err)
+	}
 }
 
 func (j *jobMonitor) getSchedule(
@@ -157,7 +173,7 @@ func (j *jobMonitor) updateSchedule(ctx context.Context, cronExpr string) {
 				if !jobs.HasScheduledJobNotFoundError(err) && !errors.Is(err, errScheduleNotFound) {
 					return err
 				}
-				sj, err = CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, txn, j.st)
+				sj, err = CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, txn, j.st, j.clusterID())
 				if err != nil {
 					return err
 				}

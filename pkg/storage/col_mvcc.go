@@ -401,13 +401,16 @@ func MVCCScanToCols(
 	opts MVCCScanOptions,
 	st *cluster.Settings,
 ) (MVCCScanResult, error) {
-	iter := newMVCCIterator(
+	iter, err := newMVCCIterator(
 		reader, timestamp, !opts.Tombstones, opts.DontInterleaveIntents, IterOptions{
 			KeyTypes:   IterKeyTypePointsAndRanges,
 			LowerBound: key,
 			UpperBound: endKey,
 		},
 	)
+	if err != nil {
+		return MVCCScanResult{}, err
+	}
 	defer iter.Close()
 	return mvccScanToCols(ctx, iter, indexFetchSpec, key, endKey, timestamp, opts, st)
 }
@@ -421,10 +424,11 @@ func mvccScanToCols(
 	opts MVCCScanOptions,
 	st *cluster.Settings,
 ) (MVCCScanResult, error) {
+	mvccScanner := pebbleMVCCScannerPool.Get().(*pebbleMVCCScanner)
 	adapter := mvccScanFetchAdapter{machine: onNextKVSeek}
 	adapter.results.maxKeysPerRow = indexFetchSpec.MaxKeysPerRow
 	adapter.results.maxFamilyID = uint32(indexFetchSpec.MaxFamilyID)
-	ok, mvccScanner, res, err := mvccScanInit(iter, key, endKey, timestamp, opts, &adapter.results)
+	ok, res, err := mvccScanInit(mvccScanner, iter, key, endKey, timestamp, opts, &adapter.results)
 	if !ok {
 		return res, err
 	}

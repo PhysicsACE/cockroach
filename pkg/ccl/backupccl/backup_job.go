@@ -28,10 +28,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -45,10 +46,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -60,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/gogo/protobuf/types"
 )
 
@@ -94,30 +98,6 @@ func filterSpans(includes []roachpb.Span, excludes []roachpb.Span) []roachpb.Spa
 	return cov.Slice()
 }
 
-// clusterNodeCount returns the approximate number of nodes in the cluster.
-func clusterNodeCount(gw gossip.OptionalGossip) (int, error) {
-	g, err := gw.OptionalErr(47970)
-	if err != nil {
-		return 0, err
-	}
-	var nodes int
-	err = g.IterateInfos(
-		gossip.KeyNodeDescPrefix, func(_ string, _ gossip.Info) error {
-			nodes++
-			return nil
-		},
-	)
-	if err != nil {
-		return 0, err
-	}
-	// If we somehow got 0 and return it, a caller may panic if they divide by
-	// such a nonsensical nodecount.
-	if nodes == 0 {
-		return 1, errors.New("failed to count nodes")
-	}
-	return nodes, nil
-}
-
 // backup exports a snapshot of every kv entry into ranged sstables.
 //
 // The output is an sstable per range with files in the following locations:
@@ -125,6 +105,9 @@ func clusterNodeCount(gw gossip.OptionalGossip) (int, error) {
 //   - <dir> is given by the user and may be cloud storage
 //   - Each file contains data for a key range that doesn't overlap with any other
 //     file.
+//
+// - numBackupInstances indicates the number of SQL instances that were used to
+// execute the backup.
 func backup(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
@@ -138,7 +121,8 @@ func backup(
 	makeExternalStorage cloud.ExternalStorageFactory,
 	encryption *jobspb.BackupEncryptionOptions,
 	statsCache *stats.TableStatisticsCache,
-) (roachpb.RowCount, error) {
+	execLocality roachpb.Locality,
+) (_ roachpb.RowCount, numBackupInstances int, _ error) {
 	resumerSpan := tracing.SpanFromContext(ctx)
 	var lastCheckpoint time.Time
 
@@ -155,12 +139,12 @@ func backup(
 	iterFactory := backupinfo.NewIterFactory(backupManifest, defaultStore, encryption, &kmsEnv)
 	it, err := iterFactory.NewFileIter(ctx)
 	if err != nil {
-		return roachpb.RowCount{}, err
+		return roachpb.RowCount{}, 0, err
 	}
 	defer it.Close()
 	for ; ; it.Next() {
 		if ok, err := it.Valid(); err != nil {
-			return roachpb.RowCount{}, err
+			return roachpb.RowCount{}, 0, err
 		} else if !ok {
 			break
 		}
@@ -170,6 +154,23 @@ func backup(
 			completedIntroducedSpans = append(completedIntroducedSpans, f.Span)
 		} else {
 			completedSpans = append(completedSpans, f.Span)
+		}
+	}
+
+	// Add the spans for any tables that are excluded from backup to the set of
+	// already-completed spans, as there is nothing to do for them.
+	descs := iterFactory.NewDescIter(ctx)
+	defer descs.Close()
+	for ; ; descs.Next() {
+		if ok, err := descs.Valid(); err != nil {
+			return roachpb.RowCount{}, 0, err
+		} else if !ok {
+			break
+		}
+
+		if tbl, _, _, _, _ := descpb.GetDescriptors(descs.Value()); tbl != nil && tbl.ExcludeDataFromBackup {
+			prefix := execCtx.ExecCfg().Codec.TablePrefix(uint32(tbl.ID))
+			completedSpans = append(completedSpans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
 		}
 	}
 
@@ -189,9 +190,11 @@ func backup(
 
 	// We don't return the compatible nodes here since PartitionSpans will
 	// filter out incompatible nodes.
-	planCtx, _, err := dsp.SetupAllNodesPlanning(ctx, evalCtx, execCtx.ExecCfg())
+	planCtx, _, err := dsp.SetupAllNodesPlanningWithOracle(
+		ctx, evalCtx, execCtx.ExecCfg(), physicalplan.DefaultReplicaChooser, execLocality,
+	)
 	if err != nil {
-		return roachpb.RowCount{}, errors.Wrap(err, "failed to determine nodes on which to run")
+		return roachpb.RowCount{}, 0, errors.Wrap(err, "failed to determine nodes on which to run")
 	}
 
 	backupSpecs, err := distBackupPlanSpecs(
@@ -212,9 +215,10 @@ func backup(
 		backupManifest.EndTime,
 	)
 	if err != nil {
-		return roachpb.RowCount{}, err
+		return roachpb.RowCount{}, 0, err
 	}
 
+	numBackupInstances = len(backupSpecs)
 	numTotalSpans := 0
 	for _, spec := range backupSpecs {
 		numTotalSpans += len(spec.IntroducedSpans) + len(spec.Spans)
@@ -229,7 +233,27 @@ func backup(
 			// Currently the granularity of backup progress is the % of spans
 			// exported. Would improve accuracy if we tracked the actual size of each
 			// file.
-			return progressLogger.Loop(ctx, requestFinishedCh)
+			return errors.Wrap(progressLogger.Loop(ctx, requestFinishedCh), "updating job progress")
+		}
+	}
+
+	// Create a channel that is large enough that it does not block.
+	perNodeProgressCh := make(chan map[execinfrapb.ComponentID]float32, numTotalSpans)
+	storePerNodeProgressLoop := func(ctx context.Context) error {
+		if !execCtx.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V23_1) {
+			return nil
+		}
+		for {
+			select {
+			case prog, ok := <-perNodeProgressCh:
+				if !ok {
+					return nil
+				}
+				jobsprofiler.StorePerNodeProcessorProgressFraction(
+					ctx, execCtx.ExecCfg().InternalDB, job.ID(), prog)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 
@@ -238,6 +262,7 @@ func backup(
 		// When a processor is done exporting a span, it will send a progress update
 		// to progCh.
 		defer close(requestFinishedCh)
+		defer close(perNodeProgressCh)
 		var numBackedUpFiles int64
 		for progress := range progCh {
 			var progDetails backuppb.BackupManifest_Progress
@@ -256,8 +281,31 @@ func backup(
 			// Signal that an ExportRequest finished to update job progress.
 			for i := int32(0); i < progDetails.CompletedSpans; i++ {
 				requestFinishedCh <- struct{}{}
+				if execCtx.ExecCfg().TestingKnobs.AfterBackupChunk != nil {
+					execCtx.ExecCfg().TestingKnobs.AfterBackupChunk()
+				}
 			}
 
+			// Update the per-component progress maintained by the job profiler.
+			perComponentProgress := make(map[execinfrapb.ComponentID]float32)
+			component := execinfrapb.ComponentID{
+				SQLInstanceID: progress.NodeID,
+				FlowID:        progress.FlowID,
+				Type:          execinfrapb.ComponentID_PROCESSOR,
+			}
+			for processorID, fraction := range progress.CompletedFraction {
+				component.ID = processorID
+				perComponentProgress[component] = fraction
+			}
+			select {
+			// This send to a buffered channel should never block but incase it does
+			// we will fallthrough to the default case.
+			case perNodeProgressCh <- perComponentProgress:
+			default:
+				log.Warningf(ctx, "skipping persisting per component progress as buffered channel was full")
+			}
+
+			// Check if we should persist a checkpoint backup manifest.
 			interval := BackupCheckpointInterval.Get(&execCtx.ExecCfg().Settings.SV)
 			if timeutil.Since(lastCheckpoint) > interval {
 				resumerSpan.RecordStructured(&backuppb.BackupProgressTraceEvent{
@@ -280,21 +328,41 @@ func backup(
 		}
 		return nil
 	}
+	tracingAggCh := make(chan *execinfrapb.TracingAggregatorEvents)
+	tracingAggLoop := func(ctx context.Context) error {
+		if err := bulk.AggregateTracingStats(ctx, job.ID(),
+			execCtx.ExecCfg().Settings, execCtx.ExecCfg().InternalDB, tracingAggCh); err != nil {
+			log.Warningf(ctx, "failed to aggregate tracing stats: %v", err)
+			// Even if we fail to aggregate tracing stats, we must continue draining
+			// the channel so that the sender in the DistSQLReceiver does not block
+			// and allows the backup to continue uninterrupted.
+			for range tracingAggCh {
+			}
+		}
+		return nil
+	}
 
-	resumerSpan.RecordStructured(&types.StringValue{Value: "starting DistSQL backup execution"})
 	runBackup := func(ctx context.Context) error {
-		return distBackup(
+		return errors.Wrapf(distBackup(
 			ctx,
 			execCtx,
 			planCtx,
 			dsp,
 			progCh,
+			tracingAggCh,
 			backupSpecs,
-		)
+		), "exporting %d ranges", errors.Safe(numTotalSpans))
 	}
 
-	if err := ctxgroup.GoAndWait(ctx, jobProgressLoop, checkpointLoop, runBackup); err != nil {
-		return roachpb.RowCount{}, errors.Wrapf(err, "exporting %d ranges", errors.Safe(numTotalSpans))
+	if err := ctxgroup.GoAndWait(
+		ctx,
+		jobProgressLoop,
+		checkpointLoop,
+		storePerNodeProgressLoop,
+		tracingAggLoop,
+		runBackup,
+	); err != nil {
+		return roachpb.RowCount{}, 0, err
 	}
 
 	backupID := uuid.MakeV4()
@@ -332,7 +400,7 @@ func backup(
 				return backupinfo.WriteBackupPartitionDescriptor(ctx, store, filename,
 					encryption, &kmsEnv, &desc)
 			}(); err != nil {
-				return roachpb.RowCount{}, err
+				return roachpb.RowCount{}, 0, err
 			}
 		}
 	}
@@ -345,7 +413,7 @@ func backup(
 	// `BACKUP_METADATA` instead.
 	if err := backupinfo.WriteBackupManifest(ctx, defaultStore, backupbase.BackupManifestName,
 		encryption, &kmsEnv, backupManifest); err != nil {
-		return roachpb.RowCount{}, err
+		return roachpb.RowCount{}, 0, err
 	}
 
 	// Write a `BACKUP_METADATA` file along with SSTs for all the alloc heavy
@@ -354,14 +422,16 @@ func backup(
 	// TODO(adityamaru,rhu713): Once backup/restore switches from writing and
 	// reading backup manifests to `metadata.sst` we can stop writing the slim
 	// manifest.
-	if err := backupinfo.WriteMetadataWithExternalSSTs(ctx, defaultStore, encryption,
-		&kmsEnv, backupManifest); err != nil {
-		return roachpb.RowCount{}, err
+	if backupinfo.WriteMetadataWithExternalSSTsEnabled.Get(&settings.SV) {
+		if err := backupinfo.WriteMetadataWithExternalSSTs(ctx, defaultStore, encryption,
+			&kmsEnv, backupManifest); err != nil {
+			return roachpb.RowCount{}, 0, err
+		}
 	}
 
 	statsTable := getTableStatsForBackup(ctx, statsCache, backupManifest.Descriptors)
 	if err := backupinfo.WriteTableStatistics(ctx, defaultStore, encryption, &kmsEnv, &statsTable); err != nil {
-		return roachpb.RowCount{}, err
+		return roachpb.RowCount{}, 0, err
 	}
 
 	if backupinfo.WriteMetadataSST.Get(&settings.SV) {
@@ -369,13 +439,13 @@ func backup(
 			statsTable.Statistics); err != nil {
 			err = errors.Wrap(err, "writing forward-compat metadata sst")
 			if !build.IsRelease() {
-				return roachpb.RowCount{}, err
+				return roachpb.RowCount{}, 0, err
 			}
 			log.Warningf(ctx, "%+v", err)
 		}
 	}
 
-	return backupManifest.EntryCounts, nil
+	return backupManifest.EntryCounts, numBackupInstances, nil
 }
 
 func releaseProtectedTimestamp(
@@ -452,13 +522,18 @@ func (b *backupResumer) ForceRealSpan() bool {
 	return true
 }
 
+// DumpTraceAfterRun implements the TraceableJob interface.
+func (b *backupResumer) DumpTraceAfterRun() bool {
+	return true
+}
+
 // Resume is part of the jobs.Resumer interface.
 func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	// The span is finished by the registry executing the job.
 	details := b.job.Details().(jobspb.BackupDetails)
 	p := execCtx.(sql.JobExecContext)
 
-	if err := b.maybeRelocateJobExecution(ctx, p, details.CoordinatorLocation); err != nil {
+	if err := maybeRelocateJobExecution(ctx, b.job.ID(), p, details.ExecutionLocality, "BACKUP"); err != nil {
 		return err
 	}
 
@@ -535,7 +610,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		initialDetails := details
 		if err := insqlDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			backupDetails, m, err := getBackupDetailAndManifest(
-				ctx, p.ExecCfg(), txn, details, p.User(), backupDest,
+				ctx, p.ExecCfg(), txn, initialDetails, p.User(), backupDest,
 			)
 			if err != nil {
 				return err
@@ -697,8 +772,9 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	// We want to retry a backup if there are transient failures (i.e. worker nodes
 	// dying), so if we receive a retryable error, re-plan and retry the backup.
 	var res roachpb.RowCount
+	var numBackupInstances int
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-		res, err = backup(
+		res, numBackupInstances, err = backup(
 			ctx,
 			p,
 			details.URI,
@@ -711,6 +787,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			p.ExecCfg().DistSQLSrv.ExternalStorage,
 			details.EncryptionOptions,
 			statsCache,
+			details.ExecutionLocality,
 		)
 		if err == nil {
 			break
@@ -806,15 +883,6 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 
 	// Collect telemetry.
 	{
-		numClusterNodes, err := clusterNodeCount(p.ExecCfg().Gossip)
-		if err != nil {
-			if !build.IsRelease() && p.ExecCfg().Codec.ForSystemTenant() {
-				return err
-			}
-			log.Warningf(ctx, "unable to determine cluster node count: %v", err)
-			numClusterNodes = 1
-		}
-
 		telemetry.Count("backup.total.succeeded")
 		const mb = 1 << 20
 		sizeMb := res.DataSize / mb
@@ -823,16 +891,20 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		if sec > 0 {
 			mbps = mb / sec
 		}
+		if numBackupInstances == 0 {
+			// This can happen when we didn't have anything to back up.
+			numBackupInstances = 1
+		}
 		if details.StartTime.IsEmpty() {
 			telemetry.CountBucketed("backup.duration-sec.full-succeeded", sec)
 			telemetry.CountBucketed("backup.size-mb.full", sizeMb)
 			telemetry.CountBucketed("backup.speed-mbps.full.total", mbps)
-			telemetry.CountBucketed("backup.speed-mbps.full.per-node", mbps/int64(numClusterNodes))
+			telemetry.CountBucketed("backup.speed-mbps.full.per-node", mbps/int64(numBackupInstances))
 		} else {
 			telemetry.CountBucketed("backup.duration-sec.inc-succeeded", sec)
 			telemetry.CountBucketed("backup.size-mb.inc", sizeMb)
 			telemetry.CountBucketed("backup.speed-mbps.inc.total", mbps)
-			telemetry.CountBucketed("backup.speed-mbps.inc.per-node", mbps/int64(numClusterNodes))
+			telemetry.CountBucketed("backup.speed-mbps.inc.per-node", mbps/int64(numBackupInstances))
 		}
 		logutil.LogJobCompletion(ctx, b.getTelemetryEventType(), b.job.ID(), true, nil, res.Rows)
 	}
@@ -859,8 +931,12 @@ func (b *backupResumer) ReportResults(ctx context.Context, resultsCh chan<- tree
 	}
 }
 
-func (b *backupResumer) maybeRelocateJobExecution(
-	ctx context.Context, p sql.JobExecContext, locality roachpb.Locality,
+func maybeRelocateJobExecution(
+	ctx context.Context,
+	jobID jobspb.JobID,
+	p sql.JobExecContext,
+	locality roachpb.Locality,
+	jobDesc redact.SafeString,
 ) error {
 	if locality.NonEmpty() {
 		current, err := p.DistSQLPlanner().GetSQLInstanceInfo(p.ExecCfg().JobRegistry.ID())
@@ -869,8 +945,8 @@ func (b *backupResumer) maybeRelocateJobExecution(
 		}
 		if ok, missedTier := current.Locality.Matches(locality); !ok {
 			log.Infof(ctx,
-				"BACKUP job %d initially adopted on instance %d but it does not match locality filter %s, finding a new coordinator",
-				b.job.ID(), current.NodeID, missedTier.String(),
+				"%s job %d initially adopted on instance %d but it does not match locality filter %s, finding a new coordinator",
+				jobDesc, jobID, current.NodeID, missedTier.String(),
 			)
 
 			instancesInRegion, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, locality)
@@ -883,7 +959,7 @@ func (b *backupResumer) maybeRelocateJobExecution(
 			var res error
 			if err := p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 				var err error
-				res, err = p.ExecCfg().JobRegistry.RelocateLease(ctx, txn, b.job.ID(), dest.InstanceID, dest.SessionID)
+				res, err = p.ExecCfg().JobRegistry.RelocateLease(ctx, txn, jobID, dest.InstanceID, dest.SessionID)
 				return err
 			}); err != nil {
 				return errors.Wrapf(err, "failed to relocate job coordinator to %d", dest.InstanceID)

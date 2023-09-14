@@ -11,10 +11,11 @@
 package server
 
 import (
-	"strings"
+	"context"
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -30,11 +31,11 @@ type grpcServer struct {
 	mode                   serveMode
 }
 
-func newGRPCServer(rpcCtx *rpc.Context) (*grpcServer, error) {
+func newGRPCServer(ctx context.Context, rpcCtx *rpc.Context) (*grpcServer, error) {
 	s := &grpcServer{}
 	s.mode.set(modeInitializing)
 	srv, interceptorInfo, err := rpc.NewServerEx(
-		rpcCtx, rpc.WithInterceptor(func(path string) error {
+		ctx, rpcCtx, rpc.WithInterceptor(func(path string) error {
 			return s.intercept(path)
 		}))
 	if err != nil {
@@ -70,6 +71,22 @@ func (s *grpcServer) operational() bool {
 	return sMode == modeOperational || sMode == modeDraining
 }
 
+func (s *grpcServer) health(ctx context.Context) error {
+	sm := s.mode.get()
+	switch sm {
+	case modeInitializing:
+		return grpcstatus.Error(codes.Unavailable, "node is waiting for cluster initialization")
+	case modeDraining:
+		// grpc.mode is set to modeDraining when the Drain(DrainMode_CLIENT) has
+		// been called (client connections are to be drained).
+		return grpcstatus.Errorf(codes.Unavailable, "node is shutting down")
+	case modeOperational:
+		return nil
+	default:
+		return srverrors.ServerError(ctx, errors.Newf("unknown mode: %v", sm))
+	}
+}
+
 var rpcsAllowedWhileBootstrapping = map[string]struct{}{
 	"/cockroach.rpc.Heartbeat/Ping":             {},
 	"/cockroach.gossip.Gossip/Gossip":           {},
@@ -83,7 +100,7 @@ func (s *grpcServer) intercept(fullName string) error {
 		return nil
 	}
 	if _, allowed := rpcsAllowedWhileBootstrapping[fullName]; !allowed {
-		return s.waitingForInitError(fullName)
+		return NewWaitingForInitError(fullName)
 	}
 	return nil
 }
@@ -96,15 +113,9 @@ func (s *serveMode) get() serveMode {
 	return serveMode(atomic.LoadInt32((*int32)(s)))
 }
 
-// waitingForInitError creates an error indicating that the server cannot run
+// NewWaitingForInitError creates an error indicating that the server cannot run
 // the specified method until the node has been initialized.
-func (s *grpcServer) waitingForInitError(methodName string) error {
+func NewWaitingForInitError(methodName string) error {
+	// NB: this error string is sadly matched in grpcutil.IsWaitingForInit().
 	return grpcstatus.Errorf(codes.Unavailable, "node waiting for init; %s not available", methodName)
-}
-
-// IsWaitingForInit checks whether the provided error is because the node is
-// still waiting for initialization.
-func IsWaitingForInit(err error) bool {
-	s, ok := grpcstatus.FromError(errors.UnwrapAll(err))
-	return ok && s.Code() == codes.Unavailable && strings.Contains(err.Error(), "node waiting for init")
 }

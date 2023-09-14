@@ -1,6 +1,5 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "flowinfra",
@@ -19,7 +18,6 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/kv",
-        "//pkg/multitenant",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/sql/catalog/catenumpb",
@@ -36,8 +34,9 @@ go_library(
         "//pkg/sql/types",
         "//pkg/util/admission",
         "//pkg/util/admission/admissionpb",
+        "//pkg/util/buildutil",
         "//pkg/util/cancelchecker",
-        "//pkg/util/contextutil",
+        "//pkg/util/ctxlog",
         "//pkg/util/log",
         "//pkg/util/mon",
         "//pkg/util/optional",
@@ -68,16 +67,16 @@ go_test(
     ],
     args = ["-test.timeout=295s"],
     embed = [":flowinfra"],
-    tags = ["no-remote"],
     deps = [
         "//pkg/base",
         "//pkg/ccl/kvccl/kvtenantccl",
         "//pkg/gossip",
-        "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/kv/kvserver/kvserverbase",
+        "//pkg/multitenant/tenantcapabilities",
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/rpc/nodedialer",
@@ -101,7 +100,6 @@ go_test(
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/sqlstats",
-        "//pkg/sql/tests",
         "//pkg/sql/types",
         "//pkg/testutils",
         "//pkg/testutils/distsqlutils",
@@ -118,6 +116,7 @@ go_test(
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_stretchr_testify//require",
     ],
 )
@@ -126,5 +125,3 @@ disallowed_imports_test(
     "flowinfra",
     ["//pkg/sql/distsql"],
 )
-
-get_x_data(name = "get_x_data")

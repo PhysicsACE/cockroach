@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
@@ -199,6 +200,8 @@ func (jsonUnionExpr) PreFilter(_ inverted.EncVal, _ []interface{}, _ []bool) (bo
 
 func TestInvertedJoiner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
@@ -708,12 +711,11 @@ func TestInvertedJoiner(t *testing.T) {
 					c.datumsToExpr,
 					in,
 					&post,
-					out,
 				)
 				require.NoError(t, err)
 				// Small batch size to exercise multiple batches.
 				ij.(*invertedJoiner).SetBatchSize(2)
-				ij.Run(ctx)
+				ij.Run(ctx, out)
 				require.True(t, in.Done)
 				require.True(t, out.ProducerClosed())
 
@@ -743,6 +745,7 @@ func TestInvertedJoiner(t *testing.T) {
 
 func TestInvertedJoinerDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
@@ -776,7 +779,8 @@ func TestInvertedJoinerDrain(t *testing.T) {
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
-	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
@@ -786,10 +790,11 @@ func TestInvertedJoinerDrain(t *testing.T) {
 			TempStorage: tempEngine,
 		},
 		Txn:         leafTxn,
+		Gateway:     false,
 		DiskMonitor: diskMonitor,
 	}
 
-	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
+	testReaderProcessorDrain(ctx, t, func() (execinfra.Processor, error) {
 		var fetchSpec fetchpb.IndexFetchSpec
 		if err := rowenc.InitIndexFetchSpec(
 			&fetchSpec,
@@ -811,7 +816,6 @@ func TestInvertedJoinerDrain(t *testing.T) {
 			arrayIntersectionExpr{t: t},
 			distsqlutils.NewRowBuffer(types.TwoIntCols, nil /* rows */, distsqlutils.RowBufferArgs{}),
 			&execinfrapb.PostProcessSpec{},
-			out,
 		)
 	})
 }

@@ -10,12 +10,6 @@
 
 import { createSelector } from "reselect";
 import { localStorageSelector } from "../utils/selectors";
-import { adminUISelector } from "../utils/selectors";
-
-export const selectJobsState = createSelector(
-  adminUISelector,
-  adminUiState => adminUiState.jobs,
-);
 
 export const selectSortSetting = createSelector(
   localStorageSelector,
@@ -42,6 +36,6 @@ export const selectColumns = createSelector(
   // return array of columns if user have customized it or `null` otherwise
   localStorage =>
     localStorage["showColumns/JobsPage"]
-      ? localStorage["showColumns/JobsPage"].split(",")
+      ? localStorage["showColumns/JobsPage"]?.split(",")
       : null,
 );

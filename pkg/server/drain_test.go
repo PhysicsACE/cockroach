@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -32,13 +31,11 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
 )
 
 // TestDrain tests the Drain RPC.
 func TestDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.UnderRaceWithIssue(t, 86974, "flaky test")
 	defer log.Scope(t).Close(t)
 	doTestDrain(t)
 }
@@ -64,18 +61,27 @@ func doTestDrain(tt *testing.T) {
 
 	// Issue another probe. This checks that the server is still running
 	// (i.e. Shutdown: false was effective), the draining status is
-	// still properly reported, and the server slept once.
+	// still properly reported, and that the server only slept once (which only
+	// should occur on the first drain).
 	resp = t.sendProbe()
 	t.assertDraining(resp, true)
 	// probe-only has no remaining.
 	t.assertRemaining(resp, false)
 	t.assertEqual(1, drainSleepCallCount)
 
-	// Issue another drain. Verify that the remaining is zero (i.e. complete)
-	// and that the server did not sleep again.
-	resp = t.sendDrainNoShutdown()
-	t.assertDraining(resp, true)
-	t.assertRemaining(resp, false)
+	// Repeat drain commands until we verify that there are zero remaining leases
+	// (i.e. complete). Also validate that the server did not sleep again.
+	testutils.SucceedsSoon(t, func() error {
+		resp = t.sendDrainNoShutdown()
+		if !resp.IsDraining {
+			return errors.Newf("expected draining")
+		}
+		if resp.DrainRemainingIndicator > 0 {
+			return errors.Newf("still %d remaining, desc: %s", resp.DrainRemainingIndicator,
+				resp.DrainRemainingDescription)
+		}
+		return nil
+	})
 	t.assertEqual(1, drainSleepCallCount)
 
 	// Now issue a drain request without drain but with shutdown.
@@ -185,12 +191,8 @@ func newTestDrainContext(t *testing.T, drainSleepCallCount *int) *testDrainConte
 	}
 
 	// We'll have the RPC talk to the first node.
-	var err error
-	tc.c, tc.connCloser, err = getAdminClientForServer(tc.tc.Server(0))
-	if err != nil {
-		tc.Close()
-		t.Fatal(err)
-	}
+	tc.c = tc.tc.Server(0).GetAdminClient(t)
+	tc.connCloser = func() {}
 
 	return tc
 }
@@ -287,16 +289,46 @@ func (t *testDrainContext) getDrainResponse(
 	return resp, nil
 }
 
-func getAdminClientForServer(
-	s serverutils.TestServerInterface,
-) (c serverpb.AdminClient, closer func(), err error) {
-	//lint:ignore SA1019 grpc.WithInsecure is deprecated
-	conn, err := grpc.Dial(s.ServingRPCAddr(), grpc.WithInsecure())
-	if err != nil {
-		return nil, nil, err
+func TestServerShutdownReleasesSession(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
+	defer s.Stopper().Stop(ctx)
+
+	tenantArgs := base.TestTenantArgs{
+		TenantID: serverutils.TestTenantID(),
 	}
-	client := serverpb.NewAdminClient(conn)
-	return client, func() {
-		_ = conn.Close() // nolint:grpcconnclose
-	}, nil
+
+	tenant, tenantSQLRaw := serverutils.StartTenant(t, s, tenantArgs)
+	defer tenant.AppStopper().Stop(ctx)
+	tenantSQL := sqlutils.MakeSQLRunner(tenantSQLRaw)
+
+	queryOwner := func(id base.SQLInstanceID) (owner *string) {
+		tenantSQL.QueryRow(t, "SELECT session_id FROM system.sql_instances WHERE id = $1", id).Scan(&owner)
+		return owner
+	}
+
+	sessionExists := func(session string) bool {
+		rows := tenantSQL.QueryStr(t, "SELECT session_id FROM system.sqlliveness WHERE session_id = $1", session)
+		return 0 < len(rows)
+	}
+
+	tmpTenant, err := s.StartTenant(ctx, tenantArgs)
+	require.NoError(t, err)
+
+	tmpSQLInstance := tmpTenant.SQLInstanceID()
+	session := queryOwner(tmpSQLInstance)
+	require.NotNil(t, session)
+	require.True(t, sessionExists(*session))
+
+	require.NoError(t, tmpTenant.DrainClients(context.Background()))
+	tmpTenant.AppStopper().Stop(ctx)
+
+	require.False(t, sessionExists(*session), "expected session %s to be deleted from the sqlliveness table, but it still exists", *session)
+	require.Nil(t, queryOwner(tmpSQLInstance), "expected sql_instance %d to have no owning session_id", tmpSQLInstance)
 }

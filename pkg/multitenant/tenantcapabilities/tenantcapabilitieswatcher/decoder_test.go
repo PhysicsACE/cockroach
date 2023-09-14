@@ -21,8 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitieswatcher"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/require"
@@ -34,15 +34,15 @@ func TestDecodeCapabilities(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			DisableDefaultTestTenant: true, // system.tenants only exists for the system tenant
-		},
+	ts, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		// Capabilities are only available in the system tenant's
+		// system.tenants table.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
 	})
-	defer tc.Stopper().Stop(ctx)
+	defer ts.Stopper().Stop(ctx)
 
 	const dummyTableName = "dummy_system_tenants"
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(db)
 	tdb.Exec(t, fmt.Sprintf("CREATE TABLE %s (LIKE system.tenants INCLUDING ALL)", dummyTableName))
 
 	var dummyTableID uint32
@@ -54,7 +54,7 @@ func TestDecodeCapabilities(t *testing.T) {
 	require.NoError(t, err)
 	info := mtinfopb.ProtoInfo{
 		Capabilities: tenantcapabilitiespb.TenantCapabilities{
-			CanAdminSplit: true,
+			DisableAdminSplit: true,
 		},
 	}
 	buf, err := protoutil.Marshal(&info)
@@ -66,14 +66,14 @@ func TestDecodeCapabilities(t *testing.T) {
 	)
 
 	// Read the row	.
-	k := keys.SystemSQLCodec.IndexPrefix(dummyTableID, keys.TenantsTablePrimaryKeyIndexID)
-	rows, err := tc.Server(0).DB().Scan(ctx, k, k.PrefixEnd(), 0 /* maxRows */)
+	k := ts.Codec().IndexPrefix(dummyTableID, keys.TenantsTablePrimaryKeyIndexID)
+	rows, err := kvDB.Scan(ctx, k, k.PrefixEnd(), 0 /* maxRows */)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 
 	// Decode and verify.
 	row := rows[0]
-	got, err := tenantcapabilitieswatcher.TestingDecoderFn()(roachpb.KeyValue{
+	got, err := tenantcapabilitieswatcher.TestingDecoderFn(ts.ClusterSettings())(ctx, roachpb.KeyValue{
 		Key:   row.Key,
 		Value: *row.Value,
 	})

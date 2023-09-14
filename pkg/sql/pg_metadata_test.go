@@ -226,6 +226,7 @@ var mappedPopulateFunctions = map[string]string{
 	"addPgProcUDFRow":        "PGCatalogProc",
 	"addPgProcBuiltinRow":    "PgCatalogProc",
 	"addRowForTimezoneNames": "PgCatalogTimezoneNames",
+	"populatePgDescription":  "PGCatalogDescription",
 }
 
 // schemaCodeFixer have specific configurations to fix the files with virtual
@@ -553,7 +554,7 @@ func (scf schemaCodeFixer) fixCatalogGo(t *testing.T, unimplementedTables PGMeta
 			text := reader.Text()
 			trimText := strings.TrimSpace(text)
 			if trimText == scf.textForNewTableInsertion {
-				//VirtualSchemas doesn't have a particular place to start we just print
+				// VirtualSchemas doesn't have a particular place to start we just print
 				// it before virtualTablePosition.
 				output.appendString(scf.printVirtualSchemas(unimplementedTables))
 			}
@@ -588,7 +589,7 @@ func fixPgCatalogGoColumns(pgCode *pgCatalogCode) {
 			if currentPosition < len(positions) && int64(scannedUntil+count) > positions[currentPosition].insertPosition {
 				relativeIndex := int(positions[currentPosition].insertPosition-int64(scannedUntil)) - 1
 				left := text[:relativeIndex]
-				indentation := indentationRE.FindStringSubmatch(text)[1] //The way it is it should at least give ""
+				indentation := indentationRE.FindStringSubmatch(text)[1] // The way it is it should at least give ""
 				if len(strings.TrimSpace(left)) > 0 {
 					// Parenthesis is right after the last variable in this case
 					// indentation is correct.
@@ -847,8 +848,13 @@ func getTableNameFromCreateTable(createTableText string) (string, error) {
 		return "", err
 	}
 
-	create := stmt.AST.(*tree.CreateTable)
-	return create.Table.Table(), nil
+	if create, ok := stmt.AST.(*tree.CreateTable); ok {
+		return create.Table.Table(), nil
+	}
+	if create, ok := stmt.AST.(*tree.CreateView); ok {
+		return create.Name.Table(), nil
+	}
+	return "", errors.Newf("could not find table name in stmt: %s", createTableText)
 }
 
 // getUndefinedTablesText retrieves pgCatalog.undefinedTables, then it merges the

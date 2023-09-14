@@ -123,6 +123,7 @@ func (t *testImpl) BuildVersion() *version.Version {
 	return t.buildVersion
 }
 
+// Cockroach returns the path to the cockroach binary.
 func (t *testImpl) Cockroach() string {
 	return t.cockroach
 }
@@ -152,6 +153,10 @@ func (t *testImpl) Helper() {}
 
 func (t *testImpl) Name() string {
 	return t.spec.Name
+}
+
+func (t *testImpl) SnapshotPrefix() string {
+	return t.spec.SnapshotPrefix
 }
 
 // L returns the test's logger.
@@ -365,8 +370,7 @@ func (t *testImpl) addFailure(depth int, format string, args ...interface{}) {
 	t.mu.output = append(t.mu.output, '\n')
 }
 
-// We take the first error from each failure which is the
-// "squashed" error that contains all information of a failure
+// We take the "squashed" error that contains information of all the errors for each failure.
 func formatFailure(b *strings.Builder, reportFailures ...failure) {
 	for i, failure := range reportFailures {
 		if i > 0 {
@@ -397,7 +401,7 @@ func (t *testImpl) failedRLocked() bool {
 func (t *testImpl) firstFailure() failure {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if len(t.mu.failures) <= 0 {
+	if len(t.mu.failures) == 0 {
 		return failure{}
 	}
 	return t.mu.failures[0]

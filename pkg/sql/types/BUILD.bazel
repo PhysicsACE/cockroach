@@ -1,8 +1,7 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "types",
@@ -26,6 +25,7 @@ go_library(
         "//pkg/util/errorutil/unimplemented",
         "//pkg/util/protoutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_gogo_protobuf//jsonpb",
         "@com_github_gogo_protobuf//proto",
         "@com_github_lib_pq//oid",
@@ -83,5 +83,3 @@ disallowed_imports_test(
         "//pkg/roachpb",
     ],
 )
-
-get_x_data(name = "get_x_data")

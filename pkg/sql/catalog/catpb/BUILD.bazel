@@ -1,8 +1,7 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 load("//build:STRINGER.bzl", "stringer")
 
 proto_library(
@@ -41,7 +40,6 @@ go_library(
         "job_id.go",
         "multiregion.go",
         "privilege.go",
-        "ttl.go",
         ":gen-privilegedescversion-stringer",  # keep
     ],
     embed = [":catpb_go_proto"],
@@ -85,5 +83,3 @@ disallowed_imports_test(
         "//pkg/sql/sem/tree",
     ],
 )
-
-get_x_data(name = "get_x_data")

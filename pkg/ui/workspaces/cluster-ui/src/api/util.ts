@@ -8,8 +8,10 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
+import moment from "moment-timezone";
 
+export const STATUS_PREFIX = "_status";
+export const ADMIN_API_PREFIX = "_admin/v1";
 export const PROMISE_TIMEOUT = moment.duration(30, "s"); // seconds
 
 // withTimeout wraps a promise in a timeout (cribbed from db-console).
@@ -40,3 +42,6 @@ export class TimeoutError extends Error {
     this.timeout = timeout;
   }
 }
+
+export const fromHexString = (hexString: string): Uint8Array =>
+  Uint8Array.from(hexString.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));

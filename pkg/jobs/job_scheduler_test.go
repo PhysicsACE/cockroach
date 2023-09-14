@@ -201,10 +201,10 @@ func TestJobSchedulerDaemonInitialScanDelay(t *testing.T) {
 	}
 }
 
-func getScopedSettings() (*settings.Values, func()) {
+func getScopedSettings() *settings.Values {
 	sv := &settings.Values{}
 	sv.Init(context.Background(), nil)
-	return sv, settings.TestingSaveRegistry()
+	return sv
 }
 
 func TestJobSchedulerDaemonGetWaitPeriod(t *testing.T) {
@@ -212,8 +212,7 @@ func TestJobSchedulerDaemonGetWaitPeriod(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	sv, cleanup := getScopedSettings()
-	defer cleanup()
+	sv := getScopedSettings()
 
 	noJitter := func(d time.Duration) time.Duration { return d }
 
@@ -576,7 +575,6 @@ func TestJobSchedulerRetriesFailed(t *testing.T) {
 func TestJobSchedulerDaemonUsesSystemTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer settings.TestingSaveRegistry()()
 
 	// Make daemon run quickly.
 	knobs := &TestingKnobs{
@@ -809,7 +807,7 @@ func TestDisablingSchedulerCancelsSchedules(t *testing.T) {
 	knobs := base.TestingKnobs{
 		JobsTestingKnobs: fastDaemonKnobs(overridePaceSetting(10 * time.Millisecond)),
 	}
-	ts, _, _ := serverutils.StartServer(t, base.TestServerArgs{Knobs: knobs})
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{Knobs: knobs})
 	defer ts.Stopper().Stop(context.Background())
 
 	schedules := ScheduledJobDB(ts.InternalDB().(isql.DB))
@@ -845,7 +843,7 @@ func TestSchedulePlanningRespectsTimeout(t *testing.T) {
 	knobs := base.TestingKnobs{
 		JobsTestingKnobs: fastDaemonKnobs(overridePaceSetting(10 * time.Millisecond)),
 	}
-	ts, _, _ := serverutils.StartServer(t, base.TestServerArgs{Knobs: knobs})
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{Knobs: knobs})
 	defer ts.Stopper().Stop(context.Background())
 	schedules := ScheduledJobDB(ts.InternalDB().(isql.DB))
 

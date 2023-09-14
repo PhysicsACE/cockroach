@@ -6,6 +6,7 @@
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
+// Package sqlproxyccl implements a server to proxy SQL connections.
 package sqlproxyccl
 
 import (
@@ -34,7 +35,7 @@ func toPgError(err error) *pgproto3.ErrorResponse {
 		switch getErrorCode(err) {
 		// These are send as is.
 		case codeExpiredClientConnection,
-			codeBackendDown,
+			codeBackendDialFailed,
 			codeParamsRoutingFailed,
 			codeClientDisconnected,
 			codeBackendDisconnected,

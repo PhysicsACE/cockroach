@@ -184,7 +184,7 @@ func (p *PrettyCfg) docAsString(f NodeFormatter) pretty.Doc {
 }
 
 func (p *PrettyCfg) fmtFlags() FmtFlags {
-	prettyFlags := FmtShowPasswords | FmtParsable
+	prettyFlags := FmtShowPasswords | FmtParsable | FmtTagDollarQuotes
 	if p.ValueRedaction {
 		prettyFlags |= FmtMarkRedactionNode | FmtOmitNameRedaction
 	}
@@ -1173,8 +1173,16 @@ func (node *Update) doc(p *PrettyCfg) pretty.Doc {
 func (node *Delete) doc(p *PrettyCfg) pretty.Doc {
 	items := make([]pretty.TableRow, 0, 7)
 	items = append(items,
-		node.With.docRow(p),
-		p.row("DELETE FROM", p.Doc(node.Table)))
+		node.With.docRow(p))
+	tableLbl := "DELETE FROM"
+	batch := node.Batch
+	if batch != nil {
+		tableLbl = "FROM"
+		items = append(items,
+			p.row("DELETE", p.Doc(batch)))
+	}
+	items = append(items,
+		p.row(tableLbl, p.Doc(node.Table)))
 	if len(node.Using) > 0 {
 		items = append(items, p.row("USING", p.Doc(&node.Using)))
 	}
@@ -1267,6 +1275,10 @@ func (node *CreateTable) doc(p *PrettyCfg) pretty.Doc {
 			title = pretty.ConcatSpace(title,
 				p.bracket("(", p.Doc(&node.Defs), ")"))
 		}
+		if node.StorageParams != nil {
+			title = pretty.ConcatSpace(title, pretty.Keyword("WITH"))
+			title = pretty.ConcatSpace(title, p.bracket(`(`, p.Doc(&node.StorageParams), `)`))
+		}
 		title = pretty.ConcatSpace(title, pretty.Keyword("AS"))
 	} else {
 		title = pretty.ConcatSpace(title,
@@ -1281,7 +1293,7 @@ func (node *CreateTable) doc(p *PrettyCfg) pretty.Doc {
 	if node.PartitionByTable != nil {
 		clauses = append(clauses, p.Doc(node.PartitionByTable))
 	}
-	if node.StorageParams != nil {
+	if node.StorageParams != nil && !node.As() {
 		clauses = append(
 			clauses,
 			pretty.ConcatSpace(
@@ -1622,7 +1634,7 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	//    [PARTITION BY ...]
 	//    [WITH ...]
 	//    [WHERE ...]
-	//    [NOT VISIBLE]
+	//    [NOT VISIBLE | VISIBILITY ...]
 	//
 	title := make([]pretty.Doc, 0, 7)
 	title = append(title, pretty.Keyword("CREATE"))
@@ -1672,7 +1684,11 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	if node.Predicate != nil {
 		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
-	if node.NotVisible {
+	switch {
+	case node.Invisibility.FloatProvided:
+		clauses = append(clauses,
+			pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-node.Invisibility.Value)))
+	case node.Invisibility.Value == 1.0:
 		clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
 	}
 	return p.nestUnder(
@@ -1712,7 +1728,7 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
 	//    [WHERE ...]
-	//    [NOT VISIBLE]
+	//    [NOT VISIBLE | VISIBILITY ...]
 	//
 	title := pretty.Keyword("INDEX")
 	if node.Name != "" {
@@ -1745,10 +1761,13 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.Predicate != nil {
 		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
-	if node.NotVisible {
+	switch {
+	case node.Invisibility.FloatProvided:
+		clauses = append(clauses,
+			pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-node.Invisibility.Value)))
+	case node.Invisibility.Value == 1.0:
 		clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
 	}
-
 	if len(clauses) == 0 {
 		return title
 	}
@@ -1763,7 +1782,7 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
 	//    [WHERE ...]
-	//    [NOT VISIBLE]
+	//    [NOT VISIBLE | VISIBILITY ...]
 	//
 	// or (no constraint name):
 	//
@@ -1772,7 +1791,7 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
 	//    [WHERE ...]
-	//    [NOT VISIBLE]
+	//    [NOT VISIBLE | VISIBILITY ...]
 	//
 	clauses := make([]pretty.Doc, 0, 6)
 	var title pretty.Doc
@@ -1805,8 +1824,18 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.Predicate != nil {
 		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
-	if node.NotVisible {
+	switch {
+	case node.Invisibility.FloatProvided:
+		clauses = append(clauses,
+			pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-node.Invisibility.Value)))
+	case node.Invisibility.Value == 1.0:
 		clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
+	}
+	if node.StorageParams != nil {
+		clauses = append(clauses, p.bracketKeyword(
+			"WITH", "(",
+			p.Doc(&node.StorageParams),
+			")", ""))
 	}
 
 	if len(clauses) == 0 {

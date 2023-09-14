@@ -1,6 +1,5 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "catalog",
@@ -24,6 +23,7 @@ go_library(
         "//pkg/clusterversion",
         "//pkg/config/zonepb",
         "//pkg/geo/geoindex",
+        "//pkg/jobs/jobspb",
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/roachpb",
@@ -46,6 +46,7 @@ go_library(
         "//pkg/util/iterutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
+        "@com_github_cockroachdb_redact//interfaces",
     ],
 )
 
@@ -59,7 +60,6 @@ go_test(
     ],
     args = ["-test.timeout=55s"],
     embed = [":catalog"],
-    tags = ["no-remote"],
     deps = [
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/dbdesc",
@@ -82,5 +82,3 @@ disallowed_imports_test(
         "//pkg/sql/sem/eval",
     ],
 )
-
-get_x_data(name = "get_x_data")

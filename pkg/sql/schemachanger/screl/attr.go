@@ -32,11 +32,11 @@ func MustQuery(clauses ...rel.Clause) *rel.Query {
 	return q
 }
 
-var elementProtoElementSelectors = func() (selectors []string) {
-	elementProtoType := reflect.TypeOf((*scpb.ElementProto)(nil)).Elem()
-	selectors = make([]string, elementProtoType.NumField())
-	for i := 0; i < elementProtoType.NumField(); i++ {
-		selectors[i] = elementProtoType.Field(i).Name
+var elementProtoElementTypes = func() (selectors []reflect.Type) {
+	oneOfProtos := scpb.GetElementOneOfProtos()
+	selectors = make([]reflect.Type, 0, len(oneOfProtos))
+	for _, proto := range oneOfProtos {
+		selectors = append(selectors, reflect.TypeOf(proto))
 	}
 	return selectors
 }()
@@ -180,6 +180,7 @@ var elementSchemaOptions = []rel.SchemaOption{
 	rel.EntityMapping(t((*scpb.UniqueWithoutIndexConstraint)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(IndexID, "IndexIDForValidation"),
 	),
 	rel.EntityMapping(t((*scpb.UniqueWithoutIndexConstraintUnvalidated)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
@@ -237,6 +238,10 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(ColumnFamilyID, "FamilyID"),
 		rel.EntityAttr(ColumnID, "ColumnID"),
 		rel.EntityAttr(ReferencedTypeIDs, "ClosedTypeIDs"),
+	),
+	rel.EntityMapping(t((*scpb.SequenceOption)(nil)),
+		rel.EntityAttr(DescID, "SequenceID"),
+		rel.EntityAttr(Name, "Key"),
 	),
 	rel.EntityMapping(t((*scpb.SequenceOwner)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
@@ -348,6 +353,10 @@ var elementSchemaOptions = []rel.SchemaOption{
 	rel.EntityMapping(t((*scpb.TableZoneConfig)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 	),
+	rel.EntityMapping(t((*scpb.IndexZoneConfig)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(IndexID, "IndexID"),
+	),
 	rel.EntityMapping(t((*scpb.DatabaseData)(nil)),
 		rel.EntityAttr(DescID, "DatabaseID"),
 	),
@@ -360,6 +369,9 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(IndexID, "IndexID"),
 	),
 	rel.EntityMapping(t((*scpb.TablePartitioning)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+	),
+	rel.EntityMapping(t((*scpb.TableSchemaLocked)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 	),
 	rel.EntityMapping(t((*scpb.Function)(nil)),
@@ -394,7 +406,7 @@ var Schema = rel.MustSchema("screl", append(
 	),
 	rel.EntityMapping(t((*scpb.Target)(nil)),
 		rel.EntityAttr(TargetStatus, "TargetStatus"),
-		rel.EntityAttr(Element, elementProtoElementSelectors...),
+		rel.EntityAttrOneOf(Element, "ElementOneOf", elementProtoElementTypes...),
 	),
 )...)
 

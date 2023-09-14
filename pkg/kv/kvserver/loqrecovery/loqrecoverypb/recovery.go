@@ -11,6 +11,7 @@
 package loqrecoverypb
 
 import (
+	_ "github.com/cockroachdb/cockroach/pkg/kv/kvpb" // Needed for recovery.proto.
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -36,7 +37,7 @@ func (r *RecoveryKey) UnmarshalYAML(fn func(interface{}) error) error {
 	if err := fn(&pretty); err != nil {
 		return err
 	}
-	scanner := keysutil.MakePrettyScanner(nil /* tableParser */)
+	scanner := keysutil.MakePrettyScanner(nil /* tableParser */, nil /* tenantParser */)
 	key, err := scanner.Scan(pretty)
 	if err != nil {
 		return errors.Wrapf(err, "failed to parse key %s", pretty)
@@ -103,8 +104,13 @@ func (m *ClusterReplicaInfo) Merge(o ClusterReplicaInfo) error {
 			return errors.Newf("can't merge cluster info from different cluster: %s != %s", m.ClusterID,
 				o.ClusterID)
 		}
+		if !m.Version.Equal(o.Version) {
+			return errors.Newf("can't merge cluster info from different version: %s != %s", m.Version,
+				o.Version)
+		}
 	} else {
 		m.ClusterID = o.ClusterID
+		m.Version = o.Version
 	}
 	if len(o.Descriptors) > 0 {
 		if len(m.Descriptors) > 0 {

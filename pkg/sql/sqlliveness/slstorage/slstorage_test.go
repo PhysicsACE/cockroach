@@ -22,11 +22,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -34,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -53,36 +53,24 @@ func TestStorage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	t.Run("RegionalByRow", func(t *testing.T) {
-		defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "1")()
-		testStorage(t)
-	})
-	t.Run("RegionalByTable", func(t *testing.T) {
-		defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "0")()
-		testStorage(t)
-	})
-}
-func testStorage(t *testing.T) {
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 	t0 := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 	setup := func(t *testing.T) (
 		*hlc.Clock, *timeutil.ManualTime, *cluster.Settings, *stop.Stopper, *slstorage.Storage,
 	) {
-		dbName := t.Name()
-
-		tableID := newSqllivenessTable(t, tDB, dbName)
-
+		table := newSqllivenessTable(t, tDB, s)
 		timeSource := timeutil.NewManualTime(t0)
 		clock := hlc.NewClockForTesting(timeSource)
 		settings := cluster.MakeTestingClusterSettings()
 		stopper := stop.NewStopper(stop.WithTracer(s.TracerI().(*tracing.Tracer)))
 		var ambientCtx log.AmbientContext
-		storage := slstorage.NewTestingStorage(ambientCtx, stopper, clock, kvDB, keys.SystemSQLCodec, settings,
-			tableID, rbrIndexID, timeSource.NewTimer)
+		storage := slstorage.NewTestingStorage(ambientCtx, stopper, clock, kvDB, s.Codec(), settings,
+			s.SettingsWatcher().(*settingswatcher.SettingsWatcher), table, timeSource.NewTimer)
 		return clock, timeSource, settings, stopper, storage
 	}
 
@@ -90,6 +78,7 @@ func testStorage(t *testing.T) {
 		clock, _, _, stopper, storage := setup(t)
 		storage.Start(ctx)
 		defer stopper.Stop(ctx)
+		reader := storage.BlockingReader()
 
 		exp := clock.Now().Add(time.Second.Nanoseconds(), 0)
 		id, err := slstorage.MakeSessionID(enum.One, uuid.MakeV4())
@@ -101,14 +90,14 @@ func testStorage(t *testing.T) {
 			require.Equal(t, int64(1), metrics.WriteSuccesses.Count())
 		}
 		{
-			isAlive, err := storage.IsAlive(ctx, id)
+			isAlive, err := reader.IsAlive(ctx, id)
 			require.NoError(t, err)
 			require.True(t, isAlive)
 			require.Equal(t, int64(1), metrics.IsAliveCacheMisses.Count())
 			require.Equal(t, int64(0), metrics.IsAliveCacheHits.Count())
 		}
 		{
-			isAlive, err := storage.IsAlive(ctx, id)
+			isAlive, err := reader.IsAlive(ctx, id)
 			require.NoError(t, err)
 			require.True(t, isAlive)
 			require.Equal(t, int64(1), metrics.IsAliveCacheMisses.Count())
@@ -120,6 +109,7 @@ func testStorage(t *testing.T) {
 		defer stopper.Stop(ctx)
 		slstorage.GCJitter.Override(ctx, &settings.SV, 0)
 		storage.Start(ctx)
+		reader := storage.BlockingReader()
 		metrics := storage.Metrics()
 
 		// GC will run some time after startup.
@@ -149,10 +139,10 @@ func testStorage(t *testing.T) {
 
 		// Verify they are alive.
 		{
-			isAlive1, err := storage.IsAlive(ctx, id1)
+			isAlive1, err := reader.IsAlive(ctx, id1)
 			require.NoError(t, err)
 			require.True(t, isAlive1)
-			isAlive2, err := storage.IsAlive(ctx, id2)
+			isAlive2, err := reader.IsAlive(ctx, id2)
 			require.NoError(t, err)
 			require.True(t, isAlive2)
 			require.Equal(t, int64(2), metrics.IsAliveCacheMisses.Count())
@@ -169,7 +159,7 @@ func testStorage(t *testing.T) {
 
 		// Ensure that the cached value is still in use for id2.
 		{
-			isAlive, err := storage.IsAlive(ctx, id2)
+			isAlive, err := reader.IsAlive(ctx, id2)
 			require.NoError(t, err)
 			require.True(t, isAlive)
 			require.Equal(t, int64(2), metrics.IsAliveCacheMisses.Count())
@@ -195,7 +185,7 @@ func testStorage(t *testing.T) {
 
 		// Ensure that we now see the id1 as dead. That fact will be cached.
 		{
-			isAlive, err := storage.IsAlive(ctx, id1)
+			isAlive, err := reader.IsAlive(ctx, id1)
 			require.NoError(t, err)
 			require.False(t, isAlive)
 			require.Equal(t, int64(2), metrics.IsAliveCacheMisses.Count())
@@ -203,7 +193,7 @@ func testStorage(t *testing.T) {
 		}
 		// Ensure that the fact that it's dead is cached.
 		{
-			isAlive, err := storage.IsAlive(ctx, id1)
+			isAlive, err := reader.IsAlive(ctx, id1)
 			require.NoError(t, err)
 			require.False(t, isAlive)
 			require.Equal(t, int64(2), metrics.IsAliveCacheMisses.Count())
@@ -219,7 +209,7 @@ func testStorage(t *testing.T) {
 
 		// Ensure that we now see the id2 as alive.
 		{
-			isAlive, err := storage.IsAlive(ctx, id2)
+			isAlive, err := reader.IsAlive(ctx, id2)
 			require.NoError(t, err)
 			require.True(t, isAlive)
 			require.Equal(t, int64(3), metrics.IsAliveCacheMisses.Count())
@@ -227,7 +217,7 @@ func testStorage(t *testing.T) {
 		}
 		// Ensure that the fact that it's still alive is cached.
 		{
-			isAlive, err := storage.IsAlive(ctx, id1)
+			isAlive, err := reader.IsAlive(ctx, id1)
 			require.NoError(t, err)
 			require.False(t, isAlive)
 			require.Equal(t, int64(3), metrics.IsAliveCacheMisses.Count())
@@ -238,6 +228,7 @@ func testStorage(t *testing.T) {
 		clock, timeSource, _, stopper, storage := setup(t)
 		defer stopper.Stop(ctx)
 		storage.Start(ctx)
+		reader := storage.BlockingReader()
 
 		exp := clock.Now().Add(time.Second.Nanoseconds(), 0)
 		id, err := slstorage.MakeSessionID(enum.One, uuid.MakeV4())
@@ -249,7 +240,7 @@ func testStorage(t *testing.T) {
 			require.Equal(t, int64(1), metrics.WriteSuccesses.Count())
 		}
 		{
-			isAlive, err := storage.IsAlive(ctx, id)
+			isAlive, err := reader.IsAlive(ctx, id)
 			require.NoError(t, err)
 			require.True(t, isAlive)
 			require.Equal(t, int64(1), metrics.IsAliveCacheMisses.Count())
@@ -260,7 +251,7 @@ func testStorage(t *testing.T) {
 		timeSource.Advance(time.Second + time.Nanosecond)
 		// Ensure that we discover it is no longer alive.
 		{
-			isAlive, err := storage.IsAlive(ctx, id)
+			isAlive, err := reader.IsAlive(ctx, id)
 			require.NoError(t, err)
 			require.False(t, isAlive)
 			require.Equal(t, int64(2), metrics.IsAliveCacheMisses.Count())
@@ -269,7 +260,7 @@ func testStorage(t *testing.T) {
 		}
 		// Ensure that the fact that it is no longer alive is cached.
 		{
-			isAlive, err := storage.IsAlive(ctx, id)
+			isAlive, err := reader.IsAlive(ctx, id)
 			require.NoError(t, err)
 			require.False(t, isAlive)
 			require.Equal(t, int64(2), metrics.IsAliveCacheMisses.Count())
@@ -321,23 +312,15 @@ func testStorage(t *testing.T) {
 func TestConcurrentAccessesAndEvictions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	t.Run("RegionalByRow", func(t *testing.T) {
-		defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "1")()
-		testConcurrentAccessesAndEvictions(t)
-	})
-	t.Run("RegionalByTable", func(t *testing.T) {
-		defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "0")()
-		testConcurrentAccessesAndEvictions(t)
-	})
-}
-func testConcurrentAccessesAndEvictions(t *testing.T) {
+
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 	t0 := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
-	dbName := t.Name()
-	tableID := newSqllivenessTable(t, tDB, dbName)
+
+	table := newSqllivenessTable(t, tDB, s)
 
 	timeSource := timeutil.NewManualTime(t0)
 	clock := hlc.NewClockForTesting(timeSource)
@@ -346,9 +329,10 @@ func testConcurrentAccessesAndEvictions(t *testing.T) {
 	defer stopper.Stop(ctx)
 	slstorage.CacheSize.Override(ctx, &settings.SV, 10)
 	var ambientCtx log.AmbientContext
-	storage := slstorage.NewTestingStorage(ambientCtx, stopper, clock, kvDB, keys.SystemSQLCodec, settings,
-		tableID, rbrIndexID, timeSource.NewTimer)
+	storage := slstorage.NewTestingStorage(ambientCtx, stopper, clock, kvDB, s.Codec(), settings,
+		s.SettingsWatcher().(*settingswatcher.SettingsWatcher), table, timeSource.NewTimer)
 	storage.Start(ctx)
+	reader := storage.BlockingReader()
 
 	const (
 		runsPerWorker   = 100
@@ -447,7 +431,7 @@ func testConcurrentAccessesAndEvictions(t *testing.T) {
 			for i := 0; i < runsPerWorker; i++ {
 				time.Sleep(time.Microsecond)
 				i, id := pickSession()
-				isAlive, err := storage.IsAlive(ctx, id)
+				isAlive, err := reader.IsAlive(ctx, id)
 				assert.NoError(t, err)
 				checkIsAlive(t, i, isAlive)
 			}
@@ -474,21 +458,12 @@ func testConcurrentAccessesAndEvictions(t *testing.T) {
 func TestConcurrentAccessSynchronization(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	t.Run("RegionalByRow", func(t *testing.T) {
-		defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "1")()
-		testConcurrentAccessSynchronization(t)
-	})
-	t.Run("RegionalByTable", func(t *testing.T) {
-		defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "0")()
-		testConcurrentAccessSynchronization(t)
-	})
-}
-func testConcurrentAccessSynchronization(t *testing.T) {
+
 	ctx := context.Background()
 	type filterFunc = func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error
 	var requestFilter atomic.Value
 	requestFilter.Store(filterFunc(nil))
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
@@ -500,12 +475,12 @@ func testConcurrentAccessSynchronization(t *testing.T) {
 			},
 		},
 	})
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 	t0 := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
 
-	dbName := t.Name()
-	tableID := newSqllivenessTable(t, tDB, dbName)
+	table := newSqllivenessTable(t, tDB, s)
 
 	timeSource := timeutil.NewManualTime(t0)
 	clock := hlc.NewClockForTesting(timeSource)
@@ -514,13 +489,13 @@ func testConcurrentAccessSynchronization(t *testing.T) {
 	defer stopper.Stop(ctx)
 	slstorage.CacheSize.Override(ctx, &settings.SV, 10)
 	var ambientCtx log.AmbientContext
-	storage := slstorage.NewTestingStorage(ambientCtx, stopper, clock, kvDB, keys.SystemSQLCodec, settings,
-		tableID, rbrIndexID, timeSource.NewTimer)
+	storage := slstorage.NewTestingStorage(ambientCtx, stopper, clock, kvDB, s.Codec(), settings,
+		s.SettingsWatcher().(*settingswatcher.SettingsWatcher), table, timeSource.NewTimer)
 	storage.Start(ctx)
 
 	// Synchronize reading from the store with the blocked channel by detecting
 	// a Get to the table.
-	prefix := keys.SystemSQLCodec.TablePrefix(uint32(tableID))
+	prefix := s.Codec().TablePrefix(uint32(table.GetID()))
 	var blockChannel atomic.Value
 	var blocked int64
 	resetBlockedChannel := func() { blockChannel.Store(make(chan struct{})) }
@@ -605,7 +580,7 @@ func testConcurrentAccessSynchronization(t *testing.T) {
 		// Now launch another, synchronous reader, which will join
 		// the single-flight.
 		g.Go(func() (err error) {
-			alive, err = storage.IsAlive(ctx, sid)
+			alive, err = storage.BlockingReader().IsAlive(ctx, sid)
 			return err
 		})
 		// Sleep some tiny amount of time to hopefully allow the other
@@ -650,7 +625,7 @@ func testConcurrentAccessSynchronization(t *testing.T) {
 		// Now launch another, synchronous reader, which will join
 		// the single-flight.
 		g.Go(func() (err error) {
-			alive, err = storage.IsAlive(toCancel, sid)
+			alive, err = storage.BlockingReader().IsAlive(toCancel, sid)
 			return err
 		})
 
@@ -677,21 +652,12 @@ func testConcurrentAccessSynchronization(t *testing.T) {
 func TestDeleteMidUpdateFails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	t.Run("RegionalByRow", func(t *testing.T) {
-		defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "1")()
-		testDeleteMidUpdateFails(t)
-	})
-	t.Run("RegionalByTable", func(t *testing.T) {
-		defer envutil.TestSetEnv(t, "COCKROACH_MR_SYSTEM_DATABASE", "0")()
-		testDeleteMidUpdateFails(t)
-	})
-}
-func testDeleteMidUpdateFails(t *testing.T) {
+
 	ctx := context.Background()
 	type filterFunc = func(context.Context, *kvpb.BatchRequest, *kvpb.BatchResponse) *kvpb.Error
 	var respFilter atomic.Value
 	respFilter.Store(filterFunc(nil))
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				TestingResponseFilter: func(
@@ -705,17 +671,17 @@ func testDeleteMidUpdateFails(t *testing.T) {
 			},
 		},
 	})
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 
 	// Set up a fake storage implementation using a separate table.
-	dbName := t.Name()
-	tableID := newSqllivenessTable(t, tdb, dbName)
+	table := newSqllivenessTable(t, tdb, s)
 
 	storage := slstorage.NewTestingStorage(
 		s.DB().AmbientContext,
-		s.Stopper(), s.Clock(), kvDB, keys.SystemSQLCodec, s.ClusterSettings(),
-		tableID, rbrIndexID, timeutil.DefaultTimeSource{}.NewTimer,
+		s.AppStopper(), s.Clock(), kvDB, s.Codec(), s.ClusterSettings(),
+		s.SettingsWatcher().(*settingswatcher.SettingsWatcher), table, timeutil.DefaultTimeSource{}.NewTimer,
 	)
 
 	// Insert a session.
@@ -730,7 +696,7 @@ func testDeleteMidUpdateFails(t *testing.T) {
 	) *kvpb.Error {
 		if get, ok := request.GetArg(kvpb.Get); !ok || !bytes.HasPrefix(
 			get.(*kvpb.GetRequest).Key,
-			keys.SystemSQLCodec.TablePrefix(uint32(tableID)),
+			s.Codec().TablePrefix(uint32(table.GetID())),
 		) {
 			return nil
 		}
@@ -757,41 +723,26 @@ func testDeleteMidUpdateFails(t *testing.T) {
 	unblock := <-getChan
 
 	// Delete the session being updated.
-	tdb.Exec(t, `DELETE FROM "`+dbName+`".sqlliveness WHERE true`)
+	require.NoError(t, storage.Delete(ctx, ID))
 
 	// Unblock the update and ensure that it saw that its session was deleted.
 	close(unblock)
 	res := <-resCh
 	require.False(t, res.exists)
 	require.NoError(t, res.err)
+
+	// Ensure delete is idempotent
+	require.NoError(t, storage.Delete(ctx, ID))
 }
 
-// rbrIndexID is the index id used to access the regional by row index in
-// tests. In production it will be index 2, but the freshly created test table
-// will have index 1.
-const rbrIndexID = 1
-
-func newSqllivenessTable(t *testing.T, db *sqlutils.SQLRunner, dbName string) (tableID descpb.ID) {
-	var schema string
-	if systemschema.TestSupportMultiRegion() {
-		schema = systemschema.MrSqllivenessTableSchema
-	} else {
-		schema = systemschema.SqllivenessTableSchema
-	}
+func newSqllivenessTable(
+	t *testing.T, db *sqlutils.SQLRunner, s serverutils.ApplicationLayerInterface,
+) (tableID catalog.TableDescriptor) {
 	t.Helper()
-	db.Exec(t, fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS "%s"`, dbName))
-	tableName := "sqlliveness"
-	schema = strings.Replace(schema,
-		fmt.Sprintf("CREATE TABLE system.%s", tableName),
-		fmt.Sprintf(`CREATE TABLE "%s".%s`, dbName, tableName),
-		1)
-	db.Exec(t, schema)
-	db.QueryRow(t, `
-		select u.id 
-		from system.namespace t
-		join system.namespace u 
-		  on t.id = u."parentID" 
-		where t.name = $1 and u.name = $2`,
-		dbName, tableName).Scan(&tableID)
-	return tableID
+	db.Exec(t, fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS "%s"`, t.Name()))
+	db.Exec(t, strings.Replace(systemschema.SqllivenessTableSchema,
+		"CREATE TABLE system.sqlliveness",
+		fmt.Sprintf(`CREATE TABLE "%s".sqlliveness`, t.Name()),
+		1))
+	return desctestutils.TestingGetTableDescriptor(s.DB(), s.Codec(), t.Name(), "public", "sqlliveness")
 }

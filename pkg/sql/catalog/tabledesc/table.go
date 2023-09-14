@@ -311,7 +311,7 @@ var DefaultHashShardedIndexBucketCount = settings.RegisterIntSetting(
 	"used as bucket count if bucket count is not specified in hash sharded index definition",
 	16,
 	settings.NonNegativeInt,
-).WithPublic()
+	settings.WithPublic)
 
 // GetShardColumnName generates a name for the hidden shard column to be used to create a
 // hash sharded index.
@@ -554,6 +554,16 @@ func RenameColumnInTable(
 		if !shardedDesc.IsSharded {
 			return
 		}
+		// Simpler case: If the shard column is to be renamed, keep the
+		// shard descriptor name in sync.
+		if shardedDesc.Name == string(col.ColName()) {
+			shardedDesc.Name = string(newName)
+			return
+		}
+		// Harder case: If one of the columns that the shard column is based on is
+		// to be renamed, then rename the base column in the descriptor as well as
+		// the shard descriptor name. We also record this fact in `shardColumnsToRename`
+		// so the next recursive call will rename the shard column.
 		oldShardColName := tree.Name(GetShardColumnName(
 			shardedDesc.ColumnNames, shardedDesc.ShardBuckets))
 		var changed bool

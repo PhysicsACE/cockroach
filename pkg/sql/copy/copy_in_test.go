@@ -13,6 +13,7 @@ package copy
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/url"
@@ -22,19 +23,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/jackc/pgx/v4"
@@ -47,8 +50,7 @@ func TestCopyFromNullInfNaN(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
@@ -148,8 +150,7 @@ func TestCopyFromRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
@@ -160,6 +161,8 @@ func TestCopyFromRandom(t *testing.T) {
 			cs TEXT COLLATE en_us_u_ks_level2,
 			o BOOL,
 			i INT,
+			i2 INT2,
+			i4 INT4,
 			f FLOAT,
 			e DECIMAL,
 			t TIME,
@@ -184,7 +187,7 @@ func TestCopyFromRandom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "cs", "o", "i", "f", "e", "t", "ttz", "ts", "s", "b", "u", "ip", "tz", "geography", "geometry", "box2d"))
+	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "cs", "o", "i", "i2", "i4", "f", "e", "t", "ttz", "ts", "s", "b", "u", "ip", "tz", "geography", "geometry", "box2d"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,6 +199,8 @@ func TestCopyFromRandom(t *testing.T) {
 		types.MakeCollatedString(types.String, "en_us_u_ks_level2"),
 		types.Bool,
 		types.Int,
+		types.Int2,
+		types.Int4,
 		types.Float,
 		types.Decimal,
 		types.Time,
@@ -299,13 +304,13 @@ func TestCopyFromBinary(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	sqlDB := sqlutils.MakeSQLRunner(db)
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
+		t, s.AdvSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
 	defer cleanupGoDB()
 	conn, err := pgx.Connect(ctx, pgURL.String())
 	if err != nil {
@@ -366,8 +371,7 @@ func TestCopyFromError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
@@ -494,7 +498,7 @@ func TestCopyFromRetries(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			params, _ := tests.CreateTestServerParams()
+			var params base.TestServerArgs
 			var attemptNumber int
 			params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
 				BeforeCopyFromInsert: func() error {
@@ -502,8 +506,9 @@ func TestCopyFromRetries(t *testing.T) {
 					return tc.hook(attemptNumber)
 				},
 			}
-			s, db, _ := serverutils.StartServer(t, params)
-			defer s.Stopper().Stop(context.Background())
+			srv, db, _ := serverutils.StartServer(t, params)
+			defer srv.Stopper().Stop(context.Background())
+			s := srv.ApplicationLayer()
 
 			_, err := db.Exec(
 				`CREATE TABLE t (
@@ -516,7 +521,7 @@ func TestCopyFromRetries(t *testing.T) {
 
 			// Use pgx instead of lib/pq as pgx doesn't require copy to be in a txn.
 			pgURL, cleanupGoDB := sqlutils.PGUrl(
-				t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
+				t, s.AdvSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
 			defer cleanupGoDB()
 			pgxConn, err := pgx.Connect(ctx, pgURL.String())
 			require.NoError(t, err)
@@ -567,8 +572,7 @@ func TestCopyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
@@ -621,8 +625,7 @@ func TestCopyFromFKCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	db.SetMaxOpenConns(1)
@@ -667,16 +670,16 @@ func TestCopyInReleasesLeases(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	tdb := sqlutils.MakeSQLRunner(db)
-	defer s.Stopper().Stop(ctx)
 	tdb.Exec(t, `CREATE TABLE t (k INT8 PRIMARY KEY)`)
 	tdb.Exec(t, `CREATE USER foo WITH PASSWORD 'testabc'`)
 	tdb.Exec(t, `GRANT admin TO foo`)
 
 	userURL, cleanupFn := sqlutils.PGUrlWithOptionalClientCerts(t,
-		s.ServingSQLAddr(), t.Name(), url.UserPassword("foo", "testabc"),
+		s.AdvSQLAddr(), t.Name(), url.UserPassword("foo", "testabc"),
 		false /* withClientCerts */)
 	defer cleanupFn()
 	conn, err := sqltestutils.PGXConn(t, userURL)
@@ -705,4 +708,94 @@ func TestCopyInReleasesLeases(t *testing.T) {
 		t.Fatal("alter did not complete")
 	}
 	require.NoError(t, conn.Close(ctx))
+}
+
+func TestMessageSizeTooBig(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
+	defer cleanup()
+	var sqlConnCtx clisqlclient.Context
+	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
+
+	err := conn.Exec(ctx, "CREATE TABLE t (s STRING)")
+	require.NoError(t, err)
+
+	rng, _ := randutil.NewTestRand()
+	str := randutil.RandString(rng, (2<<20)+1, "asdf")
+
+	var sb strings.Builder
+	for i := 0; i < 4; i++ {
+		sb.WriteString(str)
+		sb.WriteString("\n")
+	}
+
+	_, err = conn.GetDriverConn().CopyFrom(ctx, strings.NewReader(sb.String()), "COPY t FROM STDIN")
+	require.NoError(t, err)
+
+	// pgx uses a 64kb buffer
+	err = conn.Exec(ctx, "SET CLUSTER SETTING sql.conn.max_read_buffer_message_size = '60KiB'")
+	require.NoError(t, err)
+
+	_, err = conn.GetDriverConn().CopyFrom(ctx, strings.NewReader(sb.String()), "COPY t FROM STDIN")
+	require.ErrorContains(t, err, "message size 64 KiB bigger than maximum allowed message size 60 KiB")
+}
+
+// Test that a big copy results in an error and not crash.
+func TestCopyExceedsSQLMemory(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	for _, v := range []string{"on", "off"} {
+		for _, a := range []string{"on", "off"} {
+			for _, f := range []string{"on", "off"} {
+				t.Run(fmt.Sprintf("vector=%v/atomic=%v/fastpath=%v", v, a, f), func(t *testing.T) {
+					defer log.Scope(t).Close(t)
+
+					ctx := context.Background()
+					// Sometimes startup fails with lower than 10MiB.
+					params := base.TestServerArgs{
+						SQLMemoryPoolSize: 10 << 20,
+					}
+					srv := serverutils.StartServerOnly(t, params)
+					defer srv.Stopper().Stop(ctx)
+
+					s := srv.ApplicationLayer()
+
+					url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
+					defer cleanup()
+					var sqlConnCtx clisqlclient.Context
+					conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
+
+					err := conn.Exec(ctx, fmt.Sprintf(`SET VECTORIZE='%s'`, v))
+					require.NoError(t, err)
+
+					err = conn.Exec(ctx, fmt.Sprintf(`SET COPY_FAST_PATH_ENABLED='%s'`, f))
+					require.NoError(t, err)
+
+					err = conn.Exec(ctx, fmt.Sprintf(`SET COPY_FROM_ATOMIC_ENABLED='%s'`, a))
+					require.NoError(t, err)
+
+					err = conn.Exec(ctx, "CREATE TABLE t (s STRING)")
+					require.NoError(t, err)
+
+					rng, _ := randutil.NewTestRand()
+					str := randutil.RandString(rng, 11<<20, "asdf")
+
+					var sb strings.Builder
+					for i := 0; i < 3; i++ {
+						sb.WriteString(str)
+						sb.WriteString("\n")
+					}
+
+					_, err = conn.GetDriverConn().CopyFrom(ctx, strings.NewReader(sb.String()), "COPY t FROM STDIN")
+					require.Error(t, err)
+				})
+			}
+		}
+	}
 }

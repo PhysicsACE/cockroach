@@ -234,7 +234,7 @@ func (c *connector) dialTenantCluster(
 		serverAssignment := balancer.NewServerAssignment(
 			c.TenantID, c.Balancer.GetTracker(), requester, serverAddr,
 		)
-		crdbConn, err = c.dialSQLServer(serverAssignment)
+		crdbConn, err = c.dialSQLServer(ctx, serverAssignment)
 		if err != nil {
 			// Clean up the server assignment in case of an error. If there
 			// was no error, the cleanup process is merged with net.Conn.Close().
@@ -307,7 +307,7 @@ func (c *connector) lookupAddr(ctx context.Context) (string, error) {
 
 	// Lookup tenant in the directory cache. Once we have retrieve the list of
 	// pods, use the Balancer for load balancing.
-	pods, err := c.DirectoryCache.LookupTenantPods(ctx, c.TenantID, c.ClusterName)
+	pods, err := c.DirectoryCache.LookupTenantPods(ctx, c.TenantID)
 	switch {
 	case err == nil:
 		runningPods := make([]*tenant.Pod, 0, len(pods))
@@ -349,7 +349,7 @@ func (c *connector) lookupAddr(ctx context.Context) (string, error) {
 // transient, this will return an error that has been marked with
 // errRetryConnectorSentinel (i.e. markAsRetriableConnectorError).
 func (c *connector) dialSQLServer(
-	serverAssignment *balancer.ServerAssignment,
+	ctx context.Context, serverAssignment *balancer.ServerAssignment,
 ) (_ net.Conn, retErr error) {
 	if c.testingKnobs.dialSQLServer != nil {
 		return c.testingKnobs.dialSQLServer(serverAssignment)
@@ -363,9 +363,18 @@ func (c *connector) dialSQLServer(
 		}
 	}
 
-	conn, err := BackendDial(c.StartupMsg, serverAssignment.Addr(), tlsConf)
+	// TODO(JeffSwenson): The five second time out is pretty mediocre. It's too
+	// short if the sql server is overloaded and too long if everything is
+	// working the way it should. Ideally the fixed the timeout would be replaced
+	// by an adaptive timeout or maybe speculative retries on a different server.
+	var conn net.Conn
+	err := timeutil.RunWithTimeout(ctx, "backend-dial", time.Second*5, func(ctx context.Context) error {
+		var err error
+		conn, err = BackendDial(ctx, c.StartupMsg, serverAssignment.Addr(), tlsConf)
+		return err
+	})
 	if err != nil {
-		if getErrorCode(err) == codeBackendDown {
+		if getErrorCode(err) == codeBackendDialFailed {
 			return nil, markAsRetriableConnectorError(err)
 		}
 		return nil, err

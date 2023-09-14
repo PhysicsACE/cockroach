@@ -36,7 +36,7 @@ func newCDCFunctionResolver(wrapped tree.FunctionReferenceResolver) tree.Functio
 func (rs *cdcFunctionResolver) ResolveFunction(
 	ctx context.Context, name *tree.UnresolvedName, path tree.SearchPath,
 ) (*tree.ResolvedFunctionDefinition, error) {
-	fn, err := name.ToFunctionName()
+	fn, err := name.ToRoutineName()
 	if err != nil {
 		return nil, err
 	}
@@ -73,10 +73,9 @@ func (rs *cdcFunctionResolver) ResolveFunction(
 		return nil, err
 	}
 
-	// Since we may be dealing with UDFs, ensure it is something
-	// that's supported.
+	// Ensure that any overloads defined using a SQL string are supported.
 	for _, overload := range funcDef.Overloads {
-		if overload.IsUDF {
+		if overload.HasSQLBody() {
 			if err := checkOverloadSupported(fnName, overload.Overload); err != nil {
 				return nil, err
 			}
@@ -88,7 +87,7 @@ func (rs *cdcFunctionResolver) ResolveFunction(
 // ResolveFunctionByOID implements FunctionReferenceResolver interface.
 func (rs *cdcFunctionResolver) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (*tree.FunctionName, *tree.Overload, error) {
+) (*tree.RoutineName, *tree.Overload, error) {
 	fnName, overload, err := rs.wrapped.ResolveFunctionByOID(ctx, oid)
 	if err != nil {
 		return nil, nil, err

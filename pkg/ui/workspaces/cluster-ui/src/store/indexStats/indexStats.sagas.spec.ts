@@ -41,7 +41,7 @@ describe("IndexStats sagas", () => {
   const database = "test_db";
   const table = "test_table";
   const requestAction: PayloadAction<TableIndexStatsRequest> = {
-    payload: cockroach.server.serverpb.TableIndexStatsRequest.create({
+    payload: new cockroach.server.serverpb.TableIndexStatsRequest({
       database: database,
       table: table,
     }),
@@ -114,13 +114,11 @@ describe("IndexStats sagas", () => {
         )
         .withReducer(reducer)
         .hasFinalState<IndexStatsReducerState>({
-          cachedData: {
-            "test_db/test_table": {
-              data: tableIndexStatsResponse,
-              lastError: null,
-              valid: true,
-              inFlight: false,
-            },
+          "test_db/test_table": {
+            data: tableIndexStatsResponse,
+            lastError: null,
+            valid: true,
+            inFlight: false,
           },
         })
         .run();
@@ -138,13 +136,11 @@ describe("IndexStats sagas", () => {
         )
         .withReducer(reducer)
         .hasFinalState<IndexStatsReducerState>({
-          cachedData: {
-            "test_db/test_table": {
-              data: null,
-              lastError: error,
-              valid: false,
-              inFlight: false,
-            },
+          "test_db/test_table": {
+            data: null,
+            lastError: error,
+            valid: false,
+            inFlight: false,
           },
         })
         .run();
@@ -165,13 +161,11 @@ describe("IndexStats sagas", () => {
         )
         .withReducer(reducer)
         .hasFinalState<IndexStatsReducerState>({
-          cachedData: {
-            "test_db/test_table": {
-              data: null,
-              valid: false,
-              lastError: null,
-              inFlight: true,
-            },
+          "test_db/test_table": {
+            data: null,
+            valid: false,
+            lastError: null,
+            inFlight: true,
           },
         })
         .run();
@@ -189,13 +183,11 @@ describe("IndexStats sagas", () => {
         )
         .withReducer(reducer)
         .hasFinalState<IndexStatsReducerState>({
-          cachedData: {
-            "test_db/test_table": {
-              data: null,
-              lastError: err,
-              valid: false,
-              inFlight: false,
-            },
+          "test_db/test_table": {
+            data: null,
+            lastError: err,
+            valid: false,
+            inFlight: false,
           },
         })
         .run();

@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/cli"
-	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
@@ -29,8 +28,6 @@ func Example_describe_unknown() {
 
 	// Output:
 	// sql -e \set echo -e \dz
-	// ERROR: unsupported command: \dz with 0 arguments
-	// HINT: Use the SQL SHOW statement to inspect your schema.
 	// ERROR: -e: unsupported command: \dz with 0 arguments
 	// HINT: Use the SQL SHOW statement to inspect your schema.
 }
@@ -41,8 +38,7 @@ func TestDescribe(t *testing.T) {
 	c := cli.NewCLITest(cli.TestCLIParams{T: t})
 	defer c.Cleanup()
 
-	db := serverutils.OpenDBConn(
-		t, c.TestServer.ServingSQLAddr(), "defaultdb", false /* insecure */, c.TestServer.Stopper())
+	db := c.Server.SQLConn(t, "defaultdb")
 
 	var commonArgs []string
 

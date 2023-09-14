@@ -20,8 +20,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
-	"github.com/cockroachdb/cockroach/pkg/ts"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/ts/tsutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
@@ -51,20 +52,24 @@ output.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
+		conn, finish, err := getClientGRPCConn(ctx, serverCfg)
+		if err != nil {
+			return err
+		}
+		defer finish()
+
+		names, err := serverpb.GetInternalTimeseriesNamesFromServer(ctx, conn)
+		if err != nil {
+			return err
+		}
+
 		req := &tspb.DumpRequest{
 			StartNanos: time.Time(debugTimeSeriesDumpOpts.from).UnixNano(),
 			EndNanos:   time.Time(debugTimeSeriesDumpOpts.to).UnixNano(),
+			Names:      names,
 		}
-		var w tsWriter
-		switch debugTimeSeriesDumpOpts.format {
-		case tsDumpRaw:
-			// Special case, we don't go through the text output code.
-			conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
-			if err != nil {
-				return err
-			}
-			defer finish()
 
+		if debugTimeSeriesDumpOpts.format == tsDumpRaw {
 			tsClient := tspb.NewTimeSeriesClient(conn)
 			stream, err := tsClient.DumpRaw(context.Background(), req)
 			if err != nil {
@@ -74,10 +79,14 @@ output.
 			// Buffer the writes to os.Stdout since we're going to
 			// be writing potentially a lot of data to it.
 			w := bufio.NewWriter(os.Stdout)
-			if err := ts.DumpRawTo(stream, w); err != nil {
+			if err := tsutil.DumpRawTo(stream, w); err != nil {
 				return err
 			}
 			return w.Flush()
+		}
+
+		var w tsWriter
+		switch debugTimeSeriesDumpOpts.format {
 		case tsDumpCSV:
 			w = csvTSWriter{w: csv.NewWriter(os.Stdout)}
 		case tsDumpTSV:
@@ -89,12 +98,6 @@ output.
 		default:
 			return errors.Newf("unknown output format: %v", debugTimeSeriesDumpOpts.format)
 		}
-
-		conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
-		if err != nil {
-			return err
-		}
-		defer finish()
 
 		tsClient := tspb.NewTimeSeriesClient(conn)
 		stream, err := tsClient.Dump(context.Background(), req)

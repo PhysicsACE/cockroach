@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
@@ -50,6 +51,11 @@ func TestMain(m *testing.M) {
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
+
+	defer serverutils.TestingSetDefaultTenantSelectionOverride(
+		base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(76378),
+	)()
+
 	os.Exit(m.Run())
 }
 
@@ -401,6 +407,13 @@ func TestLogic_collatedstring_uniqueindex2(
 	runLogicTest(t, "collatedstring_uniqueindex2")
 }
 
+func TestLogic_comment_on(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "comment_on")
+}
+
 func TestLogic_composite_types(
 	t *testing.T,
 ) {
@@ -539,6 +552,13 @@ func TestLogic_delete(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "delete")
+}
+
+func TestLogic_delete_batch(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "delete_batch")
 }
 
 func TestLogic_dependencies(
@@ -751,6 +771,13 @@ func TestLogic_explain_analyze(
 	runLogicTest(t, "explain_analyze")
 }
 
+func TestLogic_export(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "export")
+}
+
 func TestLogic_expression_index(
 	t *testing.T,
 ) {
@@ -777,6 +804,13 @@ func TestLogic_fk(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "fk")
+}
+
+func TestLogic_fk_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "fk_read_committed")
 }
 
 func TestLogic_float(
@@ -826,6 +860,13 @@ func TestLogic_geospatial_meta(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "geospatial_meta")
+}
+
+func TestLogic_geospatial_regression(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "geospatial_regression")
 }
 
 func TestLogic_geospatial_zm(
@@ -889,6 +930,13 @@ func TestLogic_group_join(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "group_join")
+}
+
+func TestLogic_guardrails(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "guardrails")
 }
 
 func TestLogic_hash_join(
@@ -1057,6 +1105,13 @@ func TestLogic_json_builtins(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "json_builtins")
+}
+
+func TestLogic_json_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "json_index")
 }
 
 func TestLogic_kv_builtin_functions(
@@ -1290,6 +1345,13 @@ func TestLogic_pg_extension(
 	runLogicTest(t, "pg_extension")
 }
 
+func TestLogic_pg_lsn(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "pg_lsn")
+}
+
 func TestLogic_pgcrypto_builtins(
 	t *testing.T,
 ) {
@@ -1346,11 +1408,32 @@ func TestLogic_privileges_table(
 	runLogicTest(t, "privileges_table")
 }
 
+func TestLogic_procedure(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "procedure")
+}
+
 func TestLogic_propagate_input_ordering(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "propagate_input_ordering")
+}
+
+func TestLogic_raise(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "raise")
+}
+
+func TestLogic_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "read_committed")
 }
 
 func TestLogic_reassign_owned_by(
@@ -1526,6 +1609,13 @@ func TestLogic_schema_change_retry(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "schema_change_retry")
+}
+
+func TestLogic_schema_locked(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "schema_locked")
 }
 
 func TestLogic_schema_repair(
@@ -1710,6 +1800,13 @@ func TestLogic_show_create_all_types(
 	runLogicTest(t, "show_create_all_types")
 }
 
+func TestLogic_show_create_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_create_redact")
+}
+
 func TestLogic_show_default_privileges(
 	t *testing.T,
 ) {
@@ -1806,6 +1903,13 @@ func TestLogic_statement_statistics_errors(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "statement_statistics_errors")
+}
+
+func TestLogic_statement_statistics_errors_redacted(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "statement_statistics_errors_redacted")
 }
 
 func TestLogic_stats(
@@ -1962,6 +2066,13 @@ func TestLogic_truncate(
 	runLogicTest(t, "truncate")
 }
 
+func TestLogic_truncate_with_concurrent_mutation(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "truncate_with_concurrent_mutation")
+}
+
 func TestLogic_tsvector(
 	t *testing.T,
 ) {
@@ -2032,6 +2143,20 @@ func TestLogic_udf(
 	runLogicTest(t, "udf")
 }
 
+func TestLogic_udf_delete(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_delete")
+}
+
+func TestLogic_udf_fk(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_fk")
+}
+
 func TestLogic_udf_in_column_defaults(
 	t *testing.T,
 ) {
@@ -2046,6 +2171,20 @@ func TestLogic_udf_in_constraints(
 	runLogicTest(t, "udf_in_constraints")
 }
 
+func TestLogic_udf_insert(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_insert")
+}
+
+func TestLogic_udf_observability(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_observability")
+}
+
 func TestLogic_udf_oid_ref(
 	t *testing.T,
 ) {
@@ -2053,11 +2192,53 @@ func TestLogic_udf_oid_ref(
 	runLogicTest(t, "udf_oid_ref")
 }
 
+func TestLogic_udf_options(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_options")
+}
+
+func TestLogic_udf_plpgsql(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_plpgsql")
+}
+
+func TestLogic_udf_prepare(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_prepare")
+}
+
+func TestLogic_udf_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_privileges")
+}
+
 func TestLogic_udf_record(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_record")
+}
+
+func TestLogic_udf_regressions(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_regressions")
+}
+
+func TestLogic_udf_schema_change(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_schema_change")
 }
 
 func TestLogic_udf_setof(
@@ -2072,6 +2253,34 @@ func TestLogic_udf_star(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_star")
+}
+
+func TestLogic_udf_subquery(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_subquery")
+}
+
+func TestLogic_udf_unsupported(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_unsupported")
+}
+
+func TestLogic_udf_update(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_update")
+}
+
+func TestLogic_udf_upsert(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_upsert")
 }
 
 func TestLogic_udf_volatility_check(
@@ -2114,6 +2323,13 @@ func TestLogic_upsert(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "upsert")
+}
+
+func TestLogic_upsert_non_metamorphic(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "upsert_non_metamorphic")
 }
 
 func TestLogic_uuid(
@@ -2212,6 +2428,13 @@ func TestLogic_with(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "with")
+}
+
+func TestLogic_workload_indexrecs(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "workload_indexrecs")
 }
 
 func TestLogic_zero(

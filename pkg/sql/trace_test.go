@@ -45,11 +45,12 @@ func TestTrace(t *testing.T) {
 	// These are always appended, even without the test specifying it.
 	alwaysOptionalSpans := []string{
 		"drain",
-		"storage.pendingLeaseRequest: requesting lease",
-		"storage.Store: gossip on capacity change",
+		"pendingLeaseRequest: requesting lease",
+		"gossip on capacity change",
 		"outbox",
 		"request range lease",
 		"range lookup",
+		"local proposal",
 	}
 
 	testData := []struct {
@@ -113,25 +114,28 @@ func TestTrace(t *testing.T) {
 				// Check that stat collection from the above SELECT statement is output
 				// to trace. We don't insert any rows in this test, thus the expected
 				// num tuples value plus one is 1.
-				rows, err := sqlDB.Query(
-					"SELECT count(message) FROM crdb_internal.session_trace " +
-						"WHERE message LIKE '%component%num_tuples%value_plus_one:1%'",
-				)
+				rows, err := sqlDB.Query("SELECT message FROM crdb_internal.session_trace")
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !rows.Next() {
-					t.Fatal("unable to retrieve count")
-				}
-
-				var count int
-				if err := rows.Scan(&count); err != nil {
+				var trace strings.Builder
+				if err := func() error {
+					for rows.Next() {
+						var msg string
+						if err := rows.Scan(&msg); err != nil {
+							return err
+						}
+						fmt.Fprintln(&trace, msg)
+					}
+					return rows.Close()
+				}(); err != nil {
 					t.Fatal(err)
 				}
-				if err := rows.Close(); err != nil {
-					t.Fatal(err)
+				t.Logf("trace:\n%s", trace.String())
+				if trace.Len() == 0 {
+					t.Fatalf("empty trace")
 				}
-				if count == 0 {
+				if !strings.Contains(trace.String(), "ComponentStats") {
 					t.Fatalf("no stat messages found")
 				}
 
@@ -275,7 +279,7 @@ func TestTrace(t *testing.T) {
 
 	// Create a cluster. We'll run sub-tests using each node of this cluster.
 	const numNodes = 3
-	cluster := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{})
+	cluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{})
 	defer cluster.Stopper().Stop(context.Background())
 
 	clusterDB := cluster.ServerConn(0)
@@ -320,7 +324,7 @@ func TestTrace(t *testing.T) {
 							// TODO(andrei): Pull the check for an empty session_trace out of
 							// the sub-tests so we can use cluster.ServerConn(i) here.
 							pgURL, cleanup := sqlutils.PGUrl(
-								t, cluster.Server(i).ServingSQLAddr(), "TestTrace", url.User(username.RootUser))
+								t, cluster.Server(i).AdvSQLAddr(), "TestTrace", url.User(username.RootUser))
 							defer cleanup()
 							q := pgURL.Query()
 							// This makes it easier to test with the `tracing` sesssion var.
@@ -342,7 +346,7 @@ func TestTrace(t *testing.T) {
 							}
 
 							if _, err := cluster.ServerConn(0).Exec(
-								fmt.Sprintf(`SET CLUSTER SETTING trace.debug.enable = %t`, enableTr),
+								fmt.Sprintf(`SET CLUSTER SETTING trace.debug_http_endpoint.enabled = %t`, enableTr),
 							); err != nil {
 								t.Fatal(err)
 							}
@@ -364,17 +368,22 @@ func TestTrace(t *testing.T) {
 							}
 							defer rows.Close()
 
-							ignoreSpans := make(map[string]bool)
-							for _, s := range test.optionalSpans {
-								ignoreSpans[s] = true
+							ignoreSpan := func(op string) bool {
+								for _, s := range test.optionalSpans {
+									if strings.Contains(op, s) {
+										return true
+									}
+								}
+								return false
 							}
+
 							r := 0
 							for rows.Next() {
 								var op string
 								if err := rows.Scan(&op); err != nil {
 									t.Fatal(err)
 								}
-								if ignoreSpans[op] {
+								if ignoreSpan(op) {
 									continue
 								}
 
@@ -391,7 +400,7 @@ func TestTrace(t *testing.T) {
 										if err := rows.Scan(&op); err != nil {
 											t.Fatal(err)
 										}
-										if ignoreSpans[op] {
+										if ignoreSpan(op) {
 											continue
 										}
 										t.Errorf("remaining span: %q", op)
@@ -563,7 +572,7 @@ func TestKVTraceDistSQL(t *testing.T) {
 
 	// Test that kv tracing works in distsql.
 	const numNodes = 2
-	cluster := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+	cluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			UseDatabase: "test",
@@ -613,7 +622,7 @@ func TestTraceDistSQL(t *testing.T) {
 	recCh := make(chan tracingpb.Recording, 2)
 
 	const numNodes = 2
-	cluster := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+	cluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			UseDatabase: "test",

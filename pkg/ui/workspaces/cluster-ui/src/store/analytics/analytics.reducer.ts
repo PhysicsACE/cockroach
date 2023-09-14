@@ -12,6 +12,8 @@ import { createAction } from "@reduxjs/toolkit";
 import { DOMAIN_NAME } from "../utils";
 
 type Page =
+  | "Databases"
+  | "Database Details"
   | "Index Details"
   | "Jobs"
   | "Schema Insights"
@@ -25,6 +27,14 @@ type Page =
   | "Transaction Insight Details"
   | "Workload Insights - Statement"
   | "Workload Insights - Transaction";
+
+type ApplySearchCriteriaEvent = {
+  name: "Apply Search Criteria";
+  page: Page;
+  tsValue: string;
+  limitValue: number;
+  sortValue: string;
+};
 
 type BackButtonClick = {
   name: "Back Clicked";
@@ -101,7 +111,25 @@ type TimeScaleChangeEvent = {
   value: string;
 };
 
+type ViewModeEvent = {
+  name: "View Mode Clicked";
+  page: Page;
+  value: string;
+};
+
+type AutoRefreshEvent = {
+  name: "Auto Refresh Toggle";
+  page: Page;
+  value: boolean;
+};
+
+type ManualRefreshEvent = {
+  name: "Manual Refresh";
+  page: Page;
+};
+
 type AnalyticsEvent =
+  | ApplySearchCriteriaEvent
   | BackButtonClick
   | ColumnsChangeEvent
   | FilterEvent
@@ -114,7 +142,10 @@ type AnalyticsEvent =
   | StatementClicked
   | StatementDiagnosticEvent
   | TabChangedEvent
-  | TimeScaleChangeEvent;
+  | TimeScaleChangeEvent
+  | ViewModeEvent
+  | AutoRefreshEvent
+  | ManualRefreshEvent;
 
 const PREFIX = `${DOMAIN_NAME}/analytics`;
 

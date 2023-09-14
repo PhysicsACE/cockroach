@@ -11,14 +11,17 @@
 package execstats
 
 import (
+	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
+	pbtypes "github.com/gogo/protobuf/types"
 )
 
 type streamStats struct {
@@ -104,6 +107,7 @@ type NodeLevelStats struct {
 	MaxMemoryUsageGroupedByNode                     map[base.SQLInstanceID]int64
 	MaxDiskUsageGroupedByNode                       map[base.SQLInstanceID]int64
 	KVBytesReadGroupedByNode                        map[base.SQLInstanceID]int64
+	KVPairsReadGroupedByNode                        map[base.SQLInstanceID]int64
 	KVRowsReadGroupedByNode                         map[base.SQLInstanceID]int64
 	KVBatchRequestsIssuedGroupedByNode              map[base.SQLInstanceID]int64
 	KVTimeGroupedByNode                             map[base.SQLInstanceID]time.Duration
@@ -134,6 +138,7 @@ type QueryLevelStats struct {
 	MaxMemUsage                        int64
 	MaxDiskUsage                       int64
 	KVBytesRead                        int64
+	KVPairsRead                        int64
 	KVRowsRead                         int64
 	KVBatchRequestsIssued              int64
 	KVTime                             time.Duration
@@ -155,6 +160,8 @@ type QueryLevelStats struct {
 	ContentionEvents                   []kvpb.ContentionEvent
 	RUEstimate                         int64
 	CPUTime                            time.Duration
+	SqlInstanceIds                     map[base.SQLInstanceID]struct{}
+	Regions                            []string
 }
 
 // QueryLevelStatsWithErr is the same as QueryLevelStats, but also tracks
@@ -183,6 +190,7 @@ func (s *QueryLevelStats) Accumulate(other QueryLevelStats) {
 		s.MaxDiskUsage = other.MaxDiskUsage
 	}
 	s.KVBytesRead += other.KVBytesRead
+	s.KVPairsRead += other.KVPairsRead
 	s.KVRowsRead += other.KVRowsRead
 	s.KVBatchRequestsIssued += other.KVBatchRequestsIssued
 	s.KVTime += other.KVTime
@@ -204,6 +212,15 @@ func (s *QueryLevelStats) Accumulate(other QueryLevelStats) {
 	s.ContentionEvents = append(s.ContentionEvents, other.ContentionEvents...)
 	s.RUEstimate += other.RUEstimate
 	s.CPUTime += other.CPUTime
+	if len(s.SqlInstanceIds) == 0 && len(other.SqlInstanceIds) > 0 {
+		s.SqlInstanceIds = other.SqlInstanceIds
+	} else if len(other.SqlInstanceIds) > 0 && len(s.SqlInstanceIds) > 0 {
+		for id := range other.SqlInstanceIds {
+			s.SqlInstanceIds[id] = struct{}{}
+		}
+	}
+
+	s.Regions = util.CombineUnique(s.Regions, other.Regions)
 }
 
 // TraceAnalyzer is a struct that helps calculate top-level statistics from a
@@ -274,6 +291,7 @@ func (a *TraceAnalyzer) ProcessStats() error {
 		MaxMemoryUsageGroupedByNode:                     make(map[base.SQLInstanceID]int64),
 		MaxDiskUsageGroupedByNode:                       make(map[base.SQLInstanceID]int64),
 		KVBytesReadGroupedByNode:                        make(map[base.SQLInstanceID]int64),
+		KVPairsReadGroupedByNode:                        make(map[base.SQLInstanceID]int64),
 		KVRowsReadGroupedByNode:                         make(map[base.SQLInstanceID]int64),
 		KVBatchRequestsIssuedGroupedByNode:              make(map[base.SQLInstanceID]int64),
 		KVTimeGroupedByNode:                             make(map[base.SQLInstanceID]time.Duration),
@@ -297,7 +315,6 @@ func (a *TraceAnalyzer) ProcessStats() error {
 	}
 	var errs error
 
-	var allContentionEvents []kvpb.ContentionEvent
 	// Process processorStats.
 	for _, stats := range a.processorStats {
 		if stats == nil {
@@ -305,6 +322,7 @@ func (a *TraceAnalyzer) ProcessStats() error {
 		}
 		instanceID := stats.Component.SQLInstanceID
 		a.nodeLevelStats.KVBytesReadGroupedByNode[instanceID] += int64(stats.KV.BytesRead.Value())
+		a.nodeLevelStats.KVPairsReadGroupedByNode[instanceID] += int64(stats.KV.KVPairsRead.Value())
 		a.nodeLevelStats.KVRowsReadGroupedByNode[instanceID] += int64(stats.KV.TuplesRead.Value())
 		a.nodeLevelStats.KVBatchRequestsIssuedGroupedByNode[instanceID] += int64(stats.KV.BatchRequestsIssued.Value())
 		a.nodeLevelStats.KVTimeGroupedByNode[instanceID] += stats.KV.KVTime.Value()
@@ -324,7 +342,6 @@ func (a *TraceAnalyzer) ProcessStats() error {
 		a.nodeLevelStats.ContentionTimeGroupedByNode[instanceID] += stats.KV.ContentionTime.Value()
 		a.nodeLevelStats.RUEstimateGroupedByNode[instanceID] += int64(stats.Exec.ConsumedRU.Value())
 		a.nodeLevelStats.CPUTimeGroupedByNode[instanceID] += stats.Exec.CPUTime.Value()
-		allContentionEvents = append(allContentionEvents, stats.KV.ContentionEvents...)
 	}
 
 	// Process streamStats.
@@ -342,30 +359,6 @@ func (a *TraceAnalyzer) ProcessStats() error {
 			a.nodeLevelStats.NetworkBytesSentGroupedByNode[originInstanceID] += bytes
 		}
 
-		// The row execution flow attaches flow stats to a stream stat with the
-		// last outbox, so we need to check stream stats for max memory and disk
-		// usage.
-		// TODO(cathymw): maxMemUsage shouldn't be attached to span stats that
-		// are associated with streams, since it's a flow level stat. However,
-		// due to the row exec engine infrastructure, it is too complicated to
-		// attach this to a flow level span. If the row exec engine gets
-		// removed, getting maxMemUsage from streamStats should be removed as
-		// well.
-		if stats.stats.FlowStats.MaxMemUsage.HasValue() {
-			memUsage := int64(stats.stats.FlowStats.MaxMemUsage.Value())
-			if memUsage > a.nodeLevelStats.MaxMemoryUsageGroupedByNode[originInstanceID] {
-				a.nodeLevelStats.MaxMemoryUsageGroupedByNode[originInstanceID] = memUsage
-			}
-		}
-		if stats.stats.FlowStats.MaxDiskUsage.HasValue() {
-			if diskUsage := int64(stats.stats.FlowStats.MaxDiskUsage.Value()); diskUsage > a.nodeLevelStats.MaxDiskUsageGroupedByNode[originInstanceID] {
-				a.nodeLevelStats.MaxDiskUsageGroupedByNode[originInstanceID] = diskUsage
-			}
-		}
-		if stats.stats.FlowStats.ConsumedRU.HasValue() {
-			a.nodeLevelStats.RUEstimateGroupedByNode[originInstanceID] += int64(stats.stats.FlowStats.ConsumedRU.Value())
-		}
-
 		numMessages, err := getNumNetworkMessagesFromComponentsStats(stats.stats)
 		if err != nil {
 			errs = errors.CombineErrors(errs, errors.Wrap(err, "error calculating number of network messages"))
@@ -374,13 +367,23 @@ func (a *TraceAnalyzer) ProcessStats() error {
 		}
 	}
 
+	instanceIds := make(map[base.SQLInstanceID]struct{}, len(a.flowStats))
+	// Default to 1 since most queries only use a single region.
+	regions := make([]string, 0, 1)
+
 	// Process flowStats.
 	for instanceID, stats := range a.flowStats {
 		if stats.stats == nil {
 			continue
 		}
 
+		instanceIds[instanceID] = struct{}{}
 		for _, v := range stats.stats {
+			// Avoid duplicates and empty string.
+			if v.Component.Region != "" {
+				regions = util.CombineUnique(regions, []string{v.Component.Region})
+			}
+
 			if v.FlowStats.MaxMemUsage.HasValue() {
 				if memUsage := int64(v.FlowStats.MaxMemUsage.Value()); memUsage > a.nodeLevelStats.MaxMemoryUsageGroupedByNode[instanceID] {
 					a.nodeLevelStats.MaxMemoryUsageGroupedByNode[instanceID] = memUsage
@@ -399,7 +402,10 @@ func (a *TraceAnalyzer) ProcessStats() error {
 
 	// Process query level stats.
 	a.queryLevelStats = QueryLevelStats{}
+	a.queryLevelStats.SqlInstanceIds = instanceIds
+	sort.Strings(regions)
 
+	a.queryLevelStats.Regions = regions
 	for _, bytesSentByNode := range a.nodeLevelStats.NetworkBytesSentGroupedByNode {
 		a.queryLevelStats.NetworkBytesSent += bytesSentByNode
 	}
@@ -418,6 +424,10 @@ func (a *TraceAnalyzer) ProcessStats() error {
 
 	for _, kvBytesRead := range a.nodeLevelStats.KVBytesReadGroupedByNode {
 		a.queryLevelStats.KVBytesRead += kvBytesRead
+	}
+
+	for _, kvPairsRead := range a.nodeLevelStats.KVPairsReadGroupedByNode {
+		a.queryLevelStats.KVPairsRead += kvPairsRead
 	}
 
 	for _, kvRowsRead := range a.nodeLevelStats.KVRowsReadGroupedByNode {
@@ -500,8 +510,6 @@ func (a *TraceAnalyzer) ProcessStats() error {
 		a.queryLevelStats.CPUTime += cpuTime
 	}
 
-	a.queryLevelStats.ContentionEvents = allContentionEvents
-
 	return errs
 }
 
@@ -557,6 +565,25 @@ func (a *TraceAnalyzer) GetQueryLevelStats() QueryLevelStats {
 	return a.queryLevelStats
 }
 
+// getAllContentionEvents returns all contention events that are found in the
+// given trace.
+func getAllContentionEvents(trace []tracingpb.RecordedSpan) []kvpb.ContentionEvent {
+	var contentionEvents []kvpb.ContentionEvent
+	var ev kvpb.ContentionEvent
+	for i := range trace {
+		trace[i].Structured(func(any *pbtypes.Any, _ time.Time) {
+			if !pbtypes.Is(any, &ev) {
+				return
+			}
+			if err := pbtypes.UnmarshalAny(any, &ev); err != nil {
+				return
+			}
+			contentionEvents = append(contentionEvents, ev)
+		})
+	}
+	return contentionEvents
+}
+
 // GetQueryLevelStats returns all the top-level stats in a QueryLevelStats
 // struct. GetQueryLevelStats tries to process as many stats as possible. If
 // errors occur while processing stats, GetQueryLevelStats returns the combined
@@ -579,5 +606,6 @@ func GetQueryLevelStats(
 		}
 		queryLevelStats.Accumulate(analyzer.GetQueryLevelStats())
 	}
+	queryLevelStats.ContentionEvents = getAllContentionEvents(trace)
 	return queryLevelStats, errs
 }

@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/safesql"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
@@ -40,10 +42,10 @@ import (
 func (s *statusServer) IndexUsageStatistics(
 	ctx context.Context, req *serverpb.IndexUsageStatisticsRequest,
 ) (*serverpb.IndexUsageStatisticsResponse, error) {
-	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
@@ -98,6 +100,7 @@ func (s *statusServer) IndexUsageStatistics(
 	// yields an incorrect result.
 	if err := s.iterateNodes(ctx,
 		"requesting index usage stats",
+		noTimeout,
 		dialFn, fetchIndexUsageStats, aggFn, errFn); err != nil {
 		return nil, err
 	}
@@ -130,10 +133,10 @@ func indexUsageStatsLocal(
 func (s *statusServer) ResetIndexUsageStats(
 	ctx context.Context, req *serverpb.ResetIndexUsageStatsRequest,
 ) (*serverpb.ResetIndexUsageStatsResponse, error) {
-	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+	if _, err := s.privilegeChecker.RequireAdminUser(ctx); err != nil {
 		return nil, err
 	}
 
@@ -194,6 +197,7 @@ func (s *statusServer) ResetIndexUsageStats(
 
 	if err := s.iterateNodes(ctx,
 		"Resetting index usage stats",
+		noTimeout,
 		dialFn, resetIndexUsageStats, aggFn, errFn); err != nil {
 		return nil, err
 	}
@@ -207,10 +211,10 @@ func (s *statusServer) ResetIndexUsageStats(
 func (s *statusServer) TableIndexStats(
 	ctx context.Context, req *serverpb.TableIndexStatsRequest,
 ) (*serverpb.TableIndexStatsResponse, error) {
-	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 	return getTableIndexUsageStats(ctx, req, s.sqlServer.pgServer.SQLServer.GetLocalIndexStatistics(),
@@ -228,7 +232,7 @@ func getTableIndexUsageStats(
 	st *cluster.Settings,
 	execConfig *sql.ExecutorConfig,
 ) (*serverpb.TableIndexStatsResponse, error) {
-	userName, err := userFromIncomingRPCContext(ctx)
+	userName, err := authserver.UserFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +243,7 @@ func getTableIndexUsageStats(
 		return nil, err
 	}
 
-	q := makeSQLQuery()
+	q := safesql.NewQuery()
 	// TODO(#72930): Implement virtual indexes on index_usages_statistics and table_indexes
 	q.Append(`
 		SELECT
@@ -249,7 +253,8 @@ func getTableIndexUsageStats(
 			total_reads,
 			last_read,
 			indexdef,
-			ti.created_at
+			ti.created_at,
+			ti.is_unique
 		FROM crdb_internal.index_usage_statistics AS us
   	JOIN crdb_internal.table_indexes AS ti ON us.index_id = ti.index_id 
 		AND us.table_id = ti.descriptor_id
@@ -294,6 +299,7 @@ func getTableIndexUsageStats(
 			ts := tree.MustBeDTimestamp(row[6])
 			createdAt = &ts.Time
 		}
+		isUnique := tree.MustBeDBool(row[7])
 
 		if err != nil {
 			return nil, err
@@ -322,6 +328,7 @@ func getTableIndexUsageStats(
 			CreatedAt:        idxStatsRow.CreatedAt,
 			LastRead:         idxStatsRow.Statistics.Stats.LastRead,
 			IndexType:        idxStatsRow.IndexType,
+			IsUnique:         bool(isUnique),
 			UnusedIndexKnobs: execConfig.UnusedIndexRecommendationsKnobs,
 		}
 		recommendations := statsRow.GetRecommendationsFromIndexStats(req.Database, st)
@@ -384,7 +391,7 @@ func getDatabaseIndexRecommendations(
 		return []*serverpb.IndexRecommendation{}, nil
 	}
 
-	userName, err := userFromIncomingRPCContext(ctx)
+	userName, err := authserver.UserFromIncomingRPCContext(ctx)
 	if err != nil {
 		return []*serverpb.IndexRecommendation{}, err
 	}
@@ -396,7 +403,8 @@ func getDatabaseIndexRecommendations(
 			ti.index_id,
 			ti.index_type,
 			last_read,
-			ti.created_at
+			ti.created_at,
+			ti.is_unique
 		FROM %[1]s.crdb_internal.index_usage_statistics AS us
 		 JOIN %[1]s.crdb_internal.table_indexes AS ti ON (us.index_id = ti.index_id AND us.table_id = ti.descriptor_id AND index_type = 'secondary')
 		 JOIN %[1]s.crdb_internal.tables AS t ON (ti.descriptor_id = t.table_id AND t.database_name != 'system');`, escDBName)
@@ -433,6 +441,7 @@ func getDatabaseIndexRecommendations(
 			ts := tree.MustBeDTimestamp(row[4])
 			createdAt = &ts.Time
 		}
+		isUnique := tree.MustBeDBool(row[5])
 
 		if err != nil {
 			return []*serverpb.IndexRecommendation{}, err
@@ -444,6 +453,7 @@ func getDatabaseIndexRecommendations(
 			CreatedAt:        createdAt,
 			LastRead:         lastRead,
 			IndexType:        string(indexType),
+			IsUnique:         bool(isUnique),
 			UnusedIndexKnobs: knobs,
 		}
 		recommendations := statsRow.GetRecommendationsFromIndexStats(dbName, st)

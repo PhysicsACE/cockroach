@@ -29,6 +29,7 @@ const envYCSBFlags = "ROACHTEST_YCSB_FLAGS"
 func registerYCSB(r registry.Registry) {
 	workloads := []string{"A", "B", "C", "D", "E", "F"}
 	cpusConfigs := []int{8, 32}
+	cpusWithReadCommitted := 32
 	cpusWithGlobalMVCCRangeTombstone := 32
 
 	// concurrencyConfigs contains near-optimal concurrency levels for each
@@ -45,7 +46,7 @@ func registerYCSB(r registry.Registry) {
 	}
 
 	runYCSB := func(
-		ctx context.Context, t test.Test, c cluster.Cluster, wl string, cpus int, rangeTombstone bool,
+		ctx context.Context, t test.Test, c cluster.Cluster, wl string, cpus int, readCommitted, rangeTombstone bool,
 	) {
 		// For now, we only want to run the zfs tests on GCE, since only GCE supports
 		// starting roachprod instances on zfs.
@@ -75,9 +76,11 @@ func registerYCSB(r registry.Registry) {
 		m := c.NewMonitor(ctx, c.Range(1, nodes))
 		m.Go(func(ctx context.Context) error {
 			var args string
-			args += fmt.Sprintf(" --select-for-update=%t", t.IsBuildVersion("v19.2.0"))
 			args += " --ramp=" + ifLocal(c, "0s", "2m")
 			args += " --duration=" + ifLocal(c, "10s", "30m")
+			if readCommitted {
+				args += " --isolation-level=read_committed"
+			}
 			if envFlags := os.Getenv(envYCSBFlags); envFlags != "" {
 				args += " " + envFlags
 			}
@@ -102,33 +105,51 @@ func registerYCSB(r registry.Registry) {
 			}
 			wl, cpus := wl, cpus
 			r.Add(registry.TestSpec{
-				Name:    name,
-				Owner:   registry.OwnerTestEng,
-				Cluster: r.MakeClusterSpec(4, spec.CPU(cpus)),
+				Name:      name,
+				Owner:     registry.OwnerTestEng,
+				Benchmark: true,
+				Cluster:   r.MakeClusterSpec(4, spec.CPU(cpus)),
 				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					runYCSB(ctx, t, c, wl, cpus, false /* rangeTombstone */)
+					runYCSB(ctx, t, c, wl, cpus, false /* readCommitted */, false /* rangeTombstone */)
 				},
+				Tags: registry.Tags(`aws`),
 			})
 
 			if wl == "A" {
 				r.Add(registry.TestSpec{
-					Name:    fmt.Sprintf("zfs/ycsb/%s/nodes=3/cpu=%d", wl, cpus),
-					Owner:   registry.OwnerStorage,
-					Cluster: r.MakeClusterSpec(4, spec.CPU(cpus), spec.SetFileSystem(spec.Zfs)),
+					Name:      fmt.Sprintf("zfs/ycsb/%s/nodes=3/cpu=%d", wl, cpus),
+					Owner:     registry.OwnerStorage,
+					Benchmark: true,
+					Cluster:   r.MakeClusterSpec(4, spec.CPU(cpus), spec.SetFileSystem(spec.Zfs)),
 					Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-						runYCSB(ctx, t, c, wl, cpus, false /* rangeTombstone */)
+						runYCSB(ctx, t, c, wl, cpus, false /* readCommitted */, false /* rangeTombstone */)
 					},
+				})
+			}
+
+			if cpus == cpusWithReadCommitted {
+				r.Add(registry.TestSpec{
+					Name:      fmt.Sprintf("%s/isolation-level=read-committed", name),
+					Owner:     registry.OwnerTestEng,
+					Benchmark: true,
+					Cluster:   r.MakeClusterSpec(4, spec.CPU(cpus)),
+					Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+						runYCSB(ctx, t, c, wl, cpus, true /* readCommitted */, false /* rangeTombstone */)
+					},
+					Tags: registry.Tags(`aws`),
 				})
 			}
 
 			if cpus == cpusWithGlobalMVCCRangeTombstone {
 				r.Add(registry.TestSpec{
-					Name:    fmt.Sprintf("%s/mvcc-range-keys=global", name),
-					Owner:   registry.OwnerTestEng,
-					Cluster: r.MakeClusterSpec(4, spec.CPU(cpus)),
+					Name:      fmt.Sprintf("%s/mvcc-range-keys=global", name),
+					Owner:     registry.OwnerTestEng,
+					Benchmark: true,
+					Cluster:   r.MakeClusterSpec(4, spec.CPU(cpus)),
 					Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-						runYCSB(ctx, t, c, wl, cpus, true /* rangeTombstone */)
+						runYCSB(ctx, t, c, wl, cpus, false /* readCommitted */, true /* rangeTombstone */)
 					},
+					Tags: registry.Tags(`aws`),
 				})
 			}
 		}

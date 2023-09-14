@@ -12,22 +12,15 @@ package upgrades_test
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -44,27 +37,26 @@ func TestRoleMembersIDMigration10Users(t *testing.T) {
 	runTestRoleMembersIDMigration(t, 10)
 }
 
-func TestRoleMembersIDMigration1500Users(t *testing.T) {
+func TestRoleMembersIDMigration1200Users(t *testing.T) {
 	skip.UnderRace(t)
 	skip.UnderStress(t)
-	runTestRoleMembersIDMigration(t, 1500)
+	// Choosing a number larger than 1000 tests that the batching logic in
+	// this upgrade works correctly.
+	runTestRoleMembersIDMigration(t, 1200)
 }
 
 func runTestRoleMembersIDMigration(t *testing.T, numUsers int) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	settings := cluster.MakeTestingClusterSettingsWithVersions(
-		clusterversion.TestingBinaryVersion,
-		clusterversion.ByKey(clusterversion.V23_1RoleMembersTableHasIDColumns-1),
-		false,
-	)
-
 	tc := testcluster.StartTestCluster(t, 1 /* nodes */, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			Settings: settings,
 			Knobs: base.TestingKnobs{
+				SQLEvalContext: &eval.TestingKnobs{
+					ForceProductionValues: true,
+				},
 				Server: &server.TestingKnobs{
+					BootstrapVersionKeyOverride:    clusterversion.V22_2,
 					DisableAutomaticVersionUpgrade: make(chan struct{}),
 					BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1RoleMembersTableHasIDColumns - 1),
 				},
@@ -76,15 +68,10 @@ func runTestRoleMembersIDMigration(t *testing.T, numUsers int) {
 	db := tc.ServerConn(0)
 	defer db.Close()
 	tdb := sqlutils.MakeSQLRunner(db)
-	s := tc.Server(0)
 
 	// Delete all rows from the system.role_members table.
 	tdb.Exec(t, "DELETE FROM system.role_members WHERE true")
 	tdb.CheckQueryResults(t, "SELECT * FROM system.role_members", [][]string{})
-
-	// Inject the descriptor for the system.role_members table from before the
-	// ID columns were added.
-	upgrades.InjectLegacyTable(ctx, t, s, systemschema.RoleMembersTable, getTableDescForSystemRoleMembersTableBeforeIDCols)
 
 	// Insert row that would have been added in a legacy startup migration.
 	tdb.Exec(t, `INSERT INTO system.role_members ("role", "member", "isAdmin") VALUES ('admin', 'root', true)`)
@@ -93,22 +80,28 @@ func runTestRoleMembersIDMigration(t *testing.T, numUsers int) {
 	})
 
 	// Create test users.
-	expectedNumRoleMembersRows := 1
-	upgrades.ExecForCountInTxns(ctx, t, db, numUsers, 100 /* txCount */, func(txRunner *sqlutils.SQLRunner, i int) {
-		txRunner.Exec(t, fmt.Sprintf("CREATE USER testuser%d", i))
+	upgrades.ExecForCountInTxns(ctx, t, db, numUsers, 100 /* txCount */, func(tx *gosql.Tx, i int) error {
+		if _, err := tx.Exec(fmt.Sprintf("CREATE USER testuser%d", i)); err != nil {
+			return err
+		}
 		if i == 0 {
-			return
+			if _, err := tx.Exec(fmt.Sprintf("GRANT admin TO testuser%d", i)); err != nil {
+				return err
+			}
+			return nil
 		}
 		// Randomly choose an earlier test user to grant to the current test user.
-		grantStmt := fmt.Sprintf("GRANT testuser%d to testuser%d", rand.Intn(i), i)
+		grantStmt := fmt.Sprintf("GRANT testuser%d TO testuser%d", rand.Intn(i), i)
 		if rand.Intn(2) == 1 {
 			grantStmt += " WITH ADMIN OPTION"
 		}
-		txRunner.Exec(t, grantStmt)
-		expectedNumRoleMembersRows += 1
+		if _, err := tx.Exec(grantStmt); err != nil {
+			return err
+		}
+		return nil
 	})
 	tdb.CheckQueryResults(t, "SELECT count(*) FROM system.role_members", [][]string{
-		{fmt.Sprintf("%d", expectedNumRoleMembersRows)},
+		{fmt.Sprintf("%d", numUsers+1)},
 	})
 
 	// Run migrations.
@@ -124,7 +117,7 @@ func runTestRoleMembersIDMigration(t *testing.T, numUsers int) {
 	tdb.CheckQueryResults(t, "SELECT count(*) FROM system.role_members AS a JOIN system.users AS b on a.role = b.username AND a.role_id <> b.user_id", [][]string{{"0"}})
 	tdb.CheckQueryResults(t, "SELECT count(*) FROM system.role_members AS a JOIN system.users AS b on a.member = b.username AND a.member_id <> b.user_id", [][]string{{"0"}})
 
-	tdb.CheckQueryResults(t, `SELECT * FROM system.role_members WHERE "role" = 'admin'`, [][]string{
+	tdb.CheckQueryResults(t, `SELECT * FROM system.role_members WHERE "role" = 'admin' AND "member" = 'root'`, [][]string{
 		{"admin", "root", "true", "2", "1"},
 	})
 
@@ -150,71 +143,4 @@ func runTestRoleMembersIDMigration(t *testing.T, numUsers int) {
 	var actualSchema string
 	require.NoError(t, r.Scan(&actualSchema))
 	require.Equal(t, expectedSchema, actualSchema)
-}
-
-func getTableDescForSystemRoleMembersTableBeforeIDCols() *descpb.TableDescriptor {
-	return &descpb.TableDescriptor{
-		Name:                    "role_members",
-		ID:                      keys.RoleMembersTableID,
-		ParentID:                keys.SystemDatabaseID,
-		UnexposedParentSchemaID: keys.PublicSchemaID,
-		Version:                 1,
-		Columns: []descpb.ColumnDescriptor{
-			{Name: "role", ID: 1, Type: types.String},
-			{Name: "member", ID: 2, Type: types.String},
-			{Name: "isAdmin", ID: 3, Type: types.Bool},
-		},
-		NextColumnID: 4,
-		Families: []descpb.ColumnFamilyDescriptor{
-			{
-				Name:        "primary",
-				ID:          0,
-				ColumnNames: []string{"role", "member"},
-				ColumnIDs:   []descpb.ColumnID{1, 2},
-			},
-			{
-				Name:            "fam_3_isAdmin",
-				ID:              3,
-				ColumnNames:     []string{"isAdmin"},
-				ColumnIDs:       []descpb.ColumnID{3},
-				DefaultColumnID: 3,
-			},
-		},
-		NextFamilyID: 4,
-		PrimaryIndex: descpb.IndexDescriptor{
-			Name:                "primary",
-			ID:                  1,
-			Unique:              true,
-			KeyColumnNames:      []string{"role", "member"},
-			KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
-			KeyColumnIDs:        []descpb.ColumnID{1, 2},
-		},
-		Indexes: []descpb.IndexDescriptor{
-			{
-				Name:                "role_members_role_idx",
-				ID:                  2,
-				Unique:              false,
-				KeyColumnNames:      []string{"role"},
-				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
-				KeyColumnIDs:        []descpb.ColumnID{1},
-				KeySuffixColumnIDs:  []descpb.ColumnID{2},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
-			},
-			{
-				Name:                "role_members_member_idx",
-				ID:                  3,
-				Unique:              false,
-				KeyColumnNames:      []string{"member"},
-				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
-				KeyColumnIDs:        []descpb.ColumnID{2},
-				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
-			},
-		},
-		NextIndexID:      4,
-		Privileges:       catpb.NewCustomSuperuserPrivilegeDescriptor(privilege.ReadWriteData, username.NodeUserName()),
-		FormatVersion:    descpb.InterleavedFormatVersion,
-		NextMutationID:   1,
-		NextConstraintID: 1,
-	}
 }

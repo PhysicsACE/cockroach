@@ -22,9 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/stretchr/testify/require"
 )
 
@@ -57,7 +57,7 @@ func runChangeReplicasMixedVersion(ctx context.Context, t test.Test, c cluster.C
 		return rng.Intn(nodeCount) + 1
 	}
 
-	preVersion, err := version.PredecessorVersion(*t.BuildVersion())
+	preVersion, err := release.LatestPredecessor(t.BuildVersion())
 	require.NoError(t, err)
 
 	// scanTableStep runs a count(*) scan across a table, asserting the row count.
@@ -91,6 +91,20 @@ func runChangeReplicasMixedVersion(ctx context.Context, t test.Test, c cluster.C
 	// TABLE RELOCATE via a random gateway node.
 	changeReplicasRelocateFromNodeStep := func(table string, nodeID int) versionStep {
 		return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+			enqueueRangeInReplicateQueue := func(rangeID int) {
+				for n := 1; n <= nodeCount; n++ {
+					conn := u.c.Conn(ctx, t.L(), n)
+					defer conn.Close()
+					// Enqueue on every node, only the leaseholder node will process the
+					// range.
+					_, err = conn.ExecContext(ctx, fmt.Sprintf(
+						`SELECT crdb_internal.kv_enqueue_replica(%d, 'replicate', true)`,
+						rangeID))
+					if err != nil {
+						t.L().Printf("kv_enqueue_replica failed: %s", err)
+					}
+				}
+			}
 
 			// Disable the replicate queue, but re-enable it when we're done.
 			setReplicateQueueEnabled := func(enabled bool) {
@@ -125,10 +139,11 @@ func runChangeReplicasMixedVersion(ctx context.Context, t test.Test, c cluster.C
 					InitialBackoff: 100 * time.Millisecond,
 					MaxBackoff:     5 * time.Second,
 					Multiplier:     2,
-					MaxRetries:     8,
+					MaxRetries:     12,
 				}
 				var rangeErrors map[int]string
 				for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
+					setReplicateQueueEnabled(false)
 					if errCount := len(rangeErrors); errCount > 0 {
 						t.L().Printf("%d ranges failed, retrying", errCount)
 					}
@@ -152,6 +167,17 @@ func runChangeReplicasMixedVersion(ctx context.Context, t test.Test, c cluster.C
 					require.NoError(t, rows.Err())
 					if len(rangeErrors) == 0 {
 						break
+					}
+					// The failure may be caused by conflicts with ongoing configuration
+					// changes by the replicate queue, so we re-enable it and let it run
+					// for a bit before the next retry.
+					setReplicateQueueEnabled(true)
+					// Additionally, any ranges which had errors are manually enqueued
+					// into the replicate queue. This will speed up resolving conflicts
+					// and intermediate states such as left over learners or joint
+					// configurations.
+					for rangeID := range rangeErrors {
+						enqueueRangeInReplicateQueue(rangeID)
 					}
 				}
 

@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ssh"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
@@ -40,6 +39,7 @@ var (
 	extendLifetime        time.Duration
 	wipePreserveCerts     bool
 	grafanaConfig         string
+	grafanaArch           string
 	grafanaurlOpen        bool
 	grafanaDumpDir        string
 	listDetails           bool
@@ -48,6 +48,7 @@ var (
 	listPattern           string
 	secure                = false
 	tenantName            string
+	tenantInstance        int
 	extraSSHOptions       = ""
 	nodeEnv               []string
 	tag                   string
@@ -63,6 +64,7 @@ var (
 	createVMOpts          = vm.DefaultCreateOpts()
 	startOpts             = roachprod.DefaultStartOpts()
 	stageOS               string
+	stageArch             string
 	stageDir              string
 	logsDir               string
 	logsFilter            string
@@ -79,7 +81,7 @@ var (
 	// hostCluster is used for multi-tenant functionality.
 	hostCluster string
 
-	roachprodLibraryLogger *logger.Logger
+	revertUpdate bool
 )
 
 func initFlags() {
@@ -109,8 +111,12 @@ func initFlags() {
 			vm.AllProviderNames()))
 	createCmd.Flags().BoolVar(&createVMOpts.GeoDistributed,
 		"geo", false, "Create geo-distributed cluster")
+	createCmd.Flags().StringVar(&createVMOpts.Arch, "arch", "",
+		"architecture override for VM [amd64, arm64, fips]; N.B. fips implies amd64 with openssl")
+
+	// N.B. We set "usage=roachprod" as the default, custom label for billing tracking.
 	createCmd.Flags().StringToStringVar(&createVMOpts.CustomLabels,
-		"label", make(map[string]string),
+		"label", map[string]string{"usage": "roachprod"},
 		"The label(s) to be used when creating new vm instances, must be in '--label name=value' format "+
 			"and value can't be empty string after trimming space, a value that has space must be quoted by single "+
 			"quotes, gce label name only allows hyphens (-), underscores (_), lowercase characters, numbers and "+
@@ -207,6 +213,8 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 	_ = startTenantCmd.MarkFlagRequired("host-cluster")
 	startTenantCmd.Flags().IntVarP(&startOpts.TenantID,
 		"tenant-id", "t", startOpts.TenantID, "tenant ID")
+	startTenantCmd.Flags().IntVar(&startOpts.TenantInstance,
+		"tenant-instance", 0, "specific tenant instance to connect to")
 
 	stopCmd.Flags().IntVar(&sig, "sig", sig, "signal to pass to kill")
 	stopCmd.Flags().BoolVar(&waitFlag, "wait", waitFlag, "wait for processes to exit")
@@ -219,9 +227,14 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 	putCmd.Flags().BoolVar(&useTreeDist, "treedist", useTreeDist, "use treedist copy algorithm")
 
 	stageCmd.Flags().StringVar(&stageOS, "os", "", "operating system override for staged binaries")
-	stageCmd.Flags().StringVar(&stageDir, "dir", "", "destination for staged binaries")
+	stageCmd.Flags().StringVar(&stageArch, "arch", "",
+		"architecture override for staged binaries [amd64, arm64, fips]; N.B. fips implies amd64 with openssl")
 
+	stageCmd.Flags().StringVar(&stageDir, "dir", "", "destination for staged binaries")
+	// N.B. stageURLCmd just prints the URL that stageCmd would use.
 	stageURLCmd.Flags().StringVar(&stageOS, "os", "", "operating system override for staged binaries")
+	stageURLCmd.Flags().StringVar(&stageArch, "arch", "",
+		"architecture override for staged binaries [amd64, arm64, fips]; N.B. fips implies amd64 with openssl")
 
 	logsCmd.Flags().StringVar(&logsFilter,
 		"filter", "", "re to filter log messages")
@@ -252,6 +265,9 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 	grafanaStartCmd.Flags().StringVar(&grafanaConfig,
 		"grafana-config", "", "URI to grafana json config, supports local and http(s) schemes")
 
+	grafanaStartCmd.Flags().StringVar(&grafanaArch, "arch", "",
+		"binary architecture override [amd64, arm64]")
+
 	grafanaURLCmd.Flags().BoolVar(&grafanaurlOpen,
 		"open", false, "open the grafana dashboard url on the browser")
 
@@ -260,6 +276,13 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 
 	initCmd.Flags().IntVar(&startOpts.InitTarget,
 		"init-target", startOpts.InitTarget, "node on which to run initialization")
+
+	snapshotDeleteCmd.Flags().BoolVar(&dryrun,
+		"dry-run", false, "dry run (don't perform any actions)")
+	snapshotCmd.AddCommand(snapshotCreateCmd)
+	snapshotCmd.AddCommand(snapshotListCmd)
+	snapshotCmd.AddCommand(snapshotDeleteCmd)
+	snapshotCmd.AddCommand(snapshotApplyCmd)
 
 	rootStorageCmd.AddCommand(rootStorageCollectionCmd)
 	rootStorageCollectionCmd.AddCommand(collectionStartCmd)
@@ -289,6 +312,9 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 		"the volume type that should be created. Provide a volume type that is connected to"+
 			" the provider chosen for the cluster. If no volume type is provided the provider default will be used. "+
 			"Note: This volume will be deleted once the VM is deleted.")
+
+	updateCmd.Flags().BoolVar(&revertUpdate, "revert", false, "restore roachprod to the previous version "+
+		"which would have been renamed to roachprod.bak during the update process")
 
 	for _, cmd := range []*cobra.Command{createCmd, destroyCmd, extendCmd, logsCmd} {
 		cmd.Flags().StringVarP(&username, "username", "u", os.Getenv("ROACHPROD_USER"),
@@ -331,9 +357,11 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 		cmd.Flags().BoolVar(&secure,
 			"secure", false, "use a secure cluster")
 	}
-	for _, cmd := range []*cobra.Command{pgurlCmd, sqlCmd} {
+	for _, cmd := range []*cobra.Command{pgurlCmd, sqlCmd, adminurlCmd} {
 		cmd.Flags().StringVar(&tenantName,
 			"tenant-name", "", "specific tenant to connect to")
+		cmd.Flags().IntVar(&tenantInstance,
+			"tenant-instance", 0, "specific tenant instance to connect to")
 	}
 
 }

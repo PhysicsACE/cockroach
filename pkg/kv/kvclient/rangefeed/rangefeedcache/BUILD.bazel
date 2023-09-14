@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -36,19 +35,21 @@ go_test(
     embed = [":rangefeedcache"],
     deps = [
         "//pkg/base",
-        "//pkg/ccl/kvccl/kvtenantccl",
+        "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvclient/kvtenant",
         "//pkg/kv/kvclient/rangecache",  # keep
         "//pkg/kv/kvclient/rangefeed",
         "//pkg/kv/kvclient/rangefeed/rangefeedbuffer",
         "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver",
+        "//pkg/kv/kvserver/closedts",
         "//pkg/roachpb",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
-        "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/encoding",
         "//pkg/util/grpcutil",
@@ -62,5 +63,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

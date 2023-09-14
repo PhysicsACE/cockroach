@@ -32,7 +32,7 @@ import (
 
 var targetObjectToPrivilegeObject = map[privilege.TargetObjectType]privilege.ObjectType{
 	privilege.Tables:    privilege.Table,
-	privilege.Sequences: privilege.Table,
+	privilege.Sequences: privilege.Sequence,
 	privilege.Types:     privilege.Type,
 	privilege.Schemas:   privilege.Schema,
 	privilege.Functions: privilege.Function,
@@ -213,13 +213,17 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForSchemas(
 
 		for _, role := range roles {
 			if n.n.IsGrant {
-				defaultPrivs.GrantDefaultPrivileges(
+				if err := defaultPrivs.GrantDefaultPrivileges(
 					role, privileges, granteeSQLUsernames, objectType, grantOption,
-				)
+				); err != nil {
+					return err
+				}
 			} else {
-				defaultPrivs.RevokeDefaultPrivileges(
+				if err := defaultPrivs.RevokeDefaultPrivileges(
 					role, privileges, granteeSQLUsernames, objectType, grantOption,
-				)
+				); err != nil {
+					return err
+				}
 			}
 
 			eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}
@@ -292,13 +296,17 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForDatabase(
 
 	for _, role := range roles {
 		if n.n.IsGrant {
-			defaultPrivs.GrantDefaultPrivileges(
+			if err := defaultPrivs.GrantDefaultPrivileges(
 				role, privileges, granteeSQLUsernames, objectType, grantOption,
-			)
+			); err != nil {
+				return err
+			}
 		} else {
-			defaultPrivs.RevokeDefaultPrivileges(
+			if err := defaultPrivs.RevokeDefaultPrivileges(
 				role, privileges, granteeSQLUsernames, objectType, grantOption,
-			)
+			); err != nil {
+				return err
+			}
 		}
 
 		eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}

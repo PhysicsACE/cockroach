@@ -12,14 +12,17 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
 
 const (
-	benchTimeFlag = "bench-time"
-	benchMemFlag  = "bench-mem"
+	benchTimeFlag           = "bench-time"
+	benchMemFlag            = "bench-mem"
+	runSepProcessTenantFlag = "run-sep-process-tenant"
 )
 
 // makeBenchCmd constructs the subcommand used to run the specified benchmarks.
@@ -49,6 +52,7 @@ func makeBenchCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Com
 	benchCmd.Flags().Bool(benchMemFlag, false, "print memory allocations for benchmarks")
 	benchCmd.Flags().Bool(streamOutputFlag, false, "stream bench output during run")
 	benchCmd.Flags().String(testArgsFlag, "", "additional arguments to pass to go test binary")
+	benchCmd.Flags().Bool(runSepProcessTenantFlag, false, "run separate process tenant benchmarks (these may freeze due to tenant limits)")
 
 	return benchCmd
 }
@@ -57,17 +61,18 @@ func (d *dev) bench(cmd *cobra.Command, commandLine []string) error {
 	pkgs, additionalBazelArgs := splitArgsAtDash(cmd, commandLine)
 	ctx := cmd.Context()
 	var (
-		filter       = mustGetFlagString(cmd, filterFlag)
-		ignoreCache  = mustGetFlagBool(cmd, ignoreCacheFlag)
-		timeout      = mustGetFlagDuration(cmd, timeoutFlag)
-		short        = mustGetFlagBool(cmd, shortFlag)
-		showLogs     = mustGetFlagBool(cmd, showLogsFlag)
-		verbose      = mustGetFlagBool(cmd, vFlag)
-		count        = mustGetFlagInt(cmd, countFlag)
-		benchTime    = mustGetFlagString(cmd, benchTimeFlag)
-		benchMem     = mustGetFlagBool(cmd, benchMemFlag)
-		streamOutput = mustGetFlagBool(cmd, streamOutputFlag)
-		testArgs     = mustGetFlagString(cmd, testArgsFlag)
+		filter              = mustGetFlagString(cmd, filterFlag)
+		ignoreCache         = mustGetFlagBool(cmd, ignoreCacheFlag)
+		timeout             = mustGetFlagDuration(cmd, timeoutFlag)
+		short               = mustGetFlagBool(cmd, shortFlag)
+		showLogs            = mustGetFlagBool(cmd, showLogsFlag)
+		verbose             = mustGetFlagBool(cmd, vFlag)
+		count               = mustGetFlagInt(cmd, countFlag)
+		benchTime           = mustGetFlagString(cmd, benchTimeFlag)
+		benchMem            = mustGetFlagBool(cmd, benchMemFlag)
+		streamOutput        = mustGetFlagBool(cmd, streamOutputFlag)
+		testArgs            = mustGetFlagString(cmd, testArgsFlag)
+		runSepProcessTenant = mustGetFlagBool(cmd, runSepProcessTenantFlag)
 	)
 
 	// Enumerate all benches to run.
@@ -146,6 +151,9 @@ func (d *dev) bench(cmd *cobra.Command, commandLine []string) error {
 	if benchMem {
 		args = append(args, "--test_arg", "-test.benchmem")
 	}
+	if runSepProcessTenant {
+		args = append(args, "--test_arg", "-run-sep-process-tenant")
+	}
 	args = append(args, "--crdb_test_off")
 	if testArgs != "" {
 		goTestArgs, err := d.getGoTestArgs(ctx, testArgs)
@@ -154,8 +162,23 @@ func (d *dev) bench(cmd *cobra.Command, commandLine []string) error {
 		}
 		args = append(args, goTestArgs...)
 	}
-	args = append(args, d.getTestOutputArgs(false /* stress */, verbose, showLogs, streamOutput)...)
+	args = append(args, d.getGoTestEnvArgs()...)
+	args = append(args, d.getTestOutputArgs(verbose, showLogs, streamOutput)...)
 	args = append(args, additionalBazelArgs...)
 	logCommand("bazel", args...)
 	return d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...)
+}
+
+func (d *dev) getGoTestEnvArgs() []string {
+	var goTestEnv []string
+	// Make the `$HOME/.cache/crdb-test-fixtures` directory available for reusable
+	// test fixtures, if available. See testfixtures.ReuseOrGenerate().
+	if cacheDir, err := d.os.UserCacheDir(); err == nil {
+		dir := filepath.Join(cacheDir, "crdb-test-fixtures")
+		if err := os.MkdirAll(dir, 0755); err == nil {
+			goTestEnv = append(goTestEnv, "--test_env", fmt.Sprintf("COCKROACH_TEST_FIXTURES_DIR=%s", dir))
+			goTestEnv = append(goTestEnv, fmt.Sprintf("--sandbox_writable_path=%s", dir))
+		}
+	}
+	return goTestEnv
 }

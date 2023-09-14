@@ -251,7 +251,9 @@ type zigzagJoiner struct {
 	rowAlloc           rowenc.EncDatumRowAlloc
 	fetchedInititalRow bool
 
-	scanStats execstats.ScanStats
+	contentionEventsListener  execstats.ContentionEventsListener
+	scanStatsListener         execstats.ScanStatsListener
+	tenantConsumptionListener execstats.TenantConsumptionListener
 }
 
 // zigzagJoinerBatchSize is a parameter which determines how many rows should
@@ -279,7 +281,6 @@ func newZigzagJoiner(
 	spec *execinfrapb.ZigzagJoinerSpec,
 	fixedValues []rowenc.EncDatumRow,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*zigzagJoiner, error) {
 	if len(spec.Sides) != 2 {
 		return nil, errors.AssertionFailedf("zigzag joins only of two tables (or indexes) are supported, %d requested", len(spec.Sides))
@@ -315,7 +316,6 @@ func newZigzagJoiner(
 		spec.OnExpr,
 		false, /* outputContinuationColumn */
 		post,
-		output,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				// We need to generate metadata before closing the processor
@@ -373,7 +373,7 @@ func valuesSpecToEncDatum(
 	res = make([]rowenc.EncDatum, len(valuesSpec.Columns))
 	rem := valuesSpec.RawBytes[0]
 	for i, colInfo := range valuesSpec.Columns {
-		res[i], rem, err = rowenc.EncDatumFromBuffer(colInfo.Type, colInfo.Encoding, rem)
+		res[i], rem, err = rowenc.EncDatumFromBuffer(colInfo.Encoding, rem)
 		if err != nil {
 			return nil, err
 		}
@@ -383,7 +383,10 @@ func valuesSpecToEncDatum(
 
 // Start is part of the RowSource interface.
 func (z *zigzagJoiner) Start(ctx context.Context) {
-	ctx = z.StartInternal(ctx, zigzagJoinerProcName)
+	ctx = z.StartInternal(
+		ctx, zigzagJoinerProcName, &z.contentionEventsListener,
+		&z.scanStatsListener, &z.tenantConsumptionListener,
+	)
 	z.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 	log.VEventf(ctx, 2, "starting zigzag joiner run")
 }
@@ -845,16 +848,13 @@ func (z *zigzagJoiner) ConsumerClosed() {
 
 // execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
 func (z *zigzagJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
-	z.scanStats = execstats.GetScanStats(z.Ctx(), z.ExecStatsTrace)
-
-	contentionTime, contentionEvents := execstats.GetCumulativeContentionTime(z.Ctx(), z.ExecStatsTrace)
 	kvStats := execinfrapb.KVStats{
 		BytesRead:           optional.MakeUint(uint64(z.getBytesRead())),
-		ContentionTime:      optional.MakeTimeValue(contentionTime),
-		ContentionEvents:    contentionEvents,
+		KVPairsRead:         optional.MakeUint(uint64(z.getKVPairsRead())),
+		ContentionTime:      optional.MakeTimeValue(z.contentionEventsListener.CumulativeContentionTime),
 		BatchRequestsIssued: optional.MakeUint(uint64(z.getBatchRequestsIssued())),
 	}
-	execstats.PopulateKVMVCCStats(&kvStats, &z.scanStats)
+	execstats.PopulateKVMVCCStats(&kvStats, &z.scanStatsListener.ScanStats)
 	for i := range z.infos {
 		fis, ok := getFetcherInputStats(z.infos[i].fetcher)
 		if !ok {
@@ -868,7 +868,7 @@ func (z *zigzagJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 		KV:     kvStats,
 		Output: z.OutputHelper.Stats(),
 	}
-	ret.Exec.ConsumedRU = optional.MakeUint(z.scanStats.ConsumedRU)
+	ret.Exec.ConsumedRU = optional.MakeUint(z.tenantConsumptionListener.ConsumedRU)
 	return ret
 }
 
@@ -878,6 +878,14 @@ func (z *zigzagJoiner) getBytesRead() int64 {
 		bytesRead += z.infos[i].fetcher.GetBytesRead()
 	}
 	return bytesRead
+}
+
+func (z *zigzagJoiner) getKVPairsRead() int64 {
+	var kvPairsRead int64
+	for i := range z.infos {
+		kvPairsRead += z.infos[i].fetcher.GetKVPairsRead()
+	}
+	return kvPairsRead
 }
 
 func (z *zigzagJoiner) getRowsRead() int64 {

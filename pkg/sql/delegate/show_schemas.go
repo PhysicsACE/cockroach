@@ -38,7 +38,7 @@ func (d *delegator) delegateShowSchemas(n *tree.ShowSchemas) (tree.Statement, er
 		lexbase.EscapeSQLString(string(name)),
 	)
 
-	return parse(getSchemasQuery)
+	return d.parse(getSchemasQuery)
 }
 
 func (d *delegator) delegateShowCreateAllSchemas() (tree.Statement, error) {
@@ -53,7 +53,7 @@ func (d *delegator) delegateShowCreateAllSchemas() (tree.Statement, error) {
 		lexbase.EscapeSQLString(databaseLiteral),
 	)
 
-	return parse(query)
+	return d.parse(query)
 }
 
 // getSpecifiedOrCurrentDatabase returns the name of the specified database, or
@@ -62,18 +62,6 @@ func (d *delegator) delegateShowCreateAllSchemas() (tree.Statement, error) {
 // Returns an error if there is no current database, or if the specified
 // database doesn't exist.
 func (d *delegator) getSpecifiedOrCurrentDatabase(specifiedDB tree.Name) (tree.Name, error) {
-	var name cat.SchemaName
-	if specifiedDB != "" {
-		// Note: the schema name may be interpreted as database name,
-		// see name_resolution.go.
-		name.SchemaName = specifiedDB
-		name.ExplicitSchema = true
-	}
-
 	flags := cat.Flags{AvoidDescriptorCaches: true}
-	_, resName, err := d.catalog.ResolveSchema(d.ctx, flags, &name)
-	if err != nil {
-		return "", err
-	}
-	return resName.CatalogName, nil
+	return d.catalog.LookupDatabaseName(d.ctx, flags, string(specifiedDB))
 }

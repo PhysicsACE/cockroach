@@ -12,6 +12,7 @@ package opt
 
 import (
 	"context"
+	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -174,6 +175,10 @@ type TableMeta struct {
 	// Computed columns with non-immutable operators are omitted.
 	ComputedCols map[ColumnID]ScalarExpr
 
+	// ColsInComputedColsExpressions is the set of all columns referenced in the
+	// expressions used to build the column data of computed columns.
+	ColsInComputedColsExpressions ColSet
+
 	// partialIndexPredicates is a map from index ordinals on the table to
 	// *FiltersExprs representing the predicate on the corresponding partial
 	// index. If an index is not a partial index, it will not have an entry in
@@ -204,6 +209,53 @@ type TableMeta struct {
 
 	// anns annotates the table metadata with arbitrary data.
 	anns [maxTableAnnIDCount]interface{}
+
+	// notVisibleIndexMap stores information about index invisibility which maps
+	// from index ordinal to index invisibility.
+	notVisibleIndexMap map[cat.IndexOrdinal]bool
+}
+
+// IsIndexNotVisible returns true if the given index is not visible, and false
+// if it is fully visible. If the index is partially visible (i.e., it has a
+// value for invisibility in the range (0.0, 1.0)), IsIndexNotVisible randomly
+// chooses to make the index fully not visible (to this query) with probability
+// proportional to the invisibility setting for the index. Otherwise, the index
+// is fully visible (to this query). IsIndexNotVisible caches the result so that
+// it always returns the same value for a given index.
+func (tm *TableMeta) IsIndexNotVisible(indexOrd cat.IndexOrdinal, rng *rand.Rand) bool {
+	if tm.notVisibleIndexMap == nil {
+		tm.notVisibleIndexMap = make(map[cat.IndexOrdinal]bool)
+	}
+	// See if the visibility is already cached.
+	if val, ok := tm.notVisibleIndexMap[indexOrd]; ok {
+		return val
+	}
+	// Otherwise, roll the dice to assign index visibility.
+	indexInvisibility := tm.Table.Index(indexOrd).GetInvisibility()
+	// If we are making an index recommendation, we do not want to use partially
+	// visible indexes.
+	if tm.Table.IsHypothetical() && indexInvisibility != 0 {
+		indexInvisibility = 1
+	}
+
+	// If the index invisibility is 40%, we want to make this index invisible 40%
+	// of the time (invisible to 40% of the queries).
+	isNotVisible := false
+	if indexInvisibility == 1 {
+		isNotVisible = true
+	} else if indexInvisibility != 0 {
+		var r float64
+		if rng == nil {
+			r = rand.Float64()
+		} else {
+			r = rng.Float64()
+		}
+		if r <= indexInvisibility {
+			isNotVisible = true
+		}
+	}
+	tm.notVisibleIndexMap[indexOrd] = isNotVisible
+	return isNotVisible
 }
 
 // TableAnnotation returns the given annotation that is associated with the
@@ -249,6 +301,7 @@ func (tm *TableMeta) copyFrom(from *TableMeta, copyScalarFn func(Expr) Expr) {
 		for col, e := range from.ComputedCols {
 			tm.ComputedCols[col] = copyScalarFn(e).(ScalarExpr)
 		}
+		tm.ColsInComputedColsExpressions = from.ColsInComputedColsExpressions
 	}
 
 	if from.partialIndexPredicates != nil {
@@ -335,12 +388,15 @@ func (tm *TableMeta) SetConstraints(constraints ScalarExpr) {
 	tm.Constraints = constraints
 }
 
-// AddComputedCol adds a computed column expression to the table's metadata.
-func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr) {
+// AddComputedCol adds a computed column expression to the table's metadata and
+// also adds any referenced columns in the `computedCol` expression to the
+// table's metadata.
+func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr, outerCols ColSet) {
 	if tm.ComputedCols == nil {
 		tm.ComputedCols = make(map[ColumnID]ScalarExpr)
 	}
 	tm.ComputedCols[colID] = computedCol
+	tm.ColsInComputedColsExpressions.UnionWith(outerCols)
 }
 
 // ComputedColExpr returns the computed expression for the given column, if it

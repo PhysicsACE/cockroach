@@ -99,11 +99,6 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 		return
 	}
 	k1 := makePrintableKey(iter.UnsafeKey())
-	k2 := makePrintableKey(iter.Key())
-	if !k1.Equal(k2) {
-		fmt.Fprintf(b, "output: key: %s != %s\n", k1, k2)
-		return
-	}
 	engineKey, ok := DecodeEngineKey(iter.UnsafeRawKey())
 	if !ok {
 		fmt.Fprintf(b, "output: could not DecodeEngineKey: %x\n", iter.UnsafeRawKey())
@@ -145,12 +140,12 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 
 	v1, err := iter.UnsafeValue()
 	if err != nil {
-		fmt.Fprintf(b, "output: unable to fetch value: %s\n", err.Error())
+		fmt.Fprintf(b, "output: unable to fetch value: %s\n", err)
 		return
 	}
 	v2, err := iter.Value()
 	if err != nil {
-		fmt.Fprintf(b, "output: unable to fetch value: %s\n", err.Error())
+		fmt.Fprintf(b, "output: unable to fetch value: %s\n", err)
 		return
 	}
 	if !bytes.Equal(v1, v2) {
@@ -159,6 +154,7 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 	}
 	if len(v1) != iter.ValueLen() {
 		fmt.Fprintf(b, "output: value len: %d != %d\n", len(v1), iter.ValueLen())
+		return
 	}
 	if k1.Timestamp.IsEmpty() {
 		var meta enginepb.MVCCMetadata
@@ -197,9 +193,9 @@ func checkAndOutputIter(iter MVCCIterator, b *strings.Builder) {
 //   - define: defines key-value pairs in the lock table and MVCC key spaces.
 //     Intents can only be in the lock table, and inline meta and MVCC values in
 //     the latter.
-//     meta k=<key> ts=<ts> txn=<txn>  defines an intent
-//     meta k=<key>                    defines an inline meta
-//     value k=<key> ts=<ts> v=<value> defines an MVCC value
+//     meta k=<key> str=<strength> ts=<ts> txn=<txn> defines an intent/lock
+//     meta k=<key>                                  defines an inline meta
+//     value k=<key> ts=<ts> v=<value>               defines an MVCC value
 //     It is acceptable to define intents without provisional values to test
 //     out error checking code paths.
 //   - iter: for iterating, is defined as
@@ -240,7 +236,7 @@ func TestIntentInterleavingIter(t *testing.T) {
 				var mvccSection bool
 				// pos is the original <file>:<lineno> prefix computed by
 				// datadriven. It points to the top "define" command itself.
-				// We editing d.Pos in-place below by extending `pos` upon
+				// We are editing d.Pos in-place below by extending `pos` upon
 				// each new line.
 				pos := d.Pos
 				for i, line := range strings.Split(d.Input, "\n") {
@@ -270,22 +266,26 @@ func TestIntentInterleavingIter(t *testing.T) {
 					case "meta":
 						key := scanRoachKey(t, d, "k")
 						// We don't bother populating most fields in the proto.
+						var str lock.Strength
 						var meta enginepb.MVCCMetadata
 						var txnUUID uuid.UUID
 						if d.HasArg("ts") && !locksSection {
 							t.Fatalf("%s: cannot specify an intent in the mvcc section", d.Pos)
 						}
 						if locksSection {
-							var tsS string
-							d.ScanArgs(t, "ts", &tsS)
-							ts, err := hlc.ParseTimestamp(tsS)
-							if err != nil {
-								t.Fatalf("%v", err)
+							str = scanLockStrength(t, d, "str")
+							if str == lock.Intent {
+								var tsS string
+								d.ScanArgs(t, "ts", &tsS)
+								ts, err := hlc.ParseTimestamp(tsS)
+								if err != nil {
+									t.Fatalf("%v", err)
+								}
+								meta.Timestamp = ts.ToLegacyTimestamp()
+							} else if d.HasArg("ts") {
+								t.Fatalf("unexpected timestamp with lock strength: %s", str)
 							}
-							meta.Timestamp = ts.ToLegacyTimestamp()
-							var txn int
-							d.ScanArgs(t, "txn", &txn)
-							txnUUID = uuid.FromUint128(uint128.FromInts(0, uint64(txn)))
+							txnUUID = scanTxnID(t, d, "txn")
 							meta.Txn = &enginepb.TxnMeta{ID: txnUUID}
 						}
 						val, err := protoutil.Marshal(&meta)
@@ -299,7 +299,7 @@ func TestIntentInterleavingIter(t *testing.T) {
 								return err.Error()
 							}
 						} else {
-							ltKey := LockTableKey{Key: key, Strength: lock.Exclusive, TxnUUID: txnUUID[:]}
+							ltKey := LockTableKey{Key: key, Strength: str, TxnUUID: txnUUID}
 							eKey, _ := ltKey.ToEngineKey(nil)
 							if err := batch.PutEngineKey(eKey, val); err != nil {
 								return err.Error()
@@ -323,6 +323,8 @@ func TestIntentInterleavingIter(t *testing.T) {
 						if err := batch.PutMVCC(mvccKey, mvccValue); err != nil {
 							return err.Error()
 						}
+					default:
+						t.Fatalf("%s: unknown command %q", d.Pos, d.Cmd)
 					}
 				}
 				d.Pos = pos
@@ -342,12 +344,16 @@ func TestIntentInterleavingIter(t *testing.T) {
 				if d.HasArg("prefix") {
 					d.ScanArgs(t, "prefix", &opts.Prefix)
 				}
-				iter := maybeWrapInUnsafeIter(newIntentInterleavingIterator(eng, opts))
+				iiter, err := newIntentInterleavingIterator(eng, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				iter := maybeWrapInUnsafeIter(iiter)
 				var b strings.Builder
 				defer iter.Close()
 				// pos is the original <file>:<lineno> prefix computed by
 				// datadriven. It points to the top "define" command itself.
-				// We editing d.Pos in-place below by extending `pos` upon
+				// We are editing d.Pos in-place below by extending `pos` upon
 				// each new line.
 				pos := d.Pos
 				for i, line := range strings.Split(d.Input, "\n") {
@@ -389,13 +395,14 @@ func TestIntentInterleavingIter(t *testing.T) {
 						stats.Stats.InternalStats = pebble.InternalIteratorStats{}
 						fmt.Fprintf(&b, "stats: %s\n", stats.Stats.String())
 					default:
-						fmt.Fprintf(&b, "unknown command: %s\n", d.Cmd)
+						t.Fatalf("%s: unknown command %q", d.Pos, d.Cmd)
 					}
 				}
 				d.Pos = pos
 				return b.String()
 			default:
-				return fmt.Sprintf("unknown command: %s", d.Cmd)
+				t.Fatalf("%s: unknown command %q", d.Pos, d.Cmd)
+				return ""
 			}
 		})
 	})
@@ -409,33 +416,53 @@ func TestIntentInterleavingIterBoundaries(t *testing.T) {
 	// Boundary cases for constrainedToLocal.
 	func() {
 		opts := IterOptions{LowerBound: keys.MinKey}
-		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		require.Equal(t, constrainedToLocal, iter.constraint)
 		iter.SeekLT(MVCCKey{Key: keys.LocalMax})
 	}()
 	func() {
 		opts := IterOptions{UpperBound: keys.LocalMax}
-		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		require.Equal(t, constrainedToLocal, iter.constraint)
 	}()
 	require.Panics(t, func() {
 		opts := IterOptions{UpperBound: keys.LocalMax}
-		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		iter.SeekLT(MVCCKey{Key: keys.MaxKey})
 	})
 	// Boundary cases for constrainedToGlobal.
 	func() {
 		opts := IterOptions{LowerBound: keys.LocalMax}
-		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		require.Equal(t, constrainedToGlobal, iter.constraint)
 	}()
 	func() {
 		opts := IterOptions{LowerBound: keys.LocalMax}
-		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		require.Equal(t, constrainedToGlobal, iter.constraint)
 		iter.SeekLT(MVCCKey{Key: keys.LocalMax})
@@ -443,14 +470,22 @@ func TestIntentInterleavingIterBoundaries(t *testing.T) {
 	// Panics for using a local key that is above the lock table.
 	require.Panics(t, func() {
 		opts := IterOptions{UpperBound: keys.LocalMax}
-		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		require.Equal(t, constrainedToLocal, iter.constraint)
 		iter.SeekLT(MVCCKey{Key: keys.LocalRangeLockTablePrefix.PrefixEnd()})
 	})
 	require.Panics(t, func() {
 		opts := IterOptions{UpperBound: keys.LocalMax}
-		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		require.Equal(t, constrainedToLocal, iter.constraint)
 		iter.SeekGE(MVCCKey{Key: keys.LocalRangeLockTablePrefix.PrefixEnd()})
@@ -459,13 +494,21 @@ func TestIntentInterleavingIterBoundaries(t *testing.T) {
 	// specified.
 	func() {
 		opts := IterOptions{Prefix: true, LowerBound: keys.LocalMax}
-		iter := newIntentInterleavingIterator(eng, opts).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		require.Equal(t, constrainedToGlobal, iter.constraint)
 	}()
 	// Prefix iteration with no bounds.
 	func() {
-		iter := newIntentInterleavingIterator(eng, IterOptions{Prefix: true}).(*intentInterleavingIter)
+		iiiter, err := newIntentInterleavingIterator(eng, IterOptions{Prefix: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		iter := iiiter.(*intentInterleavingIter)
 		defer iter.Close()
 		require.Equal(t, notConstrained, iter.constraint)
 	}()
@@ -474,18 +517,29 @@ func TestIntentInterleavingIterBoundaries(t *testing.T) {
 type lockKeyValue struct {
 	key LockTableKey
 	val []byte
-	// An intent that is not live is written along with a Delete or SingleDelete
-	// to delete it. Deleted intents don't exercise any code in
+	// A lock table key that is not live is written along with a Delete or
+	// SingleDelete to delete it. Deleted keys don't exercise any code in
 	// intentInterleavingIter, but test the underlying Pebble code, just in case
 	// there are any undiscovered bugs.
-	liveIntent bool
+	liveKey bool
 }
 
 func generateRandomData(
 	t *testing.T, rng *rand.Rand, isLocal bool,
 ) (lkv []lockKeyValue, mvcckv []MVCCKeyValue) {
-	numKeys := 10000
 	txnIDMap := make(map[int32]struct{})
+	getTxnID := func() uuid.UUID {
+		for {
+			// Find a unique txn ID.
+			txnIDInt32 := rng.Int31()
+			if _, found := txnIDMap[txnIDInt32]; found {
+				continue
+			}
+			txnIDMap[txnIDInt32] = struct{}{}
+			return uuid.FromUint128(uint128.FromInts(0, uint64(txnIDInt32)))
+		}
+	}
+	numKeys := 10000
 	for i := 0; i < numKeys; i++ {
 		var key roachpb.Key
 		if isLocal {
@@ -493,6 +547,7 @@ func generateRandomData(
 		}
 		key = append(key, roachpb.Key(fmt.Sprintf("key%08d", i))...)
 		hasIntent := rng.Int31n(2) == 0
+		numLocks := rng.Int31n(4)
 		numVersions := int(rng.Int31n(4)) + 1
 		var timestamps []int
 		for j := 0; j < numVersions; j++ {
@@ -509,26 +564,33 @@ func generateRandomData(
 		}
 		timestamps = timestamps[:last+1]
 		for i, ts := range timestamps {
-			var txnID int32
-			for {
-				// Find unique txn ID.
-				txnID = rng.Int31()
-				if _, found := txnIDMap[txnID]; found {
-					continue
-				}
-				txnIDMap[txnID] = struct{}{}
-				break
-			}
-			txnUUID := uuid.FromUint128(uint128.FromInts(0, uint64(txnID)))
+			// Intent.
 			meta := enginepb.MVCCMetadata{
 				Timestamp: hlc.LegacyTimestamp{WallTime: int64(ts)},
-				Txn:       &enginepb.TxnMeta{ID: txnUUID},
+				Txn:       &enginepb.TxnMeta{ID: getTxnID()},
 			}
 			val, err := protoutil.Marshal(&meta)
 			require.NoError(t, err)
-			ltKey := LockTableKey{Key: key, Strength: lock.Exclusive, TxnUUID: txnUUID[:]}
-			lkv = append(lkv, lockKeyValue{
-				key: ltKey, val: val, liveIntent: hasIntent && i == 0})
+			ltKey := LockTableKey{Key: key, Strength: lock.Intent, TxnUUID: meta.Txn.ID}
+			lkv = append(lkv, lockKeyValue{key: ltKey, val: val, liveKey: hasIntent && i == 0})
+			// Lock(s).
+			for j := 0; j < int(numLocks); j++ {
+				str := lock.Exclusive
+				if numLocks > 1 || rng.Int31n(2) == 0 {
+					str = lock.Shared
+				}
+				lockMeta := enginepb.MVCCMetadata{}
+				if j == 0 {
+					lockMeta.Txn = meta.Txn
+				} else {
+					lockMeta.Txn = &enginepb.TxnMeta{ID: getTxnID()}
+				}
+				lockVal, err := protoutil.Marshal(&lockMeta)
+				require.NoError(t, err)
+				lockLTKey := LockTableKey{Key: key, Strength: str, TxnUUID: lockMeta.Txn.ID}
+				lkv = append(lkv, lockKeyValue{key: lockLTKey, val: lockVal, liveKey: i == 0})
+			}
+			// Version.
 			mvcckv = append(mvcckv, MVCCKeyValue{
 				Key:   MVCCKey{Key: key, Timestamp: hlc.Timestamp{WallTime: int64(ts)}},
 				Value: []byte("value"),
@@ -552,15 +614,15 @@ func writeRandomData(
 	// flushed, so both will be in the engine during iteration.
 	for i := len(lkv) - 1; i >= 0; i-- {
 		kv := lkv[i]
-		if interleave {
+		if interleave && kv.key.Strength == lock.Intent {
 			require.NoError(t, batch.PutUnversioned(kv.key.Key, kv.val))
-			if !kv.liveIntent {
-				require.NoError(t, batch.ClearUnversioned(kv.key.Key))
+			if !kv.liveKey {
+				require.NoError(t, batch.ClearUnversioned(kv.key.Key, ClearOptions{}))
 			}
 		} else {
 			eKey, _ := kv.key.ToEngineKey(nil)
 			require.NoError(t, batch.PutEngineKey(eKey, kv.val))
-			if !kv.liveIntent {
+			if !kv.liveKey {
 				require.NoError(t, batch.SingleClearEngineKey(eKey))
 			}
 		}
@@ -673,11 +735,13 @@ func doOps(t *testing.T, ops []string, eng Engine, interleave bool, out *strings
 			if d.HasArg("upper") {
 				opts.UpperBound = scanRoachKey(t, &d, "upper")
 			}
+			var err error
 			if interleave {
-				iter = newIntentInterleavingIterator(eng, opts)
+				iter, err = newIntentInterleavingIterator(eng, opts)
 			} else {
-				iter = eng.NewMVCCIterator(MVCCKeyIterKind, opts)
+				iter, err = eng.NewMVCCIterator(MVCCKeyIterKind, opts)
 			}
+			require.NoError(t, err)
 			lowerStr := "nil"
 			if opts.LowerBound != nil {
 				lowerStr = string(makePrintableRoachpbKey(opts.LowerBound))
@@ -734,7 +798,7 @@ func TestRandomizedIntentInterleavingIter(t *testing.T) {
 	defer eng2.Close()
 	writeRandomData(t, eng1, lockKV, mvccKV, false /* interleave */)
 	writeRandomData(t, eng1, localLockKV, localMvccKV, false /* interleave */)
-	// The interleav=true case physically interleaves the intent and then reads
+	// The interleave=true case physically interleaves the intent and then reads
 	// without using the intentInterleavingIter.
 	writeRandomData(t, eng2, lockKV, mvccKV, true /* interleave */)
 	writeRandomData(t, eng2, localLockKV, localMvccKV, true /* interleave */)
@@ -769,8 +833,8 @@ func writeBenchData(
 	numKeys int,
 	versionsPerKey int,
 	intentKeyStride int,
+	lockKeyStride int,
 	prefix []byte,
-	separated bool,
 ) {
 	batch := eng.NewBatch()
 	txnUUID := uuid.FromUint128(uint128.FromInts(0, uint64(1000)))
@@ -784,13 +848,20 @@ func writeBenchData(
 			}
 			val, err := protoutil.Marshal(&meta)
 			require.NoError(b, err)
-			if separated {
-				eKey, _ :=
-					LockTableKey{Key: key, Strength: lock.Exclusive, TxnUUID: txnUUID[:]}.ToEngineKey(nil)
-				require.NoError(b, batch.PutEngineKey(eKey, val))
-			} else {
-				require.NoError(b, batch.PutUnversioned(key, val))
+			eKey, _ :=
+				LockTableKey{Key: key, Strength: lock.Intent, TxnUUID: txnUUID}.ToEngineKey(nil)
+			require.NoError(b, batch.PutEngineKey(eKey, val))
+		}
+		if i%lockKeyStride == 0 {
+			// Write lock.
+			meta := enginepb.MVCCMetadata{
+				Txn: &enginepb.TxnMeta{ID: txnUUID},
 			}
+			val, err := protoutil.Marshal(&meta)
+			require.NoError(b, err)
+			eKey, _ :=
+				LockTableKey{Key: key, Strength: lock.Shared, TxnUUID: txnUUID}.ToEngineKey(nil)
+			require.NoError(b, batch.PutEngineKey(eKey, val))
 		}
 		for j := versionsPerKey; j >= 1; j-- {
 			require.NoError(b, batch.PutMVCC(
@@ -810,28 +881,26 @@ type benchState struct {
 	benchPrefix string
 	keyPrefix   roachpb.Key
 	eng         Engine
-	separated   bool
 }
 
 var numBenchKeys = 10000
 
 func intentInterleavingIterBench(b *testing.B, runFunc func(b *testing.B, state benchState)) {
-	for _, separated := range []bool{false, true} {
-		for _, versionsPerKey := range []int{1, 5} {
-			for _, intentKeyStride := range []int{1, 100, 1000000} {
+	for _, versionsPerKey := range []int{1, 5} {
+		for _, intentKeyStride := range []int{1, 100, 1000000} {
+			for _, lockKeyStride := range []int{1, 100, 1000000} {
 				for _, keyLength := range []int{10, 100} {
 					func() {
 						state := benchState{
 							benchPrefix: fmt.Sprintf(
-								"separated=%t/version=%d/intentStride=%d/keyLen=%d",
-								separated, versionsPerKey, intentKeyStride, keyLength),
+								"version=%d/intentStride=%d/lockStride=%d/keyLen=%d",
+								versionsPerKey, intentKeyStride, lockKeyStride, keyLength),
 							keyPrefix: bytes.Repeat([]byte("k"), keyLength),
 							eng:       createTestPebbleEngine(),
-							separated: separated,
 						}
 						defer state.eng.Close()
 						writeBenchData(b, state.eng, numBenchKeys, versionsPerKey, intentKeyStride,
-							state.keyPrefix, separated)
+							lockKeyStride, state.keyPrefix)
 						runFunc(b, state)
 					}()
 				}
@@ -846,12 +915,10 @@ func BenchmarkIntentInterleavingIterNext(b *testing.B) {
 	intentInterleavingIterBench(b, func(b *testing.B, state benchState) {
 		b.Run(state.benchPrefix,
 			func(b *testing.B) {
-				var iter MVCCIterator
 				opts := IterOptions{LowerBound: state.keyPrefix, UpperBound: state.keyPrefix.PrefixEnd()}
-				if state.separated {
-					iter = newIntentInterleavingIterator(state.eng, opts)
-				} else {
-					iter = state.eng.NewMVCCIterator(MVCCKeyIterKind, opts)
+				iter, err := newIntentInterleavingIterator(state.eng, opts)
+				if err != nil {
+					b.Fatal(err)
 				}
 				defer iter.Close()
 				startKey := MVCCKey{Key: state.keyPrefix}
@@ -884,13 +951,11 @@ func BenchmarkIntentInterleavingIterPrev(b *testing.B) {
 	intentInterleavingIterBench(b, func(b *testing.B, state benchState) {
 		b.Run(state.benchPrefix,
 			func(b *testing.B) {
-				var iter MVCCIterator
 				endKey := MVCCKey{Key: state.keyPrefix.PrefixEnd()}
 				opts := IterOptions{LowerBound: state.keyPrefix, UpperBound: endKey.Key}
-				if state.separated {
-					iter = newIntentInterleavingIterator(state.eng, opts)
-				} else {
-					iter = state.eng.NewMVCCIterator(MVCCKeyIterKind, opts)
+				iter, err := newIntentInterleavingIterator(state.eng, opts)
+				if err != nil {
+					b.Fatal(err)
 				}
 				defer iter.Close()
 				iter.SeekLT(endKey)
@@ -927,13 +992,11 @@ func BenchmarkIntentInterleavingSeekGEAndIter(b *testing.B) {
 					for i := 0; i < numBenchKeys; i += seekStride {
 						seekKeys = append(seekKeys, makeKey(state.keyPrefix, i))
 					}
-					var iter MVCCIterator
 					endKey := state.keyPrefix.PrefixEnd()
 					opts := IterOptions{LowerBound: state.keyPrefix, UpperBound: endKey}
-					if state.separated {
-						iter = newIntentInterleavingIterator(state.eng, opts)
-					} else {
-						iter = state.eng.NewMVCCIterator(MVCCKeyIterKind, opts)
+					iter, err := newIntentInterleavingIterator(state.eng, opts)
+					if err != nil {
+						b.Fatal(err)
 					}
 					defer iter.Close()
 					b.ResetTimer()

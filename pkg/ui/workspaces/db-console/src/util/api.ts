@@ -13,21 +13,11 @@
  */
 
 import _ from "lodash";
-import moment from "moment";
+import moment from "moment-timezone";
 
 import * as protos from "src/js/protos";
 import { FixLong } from "src/util/fixLong";
 import { propsToQueryString } from "src/util/query";
-
-export type DatabaseDetailsRequestMessage =
-  protos.cockroach.server.serverpb.DatabaseDetailsRequest;
-export type DatabaseDetailsResponseMessage =
-  protos.cockroach.server.serverpb.DatabaseDetailsResponse;
-
-export type TableDetailsRequestMessage =
-  protos.cockroach.server.serverpb.TableDetailsRequest;
-export type TableDetailsResponseMessage =
-  protos.cockroach.server.serverpb.TableDetailsResponse;
 
 export type LocationsRequestMessage =
   protos.cockroach.server.serverpb.LocationsRequest;
@@ -35,8 +25,6 @@ export type LocationsResponseMessage =
   protos.cockroach.server.serverpb.LocationsResponse;
 
 export type NodesRequestMessage = protos.cockroach.server.serverpb.NodesRequest;
-export type NodesResponseMessage =
-  protos.cockroach.server.serverpb.NodesResponse;
 export type NodesResponseExternalMessage =
   protos.cockroach.server.serverpb.NodesResponseExternal;
 
@@ -72,8 +60,6 @@ export type ClusterResponseMessage =
 
 export type TableStatsRequestMessage =
   protos.cockroach.server.serverpb.TableStatsRequest;
-export type TableStatsResponseMessage =
-  protos.cockroach.server.serverpb.TableStatsResponse;
 
 export type IndexStatsRequestMessage =
   protos.cockroach.server.serverpb.TableIndexStatsRequest;
@@ -99,6 +85,11 @@ export type JobsResponseMessage = protos.cockroach.server.serverpb.JobsResponse;
 
 export type JobRequestMessage = protos.cockroach.server.serverpb.JobRequest;
 export type JobResponseMessage = protos.cockroach.server.serverpb.JobResponse;
+
+export type ListJobProfilerExecutionDetailsRequestMessage =
+  protos.cockroach.server.serverpb.ListJobProfilerExecutionDetailsRequest;
+export type ListJobProfilerExecutionDetailsResponseMessage =
+  protos.cockroach.server.serverpb.ListJobProfilerExecutionDetailsResponse;
 
 export type QueryPlanRequestMessage =
   protos.cockroach.server.serverpb.QueryPlanRequest;
@@ -180,8 +171,6 @@ export type MetricMetadataRequestMessage =
 export type MetricMetadataResponseMessage =
   protos.cockroach.server.serverpb.MetricMetadataResponse;
 
-export type StatementsRequestMessage =
-  protos.cockroach.server.serverpb.StatementsRequest;
 export type StatementDetailsRequestMessage =
   protos.cockroach.server.serverpb.StatementDetailsRequest;
 
@@ -210,10 +199,15 @@ export type KeyVisualizerSamplesRequestMessage =
 export type KeyVisualizerSamplesResponseMessage =
   protos.cockroach.server.serverpb.KeyVisSamplesResponse;
 
-export type ListTracingSnapshotsRequestMessage =
-  protos.cockroach.server.serverpb.ListTracingSnapshotsRequest;
-export type ListTracingSnapshotsResponseMessage =
-  protos.cockroach.server.serverpb.ListTracingSnapshotsResponse;
+export type ListTenantsRequestMessage =
+  protos.cockroach.server.serverpb.ListTenantsRequest;
+export type ListTenantsResponseMessage =
+  protos.cockroach.server.serverpb.ListTenantsResponse;
+
+export type NetworkConnectivityRequest =
+  protos.cockroach.server.serverpb.NetworkConnectivityRequest;
+export type NetworkConnectivityResponse =
+  protos.cockroach.server.serverpb.NetworkConnectivityResponse;
 
 // API constants
 
@@ -350,45 +344,6 @@ export type APIRequestFn<TReq, TResponse> = (
 const serverpb = protos.cockroach.server.serverpb;
 const tspb = protos.cockroach.ts.tspb;
 
-// getDatabaseDetails gets details for a specific database
-export function getDatabaseDetails(
-  req: DatabaseDetailsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<DatabaseDetailsResponseMessage> {
-  const queryString = req.include_stats ? "?include_stats=true" : "";
-
-  const promiseErr = IsValidateUriName(req.database);
-  if (promiseErr) {
-    return promiseErr;
-  }
-  return timeoutFetch(
-    serverpb.DatabaseDetailsResponse,
-    `${API_PREFIX}/databases/${EncodeUriName(req.database)}${queryString}`,
-    null,
-    timeout,
-  );
-}
-
-// getTableDetails gets details for a specific table
-export function getTableDetails(
-  req: TableDetailsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<TableDetailsResponseMessage> {
-  const promiseErr = IsValidateUriName(req.database, req.table);
-  if (promiseErr) {
-    return promiseErr;
-  }
-
-  return timeoutFetch(
-    serverpb.TableDetailsResponse,
-    `${API_PREFIX}/databases/${EncodeUriName(
-      req.database,
-    )}/tables/${EncodeUriName(req.table)}`,
-    null,
-    timeout,
-  );
-}
-
 // getUIData gets UI data
 export function getUIData(
   req: GetUIDataRequestMessage,
@@ -512,6 +467,18 @@ export function getJob(
   );
 }
 
+export function listExecutionDetailFiles(
+  req: ListJobProfilerExecutionDetailsRequestMessage,
+  timeout?: moment.Duration,
+): Promise<ListJobProfilerExecutionDetailsResponseMessage> {
+  return timeoutFetch(
+    serverpb.ListJobProfilerExecutionDetailsResponse,
+    `${STATUS_PREFIX}/list_job_profiler_execution_details/${req.job_id}`,
+    null,
+    timeout,
+  );
+}
+
 // getCluster gets info about the cluster
 export function getCluster(
   _req: ClusterRequestMessage,
@@ -520,26 +487,6 @@ export function getCluster(
   return timeoutFetch(
     serverpb.ClusterResponse,
     `${API_PREFIX}/cluster`,
-    null,
-    timeout,
-  );
-}
-
-// getTableStats gets detailed stats about the current table
-export function getTableStats(
-  req: TableStatsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<TableStatsResponseMessage> {
-  const promiseErr = IsValidateUriName(req.database, req.table);
-  if (promiseErr) {
-    return promiseErr;
-  }
-
-  return timeoutFetch(
-    serverpb.TableStatsResponse,
-    `${API_PREFIX}/databases/${EncodeUriName(
-      req.database,
-    )}/tables/${EncodeUriName(req.table)}/stats`,
     null,
     timeout,
   );
@@ -768,24 +715,6 @@ export function getStores(
   );
 }
 
-// getCombinedStatements returns statements the cluster has recently executed, and some stats about them.
-export function getCombinedStatements(
-  req: StatementsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<StatementsResponseMessage> {
-  const queryStr = propsToQueryString({
-    combined: req.combined,
-    start: req.start.toInt(),
-    end: req.end.toInt(),
-  });
-  return timeoutFetch(
-    serverpb.StatementsResponse,
-    `${STATUS_PREFIX}/statements?${queryStr}`,
-    null,
-    timeout,
-  );
-}
-
 // getStatementDetails returns the statistics about the selected statement.
 export function getStatementDetails(
   req: StatementDetailsRequestMessage,
@@ -898,6 +827,30 @@ export function getKeyVisualizerSamples(
   return timeoutFetch(
     serverpb.KeyVisSamplesResponse,
     `${STATUS_PREFIX}/keyvissamples`,
+    req as any,
+    timeout,
+  );
+}
+
+export function getTenants(
+  req: ListTenantsRequestMessage,
+  timeout?: moment.Duration,
+): Promise<ListTenantsResponseMessage> {
+  return timeoutFetch(
+    serverpb.ListTenantsResponse,
+    `${API_PREFIX}/tenants`,
+    req as any,
+    timeout,
+  );
+}
+
+export function getNetworkConnectivity(
+  req: NetworkConnectivityRequest,
+  timeout?: moment.Duration,
+): Promise<NetworkConnectivityResponse> {
+  return timeoutFetch(
+    serverpb.NetworkConnectivityResponse,
+    `${STATUS_PREFIX}/connectivity`,
     req as any,
     timeout,
   );

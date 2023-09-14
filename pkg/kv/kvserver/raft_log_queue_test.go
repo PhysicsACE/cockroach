@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -43,7 +42,7 @@ func TestShouldTruncate(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
-		truncatableIndexes uint64
+		truncatableIndexes kvpb.RaftIndex
 		raftLogSize        int64
 		expected           bool
 	}{
@@ -78,12 +77,12 @@ func TestComputeTruncateDecision(t *testing.T) {
 	// truncate: false", because these tests don't simulate enough data to be over
 	// the truncation threshold.
 	testCases := []struct {
-		commit          uint64
+		commit          kvpb.RaftIndex
 		progress        []uint64
 		raftLogSize     int64
-		firstIndex      uint64
-		lastIndex       uint64
-		pendingSnapshot uint64
+		firstIndex      kvpb.RaftIndex
+		lastIndex       kvpb.RaftIndex
+		pendingSnapshot kvpb.RaftIndex
 		exp             string
 	}{
 		{
@@ -184,7 +183,7 @@ func TestComputeTruncateDecision(t *testing.T) {
 					Next:         v + 1,
 				}
 			}
-			status.Commit = c.commit
+			status.Commit = uint64(c.commit)
 			input := truncateDecisionInput{
 				RaftStatus:           status,
 				LogSize:              c.raftLogSize,
@@ -249,8 +248,8 @@ func TestComputeTruncateDecisionProgressStatusProbe(t *testing.T) {
 			status := raft.Status{
 				Progress: make(map[uint64]tracker.Progress),
 			}
-			progress := []uint64{100, 200, 300, 400, 500}
-			lastIndex := uint64(500)
+			progress := []kvpb.RaftIndex{100, 200, 300, 400, 500}
+			lastIndex := kvpb.RaftIndex(500)
 			status.Commit = 300
 
 			for i, v := range progress {
@@ -263,12 +262,12 @@ func TestComputeTruncateDecisionProgressStatusProbe(t *testing.T) {
 						RecentActive: active,
 						State:        tracker.StateProbe,
 						Match:        0,
-						Next:         v,
+						Next:         uint64(v),
 					}
 				} else { // everyone else
 					pr = tracker.Progress{
-						Match:        v,
-						Next:         v + 1,
+						Match:        uint64(v),
+						Next:         uint64(v + 1),
 						RecentActive: true,
 						State:        tracker.StateReplicate,
 					}
@@ -406,7 +405,7 @@ func TestUpdateRaftStatusActivity(t *testing.T) {
 			}
 			updateRaftProgressFromActivity(ctx, prs, tc.replicas,
 				func(replicaID roachpb.ReplicaID) bool {
-					return tc.lastUpdate.isFollowerActiveSince(ctx, replicaID, tc.now, inactivityThreashold)
+					return tc.lastUpdate.isFollowerActiveSince(replicaID, tc.now, inactivityThreashold)
 				},
 			)
 
@@ -450,18 +449,18 @@ func TestNewTruncateDecision(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 38584)
-
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	store, _ := createTestStore(ctx, t,
-		testStoreOpts{
-			// This test was written before test stores could start with more than one
-			// range and was not adapted.
-			createSystemRanges: false,
-		},
-		stopper)
+
+	opts := testStoreOpts{
+		// This test was written before test stores could start with more than one
+		// range and was not adapted.
+		createSystemRanges: false,
+	}
+	cfg := TestStoreConfig(nil /* clock */)
+	cfg.TestingKnobs.DisableQuiescence = true // quiescence adds spurious empty log entries
+	store := createTestStoreWithConfig(ctx, t, stopper, opts, &cfg)
 	store.SetRaftLogQueueActive(false)
 
 	r, err := store.GetReplica(1)
@@ -469,7 +468,7 @@ func TestNewTruncateDecision(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	getIndexes := func() (uint64, int, uint64, error) {
+	getIndexes := func() (kvpb.RaftIndex, int, kvpb.RaftIndex, error) {
 		d, err := newTruncateDecision(ctx, r)
 		if err != nil {
 			return 0, 0, 0, err
@@ -515,7 +514,7 @@ func TestNewTruncateDecision(t *testing.T) {
 
 	// There can be a delay from when the truncation command is issued and the
 	// indexes updating.
-	var cFirst, cOldest uint64
+	var cFirst, cOldest kvpb.RaftIndex
 	var numTruncatable int
 	testutils.SucceedsSoon(t, func() error {
 		var err error
@@ -648,7 +647,7 @@ func TestSnapshotLogTruncationConstraints(t *testing.T) {
 
 	r.mu.state.RaftAppliedIndex = index1
 	// Add first constraint.
-	_, cleanup1 := r.addSnapshotLogTruncationConstraint(ctx, id1, storeID)
+	_, cleanup1 := r.addSnapshotLogTruncationConstraint(ctx, id1, false /* initial */, storeID)
 	exp1 := map[uuid.UUID]snapTruncationInfo{id1: {index: index1}}
 
 	// Make sure it registered.
@@ -658,15 +657,15 @@ func TestSnapshotLogTruncationConstraints(t *testing.T) {
 	// Add another constraint with the same id. Extremely unlikely in practice
 	// but we want to make sure it doesn't blow anything up. Collisions are
 	// handled by ignoring the colliding update.
-	_, cleanup2 := r.addSnapshotLogTruncationConstraint(ctx, id1, storeID)
+	_, cleanup2 := r.addSnapshotLogTruncationConstraint(ctx, id1, false /* initial */, storeID)
 	assert.Equal(t, r.mu.snapshotLogTruncationConstraints, exp1)
 
 	// Helper that grabs the min constraint index (which can trigger GC as a
 	// byproduct) and asserts.
-	assertMin := func(exp uint64, now time.Time) {
+	assertMin := func(exp kvpb.RaftIndex, now time.Time) {
 		t.Helper()
 		const anyRecipientStore roachpb.StoreID = 0
-		if maxIndex := r.getSnapshotLogTruncationConstraintsRLocked(anyRecipientStore); maxIndex != exp {
+		if _, maxIndex := r.getSnapshotLogTruncationConstraintsRLocked(anyRecipientStore, false /* initialOnly */); maxIndex != exp {
 			t.Fatalf("unexpected max index %d, wanted %d", maxIndex, exp)
 		}
 	}
@@ -678,7 +677,7 @@ func TestSnapshotLogTruncationConstraints(t *testing.T) {
 	r.mu.state.RaftAppliedIndex = index2
 	// Add another, higher, index. We're not going to notice it's around
 	// until the lower one disappears.
-	_, cleanup3 := r.addSnapshotLogTruncationConstraint(ctx, id2, storeID)
+	_, cleanup3 := r.addSnapshotLogTruncationConstraint(ctx, id2, false /* initial */, storeID)
 
 	now := timeutil.Now()
 	// The colliding snapshot comes back. Or the original, we can't tell.
@@ -715,7 +714,7 @@ func TestTruncateLog(t *testing.T) {
 		looselyCoupledTruncationEnabled.Override(ctx, &st.SV, looselyCoupled)
 
 		// Populate the log with 10 entries. Save the LastIndex after each write.
-		var indexes []uint64
+		var indexes []kvpb.RaftIndex
 		for i := 0; i < 10; i++ {
 			args := incrementArgs([]byte("a"), int64(i))
 
@@ -910,7 +909,7 @@ func TestTruncateLogRecompute(t *testing.T) {
 }
 
 func waitForTruncationForTesting(
-	t *testing.T, r *Replica, newFirstIndex uint64, looselyCoupled bool,
+	t *testing.T, r *Replica, newFirstIndex kvpb.RaftIndex, looselyCoupled bool,
 ) {
 	testutils.SucceedsSoon(t, func() error {
 		if looselyCoupled {

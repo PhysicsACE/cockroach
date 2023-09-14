@@ -18,8 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -36,24 +34,20 @@ func TestTenantVars(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-
-	serverParams, _ := tests.CreateTestServerParams()
-	testCluster := serverutils.StartNewTestCluster(t, 1 /* numNodes */, base.TestClusterArgs{
-		ServerArgs: serverParams,
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
-	defer testCluster.Stopper().Stop(ctx)
-
-	srv := testCluster.Server(0 /* idx */)
+	defer srv.Stopper().Stop(ctx)
 
 	testutils.RunTrueAndFalse(t, "shared-process", func(t *testing.T, sharedProcess bool) {
-		var tenant serverutils.TestTenantInterface
+		var tenant serverutils.ApplicationLayerInterface
 		if !sharedProcess {
 			tenant, _ = serverutils.StartTenant(t, srv, base.TestTenantArgs{
 				TenantID: roachpb.MustMakeTenantID(10 /* id */),
 			})
 		} else {
 			var err error
-			tenant, _, err = srv.(*server.TestServer).StartSharedProcessTenant(ctx,
+			tenant, _, err = srv.TenantController().StartSharedProcessTenant(ctx,
 				base.TestSharedProcessTenantArgs{
 					TenantName: roachpb.TenantName("test"),
 					TenantID:   roachpb.MustMakeTenantID(20),
@@ -62,7 +56,7 @@ func TestTenantVars(t *testing.T) {
 		}
 
 		startNowNanos := timeutil.Now().UnixNano()
-		url := tenant.AdminURL() + "/_status/load"
+		url := tenant.AdminURL().WithPath("/_status/load").String()
 		client := http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -96,16 +90,24 @@ func TestTenantVars(t *testing.T) {
 		require.Equal(t, io_prometheus_client.MetricType_GAUGE, now.GetType())
 		nowNanos := now.Metric[0].GetGauge().GetValue()
 
+		uptime, found := metrics["sys_uptime"]
+		require.True(t, found)
+		require.Len(t, uptime.GetMetric(), 1)
+		require.Equal(t, io_prometheus_client.MetricType_GAUGE, uptime.GetType())
+		uptimeSeconds := uptime.Metric[0].GetGauge().GetValue()
+
 		// The values are between zero and whatever User/Sys time is observed after the get.
-		require.Positive(t, cpuUserNanos)
-		require.Positive(t, cpuSysNanos)
-		require.Positive(t, nowNanos)
+		require.LessOrEqual(t, float64(startNowNanos), nowNanos)
+		require.LessOrEqual(t, nowNanos, float64(timeutil.Now().UnixNano()))
+
 		cpuTime := gosigar.ProcTime{}
 		require.NoError(t, cpuTime.Get(os.Getpid()))
+		require.LessOrEqual(t, 0., cpuUserNanos)
 		require.LessOrEqual(t, cpuUserNanos, float64(cpuTime.User)*1e6)
+		require.LessOrEqual(t, 0., cpuSysNanos)
 		require.LessOrEqual(t, cpuSysNanos, float64(cpuTime.Sys)*1e6)
-		require.GreaterOrEqual(t, nowNanos, float64(startNowNanos))
-		require.LessOrEqual(t, nowNanos, float64(timeutil.Now().UnixNano()))
+
+		require.LessOrEqual(t, 0., uptimeSeconds)
 
 		resp, err = client.Get(url)
 		require.NoError(t, err)
@@ -124,13 +126,22 @@ func TestTenantVars(t *testing.T) {
 
 		sysCPU, found = metrics["sys_cpu_sys_ns"]
 		require.True(t, found)
-		require.True(t, found)
 		require.Len(t, sysCPU.GetMetric(), 1)
 		require.Equal(t, io_prometheus_client.MetricType_GAUGE, sysCPU.GetType())
 		cpuSysNanos2 := sysCPU.Metric[0].GetGauge().GetValue()
 
-		require.LessOrEqual(t, float64(cpuTime.User)*1e6, cpuUserNanos2)
-		require.LessOrEqual(t, float64(cpuTime.Sys)*1e6, cpuSysNanos2)
+		uptime, found = metrics["sys_uptime"]
+		require.True(t, found)
+		require.Len(t, uptime.GetMetric(), 1)
+		require.Equal(t, io_prometheus_client.MetricType_GAUGE, uptime.GetType())
+		uptimeSeconds2 := uptime.Metric[0].GetGauge().GetValue()
+
+		cpuTime2 := gosigar.ProcTime{}
+		require.NoError(t, cpuTime2.Get(os.Getpid()))
+
+		require.LessOrEqual(t, float64(cpuTime2.User-cpuTime.User)*1e6, cpuUserNanos2)
+		require.LessOrEqual(t, float64(cpuTime2.Sys-cpuTime.Sys)*1e6, cpuSysNanos2)
+		require.LessOrEqual(t, uptimeSeconds, uptimeSeconds2)
 
 		_, found = metrics["jobs_running_non_idle"]
 		require.True(t, found)

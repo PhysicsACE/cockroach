@@ -71,12 +71,12 @@ type ClusterAndSessionInfo interface {
 // its internal state to anything that ends up using it and only allowing
 // state changes via the provided methods.
 type BuilderState interface {
-	scpb.ElementStatusIterator
 	ElementReferences
 	NameResolver
 	PrivilegeChecker
 	TableHelpers
 	FunctionHelpers
+	SchemaHelpers
 
 	// QueryByID returns all elements sharing the given descriptor ID.
 	QueryByID(descID catid.DescID) ElementResultSet
@@ -98,8 +98,10 @@ type BuilderState interface {
 	// BuildUserPrivilegesFromDefaultPrivileges generates owner and user
 	// privileges elements from default privileges of the given database
 	// and schemas for the given descriptor and object type.
+	// `sc` can be nil if this is for building the schema itself (`descID` will
+	// be the schema ID then).
 	BuildUserPrivilegesFromDefaultPrivileges(
-		db *scpb.Database, sc *scpb.Schema, descID descpb.ID, objType privilege.TargetObjectType,
+		db *scpb.Database, sc *scpb.Schema, descID descpb.ID, objType privilege.TargetObjectType, owner username.SQLUsername,
 	) (*scpb.Owner, []*scpb.UserPrivileges)
 }
 
@@ -146,6 +148,10 @@ type TreeAnnotator interface {
 // Telemetry allows incrementing schema change telemetry counters.
 type Telemetry interface {
 
+	// IncrementSchemaChangeCreateCounter increments the selected CREATE telemetry
+	// counter.
+	IncrementSchemaChangeCreateCounter(counterType string)
+
 	// IncrementSchemaChangeAlterCounter increments the selected ALTER telemetry
 	// counter.
 	IncrementSchemaChangeAlterCounter(counterType string, extra ...string)
@@ -190,6 +196,10 @@ type SchemaFeatureChecker interface {
 	CanPerformDropOwnedBy(
 		ctx context.Context, role username.SQLUsername,
 	) (bool, error)
+
+	// CanCreateCrossDBSequenceOwnerRef returns if cross database sequence
+	// owner references are allowed.
+	CanCreateCrossDBSequenceOwnerRef() error
 }
 
 // PrivilegeChecker checks an element's privileges.
@@ -223,7 +233,7 @@ type TableHelpers interface {
 
 	// NextTableIndexID returns the ID that should be used for any new index added
 	// to this table.
-	NextTableIndexID(table *scpb.Table) catid.IndexID
+	NextTableIndexID(tableID catid.DescID) catid.IndexID
 
 	// NextViewIndexID returns the ID that should be used for any new index added
 	// to this materialized view.
@@ -231,7 +241,17 @@ type TableHelpers interface {
 
 	// NextTableConstraintID returns the ID that should be used for any new constraint
 	// added to this table.
-	NextTableConstraintID(id catid.DescID) catid.ConstraintID
+	NextTableConstraintID(tableID catid.DescID) catid.ConstraintID
+
+	// NextTableTentativeIndexID returns the tentative ID, starting from
+	// scbuild.TABLE_TENTATIVE_IDS_START, that should be used for any new index added to
+	// this table.
+	NextTableTentativeIndexID(tableID catid.DescID) catid.IndexID
+
+	// NextTableTentativeConstraintID parallels NextTableTentativeIndexID and
+	// returns tentative constraint ID, starting from scbuild.TABLE_TENTATIVE_IDS_START,
+	// that should be used for any new index added to this table.
+	NextTableTentativeConstraintID(tableID catid.DescID) catid.ConstraintID
 
 	// IndexPartitioningDescriptor creates a new partitioning descriptor
 	// for the secondary index element, or panics.
@@ -265,16 +285,11 @@ type FunctionHelpers interface {
 	WrapFunctionBody(fnID descpb.ID, bodyStr string, lang catpb.Function_Language, provider ReferenceProvider) *scpb.FunctionBody
 }
 
-// ElementResultSet wraps the results of an element query.
-type ElementResultSet interface {
-	scpb.ElementStatusIterator
-
-	// IsEmpty returns true iff there are no elements in the result set.
-	IsEmpty() bool
-
-	// Filter returns a subset of this result set according to the predicate.
-	Filter(predicate func(current scpb.Status, target scpb.TargetStatus, e scpb.Element) bool) ElementResultSet
+type SchemaHelpers interface {
+	ResolveDatabasePrefix(schemaPrefix *tree.ObjectNamePrefix)
 }
+
+type ElementResultSet = *scpb.ElementCollection[scpb.Element]
 
 // ElementReferences looks up an element's forward and backward references.
 type ElementReferences interface {
@@ -283,8 +298,8 @@ type ElementReferences interface {
 	// references in the given element. This includes the current element.
 	ForwardReferences(e scpb.Element) ElementResultSet
 
-	// BackReferences returns the set of elements to which we have back-references
-	// in the descriptor backing the given element. Back-references also include
+	// BackReferences finds all descriptors with a back-reference to descriptor `id`
+	// and return all elements that belong to them. Back-references also include
 	// children, in the case of databases and schemas.
 	BackReferences(id catid.DescID) ElementResultSet
 }
@@ -304,6 +319,10 @@ type ResolveParams struct {
 	// RequireOwnership if set to true, requires current user be the owner of the
 	// resolved descriptor. It preempts RequiredPrivilege.
 	RequireOwnership bool
+
+	// WithOffline, if set, instructs the catalog reader to include offline
+	// descriptors.
+	WithOffline bool
 }
 
 // NameResolver looks up elements in the catalog by name, and vice-versa.
@@ -319,12 +338,10 @@ type NameResolver interface {
 	// ResolveSchema retrieves a schema by name and returns its elements.
 	ResolveSchema(name tree.ObjectNamePrefix, p ResolveParams) ElementResultSet
 
-	// ResolvePrefix retrieves database and schema given the name prefix. The
-	// requested schema must exist and current user must have the required
-	// privilege.
-	ResolvePrefix(
-		prefix tree.ObjectNamePrefix, requiredSchemaPriv privilege.Kind,
-	) (dbElts ElementResultSet, scElts ElementResultSet)
+	// ResolveTargetObject retrieves database and schema given the unresolved
+	// object name. The requested schema must exist and current user must have the
+	// required privilege.
+	ResolveTargetObject(prefix *tree.UnresolvedObjectName, requiredSchemaPriv privilege.Kind) (dbElts ElementResultSet, scElts ElementResultSet)
 
 	// ResolveUserDefinedTypeType retrieves a type by name and returns its elements.
 	ResolveUserDefinedTypeType(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet

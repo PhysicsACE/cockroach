@@ -92,7 +92,7 @@ func registerKVBenchSpec(r registry.Registry, b kvBenchSpec) {
 		// for --max-rate.
 		// TODO(andrei): output something to roachperf and start running them
 		// nightly.
-		Tags:    []string{"manual"},
+		Tags:    registry.Tags("manual"),
 		Owner:   registry.OwnerKV,
 		Cluster: nodes,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -229,7 +229,7 @@ func runKVBench(ctx context.Context, t test.Test, c cluster.Cluster, b kvBenchSp
 		// Wipe cluster before starting a new run because factors like load-based
 		// splitting can significantly change the underlying layout of the table and
 		// affect benchmark results.
-		c.Wipe(ctx, roachNodes)
+		c.Wipe(ctx, false /* preserveCerts */, roachNodes)
 		c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings(), roachNodes)
 		time.Sleep(restartWait)
 

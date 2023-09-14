@@ -1,0 +1,34 @@
+parse
+DECLARE
+BEGIN
+johnny := NULL;
+gyro = 7 + 7;
+END
+----
+DECLARE
+BEGIN
+johnny := NULL;
+gyro := 7 + 7;
+END
+
+parse
+DECLARE
+BEGIN
+a := NULL;
+END
+----
+DECLARE
+BEGIN
+a := NULL;
+END
+
+
+feature-count
+DECLARE
+BEGIN
+johnny := NULL;
+gyro = 7 + 7;
+END
+----
+stmt_assign: 2
+stmt_block: 1

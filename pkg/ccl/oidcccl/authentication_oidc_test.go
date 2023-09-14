@@ -13,63 +13,41 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
-
-func tenantOrSystemAdminURL(s serverutils.TestServerInterface) string {
-	if len(s.TestTenants()) > 0 {
-		return s.TestTenants()[0].AdminURL()
-	}
-	return s.AdminURL()
-}
 
 func TestOIDCBadRequestIfDisabled(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	newRPCContext := func(cfg *base.Config) *rpc.Context {
-		return rpc.NewContext(ctx,
-			rpc.ContextOptions{
-				TenantID:        roachpb.SystemTenantID,
-				Config:          cfg,
-				Clock:           &timeutil.DefaultTimeSource{},
-				ToleratedOffset: 1,
-				Stopper:         s.Stopper(),
-				Settings:        s.ClusterSettings(),
-
-				ClientOnly: true,
-			})
-	}
-
-	plainHTTPCfg := testutils.NewTestBaseContext(username.TestUserName())
-	testCertsContext := newRPCContext(plainHTTPCfg)
+	testCertsContext := s.NewClientRPCContext(ctx, username.TestUserName())
 
 	client, err := testCertsContext.GetHTTPClient()
 	require.NoError(t, err)
 
-	resp, err := client.Get(tenantOrSystemAdminURL(s) + "/oidc/v1/login")
+	resp, err := client.Get(s.AdminURL().WithPath("/oidc/v1/login").String())
 	if err != nil {
 		t.Fatalf("could not issue GET request to admin server: %s", err)
 	}
@@ -85,21 +63,9 @@ func TestOIDCEnabled(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-
-	newRPCContext := func(cfg *base.Config) *rpc.Context {
-		return rpc.NewContext(ctx, rpc.ContextOptions{
-			TenantID:        roachpb.SystemTenantID,
-			Config:          cfg,
-			Clock:           &timeutil.DefaultTimeSource{},
-			ToleratedOffset: 1,
-			Stopper:         s.Stopper(),
-			Settings:        s.ClusterSettings(),
-
-			ClientOnly: true,
-		})
-	}
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	// Set up a test OIDC server that serves the JSON discovery document
 	var issuer string
@@ -182,8 +148,7 @@ func TestOIDCEnabled(t *testing.T) {
 	sqlDB.Exec(t, `SET CLUSTER SETTING server.oidc_authentication.redirect_url = "https://cockroachlabs.com/oidc/v1/callback"`)
 	sqlDB.Exec(t, `SET CLUSTER SETTING server.oidc_authentication.enabled = "true"`)
 
-	plainHTTPCfg := testutils.NewTestBaseContext(username.TestUserName())
-	testCertsContext := newRPCContext(plainHTTPCfg)
+	testCertsContext := s.NewClientRPCContext(ctx, username.TestUserName())
 
 	client, err := testCertsContext.GetHTTPClient()
 	require.NoError(t, err)
@@ -194,7 +159,7 @@ func TestOIDCEnabled(t *testing.T) {
 	}
 
 	t.Run("login redirect", func(t *testing.T) {
-		resp, err := client.Get(tenantOrSystemAdminURL(s) + "/oidc/v1/login")
+		resp, err := client.Get(s.AdminURL().WithPath("/oidc/v1/login").String())
 		if err != nil {
 			t.Fatalf("could not issue GET request to admin server: %s", err)
 		}
@@ -234,18 +199,18 @@ func TestOIDCEnabled(t *testing.T) {
 }
 
 func TestKeyAndSignedTokenIsValid(t *testing.T) {
-	kastValid, err := newKeyAndSignedToken(32, 32)
+	kastValid, err := newKeyAndSignedToken(32, 32, serverpb.OIDCState_MODE_LOG_IN)
 	require.NoError(t, err)
-	kastModifiedCookie, err := newKeyAndSignedToken(32, 32)
+	kastModifiedCookie, err := newKeyAndSignedToken(32, 32, serverpb.OIDCState_MODE_LOG_IN)
 	require.NoError(t, err)
 	kastModifiedCookie.secretKeyCookie.Value = kastModifiedCookie.secretKeyCookie.Value + "Z"
-	kastModifiedTokenPayload, err := newKeyAndSignedToken(32, 32)
+	kastModifiedTokenPayload, err := newKeyAndSignedToken(32, 32, serverpb.OIDCState_MODE_LOG_IN)
 	require.NoError(t, err)
 	kastModifiedTokenPayload.signedTokenEncoded = kastModifiedCookie.signedTokenEncoded + "Z"
-	kastEmptyCookie, err := newKeyAndSignedToken(32, 32)
+	kastEmptyCookie, err := newKeyAndSignedToken(32, 32, serverpb.OIDCState_MODE_LOG_IN)
 	require.NoError(t, err)
 	kastEmptyCookie.secretKeyCookie.Value = ""
-	kastEmptyToken, err := newKeyAndSignedToken(32, 32)
+	kastEmptyToken, err := newKeyAndSignedToken(32, 32, serverpb.OIDCState_MODE_LOG_IN)
 	require.NoError(t, err)
 	kastEmptyToken.signedTokenEncoded = ""
 
@@ -262,7 +227,7 @@ func TestKeyAndSignedTokenIsValid(t *testing.T) {
 		{"valid cookie, empty token", kastEmptyToken, false, false},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			valid, err := tc.kast.validate()
+			valid, _, err := tc.kast.validate()
 			if tc.expectErr {
 				require.Error(t, err)
 			} else {
@@ -286,6 +251,67 @@ func TestOIDCStateEncodeDecode(t *testing.T) {
 
 	if string(state.Token) != testString || string(state.TokenMAC) != testString {
 		t.Fatal("state didn't match when decoded")
+	}
+}
+
+func TestOIDCClaimMatch(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		testName       string
+		claimKey       string
+		principalRegex string
+		claims         map[string]json.RawMessage
+		wantError      bool
+	}{
+		{
+			testName:       "string valued claim",
+			claimKey:       "email",
+			principalRegex: "^([^@]+)@[^@]+$",
+			claims: map[string]json.RawMessage{
+				"email": json.RawMessage(`"myfakeemail@example.com"`),
+			},
+		},
+		{
+			testName:       "string valued claim with no match",
+			claimKey:       "email",
+			principalRegex: "^([^@]+)@[^@]+$",
+			claims: map[string]json.RawMessage{
+				"email": json.RawMessage(`"bademail"`),
+			},
+			wantError: true,
+		},
+		{
+			testName:       "list valued claim",
+			claimKey:       "groups",
+			principalRegex: "^([^@]+)@[^@]+$",
+			claims: map[string]json.RawMessage{
+				"groups": json.RawMessage(
+					`["badgroupname", "myfakeemail@example.com", "anotherbadgroupname"]`,
+				),
+			},
+		},
+		{
+			testName:       "list valued claim with no matches",
+			claimKey:       "groups",
+			principalRegex: "^([^@]+)@[^@]+$",
+			claims: map[string]json.RawMessage{
+				"groups": json.RawMessage(`["badgroupname", "anotherbadgroupname"]`),
+			},
+			wantError: true,
+		},
+	} {
+		t.Run(tc.testName, func(t *testing.T) {
+			sqlUsername, err := extractUsernameFromClaims(
+				ctx, tc.claims, tc.claimKey, regexp.MustCompile(tc.principalRegex),
+			)
+			if !tc.wantError {
+				require.NoError(t, err)
+				require.Equal(t, "myfakeemail", sqlUsername)
+			} else {
+				require.ErrorContains(t, err, "expected one group in regexp")
+			}
+		})
 	}
 }
 

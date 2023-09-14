@@ -34,8 +34,9 @@ import {
   Count,
   FixLong,
   longToInt,
-  TimestampToString,
   unset,
+  appNamesAttr,
+  propsToQueryString,
 } from "src/util";
 import { SortSetting } from "../sortedtable";
 import {
@@ -46,6 +47,7 @@ import {
 } from "../transactionsPage/utils";
 import classNames from "classnames/bind";
 import statsTablePageStyles from "src/statementsTable/statementsTableContent.module.scss";
+import { BarChartOptions } from "../barCharts/barChartFactory";
 
 export type Transaction =
   protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
@@ -71,8 +73,8 @@ const { latencyClasses } = tableClasses;
 const cx = classNames.bind(statsTablePageStyles);
 
 interface TransactionLinkTargetProps {
-  aggregatedTs: string;
   transactionFingerprintId: string;
+  application?: string;
 }
 
 // TransactionLinkTarget returns the link to the relevant transaction page, given
@@ -80,7 +82,14 @@ interface TransactionLinkTargetProps {
 export const TransactionLinkTarget = (
   props: TransactionLinkTargetProps,
 ): string => {
-  return `/transaction/${props.transactionFingerprintId}`;
+  let searchParams = "";
+  if (props.application != null) {
+    searchParams = propsToQueryString({
+      [appNamesAttr]: [props.application],
+    });
+  }
+
+  return `/transaction/${props.transactionFingerprintId}?${searchParams}`;
 };
 
 export function makeTransactionsColumns(
@@ -95,7 +104,7 @@ export function makeTransactionsColumns(
       label: cx("statements-table__col--bar-chart__label"),
     },
   };
-  const sampledExecStatsBarChartOptions = {
+  const sampledExecStatsBarChartOptions: BarChartOptions<TransactionInfo> = {
     classes: defaultBarChartOptions.classes,
     displayNoSamples: (d: TransactionInfo) => {
       return longToInt(d.stats_data.stats.exec_stats?.count) == 0;
@@ -136,15 +145,17 @@ export function makeTransactionsColumns(
       title: statisticsTableTitles.transactions(statType),
       cell: (item: TransactionInfo) =>
         transactionLink({
-          transactionText: statementFingerprintIdsToText(
-            item.stats_data.statement_fingerprint_ids,
-            statements,
-          ),
-          transactionSummary: statementFingerprintIdsToSummarizedText(
-            item.stats_data.statement_fingerprint_ids,
-            statements,
-          ),
-          aggregatedTs: TimestampToString(item.stats_data.aggregated_ts),
+          transactionText:
+            statementFingerprintIdsToText(
+              item.stats_data.statement_fingerprint_ids,
+              statements,
+            ) || "Transaction query unavailable.",
+          transactionSummary:
+            statementFingerprintIdsToSummarizedText(
+              item.stats_data.statement_fingerprint_ids,
+              statements,
+            ) || "Transaction query unavailable.",
+          appName: item.stats_data.app,
           transactionFingerprintId:
             item.stats_data.transaction_fingerprint_id.toString(),
           search,
@@ -170,9 +181,8 @@ export function makeTransactionsColumns(
       title: statisticsTableTitles.applicationName(statType),
       className: cx("statements-table__col-app-name"),
       cell: (item: TransactionInfo) =>
-        item.stats_data?.app?.length > 0 ? item.stats_data?.app : unset,
+        item.stats_data?.app?.length ? item.stats_data.app : unset,
       sort: (item: TransactionInfo) => item.stats_data?.app,
-      showByDefault: false,
     },
     {
       name: "rowsProcessed",

@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -91,12 +92,13 @@ type registration struct {
 
 	// Output.
 	stream Stream
-	errC   chan<- *kvpb.Error
-
+	done   *future.ErrorFuture
+	unreg  func()
 	// Internal.
-	id   int64
-	keys interval.Range
-	buf  chan *sharedEvent
+	id            int64
+	keys          interval.Range
+	buf           chan *sharedEvent
+	blockWhenFull bool // if true, block when buf is full (for tests)
 
 	mu struct {
 		sync.Locker
@@ -124,9 +126,11 @@ func newRegistration(
 	catchUpIterConstructor CatchUpIteratorConstructor,
 	withDiff bool,
 	bufferSz int,
+	blockWhenFull bool,
 	metrics *Metrics,
 	stream Stream,
-	errC chan<- *kvpb.Error,
+	unregisterFn func(),
+	done *future.ErrorFuture,
 ) registration {
 	r := registration{
 		span:                   span,
@@ -135,8 +139,10 @@ func newRegistration(
 		withDiff:               withDiff,
 		metrics:                metrics,
 		stream:                 stream,
-		errC:                   errC,
+		done:                   done,
+		unreg:                  unregisterFn,
 		buf:                    make(chan *sharedEvent, bufferSz),
+		blockWhenFull:          blockWhenFull,
 	}
 	r.mu.Locker = &syncutil.Mutex{}
 	r.mu.caughtUp = true
@@ -164,6 +170,22 @@ func (r *registration) publish(
 	case r.buf <- e:
 		r.mu.caughtUp = false
 	default:
+		// If we're asked to block (in tests), do a blocking send after releasing
+		// the mutex -- otherwise, the output loop won't be able to consume from the
+		// channel. We optimistically attempt the non-blocking send above first,
+		// since we're already holding the mutex.
+		if r.blockWhenFull {
+			r.mu.Unlock()
+			select {
+			case r.buf <- e:
+				r.mu.Lock()
+				r.mu.caughtUp = false
+			case <-ctx.Done():
+				r.mu.Lock()
+				alloc.Release(ctx)
+			}
+			return
+		}
 		// Buffer exceeded and we are dropping this event. Registration will need
 		// a catch-up scan.
 		r.mu.overflowed = true
@@ -268,9 +290,8 @@ func (r *registration) maybeStripEvent(event *kvpb.RangeFeedEvent) *kvpb.RangeFe
 }
 
 // disconnect cancels the output loop context for the registration and passes an
-// error to the output error stream for the registration. This also sets the
-// disconnected flag on the registration, preventing it from being disconnected
-// again.
+// error to the output error stream for the registration.
+// Safe to run multiple times, but subsequent errors would be discarded.
 func (r *registration) disconnect(pErr *kvpb.Error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -283,7 +304,7 @@ func (r *registration) disconnect(pErr *kvpb.Error) {
 			r.mu.outputLoopCancelFn()
 		}
 		r.mu.disconnected = true
-		r.errC <- pErr
+		r.done.Set(pErr.GoError())
 	}
 }
 
@@ -403,13 +424,15 @@ func (r registration) String() string {
 
 // registry holds a set of registrations and manages their lifecycle.
 type registry struct {
+	metrics *Metrics
 	tree    interval.Tree // *registration items
 	idAlloc int64
 }
 
-func makeRegistry() registry {
+func makeRegistry(metrics *Metrics) registry {
 	return registry{
-		tree: interval.NewTree(interval.ExclusiveOverlapper),
+		metrics: metrics,
+		tree:    interval.NewTree(interval.ExclusiveOverlapper),
 	}
 }
 
@@ -426,6 +449,7 @@ func (reg *registry) NewFilter() *Filter {
 
 // Register adds the provided registration to the registry.
 func (reg *registry) Register(r *registration) {
+	reg.metrics.RangeFeedRegistrations.Inc(1)
 	r.id = reg.nextID()
 	r.keys = r.span.AsRange()
 	if err := reg.tree.Insert(r, false /* fast */); err != nil {
@@ -481,6 +505,7 @@ func (reg *registry) PublishToOverlapping(
 // that we rely on a fact that caller is not going to post any more events
 // concurrently or after this function is called.
 func (reg *registry) Unregister(ctx context.Context, r *registration) {
+	reg.metrics.RangeFeedRegistrations.Dec(1)
 	if err := reg.tree.Delete(r, false /* fast */); err != nil {
 		panic(err)
 	}
@@ -496,8 +521,8 @@ func (reg *registry) Disconnect(span roachpb.Span) {
 // DisconnectWithErr disconnects all registrations that overlap the specified
 // span with the provided error.
 func (reg *registry) DisconnectWithErr(span roachpb.Span, pErr *kvpb.Error) {
-	reg.forOverlappingRegs(span, func(_ *registration) (bool, *kvpb.Error) {
-		return true, pErr
+	reg.forOverlappingRegs(span, func(r *registration) (bool, *kvpb.Error) {
+		return true /* disconned */, pErr
 	})
 }
 
@@ -564,17 +589,21 @@ func (r *registration) waitForCaughtUp() error {
 
 // maybeConstructCatchUpIter calls the catchUpIterConstructor and attaches
 // the catchUpIter to be detached in the catchUpScan or closed on disconnect.
-func (r *registration) maybeConstructCatchUpIter() {
+func (r *registration) maybeConstructCatchUpIter() error {
 	if r.catchUpIterConstructor == nil {
-		return
+		return nil
 	}
 
-	catchUpIter := r.catchUpIterConstructor(r.span, r.catchUpTimestamp)
+	catchUpIter, err := r.catchUpIterConstructor(r.span, r.catchUpTimestamp)
+	if err != nil {
+		return err
+	}
 	r.catchUpIterConstructor = nil
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.mu.catchUpIter = catchUpIter
+	return nil
 }
 
 // detachCatchUpIter detaches the catchUpIter that was previously attached.

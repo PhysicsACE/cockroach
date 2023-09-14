@@ -114,41 +114,25 @@ func newMergeQueue(store *Store, db *kv.DB) *mergeQueue {
 			// hard to determine ahead of time. An alternative would be to calculate
 			// the timeout with a function that additionally considers the replication
 			// factor.
-			processTimeoutFunc:   makeRateLimitedTimeoutFunc(rebalanceSnapshotRate, recoverySnapshotRate),
+			processTimeoutFunc:   makeRateLimitedTimeoutFunc(rebalanceSnapshotRate),
 			needsLease:           true,
-			needsSystemConfig:    true,
+			needsSpanConfigs:     true,
 			acceptsUnsplitRanges: false,
 			successes:            store.metrics.MergeQueueSuccesses,
 			failures:             store.metrics.MergeQueueFailures,
+			storeFailures:        store.metrics.StoreFailures,
 			pending:              store.metrics.MergeQueuePending,
 			processingNanos:      store.metrics.MergeQueueProcessingNanos,
 			purgatory:            store.metrics.MergeQueuePurgatory,
+			disabledConfig:       kvserverbase.MergeQueueEnabled,
 		},
 	)
 	return mq
 }
 
-func (mq *mergeQueue) enabled() bool {
-	if !mq.store.cfg.SpanConfigsDisabled {
-		if mq.store.cfg.SpanConfigSubscriber.LastUpdated().IsEmpty() {
-			// If we don't have any span configs available, enabling range merges would
-			// be extremely dangerous -- we could collapse everything into a single
-			// range.
-			return false
-		}
-	}
-
-	st := mq.store.ClusterSettings()
-	return kvserverbase.MergeQueueEnabled.Get(&st.SV)
-}
-
 func (mq *mergeQueue) shouldQueue(
 	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, confReader spanconfig.StoreReader,
 ) (shouldQueue bool, priority float64) {
-	if !mq.enabled() {
-		return false, 0
-	}
-
 	desc := repl.Desc()
 
 	if desc.EndKey.Equal(roachpb.RKeyMax) {
@@ -156,7 +140,17 @@ func (mq *mergeQueue) shouldQueue(
 		return false, 0
 	}
 
-	if confReader.NeedsSplit(ctx, desc.StartKey, desc.EndKey.Next()) {
+	needsSplit, err := confReader.NeedsSplit(ctx, desc.StartKey, desc.EndKey.Next())
+	if err != nil {
+		log.Warningf(
+			ctx,
+			"could not compute if extending range would result in a split (err=%v); skipping merge for range %s",
+			err,
+			desc.RangeID,
+		)
+		return false, 0
+	}
+	if needsSplit {
 		// This range would need to be split if it extended just one key further.
 		// There is thus no possible right-hand neighbor that it could be merged
 		// with.
@@ -179,6 +173,13 @@ func (mq *mergeQueue) shouldQueue(
 // rangeMergePurgatoryError wraps an error that occurs during merging to
 // indicate that the error should send the range to purgatory.
 type rangeMergePurgatoryError struct{ error }
+
+var _ errors.SafeFormatter = decommissionPurgatoryError{}
+
+func (e rangeMergePurgatoryError) SafeFormatError(p errors.Printer) (next error) {
+	p.Print(e.error)
+	return nil
+}
 
 func (rangeMergePurgatoryError) PurgatoryErrorMarker() {}
 
@@ -235,10 +236,6 @@ func (mq *mergeQueue) requestRangeStats(
 func (mq *mergeQueue) process(
 	ctx context.Context, lhsRepl *Replica, confReader spanconfig.StoreReader,
 ) (processed bool, err error) {
-	if !mq.enabled() {
-		log.VEventf(ctx, 2, "skipping merge: queue has been disabled")
-		return false, nil
-	}
 
 	lhsDesc := lhsRepl.Desc()
 	lhsStats := lhsRepl.GetMVCCStats()

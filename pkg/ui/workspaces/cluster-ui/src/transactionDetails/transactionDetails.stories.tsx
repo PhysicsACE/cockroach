@@ -13,17 +13,18 @@ import { storiesOf } from "@storybook/react";
 import { MemoryRouter } from "react-router-dom";
 import { noop } from "lodash";
 import {
-  transactionDetailsData,
-  routeProps,
   nodeRegions,
-  error,
+  requestTime,
+  routeProps,
   timeScale,
-  transaction,
+  transactionDetailsData,
   transactionFingerprintId,
 } from "./transactionDetails.fixture";
 
 import { TransactionDetails } from ".";
-import moment from "moment";
+import moment from "moment-timezone";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import StatsSortOptions = cockroach.server.serverpb.StatsSortOptions;
 
 storiesOf("Transactions Details", module)
   .addDecorator(storyFn => <MemoryRouter>{storyFn()}</MemoryRouter>)
@@ -35,9 +36,6 @@ storiesOf("Transactions Details", module)
       {...routeProps}
       timeScale={timeScale}
       transactionFingerprintId={transactionFingerprintId.toString()}
-      transaction={transaction}
-      isLoading={false}
-      statements={transactionDetailsData.statements}
       nodeRegions={nodeRegions}
       isTenant={false}
       hasViewActivityRedactedRole={false}
@@ -46,8 +44,18 @@ storiesOf("Transactions Details", module)
       refreshUserSQLRoles={noop}
       onTimeScaleChange={noop}
       refreshNodes={noop}
-      lastUpdated={moment("0001-01-01T00:00:00Z")}
       refreshTransactionInsights={noop}
+      limit={100}
+      reqSortSetting={StatsSortOptions.SERVICE_LAT}
+      requestTime={requestTime}
+      onRequestTimeChange={noop}
+      txnStatsResp={{
+        lastUpdated: moment(),
+        error: null,
+        inFlight: false,
+        valid: true,
+        data: transactionDetailsData,
+      }}
     />
   ))
   .add("with loading indicator", () => (
@@ -55,9 +63,6 @@ storiesOf("Transactions Details", module)
       {...routeProps}
       timeScale={timeScale}
       transactionFingerprintId={transactionFingerprintId.toString()}
-      transaction={null}
-      isLoading={true}
-      statements={undefined}
       nodeRegions={nodeRegions}
       isTenant={false}
       hasViewActivityRedactedRole={false}
@@ -66,8 +71,18 @@ storiesOf("Transactions Details", module)
       refreshUserSQLRoles={noop}
       onTimeScaleChange={noop}
       refreshNodes={noop}
-      lastUpdated={moment("0001-01-01T00:00:00Z")}
       refreshTransactionInsights={noop}
+      limit={100}
+      reqSortSetting={StatsSortOptions.SERVICE_LAT}
+      requestTime={requestTime}
+      onRequestTimeChange={noop}
+      txnStatsResp={{
+        lastUpdated: moment(),
+        error: null,
+        inFlight: false,
+        valid: true,
+        data: transactionDetailsData,
+      }}
     />
   ))
   .add("with error alert", () => (
@@ -75,11 +90,7 @@ storiesOf("Transactions Details", module)
       {...routeProps}
       timeScale={timeScale}
       transactionFingerprintId={undefined}
-      transaction={undefined}
-      isLoading={false}
-      statements={undefined}
       nodeRegions={nodeRegions}
-      error={error}
       isTenant={false}
       hasViewActivityRedactedRole={false}
       transactionInsights={undefined}
@@ -87,8 +98,18 @@ storiesOf("Transactions Details", module)
       refreshUserSQLRoles={noop}
       onTimeScaleChange={noop}
       refreshNodes={noop}
-      lastUpdated={moment("0001-01-01T00:00:00Z")}
       refreshTransactionInsights={noop}
+      limit={100}
+      reqSortSetting={StatsSortOptions.SERVICE_LAT}
+      requestTime={moment()}
+      onRequestTimeChange={noop}
+      txnStatsResp={{
+        lastUpdated: moment(),
+        error: null,
+        inFlight: false,
+        valid: true,
+        data: transactionDetailsData,
+      }}
     />
   ))
   .add("No data for this time frame; no cached transaction text", () => {
@@ -97,9 +118,6 @@ storiesOf("Transactions Details", module)
         {...routeProps}
         timeScale={timeScale}
         transactionFingerprintId={transactionFingerprintId.toString()}
-        transaction={undefined}
-        isLoading={false}
-        statements={transactionDetailsData.statements}
         nodeRegions={nodeRegions}
         isTenant={false}
         hasViewActivityRedactedRole={false}
@@ -108,8 +126,18 @@ storiesOf("Transactions Details", module)
         refreshUserSQLRoles={noop}
         onTimeScaleChange={noop}
         refreshNodes={noop}
-        lastUpdated={moment("0001-01-01T00:00:00Z")}
         refreshTransactionInsights={noop}
+        limit={100}
+        reqSortSetting={StatsSortOptions.SERVICE_LAT}
+        requestTime={requestTime}
+        onRequestTimeChange={noop}
+        txnStatsResp={{
+          lastUpdated: moment(),
+          error: null,
+          inFlight: false,
+          valid: true,
+          data: transactionDetailsData,
+        }}
       />
     );
   });

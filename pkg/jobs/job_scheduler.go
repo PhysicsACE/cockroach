@@ -26,11 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
@@ -260,7 +260,7 @@ func (s *jobScheduler) executeCandidateSchedule(
 	timeout := schedulerScheduleExecutionTimeout.Get(&s.Settings.SV)
 	if processErr := withSavePoint(ctx, txn.KV(), func() error {
 		if timeout > 0 {
-			return contextutil.RunWithTimeout(
+			return timeutil.RunWithTimeout(
 				ctx, fmt.Sprintf("process-schedule-%d", schedule.ScheduleID()), timeout,
 				func(ctx context.Context) error {
 					return s.processSchedule(ctx, schedule, numRunning, txn)
@@ -362,10 +362,10 @@ func newCancelWhenDisabled(sv *settings.Values) *syncCancelFunc {
 	schedulerEnabledSetting.SetOnChange(sv, func(ctx context.Context) {
 		if !schedulerEnabledSetting.Get(sv) {
 			sf.Lock()
+			defer sf.Unlock()
 			if sf.CancelFunc != nil {
 				sf.CancelFunc()
 			}
-			sf.Unlock()
 		}
 	})
 	return sf
@@ -384,6 +384,7 @@ func (sf *syncCancelFunc) withCancelOnDisabled(
 		sf.CancelFunc = cancel
 
 		if !schedulerEnabledSetting.Get(sv) {
+			log.Warning(ctx, "scheduled job system disabled by setting, cancelling execution")
 			cancel()
 		}
 
@@ -419,6 +420,7 @@ func (s *jobScheduler) runDaemon(ctx context.Context, stopper *stop.Stopper) {
 				return
 			case <-timer.C:
 				if !schedulerEnabledSetting.Get(&s.Settings.SV) {
+					log.Warning(ctx, "scheduled job system disabled by setting")
 					continue
 				}
 

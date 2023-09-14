@@ -18,8 +18,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -46,7 +46,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	if err := dialAndCheckHealth(ctx); err != nil {
 		return err
 	}
-	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
+	conn, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
 		return err
 	}
@@ -76,7 +76,7 @@ func dialAndCheckHealth(ctx context.Context) error {
 		// (Attempt to) establish the gRPC connection. If that fails,
 		// it may be that the server hasn't started to listen yet, in
 		// which case we'll retry.
-		conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
+		conn, finish, err := getClientGRPCConn(ctx, serverCfg)
 		if err != nil {
 			return err
 		}
@@ -91,7 +91,7 @@ func dialAndCheckHealth(ctx context.Context) error {
 	}
 
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-		if err := contextutil.RunWithTimeout(
+		if err := timeutil.RunWithTimeout(
 			ctx, "init-open-conn", 5*time.Second, tryConnect,
 		); err != nil {
 			err = errors.Wrapf(err, "node not ready to perform cluster initialization")

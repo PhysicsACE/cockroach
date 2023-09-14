@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
@@ -29,9 +30,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 10
+const configIdx = 9
 
 var logicTestDir string
+var cclLogicTestDir string
 var execBuildLogicTestDir string
 
 func init() {
@@ -43,6 +45,15 @@ func init() {
 		}
 	} else {
 		logicTestDir = "../../../../sql/logictest/testdata/logic_test"
+	}
+	if bazel.BuiltWithBazel() {
+		var err error
+		cclLogicTestDir, err = bazel.Runfile("pkg/ccl/logictestccl/testdata/logic_test")
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		cclLogicTestDir = "../../../../ccl/logictestccl/testdata/logic_test"
 	}
 	if bazel.BuiltWithBazel() {
 		var err error
@@ -61,12 +72,21 @@ func TestMain(m *testing.M) {
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
+
+	defer serverutils.TestingSetDefaultTenantSelectionOverride(
+		base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(76378),
+	)()
+
 	os.Exit(m.Run())
 }
 
 func runLogicTest(t *testing.T, file string) {
 	skip.UnderDeadlock(t, "times out and/or hangs")
 	logictest.RunLogicTest(t, logictest.TestServerArgs{}, configIdx, filepath.Join(logicTestDir, file))
+}
+func runCCLLogicTest(t *testing.T, file string) {
+	skip.UnderDeadlock(t, "times out and/or hangs")
+	logictest.RunLogicTest(t, logictest.TestServerArgs{}, configIdx, filepath.Join(cclLogicTestDir, file))
 }
 func runExecBuildLogicTest(t *testing.T, file string) {
 	defer sql.TestingOverrideExplainEnvVersion("CockroachDB execbuilder test version")()
@@ -91,6 +111,8 @@ func TestLogic_tmp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var glob string
 	glob = filepath.Join(logicTestDir, "_*")
+	logictest.RunLogicTests(t, logictest.TestServerArgs{}, configIdx, glob)
+	glob = filepath.Join(cclLogicTestDir, "_*")
 	logictest.RunLogicTests(t, logictest.TestServerArgs{}, configIdx, glob)
 	glob = filepath.Join(execBuildLogicTestDir, "_*")
 	serverArgs := logictest.TestServerArgs{
@@ -118,6 +140,13 @@ func TestTenantLogic_tenant_from_tenant(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "tenant_from_tenant")
+}
+
+func TestTenantLogicCCL_multi_region_system_database(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "multi_region_system_database")
 }
 
 func TestTenantExecBuild_distsql_tenant_locality(

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -1108,6 +1109,10 @@ func (b *logicalPropsBuilder) buildExportProps(export *ExportExpr, rel *props.Re
 	b.buildBasicProps(export, export.Columns, rel)
 }
 
+func (b *logicalPropsBuilder) buildCallProps(c *CallExpr, rel *props.Relational) {
+	b.buildBasicProps(c, opt.ColList{}, rel)
+}
+
 func (b *logicalPropsBuilder) buildTopKProps(topK *TopKExpr, rel *props.Relational) {
 	// TopK has the same logical properties as limit.
 	b.buildLimitOrTopKProps(topK, rel, topK.K, true /* haveConstLimit */)
@@ -1662,9 +1667,9 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared, evalCtx *eval.Context) {
 		}
 		shared.VolatilitySet.Add(volatility)
 
-	case *UDFExpr:
+	case *UDFCallExpr:
 		shared.HasUDF = true
-		shared.VolatilitySet.Add(t.Volatility)
+		shared.VolatilitySet.Add(t.Def.Volatility)
 
 	default:
 		if opt.IsUnaryOp(e) {
@@ -1728,6 +1733,9 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared, evalCtx *eval.Context) {
 			}
 			if cached.HasCorrelatedSubquery {
 				shared.HasCorrelatedSubquery = true
+			}
+			if cached.HasUDF {
+				shared.HasUDF = true
 			}
 		} else {
 			BuildSharedProps(e.Child(i), shared, evalCtx)
@@ -2257,6 +2265,7 @@ func addOuterColsToFuncDep(outerCols opt.ColSet, fdset *props.FuncDepSet) {
 // joins that are used internally when deriving logical properties and
 // statistics.
 type joinPropsHelper struct {
+	evalCtx  *eval.Context
 	join     RelExpr
 	joinType opt.Operator
 
@@ -2275,7 +2284,7 @@ type joinPropsHelper struct {
 func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
-	*h = joinPropsHelper{join: joinExpr}
+	*h = joinPropsHelper{evalCtx: b.evalCtx, join: joinExpr}
 
 	switch join := joinExpr.(type) {
 	case *LookupJoinExpr:
@@ -2513,6 +2522,68 @@ func (h *joinPropsHelper) setFuncDeps(rel *props.Relational) {
 		// created new possibilities for simplifying removed columns.
 		rel.FuncDeps.ProjectCols(rel.OutputCols)
 	}
+	if h.evalCtx.SessionData().OptimizerUseImprovedJoinElimination {
+		h.addSelfJoinImpliedFDs(rel)
+	}
+}
+
+// addSelfJoinImpliedFDs adds any extra equality FDs that are implied by a self
+// join equality between key columns on a table.
+func (h *joinPropsHelper) addSelfJoinImpliedFDs(rel *props.Relational) {
+	md := h.join.Memo().Metadata()
+	leftCols, rightCols := h.leftProps.OutputCols, h.rightProps.OutputCols
+	if !rel.FuncDeps.ComputeEquivClosure(leftCols).Intersects(rightCols) {
+		// There are no equalities between left and right columns.
+		return
+	}
+	// Retrieve the tables that originate the given columns.
+	getTables := func(cols opt.ColSet) intsets.Fast {
+		var tables intsets.Fast
+		cols.ForEach(func(col opt.ColumnID) {
+			if tab := md.ColumnMeta(col).Table; tab != opt.TableID(0) {
+				tables.Add(int(tab))
+			}
+		})
+		return tables
+	}
+	leftTables, rightTables := getTables(leftCols), getTables(rightCols)
+	if leftTables.Empty() || rightTables.Empty() {
+		return
+	}
+	leftTables.ForEach(func(left int) {
+		leftTable := opt.TableID(left)
+		baseTabFDs := MakeTableFuncDep(md, leftTable)
+		rightTables.ForEach(func(right int) {
+			rightTable := opt.TableID(right)
+			if md.TableMeta(leftTable).Table.ID() != md.TableMeta(rightTable).Table.ID() {
+				return
+			}
+			// This is a self-join. If there are equalities between columns at the
+			// same ordinal positions in each (meta) table and those columns form a
+			// key on the base table, *every* pair of columns at the same ordinal
+			// position is equal.
+			var eqCols opt.ColSet
+			var outColOrds intsets.Fast
+			numCols := md.Table(leftTable).ColumnCount()
+			for colOrd := 0; colOrd < numCols; colOrd++ {
+				leftCol, rightCol := leftTable.ColumnID(colOrd), rightTable.ColumnID(colOrd)
+				if rel.OutputCols.Contains(leftCol) && rel.OutputCols.Contains(rightCol) {
+					outColOrds.Add(colOrd)
+					if rel.FuncDeps.AreColsEquiv(leftCol, rightCol) {
+						eqCols.Add(leftCol)
+						eqCols.Add(rightCol)
+					}
+				}
+			}
+			if !eqCols.Empty() && baseTabFDs.ColsAreStrictKey(eqCols) {
+				// Add equalities between each pair of columns at the same ordinal
+				// position, ignoring those that aren't part of the output.
+				outColOrds.ForEach(func(colOrd int) {
+					rel.FuncDeps.AddEquivalency(leftTable.ColumnID(colOrd), rightTable.ColumnID(colOrd))
+				})
+			}
+		})
+	})
 }
 
 func (h *joinPropsHelper) cardinality() props.Cardinality {

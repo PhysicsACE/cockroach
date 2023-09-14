@@ -23,9 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/spf13/cobra"
@@ -44,7 +44,7 @@ var connectJoinCmd = &cobra.Command{
 func requestPeerCA(
 	ctx context.Context, stopper *stop.Stopper, peer string, jt security.JoinToken,
 ) (*x509.CertPool, error) {
-	dialOpts := rpc.GetAddJoinDialOptions(nil)
+	dialOpts := rpc.GetAddJoinDialOptions(ctx, nil)
 
 	conn, err := grpc.DialContext(ctx, peer, dialOpts...)
 	if err != nil {
@@ -89,7 +89,7 @@ func requestCertBundle(
 	certPool *x509.CertPool,
 	jt security.JoinToken,
 ) (*server.CertificateBundle, error) {
-	dialOpts := rpc.GetAddJoinDialOptions(certPool)
+	dialOpts := rpc.GetAddJoinDialOptions(ctx, certPool)
 
 	conn, err := grpc.DialContext(ctx, peerAddr, dialOpts...)
 	if err != nil {
@@ -131,7 +131,7 @@ func requestCertBundle(
 // peer.
 // TODO(aaron-crl): Parallelize this and handle errors.
 func runConnectJoin(cmd *cobra.Command, args []string) error {
-	return contextutil.RunWithTimeout(context.Background(), "init handshake", nodeJoinTimeout, func(ctx context.Context) error {
+	return timeutil.RunWithTimeout(context.Background(), "init handshake", nodeJoinTimeout, func(ctx context.Context) error {
 		ctx = logtags.AddTag(ctx, "init-tls-handshake", nil)
 
 		stopper := stop.NewStopper()

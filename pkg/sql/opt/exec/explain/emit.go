@@ -183,7 +183,15 @@ func makeEmitter(ob *OutputBuilder, spanFormatFn SpanFormatFn) emitter {
 	return emitter{ob: ob, spanFormatFn: spanFormatFn}
 }
 
-func (e *emitter) nodeName(n *Node) (string, error) {
+func (e *emitter) nodeName(n *Node) (name string, _ error) {
+	defer func() {
+		if stats, ok := n.annotations[exec.ExecutionStatsID]; ok && !omitStats(n) {
+			if stats.(*exec.ExecutionStats).UsedStreamer {
+				name += " (streamer)"
+			}
+		}
+	}()
+
 	switch n.op {
 	case scanOp:
 		a := n.args.(*scanArgs)
@@ -418,7 +426,17 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			e.ob.AddField("KV contention time", string(humanizeutil.Duration(s.KVContentionTime.Value())))
 		}
 		if s.KVRowsRead.HasValue() {
-			e.ob.AddField("KV rows read", string(humanizeutil.Count(s.KVRowsRead.Value())))
+			e.ob.AddField("KV rows decoded", string(humanizeutil.Count(s.KVRowsRead.Value())))
+		}
+		if s.KVPairsRead.HasValue() {
+			pairs := s.KVPairsRead.Value()
+			rows := s.KVRowsRead.Value()
+			if pairs != rows || e.ob.flags.Verbose {
+				// Only show the number of KV pairs read when it's different
+				// from the number of rows decoded or if verbose output is
+				// requested.
+				e.ob.AddField("KV pairs read", string(humanizeutil.Count(s.KVPairsRead.Value())))
+			}
 		}
 		if s.KVBytesRead.HasValue() {
 			e.ob.AddField("KV bytes read", humanize.IBytes(s.KVBytesRead.Value()))
@@ -762,8 +780,12 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 
 	case invertedFilterOp:
 		a := n.args.(*invertedFilterArgs)
-		ob.Attr("inverted column", a.Input.Columns()[a.InvColumn].Name)
-		ob.Attr("num spans", len(a.InvFilter.SpansToRead))
+		if a.InvColumn != 0 {
+			ob.Attr("inverted column", a.Input.Columns()[a.InvColumn].Name)
+		}
+		if a.InvFilter != nil && len(a.InvFilter.SpansToRead) > 0 {
+			ob.Attr("num spans", len(a.InvFilter.SpansToRead))
+		}
 
 	case invertedJoinOp:
 		a := n.args.(*invertedJoinArgs)
@@ -847,6 +869,7 @@ func (e *emitter) emitNodeAttributes(n *Node) error {
 			ob.Attr(
 				"FK check", fmt.Sprintf("%s@%s", fk.ReferencedTable.Name(), fk.ReferencedIndex.Name()),
 			)
+			e.emitLockingPolicyWithPrefix("FK check ", fk.Locking)
 		}
 		if len(a.Rows) > 0 {
 			e.emitTuples(tree.RawRows(a.Rows), len(a.Rows[0]))
@@ -1051,11 +1074,15 @@ func (e *emitter) emitLockingPolicy(locking opt.Locking) {
 func (e *emitter) emitLockingPolicyWithPrefix(keyPrefix string, locking opt.Locking) {
 	strength := descpb.ToScanLockingStrength(locking.Strength)
 	waitPolicy := descpb.ToScanLockingWaitPolicy(locking.WaitPolicy)
+	durability := locking.Durability
 	if strength != descpb.ScanLockingStrength_FOR_NONE {
 		e.ob.Attr(keyPrefix+"locking strength", strength.PrettyString())
 	}
 	if waitPolicy != descpb.ScanLockingWaitPolicy_BLOCK {
 		e.ob.Attr(keyPrefix+"locking wait policy", waitPolicy.PrettyString())
+	}
+	if durability != tree.LockDurabilityBestEffort {
+		e.ob.Attr(keyPrefix+"locking durability", durability.String())
 	}
 }
 

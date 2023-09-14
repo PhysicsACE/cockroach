@@ -1,6 +1,5 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "execstats",
@@ -14,8 +13,10 @@ go_library(
         "//pkg/base",
         "//pkg/kv/kvpb",
         "//pkg/sql/execinfrapb",
+        "//pkg/util",
         "//pkg/util/buildutil",
         "//pkg/util/optional",
+        "//pkg/util/protoutil",
         "//pkg/util/tracing",
         "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_errors//:errors",
@@ -36,6 +37,7 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/kv/kvpb",
+        "//pkg/multitenant/tenantcapabilities",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
@@ -62,5 +64,3 @@ disallowed_imports_test(
     "execstats",
     ["//pkg/sql/execinfra"],
 )
-
-get_x_data(name = "get_x_data")

@@ -55,10 +55,11 @@ type tableReader struct {
 	fetcher rowFetcher
 	alloc   tree.DatumAlloc
 
-	scanStats execstats.ScanStats
-
 	// rowsRead is the number of rows read and is tracked unconditionally.
-	rowsRead int64
+	rowsRead                  int64
+	contentionEventsListener  execstats.ContentionEventsListener
+	scanStatsListener         execstats.ScanStatsListener
+	tenantConsumptionListener execstats.TenantConsumptionListener
 }
 
 var _ execinfra.Processor = &tableReader{}
@@ -81,7 +82,6 @@ func newTableReader(
 	processorID int32,
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*tableReader, error) {
 	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
 	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); ok && nodeID == 0 {
@@ -124,7 +124,7 @@ func newTableReader(
 		resultTypes[i] = spec.FetchSpec.FetchedColumns[i].Type
 	}
 
-	tr.ignoreMisplannedRanges = flowCtx.Local
+	tr.ignoreMisplannedRanges = flowCtx.Local || spec.IgnoreMisplannedRanges
 	if err := tr.Init(
 		ctx,
 		tr,
@@ -132,7 +132,6 @@ func newTableReader(
 		resultTypes,
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// We don't pass tr.input as an inputToDrain; tr.input is just an adapter
@@ -197,7 +196,10 @@ func (tr *tableReader) Start(ctx context.Context) {
 	}
 
 	// Keep ctx assignment so we remember StartInternal can make a new one.
-	ctx = tr.StartInternal(ctx, tableReaderProcName)
+	ctx = tr.StartInternal(
+		ctx, tableReaderProcName, &tr.contentionEventsListener,
+		&tr.scanStatsListener, &tr.tenantConsumptionListener,
+	)
 	// Appease the linter.
 	_ = ctx
 }
@@ -308,22 +310,20 @@ func (tr *tableReader) execStatsForTrace() *execinfrapb.ComponentStats {
 	if !ok {
 		return nil
 	}
-	tr.scanStats = execstats.GetScanStats(tr.Ctx(), tr.ExecStatsTrace)
-	contentionTime, contentionEvents := execstats.GetCumulativeContentionTime(tr.Ctx(), tr.ExecStatsTrace)
 	ret := &execinfrapb.ComponentStats{
 		KV: execinfrapb.KVStats{
 			BytesRead:           optional.MakeUint(uint64(tr.fetcher.GetBytesRead())),
+			KVPairsRead:         optional.MakeUint(uint64(tr.fetcher.GetKVPairsRead())),
 			TuplesRead:          is.NumTuples,
 			KVTime:              is.WaitTime,
-			ContentionTime:      optional.MakeTimeValue(contentionTime),
-			ContentionEvents:    contentionEvents,
+			ContentionTime:      optional.MakeTimeValue(tr.contentionEventsListener.CumulativeContentionTime),
 			BatchRequestsIssued: optional.MakeUint(uint64(tr.fetcher.GetBatchRequestsIssued())),
 			KVCPUTime:           optional.MakeTimeValue(is.kvCPUTime),
 		},
 		Output: tr.OutputHelper.Stats(),
 	}
-	ret.Exec.ConsumedRU = optional.MakeUint(tr.scanStats.ConsumedRU)
-	execstats.PopulateKVMVCCStats(&ret.KV, &tr.scanStats)
+	ret.Exec.ConsumedRU = optional.MakeUint(tr.tenantConsumptionListener.ConsumedRU)
+	execstats.PopulateKVMVCCStats(&ret.KV, &tr.scanStatsListener.ScanStats)
 	return ret
 }
 

@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -20,6 +19,7 @@ go_library(
         "//pkg/util/mon",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_pebble//vfs",
         "@com_github_golang_snappy//:snappy",
         "@com_github_marusama_semaphore//:semaphore",
     ],
@@ -46,7 +46,6 @@ go_test(
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/types",
-        "//pkg/storage/fs",
         "//pkg/testutils/colcontainerutils",
         "//pkg/testutils/skip",
         "//pkg/util/humanizeutil",
@@ -54,9 +53,8 @@ go_test(
         "//pkg/util/log",
         "//pkg/util/mon",
         "//pkg/util/randutil",
+        "@com_github_cockroachdb_pebble//vfs",
         "@com_github_marusama_semaphore//:semaphore",
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

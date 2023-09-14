@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/migrationstable"
 	"github.com/cockroachdb/errors"
@@ -91,6 +90,7 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 			Codec:            execCtx.ExecCfg().Codec,
 			Settings:         execCtx.ExecCfg().Settings,
 			DB:               execCtx.ExecCfg().InternalDB,
+			KVDB:             execCtx.ExecCfg().DB,
 			LeaseManager:     execCtx.ExecCfg().LeaseManager,
 			InternalExecutor: ex,
 			JobRegistry:      execCtx.ExecCfg().JobRegistry,
@@ -104,12 +104,16 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 		tenantDeps.SchemaResolverConstructor = func(
 			txn *kv.Txn, descriptors *descs.Collection, currDb string,
 		) (resolver.SchemaResolver, func(), error) {
-			internalPlanner, cleanup := sql.NewInternalPlanner("internal planner for upgrades",
+			opName := "internal-planner-for-upgrades"
+			sd := execCtx.SessionData().Clone()
+			sd.Database = currDb
+			internalPlanner, cleanup := sql.NewInternalPlanner(
+				opName,
 				txn,
 				execCtx.User(),
 				&sql.MemoryMetrics{},
 				execCtx.ExecCfg(),
-				sessiondatapb.SessionData{Database: currDb},
+				sd,
 				sql.WithDescCollection(descriptors),
 			)
 			sr, ok := internalPlanner.(resolver.SchemaResolver)

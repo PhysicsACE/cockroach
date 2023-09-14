@@ -23,9 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
@@ -38,7 +38,12 @@ import (
 
 func TestServerQuery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	defer log.Scope(t).Close(t)
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		// For now, direct access to the tsdb is reserved to the storage layer.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableTimeSeriesMaintenanceQueue: true,
@@ -46,10 +51,9 @@ func TestServerQuery(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(context.Background())
-	tsrv := s.(*server.TestServer)
 
 	// Populate data directly.
-	tsdb := tsrv.TsDB()
+	tsdb := s.TsDB().(*ts.DB)
 	if err := tsdb.StoreData(context.Background(), ts.Resolution10s, []tspb.TimeSeriesData{
 		{
 			Name:   "test.metric",
@@ -176,11 +180,7 @@ func TestServerQuery(t *testing.T) {
 		},
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
-		rpc.DefaultClass).Connect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := s.RPCClientConn(t, username.RootUserName())
 	client := tspb.NewTimeSeriesClient(conn)
 	response, err := client.Query(context.Background(), &tspb.TimeSeriesQueryRequest{
 		StartNanos: 500 * 1e9,
@@ -260,23 +260,23 @@ func TestServerQuery(t *testing.T) {
 // query request has more queries than the server's MaxWorkers count.
 func TestServerQueryStarvation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	workerCount := 20
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		// For now, direct access to the tsdb is reserved to the storage layer.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+
 		TimeSeriesQueryWorkerMax: workerCount,
 	})
 	defer s.Stopper().Stop(context.Background())
-	tsrv := s.(*server.TestServer)
 
 	seriesCount := workerCount * 2
-	if err := populateSeries(seriesCount, 10, 3, tsrv.TsDB()); err != nil {
+	if err := populateSeries(seriesCount, 10, 3, s.TsDB().(*ts.DB)); err != nil {
 		t.Fatal(err)
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
-		rpc.DefaultClass).Connect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := s.RPCClientConn(t, username.RootUserName())
 	client := tspb.NewTimeSeriesClient(conn)
 
 	queries := make([]tspb.Query, 0, seriesCount)
@@ -295,10 +295,291 @@ func TestServerQueryStarvation(t *testing.T) {
 	}
 }
 
+func TestServerQueryTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				DisableTimeSeriesMaintenanceQueue: true,
+			},
+		},
+	})
+	defer s.Stopper().Stop(context.Background())
+
+	systemDB := s.SystemLayer().SQLConn(t, "")
+
+	// Populate data directly.
+	tsdb := s.TsDB().(*ts.DB)
+	if err := tsdb.StoreData(context.Background(), ts.Resolution10s, []tspb.TimeSeriesData{
+		{
+			Name:   "test.metric",
+			Source: "1",
+			Datapoints: []tspb.TimeSeriesDatapoint{
+				{
+					TimestampNanos: 400 * 1e9,
+					Value:          100.0,
+				},
+				{
+					TimestampNanos: 500 * 1e9,
+					Value:          200.0,
+				},
+			},
+		},
+		{
+			Name:   "test.metric",
+			Source: "1-2",
+			Datapoints: []tspb.TimeSeriesDatapoint{
+				{
+					TimestampNanos: 400 * 1e9,
+					Value:          1.0,
+				},
+				{
+					TimestampNanos: 500 * 1e9,
+					Value:          2.0,
+				},
+			},
+		},
+		{
+			Name:   "test.metric",
+			Source: "10",
+			Datapoints: []tspb.TimeSeriesDatapoint{
+				{
+					TimestampNanos: 400 * 1e9,
+					Value:          200.0,
+				},
+				{
+					TimestampNanos: 500 * 1e9,
+					Value:          400.0,
+				},
+			},
+		},
+		{
+			Name:   "test.metric",
+			Source: "10-2",
+			Datapoints: []tspb.TimeSeriesDatapoint{
+				{
+					TimestampNanos: 400 * 1e9,
+					Value:          4.0,
+				},
+				{
+					TimestampNanos: 500 * 1e9,
+					Value:          5.0,
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Undefined tenant ID should aggregate across all tenants.
+	expectedAggregatedResult := &tspb.TimeSeriesQueryResponse{
+		Results: []tspb.TimeSeriesQueryResponse_Result{
+			{
+				Query: tspb.Query{
+					Name:    "test.metric",
+					Sources: []string{"1"},
+				},
+				Datapoints: []tspb.TimeSeriesDatapoint{
+					{
+						TimestampNanos: 400 * 1e9,
+						Value:          101.0,
+					},
+					{
+						TimestampNanos: 500 * 1e9,
+						Value:          202.0,
+					},
+				},
+			},
+			{
+				Query: tspb.Query{
+					Name:    "test.metric",
+					Sources: []string{"1", "10"},
+				},
+				Datapoints: []tspb.TimeSeriesDatapoint{
+					{
+						TimestampNanos: 400 * 1e9,
+						Value:          305.0,
+					},
+					{
+						TimestampNanos: 500 * 1e9,
+						Value:          607.0,
+					},
+				},
+			},
+		},
+	}
+
+	conn := s.RPCClientConn(t, username.RootUserName())
+	client := tspb.NewTimeSeriesClient(conn)
+	aggregatedResponse, err := client.Query(context.Background(), &tspb.TimeSeriesQueryRequest{
+		StartNanos: 400 * 1e9,
+		EndNanos:   500 * 1e9,
+		Queries: []tspb.Query{
+			{
+				Name:    "test.metric",
+				Sources: []string{"1"},
+			},
+			{
+				// Not providing a source (nodeID or storeID) will aggregate across all sources.
+				Name: "test.metric",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range aggregatedResponse.Results {
+		sort.Strings(r.Sources)
+	}
+	require.Equal(t, expectedAggregatedResult, aggregatedResponse)
+
+	// System tenant ID should provide system tenant ts data.
+	systemID := roachpb.MustMakeTenantID(1)
+	expectedSystemResult := &tspb.TimeSeriesQueryResponse{
+		Results: []tspb.TimeSeriesQueryResponse_Result{
+			{
+				Query: tspb.Query{
+					Name:     "test.metric",
+					Sources:  []string{"1"},
+					TenantID: systemID,
+				},
+				Datapoints: []tspb.TimeSeriesDatapoint{
+					{
+						TimestampNanos: 400 * 1e9,
+						Value:          100.0,
+					},
+					{
+						TimestampNanos: 500 * 1e9,
+						Value:          200.0,
+					},
+				},
+			},
+			{
+				Query: tspb.Query{
+					Name:     "test.metric",
+					Sources:  []string{"1", "10"},
+					TenantID: systemID,
+				},
+				Datapoints: []tspb.TimeSeriesDatapoint{
+					{
+						TimestampNanos: 400 * 1e9,
+						Value:          300.0,
+					},
+					{
+						TimestampNanos: 500 * 1e9,
+						Value:          600.0,
+					},
+				},
+			},
+		},
+	}
+
+	systemResponse, err := client.Query(context.Background(), &tspb.TimeSeriesQueryRequest{
+		StartNanos: 400 * 1e9,
+		EndNanos:   500 * 1e9,
+		Queries: []tspb.Query{
+			{
+				Name:     "test.metric",
+				Sources:  []string{"1"},
+				TenantID: systemID,
+			},
+			{
+				Name:     "test.metric",
+				TenantID: systemID,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range systemResponse.Results {
+		sort.Strings(r.Sources)
+	}
+	require.Equal(t, expectedSystemResult, systemResponse)
+
+	// App tenant should only report metrics with its tenant ID in the secondary source field
+	tenantID := roachpb.MustMakeTenantID(2)
+	expectedTenantResponse := &tspb.TimeSeriesQueryResponse{
+		Results: []tspb.TimeSeriesQueryResponse_Result{
+			{
+				Query: tspb.Query{
+					Name:     "test.metric",
+					Sources:  []string{"1"},
+					TenantID: tenantID,
+				},
+				Datapoints: []tspb.TimeSeriesDatapoint{
+					{
+						TimestampNanos: 400 * 1e9,
+						Value:          1.0,
+					},
+					{
+						TimestampNanos: 500 * 1e9,
+						Value:          2.0,
+					},
+				},
+			},
+			{
+				Query: tspb.Query{
+					Name:     "test.metric",
+					Sources:  []string{"1", "10"},
+					TenantID: tenantID,
+				},
+				Datapoints: []tspb.TimeSeriesDatapoint{
+					{
+						TimestampNanos: 400 * 1e9,
+						Value:          5.0,
+					},
+					{
+						TimestampNanos: 500 * 1e9,
+						Value:          7.0,
+					},
+				},
+			},
+		},
+	}
+
+	tenant, _ := serverutils.StartTenant(t, s, base.TestTenantArgs{TenantID: tenantID})
+	_, err = systemDB.Exec("ALTER TENANT [2] GRANT CAPABILITY can_view_tsdb_metrics=true;\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability := map[tenantcapabilities.ID]string{tenantcapabilities.CanViewTSDBMetrics: "true"}
+	serverutils.WaitForTenantCapabilities(t, s, tenantID, capability, "")
+	tenantConn := tenant.RPCClientConn(t, username.RootUserName())
+	tenantClient := tspb.NewTimeSeriesClient(tenantConn)
+
+	tenantResponse, err := tenantClient.Query(context.Background(), &tspb.TimeSeriesQueryRequest{
+		StartNanos: 400 * 1e9,
+		EndNanos:   500 * 1e9,
+		Queries: []tspb.Query{
+			{
+				Name:    "test.metric",
+				Sources: []string{"1"},
+			},
+			{
+				// Not providing a source (nodeID or storeID) will aggregate across all sources.
+				Name: "test.metric",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range tenantResponse.Results {
+		sort.Strings(r.Sources)
+	}
+	require.Equal(t, expectedTenantResponse, tenantResponse)
+}
+
 // TestServerQueryMemoryManagement verifies that queries succeed under
 // constrained memory requirements.
 func TestServerQueryMemoryManagement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Number of workers that will be available to process data.
 	workerCount := 20
@@ -317,22 +598,20 @@ func TestServerQueryMemoryManagement(t *testing.T) {
 	sizeOfSlab := int64(unsafe.Sizeof(roachpb.InternalTimeSeriesData{})) + (int64(unsafe.Sizeof(roachpb.InternalTimeSeriesSample{})) * samplesPerSlab)
 	budget := 3 * sizeOfSlab * int64(sourceCount) * int64(workerCount)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		// For now, direct access to the tsdb is reserved to the storage layer.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+
 		TimeSeriesQueryWorkerMax:    workerCount,
 		TimeSeriesQueryMemoryBudget: budget,
 	})
 	defer s.Stopper().Stop(context.Background())
-	tsrv := s.(*server.TestServer)
 
-	if err := populateSeries(seriesCount, sourceCount, valueCount, tsrv.TsDB()); err != nil {
+	if err := populateSeries(seriesCount, sourceCount, valueCount, s.TsDB().(*ts.DB)); err != nil {
 		t.Fatal(err)
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
-		rpc.DefaultClass).Connect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := s.RPCClientConn(t, username.RootUserName())
 	client := tspb.NewTimeSeriesClient(conn)
 
 	queries := make([]tspb.Query, 0, seriesCount)
@@ -354,6 +633,7 @@ func TestServerQueryMemoryManagement(t *testing.T) {
 func TestServerDump(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
 	seriesCount := 10
@@ -387,7 +667,10 @@ func TestServerDump(t *testing.T) {
 
 	expTotalMsgCount := seriesCount * sourceCount * (endSlab - startSlab)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		// For now, direct access to the tsdb is reserved to the storage layer.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableTimeSeriesMaintenanceQueue: true,
@@ -395,9 +678,8 @@ func TestServerDump(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(ctx)
-	tsrv := s.(*server.TestServer)
 
-	if err := populateSeries(seriesCount, sourceCount, valueCount, tsrv.TsDB()); err != nil {
+	if err := populateSeries(seriesCount, sourceCount, valueCount, s.TsDB().(*ts.DB)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -406,11 +688,7 @@ func TestServerDump(t *testing.T) {
 		names = append(names, seriesName(series))
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
-		rpc.DefaultClass).Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := s.RPCClientConn(t, username.RootUserName())
 	client := tspb.NewTimeSeriesClient(conn)
 
 	dumpClient, err := client.Dump(ctx, &tspb.DumpRequest{
@@ -482,7 +760,10 @@ func TestServerDump(t *testing.T) {
 	s.Stopper().Stop(ctx)
 
 	// Start a new server, into which to write the raw dump.
-	s, _, _ = serverutils.StartServer(t, base.TestServerArgs{
+	s = serverutils.StartServerOnly(t, base.TestServerArgs{
+		// For now, direct access to the tsdb is reserved to the storage layer.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableTimeSeriesMaintenanceQueue: true,
@@ -503,11 +784,7 @@ func TestServerDump(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		require.NoError(t, s.DB().Run(ctx, &b))
 
-		conn, err := s.RPCContext().GRPCDialNode(s.ServingRPCAddr(), s.NodeID(),
-			rpc.DefaultClass).Connect(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
+		conn := s.RPCClientConn(t, username.RootUserName())
 		client := tspb.NewTimeSeriesClient(conn)
 
 		dumpClient, err := client.Dump(ctx, &tspb.DumpRequest{
@@ -525,22 +802,19 @@ func TestServerDump(t *testing.T) {
 }
 
 func BenchmarkServerQuery(b *testing.B) {
-	s, _, _ := serverutils.StartServer(b, base.TestServerArgs{})
+	defer log.Scope(b).Close(b)
+
+	s := serverutils.StartServerOnly(b, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	tsrv := s.(*server.TestServer)
 
 	// Populate data for large number of time series.
 	seriesCount := 50
 	sourceCount := 10
-	if err := populateSeries(seriesCount, sourceCount, 3, tsrv.TsDB()); err != nil {
+	if err := populateSeries(seriesCount, sourceCount, 3, s.TsDB().(*ts.DB)); err != nil {
 		b.Fatal(err)
 	}
 
-	conn, err := tsrv.RPCContext().GRPCDialNode(tsrv.Cfg.Addr, tsrv.NodeID(),
-		rpc.DefaultClass).Connect(context.Background())
-	if err != nil {
-		b.Fatal(err)
-	}
+	conn := s.RPCClientConn(b, username.RootUserName())
 	client := tspb.NewTimeSeriesClient(conn)
 
 	queries := make([]tspb.Query, 0, seriesCount)

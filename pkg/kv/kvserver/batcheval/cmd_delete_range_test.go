@@ -18,6 +18,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -57,13 +59,13 @@ func TestDeleteRangeTombstone(t *testing.T) {
 		t.Helper()
 		var localTS hlc.ClockTimestamp
 
-		txn := roachpb.MakeTransaction("test", nil /* baseKey */, roachpb.NormalUserPriority, hlc.Timestamp{WallTime: 5e9}, 0, 0)
-		require.NoError(t, storage.MVCCPut(ctx, rw, nil, roachpb.Key("b"), hlc.Timestamp{WallTime: 2e9}, localTS, roachpb.MakeValueFromString("b2"), nil))
-		require.NoError(t, storage.MVCCPut(ctx, rw, nil, roachpb.Key("c"), hlc.Timestamp{WallTime: 4e9}, localTS, roachpb.MakeValueFromString("c4"), nil))
-		require.NoError(t, storage.MVCCPut(ctx, rw, nil, roachpb.Key("d"), hlc.Timestamp{WallTime: 2e9}, localTS, roachpb.MakeValueFromString("d2"), nil))
-		_, err := storage.MVCCDelete(ctx, rw, nil, roachpb.Key("d"), hlc.Timestamp{WallTime: 3e9}, localTS, nil)
+		txn := roachpb.MakeTransaction("test", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority, hlc.Timestamp{WallTime: 5e9}, 0, 0, 0)
+		require.NoError(t, storage.MVCCPut(ctx, rw, roachpb.Key("b"), hlc.Timestamp{WallTime: 2e9}, roachpb.MakeValueFromString("b2"), storage.MVCCWriteOptions{}))
+		require.NoError(t, storage.MVCCPut(ctx, rw, roachpb.Key("c"), hlc.Timestamp{WallTime: 4e9}, roachpb.MakeValueFromString("c4"), storage.MVCCWriteOptions{}))
+		require.NoError(t, storage.MVCCPut(ctx, rw, roachpb.Key("d"), hlc.Timestamp{WallTime: 2e9}, roachpb.MakeValueFromString("d2"), storage.MVCCWriteOptions{}))
+		_, err := storage.MVCCDelete(ctx, rw, roachpb.Key("d"), hlc.Timestamp{WallTime: 3e9}, storage.MVCCWriteOptions{})
 		require.NoError(t, err)
-		require.NoError(t, storage.MVCCPut(ctx, rw, nil, roachpb.Key("i"), hlc.Timestamp{WallTime: 5e9}, localTS, roachpb.MakeValueFromString("i5"), &txn))
+		require.NoError(t, storage.MVCCPut(ctx, rw, roachpb.Key("i"), hlc.Timestamp{WallTime: 5e9}, roachpb.MakeValueFromString("i5"), storage.MVCCWriteOptions{Txn: &txn}))
 		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("f"), roachpb.Key("h"), hlc.Timestamp{WallTime: 3e9}, localTS, nil, nil, false, 0, nil))
 		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("Z"), roachpb.Key("a"), hlc.Timestamp{WallTime: 100e9}, localTS, nil, nil, false, 0, nil))
 		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("z"), roachpb.Key("|"), hlc.Timestamp{WallTime: 100e9}, localTS, nil, nil, false, 0, nil))
@@ -143,11 +145,11 @@ func TestDeleteRangeTombstone(t *testing.T) {
 			returnKeys: true,
 			expectErr:  "ReturnKeys can't be used with range tombstones",
 		},
-		"intent errors with WriteIntentError": {
+		"intent errors with LockConflictError": {
 			start:     "i",
 			end:       "j",
 			ts:        10e9,
-			expectErr: &kvpb.WriteIntentError{},
+			expectErr: &kvpb.LockConflictError{},
 		},
 		"below point errors with WriteTooOldError": {
 			start:     "a",
@@ -215,7 +217,7 @@ func TestDeleteRangeTombstone(t *testing.T) {
 						Timestamp: rangeKey.Timestamp,
 					}
 					if tc.txn {
-						txn := roachpb.MakeTransaction("txn", nil /* baseKey */, roachpb.NormalUserPriority, rangeKey.Timestamp, 0, 0)
+						txn := roachpb.MakeTransaction("txn", nil, isolation.Serializable, roachpb.NormalUserPriority, rangeKey.Timestamp, 0, 0, 0)
 						h.Txn = &txn
 					}
 					var predicates kvpb.DeleteRangePredicates
@@ -250,7 +252,8 @@ func TestDeleteRangeTombstone(t *testing.T) {
 					// the additional seeks necessary to check for adjacent range keys that we
 					// may merge with (for stats purposes) which should not cross the range
 					// bounds.
-					var latchSpans, lockSpans spanset.SpanSet
+					var latchSpans spanset.SpanSet
+					var lockSpans lockspanset.LockSpanSet
 					declareKeysDeleteRange(evalCtx.Desc, &h, req, &latchSpans, &lockSpans, 0)
 					batch := spanset.NewBatchAt(engine.NewBatch(), &latchSpans, h.Timestamp)
 					defer batch.Close()
@@ -304,11 +307,14 @@ func TestDeleteRangeTombstone(t *testing.T) {
 // operated on. The command should not have written an actual rangekey!
 func checkPredicateDeleteRange(t *testing.T, engine storage.Reader, rKeyInfo storage.MVCCRangeKey) {
 
-	iter := engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	iter, err := engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		LowerBound: rKeyInfo.StartKey,
 		UpperBound: rKeyInfo.EndKey,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer iter.Close()
 
 	for iter.SeekGE(storage.MVCCKey{Key: rKeyInfo.StartKey}); ; iter.NextKey() {
@@ -341,11 +347,14 @@ func checkDeleteRangeTombstone(
 	written bool,
 	now hlc.ClockTimestamp,
 ) {
-	iter := engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	iter, err := engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		KeyTypes:   storage.IterKeyTypeRangesOnly,
 		LowerBound: rangeKey.StartKey,
 		UpperBound: rangeKey.EndKey,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer iter.Close()
 	iter.SeekGE(storage.MVCCKey{Key: rangeKey.StartKey})
 

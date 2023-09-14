@@ -25,10 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/replicastats"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -531,7 +533,7 @@ func mockStorePool(
 	for _, storeID := range suspectedStoreIDs {
 		liveNodeSet[roachpb.NodeID(storeID)] = livenesspb.NodeLivenessStatus_LIVE
 		detail := storePool.GetStoreDetailLocked(storeID)
-		detail.LastUnavailable = storePool.Clock().Now().GoTime()
+		detail.LastUnavailable = storePool.Clock().Now()
 		detail.Desc = &roachpb.StoreDescriptor{
 			StoreID: storeID,
 			Node:    roachpb.NodeDescriptor{NodeID: roachpb.NodeID(storeID)},
@@ -541,7 +543,7 @@ func mockStorePool(
 	// Set the node liveness function using the set we constructed.
 	// TODO(sarkesian): This override needs to be fixed to stop exporting this field.
 	storePool.NodeLivenessFn =
-		func(nodeID roachpb.NodeID, now time.Time, threshold time.Duration) livenesspb.NodeLivenessStatus {
+		func(nodeID roachpb.NodeID) livenesspb.NodeLivenessStatus {
 			if status, ok := liveNodeSet[nodeID]; ok {
 				return status
 			}
@@ -841,12 +843,12 @@ func TestAllocatorReplaceDecommissioningReplica(t *testing.T) {
 	gossiputil.NewStoreGossiper(g).GossipStores(storeDescriptors, t)
 
 	// Override liveness of n3 to decommissioning so the only available target is s4.
-	oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration) livenesspb.NodeLivenessStatus {
+	oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID) livenesspb.NodeLivenessStatus {
 		if nid == roachpb.NodeID(3) {
 			return livenesspb.NodeLivenessStatus_DECOMMISSIONING
 		}
 
-		return sp.NodeLivenessFn(nid, now, timeUntilStoreDead)
+		return sp.NodeLivenessFn(nid)
 	}, getNumNodes)
 
 	result, _, err := a.AllocateVoter(
@@ -899,12 +901,12 @@ func TestAllocatorReplaceFailsOnConstrainedDecommissioningReplica(t *testing.T) 
 	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
 
 	// Override liveness of n3 to decommissioning so the only available target is s4.
-	oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration) livenesspb.NodeLivenessStatus {
+	oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID) livenesspb.NodeLivenessStatus {
 		if nid == roachpb.NodeID(3) {
 			return livenesspb.NodeLivenessStatus_DECOMMISSIONING
 		}
 
-		return sp.NodeLivenessFn(nid, now, timeUntilStoreDead)
+		return sp.NodeLivenessFn(nid)
 	}, func() int {
 		return 4
 	})
@@ -1893,7 +1895,7 @@ func (r *mockRepl) RaftStatus() *raft.Status {
 	return raftStatus
 }
 
-func (r *mockRepl) GetFirstIndex() uint64 {
+func (r *mockRepl) GetFirstIndex() kvpb.RaftIndex {
 	return 0
 }
 
@@ -1965,6 +1967,7 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				emptySpanConfig(),
 				c.existing,
 				&mockRepl{
@@ -2094,6 +2097,7 @@ func TestAllocatorTransferLeaseTargetIOOverloadCheck(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				emptySpanConfig(),
 				existing,
 				&mockRepl{
@@ -2209,6 +2213,7 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				emptySpanConfig(),
 				c.existing,
 				repl,
@@ -2301,6 +2306,7 @@ func TestAllocatorTransferLeaseTargetConstraints(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				context.Background(),
 				sp,
+				&roachpb.RangeDescriptor{},
 				c.conf,
 				c.existing,
 				&mockRepl{
@@ -2329,7 +2335,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	stopper, g, _, storePool, nl := storepool.CreateTestStorePool(ctx, st,
-		storepool.TestTimeUntilStoreDeadOff, true, /* deterministic */
+		liveness.TestTimeUntilNodeDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
 	a := MakeAllocator(st, true /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
@@ -2413,6 +2419,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
 				storePool,
+				&roachpb.RangeDescriptor{},
 				c.conf,
 				c.existing,
 				&mockRepl{
@@ -2697,6 +2704,7 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 			result := a.ShouldTransferLease(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				emptySpanConfig(),
 				c.existing,
 				&mockRepl{
@@ -2718,7 +2726,7 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	stopper, g, _, storePool, nl := storepool.CreateTestStorePool(ctx, st,
-		storepool.TestTimeUntilStoreDeadOff, true, /* deterministic */
+		liveness.TestTimeUntilNodeDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
 	a := MakeAllocator(st, true /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
@@ -2765,6 +2773,7 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 			result := a.ShouldTransferLease(
 				ctx,
 				storePool,
+				&roachpb.RangeDescriptor{},
 				emptySpanConfig(),
 				c.existing,
 				&mockRepl{
@@ -2786,7 +2795,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	stopper, g, clock, storePool, nl := storepool.CreateTestStorePool(ctx, st,
-		storepool.TestTimeUntilStoreDeadOff, true, /* deterministic */
+		liveness.TestTimeUntilNodeDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
 	a := MakeAllocator(st, true /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
@@ -2812,6 +2821,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 		result := a.ShouldTransferLease(
 			ctx,
 			storePool,
+			&roachpb.RangeDescriptor{},
 			emptySpanConfig(),
 			replicas(1, 2, 3),
 			&mockRepl{storeID: 2, replicationFactor: 3},
@@ -2819,7 +2829,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 		)
 		require.Equal(t, expected, result)
 	}
-	timeAfterStoreSuspect := storepool.TimeAfterStoreSuspect.Get(&a.st.SV)
+	timeAfterNodeSuspect := liveness.TimeAfterNodeSuspect.Get(&a.st.SV)
 	// Based on capacity node 1 is desirable.
 	assertShouldTransferLease(true)
 	// Flip node 1 to unavailable, there should be no lease transfer now.
@@ -2829,7 +2839,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 	nl.SetNodeStatus(1, livenesspb.NodeLivenessStatus_LIVE)
 	assertShouldTransferLease(false)
 	// Wait out the suspected store timeout, verify that lease transfers are back.
-	clock.Advance(timeAfterStoreSuspect + time.Millisecond)
+	clock.Advance(timeAfterNodeSuspect + time.Millisecond)
 	assertShouldTransferLease(true)
 }
 
@@ -2953,6 +2963,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 			result := a.ShouldTransferLease(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				conf,
 				c.existing,
 				&mockRepl{
@@ -2968,6 +2979,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				conf,
 				c.existing,
 				&mockRepl{
@@ -2987,6 +2999,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 			target = a.TransferLeaseTarget(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				conf,
 				c.existing,
 				&mockRepl{
@@ -3080,6 +3093,7 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				conf,
 				c.existing,
 				&mockRepl{
@@ -3100,6 +3114,7 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 			target = a.TransferLeaseTarget(
 				ctx,
 				sp,
+				&roachpb.RangeDescriptor{},
 				conf,
 				c.existing,
 				&mockRepl{
@@ -5574,7 +5589,7 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	stopper, g, _, storePool, _ := storepool.CreateTestStorePool(ctx, st,
-		storepool.TestTimeUntilStoreDeadOff, true, /* deterministic */
+		liveness.TestTimeUntilNodeDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
 	defer stopper.Stop(ctx)
@@ -5730,6 +5745,7 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
 				storePool,
+				&roachpb.RangeDescriptor{},
 				emptySpanConfig(),
 				existing,
 				&mockRepl{
@@ -6828,14 +6844,14 @@ func TestAllocatorComputeActionWithStorePoolRemoveDead(t *testing.T) {
 			// Mark all dead nodes as alive, so we can override later.
 			all := append(tcase.live, tcase.dead...)
 			mockStorePool(sp, all, nil, nil, nil, nil, nil)
-			oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration) livenesspb.NodeLivenessStatus {
+			oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID) livenesspb.NodeLivenessStatus {
 				for _, deadStoreID := range tcase.dead {
 					if nid == roachpb.NodeID(deadStoreID) {
 						return livenesspb.NodeLivenessStatus_DEAD
 					}
 				}
 
-				return sp.NodeLivenessFn(nid, now, timeUntilStoreDead)
+				return sp.NodeLivenessFn(nid)
 			}, getNumNodes)
 			action, _ := a.ComputeAction(ctx, oSp, conf, &tcase.desc)
 			if tcase.expectedAction != action {
@@ -7720,7 +7736,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	stopper, _, _, sp, _ := storepool.CreateTestStorePool(ctx, st,
-		storepool.TestTimeUntilStoreDeadOff, false, /* deterministic */
+		liveness.TestTimeUntilNodeDeadOff, false, /* deterministic */
 		func() int { return numNodes },
 		livenesspb.NodeLivenessStatus_LIVE)
 	a := MakeAllocator(st, false /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
@@ -8444,7 +8460,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 	g := gossip.NewTest(1, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
-	storepool.TimeUntilStoreDead.Override(ctx, &st.SV, storepool.TestTimeUntilStoreDeadOff)
+	liveness.TimeUntilNodeDead.Override(ctx, &st.SV, liveness.TestTimeUntilNodeDeadOff)
 
 	const generations = 100
 	const nodes = 20
@@ -8475,7 +8491,14 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 	do := makeDiskCapacityOptions(&st.SV)
 
-	rangesPerNode := int(math.Floor(capacity * do.ShedAndBlockAllThreshold / rangeSize))
+	// Each range is equally sized (16mb), we want the number of ranges per node,
+	// when their size is added, to be no greater than the full disk rebalance
+	// threshold (0.925%) e.g for below:
+	//   capacity  = 1024mb
+	//   rangeSize = 16mb
+	//   threshold = 0.925
+	//   rangesPerNode =  ⌊1024mb * 0.925 / 16mb⌋ = 59
+	rangesPerNode := int(math.Floor(capacity * do.RebalanceToThreshold / rangeSize))
 	rangesToAdd := rangesPerNode * nodes
 
 	// Initialize testStores.
@@ -8495,7 +8518,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 	for i := 0; i < generations; i++ {
 		// First loop through test stores and randomly add data.
 		for j := 0; j < len(testStores); j++ {
-			if mockNodeLiveness.NodeLivenessFunc(roachpb.NodeID(j), time.Time{}, 0) == livenesspb.NodeLivenessStatus_DEAD {
+			if mockNodeLiveness.NodeLivenessFunc(roachpb.NodeID(j)) == livenesspb.NodeLivenessStatus_DEAD {
 				continue
 			}
 			ts := &testStores[j]
@@ -8522,7 +8545,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 		// Loop through each store a number of times and maybe rebalance.
 		for j := 0; j < 10; j++ {
 			for k := 0; k < len(testStores); k++ {
-				if mockNodeLiveness.NodeLivenessFunc(roachpb.NodeID(k), time.Time{}, 0) == livenesspb.NodeLivenessStatus_DEAD {
+				if mockNodeLiveness.NodeLivenessFunc(roachpb.NodeID(k)) == livenesspb.NodeLivenessStatus_DEAD {
 					continue
 				}
 				ts := &testStores[k]
@@ -8559,7 +8582,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 		// Simulate rocksdb compactions freeing up disk space.
 		for j := 0; j < len(testStores); j++ {
-			if mockNodeLiveness.NodeLivenessFunc(roachpb.NodeID(j), time.Time{}, 0) != livenesspb.NodeLivenessStatus_DEAD {
+			if mockNodeLiveness.NodeLivenessFunc(roachpb.NodeID(j)) != livenesspb.NodeLivenessStatus_DEAD {
 				ts := &testStores[j]
 				if ts.Capacity.Available <= 0 {
 					t.Errorf("testStore %d ran out of space during generation %d: %+v", j, i, ts.Capacity)
@@ -8895,7 +8918,7 @@ func exampleRebalancing(
 	// adding / rebalancing ranges of random sizes.
 	g := gossip.NewTest(1, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
-	storepool.TimeUntilStoreDead.Override(ctx, &st.SV, storepool.TestTimeUntilStoreDeadOff)
+	liveness.TimeUntilNodeDead.Override(ctx, &st.SV, liveness.TestTimeUntilNodeDeadOff)
 
 	const nodes = 20
 

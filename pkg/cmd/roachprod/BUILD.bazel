@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 
 go_library(
@@ -13,19 +12,23 @@ go_library(
     deps = [
         "//pkg/build",
         "//pkg/cmd/roachprod/grafana",
+        "//pkg/cmd/roachprod/upgrade",
         "//pkg/roachprod",
         "//pkg/roachprod/config",
         "//pkg/roachprod/errors",
         "//pkg/roachprod/install",
-        "//pkg/roachprod/logger",
         "//pkg/roachprod/ssh",
         "//pkg/roachprod/ui",
         "//pkg/roachprod/vm",
         "//pkg/roachprod/vm/gce",
         "//pkg/util/flagutil",
+        "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_fatih_color//:color",
         "@com_github_spf13_cobra//:cobra",
         "@org_golang_x_term//:term",
+        "@org_golang_x_text//language",
+        "@org_golang_x_text//message",
     ],
 )
 
@@ -34,5 +37,3 @@ go_binary(
     embed = [":roachprod_lib"],
     visibility = ["//visibility:public"],
 )
-
-get_x_data(name = "get_x_data")

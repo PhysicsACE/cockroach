@@ -174,6 +174,7 @@ type Index interface {
 	IsSharded() bool
 	IsNotVisible() bool
 	IsCreatedExplicitly() bool
+	GetInvisibility() float64
 	GetPredicate() string
 	GetType() descpb.IndexDescriptor_Type
 	GetGeoConfig() geoindex.Config
@@ -1040,11 +1041,11 @@ func FindTargetIndexNameByID(desc TableDescriptor, indexID descpb.IndexID) (stri
 	// them.
 	if scState := desc.GetDeclarativeSchemaChangerState(); scState != nil {
 		for _, target := range scState.Targets {
-			if target.IndexName != nil &&
+			if indexName := target.GetIndexName(); indexName != nil &&
 				target.TargetStatus == scpb.Status_PUBLIC &&
-				target.IndexName.TableID == desc.GetID() &&
-				target.IndexName.IndexID == indexID {
-				return target.IndexName.Name, nil
+				indexName.TableID == desc.GetID() &&
+				indexName.IndexID == indexID {
+				return indexName.Name, nil
 			}
 		}
 	}

@@ -164,10 +164,12 @@ func registerTPCCOverload(r registry.Registry) {
 		r.Add(registry.TestSpec{
 			Name:              name,
 			Owner:             registry.OwnerAdmissionControl,
-			Tags:              []string{`weekly`},
+			Benchmark:         true,
+			Tags:              registry.Tags(`weekly`),
 			Cluster:           r.MakeClusterSpec(s.Nodes+1, spec.CPU(s.CPUs)),
 			Run:               s.run,
 			EncryptionSupport: registry.EncryptionMetamorphic,
+			Leases:            registry.MetamorphicLeases,
 			Timeout:           20 * time.Minute,
 		})
 	}
@@ -181,8 +183,9 @@ func registerTPCCOverload(r registry.Registry) {
 // CRDB nodes will eventually OOM around 3-4 hours through the ramp period.
 func registerTPCCSevereOverload(r registry.Registry) {
 	r.Add(registry.TestSpec{
-		Name:  "admission-control/tpcc-severe-overload",
-		Owner: registry.OwnerAdmissionControl,
+		Name:      "admission-control/tpcc-severe-overload",
+		Owner:     registry.OwnerAdmissionControl,
+		Benchmark: true,
 		// TODO(abaptist): This test will require a lot of admission control work
 		// to pass. Just putting it here to make easy to run at any time.
 		Skip:    "#89142",

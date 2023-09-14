@@ -11,10 +11,13 @@ package streamproducer
 import (
 	"context"
 	"fmt"
+	"runtime/pprof"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
@@ -22,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -35,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 type eventStream struct {
@@ -43,7 +49,6 @@ type eventStream struct {
 	spec            streampb.StreamPartitionSpec
 	subscribedSpans roachpb.SpanGroup
 	mon             *mon.BytesMonitor
-	acc             mon.BoundAccount
 
 	data tree.Datums // Data to send to the consumer
 
@@ -55,6 +60,7 @@ type eventStream struct {
 	errCh       chan error                    // Signaled when error occurs in rangefeed.
 	streamCh    chan tree.Datums              // Channel signaled to forward datums to consumer.
 	sp          *tracing.Span                 // Span representing the lifetime of the eventStream.
+	acc         mon.BoundAccount
 }
 
 var _ eval.ValueGenerator = (*eventStream)(nil)
@@ -79,10 +85,20 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 		return errors.AssertionFailedf("expected to be started once")
 	}
 
+	sourceTenantID, err := s.validateProducerJobAndSpec(ctx)
+	if err != nil {
+		return err
+	}
+
+	log.Infof(ctx, "starting physical replication event stream: tenant=%s initial_scan_timestamp=%s previous_replicated_time=%s",
+		sourceTenantID, s.spec.InitialScanTimestamp, s.spec.PreviousReplicatedTimestamp)
+
 	s.acc = s.mon.MakeBoundAccount()
 
-	// errCh consumed by ValueGenerator and is signaled when go routines encounter error.
-	s.errCh = make(chan error)
+	// errCh is buffered to ensure the sender can send an error to
+	// the buffer, without waiting, when the channel receiver is not waiting on
+	// the channel.
+	s.errCh = make(chan error, 1)
 
 	// Events channel gets RangeFeedEvents and is consumed by ValueGenerator.
 	s.eventsCh = make(chan kvcoord.RangeFeedMessage)
@@ -94,6 +110,7 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 
 	// Common rangefeed options.
 	opts := []rangefeed.Option{
+		rangefeed.WithPProfLabel("job", fmt.Sprintf("id=%d", s.streamID)),
 		rangefeed.WithOnCheckpoint(s.onCheckpoint),
 
 		rangefeed.WithOnInternalError(func(ctx context.Context, err error) {
@@ -103,7 +120,7 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 		rangefeed.WithMemoryMonitor(s.mon),
 
 		rangefeed.WithOnSSTable(s.onSSTable),
-
+		rangefeed.WithMuxRangefeed(true),
 		rangefeed.WithOnDeleteRange(s.onDeleteRange),
 	}
 
@@ -113,7 +130,7 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 	}
 
 	initialTimestamp := s.spec.InitialScanTimestamp
-	if s.spec.PreviousHighWaterTimestamp.IsEmpty() {
+	if s.spec.PreviousReplicatedTimestamp.IsEmpty() {
 		opts = append(opts,
 			rangefeed.WithInitialScan(func(ctx context.Context) {}),
 			rangefeed.WithScanRetryBehavior(rangefeed.ScanRetryRemaining),
@@ -130,10 +147,10 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 			rangefeed.WithOnScanCompleted(s.onInitialScanSpanCompleted),
 		)
 	} else {
-		initialTimestamp = s.spec.PreviousHighWaterTimestamp
+		initialTimestamp = s.spec.PreviousReplicatedTimestamp
 		// When resuming from cursor, advance frontier to the cursor position.
 		for _, sp := range s.spec.Spans {
-			if _, err := frontier.Forward(sp, s.spec.PreviousHighWaterTimestamp); err != nil {
+			if _, err := frontier.Forward(sp, s.spec.PreviousReplicatedTimestamp); err != nil {
 				return err
 			}
 		}
@@ -159,6 +176,9 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) error {
 }
 
 func (s *eventStream) maybeSetError(err error) {
+	// Only send the error if the channel is empty, else it's ok to swallow the
+	// error because the first error in the channel will shut down the event
+	// stream.
 	select {
 	case s.errCh <- err:
 	default:
@@ -171,6 +191,14 @@ func (s *eventStream) startStreamProcessor(ctx context.Context, frontier *span.F
 	// withErrCapture wraps fn to capture and report error to the error channel.
 	withErrCapture := func(fn ctxGroupFn) ctxGroupFn {
 		return func(ctx context.Context) error {
+			// Attach the streamID as a job ID so that the job-specific
+			// CPU profile on the Job's advanced debug page includes
+			// stacks from these streams.
+			defer pprof.SetGoroutineLabels(ctx)
+			ctx = logtags.AddTag(ctx, "job", s.streamID)
+			ctx = pprof.WithLabels(ctx, pprof.Labels("job", fmt.Sprintf("id=%d", s.streamID)))
+			pprof.SetGoroutineLabels(ctx)
+
 			err := fn(ctx)
 			if err != nil {
 				// Signal ValueGenerator that this stream is terminating due to an error
@@ -193,7 +221,6 @@ func (s *eventStream) startStreamProcessor(ctx context.Context, frontier *span.F
 	}))
 
 	// TODO(yevgeniy): Add go routine to monitor stream job liveness.
-	// TODO(yevgeniy): Add validation that partition spans are a subset of stream spans.
 }
 
 // Next implements tree.ValueGenerator interface.
@@ -215,16 +242,20 @@ func (s *eventStream) Values() (tree.Datums, error) {
 
 // Close implements tree.ValueGenerator interface.
 func (s *eventStream) Close(ctx context.Context) {
-	s.rf.Close()
+	if s.rf != nil {
+		s.rf.Close()
+	}
 	s.acc.Close(ctx)
-
-	close(s.doneChan)
+	if s.doneChan != nil {
+		close(s.doneChan)
+	}
 	if err := s.streamGroup.Wait(); err != nil {
 		// Note: error in close is normal; we expect to be terminated with context canceled.
 		log.Errorf(ctx, "partition stream %d terminated with error %v", s.streamID, err)
 	}
-
-	s.sp.Finish()
+	if s.sp != nil {
+		s.sp.Finish()
+	}
 }
 
 func (s *eventStream) onValue(ctx context.Context, value *kvpb.RangeFeedValue) {
@@ -304,6 +335,8 @@ func (s *eventStream) flushEvent(ctx context.Context, event *streampb.StreamEven
 		return ctx.Err()
 	case s.streamCh <- tree.Datums{tree.NewDBytes(tree.DBytes(data))}:
 		return nil
+	case <-s.doneChan:
+		return nil
 	}
 }
 
@@ -355,84 +388,56 @@ func (p *checkpointPacer) shouldCheckpoint(
 	return false
 }
 
-// Add a RangeFeedSSTable into current batch and return number of bytes added.
+// Add a RangeFeedSSTable into current batch.
 func (s *eventStream) addSST(
-	sst *kvpb.RangeFeedSSTable, registeredSpan roachpb.Span, batch *streampb.StreamEvent_Batch,
-) (int, error) {
+	sst *kvpb.RangeFeedSSTable, registeredSpan roachpb.Span, seb *streamEventBatcher,
+) error {
 	// We send over the whole SSTable if the sst span is within
 	// the registered span boundaries.
 	if registeredSpan.Contains(sst.Span) {
-		batch.Ssts = append(batch.Ssts, *sst)
-		return sst.Size(), nil
+		seb.addSST(sst)
+		return nil
 	}
 	// If the sst span exceeds boundaries of the watched spans,
 	// we trim the sst data to avoid sending unnecessary data.
 	// TODO(casper): add metrics to track number of SSTs, and number of ssts
 	// that are not inside the boundaries (and possible count+size of kvs in such ssts).
-	size := 0
+	//
 	// Extract the received SST to only contain data within the boundaries of
 	// matching registered span. Execute the specified operations on each MVCC
 	// key value and each MVCCRangeKey value in the trimmed SSTable.
-	if err := replicationutils.ScanSST(sst, registeredSpan,
+	return replicationutils.ScanSST(sst, registeredSpan,
 		func(mvccKV storage.MVCCKeyValue) error {
-			batch.KeyValues = append(batch.KeyValues, roachpb.KeyValue{
+			seb.addKV(&roachpb.KeyValue{
 				Key: mvccKV.Key.Key,
 				Value: roachpb.Value{
 					RawBytes:  mvccKV.Value,
-					Timestamp: mvccKV.Key.Timestamp,
-				},
-			})
-			size += batch.KeyValues[len(batch.KeyValues)-1].Size()
+					Timestamp: mvccKV.Key.Timestamp}})
 			return nil
 		}, func(rangeKeyVal storage.MVCCRangeKeyValue) error {
-			batch.DelRanges = append(batch.DelRanges, kvpb.RangeFeedDeleteRange{
+			seb.addDelRange(&kvpb.RangeFeedDeleteRange{
 				Span: roachpb.Span{
 					Key:    rangeKeyVal.RangeKey.StartKey,
 					EndKey: rangeKeyVal.RangeKey.EndKey,
 				},
 				Timestamp: rangeKeyVal.RangeKey.Timestamp,
 			})
-			size += batch.DelRanges[len(batch.DelRanges)-1].Size()
 			return nil
-		}); err != nil {
-		return 0, err
-	}
-	return size, nil
+		})
 }
 
 // streamLoop is the main processing loop responsible for reading rangefeed events,
 // accumulating them in a batch, and sending those events to the ValueGenerator.
 func (s *eventStream) streamLoop(ctx context.Context, frontier *span.Frontier) error {
 	pacer := makeCheckpointPacer(s.spec.Config.MinCheckpointFrequency)
-
-	var batch streampb.StreamEvent_Batch
-	batchSize := 0
-	addValue := func(v *kvpb.RangeFeedValue) {
-		keyValue := roachpb.KeyValue{
-			Key:   v.Key,
-			Value: v.Value,
-		}
-		batch.KeyValues = append(batch.KeyValues, keyValue)
-		batchSize += keyValue.Size()
-	}
-
-	addDelRange := func(delRange *kvpb.RangeFeedDeleteRange) error {
-		// DelRange's span is already trimmed to enclosed within
-		// the subscribed span, just emit it.
-		batch.DelRanges = append(batch.DelRanges, *delRange)
-		batchSize += delRange.Size()
-		return nil
-	}
+	seb := makeStreamEventBatcher()
 
 	maybeFlushBatch := func(force bool) error {
-		if (force && batchSize > 0) || batchSize > int(s.spec.Config.BatchByteSize) {
+		if (force && seb.getSize() > 0) || seb.getSize() > int(s.spec.Config.BatchByteSize) {
 			defer func() {
-				batchSize = 0
-				batch.KeyValues = batch.KeyValues[:0]
-				batch.Ssts = batch.Ssts[:0]
-				batch.DelRanges = batch.DelRanges[:0]
+				seb.reset()
 			}()
-			return s.flushEvent(ctx, &streampb.StreamEvent{Batch: &batch})
+			return s.flushEvent(ctx, &streampb.StreamEvent{Batch: &seb.batch})
 		}
 		return nil
 	}
@@ -453,7 +458,10 @@ func (s *eventStream) streamLoop(ctx context.Context, frontier *span.Frontier) e
 		case ev := <-s.eventsCh:
 			switch {
 			case ev.Val != nil:
-				addValue(ev.Val)
+				seb.addKV(&roachpb.KeyValue{
+					Key:   ev.Val.Key,
+					Value: ev.Val.Value,
+				})
 				if err := maybeFlushBatch(flushIfNeeded); err != nil {
 					return err
 				}
@@ -473,18 +481,15 @@ func (s *eventStream) streamLoop(ctx context.Context, frontier *span.Frontier) e
 					}
 				}
 			case ev.SST != nil:
-				size, err := s.addSST(ev.SST, ev.RegisteredSpan, &batch)
+				err := s.addSST(ev.SST, ev.RegisteredSpan, seb)
 				if err != nil {
 					return err
 				}
-				batchSize += size
 				if err := maybeFlushBatch(flushIfNeeded); err != nil {
 					return err
 				}
 			case ev.DeleteRange != nil:
-				if err := addDelRange(ev.DeleteRange); err != nil {
-					return err
-				}
+				seb.addDelRange(ev.DeleteRange)
 				if err := maybeFlushBatch(flushIfNeeded); err != nil {
 					return err
 				}
@@ -495,10 +500,44 @@ func (s *eventStream) streamLoop(ctx context.Context, frontier *span.Frontier) e
 	}
 }
 
+func (s *eventStream) validateProducerJobAndSpec(ctx context.Context) (roachpb.TenantID, error) {
+	producerJobID := jobspb.JobID(s.streamID)
+	job, err := s.execCfg.JobRegistry.LoadJob(ctx, producerJobID)
+	if err != nil {
+		return roachpb.TenantID{}, err
+	}
+	payload := job.Payload()
+	sp, ok := payload.GetDetails().(*jobspb.Payload_StreamReplication)
+	if !ok {
+		return roachpb.TenantID{}, notAReplicationJobError(producerJobID)
+	}
+	if sp.StreamReplication == nil {
+		return roachpb.TenantID{}, errors.AssertionFailedf("unexpected nil StreamReplication in producer job %d payload", producerJobID)
+	}
+	if job.Status() != jobs.StatusRunning {
+		return roachpb.TenantID{}, jobIsNotRunningError(producerJobID, job.Status(), "stream events")
+	}
+
+	// Validate that the requested spans are a subset of the
+	// source tenant's keyspace.
+	sourceTenantID := sp.StreamReplication.TenantID
+	sourceTenantSpans := keys.MakeTenantSpan(sourceTenantID)
+	for _, sp := range s.spec.Spans {
+		if !sourceTenantSpans.Contains(sp) {
+			err := pgerror.Newf(pgcode.InvalidParameterValue, "requested span %s is not contained within the keyspace of source tenant %d",
+				sp,
+				sourceTenantID)
+			return roachpb.TenantID{}, err
+		}
+	}
+	return sourceTenantID, nil
+}
+
+const defaultBatchSize = 1 << 20
+
 func setConfigDefaults(cfg *streampb.StreamPartitionSpec_ExecutionConfig) {
 	const defaultInitialScanParallelism = 16
 	const defaultMinCheckpointFrequency = 10 * time.Second
-	const defaultBatchSize = 1 << 20
 
 	if cfg.InitialScanParallelism <= 0 {
 		cfg.InitialScanParallelism = defaultInitialScanParallelism
@@ -516,19 +555,16 @@ func setConfigDefaults(cfg *streampb.StreamPartitionSpec_ExecutionConfig) {
 func streamPartition(
 	evalCtx *eval.Context, streamID streampb.StreamID, opaqueSpec []byte,
 ) (eval.ValueGenerator, error) {
-	if !evalCtx.SessionData().AvoidBuffering {
-		return nil, errors.New("partition streaming requires 'SET avoid_buffering = true' option")
-	}
-
 	var spec streampb.StreamPartitionSpec
 	if err := protoutil.Unmarshal(opaqueSpec, &spec); err != nil {
 		return nil, errors.Wrapf(err, "invalid partition spec for stream %d", streamID)
 	}
-
+	if !evalCtx.SessionData().AvoidBuffering {
+		return nil, errors.New("partition streaming requires 'SET avoid_buffering = true' option")
+	}
 	if len(spec.Spans) == 0 {
 		return nil, errors.AssertionFailedf("expected at least one span, got none")
 	}
-
 	setConfigDefaults(&spec.Config)
 
 	execCfg := evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)

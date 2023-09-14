@@ -18,24 +18,77 @@ import {
   SampleBucket,
 } from "src/views/keyVisualizer/interfaces";
 import { CanvasHeight, XAxisPadding } from "./constants";
-import { KeyVisualizerTimeWindow } from "src/views/keyVisualizer/timeWindow";
 import { AdminUIState } from "src/redux/state";
 import { connect } from "react-redux";
-import { TimeScale, util } from "@cockroachlabs/cluster-ui";
+import {
+  TimeScale,
+  TimeScaleDropdown,
+  TimeScaleOptions,
+  util,
+} from "@cockroachlabs/cluster-ui";
 import { selectClusterSettings } from "src/redux/clusterSettings";
-import { selectTimeScale } from "src/redux/timeScale";
+import { selectTimeScale, setTimeScale } from "src/redux/timeScale";
 import { refreshSettings } from "src/redux/apiReducers";
 import KeyVisSamplesRequest = cockroach.server.serverpb.KeyVisSamplesRequest;
 import KeyVisSamplesResponse = cockroach.server.serverpb.KeyVisSamplesResponse;
+import { BackToAdvanceDebug } from "../reports/containers/util";
+import { RouteComponentProps } from "react-router-dom";
+import moment from "moment-timezone";
 
 const EnabledSetting = "keyvisualizer.enabled";
 const IntervalSetting = "keyvisualizer.sample_interval";
+
+const timeScaleOptions: TimeScaleOptions = {
+  "Past 30 Minutes": {
+    windowSize: moment.duration(30, "minutes"),
+    windowValid: moment.duration(15, "minutes"),
+    sampleSize: moment.duration(1, "minutes"),
+  },
+  "Past Hour": {
+    windowSize: moment.duration(1, "hour"),
+    windowValid: moment.duration(15, "minutes"),
+    sampleSize: moment.duration(1, "minutes"),
+  },
+  "Past 6 Hours": {
+    windowSize: moment.duration(6, "hours"),
+    windowValid: moment.duration(15, "minutes"),
+    sampleSize: moment.duration(1, "minutes"),
+  },
+  "Past Day": {
+    windowSize: moment.duration(1, "day"),
+    windowValid: moment.duration(15, "minutes"),
+    sampleSize: moment.duration(1, "minutes"),
+  },
+  "Past 2 Days": {
+    windowSize: moment.duration(2, "day"),
+    windowValid: moment.duration(15, "minutes"),
+    sampleSize: moment.duration(1, "minutes"),
+  },
+  "Past 3 Days": {
+    windowSize: moment.duration(3, "day"),
+    windowValid: moment.duration(15, "minutes"),
+    sampleSize: moment.duration(1, "minutes"),
+  },
+  "Past Week": {
+    windowSize: moment.duration(7, "days"),
+    windowValid: moment.duration(15, "minutes"),
+    sampleSize: moment.duration(1, "minutes"),
+  },
+};
+
+export function getRequestsAsNumber(requests: number | Long | null): number {
+  if (typeof requests === "number") {
+    return requests;
+  }
+
+  return requests?.toInt() ?? 0;
+}
 
 function hottestBucket(samples: KeyVisSamplesResponse["samples"]) {
   let highest = 0;
   for (const sample of samples) {
     for (const stat of sample.buckets) {
-      const numRequests = stat.requests?.toInt() || 0;
+      const numRequests = getRequestsAsNumber(stat.requests);
       if (numRequests > highest) {
         highest = numRequests;
       }
@@ -125,18 +178,19 @@ function buildKeyVisualizerProps(
 interface KeyVisualizerContainerProps {
   refreshInterval: number;
   timeScale: TimeScale;
+  setTimeScale: typeof setTimeScale;
 }
 
 class KeyVisualizerContainer extends React.Component<
-  KeyVisualizerContainerProps,
+  KeyVisualizerContainerProps & RouteComponentProps,
   KeyVisualizerContainerState
 > {
   interval: any;
 
-  state = { response: KeyVisSamplesResponse.create() };
+  state = { response: new KeyVisSamplesResponse() };
 
   fetchSamples() {
-    const req = KeyVisSamplesRequest.create({});
+    const req = new KeyVisSamplesRequest({});
     getKeyVisualizerSamples(req).then(res => this.setState({ response: res }));
   }
 
@@ -158,20 +212,35 @@ class KeyVisualizerContainer extends React.Component<
     const { samples, yOffsetsForKey, hottestBucket, keys } =
       buildKeyVisualizerProps(this.state, this.props.timeScale);
 
-    if (samples.length === 0 || Object.keys(keys).length === 0) {
-      return <div>Waiting for samples...</div>;
+    if (
+      this.state.response.samples.length === 0 ||
+      Object.keys(this.state.response.pretty_key_for_uuid).length === 0
+    ) {
+      return (
+        <>
+          <BackToAdvanceDebug history={this.props.history} />
+          <div>Waiting for samples...</div>
+        </>
+      );
     }
 
     return (
-      <div style={{ position: "relative" }}>
-        <KeyVisualizerTimeWindow />
-        <KeyVisualizer
-          samples={samples}
-          yOffsetsForKey={yOffsetsForKey}
-          hottestBucket={hottestBucket}
-          keys={keys}
-        />
-      </div>
+      <>
+        <BackToAdvanceDebug history={this.props.history} />
+        <div style={{ position: "relative" }}>
+          <TimeScaleDropdown
+            options={timeScaleOptions}
+            currentScale={this.props.timeScale}
+            setTimeScale={this.props.setTimeScale}
+          />
+          <KeyVisualizer
+            samples={samples}
+            yOffsetsForKey={yOffsetsForKey}
+            hottestBucket={hottestBucket}
+            keys={keys}
+          />
+        </div>
+      </>
     );
   }
 }
@@ -181,11 +250,12 @@ interface KeyVisualizerPageProps {
     [key: string]: cockroach.server.serverpb.SettingsResponse.IValue;
   };
   refreshSettings: typeof refreshSettings;
+  setTimeScale: typeof setTimeScale;
   timeScale: TimeScale;
 }
 
 const KeyVisualizerPage: React.FunctionComponent<
-  KeyVisualizerPageProps
+  KeyVisualizerPageProps & RouteComponentProps
 > = props => {
   if (props.clusterSettings === undefined) {
     props.refreshSettings();
@@ -197,6 +267,7 @@ const KeyVisualizerPage: React.FunctionComponent<
   if (!enabled) {
     return (
       <div>
+        <BackToAdvanceDebug history={props.history} />
         <p>To enable the key visualizer, run the following SQL statement:</p>
         <pre>SET CLUSTER SETTING {EnabledSetting} = true;</pre>
       </div>
@@ -209,6 +280,7 @@ const KeyVisualizerPage: React.FunctionComponent<
 
   return (
     <KeyVisualizerContainer
+      {...props}
       timeScale={props.timeScale}
       refreshInterval={refreshInterval}
     />
@@ -222,5 +294,6 @@ export default connect(
   }),
   {
     refreshSettings,
+    setTimeScale,
   },
 )(KeyVisualizerPage);

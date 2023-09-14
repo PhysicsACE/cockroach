@@ -26,11 +26,13 @@ import {
   propsToQueryString,
   computeOrUseStmtSummary,
   appNamesAttr,
+  unset,
 } from "src/util";
 import styles from "./statementsTableContent.module.scss";
 import { EllipsisVertical } from "@cockroachlabs/icons";
-import { getBasePath, StatementDiagnosticsReport } from "../api";
-import moment from "moment";
+import { withBasePath } from "src/api/basePath";
+import { StatementDiagnosticsReport } from "src/api/statementDiagnosticsApi";
+import moment from "moment-timezone";
 
 export type NodeNames = { [nodeId: string]: string };
 const cx = classNames.bind(styles);
@@ -49,7 +51,13 @@ export const StatementTableCell = {
           statement={stmt.label}
           statementSummary={stmt.summary}
           aggregatedTs={stmt.aggregatedTs}
-          appNames={selectedApp}
+          appNames={[
+            stmt.applicationName != null
+              ? stmt.applicationName
+                ? stmt.applicationName
+                : unset
+              : null,
+          ]}
           implicitTxn={stmt.implicitTxn}
           search={search}
           onClick={onStatementClick}
@@ -127,9 +135,9 @@ export const StatementTableCell = {
                       name: (
                         <a
                           className={cx("diagnostic-report-dropdown-option")}
-                          href={`${getBasePath()}/_admin/v1/stmtbundle/${
-                            dr.statement_diagnostics_id
-                          }`}
+                          href={withBasePath(
+                            `_admin/v1/stmtbundle/${dr.statement_diagnostics_id}`,
+                          )}
                         >
                           {`Download ${moment(dr.requested_at).format(
                             "MMM DD, YYYY [at] H:mm [(UTC)] [diagnostic]",
@@ -153,10 +161,6 @@ export const StatementTableCell = {
         </div>
       );
     },
-  nodeLink:
-    (nodeNames: NodeNames) =>
-    (stmt: AggregateStatistics): React.ReactElement =>
-      <NodeLink nodeId={stmt.label} nodeNames={nodeNames} />,
 };
 
 type StatementLinkTargetProps = {

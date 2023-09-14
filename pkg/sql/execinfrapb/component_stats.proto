@@ -15,7 +15,6 @@ option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 import "gogoproto/gogo.proto";
 
 import "util/optional/optional.proto";
-import "kv/kvpb/api.proto";
 
 // ComponentID identifies a component in a flow. There are multiple types of
 // components (e.g. processors, streams); each component of a certain type has
@@ -55,6 +54,10 @@ message ComponentID {
     (gogoproto.nullable) = false,
     (gogoproto.customname) = "SQLInstanceID",
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"];
+
+  // The region the component is associated with.
+  // For the initial implementation only ComponentIDs of Flow type might have this set.
+  optional string region = 5 [(gogoproto.nullable) = false];
 }
 
 // ComponentStats contains statistics for an execution component. A component is
@@ -64,6 +67,8 @@ message ComponentID {
 // Depending on the component, not all statistics apply. For all fields, the zero
 // value indicates that the particular stat is not available.
 message ComponentStats {
+  option (gogoproto.goproto_stringer) = false;
+
   optional ComponentID component = 1 [(gogoproto.nullable) = false];
 
   optional NetworkRxStats net_rx = 2 [(gogoproto.nullable) = false];
@@ -121,6 +126,7 @@ message NetworkTxStats {
 // KVStats contains statistics for components that perform KV operations.
 message KVStats {
   optional util.optional.Uint bytes_read = 1 [(gogoproto.nullable) = false];
+  optional util.optional.Uint kv_pairs_read = 24 [(gogoproto.customname) = "KVPairsRead", (gogoproto.nullable) = false];
   optional util.optional.Uint tuples_read = 2 [(gogoproto.nullable) = false];
   optional util.optional.Uint batch_requests_issued = 9 [(gogoproto.nullable) = false];
 
@@ -151,9 +157,6 @@ message KVStats {
   optional util.optional.Uint range_key_contained_points = 19 [(gogoproto.nullable) = false];
   optional util.optional.Uint range_key_skipped_points = 20 [(gogoproto.nullable) = false];
 
-  // contention_events hit at the statement level.
-  repeated cockroach.roachpb.ContentionEvent contention_events = 10 [(gogoproto.nullable) = false];
-
   // Cumulated CPU time spent fulfilling KV requests on a SQL goroutine. This
   // would not include CPU time spent on a remote node, but would include time
   // spent on a Scan's goroutine. This is only used to calculate SQL CPU time
@@ -166,6 +169,10 @@ message KVStats {
   optional util.optional.Uint num_gets = 21 [(gogoproto.nullable) = false];
   optional util.optional.Uint num_scans = 22 [(gogoproto.nullable) = false];
   optional util.optional.Uint num_reverse_scans = 23 [(gogoproto.nullable) = false];
+
+  // UsedStreamer indicates whether the Streamer API was used to perform KV
+  // operations.
+  optional bool used_streamer = 25 [(gogoproto.nullable) = false];
 }
 
 // ExecStats contains statistics about the execution of a component.

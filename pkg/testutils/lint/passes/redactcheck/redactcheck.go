@@ -58,6 +58,12 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"NodeIDContainer":  {},
 						"SQLIDContainer":   {},
 						"StoreIDContainer": {},
+						"SQLInstanceID":    {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/settings": {
+						"InternalKey": {},
+						"SettingName": {},
+						"ValueOrigin": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/cli/exit": {
 						"Code": {},
@@ -77,11 +83,16 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"timing": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvpb": {
-						"Method": {},
+						"Method":            {},
+						"LeaseAppliedIndex": {},
+						"RaftIndex":         {},
+						"RaftTerm":          {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb": {
-						"LAI":    {},
 						"SeqNum": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation": {
+						"Level": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock": {
 						"Durability": {},
@@ -91,6 +102,13 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb": {
 						"SnapshotRequest_Type": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset": {
+						"SpanAccess": {},
+						"SpanScope":  {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities": {
+						"ID": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/repstream/streampb": {
 						"StreamID": {},
@@ -104,6 +122,7 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"ReplicaID":         {},
 						"ReplicaType":       {},
 						"StoreID":           {},
+						"StoreIDSlice":      {},
 						"TenantID":          {},
 						"TransactionStatus": {},
 					},
@@ -122,6 +141,19 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"IndexDescriptorVersion":       {},
 						"MutationID":                   {},
 					},
+					"github.com/cockroachdb/cockroach/pkg/sql/clusterunique": {
+						"ID": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb": {
+						"ComponentID_Type": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase": {
+						"FormatCode": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/sql/privilege": {
+						"Kind":       {},
+						"ObjectType": {},
+					},
 					"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants": {
 						"ConstraintType": {},
 					},
@@ -138,6 +170,9 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"FamilyID":       {},
 						"IndexID":        {},
 						"PGAttributeNum": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/sql/sem/tree": {
+						"IsolationLevel": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness": {
 						"SessionID": {},

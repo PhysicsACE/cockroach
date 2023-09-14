@@ -77,48 +77,58 @@ func toBytes(t *testing.T, desc *descpb.Descriptor) []byte {
 		if parentSchemaID == descpb.InvalidID {
 			parentSchemaID = keys.PublicSchemaID
 		}
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&table.Privileges,
 			table.GetParentID(),
 			parentSchemaID,
 			privilege.Table,
 			table.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
 		if table.FormatVersion == 0 {
 			table.FormatVersion = descpb.InterleavedFormatVersion
 		}
 	} else if database != nil {
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&database.Privileges,
 			descpb.InvalidID,
 			descpb.InvalidID,
 			privilege.Database,
 			database.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
 	} else if typ != nil {
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&typ.Privileges,
 			typ.GetParentID(),
 			typ.GetParentSchemaID(),
 			privilege.Type,
 			typ.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
 	} else if schema != nil {
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&schema.Privileges,
 			schema.GetParentID(),
 			descpb.InvalidID,
 			privilege.Schema,
 			schema.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
 	} else if function != nil {
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&function.Privileges,
 			function.GetParentID(),
 			descpb.InvalidID,
 			privilege.Function,
 			function.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
 	}
 	res, err := protoutil.Marshal(desc)
 	require.NoError(t, err)
@@ -373,7 +383,7 @@ func TestExamineDescriptors(t *testing.T) {
 				{NameInfo: descpb.NameInfo{Name: "causes_error"}, ID: 2},
 			},
 			expected: `Examining 0 descriptors and 4 namespace entries...
-  ParentID   0, ParentSchemaID  0: namespace entry "causes_error" (2): referenced descriptor not found
+  ParentID   0, ParentSchemaID  0: namespace entry "causes_error" (2): referenced schema ID 2: referenced descriptor not found
 `,
 		},
 		{ // 14
@@ -486,6 +496,7 @@ func TestExamineDescriptors(t *testing.T) {
 					desc := protoutil.Clone(validTableDesc).(*descpb.Descriptor)
 					tbl, _, _, _, _ := descpb.GetDescriptors(desc)
 					tbl.MutationJobs = []descpb.TableDescriptor_MutationJob{{MutationID: 1, JobID: 123}}
+					tbl.Mutations = []descpb.DescriptorMutation{{MutationID: 1}}
 					return desc
 				}())},
 				{
@@ -507,7 +518,7 @@ func TestExamineDescriptors(t *testing.T) {
 				},
 			},
 			expected: `Examining 2 descriptors and 2 namespace entries...
-  ParentID  52, ParentSchemaID 29: relation "t" (51): unknown mutation ID 1 associated with job ID 123
+  ParentID  52, ParentSchemaID 29: relation "t" (51): mutation in state UNKNOWN, direction NONE, and no column/index descriptor
   ParentID  52, ParentSchemaID 29: relation "t" (51): mutation job 123 has terminal status (canceled)
 `,
 		},

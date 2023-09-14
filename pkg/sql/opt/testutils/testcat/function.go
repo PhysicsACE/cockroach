@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -28,7 +29,7 @@ var _ tree.FunctionReferenceResolver = (*Catalog)(nil)
 func (tc *Catalog) ResolveFunction(
 	ctx context.Context, name *tree.UnresolvedName, path tree.SearchPath,
 ) (*tree.ResolvedFunctionDefinition, error) {
-	fn, err := name.ToFunctionName()
+	fn, err := name.ToRoutineName()
 	if err != nil {
 		return nil, err
 	}
@@ -51,20 +52,37 @@ func (tc *Catalog) ResolveFunction(
 // ResolveFunctionByOID part of the tree.FunctionReferenceResolver interface.
 func (tc *Catalog) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (*tree.FunctionName, *tree.Overload, error) {
+) (*tree.RoutineName, *tree.Overload, error) {
 	return nil, nil, errors.AssertionFailedf("ResolveFunctionByOID not supported in test catalog")
 }
 
-// CreateFunction handles the CREATE FUNCTION statement.
-func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
-	name := c.FuncName.String()
+// ResolveProcedure is part of the tree.FunctionReferenceResolver interface.
+func (tc *Catalog) ResolveProcedure(
+	ctx context.Context, name *tree.UnresolvedObjectName, path tree.SearchPath,
+) (*tree.Overload, error) {
+	if def, ok := tc.udfs[name.String()]; ok {
+		o := def.Overloads[0]
+		if o.IsProcedure {
+			return o.Overload, nil
+		}
+	}
+	return nil, sqlerrors.NewProcedureUndefinedError(name)
+}
+
+// CreateRoutine handles the CREATE FUNCTION statement.
+func (tc *Catalog) CreateRoutine(c *tree.CreateRoutine) {
+	name := c.Name.String()
 	if _, ok := tree.FunDefs[name]; ok {
 		panic(fmt.Errorf("built-in function with name %q already exists", name))
 	}
 	if _, ok := tc.udfs[name]; ok {
-		// TODO(mgartner): The test catalog should support multiple overloads
-		// with the same name if their arguments are different.
-		panic(fmt.Errorf("user-defined function with name %q already exists", name))
+		if c.Replace {
+			delete(tc.udfs, name)
+		} else {
+			// TODO(mgartner): The test catalog should support multiple overloads
+			// with the same name if their arguments are different.
+			panic(fmt.Errorf("user-defined function with name %q already exists", name))
+		}
 	}
 	if c.RoutineBody != nil {
 		panic(fmt.Errorf("routine body of BEGIN ATOMIC is not supported"))
@@ -88,7 +106,7 @@ func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
 	}
 
 	// Retrieve the function body, volatility, and calledOnNullInput.
-	body, v, calledOnNullInput := collectFuncOptions(c.Options)
+	body, v, calledOnNullInput, language := collectFuncOptions(c.Options)
 
 	if tc.udfs == nil {
 		tc.udfs = make(map[string]*tree.ResolvedFunctionDefinition)
@@ -101,6 +119,8 @@ func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
 		Body:              body,
 		Volatility:        v,
 		CalledOnNullInput: calledOnNullInput,
+		Language:          language,
+		IsProcedure:       c.IsProcedure,
 	}
 	if c.ReturnType.IsSet {
 		overload.Class = tree.GeneratorClass
@@ -116,8 +136,8 @@ func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
 }
 
 func collectFuncOptions(
-	o tree.FunctionOptions,
-) (body string, v volatility.V, calledOnNullInput bool) {
+	o tree.RoutineOptions,
+) (body string, v volatility.V, calledOnNullInput bool, language tree.RoutineLanguage) {
 	// The default volatility is VOLATILE.
 	v = volatility.Volatile
 
@@ -128,32 +148,35 @@ func collectFuncOptions(
 	// CalledOnNullInput=true in function overloads.
 	calledOnNullInput = true
 
+	language = tree.RoutineLangUnknown
+
 	for _, option := range o {
 		switch t := option.(type) {
-		case tree.FunctionBodyStr:
+		case tree.RoutineBodyStr:
 			body = strings.Trim(string(t), "\n")
 
-		case tree.FunctionVolatility:
+		case tree.RoutineVolatility:
 			switch t {
-			case tree.FunctionImmutable:
+			case tree.RoutineImmutable:
 				v = volatility.Immutable
-			case tree.FunctionStable:
+			case tree.RoutineStable:
 				v = volatility.Stable
 			}
 
-		case tree.FunctionLeakproof:
+		case tree.RoutineLeakproof:
 			leakproof = bool(t)
 
-		case tree.FunctionNullInputBehavior:
+		case tree.RoutineNullInputBehavior:
 			switch t {
-			case tree.FunctionReturnsNullOnNullInput, tree.FunctionStrict:
+			case tree.RoutineReturnsNullOnNullInput, tree.RoutineStrict:
 				calledOnNullInput = false
 			}
 
-		case tree.FunctionLanguage:
-			if t != tree.FunctionLangSQL && t != tree.FunctionLangPlPgSQL {
+		case tree.RoutineLanguage:
+			if t != tree.RoutineLangSQL && t != tree.RoutineLangPLpgSQL {
 				panic(fmt.Errorf("LANGUAGE must be SQL or plpgsql"))
 			}
+			language = t
 
 		default:
 			ctx := tree.NewFmtCtx(tree.FmtSimple)
@@ -168,7 +191,7 @@ func collectFuncOptions(
 		panic(fmt.Errorf("LEAKPROOF functions must be IMMUTABLE"))
 	}
 
-	return body, v, calledOnNullInput
+	return body, v, calledOnNullInput, language
 }
 
 // formatFunction nicely formats a function definition creating in the opt test

@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -35,15 +34,9 @@ import (
 )
 
 func init() {
-	// Add all windows to the Builtins map after a few sanity checks.
 	for k, v := range probeRangesGenerators {
-		for _, g := range v.overloads {
-			if g.Class != tree.GeneratorClass {
-				panic(errors.AssertionFailedf("generator functions should be marked with the tree.GeneratorClass "+
-					"function class, found %v", v))
-			}
-		}
-		registerBuiltin(k, v)
+		const enforceClass = true
+		registerBuiltin(k, v, tree.GeneratorClass, enforceClass)
 	}
 }
 
@@ -202,20 +195,14 @@ func (p *probeRangeGenerator) Next(ctx context.Context) (bool, error) {
 	}()
 
 	tBegin := timeutil.Now()
-	err := contextutil.RunWithTimeout(ctx, opName, p.timeout, func(ctx context.Context) error {
+	err := timeutil.RunWithTimeout(ctx, opName, p.timeout, func(ctx context.Context) error {
 		var desc roachpb.RangeDescriptor
 		if err := rawKV.ValueProto(&desc); err != nil {
 			// NB: on error, p.curr.rangeID == 0.
 			return err
 		}
 		p.curr.rangeID = int64(desc.RangeID)
-		key := desc.StartKey.AsRawKey()
-		if desc.RangeID == 1 {
-			// The first range starts at KeyMin, but the replicated keyspace starts only at keys.LocalMax,
-			// so there is a special case here.
-			key = keys.LocalMax
-		}
-		return p.rangeProber.RunProbe(ctx, key, p.isWrite)
+		return p.rangeProber.RunProbe(ctx, &desc, p.isWrite)
 	})
 
 	p.curr.latency = timeutil.Since(tBegin)

@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -34,7 +35,8 @@ func declareKeysDeleteRange(
 	rs ImmutableRangeState,
 	header *kvpb.Header,
 	req kvpb.Request,
-	latchSpans, lockSpans *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
 ) {
 	args := req.(*kvpb.DeleteRangeRequest)
@@ -147,7 +149,7 @@ func DeleteRange(
 
 		leftPeekBound, rightPeekBound := rangeTombstonePeekBounds(
 			args.Key, args.EndKey, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey())
-		maxIntents := storage.MaxIntentsPerWriteIntentError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
+		maxIntents := storage.MaxIntentsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
 
 		// If no predicate parameters are passed, use the fast path. If we're
 		// deleting the entire Raft range, use an even faster path that avoids a
@@ -193,6 +195,9 @@ func DeleteRange(
 			args.Key, args.EndKey, h.Timestamp, cArgs.Now, leftPeekBound, rightPeekBound,
 			args.Predicates, h.MaxSpanRequestKeys, maxDeleteRangeBatchBytes,
 			defaultRangeTombstoneThreshold, maxIntents)
+		if err != nil {
+			return result.Result{}, err
+		}
 
 		if resumeSpan != nil {
 			reply.ResumeSpan = resumeSpan
@@ -211,21 +216,33 @@ func DeleteRange(
 		}
 		// Return result is always empty, since the reply is populated into the
 		// passed in resp pointer.
-		return result.Result{}, err
+		return result.Result{}, nil
 	}
 
 	var timestamp hlc.Timestamp
 	if !args.Inline {
 		timestamp = h.Timestamp
 	}
+
+	opts := storage.MVCCWriteOptions{
+		Txn:                            h.Txn,
+		LocalTimestamp:                 cArgs.Now,
+		Stats:                          cArgs.Stats,
+		ReplayWriteTimestampProtection: h.AmbiguousReplayProtection,
+	}
+
 	// NB: Even if args.ReturnKeys is false, we want to know which intents were
 	// written if we're evaluating the DeleteRange for a transaction so that we
 	// can update the Result's AcquiredLocks field.
 	returnKeys := args.ReturnKeys || h.Txn != nil
 	deleted, resumeSpan, num, err := storage.MVCCDeleteRange(
-		ctx, readWriter, cArgs.Stats, args.Key, args.EndKey,
-		h.MaxSpanRequestKeys, timestamp, cArgs.Now, h.Txn, returnKeys)
-	if err == nil && args.ReturnKeys {
+		ctx, readWriter, args.Key, args.EndKey,
+		h.MaxSpanRequestKeys, timestamp,
+		opts, returnKeys)
+	if err != nil {
+		return result.Result{}, err
+	}
+	if args.ReturnKeys {
 		reply.Keys = deleted
 	}
 	reply.NumKeys = num
@@ -235,7 +252,7 @@ func DeleteRange(
 	}
 
 	// If requested, replace point tombstones with range tombstones.
-	if cArgs.EvalCtx.EvalKnobs().UseRangeTombstonesForPointDeletes && err == nil && h.Txn == nil {
+	if cArgs.EvalCtx.EvalKnobs().UseRangeTombstonesForPointDeletes && h.Txn == nil {
 		if err := storage.ReplacePointTombstonesWithRangeTombstones(
 			ctx, spanset.DisableReadWriterAssertions(readWriter),
 			cArgs.Stats, args.Key, args.EndKey); err != nil {
@@ -243,11 +260,5 @@ func DeleteRange(
 		}
 	}
 
-	// NB: even if MVCC returns an error, it may still have written an intent
-	// into the batch. This allows callers to consume errors like WriteTooOld
-	// without re-evaluating the batch. This behavior isn't particularly
-	// desirable, but while it remains, we need to assume that an intent could
-	// have been written even when an error is returned. This is harmless if the
-	// error is not consumed by the caller because the result will be discarded.
-	return result.FromAcquiredLocks(h.Txn, deleted...), err
+	return result.FromAcquiredLocks(h.Txn, deleted...), nil
 }

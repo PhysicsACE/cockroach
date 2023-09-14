@@ -1,15 +1,15 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_test")
 
 go_test(
     name = "copy_test",
+    size = "large",
     srcs = [
         "copy_in_test.go",
         "copy_out_test.go",
         "copy_test.go",
         "main_test.go",
     ],
-    args = ["-test.timeout=295s"],
+    args = ["-test.timeout=895s"],
     data = glob(["testdata/**"]),
     deps = [
         "//pkg/base",
@@ -19,19 +19,22 @@ go_test(
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
-        "//pkg/settings/cluster",
         "//pkg/sql",
+        "//pkg/sql/catalog",
+        "//pkg/sql/catalog/desctestutils",
+        "//pkg/sql/parser",
         "//pkg/sql/randgen",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sqltestutils",
-        "//pkg/sql/tests",
         "//pkg/sql/types",
         "//pkg/testutils",
         "//pkg/testutils/datapathutils",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/ctxgroup",
+        "//pkg/util/encoding",
         "//pkg/util/encoding/csv",
         "//pkg/util/leaktest",
         "//pkg/util/log",
@@ -50,5 +53,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

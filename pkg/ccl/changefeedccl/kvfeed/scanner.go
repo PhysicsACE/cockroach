@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -52,7 +51,6 @@ type kvScanner interface {
 
 type scanRequestScanner struct {
 	settings                *cluster.Settings
-	gossip                  gossip.OptionalGossip
 	db                      *kv.DB
 	onBackfillRangeCallback func(int64) (func(), func())
 }
@@ -64,13 +62,14 @@ func (p *scanRequestScanner) Scan(ctx context.Context, sink kvevent.Writer, cfg 
 	defer cancel()
 
 	if log.V(2) {
-		log.Infof(ctx, "performing scan on %v at %v withDiff %v",
-			cfg.Spans, cfg.Timestamp, cfg.WithDiff)
+		var sp roachpb.Spans = cfg.Spans
+		log.Infof(ctx, "performing scan on %s at %v withDiff %v",
+			sp, cfg.Timestamp, cfg.WithDiff)
 	}
 
 	sender := p.db.NonTransactionalSender()
 	distSender := sender.(*kv.CrossRangeTxnWrapperSender).Wrapped().(*kvcoord.DistSender)
-	spans, err := getSpansToProcess(ctx, distSender, cfg.Spans)
+	spans, numNodesHint, err := getRangesToProcess(ctx, distSender, cfg.Spans)
 	if err != nil {
 		return err
 	}
@@ -81,7 +80,7 @@ func (p *scanRequestScanner) Scan(ctx context.Context, sink kvevent.Writer, cfg 
 		defer backfillClear()
 	}
 
-	maxConcurrentScans := maxConcurrentScanRequests(p.gossip, &p.settings.SV)
+	maxConcurrentScans := maxConcurrentScanRequests(numNodesHint, &p.settings.SV)
 	exportLim := limit.MakeConcurrentRequestLimiter("changefeedScanRequestLimiter", maxConcurrentScans)
 
 	lastScanLimitUserSetting := changefeedbase.ScanRequestLimit.Get(&p.settings.SV)
@@ -95,7 +94,7 @@ func (p *scanRequestScanner) Scan(ctx context.Context, sink kvevent.Writer, cfg 
 		// If the user defined scan request limit has changed, recalculate it
 		if currentUserScanLimit := changefeedbase.ScanRequestLimit.Get(&p.settings.SV); currentUserScanLimit != lastScanLimitUserSetting {
 			lastScanLimitUserSetting = currentUserScanLimit
-			exportLim.SetLimit(maxConcurrentScanRequests(p.gossip, &p.settings.SV))
+			exportLim.SetLimit(maxConcurrentScanRequests(numNodesHint, &p.settings.SV))
 		}
 
 		limAlloc, err := exportLim.Begin(ctx)
@@ -189,7 +188,7 @@ func (p *scanRequestScanner) exportSpan(
 	for remaining := &span; remaining != nil; {
 		start := timeutil.Now()
 		b := txn.NewBatch()
-		r := kvpb.NewScan(remaining.Key, remaining.EndKey, false /* forUpdate */).(*kvpb.ScanRequest)
+		r := kvpb.NewScan(remaining.Key, remaining.EndKey, kvpb.NonLocking).(*kvpb.ScanRequest)
 		r.ScanFormat = kvpb.BATCH_RESPONSE
 		b.Header.TargetBytes = targetBytesPerScan
 		b.AdmissionHeader = kvpb.AdmissionHeader{
@@ -249,12 +248,14 @@ func (p *scanRequestScanner) exportSpan(
 	return nil
 }
 
-func getSpansToProcess(
+// getRangesToProcess returns the list of ranges covering input list of spans.
+// Returns the number of nodes that are leaseholders for those spans.
+func getRangesToProcess(
 	ctx context.Context, ds *kvcoord.DistSender, targetSpans []roachpb.Span,
-) ([]roachpb.Span, error) {
-	ranges, err := AllRangeSpans(ctx, ds, targetSpans)
+) ([]roachpb.Span, int, error) {
+	ranges, numNodes, err := ds.AllRangeSpans(ctx, targetSpans)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	type spanMarker struct{}
@@ -289,7 +290,7 @@ func getSpansToProcess(
 		}
 		requests = append(requests, roachpb.Span{Key: chunk.Start, EndKey: chunk.End})
 	}
-	return requests, nil
+	return requests, numNodes, nil
 }
 
 // slurpScanResponse iterates the ScanResponse and inserts the contained kvs into
@@ -311,6 +312,9 @@ func slurpScanResponse(
 			if err != nil {
 				return errors.Wrapf(err, `decoding changes for %s`, span)
 			}
+			if log.V(3) {
+				log.Infof(ctx, "scanResponse: %s@%s", keys.PrettyPrint(nil, keyBytes), ts)
+			}
 			if err = sink.Add(ctx, kvevent.NewBackfillKVEvent(keyBytes, ts, valBytes, withDiff, backfillTS)); err != nil {
 				return errors.Wrapf(err, `buffering changes for %s`, span)
 			}
@@ -319,66 +323,20 @@ func slurpScanResponse(
 	return nil
 }
 
-// AllRangeSpans returns the list of all ranges that for the specified list of spans.
-func AllRangeSpans(
-	ctx context.Context, ds *kvcoord.DistSender, spans []roachpb.Span,
-) ([]roachpb.Span, error) {
-
-	ranges := make([]roachpb.Span, 0, len(spans))
-
-	it := kvcoord.MakeRangeIterator(ds)
-
-	for i := range spans {
-		rSpan, err := keys.SpanAddr(spans[i])
-		if err != nil {
-			return nil, err
-		}
-		for it.Seek(ctx, rSpan.Key, kvcoord.Ascending); ; it.Next(ctx) {
-			if !it.Valid() {
-				return nil, it.Error()
-			}
-			ranges = append(ranges, roachpb.Span{
-				Key: it.Desc().StartKey.AsRawKey(), EndKey: it.Desc().EndKey.AsRawKey(),
-			})
-			if !it.NeedAnother(rSpan) {
-				break
-			}
-		}
-	}
-
-	return ranges, nil
-}
-
-// clusterNodeCount returns the approximate number of nodes in the cluster.
-func clusterNodeCount(gw gossip.OptionalGossip) int {
-	g, err := gw.OptionalErr(47971)
-	if err != nil {
-		// can't count nodes in tenants
-		return 1
-	}
-	var nodes int
-	_ = g.IterateInfos(gossip.KeyNodeDescPrefix, func(_ string, _ gossip.Info) error {
-		nodes++
-		return nil
-	})
-	return nodes
-}
-
 // maxConcurrentScanRequests returns the number of concurrent scan requests.
-func maxConcurrentScanRequests(gw gossip.OptionalGossip, sv *settings.Values) int {
+func maxConcurrentScanRequests(numNodesHint int, sv *settings.Values) int {
 	// If the user specified ScanRequestLimit -- use that value.
 	if max := changefeedbase.ScanRequestLimit.Get(sv); max > 0 {
 		return int(max)
 	}
+	if numNodesHint < 1 {
+		return 1
+	}
 
-	// TODO(yevgeniy): Currently, issuing multiple concurrent updates scaled to the size of
-	//  the cluster only make sense for the core change feeds.  This configuration shoould
-	//  be specified explicitly when creating scanner.
-	nodes := clusterNodeCount(gw)
 	// This is all hand-wavy: 3 per node used to be the default for a very long time.
 	// However, this could get out of hand if the clusters are large.
 	// So cap the max to an arbitrary value of a 100.
-	max := 3 * nodes
+	max := 3 * numNodesHint
 	if max > 100 {
 		max = 100
 	}

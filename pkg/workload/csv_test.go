@@ -37,12 +37,12 @@ func TestHandleCSV(t *testing.T) {
 	}{
 		{
 			`?rows=1`, `
-0,0,initial-dTqnRurXztAPkykhZWvsCmeJkMwRNcJAvTlNbgUEYfagEQJaHmfPsquKZUBOGwpAjPtATpGXFJkrtQCEJODSlmQctvyh`,
+0,0,dTqnRurXztAPkykhZWvsCmeJkMwRNcJAvTlNbgUEYfagEQJaHmfPsquKZUBOGwpAjPtATpGXFJkrtQCEJODSlmQctvyhWevfEafP`,
 		},
 		{
 			`?rows=5&row-start=1&row-end=3&batch-size=1`, `
-1,0,initial-vOpikzTTWxvMqnkpfEIVXgGyhZNDqvpVqpNnHawruAcIVltgbnIEIGmCDJcnkVkfVmAcutkMvRACFuUBPsZTemTDSfZT
-2,0,initial-qMvoPeRiOBXvdVQxhZUfdmehETKPXyBaVWxzMqwiStIkxfoDFygYxIDyXiaVEarcwMboFhBlCAapvKijKAyjEAhRBNZz`,
+1,0,vOpikzTTWxvMqnkpfEIVXgGyhZNDqvpVqpNnHawruAcIVltgbnIEIGmCDJcnkVkfVmAcutkMvRACFuUBPsZTemTDSfZTLdqDkrhj
+2,0,qMvoPeRiOBXvdVQxhZUfdmehETKPXyBaVWxzMqwiStIkxfoDFygYxIDyXiaVEarcwMboFhBlCAapvKijKAyjEAhRBNZzvGuJkQXu`,
 		},
 	}
 
@@ -76,7 +76,8 @@ func TestHandleCSV(t *testing.T) {
 }
 
 func BenchmarkWriteCSVRows(b *testing.B) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var batches []coldata.Batch
 	for _, table := range tpcc.FromWarehouses(1).Tables() {
@@ -123,8 +124,8 @@ func TestCSVRowsReader(t *testing.T) {
 	b, err := io.ReadAll(r)
 	require.NoError(t, err)
 	expected := `
-1,0,initial-vOpikzTTWxvMqnkpfEIVXgGyhZNDqvpVqpNnHawruAcIVltgbnIEIGmCDJcnkVkfVmAcutkMvRACFuUBPsZTemTDSfZT
-2,0,initial-qMvoPeRiOBXvdVQxhZUfdmehETKPXyBaVWxzMqwiStIkxfoDFygYxIDyXiaVEarcwMboFhBlCAapvKijKAyjEAhRBNZz
+1,0,vOpikzTTWxvMqnkpfEIVXgGyhZNDqvpVqpNnHawruAcIVltgbnIEIGmCDJcnkVkfVmAcutkMvRACFuUBPsZTemTDSfZTLdqDkrhj
+2,0,qMvoPeRiOBXvdVQxhZUfdmehETKPXyBaVWxzMqwiStIkxfoDFygYxIDyXiaVEarcwMboFhBlCAapvKijKAyjEAhRBNZzvGuJkQXu
 `
 	require.Equal(t, strings.TrimSpace(expected), strings.TrimSpace(string(b)))
 }

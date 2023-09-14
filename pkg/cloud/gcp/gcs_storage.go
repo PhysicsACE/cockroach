@@ -27,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"go.opentelemetry.io/otel/attribute"
@@ -74,6 +74,7 @@ var gcsChunkRetryTimeout = settings.RegisterDurationSetting(
 	"cloudstorage.gs.chunking.retry_timeout",
 	"per-chunk retry deadline when chunking of file upload to Google Cloud Storage",
 	60*time.Second,
+	settings.WithName("cloudstorage.gs.chunking.per_chunk_retry.timeout"),
 )
 
 func parseGSURL(_ cloud.ExternalStorageURIContext, uri *url.URL) (cloudpb.ExternalStorage, error) {
@@ -271,28 +272,40 @@ func (g *gcsStorage) Writer(ctx context.Context, basename string) (io.WriteClose
 	return w, nil
 }
 
-// ReadFile is shorthand for ReadFileAt with offset 0.
-func (g *gcsStorage) ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error) {
-	reader, _, err := g.ReadFileAt(ctx, basename, 0)
-	return reader, err
-}
-
-func (g *gcsStorage) ReadFileAt(
-	ctx context.Context, basename string, offset int64,
+func (g *gcsStorage) ReadFile(
+	ctx context.Context, basename string, opts cloud.ReadOptions,
 ) (ioctx.ReadCloserCtx, int64, error) {
 	object := path.Join(g.prefix, basename)
 
-	ctx, sp := tracing.ChildSpan(ctx, "gcs.ReadFileAt")
+	ctx, sp := tracing.ChildSpan(ctx, "gcs.ReadFile")
 	defer sp.Finish()
 	sp.SetTag("path", attribute.StringValue(path.Join(g.prefix, basename)))
 
+	endPos := int64(0)
+	if opts.LengthHint != 0 {
+		endPos = opts.Offset + opts.LengthHint
+	}
+
 	r := cloud.NewResumingReader(ctx,
-		func(ctx context.Context, pos int64) (io.ReadCloser, error) {
-			return g.bucket.Object(object).NewRangeReader(ctx, pos, -1)
+		func(ctx context.Context, pos int64) (io.ReadCloser, int64, error) {
+			length := int64(-1)
+			if endPos != 0 {
+				length = endPos - pos
+				if length <= 0 {
+					return nil, 0, io.EOF
+				}
+			}
+			r, err := g.bucket.Object(object).NewRangeReader(ctx, pos, length)
+			if err != nil {
+				return nil, 0, err
+			}
+			return r, r.Attrs.Size, nil
 		}, // opener
 		nil, //  reader
-		offset,
-		cloud.IsResumableHTTPError,
+		opts.Offset,
+		0,
+		object,
+		cloud.ResumingReaderRetryOnErrFnForSettings(ctx, g.settings),
 		nil, // errFn
 	)
 
@@ -340,7 +353,7 @@ func (g *gcsStorage) List(ctx context.Context, prefix, delim string, fn cloud.Li
 }
 
 func (g *gcsStorage) Delete(ctx context.Context, basename string) error {
-	return contextutil.RunWithTimeout(ctx, "delete gcs file",
+	return timeutil.RunWithTimeout(ctx, "delete gcs file",
 		cloud.Timeout.Get(&g.settings.SV),
 		func(ctx context.Context) error {
 			return g.bucket.Object(path.Join(g.prefix, basename)).Delete(ctx)
@@ -349,7 +362,7 @@ func (g *gcsStorage) Delete(ctx context.Context, basename string) error {
 
 func (g *gcsStorage) Size(ctx context.Context, basename string) (int64, error) {
 	var r *gcs.Reader
-	if err := contextutil.RunWithTimeout(ctx, "size gcs file",
+	if err := timeutil.RunWithTimeout(ctx, "size gcs file",
 		cloud.Timeout.Get(&g.settings.SV),
 		func(ctx context.Context) error {
 			var err error

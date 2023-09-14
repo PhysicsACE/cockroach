@@ -37,7 +37,7 @@ type Cluster struct {
 type ClusterConfig struct {
 
 	// NodeLiveness is used to determine the set of nodes in the cluster.
-	NodeLiveness NodeLiveness
+	NodeLiveness livenesspb.NodeVitalityInterface
 
 	// Dialer constructs connections to other nodes.
 	Dialer NodeDialer
@@ -57,13 +57,6 @@ type ClusterConfig struct {
 type NodeDialer interface {
 	// Dial returns a grpc connection to the given node.
 	Dial(context.Context, roachpb.NodeID, rpc.ConnectionClass) (*grpc.ClientConn, error)
-}
-
-// NodeLiveness is the subset of the interface satisfied by CRDB's node liveness
-// component that the upgrade manager relies upon.
-type NodeLiveness interface {
-	GetLivenessesFromKV(context.Context) ([]livenesspb.Liveness, error)
-	IsLive(roachpb.NodeID) (bool, error)
 }
 
 // New constructs a new Cluster with the provided dependencies.
@@ -97,8 +90,8 @@ func (c *Cluster) UntilClusterStable(ctx context.Context, fn func() error) error
 	return nil
 }
 
-// NumNodes is part of the upgrade.Cluster interface.
-func (c *Cluster) NumNodes(ctx context.Context) (int, error) {
+// NumNodesOrTenantPods is part of the upgrade.Cluster interface.
+func (c *Cluster) NumNodesOrServers(ctx context.Context) (int, error) {
 	ns, err := NodesFromNodeLiveness(ctx, c.c.NodeLiveness)
 	if err != nil {
 		return 0, err
@@ -106,8 +99,8 @@ func (c *Cluster) NumNodes(ctx context.Context) (int, error) {
 	return len(ns), nil
 }
 
-// ForEveryNode is part of the upgrade.Cluster interface.
-func (c *Cluster) ForEveryNode(
+// ForEveryNodeOrTenantPod is part of the upgrade.Cluster interface.
+func (c *Cluster) ForEveryNodeOrServer(
 	ctx context.Context, op string, fn func(context.Context, serverpb.MigrationClient) error,
 ) error {
 
@@ -147,4 +140,9 @@ func (c *Cluster) IterateRangeDescriptors(
 	ctx context.Context, blockSize int, init func(), fn func(...roachpb.RangeDescriptor) error,
 ) error {
 	return c.c.RangeDescScanner.Scan(ctx, blockSize, init, keys.EverythingSpan, fn)
+}
+
+// ValidateAfterUpdateSystemVersion is part of the upgrade.Cluster interface.
+func (c *Cluster) ValidateAfterUpdateSystemVersion(_ context.Context, _ *kv.Txn) error {
+	return nil
 }

@@ -183,12 +183,13 @@ func TestRaftSSTableSideloading(t *testing.T) {
 	hi := tc.repl.mu.lastIndexNotDurable + 1
 
 	tc.store.raftEntryCache.Clear(tc.repl.RangeID, hi)
-	ents, err := logstore.LoadEntries(
+	ents, cachedBytes, _, err := logstore.LoadEntries(
 		ctx, rsl, tc.store.TODOEngine(), tc.repl.RangeID, tc.store.raftEntryCache,
 		tc.repl.raftMu.sideloaded, lo, hi, math.MaxUint64,
 	)
 	require.NoError(t, err)
 	require.Len(t, ents, int(hi-lo))
+	require.Zero(t, cachedBytes)
 
 	// Check that the Raft entry cache was populated.
 	_, okLo := tc.store.raftEntryCache.Get(tc.repl.RangeID, lo)
@@ -205,7 +206,7 @@ func TestRaftSSTableSideloading(t *testing.T) {
 		}
 		ent, err := logstore.MaybeInlineSideloadedRaftCommand(ctx, tc.repl.RangeID, ents[idx], tc.repl.raftMu.sideloaded, tc.store.raftEntryCache)
 		require.NoError(t, err)
-		sst, err := tc.repl.raftMu.sideloaded.Get(ctx, ent.Index, ent.Term)
+		sst, err := tc.repl.raftMu.sideloaded.Get(ctx, kvpb.RaftIndex(ent.Index), kvpb.RaftTerm(ent.Term))
 		require.NoError(t, err)
 		require.Equal(t, origSSTData, sst)
 		break
@@ -229,7 +230,7 @@ func TestRaftSSTableSideloadingTruncation(t *testing.T) {
 
 		const count = 10
 
-		var indexes []uint64
+		var indexes []kvpb.RaftIndex
 		addLastIndex := func() {
 			lastIndex := tc.repl.GetLastIndex()
 			indexes = append(indexes, lastIndex)

@@ -25,6 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -134,8 +135,8 @@ func TestIntentAgeThresholdSetting(t *testing.T) {
 	intentHlc := hlc.Timestamp{
 		WallTime: intentTs.Nanoseconds(),
 	}
-	txn := roachpb.MakeTransaction("txn", key, roachpb.NormalUserPriority, intentHlc, 1000, 0)
-	require.NoError(t, storage.MVCCPut(ctx, eng, nil, key, intentHlc, hlc.ClockTimestamp{}, value, &txn))
+	txn := roachpb.MakeTransaction("txn", key, isolation.Serializable, roachpb.NormalUserPriority, intentHlc, 1000, 0, 0)
+	require.NoError(t, storage.MVCCPut(ctx, eng, key, intentHlc, value, storage.MVCCWriteOptions{Txn: &txn}))
 	require.NoError(t, eng.Flush())
 
 	// Prepare test fixtures for GC run.
@@ -193,10 +194,10 @@ func TestIntentCleanupBatching(t *testing.T) {
 	}
 	for _, prefix := range txnPrefixes {
 		key := []byte{prefix, objectKeys[0]}
-		txn := roachpb.MakeTransaction("txn", key, roachpb.NormalUserPriority, intentHlc, 1000, 0)
+		txn := roachpb.MakeTransaction("txn", key, isolation.Serializable, roachpb.NormalUserPriority, intentHlc, 1000, 0, 0)
 		for _, suffix := range objectKeys {
 			key := []byte{prefix, suffix}
-			require.NoError(t, storage.MVCCPut(ctx, eng, nil, key, intentHlc, hlc.ClockTimestamp{}, value, &txn))
+			require.NoError(t, storage.MVCCPut(ctx, eng, key, intentHlc, value, storage.MVCCWriteOptions{Txn: &txn}))
 		}
 		require.NoError(t, eng.Flush())
 	}
@@ -1141,21 +1142,23 @@ func requireEqualReaders(
 ) {
 	// First compare only points. We assert points and ranges separately for
 	// simplicity.
-	itExp := exected.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	itExp, err := exected.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		LowerBound:           desc.StartKey.AsRawKey(),
 		UpperBound:           desc.EndKey.AsRawKey(),
 		KeyTypes:             storage.IterKeyTypePointsOnly,
 		RangeKeyMaskingBelow: hlc.Timestamp{},
 	})
+	require.NoError(t, err)
 	defer itExp.Close()
 	itExp.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 
-	itActual := actual.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	itActual, err := actual.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		LowerBound:           desc.StartKey.AsRawKey(),
 		UpperBound:           desc.EndKey.AsRawKey(),
 		KeyTypes:             storage.IterKeyTypePointsOnly,
 		RangeKeyMaskingBelow: hlc.Timestamp{},
 	})
+	require.NoError(t, err)
 	defer itActual.Close()
 	itActual.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 
@@ -1189,21 +1192,23 @@ func requireEqualReaders(
 	}
 
 	// Compare only ranges.
-	itExpRanges := exected.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	itExpRanges, err := exected.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		LowerBound:           desc.StartKey.AsRawKey(),
 		UpperBound:           desc.EndKey.AsRawKey(),
 		KeyTypes:             storage.IterKeyTypeRangesOnly,
 		RangeKeyMaskingBelow: hlc.Timestamp{},
 	})
+	require.NoError(t, err)
 	defer itExpRanges.Close()
 	itExpRanges.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 
-	itActualRanges := actual.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	itActualRanges, err := actual.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		LowerBound:           desc.StartKey.AsRawKey(),
 		UpperBound:           desc.EndKey.AsRawKey(),
 		KeyTypes:             storage.IterKeyTypeRangesOnly,
 		RangeKeyMaskingBelow: hlc.Timestamp{},
 	})
+	require.NoError(t, err)
 	defer itActualRanges.Close()
 	itActualRanges.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 
@@ -1429,12 +1434,13 @@ func (d tableData) liveDistribution() dataDistribution {
 func engineData(t *testing.T, r storage.Reader, desc roachpb.RangeDescriptor) []tableCell {
 	var result []tableCell
 
-	rangeIt := r.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	rangeIt, err := r.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		LowerBound:           desc.StartKey.AsRawKey(),
 		UpperBound:           desc.EndKey.AsRawKey(),
 		KeyTypes:             storage.IterKeyTypeRangesOnly,
 		RangeKeyMaskingBelow: hlc.Timestamp{},
 	})
+	require.NoError(t, err)
 	defer rangeIt.Close()
 	rangeIt.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 	makeRangeCells := func(rks []storage.MVCCRangeKey) (tc []tableCell) {
@@ -1504,12 +1510,13 @@ func engineData(t *testing.T, r storage.Reader, desc roachpb.RangeDescriptor) []
 	}
 	result = append(result, makeRangeCells(partialRangeKeys)...)
 
-	it := r.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	it, err := r.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		LowerBound:           desc.StartKey.AsRawKey(),
 		UpperBound:           desc.EndKey.AsRawKey(),
 		KeyTypes:             storage.IterKeyTypePointsOnly,
 		RangeKeyMaskingBelow: hlc.Timestamp{},
 	})
+	require.NoError(t, err)
 	defer it.Close()
 	it.SeekGE(storage.MVCCKey{Key: desc.StartKey.AsRawKey()})
 	prefix := ""
@@ -1534,7 +1541,7 @@ func engineData(t *testing.T, r storage.Reader, desc roachpb.RangeDescriptor) []
 				v = prefix + string(b)
 			}
 			result = append(result, tableCell{
-				key:   it.Key(),
+				key:   it.UnsafeKey().Clone(),
 				value: v,
 			})
 			prefix = ""

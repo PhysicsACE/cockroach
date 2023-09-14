@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -9,6 +8,7 @@ go_library(
     deps = [
         "//pkg/roachprod/install",
         "//pkg/roachprod/logger",
+        "//pkg/roachprod/vm",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_prometheus_client_golang//api/prometheus/v1:prometheus",
         "@com_github_prometheus_common//model",
@@ -29,5 +29,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

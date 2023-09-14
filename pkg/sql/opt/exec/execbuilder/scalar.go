@@ -13,6 +13,7 @@ package execbuilder
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -20,13 +21,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -76,7 +82,7 @@ func init() {
 		opt.SubqueryOp: (*Builder).buildSubquery,
 
 		// User-defined functions.
-		opt.UDFOp: (*Builder).buildUDF,
+		opt.UDFCallOp: (*Builder).buildUDF,
 	}
 
 	for _, op := range opt.BoolOperators {
@@ -135,17 +141,17 @@ func (b *Builder) buildNull(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Ty
 func (b *Builder) buildVariable(
 	ctx *buildScalarCtx, scalar opt.ScalarExpr,
 ) (tree.TypedExpr, error) {
-	return b.indexedVar(ctx, b.mem.Metadata(), *scalar.Private().(*opt.ColumnID)), nil
+	return b.indexedVar(ctx, b.mem.Metadata(), *scalar.Private().(*opt.ColumnID))
 }
 
 func (b *Builder) indexedVar(
 	ctx *buildScalarCtx, md *opt.Metadata, colID opt.ColumnID,
-) tree.TypedExpr {
+) (tree.TypedExpr, error) {
 	idx, ok := ctx.ivarMap.Get(int(colID))
 	if !ok {
-		panic(errors.AssertionFailedf("cannot map variable %d to an indexed var", redact.Safe(colID)))
+		return nil, errors.AssertionFailedf("cannot map variable %d to an indexed var", redact.Safe(colID))
 	}
-	return ctx.ivh.IndexedVarWithType(idx, md.ColumnMeta(colID).Type)
+	return ctx.ivh.IndexedVarWithType(idx, md.ColumnMeta(colID).Type), nil
 }
 
 func (b *Builder) buildTuple(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
@@ -226,7 +232,7 @@ func (b *Builder) buildBoolean(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree
 		return tree.NewTypedIsNotNullExpr(expr), nil
 
 	default:
-		panic(errors.AssertionFailedf("invalid op %s", redact.Safe(scalar.Op())))
+		return nil, errors.AssertionFailedf("invalid op %s", redact.Safe(scalar.Op()))
 	}
 }
 
@@ -292,7 +298,10 @@ func (b *Builder) buildFunction(
 			return nil, err
 		}
 	}
-	funcRef := b.wrapFunction(fn.Name)
+	funcRef, err := b.wrapFunction(fn.Name)
+	if err != nil {
+		return nil, err
+	}
 	return tree.NewTypedFuncExpr(
 		funcRef,
 		0, /* aggQualifier */
@@ -374,7 +383,10 @@ func (b *Builder) buildAssignmentCast(
 		return input, nil
 	}
 	const fnName = "crdb_internal.assignment_cast"
-	funcRef := b.wrapFunction(fnName)
+	funcRef, err := b.wrapFunction(fnName)
+	if err != nil {
+		return nil, err
+	}
 	props, overloads := builtinsregistry.GetBuiltinProperties(fnName)
 	return tree.NewTypedFuncExpr(
 		funcRef,
@@ -494,7 +506,17 @@ func (b *Builder) buildArrayFlatten(
 	// The subquery here should always be uncorrelated: if it were not, we would
 	// have converted it to an aggregation.
 	if !af.Input.Relational().OuterCols.Empty() {
-		panic(errors.AssertionFailedf("input to ArrayFlatten should be uncorrelated"))
+		return nil, errors.AssertionFailedf("input to ArrayFlatten should be uncorrelated")
+	}
+
+	if b.planLazySubqueries {
+		// The NormalizeArrayFlattenToAgg rule should have converted an
+		// ArrayFlatten within a UDF into an aggregation.
+		// We don't yet convert an ArrayFlatten within a correlated subquery
+		// into an aggregation, so we return a decorrelation error.
+		// TODO(mgartner): Build an ArrayFlatten within a correlated subquery as
+		// a Routine, or apply NormalizeArrayFlattenToAgg to all ArrayFlattens.
+		return nil, b.decorrelationError()
 	}
 
 	root, err := b.buildRelational(af.Input)
@@ -547,6 +569,12 @@ func (b *Builder) buildAny(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 	// TODO(mgartner): Plan correlated ANY subqueries using tree.RoutineExpr.
 	// See buildSubquery.
 	if !any.Input.Relational().OuterCols.Empty() {
+		return nil, b.decorrelationError()
+	}
+
+	if b.planLazySubqueries {
+		// We cannot currently plan uncorrelated ANY subqueries as
+		// lazily-evaluated routines.
 		return nil, b.decorrelationError()
 	}
 
@@ -624,7 +652,11 @@ func (b *Builder) buildExistsSubquery(
 		// arguments of the routine.
 		args := make(tree.TypedExprs, len(params))
 		for i := range args {
-			args[i] = b.indexedVar(ctx, b.mem.Metadata(), params[i])
+			indexedVar, err := b.indexedVar(ctx, b.mem.Metadata(), params[i])
+			if err != nil {
+				return nil, err
+			}
+			args[i] = indexedVar
 		}
 
 		// Create a new column for the boolean result.
@@ -635,12 +667,8 @@ func (b *Builder) buildExistsSubquery(
 			Alias: b.mem.Metadata().ColumnMeta(existsCol).Alias,
 			ID:    existsCol,
 		}
-		stmts := memo.RelListExpr{memo.RelRequiredPropsExpr{
-			RelExpr: input,
-			PhysProps: &physical.Required{
-				Presentation: physical.Presentation{aliasedCol},
-			},
-		}}
+		stmts := []memo.RelExpr{input}
+		stmtProps := []*physical.Required{{Presentation: physical.Presentation{aliasedCol}}}
 
 		// Create an wrapRootExprFn that wraps input in a Limit and a Project.
 		wrapRootExpr := func(f *norm.Factory, e memo.RelExpr) opt.Expr {
@@ -660,6 +688,7 @@ func (b *Builder) buildExistsSubquery(
 		planGen := b.buildRoutinePlanGenerator(
 			params,
 			stmts,
+			stmtProps,
 			true, /* allowOuterWithRefs */
 			wrapRootExpr,
 		)
@@ -671,9 +700,22 @@ func (b *Builder) buildExistsSubquery(
 				types.Bool,
 				false, /* enableStepping */
 				true,  /* calledOnNullInput */
+				false, /* multiColOutput */
+				false, /* generator */
+				false, /* tailCall */
+				false, /* procedure */
+				nil,   /* exceptionHandler */
 			),
 			tree.DBoolFalse,
 		}, types.Bool), nil
+	}
+
+	if b.planLazySubqueries {
+		// We cannot currently plan uncorrelated Exists subqueries as
+		// lazily-evaluated routines. However, this path should never be
+		// executed because the ConvertUncorrelatedExistsToCoalesceSubquery rule
+		// converts all uncorrelated Exists into Coalesce+Subquery expressions.
+		return nil, b.decorrelationError()
 	}
 
 	// Build the execution plan for the subquery. Note that the subquery could
@@ -700,6 +742,26 @@ func (b *Builder) buildSubquery(
 	subquery := scalar.(*memo.SubqueryExpr)
 	input := subquery.Input
 
+	if b.evalCtx.SessionData().EnforceHomeRegion && b.IsANSIDML {
+		inputDistributionProvidedPhysical := input.ProvidedPhysical()
+		if homeRegion, ok := inputDistributionProvidedPhysical.Distribution.GetSingleRegion(); ok {
+			if gatewayRegion, ok := b.evalCtx.GetLocalRegion(); ok {
+				if homeRegion != gatewayRegion {
+					return nil, pgerror.Newf(pgcode.QueryNotRunningInHomeRegion,
+						`%s. Try running the query from region '%s'. %s`,
+						execinfra.QueryNotRunningInHomeRegionMessagePrefix,
+						homeRegion,
+						sqlerrors.EnforceHomeRegionFurtherInfo,
+					)
+				}
+			}
+		} else {
+			return nil, pgerror.Newf(pgcode.QueryHasNoHomeRegion,
+				"Query has no home region. Try adding a LIMIT clause. %s",
+				sqlerrors.EnforceHomeRegionFurtherInfo)
+		}
+	}
+
 	// TODO(radu): for now we only support the trivial projection.
 	cols := input.Relational().OutputCols
 	if cols.Len() != 1 {
@@ -724,7 +786,11 @@ func (b *Builder) buildSubquery(
 		// The arguments are indexed variables representing the outer columns.
 		args := make(tree.TypedExprs, len(params))
 		for i := range args {
-			args[i] = b.indexedVar(ctx, b.mem.Metadata(), params[i])
+			indexedVar, err := b.indexedVar(ctx, b.mem.Metadata(), params[i])
+			if err != nil {
+				return nil, err
+			}
+			args[i] = indexedVar
 		}
 
 		// Create a single-element RelListExpr representing the subquery.
@@ -733,18 +799,15 @@ func (b *Builder) buildSubquery(
 			Alias: b.mem.Metadata().ColumnMeta(outputCol).Alias,
 			ID:    outputCol,
 		}
-		stmts := memo.RelListExpr{memo.RelRequiredPropsExpr{
-			RelExpr: input,
-			PhysProps: &physical.Required{
-				Presentation: physical.Presentation{aliasedCol},
-			},
-		}}
+		stmts := []memo.RelExpr{input}
+		stmtProps := []*physical.Required{{Presentation: physical.Presentation{aliasedCol}}}
 
 		// Create a tree.RoutinePlanFn that can plan the single statement
 		// representing the subquery.
 		planGen := b.buildRoutinePlanGenerator(
 			params,
 			stmts,
+			stmtProps,
 			true, /* allowOuterWithRefs */
 			nil,  /* wrapRootExpr */
 		)
@@ -755,6 +818,11 @@ func (b *Builder) buildSubquery(
 			subquery.Typ,
 			false, /* enableStepping */
 			true,  /* calledOnNullInput */
+			false, /* multiColOutput */
+			false, /* generator */
+			false, /* tailCall */
+			false, /* procedure */
+			nil,   /* exceptionHandler */
 		), nil
 	}
 
@@ -764,10 +832,6 @@ func (b *Builder) buildSubquery(
 		// because we don't need to optimize the subquery input any further.
 		// It's already been fully optimized because it is uncorrelated and has
 		// no outer columns.
-		//
-		// TODO(mgartner): Uncorrelated subqueries only need to be evaluated
-		// once. We should cache their result to avoid all this overhead for
-		// every invocation.
 		inputRowCount := int64(input.Relational().Statistics().RowCountIfAvailable())
 		withExprs := make([]builtWithExpr, len(b.withExprs))
 		copy(withExprs, b.withExprs)
@@ -811,6 +875,11 @@ func (b *Builder) buildSubquery(
 			subquery.Typ,
 			false, /* enableStepping */
 			true,  /* calledOnNullInput */
+			false, /* multiColOutput */
+			false, /* generator */
+			false, /* tailCall */
+			false, /* procedure */
+			nil,   /* exceptionHandler */
 		), nil
 	}
 
@@ -854,10 +923,13 @@ func (b *Builder) addSubquery(
 	return exprNode
 }
 
-// buildUDF builds a UDF expression into a typed expression that can be
+// buildUDF builds a UDFCall expression into a typed expression that can be
 // evaluated.
 func (b *Builder) buildUDF(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
-	udf := scalar.(*memo.UDFExpr)
+	udf := scalar.(*memo.UDFCallExpr)
+	if udf.Def == nil {
+		return nil, errors.AssertionFailedf("expected non-nil UDF definition")
+	}
 
 	// Build the argument expressions.
 	var err error
@@ -872,27 +944,74 @@ func (b *Builder) buildUDF(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 		}
 	}
 
+	for _, s := range udf.Def.Body {
+		if s.Relational().CanMutate {
+			b.ContainsMutation = true
+			break
+		}
+	}
+
 	// Create a tree.RoutinePlanFn that can plan the statements in the UDF body.
 	// TODO(mgartner): Add support for WITH expressions inside UDF bodies.
 	planGen := b.buildRoutinePlanGenerator(
-		udf.Params,
-		udf.Body,
+		udf.Def.Params,
+		udf.Def.Body,
+		udf.Def.BodyProps,
 		false, /* allowOuterWithRefs */
 		nil,   /* wrapRootExpr */
 	)
 
 	// Enable stepping for volatile functions so that statements within the UDF
-	// see mutations made by the invoking statement and by previous executed
+	// see mutations made by the invoking statement and by previously executed
 	// statements.
-	enableStepping := udf.Volatility == volatility.Volatile
+	enableStepping := udf.Def.Volatility == volatility.Volatile
+
+	// Build each routine for the exception handler, if one exists.
+	var exceptionHandler *tree.RoutineExceptionHandler
+	if udf.Def.ExceptionBlock != nil {
+		block := udf.Def.ExceptionBlock
+		exceptionHandler = &tree.RoutineExceptionHandler{
+			Codes:   block.Codes,
+			Actions: make([]*tree.RoutineExpr, len(block.Actions)),
+		}
+		for i, action := range block.Actions {
+			actionPlanGen := b.buildRoutinePlanGenerator(
+				action.Params,
+				action.Body,
+				action.BodyProps,
+				false, /* allowOuterWithRefs */
+				nil,   /* wrapRootExpr */
+			)
+			// Build a routine with no arguments for the exception handler. The actual
+			// arguments will be supplied when (if) the handler is invoked.
+			exceptionHandler.Actions[i] = tree.NewTypedRoutineExpr(
+				action.Name,
+				nil, /* args */
+				actionPlanGen,
+				action.Typ,
+				true, /* enableStepping */
+				action.CalledOnNullInput,
+				action.MultiColDataSource,
+				action.SetReturning,
+				false, /* tailCall */
+				false, /* procedure */
+				nil,   /* exceptionHandler */
+			)
+		}
+	}
 
 	return tree.NewTypedRoutineExpr(
-		udf.Name,
+		udf.Def.Name,
 		args,
 		planGen,
 		udf.Typ,
 		enableStepping,
-		udf.CalledOnNullInput,
+		udf.Def.CalledOnNullInput,
+		udf.Def.MultiColDataSource,
+		udf.Def.SetReturning,
+		udf.TailCall,
+		false, /* procedure */
+		exceptionHandler,
 	), nil
 }
 
@@ -909,7 +1028,11 @@ type wrapRootExprFn func(f *norm.Factory, e memo.RelExpr) opt.Expr
 // wrapRootExpr allows the root expression of all statements to be replaced with
 // an arbitrary expression.
 func (b *Builder) buildRoutinePlanGenerator(
-	params opt.ColList, stmts memo.RelListExpr, allowOuterWithRefs bool, wrapRootExpr wrapRootExprFn,
+	params opt.ColList,
+	stmts []memo.RelExpr,
+	stmtProps []*physical.Required,
+	allowOuterWithRefs bool,
+	wrapRootExpr wrapRootExprFn,
 ) tree.RoutinePlanGenerator {
 	// argOrd returns the ordinal of the argument within the arguments list that
 	// can be substituted for each reference to the given function parameter
@@ -942,9 +1065,32 @@ func (b *Builder) buildRoutinePlanGenerator(
 	var o xform.Optimizer
 	planGen := func(
 		ctx context.Context, ref tree.RoutineExecFactory, args tree.Datums, fn tree.RoutinePlanGeneratedFunc,
-	) error {
+	) (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				// This code allows us to propagate internal errors without
+				// having to add error checks everywhere throughout the code.
+				// This is only possible because the code does not update shared
+				// state and does not manipulate locks.
+				//
+				// This is the same panic-catching logic that exists in
+				// o.Optimize() below. It's required here because it's possible
+				// for factory functions to panic below, like
+				// CopyAndReplaceDefault.
+				if ok, e := errorutil.ShouldCatch(r); ok {
+					err = e
+					log.VEventf(ctx, 1, "%v", err)
+				} else {
+					// Other panic objects can't be considered "safe" and thus
+					// are propagated as crashes that terminate the session.
+					panic(r)
+				}
+			}
+		}()
+
 		for i := range stmts {
 			stmt := stmts[i]
+			props := stmtProps[i]
 			o.Init(ctx, b.evalCtx, b.catalog)
 			f := o.Factory()
 
@@ -986,11 +1132,11 @@ func (b *Builder) buildRoutinePlanGenerator(
 
 				return f.CopyAndReplaceDefault(e, replaceFn)
 			}
-			f.CopyAndReplace(stmt.RelExpr, stmt.PhysProps, replaceFn)
+			f.CopyAndReplace(stmt, props, replaceFn)
 
 			if wrapRootExpr != nil {
 				wrapped := wrapRootExpr(f, f.Memo().RootExpr().(memo.RelExpr)).(memo.RelExpr)
-				f.Memo().SetRoot(wrapped, stmt.PhysProps)
+				f.Memo().SetRoot(wrapped, props)
 			}
 
 			// Optimize the memo.
@@ -1012,7 +1158,7 @@ func (b *Builder) buildRoutinePlanGenerator(
 					// inner expression.
 					fmtFlags := memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars |
 						memo.ExprFmtHideTypes
-					explainOpt := o.FormatExpr(optimizedExpr, fmtFlags)
+					explainOpt := o.FormatExpr(optimizedExpr, fmtFlags, false /* redactableValues */)
 					err = errors.WithDetailf(err, "routineExpr:\n%s", explainOpt)
 				}
 				return err
@@ -1022,9 +1168,6 @@ func (b *Builder) buildRoutinePlanGenerator(
 			}
 			if len(eb.cascades) > 0 {
 				return expectedLazyRoutineError("cascade")
-			}
-			if len(eb.checks) > 0 {
-				return expectedLazyRoutineError("check")
 			}
 			isFinalPlan := i == len(stmts)-1
 			err = fn(plan, isFinalPlan)

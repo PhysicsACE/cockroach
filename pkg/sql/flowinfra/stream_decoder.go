@@ -45,8 +45,7 @@ import (
 // AddMessage can be called multiple times before getting the rows, but this
 // will cause data to accumulate internally.
 type StreamDecoder struct {
-	types []*types.T
-	// TODO(yuzefovich): move catenumpb.DatumEncoding into execinfrapb.
+	types        []*types.T
 	encoding     []catenumpb.DatumEncoding
 	data         []byte
 	numEmptyRows int
@@ -154,7 +153,7 @@ func (sd *StreamDecoder) GetRow(
 	for i := range rowBuf {
 		var err error
 		rowBuf[i], sd.data, err = rowenc.EncDatumFromBuffer(
-			sd.types[i], sd.encoding[i], sd.data,
+			sd.encoding[i], sd.data,
 		)
 		if err != nil {
 			// Reset sd because it is no longer usable.

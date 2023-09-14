@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -67,22 +66,30 @@ type KVReader interface {
 	// GetBytesRead returns the number of bytes read from KV by this operator.
 	// It must be safe for concurrent use.
 	GetBytesRead() int64
+	// GetKVPairsRead returns the number of key-values pairs read from KV by
+	// this operator. It must be safe for concurrent use.
+	GetKVPairsRead() int64
 	// GetRowsRead returns the number of rows read from KV by this operator.
 	// It must be safe for concurrent use.
 	GetRowsRead() int64
 	// GetBatchRequestsIssued returns the number of BatchRequests issued to KV
 	// by this operator. It must be safe for concurrent use.
 	GetBatchRequestsIssued() int64
-	// GetContentionInfo returns the amount of time KV reads spent
+	// GetContentionTime returns the amount of time KV reads spent
 	// contending. It must be safe for concurrent use.
-	GetContentionInfo() (time.Duration, []kvpb.ContentionEvent)
+	GetContentionTime() time.Duration
 	// GetScanStats returns statistics about the scan that happened during the
 	// KV reads. It must be safe for concurrent use.
 	GetScanStats() execstats.ScanStats
+	// GetConsumedRU returns the number of RUs that were consumed during the
+	// KV reads.
+	GetConsumedRU() uint64
 	// GetKVCPUTime returns the CPU time consumed *on the current goroutine* by
 	// KV requests. It must be safe for concurrent use. It is used to calculate
 	// the SQL CPU time.
 	GetKVCPUTime() time.Duration
+	// UsedStreamer returns whether the Streamer API was used by the KVReader.
+	UsedStreamer() bool
 }
 
 // ZeroInputNode is an execopnode.OpNode with no inputs.

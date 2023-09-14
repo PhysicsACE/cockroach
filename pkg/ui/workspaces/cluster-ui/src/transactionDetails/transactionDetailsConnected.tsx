@@ -8,14 +8,14 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { createSelector } from "@reduxjs/toolkit";
 import { connect } from "react-redux";
-import { RouteComponentProps, withRouter } from "react-router-dom";
+import { withRouter } from "react-router-dom";
 import { Dispatch } from "redux";
-
+import { actions as localStorageActions } from "src/store/localStorage";
 import { AppState, uiConfigActions } from "src/store";
 import { actions as nodesActions } from "../store/nodes";
 import { actions as sqlStatsActions } from "src/store/sqlStats";
+import { actions as txnStatsActions } from "src/store/transactionStats";
 import { TxnInsightsRequest } from "../api";
 import {
   actions as transactionInsights,
@@ -28,74 +28,41 @@ import {
   TransactionDetailsStateProps,
 } from "./transactionDetails";
 import {
-  selectTransactionsData,
-  selectTransactionsLastError,
-} from "../transactionsPage/transactionsPage.selectors";
-import {
   selectIsTenant,
   selectHasViewActivityRedactedRole,
   selectHasAdminRole,
 } from "../store/uiConfig";
 import { nodeRegionsByIDSelector } from "../store/nodes";
-import { selectTimeScale } from "../store/utils/selectors";
+import {
+  selectTimeScale,
+  selectTxnsPageLimit,
+  selectTxnsPageReqSort,
+} from "../store/utils/selectors";
 import { StatementsRequest } from "src/api/statementsApi";
 import { txnFingerprintIdAttr, getMatchParamByName } from "../util";
 import { TimeScale } from "../timeScaleDropdown";
 import { actions as analyticsActions } from "../store/analytics";
-
-export const selectTransaction = createSelector(
-  (state: AppState) => state.adminUI?.sqlStats,
-  (_state: AppState, props: RouteComponentProps) => props,
-  (transactionState, props) => {
-    const transactions = transactionState.data?.transactions;
-    if (!transactions) {
-      return {
-        isLoading: true,
-        transaction: null,
-      };
-    }
-    const txnFingerprintId = getMatchParamByName(
-      props.match,
-      txnFingerprintIdAttr,
-    );
-
-    const transaction = transactions.filter(
-      txn =>
-        txn.stats_data.transaction_fingerprint_id.toString() ==
-        txnFingerprintId,
-    )[0];
-    return {
-      isLoading: false,
-      transaction: transaction,
-      lastUpdated: transactionState.lastUpdated,
-    };
-  },
-);
+import { selectRequestTime } from "src/transactionsPage/transactionsPage.selectors";
 
 const mapStateToProps = (
   state: AppState,
   props: TransactionDetailsProps,
 ): TransactionDetailsStateProps => {
-  const { isLoading, transaction, lastUpdated } = selectTransaction(
-    state,
-    props,
-  );
   return {
     timeScale: selectTimeScale(state),
-    error: selectTransactionsLastError(state),
     isTenant: selectIsTenant(state),
     nodeRegions: nodeRegionsByIDSelector(state),
-    statements: selectTransactionsData(state)?.statements,
-    transaction,
+    txnStatsResp: state?.adminUI?.transactions,
     transactionFingerprintId: getMatchParamByName(
       props.match,
       txnFingerprintIdAttr,
     ),
-    isLoading: isLoading,
-    lastUpdated: lastUpdated,
     hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
     transactionInsights: selectTxnInsightsByFingerprint(state, props),
     hasAdminRole: selectHasAdminRole(state),
+    limit: selectTxnsPageLimit(state),
+    reqSortSetting: selectTxnsPageReqSort(state),
+    requestTime: selectRequestTime(state),
   };
 };
 
@@ -103,7 +70,7 @@ const mapDispatchToProps = (
   dispatch: Dispatch,
 ): TransactionDetailsDispatchProps => ({
   refreshData: (req?: StatementsRequest) =>
-    dispatch(sqlStatsActions.refresh(req)),
+    dispatch(txnStatsActions.refresh(req)),
   refreshNodes: () => dispatch(nodesActions.refresh()),
   refreshUserSQLRoles: () => dispatch(uiConfigActions.refreshUserSQLRoles()),
   onTimeScaleChange: (ts: TimeScale) => {
@@ -122,6 +89,14 @@ const mapDispatchToProps = (
   },
   refreshTransactionInsights: (req: TxnInsightsRequest) => {
     dispatch(transactionInsights.refresh(req));
+  },
+  onRequestTimeChange: (t: moment.Moment) => {
+    dispatch(
+      localStorageActions.update({
+        key: "requestTime/StatementsPage",
+        value: t,
+      }),
+    );
   },
 });
 

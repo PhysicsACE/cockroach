@@ -9,7 +9,7 @@
 // licenses/APL.txt.
 
 import Long from "long";
-import moment from "moment";
+import moment from "moment-timezone";
 import { RouteComponentProps } from "react-router-dom";
 import * as H from "history";
 import { merge } from "lodash";
@@ -22,12 +22,7 @@ import {
   statementAttr,
   unset,
 } from "src/util/constants";
-import {
-  selectStatements,
-  selectApps,
-  selectTotalFingerprints,
-  selectLastReset,
-} from "./statementsPage";
+import { selectLastReset } from "./statementsPage";
 import { selectStatementDetails } from "./statementDetails";
 import ISensitiveInfo = protos.cockroach.sql.ISensitiveInfo;
 import { AdminUIState, createAdminUIStore } from "src/redux/state";
@@ -56,240 +51,6 @@ const timeScale: TimeScale = {
   fixedWindowEnd: moment(1646334815),
 };
 
-describe("selectStatements", () => {
-  it("returns null if the statements data is invalid", () => {
-    const state = makeInvalidState();
-    const props = makeEmptyRouteProps();
-    const result = selectStatements(state, props);
-
-    expect(result).toBeNull();
-  });
-
-  it("returns the statements currently loaded", () => {
-    const stmtA = makeFingerprint(1);
-    const stmtB = makeFingerprint(2, "foobar");
-    const stmtC = makeFingerprint(3, "another");
-    const state = makeStateWithStatements([stmtA, stmtB, stmtC], timeScale);
-    const props = makeEmptyRouteProps();
-
-    const result = selectStatements(state, props);
-    expect(result.length).toBe(3);
-
-    const expectedFingerprints = [stmtA, stmtB, stmtC].map(
-      stmt => stmt.key.key_data.query,
-    );
-    expectedFingerprints.sort();
-    const actualFingerprints = result.map((stmt: any) => stmt.label);
-    actualFingerprints.sort();
-    expect(actualFingerprints).toEqual(expectedFingerprints);
-  });
-
-  it("returns the statements without Internal for default ALL filter", () => {
-    const stmtA = makeFingerprint(1);
-    const stmtB = makeFingerprint(2, INTERNAL_STATEMENT_PREFIX);
-    const stmtC = makeFingerprint(3, INTERNAL_STATEMENT_PREFIX);
-    const stmtD = makeFingerprint(3, "another");
-    const state = makeStateWithStatements(
-      [stmtA, stmtB, stmtC, stmtD],
-      timeScale,
-    );
-    const props = makeEmptyRouteProps();
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(2);
-  });
-
-  it("coalesces statements from different apps", () => {
-    const stmtA = makeFingerprint(1);
-    const stmtB = makeFingerprint(1, "foobar");
-    const stmtC = makeFingerprint(1, "another");
-    const sumCount = stmtA.stats.count
-      .add(stmtB.stats.count.add(stmtC.stats.count))
-      .toNumber();
-    const state = makeStateWithStatements([stmtA, stmtB, stmtC], timeScale);
-    const props = makeEmptyRouteProps();
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(1);
-    expect(result[0].label).toEqual(stmtA.key.key_data.query);
-    expect(result[0].stats.count.toNumber()).toEqual(sumCount);
-  });
-
-  it("coalesces statements with differing node ids", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "", 1),
-        makeFingerprint(1, "", 2),
-        makeFingerprint(1, "", 3),
-      ],
-      timeScale,
-    );
-    const props = makeEmptyRouteProps();
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(1);
-  });
-
-  it("coalesces statements with differing distSQL and failed values", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "", 1, false, false),
-        makeFingerprint(1, "", 1, false, true),
-        makeFingerprint(1, "", 1, true, false),
-        makeFingerprint(1, "", 1, true, true),
-      ],
-      timeScale,
-    );
-    const props = makeEmptyRouteProps();
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(1);
-  });
-
-  it("filters out statements when app param is set", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "foo"),
-        makeFingerprint(2, "bar"),
-        makeFingerprint(3, "baz"),
-      ],
-      timeScale,
-    );
-    const props = makeRoutePropsWithApp("foo");
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(1);
-  });
-
-  it('filters out statements with app set when app param is "(unset)"', () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, ""),
-        makeFingerprint(2, "bar"),
-        makeFingerprint(3, "baz"),
-      ],
-      timeScale,
-    );
-    const props = makeRoutePropsWithApp(unset);
-
-    const result = selectStatements(state, props);
-
-    expect(result.length).toBe(1);
-  });
-
-  it('filters out statements with app set when app param is "$ internal"', () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "$ internal_stmnt_app"),
-        makeFingerprint(2, "bar"),
-        makeFingerprint(3, "baz"),
-      ],
-      timeScale,
-    );
-    const props = makeRoutePropsWithApp("$ internal");
-    const result = selectStatements(state, props);
-    expect(result.length).toBe(1);
-  });
-});
-
-describe("selectApps", () => {
-  it("returns an empty array if the statements data is invalid", () => {
-    const state = makeInvalidState();
-
-    const result = selectApps(state);
-
-    expect(result).toEqual([]);
-  });
-
-  it("returns all the apps that appear in the statements", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1),
-        makeFingerprint(1, "foobar"),
-        makeFingerprint(2, "foobar"),
-        makeFingerprint(3, "cockroach sql"),
-      ],
-      timeScale,
-    );
-
-    const result = selectApps(state);
-
-    expect(result).toEqual([unset, "cockroach sql", "foobar"]);
-  });
-});
-
-describe("selectTotalFingerprints", () => {
-  it("returns zero if the statements data is invalid", () => {
-    const state = makeInvalidState();
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(0);
-  });
-
-  it("returns the number of statement fingerprints", () => {
-    const state = makeStateWithStatements(
-      [makeFingerprint(1), makeFingerprint(2), makeFingerprint(3)],
-      timeScale,
-    );
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(3);
-  });
-
-  it("coalesces statements from different apps", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1),
-        makeFingerprint(1, "foobar"),
-        makeFingerprint(1, "another"),
-      ],
-      timeScale,
-    );
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(1);
-  });
-
-  it("coalesces statements with differing node ids", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "", 1),
-        makeFingerprint(1, "", 2),
-        makeFingerprint(1, "", 3),
-      ],
-      timeScale,
-    );
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(1);
-  });
-
-  it("coalesces statements with differing distSQL and failed keys", () => {
-    const state = makeStateWithStatements(
-      [
-        makeFingerprint(1, "", 1, false, false),
-        makeFingerprint(1, "", 1, false, true),
-        makeFingerprint(1, "", 1, true, false),
-        makeFingerprint(1, "", 1, true, true),
-      ],
-      timeScale,
-    );
-
-    const result = selectTotalFingerprints(state);
-
-    expect(result).toBe(1);
-  });
-});
-
 describe("selectLastReset", () => {
   it('returns "unknown" if the statements data is invalid', () => {
     const state = makeInvalidState();
@@ -314,9 +75,8 @@ describe("selectStatement", () => {
     const state = makeInvalidState();
     const props = makeEmptyRouteProps();
     const { statementDetails } = selectStatementDetails(state, props);
-    const result = statementDetails;
 
-    expect(result).toBeNull();
+    expect(statementDetails).toBeNull();
   });
 
   it("returns the statement currently loaded", () => {
@@ -496,7 +256,6 @@ function makeDetails(
       statement_statistics_per_aggregated_ts: [],
       statement_statistics_per_plan_hash: [],
       internal_app_name_prefix: "$ internal",
-      toJSON: () => ({}),
     },
   };
 }
@@ -596,12 +355,12 @@ function makeStateWithStatementsAndLastReset(
   const state = merge(store.getState(), {
     cachedData: {
       statements: {
-        data: protos.cockroach.server.serverpb.StatementsResponse.fromObject({
+        data: new protos.cockroach.server.serverpb.StatementsResponse({
           statements,
-          last_reset: {
-            seconds: lastReset,
+          last_reset: new protos.google.protobuf.Timestamp({
+            seconds: Long.fromNumber(lastReset),
             nanos: 0,
-          },
+          }),
           internal_app_name_prefix: INTERNAL_STATEMENT_PREFIX,
         }),
         inFlight: false,
@@ -614,7 +373,7 @@ function makeStateWithStatementsAndLastReset(
       },
     },
     localSettings: {
-      "timeScale/SQLActivity": timeScale,
+      [localStorage.GlOBAL_TIME_SCALE]: timeScale,
     },
     timeScale: {
       scale: timeScale,
@@ -635,16 +394,15 @@ function makeStateWithStatementsAndLastReset(
           timeEnd,
         )
       ] = {
-        data: protos.cockroach.server.serverpb.StatementDetailsResponse.fromObject(
-          {
-            statement: stmt.details.statement,
-            statement_statistics_per_aggregated_ts: [],
-            statement_statistics_per_plan_hash: [],
-            internal_app_name_prefix: "$ internal",
-          },
-        ),
+        data: new protos.cockroach.server.serverpb.StatementDetailsResponse({
+          statement: stmt.details.statement,
+          statement_statistics_per_aggregated_ts: [],
+          statement_statistics_per_plan_hash: [],
+          internal_app_name_prefix: "$ internal",
+        }),
         inFlight: false,
         valid: true,
+        unauthorized: false,
       };
     }
   }
@@ -685,21 +443,6 @@ function makeRoutePropsWithParams(params: { [key: string]: string }) {
   };
 }
 
-function makeRoutePropsWithSearchParams(params: { [key: string]: string }) {
-  const history = H.createHashHistory();
-  history.location.search = new URLSearchParams(params).toString();
-  return {
-    location: history.location,
-    history,
-    match: {
-      url: "",
-      path: history.location.pathname,
-      isExact: false,
-      params: {},
-    },
-  };
-}
-
 function makeEmptyRouteProps(): RouteComponentProps<any> {
   const history = H.createHashHistory();
   return {
@@ -712,12 +455,6 @@ function makeEmptyRouteProps(): RouteComponentProps<any> {
       params: {},
     },
   };
-}
-
-function makeRoutePropsWithApp(app: string) {
-  return makeRoutePropsWithSearchParams({
-    [appAttr]: app,
-  });
 }
 
 function makeRoutePropsWithStatement(stmt: string) {

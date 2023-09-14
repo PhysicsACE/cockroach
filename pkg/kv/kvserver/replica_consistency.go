@@ -15,6 +15,7 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -24,14 +25,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -42,22 +43,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
-
-// fatalOnStatsMismatch, if true, turns stats mismatches into fatal errors. A
-// stats mismatch is the event in which
-//   - the consistency checker finds that all replicas are consistent
-//     (i.e. byte-by-byte identical)
-//   - the (identical) stats tracked in them do not correspond to a recomputation
-//     via the data, i.e. the stats were incorrect
-//   - ContainsEstimates==false, i.e. the stats claimed they were correct.
-//
-// Before issuing the fatal error, the cluster bootstrap version is verified.
-// Note that on clusters that originally got bootstrapped on older releases
-// (definitely 19.1, and likely also more recent ones) we know of the existence
-// of stats bugs, so it has to be expected to see the assertion fire there.
-//
-// This env var is intended solely for use in Cockroach Labs testing.
-var fatalOnStatsMismatch = envutil.EnvOrDefaultBool("COCKROACH_ENFORCE_CONSISTENT_STATS", false)
 
 // replicaChecksum contains progress on a replica checksum computation.
 type replicaChecksum struct {
@@ -218,11 +203,6 @@ func (r *Replica) checkConsistencyImpl(
 		// If there's no delta, there's nothing else to do.
 		if !haveDelta {
 			return resp, nil
-		}
-		if delta.ContainsEstimates <= 0 && fatalOnStatsMismatch {
-			// We just found out that the recomputation doesn't match the persisted stats,
-			// so ContainsEstimates should have been strictly positive.
-			log.Fatalf(ctx, "found a delta of %+v", redact.Safe(delta))
 		}
 
 		// We've found that there's something to correct; send an RecomputeStatsRequest. Note that this
@@ -507,6 +487,22 @@ func CalcReplicaDigest(
 	var timestampBuf []byte
 	hasher := sha512.New()
 
+	if efos, ok := snap.(storage.EventuallyFileOnlyReader); ok {
+		// We start off by waiting for this snapshot to become a file-only snapshot.
+		// This is preferable as it reduces the amount of in-memory tables
+		// (memtables) pinned for the iterations below, and reduces errors later on
+		// in checksum computation. A wait here is safe as we're running
+		// asynchronously and not blocking other computation requests. Other checksum
+		// computation requests can run concurrently and start computation while
+		// we're waiting for this EFOS to transition to a file-only snapshot, however
+		// both requests are likely sharing the same `limiter` so if too many
+		// requests run concurrently, some of them could time out due to a
+		// combination of this wait and the limiter-induced wait.
+		if err := efos.WaitForFileOnly(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	// Request quota from the limiter in chunks of at least targetBatchSize, to
 	// amortize the overhead of the limiter when reading many small KVs.
 	var batchSize int64
@@ -543,7 +539,7 @@ func CalcReplicaDigest(
 		} else {
 			timestampBuf = timestampBuf[:size]
 		}
-		if _, err := protoutil.MarshalTo(&legacyTimestamp, timestampBuf); err != nil {
+		if _, err := protoutil.MarshalToSizedBuffer(&legacyTimestamp, timestampBuf); err != nil {
 			return err
 		}
 		if _, err := hasher.Write(timestampBuf); err != nil {
@@ -585,7 +581,7 @@ func CalcReplicaDigest(
 		} else {
 			timestampBuf = timestampBuf[:size]
 		}
-		if _, err := protoutil.MarshalTo(&legacyTimestamp, timestampBuf); err != nil {
+		if _, err := protoutil.MarshalToSizedBuffer(&legacyTimestamp, timestampBuf); err != nil {
 			return err
 		}
 		if _, err := hasher.Write(timestampBuf); err != nil {
@@ -657,7 +653,20 @@ func (r *Replica) computeChecksumPostApply(
 
 	// Caller is holding raftMu, so an engine snapshot is automatically
 	// Raft-consistent (i.e. not in the middle of an AddSSTable).
-	snap := r.store.TODOEngine().NewSnapshot()
+	spans := rditer.MakeReplicatedKeySpans(&desc)
+	var snap storage.Reader
+	if r.store.cfg.SharedStorageEnabled || storage.UseEFOS.Get(&r.ClusterSettings().SV) {
+		efos := r.store.TODOEngine().NewEventuallyFileOnlySnapshot(spans)
+		if util.RaceEnabled {
+			ss := rditer.MakeReplicatedKeySpanSet(&desc)
+			defer ss.Release()
+			snap = spanset.NewEventuallyFileOnlySnapshot(efos, ss)
+		} else {
+			snap = efos
+		}
+	} else {
+		snap = r.store.TODOEngine().NewSnapshot()
+	}
 	if cc.Checkpoint {
 		sl := stateloader.Make(r.RangeID)
 		as, err := sl.LoadRangeAppliedState(ctx, snap)
@@ -701,7 +710,7 @@ func (r *Replica) computeChecksumPostApply(
 
 		// Wait until the CollectChecksum request handler joins in and learns about
 		// the starting computation, and then start it.
-		if err := contextutil.RunWithTimeout(ctx, taskName, consistencyCheckSyncTimeout,
+		if err := timeutil.RunWithTimeout(ctx, taskName, consistencyCheckSyncTimeout,
 			func(ctx context.Context) error {
 				// There is only one writer to c.started (this task), buf if by mistake
 				// there is another writer, one of us closes the channel eventually, and
@@ -741,7 +750,7 @@ func (r *Replica) computeChecksumPostApply(
 		// certain of completing the check. Since we're already in a goroutine
 		// that's about to end, just sleep for a few seconds and then terminate.
 		auxDir := r.store.TODOEngine().GetAuxiliaryDir()
-		_ = r.store.TODOEngine().MkdirAll(auxDir)
+		_ = r.store.TODOEngine().MkdirAll(auxDir, os.ModePerm)
 		path := base.PreventedStartupFile(auxDir)
 
 		const attentionFmt = `ATTENTION:
@@ -777,6 +786,10 @@ To inspect the checkpoints, one can use the cockroach debug range-data tool, and
 command line tools like diff. For example:
 
 $ cockroach debug range-data --replicated data/auxiliary/checkpoints/rN_at_M N
+
+Note that a directory that ends with "_pending" might not represent a valid
+checkpoint. Such directories can exist if the node fails during checkpoint
+creation. These directories should be deleted, or inspected with caution.
 `
 		attentionArgs := []any{r, desc.Replicas(), redact.Safe(auxDir), redact.Safe(path)}
 		preventStartupMsg := fmt.Sprintf(attentionFmt, attentionArgs...)

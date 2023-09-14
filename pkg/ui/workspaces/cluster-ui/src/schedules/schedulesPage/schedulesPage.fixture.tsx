@@ -7,10 +7,9 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
-import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { createMemoryHistory } from "history";
 import Long from "long";
-import moment from "moment";
+import moment from "moment-timezone";
 import { SchedulesPageProps } from "./schedulesPage";
 
 import { Schedule } from "src/api/schedulesApi";

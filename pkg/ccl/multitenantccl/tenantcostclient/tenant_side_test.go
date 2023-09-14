@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/blobs"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl" // ccl init hooks
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl/tenantcostclient"
@@ -40,9 +39,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -62,7 +62,7 @@ import (
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 // TestDataDriven tests the tenant-side cost controller in an isolated setting.
@@ -165,12 +165,12 @@ func (ts *testState) stop() {
 }
 
 type cmdArgs struct {
-	count        int64
-	bytes        int64
-	repeat       int64
-	label        string
-	wait         bool
-	ruMultiplier float64
+	count       int64
+	bytes       int64
+	repeat      int64
+	label       string
+	wait        bool
+	networkCost float64
 }
 
 func parseBytesVal(arg datadriven.CmdArg) (int64, error) {
@@ -234,15 +234,17 @@ func parseArgs(t *testing.T, d *datadriven.TestData) cmdArgs {
 				d.Fatalf(t, "invalid wait value")
 			}
 
-		case "ruMultiplier":
+		case "networkCost":
 			if len(args.Vals) != 1 {
-				d.Fatalf(t, "expected one value for ruMultiplier")
+				d.Fatalf(t, "expected one value for networkCost")
 			}
 			val, err := strconv.ParseFloat(args.Vals[0], 64)
 			if err != nil {
-				d.Fatalf(t, "invalid ruMultiplier value")
+				d.Fatalf(t, "invalid networkCost value")
 			}
-			res.ruMultiplier = val
+			res.networkCost = val
+		default:
+			d.Fatalf(t, "uknown command: '%s'", args.Key)
 		}
 	}
 	return res
@@ -313,24 +315,18 @@ func (ts *testState) request(
 	}
 
 	var writeCount, readCount, writeBytes, readBytes int64
-	var writeRUMultiplier, readRUMultiplier tenantcostmodel.RUMultiplier
+	var writeNetworkCost, readNetworkCost tenantcostmodel.NetworkCost
 	if isWrite {
 		writeCount = args.count
 		writeBytes = args.bytes
-		writeRUMultiplier = tenantcostmodel.RUMultiplier(args.ruMultiplier)
-		if writeRUMultiplier == 0 {
-			writeRUMultiplier = 1
-		}
+		writeNetworkCost = tenantcostmodel.NetworkCost(args.networkCost)
 	} else {
 		readCount = args.count
 		readBytes = args.bytes
-		readRUMultiplier = tenantcostmodel.RUMultiplier(args.ruMultiplier)
-		if readRUMultiplier == 0 {
-			readRUMultiplier = 1
-		}
+		readNetworkCost = tenantcostmodel.NetworkCost(args.networkCost)
 	}
-	reqInfo := tenantcostmodel.TestingRequestInfo(1, writeCount, writeBytes, writeRUMultiplier)
-	respInfo := tenantcostmodel.TestingResponseInfo(!isWrite, readCount, readBytes, readRUMultiplier)
+	reqInfo := tenantcostmodel.TestingRequestInfo(1, writeCount, writeBytes, writeNetworkCost)
+	respInfo := tenantcostmodel.TestingResponseInfo(!isWrite, readCount, readBytes, readNetworkCost)
 
 	for ; repeat > 0; repeat-- {
 		ts.runOperation(t, d, args.label, func() {
@@ -557,6 +553,7 @@ func (ts *testState) usage(*testing.T, *datadriven.TestData, cmdArgs) string {
 	return fmt.Sprintf(""+
 		"RU:  %.2f\n"+
 		"KVRU:  %.2f\n"+
+		"CrossRegionNetworkRU:  %.2f\n"+
 		"Reads:  %d requests in %d batches (%d bytes)\n"+
 		"Writes:  %d requests in %d batches (%d bytes)\n"+
 		"SQL Pods CPU seconds:  %.2f\n"+
@@ -565,6 +562,7 @@ func (ts *testState) usage(*testing.T, *datadriven.TestData, cmdArgs) string {
 		"ExternalIO ingress: %d bytes\n",
 		c.RU,
 		c.KVRU,
+		c.CrossRegionNetworkRU,
 		c.ReadRequests,
 		c.ReadBatches,
 		c.ReadBytes,
@@ -788,7 +786,7 @@ func TestWaitingRU(t *testing.T) {
 
 	// Immediately consume the initial 10K RUs.
 	require.NoError(t, ctrl.OnResponseWait(ctx,
-		tenantcostmodel.TestingRequestInfo(1, 1, 10237952, 1), tenantcostmodel.ResponseInfo{}))
+		tenantcostmodel.TestingRequestInfo(1, 1, 10237952, 0), tenantcostmodel.ResponseInfo{}))
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -806,20 +804,25 @@ func TestWaitingRU(t *testing.T) {
 	// Send 20 KV requests for 1K RU each.
 	const count = 20
 	const fillRate = 100
-	req := tenantcostmodel.TestingRequestInfo(1, 1, 1021952, 1)
+	req := tenantcostmodel.TestingRequestInfo(1, 1, 1021952, 0)
 	resp := tenantcostmodel.TestingResponseInfo(false, 0, 0, 0)
 
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		tenantcostclient.TestingSetRate(ctrl, fillRate)
 
 		var doneCount int64
 		for i := 0; i < count; i++ {
+			require.NoError(t, ctrl.OnRequestWait(ctx))
+		}
+		for i := 0; i < count; i++ {
 			go func(i int) {
-				require.NoError(t, ctrl.OnRequestWait(ctx))
 				require.NoError(t, ctrl.OnResponseWait(ctx, req, resp))
 				atomic.AddInt64(&doneCount, 1)
 			}(i)
 		}
+
+		// Allow some responses to queue up before refilling the available RUs.
+		time.Sleep(time.Millisecond)
 
 		// If available RUs drop below -1K, then multiple responses must be waiting.
 		succeeded := false
@@ -861,7 +864,7 @@ func TestWaitingRU(t *testing.T) {
 		}
 
 		return errors.Errorf("RUs did not drop below 1K: %0.2f", available)
-	})
+	}, 2*time.Minute)
 }
 
 // TestConsumption verifies consumption reporting from a tenant server process.
@@ -869,11 +872,12 @@ func TestConsumption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	hostServer, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	hostServer := serverutils.StartServerOnly(t, base.TestServerArgs{DefaultTestTenant: base.TestControlsTenantsExplicitly})
 	defer hostServer.Stopper().Stop(context.Background())
 
+	const targetPeriod = time.Millisecond
 	st := cluster.MakeTestingClusterSettings()
-	tenantcostclient.TargetPeriodSetting.Override(context.Background(), &st.SV, time.Millisecond)
+	tenantcostclient.TargetPeriodSetting.Override(context.Background(), &st.SV, targetPeriod)
 	tenantcostclient.CPUUsageAllowance.Override(context.Background(), &st.SV, 0)
 
 	testProvider := newTestProvider()
@@ -901,21 +905,32 @@ func TestConsumption(t *testing.T) {
 		r.Exec(t, "INSERT INTO t (v) SELECT repeat('1234567890', 1024) FROM generate_series(1, 10) AS g(i)")
 		const expectedBytes = 10 * 10 * 1024
 
-		afterWrite := testProvider.waitForConsumption(t)
-		delta := afterWrite
-		delta.Sub(&beforeWrite)
-		if delta.WriteBatches < 1 || delta.WriteRequests < 2 || delta.WriteBytes < expectedBytes*2 {
-			t.Errorf("usage after write: %s", delta.String())
-		}
+		// Try a few times because background activity can trigger bucket
+		// requests before the test query does.
+		testutils.SucceedsSoon(t, func() error {
+			afterWrite := testProvider.waitForConsumption(t)
+			delta := afterWrite
+			delta.Sub(&beforeWrite)
+			if delta.WriteBatches < 1 || delta.WriteRequests < 2 || delta.WriteBytes < expectedBytes*2 {
+				return errors.Newf("usage after write: %s", delta.String())
+			}
+			return nil
+		})
 
+		beforeRead := testProvider.waitForConsumption(t)
 		r.QueryStr(t, "SELECT min(v) FROM t")
 
-		afterRead := testProvider.waitForConsumption(t)
-		delta = afterRead
-		delta.Sub(&afterWrite)
-		if delta.ReadBatches < 1 || delta.ReadRequests < 1 || delta.ReadBytes < expectedBytes {
-			t.Errorf("usage after read: %s", delta.String())
-		}
+		// Try a few times because background activity can trigger bucket
+		// requests before the test query does.
+		testutils.SucceedsSoon(t, func() error {
+			afterRead := testProvider.waitForConsumption(t)
+			delta := afterRead
+			delta.Sub(&beforeRead)
+			if delta.ReadBatches < 1 || delta.ReadRequests < 1 || delta.ReadBytes < expectedBytes {
+				return errors.Newf("usage after read: %s", delta.String())
+			}
+			return nil
+		})
 		r.Exec(t, "DELETE FROM t WHERE true")
 	}
 	// Make sure some CPU usage is reported.
@@ -939,7 +954,8 @@ func TestSQLLivenessExemption(t *testing.T) {
 
 	// This test fails when run with the default test tenant. Disabling and
 	// tracking with #76378.
-	hostServer, hostDB, hostKV := serverutils.StartServer(t, base.TestServerArgs{DisableDefaultTestTenant: true})
+	hostServer, hostDB, hostKV := serverutils.StartServer(t,
+		base.TestServerArgs{DefaultTestTenant: base.TestControlsTenantsExplicitly})
 	defer hostServer.Stopper().Stop(context.Background())
 
 	tenantID := serverutils.TestTenantID()
@@ -947,7 +963,7 @@ func TestSQLLivenessExemption(t *testing.T) {
 	// Create a tenant with ridiculously low resource limits.
 	host := sqlutils.MakeSQLRunner(hostDB)
 	host.Exec(t, "SELECT crdb_internal.create_tenant($1::INT)", tenantID.ToUint64())
-	host.Exec(t, "SELECT crdb_internal.update_tenant_resource_limits($1, 0, 0.001, 0, now(), 0)", tenantID.ToUint64())
+	host.Exec(t, "SELECT crdb_internal.update_tenant_resource_limits($1::INT, 0, 0.001, 0, now(), 0)", tenantID.ToUint64())
 
 	st := cluster.MakeTestingClusterSettings()
 	// Make the tenant heartbeat like crazy.
@@ -963,7 +979,8 @@ func TestSQLLivenessExemption(t *testing.T) {
 	_ = r
 
 	codec := keys.MakeSQLCodec(tenantID)
-	key := codec.IndexPrefix(keys.SqllivenessID, 1)
+	indexID := uint32(systemschema.SqllivenessTable().GetPrimaryIndexID())
+	key := codec.IndexPrefix(keys.SqllivenessID, indexID)
 
 	// livenessValue returns the KV value for the one row in the
 	// system.sqlliveness table. The value contains the session expiration time
@@ -1005,7 +1022,10 @@ func TestScheduledJobsConsumption(t *testing.T) {
 	stats.AutomaticStatisticsOnSystemTables.Override(ctx, &st.SV, false)
 	tenantcostclient.TargetPeriodSetting.Override(ctx, &st.SV, time.Millisecond*20)
 
-	hostServer, _, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
+	hostServer := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		Settings:          st,
+	})
 	defer hostServer.Stopper().Stop(ctx)
 
 	testProvider := newTestProvider()
@@ -1013,7 +1033,7 @@ func TestScheduledJobsConsumption(t *testing.T) {
 	env := jobstest.NewJobSchedulerTestEnv(jobstest.UseSystemTables, timeutil.Now())
 	var zeroDuration time.Duration
 	var execSchedules func() error
-	var tenantServer serverutils.TestTenantInterface
+	var tenantServer serverutils.ApplicationLayerInterface
 	var tenantDB *gosql.DB
 	tenantServer, tenantDB = serverutils.StartTenant(t, hostServer, base.TestTenantArgs{
 		TenantID: serverutils.TestTenantID(),
@@ -1089,7 +1109,9 @@ func TestConsumptionChangefeeds(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	hostServer, hostDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	hostServer, hostDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer hostServer.Stopper().Stop(context.Background())
 	if _, err := hostDB.Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true"); err != nil {
 		t.Fatalf("changefeed setup failed: %s", err.Error())
@@ -1158,11 +1180,9 @@ func TestConsumptionExternalStorage(t *testing.T) {
 
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
-	blobClientFactory := blobs.NewLocalOnlyBlobClientFactory(dir)
 	hostServer, hostDB, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Test fails when run within the default tenant. Tracked with #76378.
-		DisableDefaultTestTenant: true,
-		ExternalIODir:            dir,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		ExternalIODir:     dir,
 	})
 	defer hostServer.Stopper().Stop(context.Background())
 	hostSQL := sqlutils.MakeSQLRunner(hostDB)
@@ -1177,9 +1197,6 @@ func TestConsumptionExternalStorage(t *testing.T) {
 		Settings:      st,
 		ExternalIODir: dir,
 		TestingKnobs: base.TestingKnobs{
-			Server: &server.TestingKnobs{
-				BlobClientFactory: blobClientFactory,
-			},
 			TenantTestingKnobs: &sql.TenantTestingKnobs{
 				OverrideTokenBucketProvider: func(kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider {
 					return testProvider
@@ -1245,7 +1262,7 @@ func TestConsumptionExternalStorage(t *testing.T) {
 		nodelocal.LocalRequiresExternalIOAccounting = true
 		defer func() { nodelocal.LocalRequiresExternalIOAccounting = false }()
 		before := testProvider.waitForConsumption(t)
-		r.Exec(t, "BACKUP t INTO 'nodelocal://0/backups/tenant'")
+		r.Exec(t, "BACKUP t INTO 'nodelocal://1/backups/tenant'")
 		c := testProvider.waitForConsumption(t)
 		c.Sub(&before)
 		require.NotEqual(t, uint64(0), c.ExternalIOEgressBytes)
@@ -1256,7 +1273,7 @@ func TestConsumptionExternalStorage(t *testing.T) {
 		nodelocal.LocalRequiresExternalIOAccounting = true
 		defer func() { nodelocal.LocalRequiresExternalIOAccounting = false }()
 		before := testProvider.waitForConsumption(t)
-		hostSQL.Exec(t, "BACKUP t INTO 'nodelocal://0/backups/host'")
+		hostSQL.Exec(t, "BACKUP t INTO 'nodelocal://1/backups/host'")
 		c := testProvider.waitForConsumption(t)
 		c.Sub(&before)
 		require.Equal(t, uint64(0), c.ExternalIOEgressBytes)
@@ -1270,7 +1287,7 @@ func BenchmarkExternalIOAccounting(b *testing.B) {
 
 	hostServer, hostSQL, _ := serverutils.StartServer(b,
 		base.TestServerArgs{
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		})
 	defer hostServer.Stopper().Stop(context.Background())
 
@@ -1286,11 +1303,10 @@ func BenchmarkExternalIOAccounting(b *testing.B) {
 	nullsink.NullRequiresExternalIOAccounting = true
 
 	setRUAccountingMode := func(b *testing.B, mode string) {
-		_, err := hostSQL.Exec(fmt.Sprintf("SET CLUSTER SETTING tenant_external_io_ru_accounting_mode = '%s'", mode))
+		_, err := hostSQL.Exec(fmt.Sprintf("SET CLUSTER SETTING tenant_cost_control.external_io.ru_accounting_mode = '%s'", mode))
 		require.NoError(b, err)
 
-		_, err = hostSQL.Exec(`UPSERT INTO system.tenant_settings (tenant_id, name, value, value_type) VALUES ($1, $2, $3, $4)`,
-			0, "tenant_external_io_ru_accounting_mode", mode, "s")
+		_, err = hostSQL.Exec(fmt.Sprintf("ALTER TENANT ALL SET CLUSTER SETTING tenant_cost_control.external_io.ru_accounting_mode = '%s'", mode))
 		require.NoError(b, err)
 	}
 
@@ -1318,7 +1334,7 @@ func BenchmarkExternalIOAccounting(b *testing.B) {
 			cloud.WithIOAccountingInterceptor(interceptor))
 		require.NoError(b, err)
 		return func(ctx context.Context) error {
-				r, err := es.ReadFile(ctx, "")
+				r, _, err := es.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
 				if err != nil {
 					return err
 				}
@@ -1402,4 +1418,136 @@ func BenchmarkExternalIOAccounting(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestRUSettingsChanged(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	params := base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	}
+
+	s, mainDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	sysDB := sqlutils.MakeSQLRunner(mainDB)
+
+	tenantID := serverutils.TestTenantID()
+	tenant1, tenantDB1 := serverutils.StartTenant(t, s, base.TestTenantArgs{
+		TenantID: tenantID,
+	})
+	defer tenant1.AppStopper().Stop(ctx)
+	defer tenantDB1.Close()
+
+	costClient, err := tenantcostclient.NewTenantSideCostController(tenant1.ClusterSettings(), tenantID, nil)
+	require.NoError(t, err)
+
+	initialModel := costClient.GetCostConfig()
+
+	// Increase the RU cost of everything by 100x
+	settings := []*settings.FloatSetting{
+		tenantcostmodel.ReadBatchCost,
+		tenantcostmodel.ReadRequestCost,
+		tenantcostmodel.ReadPayloadCostPerMiB,
+		tenantcostmodel.WriteBatchCost,
+		tenantcostmodel.WriteRequestCost,
+		tenantcostmodel.WritePayloadCostPerMiB,
+		tenantcostmodel.SQLCPUSecondCost,
+		tenantcostmodel.PgwireEgressCostPerMiB,
+		tenantcostmodel.ExternalIOEgressCostPerMiB,
+		tenantcostmodel.ExternalIOIngressCostPerMiB,
+	}
+	for _, setting := range settings {
+		sysDB.Exec(t, fmt.Sprintf("ALTER TENANT ALL SET CLUSTER SETTING %s = $1", setting.Name()), setting.Default()*100)
+	}
+
+	// Check to make sure the cost of the query increased. Use SucceedsSoon
+	// because the settings propogation is async.
+	testutils.SucceedsSoon(t, func() error {
+		currentModel := costClient.GetCostConfig()
+
+		expect100x := func(name string, getter func(model *tenantcostmodel.Config) tenantcostmodel.RU) error {
+			before := getter(initialModel)
+			after := getter(currentModel)
+			expect := before * 100
+			if after != expect {
+				return errors.Newf("expected %s to be %f found %f", name, expect, after)
+			}
+			return nil
+		}
+
+		err = expect100x("KVReadBatch", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.KVReadBatch
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("KVReadRequest", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.KVReadRequest
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("KVReadByte", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.KVReadByte
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("KVWriteBatch", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.KVWriteBatch
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("KVWriteRequest", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.KVWriteRequest
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("KVWriteByte", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.KVWriteByte
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("PodCPUSecond", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.PodCPUSecond
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("PGWireEgressByte", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.PGWireEgressByte
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("ExternalIOEgressByte", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.ExternalIOEgressByte
+		})
+		if err != nil {
+			return err
+		}
+
+		err = expect100x("ExternalIOIngressByte", func(m *tenantcostmodel.Config) tenantcostmodel.RU {
+			return m.ExternalIOIngressByte
+		})
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 }

@@ -1,6 +1,5 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "parser",
@@ -26,6 +25,7 @@ go_library(
         "//pkg/geo/geopb",  # keep
         "//pkg/security/username",  # keep
         "//pkg/sql/lexbase",
+        "//pkg/sql/parser/statements",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/privilege",  # keep
@@ -70,7 +70,6 @@ go_test(
         "//pkg/testutils/datapathutils",
         "//pkg/testutils/sqlutils",
         "//pkg/util/leaktest",
-        "//pkg/util/log",
         "//pkg/util/randutil",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",
@@ -81,7 +80,7 @@ go_test(
 
 sh_binary(
     name = "sql-gen",
-    srcs = ["sql-gen.sh"],
+    srcs = ["//pkg/sql/lexbase:sql-gen.sh"],
 )
 
 # Define the target to auto-generate sql.go from the grammar file.
@@ -98,16 +97,16 @@ GO_ABS_PATH=`cd $$GO_REL_PATH && pwd`
 export PATH=$$GO_ABS_PATH:$$PATH
 export HOME=$(GENDIR)
 export GOPATH=/nonexist-gopath
-$(location :sql-gen) $(location sql.y) $(location replace_help_rules.awk) \
-    $(location sql.go) $(location @org_golang_x_tools//cmd/goyacc) \
-    $(location @com_github_cockroachdb_gostdlib//x/tools/cmd/goimports)
+export GOROOT=
+$(location :sql-gen) $(location sql.y) sql $(location replace_help_rules.awk) \
+    $(location sql.go) $(location @org_golang_x_tools//cmd/goyacc)
 """,
     exec_tools = [
         ":sql-gen",
-        "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports",
         "@go_sdk//:bin/go",
         "@org_golang_x_tools//cmd/goyacc",
     ],
+    tags = ["no-remote-exec"],  # keep
     visibility = ["//visibility:public"],
 )
 
@@ -177,5 +176,3 @@ disallowed_imports_test(
         "pkg/sql/catalog",
     ],
 )
-
-get_x_data(name = "get_x_data")

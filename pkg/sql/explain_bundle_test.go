@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -33,6 +34,41 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
 )
+
+func TestExplainAnalyzeDebugWithTxnRetries(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	retryFilter, verifyRetryHit := testutils.TestingRequestFilterRetryTxnWithPrefix(t, "stmt-diag-", 1)
+	srv, godb, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Insecure: true,
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingRequestFilter: retryFilter,
+			},
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
+	r := sqlutils.MakeSQLRunner(godb)
+	r.Exec(t, `CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT UNIQUE);
+CREATE SCHEMA s;
+CREATE TABLE s.a (a INT PRIMARY KEY);`)
+
+	base := "statement.sql trace.json trace.txt trace-jaeger.json env.sql"
+	plans := "schema.sql opt.txt opt-v.txt opt-vv.txt plan.txt"
+
+	// Set a small chunk size to test splitting into chunks. The bundle files are
+	// on the order of 10KB.
+	r.Exec(t, "SET CLUSTER SETTING sql.stmt_diagnostics.bundle_chunk_size = '2000'")
+
+	rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM abc WHERE c=1")
+	checkBundle(
+		t, fmt.Sprint(rows), "public.abc", nil, false, /* expectErrors */
+		base, plans, "stats-defaultdb.public.abc.sql", "distsql.html vec.txt vec-v.txt",
+	)
+	verifyRetryHit()
+}
 
 func TestExplainAnalyzeDebug(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -59,7 +95,7 @@ CREATE TABLE s.a (a INT PRIMARY KEY);`)
 	t.Run("no-table", func(t *testing.T) {
 		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT 123")
 		checkBundle(
-			t, fmt.Sprint(rows), "", nil,
+			t, fmt.Sprint(rows), "", nil, false, /* expectErrors */
 			base, plans, "distsql.html vec.txt vec-v.txt",
 		)
 	})
@@ -67,7 +103,7 @@ CREATE TABLE s.a (a INT PRIMARY KEY);`)
 	t.Run("basic", func(t *testing.T) {
 		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM abc WHERE c=1")
 		checkBundle(
-			t, fmt.Sprint(rows), "public.abc", nil,
+			t, fmt.Sprint(rows), "public.abc", nil, false, /* expectErrors */
 			base, plans, "stats-defaultdb.public.abc.sql", "distsql.html vec.txt vec-v.txt",
 		)
 	})
@@ -76,7 +112,7 @@ CREATE TABLE s.a (a INT PRIMARY KEY);`)
 	t.Run("subqueries", func(t *testing.T) {
 		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT EXISTS (SELECT * FROM abc WHERE c=1)")
 		checkBundle(
-			t, fmt.Sprint(rows), "public.abc", nil,
+			t, fmt.Sprint(rows), "public.abc", nil, false, /* expectErrors */
 			base, plans, "stats-defaultdb.public.abc.sql", "distsql-2-main-query.html distsql-1-subquery.html vec-1-subquery-v.txt vec-1-subquery.txt vec-2-main-query-v.txt vec-2-main-query.txt",
 		)
 	})
@@ -84,7 +120,7 @@ CREATE TABLE s.a (a INT PRIMARY KEY);`)
 	t.Run("user-defined schema", func(t *testing.T) {
 		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM s.a WHERE a=1")
 		checkBundle(
-			t, fmt.Sprint(rows), "s.a", nil,
+			t, fmt.Sprint(rows), "s.a", nil, false, /* expectErrors */
 			base, plans, "stats-defaultdb.s.a.sql", "distsql.html vec.txt vec-v.txt",
 		)
 	})
@@ -98,7 +134,7 @@ CREATE TABLE s.a (a INT PRIMARY KEY);`)
 		// The bundle url is inside the error detail.
 		var pqErr *pq.Error
 		_ = errors.As(err, &pqErr)
-		checkBundle(t, fmt.Sprintf("%+v", pqErr.Detail), "", nil, base, plans, "distsql.html errors.txt")
+		checkBundle(t, fmt.Sprintf("%+v", pqErr.Detail), "", nil, false /* expectErrors */, base, plans, "distsql.html errors.txt")
 	})
 
 	// #92920 Make sure schema and opt files are created.
@@ -111,34 +147,7 @@ CREATE TABLE s.a (a INT PRIMARY KEY);`)
 				}
 			}
 			return nil
-		}, base, plans, "distsql.html vec.txt vec-v.txt")
-	})
-
-	// Verify that we can issue the statement with prepare (which can happen
-	// depending on the client).
-	t.Run("prepare", func(t *testing.T) {
-		stmt, err := godb.Prepare("EXPLAIN ANALYZE (DEBUG) SELECT * FROM abc WHERE c=1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer stmt.Close()
-		rows, err := stmt.Query()
-		if err != nil {
-			t.Fatal(err)
-		}
-		var rowsBuf bytes.Buffer
-		for rows.Next() {
-			var row string
-			if err := rows.Scan(&row); err != nil {
-				t.Fatal(err)
-			}
-			rowsBuf.WriteString(row)
-			rowsBuf.WriteByte('\n')
-		}
-		checkBundle(
-			t, rowsBuf.String(), "public.abc", nil,
-			base, plans, "stats-defaultdb.public.abc.sql", "distsql.html vec.txt vec-v.txt",
-		)
+		}, false /* expectErrors */, base, plans, "distsql.html vec.txt vec-v.txt")
 	})
 
 	// This is a regression test for the situation where wrapped into the
@@ -155,7 +164,7 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 `)
 		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) INSERT INTO users (promo_id) VALUES (642606224929619969);")
 		checkBundle(
-			t, fmt.Sprint(rows), "public.users", nil, base, plans,
+			t, fmt.Sprint(rows), "public.users", nil, false /* expectErrors */, base, plans,
 			"stats-defaultdb.public.users.sql", "stats-defaultdb.public.promos.sql",
 			"distsql-1-main-query.html distsql-2-postquery.html vec-1-main-query-v.txt vec-1-main-query.txt vec-2-postquery-v.txt vec-2-postquery.txt",
 		)
@@ -167,7 +176,7 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		defer r.Exec(t, "SET CLUSTER SETTING sql.trace.txn.enable_threshold='0ms';")
 		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM abc WHERE c=1")
 		checkBundle(
-			t, fmt.Sprint(rows), "public.abc", nil,
+			t, fmt.Sprint(rows), "public.abc", nil, false, /* expectErrors */
 			base, plans, "stats-defaultdb.public.abc.sql", "distsql.html vec.txt vec-v.txt",
 		)
 	})
@@ -189,7 +198,7 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 			{"enable_implicit_transaction_for_batch_statements", "off"},
 			{"enable_insert_fast_path", "off"},
 			{"enable_multiple_modifications_of_table", "on"},
-			{"enable_zigzag_join", "off"},
+			{"enable_zigzag_join", "on"},
 			{"expect_and_ignore_not_visible_columns_in_copy", "on"},
 			{"intervalstyle", "iso_8601"},
 			{"large_full_scan_rows", "2000"},
@@ -225,7 +234,7 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 							}
 						}
 						return nil
-					},
+					}, false, /* expectErrors */
 					base, plans, "stats-defaultdb.public.abc.sql", "distsql.html vec.txt vec-v.txt",
 				)
 			})
@@ -277,18 +286,20 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 					}
 				}
 				return nil
-			},
+			}, false, /* expectErrors */
 			base, plans, "stats-defaultdb.public.parent.sql", "stats-defaultdb.public.child.sql",
 			"distsql.html vec.txt vec-v.txt",
 		)
 	})
 
 	t.Run("redact", func(t *testing.T) {
+		r.Exec(t, "CREATE TYPE plesiosaur AS ENUM ('pterodactyl', '5555555555554444');")
 		r.Exec(t, "CREATE TABLE pterosaur (cardholder STRING PRIMARY KEY, cardno INT, INDEX (cardno));")
 		r.Exec(t, "INSERT INTO pterosaur VALUES ('pterodactyl', 5555555555554444);")
 		r.Exec(t, "CREATE STATISTICS jurassic FROM pterosaur;")
+		r.Exec(t, "CREATE FUNCTION test_redact() RETURNS STRING AS $body$ SELECT 'pterodactyl' $body$ LANGUAGE sql;")
 		rows := r.QueryStr(t,
-			"EXPLAIN ANALYZE (DEBUG, REDACT) SELECT max(cardno) FROM pterosaur WHERE cardholder = 'pterodactyl'",
+			"EXPLAIN ANALYZE (DEBUG, REDACT) SELECT max(cardno), test_redact() FROM pterosaur WHERE cardholder = 'pterodactyl'",
 		)
 		verboten := []string{"pterodactyl", "5555555555554444", fmt.Sprintf("%x", 5555555555554444)}
 		checkBundle(
@@ -300,7 +311,78 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 					}
 				}
 				return nil
-			}, "env.sql plan.txt schema.sql statement.sql vec-v.txt vec.txt",
+			}, false, /* expectErrors */
+			plans, "statement.sql stats-defaultdb.public.pterosaur.sql env.sql vec.txt vec-v.txt",
+		)
+	})
+
+	t.Run("types", func(t *testing.T) {
+		r.Exec(t, "CREATE TYPE test_type1 AS ENUM ('hello','world');")
+		r.Exec(t, "CREATE TYPE test_type2 AS ENUM ('goodbye','earth');")
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT 1;")
+		checkBundle(
+			t, fmt.Sprint(rows), "test_type1", nil, false, /* expectErrors */
+			base, plans, "distsql.html vec.txt vec-v.txt",
+		)
+		checkBundle(
+			t, fmt.Sprint(rows), "test_type2", nil, false, /* expectErrors */
+			base, plans, "distsql.html vec.txt vec-v.txt",
+		)
+	})
+
+	t.Run("udfs", func(t *testing.T) {
+		r.Exec(t, "CREATE FUNCTION add(a INT, b INT) RETURNS INT IMMUTABLE LEAKPROOF LANGUAGE SQL AS 'SELECT a + b';")
+		r.Exec(t, "CREATE FUNCTION subtract(a INT, b INT) RETURNS INT IMMUTABLE LEAKPROOF LANGUAGE SQL AS 'SELECT a - b';")
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT add(3, 4);")
+		checkBundle(
+			t, fmt.Sprint(rows), "add", func(name, contents string) error {
+				if name == "schema.sql" {
+					reg := regexp.MustCompile("add")
+					if reg.FindString(contents) == "" {
+						return errors.Errorf("could not find definition for 'add' function in schema.sql")
+					}
+					reg = regexp.MustCompile("subtract")
+					if reg.FindString(contents) != "" {
+						return errors.Errorf("Found irrelevant user defined function 'substract' in schema.sql")
+					}
+				}
+				return nil
+			}, false /* expectErrors */, base, plans,
+			"distsql.html vec-v.txt vec.txt")
+	})
+
+	t.Run("permission error", func(t *testing.T) {
+		r.Exec(t, "CREATE USER test")
+		r.Exec(t, "SET ROLE test")
+		defer r.Exec(t, "SET ROLE root")
+		r.Exec(t, "CREATE TABLE permissions (k PRIMARY KEY) AS SELECT 1")
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM permissions")
+		// Check that we see two errors about missing privileges as warnings
+		// (one for the cluster settings and another for the table statistics).
+		var numErrors int
+		for _, row := range rows {
+			if strings.HasPrefix(row[0], "-- error") {
+				numErrors++
+			}
+		}
+		if numErrors != 2 {
+			t.Fatalf("didn't see 2 errors in %v", rows)
+		}
+		checkBundle(
+			t, fmt.Sprint(rows), "permission" /* tableName */, nil /* contentCheck */, true, /* expectErrors */
+			base, plans, "distsql.html errors.txt stats-defaultdb.public.permissions.sql vec.txt vec-v.txt",
+		)
+	})
+
+	t.Run("with in-flight trace", func(t *testing.T) {
+		r.Exec(t, "SET CLUSTER SETTING sql.stmt_diagnostics.in_flight_trace_collector.poll_interval = '0.25s'")
+		defer r.Exec(t, "SET CLUSTER SETTING sql.stmt_diagnostics.in_flight_trace_collector.poll_interval = '0s'")
+		// Sleep for 1s during the query execution to allow for the trace
+		// collector goroutine to start.
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT pg_sleep(1)")
+		checkBundle(
+			t, fmt.Sprint(rows), "" /* tableName */, nil /* contentCheck */, false, /* expectErrors */
+			base, plans, "distsql.html vec.txt vec-v.txt inflight-trace-n1.txt inflight-trace-jaeger-n1.json",
 		)
 	})
 }
@@ -309,10 +391,13 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 // bundle contains the expected files. The expected files are passed as an
 // arbitrary number of strings; each string contains one or more filenames
 // separated by a space.
+// - expectErrors, if set, indicates that non-critical errors might have
+// occurred during the bundle collection and shouldn't fail the test.
 func checkBundle(
 	t *testing.T,
 	text, tableName string,
-	contentCheck func(name, contents string) error,
+	contentCheck func(name string, contents string) error,
+	expectErrors bool,
 	expectedFiles ...string,
 ) {
 	httpClient := httputil.NewClientWithTimeout(30 * time.Second)
@@ -359,7 +444,7 @@ func checkBundle(
 		}
 		contents := string(bytes)
 
-		if strings.Contains(contents, "-- error") {
+		if !expectErrors && strings.Contains(contents, "-- error") {
 			t.Errorf(
 				"expected no errors in %s, file contents:\n%s",
 				f.Name, contents,

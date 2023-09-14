@@ -18,7 +18,10 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/apiutil"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/gorilla/mux"
 )
@@ -45,6 +48,8 @@ type nodeStatus struct {
 
 	// Metrics contain the last sampled metrics for this node.
 	Metrics map[string]float64 `json:"metrics,omitempty"`
+	// StoreMetrics contain the last sampled store metrics for this node.
+	StoreMetrics map[roachpb.StoreID]map[string]float64 `json:"store_metrics,omitempty"`
 	// TotalSystemMemory is the total amount of available system memory on this
 	// node (or cgroup), in bytes.
 	TotalSystemMemory int64 `json:"total_system_memory,omitempty"`
@@ -106,16 +111,20 @@ type nodesResponse struct {
 func (a *apiV2SystemServer) listNodes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit, offset := getSimplePaginationValues(r)
-	ctx = forwardHTTPAuthInfoToRPCCalls(ctx, r)
+	ctx = authserver.ForwardHTTPAuthInfoToRPCCalls(ctx, r)
 
 	nodes, next, err := a.systemStatus.nodesHelper(ctx, limit, offset)
 	if err != nil {
-		apiV2InternalError(ctx, err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
 	var resp nodesResponse
 	resp.Next = next
 	for _, n := range nodes.Nodes {
+		storeMetrics := make(map[roachpb.StoreID]map[string]float64)
+		for _, ss := range n.StoreStatuses {
+			storeMetrics[ss.Desc.StoreID] = ss.Metrics
+		}
 		resp.Nodes = append(resp.Nodes, nodeStatus{
 			NodeID:            int32(n.Desc.NodeID),
 			Address:           n.Desc.Address,
@@ -127,17 +136,18 @@ func (a *apiV2SystemServer) listNodes(w http.ResponseWriter, r *http.Request) {
 			ClusterName:       n.Desc.ClusterName,
 			SQLAddress:        n.Desc.SQLAddress,
 			Metrics:           n.Metrics,
+			StoreMetrics:      storeMetrics,
 			TotalSystemMemory: n.TotalSystemMemory,
 			NumCpus:           n.NumCpus,
 			UpdatedAt:         n.UpdatedAt,
 			LivenessStatus:    int32(nodes.LivenessByNodeID[n.Desc.NodeID]),
 		})
 	}
-	writeJSONResponse(ctx, w, 200, resp)
+	apiutil.WriteJSONResponse(ctx, w, 200, resp)
 }
 
 func (a *apiV2Server) listNodes(w http.ResponseWriter, r *http.Request) {
-	writeJSONResponse(r.Context(), w, http.StatusNotImplemented, nil)
+	apiutil.WriteJSONResponse(r.Context(), w, http.StatusNotImplemented, nil)
 }
 
 func parseRangeIDs(input string, w http.ResponseWriter) (ranges []roachpb.RangeID, ok bool) {
@@ -195,7 +205,7 @@ type rangeResponse struct {
 //	    "$ref": "#/definitions/rangeResponse"
 func (a *apiV2Server) listRange(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = forwardHTTPAuthInfoToRPCCalls(ctx, r)
+	ctx = authserver.ForwardHTTPAuthInfoToRPCCalls(ctx, r)
 	vars := mux.Vars(r)
 	rangeID, err := strconv.ParseInt(vars["range_id"], 10, 64)
 	if err != nil {
@@ -237,12 +247,16 @@ func (a *apiV2Server) listRange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.status.iterateNodes(
-		ctx, fmt.Sprintf("details about range %d", rangeID), dialFn, nodeFn, responseFn, errorFn,
+		ctx,
+		fmt.Sprintf("details about range %d", rangeID),
+		noTimeout,
+		dialFn, nodeFn,
+		responseFn, errorFn,
 	); err != nil {
-		apiV2InternalError(ctx, err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
-	writeJSONResponse(ctx, w, 200, response)
+	apiutil.WriteJSONResponse(ctx, w, 200, response)
 }
 
 // rangeDescriptorInfo contains a subset of fields from the Cockroach-internal
@@ -378,7 +392,7 @@ type nodeRangesResponse struct {
 //	    "$ref": "#/definitions/nodeRangesResponse"
 func (a *apiV2SystemServer) listNodeRanges(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = forwardHTTPAuthInfoToRPCCalls(ctx, r)
+	ctx = authserver.ForwardHTTPAuthInfoToRPCCalls(ctx, r)
 	vars := mux.Vars(r)
 	nodeIDStr := vars["node_id"]
 	if nodeIDStr != "local" {
@@ -400,7 +414,7 @@ func (a *apiV2SystemServer) listNodeRanges(w http.ResponseWriter, r *http.Reques
 	limit, offset := getSimplePaginationValues(r)
 	statusResp, next, err := a.systemStatus.rangesHelper(ctx, req, limit, offset)
 	if err != nil {
-		apiV2InternalError(ctx, err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
 	resp := nodeRangesResponse{
@@ -412,11 +426,11 @@ func (a *apiV2SystemServer) listNodeRanges(w http.ResponseWriter, r *http.Reques
 		ri.init(r)
 		resp.Ranges = append(resp.Ranges, ri)
 	}
-	writeJSONResponse(ctx, w, 200, resp)
+	apiutil.WriteJSONResponse(ctx, w, 200, resp)
 }
 
 func (a *apiV2Server) listNodeRanges(w http.ResponseWriter, r *http.Request) {
-	writeJSONResponse(r.Context(), w, http.StatusNotImplemented, nil)
+	apiutil.WriteJSONResponse(r.Context(), w, http.StatusNotImplemented, nil)
 }
 
 type responseError struct {
@@ -497,7 +511,7 @@ type hotRangeInfo struct {
 //	    "$ref": "#/definitions/hotRangesResponse"
 func (a *apiV2Server) listHotRanges(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx = forwardHTTPAuthInfoToRPCCalls(ctx, r)
+	ctx = authserver.ForwardHTTPAuthInfoToRPCCalls(ctx, r)
 	nodeIDStr := r.URL.Query().Get("node_id")
 	limit, start := getRPCPaginationValues(r)
 
@@ -556,12 +570,13 @@ func (a *apiV2Server) listHotRanges(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	timeout := HotRangesRequestNodeTimeout.Get(&a.status.st.SV)
 	next, err := a.status.paginatedIterateNodes(
-		ctx, "hot ranges", limit, start, requestedNodes, dialFn,
+		ctx, "hot ranges", limit, start, requestedNodes, timeout, dialFn,
 		nodeFn, responseFn, errorFn)
 
 	if err != nil {
-		apiV2InternalError(ctx, err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
 	var nextBytes []byte
@@ -570,5 +585,5 @@ func (a *apiV2Server) listHotRanges(w http.ResponseWriter, r *http.Request) {
 	} else {
 		response.Next = string(nextBytes)
 	}
-	writeJSONResponse(ctx, w, 200, response)
+	apiutil.WriteJSONResponse(ctx, w, 200, response)
 }

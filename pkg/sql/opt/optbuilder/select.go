@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -24,16 +25,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -49,10 +53,12 @@ import (
 func (b *Builder) buildDataSource(
 	texpr tree.TableExpr, indexFlags *tree.IndexFlags, locking lockingSpec, inScope *scope,
 ) (outScope *scope) {
-	defer func(prevAtRoot bool) {
+	defer func(prevAtRoot bool, prevInsideDataSource bool) {
 		inScope.atRoot = prevAtRoot
-	}(inScope.atRoot)
+		b.insideDataSource = prevInsideDataSource
+	}(inScope.atRoot, b.insideDataSource)
 	inScope.atRoot = false
+	b.insideDataSource = true
 	// NB: The case statements are sorted lexicographically.
 	switch source := (texpr).(type) {
 	case *tree.AliasedTableExpr:
@@ -81,7 +87,6 @@ func (b *Builder) buildDataSource(
 		}
 
 		if source.As.Alias != "" {
-			inScope = inScope.push()
 			inScope.alias = &source.As
 			locking = locking.filter(source.As.Alias)
 		}
@@ -280,6 +285,17 @@ func (b *Builder) buildDataSource(
 func (b *Builder) buildView(
 	view cat.View, viewName *tree.TableName, locking lockingSpec, inScope *scope,
 ) (outScope *scope) {
+	if b.sourceViews == nil {
+		b.sourceViews = make(map[string]struct{})
+	}
+	// Check whether there is a circular dependency between views.
+	if _, ok := b.sourceViews[viewName.FQString()]; ok {
+		panic(pgerror.Newf(pgcode.InvalidObjectDefinition, "cyclic view dependency for relation %s", viewName))
+	}
+	b.sourceViews[viewName.FQString()] = struct{}{}
+	defer func() {
+		delete(b.sourceViews, viewName.FQString())
+	}()
 	// Cache the AST so that multiple references won't need to reparse.
 	if b.views == nil {
 		b.views = make(map[cat.View]*tree.Select)
@@ -527,17 +543,22 @@ func (b *Builder) buildScan(
 	// We collect VirtualComputed columns separately; these cannot be scanned,
 	// they can only be projected afterward.
 	var scanColIDs, virtualColIDs opt.ColSet
+	var virtualMutationColOrds intsets.Fast
 	outScope.cols = make([]scopeColumn, len(ordinals))
 	for i, ord := range ordinals {
 		col := tab.Column(ord)
 		colID := tabID.ColumnID(ord)
 		name := col.ColName()
+		kind := col.Kind()
+		mutation := kind == cat.WriteOnly || kind == cat.DeleteOnly
 		if col.IsVirtualComputed() {
 			virtualColIDs.Add(colID)
+			if mutation {
+				virtualMutationColOrds.Add(ord)
+			}
 		} else {
 			scanColIDs.Add(colID)
 		}
-		kind := col.Kind()
 		outScope.cols[i] = scopeColumn{
 			id:           colID,
 			name:         scopeColName(name),
@@ -545,7 +566,7 @@ func (b *Builder) buildScan(
 			typ:          col.DatumType(),
 			visibility:   columnVisibility(col.Visibility()),
 			kind:         kind,
-			mutation:     kind == cat.WriteOnly || kind == cat.DeleteOnly,
+			mutation:     mutation,
 			tableOrdinal: ord,
 		}
 	}
@@ -578,7 +599,7 @@ func (b *Builder) buildScan(
 
 	// Scanning tables in databases that don't use the SURVIVE ZONE FAILURE option
 	// is disallowed when EnforceHomeRegion is true.
-	if b.evalCtx.SessionData().EnforceHomeRegion && parser.IsANSIDML(b.stmt) {
+	if b.evalCtx.SessionData().EnforceHomeRegion && statements.IsANSIDML(b.stmt) {
 		errorOnInvalidMultiregionDB(b.ctx, b.evalCtx, tabMeta)
 		// Populate the remote regions touched by the multiregion database used in
 		// this query. If a query dynamically errors out as having no home region,
@@ -676,6 +697,24 @@ func (b *Builder) buildScan(
 	}
 	if locking.isSet() {
 		private.Locking = locking.get()
+		if b.evalCtx.TxnIsoLevel != isolation.Serializable ||
+			b.evalCtx.SessionData().DurableLockingForSerializable {
+			// Under weaker isolation levels we use fully-durable locks for SELECT FOR
+			// UPDATE statements, SELECT FOR SHARE statements, and constraint checks
+			// (e.g. FK checks), regardless of locking strength and wait policy.
+			// Unlike mutation statements, SELECT FOR UPDATE statements do not lay
+			// down intents, so we cannot rely on the durability of intents to
+			// guarantee exclusion until commit as we do for mutation statements. And
+			// unlike serializable isolation, weaker isolation levels do not perform
+			// read refreshing, so we cannot rely on read refreshing to guarantee
+			// exclusion.
+			//
+			// Under serializable isolation we only use fully-durable locks if
+			// enable_durable_locking_for_serializable is set. (Serializable isolation
+			// does not require locking for correctness, so by default we use
+			// best-effort locks for better performance.)
+			private.Locking.Durability = tree.LockDurabilityGuaranteed
+		}
 		if private.Locking.WaitPolicy == tree.LockWaitSkipLocked && tab.FamilyCount() > 1 {
 			// TODO(rytaft): We may be able to support this if enough columns are
 			// pruned that only a single family is scanned.
@@ -691,7 +730,7 @@ func (b *Builder) buildScan(
 	private.Flags.DisableNotVisibleIndex = disableNotVisibleIndex
 
 	b.addCheckConstraintsForTable(tabMeta)
-	b.addComputedColsForTable(tabMeta)
+	b.addComputedColsForTable(tabMeta, virtualMutationColOrds)
 	tabMeta.CacheIndexPartitionLocalities(b.evalCtx)
 
 	outScope.expr = b.factory.ConstructScan(&private)
@@ -820,7 +859,13 @@ func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 // caches them in the table metadata as scalar expressions. These expressions
 // are used as "known truths" about table data. Any columns for which the
 // expression contains non-immutable operators are omitted.
-func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
+// `includeVirtualMutationColOrds` is the set of virtual computed column
+// ordinals which are under mutation, but whose computed expressions should be
+// built anyway. Normally `addComputedColsForTable` does not build expressions
+// for columns under mutation.
+func (b *Builder) addComputedColsForTable(
+	tabMeta *opt.TableMeta, includeVirtualMutationColOrds intsets.Fast,
+) {
 	// We do not want to track view deps here, otherwise a view depending
 	// on a table with a computed column of a UDT will result in a
 	// type dependency being added between the view and the UDT,
@@ -838,7 +883,7 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 		if !tabCol.IsComputed() {
 			continue
 		}
-		if tabCol.IsMutation() {
+		if tabCol.IsMutation() && !includeVirtualMutationColOrds.Contains(i) {
 			// Mutation columns can be NULL during backfill, so they won't equal the
 			// computed column expression value (in general).
 			continue
@@ -853,17 +898,33 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 			tableScope.appendOrdinaryColumnsFromTable(tabMeta, &tabMeta.Alias)
 		}
 
-		if texpr := tableScope.resolveAndRequireType(expr, tabCol.DatumType()); texpr != nil {
+		colType := tabCol.DatumType()
+		if texpr := tableScope.resolveAndRequireType(expr, colType); texpr != nil {
 			colID := tabMeta.MetaID.ColumnID(i)
 			var scalar opt.ScalarExpr
 			b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
 				scalar = b.buildScalar(texpr, tableScope, nil, nil, nil)
+				// Add an assignment cast if the types are not identical.
+				scalarType := scalar.DataType()
+				if !colType.Identical(scalarType) {
+					// Assert that an assignment cast is available from the
+					// expression type to the column type.
+					if !cast.ValidCast(scalarType, colType, cast.ContextAssignment) {
+						panic(sqlerrors.NewInvalidAssignmentCastError(
+							scalarType, colType, string(tabCol.ColName()),
+						))
+					}
+					// TODO(mgartner): This should be an assignment cast, but
+					// until #81698 is addressed, that could cause reads to
+					// error after adding a virtual computed column to a table.
+					scalar = b.factory.ConstructCast(scalar, colType)
+				}
 			})
 			// Check if the expression contains non-immutable operators.
 			var sharedProps props.Shared
 			memo.BuildSharedProps(scalar, &sharedProps, b.evalCtx)
 			if !sharedProps.VolatilitySet.HasStable() && !sharedProps.VolatilitySet.HasVolatile() {
-				tabMeta.AddComputedCol(colID, scalar)
+				tabMeta.AddComputedCol(colID, scalar, sharedProps.OuterCols)
 			}
 		}
 	}
@@ -932,6 +993,12 @@ func (b *Builder) buildWithOrdinality(inScope *scope) (outScope *scope) {
 func (b *Builder) buildSelectStmt(
 	stmt tree.SelectStatement, locking lockingSpec, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
+	// The top level in a select statement is not considered a data source.
+	oldInsideDataSource := b.insideDataSource
+	defer func() {
+		b.insideDataSource = oldInsideDataSource
+	}()
+	b.insideDataSource = false
 	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
 	case *tree.LiteralValuesClause:
@@ -1058,7 +1125,8 @@ func (b *Builder) buildSelectStmtWithoutParens(
 			col := projectionsScope.addColumn(scopeColName(""), expr)
 			b.buildScalar(expr, outScope, projectionsScope, col, nil)
 		}
-		orderByScope := b.analyzeOrderBy(orderBy, outScope, projectionsScope, tree.RejectGenerators|tree.RejectAggregates|tree.RejectWindowApplications)
+		orderByScope := b.analyzeOrderBy(orderBy, outScope, projectionsScope, exprKindOrderBy,
+			tree.RejectGenerators|tree.RejectAggregates|tree.RejectWindowApplications)
 		b.buildOrderBy(outScope, projectionsScope, orderByScope)
 		b.constructProjectForScope(outScope, projectionsScope)
 		outScope = projectionsScope
@@ -1103,7 +1171,8 @@ func (b *Builder) buildSelectClause(
 	// Any aggregates in the HAVING, ORDER BY and DISTINCT ON clauses (if they
 	// exist) will be added here.
 	havingExpr := b.analyzeHaving(sel.Having, fromScope)
-	orderByScope := b.analyzeOrderBy(orderBy, fromScope, projectionsScope, tree.RejectGenerators)
+	orderByScope := b.analyzeOrderBy(orderBy, fromScope, projectionsScope,
+		exprKindOrderBy, tree.RejectGenerators)
 	distinctOnScope := b.analyzeDistinctOnArgs(sel.DistinctOn, fromScope, projectionsScope)
 
 	var having opt.ScalarExpr

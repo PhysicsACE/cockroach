@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -123,6 +124,14 @@ type AuthorizationAccessor interface {
 	// the role options table. Example: CREATEROLE instead of NOCREATEROLE.
 	// NOLOGIN instead of LOGIN.
 	HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error)
+
+	// HasGlobalPrivilegeOrRoleOption returns a bool representing whether the current user
+	// has a global privilege or the corresponding legacy role option.
+	HasGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) (bool, error)
+
+	// CheckGlobalPrivilegeOrRoleOption checks if the current user has a global privilege
+	// or the corresponding legacy role option, and returns an error if the user does not.
+	CheckGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) error
 }
 
 var _ AuthorizationAccessor = &planner{}
@@ -150,9 +159,11 @@ func (p *planner) HasPrivilege(
 	if (user.IsRootUser() || user.IsAdminRole() || user.IsNodeUser()) &&
 		!privilegeObject.GetObjectType().IsDescriptorBacked() &&
 		privilegeKind != privilege.NOSQLLOGIN {
-		if privilege.GetValidPrivilegesForObject(
-			privilegeObject.GetObjectType(),
-		).Contains(privilegeKind) {
+		validPrivs, err := privilege.GetValidPrivilegesForObject(privilegeObject.GetObjectType())
+		if err != nil {
+			return false, err
+		}
+		if validPrivs.Contains(privilegeKind) {
 			return true, nil
 		}
 		return false, nil
@@ -163,7 +174,7 @@ func (p *planner) HasPrivilege(
 	// it will not be forgotten if features are added that access
 	// descriptors (since every use of descriptors presumably need a
 	// permission check).
-	p.maybeAudit(privilegeObject, privilegeKind)
+	p.maybeAuditSensitiveTableAccessEvent(privilegeObject, privilegeKind)
 
 	privs, err := p.getPrivilegeDescriptor(ctx, privilegeObject)
 	if err != nil {
@@ -172,6 +183,21 @@ func (p *planner) HasPrivilege(
 
 	// Check if the 'public' pseudo-role has privileges.
 	if privs.CheckPrivilege(username.PublicRoleName(), privilegeKind) {
+		// Before returning true, make sure the user actually exists.
+		// We only need to check for existence here, since a dropped user will not
+		// appear in the role hierarchy, so it cannot pass the privilege check made
+		// later in this function. The RoleExists call performs a system table
+		// lookup, so it's better not to do it in the general case.
+		if user.IsNodeUser() || user.IsRootUser() {
+			// Short-circuit for the node and root users to avoid doing an extra
+			// lookup in common cases (e.g., internal executor usages).
+			return true, nil
+		}
+		if exists, err := p.RoleExists(ctx, user); err != nil {
+			return false, err
+		} else if !exists {
+			return false, pgerror.Newf(pgcode.UndefinedObject, "role %s was concurrently dropped", user)
+		}
 		return true, nil
 	}
 
@@ -244,14 +270,32 @@ func (p *planner) CheckPrivilegeForUser(
 	privilegeKind privilege.Kind,
 	user username.SQLUsername,
 ) error {
-	ok, err := p.HasPrivilege(ctx, privilegeObject, privilegeKind, user)
+	hasPriv, err := p.HasPrivilege(ctx, privilegeObject, privilegeKind, user)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return insufficientPrivilegeError(user, privilegeKind, privilegeObject)
+	if hasPriv {
+		return nil
 	}
-	return nil
+	// Special case for system tables. The VIEWSYSTEMTABLE system privilege is
+	// equivalent to having SELECT on all system tables. This is because it is not
+	// possible to dynamically grant SELECT privileges system tables, but in the
+	// context of support escalations, we need to be able to grant the ability to
+	// view system tables without granting the entire admin role.
+	if d, ok := privilegeObject.(catalog.Descriptor); ok {
+		if catalog.IsSystemDescriptor(d) && privilegeKind == privilege.SELECT {
+			hasViewSystemTablePriv, err := p.HasPrivilege(
+				ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWSYSTEMTABLE, user,
+			)
+			if err != nil {
+				return err
+			}
+			if hasViewSystemTablePriv {
+				return nil
+			}
+		}
+	}
+	return insufficientPrivilegeError(user, privilegeKind, privilegeObject)
 }
 
 // CheckPrivilege implements the AuthorizationAccessor interface.
@@ -327,6 +371,13 @@ func (p *planner) CheckGrantOptionsForUser(
 func (p *planner) getOwnerOfPrivilegeObject(
 	ctx context.Context, privilegeObject privilege.Object,
 ) (username.SQLUsername, error) {
+	// Short-circuit for virtual tables, which are all owned by node. This allows
+	// us to avoid fetching the synthetic privileges for virtual tables in a
+	// thundering herd while populating a table like pg_class, which has a row for
+	// every table, including virtual tables.
+	if d, ok := privilegeObject.(catalog.TableDescriptor); ok && d.IsVirtualTable() {
+		return username.NodeUserName(), nil
+	}
 	privDesc, err := p.getPrivilegeDescriptor(ctx, privilegeObject)
 	if err != nil {
 		return username.SQLUsername{}, err
@@ -492,7 +543,7 @@ func (p *planner) MemberOfWithAdminOption(
 // Requires a valid transaction to be open.
 func MemberOfWithAdminOption(
 	ctx context.Context, execCfg *ExecutorConfig, txn descs.Txn, member username.SQLUsername,
-) (map[username.SQLUsername]bool, error) {
+) (_ map[username.SQLUsername]bool, retErr error) {
 	if txn == nil {
 		return nil, errors.AssertionFailedf("cannot use MemberOfWithAdminoption without a txn")
 	}
@@ -510,6 +561,20 @@ func MemberOfWithAdminOption(
 	tableVersion := tableDesc.GetVersion()
 	if tableDesc.IsUncommittedVersion() {
 		return resolveMemberOfWithAdminOption(ctx, member, txn, useSingleQueryForRoleMembershipCache.Get(execCfg.SV()))
+	}
+	if txn.SessionData().AllowRoleMembershipsToChangeDuringTransaction {
+		defer func() {
+			if retErr != nil {
+				return
+			}
+			txn.Descriptors().ReleaseSpecifiedLeases(ctx, []lease.IDVersion{
+				{
+					Name:    tableDesc.GetName(),
+					ID:      tableDesc.GetID(),
+					Version: tableVersion,
+				},
+			})
+		}()
 	}
 
 	// Check version and maybe clear cache while holding the mutex.
@@ -542,6 +607,13 @@ func MemberOfWithAdminOption(
 	// in-flight for each user. The role_memberships table version is also part
 	// of the request key so that we don't read data from an old version of the
 	// table.
+	//
+	// The singleflight closure uses a fresh transaction to prevent a data race
+	// that may occur if the context is cancelled, leading to the outer txn
+	// being cleaned up. We set the timestamp of this new transaction to be
+	// the same as the outer transaction that already read the descriptor, to
+	// ensure that we are reading from the right version of the table.
+	newTxnTimestamp := txn.KV().ReadTimestamp()
 	future, _ := roleMembersCache.populateCacheGroup.DoChan(ctx,
 		fmt.Sprintf("%s-%d", member.Normalized(), tableVersion),
 		singleflight.DoOpts{
@@ -549,10 +621,22 @@ func MemberOfWithAdminOption(
 			InheritCancelation: false,
 		},
 		func(ctx context.Context) (interface{}, error) {
-			return resolveMemberOfWithAdminOption(
-				ctx, member, txn,
-				useSingleQueryForRoleMembershipCache.Get(execCfg.SV()),
-			)
+			var m map[username.SQLUsername]bool
+			err = execCfg.InternalDB.Txn(ctx, func(ctx context.Context, newTxn isql.Txn) error {
+				err := newTxn.KV().SetFixedTimestamp(ctx, newTxnTimestamp)
+				if err != nil {
+					return err
+				}
+				m, err = resolveMemberOfWithAdminOption(
+					ctx, member, newTxn,
+					useSingleQueryForRoleMembershipCache.Get(execCfg.SV()),
+				)
+				if err != nil {
+					return err
+				}
+				return err
+			})
+			return m, err
 		})
 	var memberships map[username.SQLUsername]bool
 	res := future.WaitForResult(ctx)
@@ -597,7 +681,7 @@ var useSingleQueryForRoleMembershipCache = settings.RegisterBoolSetting(
 	"sql.auth.resolve_membership_single_scan.enabled",
 	"determines whether to populate the role membership cache with a single scan",
 	defaultSingleQueryForRoleMembershipCache,
-).WithPublic()
+	settings.WithPublic)
 
 // resolveMemberOfWithAdminOption performs the actual recursive role membership lookup.
 func resolveMemberOfWithAdminOption(
@@ -735,6 +819,38 @@ func (p *planner) CheckRoleOption(ctx context.Context, roleOption roleoption.Opt
 	return nil
 }
 
+// HasGlobalPrivilegeOrRoleOption implements the AuthorizationAccessor interface.
+func (p *planner) HasGlobalPrivilegeOrRoleOption(
+	ctx context.Context, privilege privilege.Kind,
+) (bool, error) {
+	ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege, p.User())
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		return true, nil
+	}
+	if roleOption, ok := roleoption.ByName[privilege.String()]; ok {
+		return p.HasRoleOption(ctx, roleOption)
+	}
+	return false, nil
+}
+
+// CheckGlobalPrivilegeOrRoleOption implements the AuthorizationAccessor interface.
+func (p *planner) CheckGlobalPrivilegeOrRoleOption(
+	ctx context.Context, privilege privilege.Kind,
+) error {
+	ok, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"user %s does not have %s privilege", p.User(), privilege)
+	}
+	return nil
+}
+
 // ConnAuditingClusterSettingName is the name of the cluster setting
 // for the cluster setting that enables pgwire-level connection audit
 // logs.
@@ -797,8 +913,7 @@ func (p *planner) canCreateOnSchema(
 		// Callers must check whether temporary schemas are valid to create in.
 		return nil
 	case catalog.SchemaVirtual:
-		return pgerror.Newf(pgcode.InsufficientPrivilege,
-			"cannot CREATE on schema %s", scDesc.GetName())
+		return sqlerrors.NewCannotModifyVirtualSchemaError(scDesc.GetName())
 	case catalog.SchemaUserDefined:
 		return p.CheckPrivilegeForUser(ctx, scDesc, privilege.CREATE, user)
 	default:
@@ -915,27 +1030,25 @@ func (p *planner) HasViewActivityOrViewActivityRedactedRole(ctx context.Context)
 	} else if hasAdmin {
 		return true, nil
 	}
-	if hasView, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWACTIVITY, p.User()); err != nil {
+	if hasView, err := p.HasViewActivity(ctx); err != nil {
 		return false, err
 	} else if hasView {
 		return true, nil
 	}
-	if hasViewRedacted, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWACTIVITYREDACTED, p.User()); err != nil {
-		return false, err
-	} else if hasViewRedacted {
-		return true, nil
-	}
-	if hasView, err := p.HasRoleOption(ctx, roleoption.VIEWACTIVITY); err != nil {
-		return false, err
-	} else if hasView {
-		return true, nil
-	}
-	if hasViewRedacted, err := p.HasRoleOption(ctx, roleoption.VIEWACTIVITYREDACTED); err != nil {
+	if hasViewRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
 		return false, err
 	} else if hasViewRedacted {
 		return true, nil
 	}
 	return false, nil
+}
+
+func (p *planner) HasViewActivityRedacted(ctx context.Context) (bool, error) {
+	return p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.VIEWACTIVITYREDACTED)
+}
+
+func (p *planner) HasViewActivity(ctx context.Context) (bool, error) {
+	return p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.VIEWACTIVITY)
 }
 
 func insufficientPrivilegeError(

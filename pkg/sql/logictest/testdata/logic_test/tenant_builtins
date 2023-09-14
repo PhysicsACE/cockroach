@@ -1,4 +1,5 @@
-# LogicTest: !3node-tenant-default-configs
+# LogicTest: !3node-tenant-default-configs !local-mixed-22.2-23.1
+
 query IBIT colnames
 SELECT id, active, length(info), name FROM system.tenants ORDER BY id
 ----
@@ -30,6 +31,10 @@ SELECT crdb_internal.create_tenant(10, 'invalid_name')
 query error invalid tenant name
 SELECT crdb_internal.create_tenant(10, 'invalid.name')
 
+# The max tenant ID is less or equal to 18446744073709551614.
+query error out of range
+SELECT crdb_internal.create_tenant('{"id":18446744073709551615}'::jsonb)
+
 query I
 SELECT crdb_internal.create_tenant(10, 'tenant-number-ten')
 ----
@@ -38,19 +43,25 @@ SELECT crdb_internal.create_tenant(10, 'tenant-number-ten')
 query I
 SELECT crdb_internal.create_tenant('tenant-number-eleven')
 ----
-2
+11
 
-query IBTIIT colnames
-SELECT id, active, name, data_state, service_mode,
-       crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true)
+query IBTIITT colnames
+SELECT
+  id,
+  active,
+  name,
+  data_state,
+  service_mode,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'deprecatedDataState') AS deprecated_data_state,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'droppedName') AS dropped_name
 FROM system.tenants
 ORDER BY id
 ----
-id  active  name                  data_state  service_mode  crdb_internal.pb_to_json
-1   true    system                1           2             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "1", "droppedName": "", "tenantReplicationJobId": "0"}
-2   true    tenant-number-eleven  1           0             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "2", "droppedName": "", "tenantReplicationJobId": "0"}
-5   true    tenant-5              1           0             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "5", "droppedName": "", "tenantReplicationJobId": "0"}
-10  true    tenant-number-ten     1           0             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "10", "droppedName": "", "tenantReplicationJobId": "0"}
+id  active  name                  data_state  service_mode  deprecated_data_state  dropped_name
+1   true    system                1           2             READY                  ·
+5   true    tenant-5              1           0             READY                  ·
+10  true    tenant-number-ten     1           0             READY                  ·
+11  true    tenant-number-eleven  1           0             READY                  ·
 
 # Check we can add a name where none existed before.
 statement ok
@@ -61,9 +72,9 @@ SELECT id, active, name FROM system.tenants ORDER BY id
 ----
 id  active  name
 1   true    system
-2   true    tenant-number-eleven
 5   true    my-tenant
 10  true    tenant-number-ten
+11  true    tenant-number-eleven
 
 
 # Check we can change the name when there was one before.
@@ -97,9 +108,9 @@ SELECT id, active, name FROM system.tenants ORDER BY id
 ----
 id  active  name
 1   true    system
-2   true    tenant-number-eleven
 5   true    my-new-tenant-name
 10  true    tenant-number-ten
+11  true    tenant-number-eleven
 
 # Garbage collect a non-drop tenant fails.
 
@@ -111,17 +122,23 @@ SELECT crdb_internal.gc_tenant(5)
 statement ok
 DROP TENANT [5]
 
-query IBTIIT colnames
-SELECT id, active, name, data_state, service_mode,
-       crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true)
+query IBTIITT colnames
+SELECT
+  id,
+  active,
+  name,
+  data_state,
+  service_mode,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'deprecatedDataState') AS deprecated_data_state,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'droppedName') AS dropped_name
 FROM system.tenants
 ORDER BY id
 ----
-id  active  name                  data_state  service_mode  crdb_internal.pb_to_json
-1   true    system                1           2             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "1", "droppedName": "", "tenantReplicationJobId": "0"}
-2   true    tenant-number-eleven  1           0             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "2", "droppedName": "", "tenantReplicationJobId": "0"}
-5   false   NULL                  2           0             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "DROP", "deprecatedId": "5", "droppedName": "my-new-tenant-name", "tenantReplicationJobId": "0"}
-10  true    tenant-number-ten     1           0             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "10", "droppedName": "", "tenantReplicationJobId": "0"}
+id  active  name                  data_state  service_mode  deprecated_data_state  dropped_name
+1   true    system                1           2             READY                  ·
+5   false   NULL                  2           0             DROP                   my-new-tenant-name
+10  true    tenant-number-ten     1           0             READY                  ·
+11  true    tenant-number-eleven  1           0             READY                  ·
 
 
 # Try to recreate an existing tenant.
@@ -222,37 +239,121 @@ succeeded
 statement error pgcode 42704 tenant "5" does not exist
 DROP TENANT [5]
 
-query IBTIIT colnames
-SELECT id, active, name, data_state, service_mode,
-       crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true)
+query IBTIITT colnames
+SELECT
+  id,
+  active,
+  name,
+  data_state,
+  service_mode,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'deprecatedDataState') AS deprecated_data_state,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'droppedName') AS dropped_name
 FROM system.tenants
 ORDER BY id
 ----
-id  active  name                  data_state  service_mode  crdb_internal.pb_to_json
-1   true    system                1           2             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "1", "droppedName": "", "tenantReplicationJobId": "0"}
-2   true    tenant-number-eleven  1           0             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "2", "droppedName": "", "tenantReplicationJobId": "0"}
-10  true    tenant-number-ten     1           0             {"capabilities": {"canAdminScatter": false, "canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "10", "droppedName": "", "tenantReplicationJobId": "0"}
+id  active  name                  data_state  service_mode  deprecated_data_state  dropped_name
+1   true    system                1           2             READY                  ·
+10  true    tenant-number-ten     1           0             READY                  ·
+11  true    tenant-number-eleven  1           0             READY                  ·
 
 query error tenant resource limits require a CCL binary
 SELECT crdb_internal.update_tenant_resource_limits(10, 1000, 100, 0, now(), 0)
 
+query error tenant resource limits require a CCL binary
+SELECT crdb_internal.update_tenant_resource_limits('tenant-number-ten', 1000, 100, 0, now(), 0)
+
 user testuser
 
-statement error only users with the admin role are allowed to create tenant
+statement error user testuser does not have MANAGETENANT privilege on global
 SELECT crdb_internal.create_tenant(314)
 
-statement error only users with the admin role are allowed to create tenant
+statement error user testuser does not have MANAGETENANT privilege on global
 SELECT crdb_internal.create_tenant('not-allowed')
 
-statement error only users with the admin role are allowed to drop tenant
+statement error user testuser does not have MANAGETENANT privilege on global
 DROP TENANT [1]
 
 statement error only users with the admin role are allowed to gc tenant
 SELECT crdb_internal.gc_tenant(314)
 
-subtest regression_97873
-
 user root
+
+subtest avoid_tenant_id_reuse
+
+# Check what is the last tenant ID assigned according to the tenant ID sequence.
+query I
+SELECT last_value FROM system.tenant_id_seq
+----
+11
+
+# Remove the last tenant with IMMEDIATE, which ensures the record is immediately
+# removed. Then create another one.
+statement ok
+DROP TENANT [11] IMMEDIATE;
+CREATE TENANT anothertenant
+
+query ITI
+SELECT id, name, data_state FROM system.tenants ORDER BY id
+----
+1   system             1
+10  tenant-number-ten  1
+12  anothertenant      1
+
+# Check the sequence was updated.
+query I
+SELECT last_value FROM system.tenant_id_seq
+----
+12
+
+# Now force a tenant with a large ID, "a la" serverless.
+statement ok
+SELECT crdb_internal.create_tenant(123)
+
+# Check the sequence was updated.
+query I
+SELECT last_value FROM system.tenant_id_seq
+----
+123
+
+# Check that the next tenant created picks up a higher ID.
+statement ok
+CREATE TENANT yetanotherone
+
+# Check the sequence was updated.
+query I
+SELECT last_value FROM system.tenant_id_seq
+----
+124
+
+query ITI
+SELECT id, name, data_state FROM system.tenants ORDER BY id
+----
+1    system             1
+10   tenant-number-ten  1
+12   anothertenant      1
+123  tenant-123         1
+124  yetanotherone      1
+
+subtest multiple_tenants_in_txn
+
+statement ok
+BEGIN;
+SELECT crdb_internal.create_tenant(200);
+CREATE TENANT hello;
+COMMIT
+
+query ITI
+SELECT id, name, data_state FROM system.tenants ORDER BY id
+----
+1    system             1
+10   tenant-number-ten  1
+12   anothertenant      1
+123  tenant-123         1
+124  yetanotherone      1
+200  tenant-200         1
+201  hello              1
+
+subtest regression_97873
 
 # Verify that destroy_tenant works even in the default service mode,
 # for compatibility with CC serverless.
@@ -265,3 +366,26 @@ query I
 SELECT crdb_internal.destroy_tenant(97873)
 ----
 97873
+
+subtest if_not_exists
+
+query error pgcode 42710 a tenant with ID 10 or with name "tenant-10" already exists
+SELECT crdb_internal.create_tenant('{"id":10}'::JSONB)
+
+query error pgcode 42710 tenant with name "tenant-number-ten" already exists
+SELECT crdb_internal.create_tenant('{"name":"tenant-number-ten"}'::JSONB)
+
+query I
+SELECT crdb_internal.create_tenant('{"id":10, "if_not_exists": true}'::JSONB)
+----
+NULL
+
+query I
+SELECT crdb_internal.create_tenant('{"name":"tenant-number-ten", "if_not_exists": true}'::JSONB)
+----
+NULL
+
+subtest avoid_too_large_ids
+
+query error tenant ID 10000000000 out of range
+SELECT crdb_internal.create_tenant(10000000000)

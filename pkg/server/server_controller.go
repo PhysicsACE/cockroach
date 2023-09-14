@@ -17,18 +17,20 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/server/serverctl"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/redact"
 )
 
 // onDemandServer represents a server that can be started on demand.
 type onDemandServer interface {
-	stop(context.Context)
+	orchestratedServer
 
 	// getHTTPHandlerFn retrieves the function that can serve HTTP
 	// requests for this server.
@@ -45,33 +47,6 @@ type onDemandServer interface {
 
 	// getRPCAddr() returns the RPC address for this server.
 	getRPCAddr() string
-
-	// getTenantID returns the TenantID for this server.
-	getTenantID() roachpb.TenantID
-
-	// getInstanceID returns the SQLInstanceID for this server.
-	getInstanceID() base.SQLInstanceID
-
-	// shutdownRequested returns the shutdown request channel.
-	shutdownRequested() <-chan ShutdownRequest
-}
-
-type serverEntry struct {
-	// server is the actual server.
-	// This is only defined once state.started is true.
-	server onDemandServer
-
-	// nameContainer holds a shared reference to the current
-	// name of the tenant within this serverEntry. If the
-	// tenant's name is updated, the `Set` method on
-	// nameContainer should be called in order to update
-	// any subscribers within the tenant. These are typically
-	// observability-related features that label data with
-	// the current tenant name.
-	nameContainer *roachpb.TenantNameContainer
-
-	// state coordinates the server's lifecycle.
-	state serverState
 }
 
 // serverController manages a fleet of multiple servers side-by-side.
@@ -79,6 +54,8 @@ type serverEntry struct {
 // Instantiation can fail, e.g. if the target tenant doesn't exist or
 // is not active.
 type serverController struct {
+	log.AmbientContext
+
 	// nodeID is the node ID of the server where the controller
 	// is running. This is used for logging only.
 	nodeID *base.NodeIDContainer
@@ -95,12 +72,16 @@ type serverController struct {
 	// st refers to the applicable cluster settings.
 	st *cluster.Settings
 
-	// testArgs is used when creating new tenant servers.
-	testArgs map[roachpb.TenantName]base.TestSharedProcessTenantArgs
-
 	// sendSQLRoutingError is a callback to use to report
 	// a tenant routing error to the incoming client.
 	sendSQLRoutingError func(ctx context.Context, conn net.Conn, tenantName roachpb.TenantName)
+
+	// draining is set when the surrounding server starts draining, and
+	// prevents further creation of new tenant servers.
+	draining syncutil.AtomicBool
+
+	// orchestrator is the orchestration method to use.
+	orchestrator serverOrchestrator
 
 	mu struct {
 		syncutil.Mutex
@@ -109,7 +90,10 @@ type serverController struct {
 		//
 		// TODO(knz): Detect when the mapping of name to tenant ID has
 		// changed, and invalidate the entry.
-		servers map[roachpb.TenantName]*serverEntry
+		servers map[roachpb.TenantName]serverState
+
+		// testArgs is used when creating new tenant servers.
+		testArgs map[roachpb.TenantName]base.TestSharedProcessTenantArgs
 
 		// nextServerIdx is the index to provide to the next call to
 		// newServerFn.
@@ -119,6 +103,7 @@ type serverController struct {
 
 func newServerController(
 	ctx context.Context,
+	ambientCtx log.AmbientContext,
 	logger nodeEventLogger,
 	parentNodeID *base.NodeIDContainer,
 	parentStopper *stop.Stopper,
@@ -129,51 +114,22 @@ func newServerController(
 	sendSQLRoutingError func(ctx context.Context, conn net.Conn, tenantName roachpb.TenantName),
 ) *serverController {
 	c := &serverController{
+		AmbientContext:      ambientCtx,
 		nodeID:              parentNodeID,
 		logger:              logger,
 		st:                  st,
-		testArgs:            make(map[roachpb.TenantName]base.TestSharedProcessTenantArgs),
 		stopper:             parentStopper,
 		tenantServerCreator: tenantServerCreator,
 		sendSQLRoutingError: sendSQLRoutingError,
 	}
-
-	// We make the serverState for the system mock the regular
-	// lifecycle. It starts with an already-closed `startedOrStopped`
-	// channel; and it properly reacts to a call to requestStop()
-	// by closing its stopped channel -- albeit with no other side effects.
-	closedChan := make(chan struct{})
-	close(closedChan)
-	closeCtx, cancelFn := context.WithCancel(context.Background())
-	entry := &serverEntry{
-		server:        systemServer,
-		nameContainer: systemTenantNameContainer,
-		state: serverState{
-			startedOrStopped: closedChan,
-			requestStop:      cancelFn,
-			stopped:          closeCtx.Done(),
-		},
+	c.orchestrator = newServerOrchestrator(parentStopper, c)
+	c.mu.servers = map[roachpb.TenantName]serverState{
+		catconstants.SystemTenantName: c.orchestrator.makeServerStateForSystemTenant(systemTenantNameContainer, systemServer),
 	}
-	entry.state.started.Set(true)
-
-	c.mu.servers = map[roachpb.TenantName]*serverEntry{
-		catconstants.SystemTenantName: entry,
-	}
+	c.mu.testArgs = make(map[roachpb.TenantName]base.TestSharedProcessTenantArgs)
 	parentStopper.AddCloser(c)
 	return c
 }
-
-// DefaultTenantSelectSettingName is the name of the setting that
-// configures the default tenant to use when a client does not specify
-// a specific tenant.
-var DefaultTenantSelectSettingName = "server.controller.default_tenant"
-
-var defaultTenantSelect = settings.RegisterStringSetting(
-	settings.SystemOnly,
-	DefaultTenantSelectSettingName,
-	"name of the tenant to use to serve requests when clients don't specify a tenant",
-	catconstants.SystemTenantName,
-).WithPublic()
 
 // tenantServerWrapper implements the onDemandServer interface for SQLServerWrapper.
 type tenantServerWrapper struct {
@@ -183,9 +139,21 @@ type tenantServerWrapper struct {
 
 var _ onDemandServer = (*tenantServerWrapper)(nil)
 
-func (t *tenantServerWrapper) stop(ctx context.Context) {
-	ctx = t.server.AnnotateCtx(ctx)
-	t.stopper.Stop(ctx)
+func (t *tenantServerWrapper) annotateCtx(ctx context.Context) context.Context {
+	return t.server.AnnotateCtx(ctx)
+}
+
+func (t *tenantServerWrapper) preStart(ctx context.Context) error {
+	return t.server.PreStart(ctx)
+}
+
+func (t *tenantServerWrapper) acceptClients(ctx context.Context) error {
+	if err := t.server.AcceptClients(ctx); err != nil {
+		return err
+	}
+	// Show the tenant details in logs.
+	// TODO(knz): Remove this once we can use a single listener.
+	return t.server.reportTenantInfo(ctx)
 }
 
 func (t *tenantServerWrapper) getHTTPHandlerFn() http.HandlerFunc {
@@ -208,8 +176,15 @@ func (s *tenantServerWrapper) getInstanceID() base.SQLInstanceID {
 	return s.server.sqlServer.sqlIDContainer.SQLInstanceID()
 }
 
-func (s *tenantServerWrapper) shutdownRequested() <-chan ShutdownRequest {
+func (s *tenantServerWrapper) shutdownRequested() <-chan serverctl.ShutdownRequest {
 	return s.server.sqlServer.ShutdownRequested()
+}
+
+func (s *tenantServerWrapper) gracefulDrain(
+	ctx context.Context, verbose bool,
+) (uint64, redact.RedactableString, error) {
+	ctx = s.server.AnnotateCtx(ctx)
+	return s.server.Drain(ctx, verbose)
 }
 
 // systemServerWrapper implements the onDemandServer interface for Server.
@@ -222,13 +197,23 @@ func (s *tenantServerWrapper) shutdownRequested() <-chan ShutdownRequest {
 // We do not implement the onDemandServer interface methods on *Server
 // directly so as to not add noise to its go documentation.
 type systemServerWrapper struct {
-	server *Server
+	server *topLevelServer
 }
 
 var _ onDemandServer = (*systemServerWrapper)(nil)
 
-func (s *systemServerWrapper) stop(ctx context.Context) {
-	// No-op: the SQL service for the system tenant never shuts down.
+func (s *systemServerWrapper) annotateCtx(ctx context.Context) context.Context {
+	return s.server.AnnotateCtx(ctx)
+}
+
+func (s *systemServerWrapper) preStart(ctx context.Context) error {
+	// No-op: the SQL service for the system tenant is started elsewhere.
+	return nil
+}
+
+func (s *systemServerWrapper) acceptClients(ctx context.Context) error {
+	// No-op: the SQL service for the system tenant is started elsewhere.
+	return nil
 }
 
 func (t *systemServerWrapper) getHTTPHandlerFn() http.HandlerFunc {
@@ -252,6 +237,13 @@ func (s *systemServerWrapper) getInstanceID() base.SQLInstanceID {
 	return base.SQLInstanceID(s.server.nodeIDContainer.Get())
 }
 
-func (s *systemServerWrapper) shutdownRequested() <-chan ShutdownRequest {
+func (s *systemServerWrapper) shutdownRequested() <-chan serverctl.ShutdownRequest {
 	return nil
+}
+
+func (s *systemServerWrapper) gracefulDrain(
+	ctx context.Context, verbose bool,
+) (uint64, redact.RedactableString, error) {
+	// The controller is not responsible for draining the system tenant.
+	return 0, "", nil
 }

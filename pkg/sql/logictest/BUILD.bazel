@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 filegroup(
@@ -36,7 +35,6 @@ go_library(
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/multitenant/tenantcapabilities",
-        "//pkg/roachpb",
         "//pkg/security/username",
         "//pkg/server",
         "//pkg/settings/cluster",
@@ -50,7 +48,6 @@ go_library(
         "//pkg/sql/rowinfra",
         "//pkg/sql/schemachanger/corpus",
         "//pkg/sql/schemachanger/scexec",
-        "//pkg/sql/schemachanger/scplan",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondatapb",
@@ -59,16 +56,15 @@ go_library(
         "//pkg/testutils",
         "//pkg/testutils/floatcmp",
         "//pkg/testutils/physicalplanutils",
+        "//pkg/testutils/release",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
-        "//pkg/upgrade/upgradebase",
         "//pkg/util",
         "//pkg/util/binfetcher",
         "//pkg/util/envutil",
         "//pkg/util/log",
         "//pkg/util/randutil",
-        "//pkg/util/retry",
         "//pkg/util/timeutil",
         "//pkg/util/tracing",
         "//pkg/util/version",
@@ -91,6 +87,7 @@ go_test(
     args = ["-test.timeout=295s"],
     data = [":testdata"],
     embed = [":logictest"],
+    exec_properties = {"Pool": "medium"},
     deps = [
         "//pkg/base",
         "//pkg/config/zonepb",
@@ -112,10 +109,7 @@ go_test(
         "//pkg/util/log",
         "//pkg/util/protoutil",
         "//pkg/util/randutil",
-        "//pkg/util/stop",
         "@com_github_gogo_protobuf//proto",
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
-
-get_x_data(name = "get_x_data")

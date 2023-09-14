@@ -13,15 +13,14 @@ package tpcc
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgx"
+	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/exp/rand"
 )
 
@@ -142,7 +141,7 @@ func createPayment(ctx context.Context, config *tpcc, mcp *workload.MultiConnPoo
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 	)
 
-	if err := p.sr.Init(ctx, "payment", mcp, config.connFlags); err != nil {
+	if err := p.sr.Init(ctx, "payment", mcp); err != nil {
 		return nil, err
 	}
 
@@ -150,7 +149,7 @@ func createPayment(ctx context.Context, config *tpcc, mcp *workload.MultiConnPoo
 }
 
 func (p *payment) run(ctx context.Context, wID int) (interface{}, error) {
-	atomic.AddUint64(&p.config.auditor.paymentTransactions, 1)
+	p.config.auditor.paymentTransactions.Add(1)
 
 	rng := rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano())))
 
@@ -185,7 +184,7 @@ func (p *payment) run(ctx context.Context, wID int) (interface{}, error) {
 	// and 40% by number.
 	if rng.Intn(100) < 60 {
 		d.cLast = string(p.config.randCLast(rng, &p.a))
-		atomic.AddUint64(&p.config.auditor.paymentsByLastName, 1)
+		p.config.auditor.paymentsByLastName.Add(1)
 	} else {
 		d.cID = p.config.randCustomerID(rng)
 	}

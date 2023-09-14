@@ -14,9 +14,9 @@ package tablestorageparam
 
 import (
 	"context"
+	"math"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
@@ -458,11 +458,21 @@ var tableParams = map[string]tableParam{
 		onReset: autoStatsTableSettingResetFunc,
 	},
 	catpb.AutoStatsMinStaleTableSettingName: {
-		onSet:   autoStatsMinStaleRowsSettingFunc(settings.NonNegativeInt),
+		onSet: autoStatsMinStaleRowsSettingFunc(func(intVal int64) error {
+			if intVal < 0 {
+				return errors.Newf("cannot be set to a negative value: %d", intVal)
+			}
+			return nil
+		}),
 		onReset: autoStatsTableSettingResetFunc,
 	},
 	catpb.AutoStatsFractionStaleTableSettingName: {
-		onSet:   autoStatsFractionStaleRowsSettingFunc(settings.NonNegativeFloat),
+		onSet: autoStatsFractionStaleRowsSettingFunc(func(floatVal float64) error {
+			if floatVal < 0 {
+				return errors.Newf("cannot set to a negative value: %f", floatVal)
+			}
+			return nil
+		}),
 		onReset: autoStatsTableSettingResetFunc,
 	},
 	`sql_stats_forecasts_enabled`: {
@@ -481,6 +491,72 @@ var tableParams = map[string]tableParam{
 			return nil
 		},
 	},
+	`sql_stats_histogram_samples_count`: {
+		onSet: func(
+			ctx context.Context, po *Setter, semaCtx *tree.SemaContext, evalCtx *eval.Context, key string, datum tree.Datum,
+		) error {
+			intVal, err := intFromDatum(ctx, evalCtx, key, datum)
+			if err != nil {
+				return err
+			}
+			if err := nonNegativeIntWithMaximum(math.MaxUint32)(intVal); err != nil {
+				return errors.Wrapf(err, "invalid integer value for %s", key)
+			}
+			uint32Val := uint32(intVal)
+			po.TableDesc.HistogramSamples = &uint32Val
+			return nil
+		},
+		onReset: func(_ context.Context, po *Setter, evalCtx *eval.Context, key string) error {
+			po.TableDesc.HistogramSamples = nil
+			return nil
+		},
+	},
+	`sql_stats_histogram_buckets_count`: {
+		onSet: func(
+			ctx context.Context, po *Setter, semaCtx *tree.SemaContext, evalCtx *eval.Context, key string, datum tree.Datum,
+		) error {
+			intVal, err := intFromDatum(ctx, evalCtx, key, datum)
+			if err != nil {
+				return err
+			}
+			if err = nonNegativeIntWithMaximum(math.MaxUint32)(intVal); err != nil {
+				return errors.Wrapf(err, "invalid integer value for %s", key)
+			}
+			uint32Val := uint32(intVal)
+			po.TableDesc.HistogramBuckets = &uint32Val
+			return nil
+		},
+		onReset: func(_ context.Context, po *Setter, evalCtx *eval.Context, key string) error {
+			po.TableDesc.HistogramBuckets = nil
+			return nil
+		},
+	},
+	`schema_locked`: {
+		onSet: func(ctx context.Context, po *Setter, semaCtx *tree.SemaContext, evalCtx *eval.Context, key string, datum tree.Datum) error {
+			boolVal, err := boolFromDatum(ctx, evalCtx, key, datum)
+			if err != nil {
+				return err
+			}
+			po.TableDesc.SchemaLocked = boolVal
+			return nil
+		},
+		onReset: func(ctx context.Context, po *Setter, evalCtx *eval.Context, key string) error {
+			po.TableDesc.SchemaLocked = false
+			return nil
+		},
+	},
+}
+
+func nonNegativeIntWithMaximum(max int64) func(int64) error {
+	return func(intVal int64) error {
+		if intVal < 0 {
+			return errors.Newf("cannot be set to a negative integer: %d", intVal)
+		}
+		if intVal > max {
+			return errors.Newf("cannot be set to an integer larger than %d", max)
+		}
+		return nil
+	}
 }
 
 func init() {

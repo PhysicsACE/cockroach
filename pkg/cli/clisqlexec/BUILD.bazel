@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -6,6 +5,13 @@ go_library(
     srcs = [
         "context.go",
         "doc.go",
+        "format_ascii_table.go",
+        "format_csv_tsv.go",
+        "format_html.go",
+        "format_json.go",
+        "format_raw.go",
+        "format_record.go",
+        "format_sql.go",
         "format_table.go",
         "format_value.go",
         "row_strings.go",
@@ -54,5 +60,3 @@ go_test(
         "//pkg/util/log",
     ],
 )
-
-get_x_data(name = "get_x_data")

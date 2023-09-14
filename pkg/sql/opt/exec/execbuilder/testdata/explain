@@ -403,12 +403,12 @@ vectorized: true
 └── • render
     │
     └── • hash join (left outer)
-        │ equality: (column85) = (table_id)
+        │ equality: (column95) = (table_id)
         │
         ├── • render
         │   │
         │   └── • hash join (left outer)
-        │       │ equality: (column67) = (table_id)
+        │       │ equality: (column77) = (table_id)
         │       │
         │       ├── • render
         │       │   │
@@ -439,11 +439,18 @@ vectorized: true
         │       │               └── • sort
         │       │                   │ order: +objoid
         │       │                   │
-        │       │                   └── • filter
-        │       │                       │ filter: (objsubid = 0) AND (classoid = 4294967112)
+        │       │                   └── • render
         │       │                       │
-        │       │                       └── • virtual table
-        │       │                             table: pg_description@primary
+        │       │                       └── • filter
+        │       │                           │ filter: objsubid = 0
+        │       │                           │
+        │       │                           └── • render
+        │       │                               │
+        │       │                               └── • filter
+        │       │                                   │ filter: classoid = 4294967098
+        │       │                                   │
+        │       │                                   └── • virtual table
+        │       │                                         table: kv_catalog_comments@primary
         │       │
         │       └── • virtual table
         │             table: table_row_statistics@primary
@@ -576,16 +583,45 @@ SELECT * FROM [EXPLAIN SHOW GRANTS ON foo] WHERE info NOT LIKE '%size%'
 distribution: local
 vectorized: true
 ·
-• sort
-│ order: +grantee,+privilege_type
+• root
 │
-└── • render
+├── • sort
+│   │ order: +database_name,+schema_name,+table_name,+grantee,+privilege_type,+is_grantable
+│   │
+│   └── • distinct
+│       │ distinct on: database_name, schema_name, table_name, grantee, privilege_type, is_grantable
+│       │
+│       └── • render
+│           │
+│           └── • union all
+│               │
+│               ├── • hash join
+│               │   │ equality: (role) = (grantee)
+│               │   │
+│               │   ├── • virtual table
+│               │   │     table: kv_inherited_role_members@primary
+│               │   │
+│               │   └── • scan buffer
+│               │         label: buffer 1 (r)
+│               │
+│               └── • scan buffer
+│                     label: buffer 1 (r)
+│
+└── • subquery
+    │ id: @S1
+    │ original sql: SELECT * FROM (SELECT table_catalog AS database_name, table_schema AS schema_name, table_name, grantee, privilege_type, is_grantable::BOOL FROM "".information_schema.table_privileges) WHERE (database_name, schema_name, table_name) IN (('test', 'public', 'foo'),)
+    │ exec mode: all rows
     │
-    └── • filter
-        │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+    └── • buffer
+        │ label: buffer 1 (r)
         │
-        └── • virtual table
-              table: table_privileges@primary
+        └── • render
+            │
+            └── • filter
+                │ filter: ((table_catalog = 'test') AND (table_schema = 'public')) AND (table_name = 'foo')
+                │
+                └── • virtual table
+                      table: table_privileges@primary
 
 query T
 EXPLAIN SHOW INDEX FROM foo
@@ -1321,6 +1357,12 @@ values
  └── (1,)
 
 query T
+EXPLAIN (OPT,REDACT) SELECT 1 AS r
+----
+values
+ └── ‹(‹×›,)›
+
+query T
 EXPLAIN (OPT,VERBOSE) SELECT 1 AS r
 ----
 values
@@ -1333,6 +1375,20 @@ values
  ├── distribution: test
  ├── prune: (1)
  └── (1,)
+
+query T
+EXPLAIN (OPT,VERBOSE,REDACT) SELECT 1 AS r
+----
+values
+ ├── columns: r:1
+ ├── cardinality: [1 - 1]
+ ├── stats: [rows=1]
+ ├── cost: 0.02
+ ├── key: ()
+ ├── fd: ()-->(1)
+ ├── distribution: test
+ ├── prune: (1)
+ └── ‹(‹×›,)›
 
 query T
 EXPLAIN (OPT,TYPES) SELECT 1 AS r
@@ -1350,6 +1406,21 @@ values
       └── const: 1 [type=int]
 
 query T
+EXPLAIN (OPT,TYPES,REDACT) SELECT 1 AS r
+----
+values
+ ├── columns: r:1(int!null)
+ ├── cardinality: [1 - 1]
+ ├── stats: [rows=1]
+ ├── cost: 0.02
+ ├── key: ()
+ ├── fd: ()-->(1)
+ ├── distribution: test
+ ├── prune: (1)
+ └── tuple [type=tuple{int}]
+      └── const: ‹×› [type=int]
+
+query T
 EXPLAIN (OPT) SELECT * FROM tc WHERE a = 10 ORDER BY b
 ----
 distribute
@@ -1357,6 +1428,15 @@ distribute
       └── index-join tc
            └── scan tc@c
                 └── constraint: /1/3: [/10 - /10]
+
+query T
+EXPLAIN (OPT,REDACT) SELECT * FROM tc WHERE a = 10 ORDER BY b
+----
+distribute
+ └── sort
+      └── index-join tc
+           └── scan tc@c
+                └── constraint: /1/3: ‹×›
 
 query T
 EXPLAIN (OPT,VERBOSE) SELECT * FROM tc WHERE a = 10 ORDER BY b
@@ -1386,6 +1466,39 @@ distribute
            └── scan tc@c
                 ├── columns: a:1 rowid:3
                 ├── constraint: /1/3: [/10 - /10]
+                ├── stats: [rows=10, distinct(1)=1, null(1)=0]
+                ├── cost: 28.8200001
+                ├── key: (3)
+                └── fd: ()-->(1)
+
+query T
+EXPLAIN (OPT,VERBOSE,REDACT) SELECT * FROM tc WHERE a = 10 ORDER BY b
+----
+distribute
+ ├── columns: a:1 b:2
+ ├── stats: [rows=10, distinct(1)=1, null(1)=0]
+ ├── cost: 290.844386
+ ├── fd: ()-->(1)
+ ├── ordering: +2 opt(1) [actual: +2]
+ ├── distribution: test
+ ├── input distribution:
+ ├── prune: (2)
+ └── sort
+      ├── columns: a:1 b:2
+      ├── stats: [rows=10, distinct(1)=1, null(1)=0]
+      ├── cost: 90.8243864
+      ├── fd: ()-->(1)
+      ├── ordering: +2 opt(1) [actual: +2]
+      ├── prune: (2)
+      └── index-join tc
+           ├── columns: a:1 b:2
+           ├── stats: [rows=10, distinct(1)=1, null(1)=0]
+           ├── cost: 89.7400007
+           ├── fd: ()-->(1)
+           ├── prune: (2)
+           └── scan tc@c
+                ├── columns: a:1 rowid:3
+                ├── constraint: /1/3: ‹×›
                 ├── stats: [rows=10, distinct(1)=1, null(1)=0]
                 ├── cost: 28.8200001
                 ├── key: (3)
@@ -1425,6 +1538,39 @@ distribute
                 └── fd: ()-->(1)
 
 query T
+EXPLAIN (OPT,TYPES,REDACT) SELECT * FROM tc WHERE a = 10 ORDER BY b
+----
+distribute
+ ├── columns: a:1(int!null) b:2(int)
+ ├── stats: [rows=10, distinct(1)=1, null(1)=0]
+ ├── cost: 290.844386
+ ├── fd: ()-->(1)
+ ├── ordering: +2 opt(1) [actual: +2]
+ ├── distribution: test
+ ├── input distribution:
+ ├── prune: (2)
+ └── sort
+      ├── columns: a:1(int!null) b:2(int)
+      ├── stats: [rows=10, distinct(1)=1, null(1)=0]
+      ├── cost: 90.8243864
+      ├── fd: ()-->(1)
+      ├── ordering: +2 opt(1) [actual: +2]
+      ├── prune: (2)
+      └── index-join tc
+           ├── columns: a:1(int!null) b:2(int)
+           ├── stats: [rows=10, distinct(1)=1, null(1)=0]
+           ├── cost: 89.7400007
+           ├── fd: ()-->(1)
+           ├── prune: (2)
+           └── scan tc@c
+                ├── columns: a:1(int!null) rowid:3(int!null)
+                ├── constraint: /1/3: ‹×›
+                ├── stats: [rows=10, distinct(1)=1, null(1)=0]
+                ├── cost: 28.8200001
+                ├── key: (3)
+                └── fd: ()-->(1)
+
+query T
 EXPLAIN (OPT,CATALOG) SELECT * FROM tc WHERE a = 10 ORDER BY b
 ----
 TABLE tc
@@ -1443,6 +1589,26 @@ distribute
       └── index-join tc
            └── scan tc@c
                 └── constraint: /1/3: [/10 - /10]
+
+query T
+EXPLAIN (OPT,CATALOG,REDACT) SELECT * FROM tc WHERE a = 10 ORDER BY b
+----
+TABLE tc
+ ├── a int
+ ├── b int
+ ├── rowid int not null default (‹×›) [hidden]
+ ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
+ ├── PRIMARY INDEX tc_pkey
+ │    └── rowid int not null default (‹×›) [hidden]
+ └── INDEX c
+      ├── a int
+      └── rowid int not null default (‹×›) [hidden]
+distribute
+ └── sort
+      └── index-join tc
+           └── scan tc@c
+                └── constraint: /1/3: ‹×›
 
 query T
 EXPLAIN (OPT,VERBOSE,CATALOG) SELECT * FROM tc JOIN t ON k=a
@@ -1495,6 +1661,56 @@ inner-join (hash)
       └── k:6 = a:1 [outer=(1,6), constraints=(/1: (/NULL - ]; /6: (/NULL - ]), fd=(1)==(6), (6)==(1)]
 
 query T
+EXPLAIN (OPT,VERBOSE,CATALOG,REDACT) SELECT * FROM tc JOIN t ON k=a
+----
+TABLE tc
+ ├── a int
+ ├── b int
+ ├── rowid int not null default (‹×›) [hidden]
+ ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
+ ├── PRIMARY INDEX tc_pkey
+ │    └── rowid int not null default (‹×›) [hidden]
+ └── INDEX c
+      ├── a int
+      └── rowid int not null default (‹×›) [hidden]
+TABLE t
+ ├── k int not null
+ ├── v int
+ ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
+ ├── tableoid oid [hidden] [system]
+ └── PRIMARY INDEX t_pkey
+      └── k int not null
+inner-join (hash)
+ ├── columns: a:1 b:2 k:6 v:7
+ ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
+ ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(6)=99, null(6)=0]
+ ├── cost: 2277.90625
+ ├── fd: (6)-->(7), (1)==(6), (6)==(1)
+ ├── distribution: test
+ ├── prune: (2,7)
+ ├── scan tc
+ │    ├── columns: a:1 b:2
+ │    ├── stats: [rows=1000, distinct(1)=100, null(1)=10]
+ │    ├── cost: 1129.02
+ │    ├── distribution: test
+ │    ├── prune: (1,2)
+ │    ├── interesting orderings: (+1)
+ │    └── unfiltered-cols: (1-5)
+ ├── scan t
+ │    ├── columns: k:6 v:7
+ │    ├── stats: [rows=1000, distinct(6)=1000, null(6)=0]
+ │    ├── cost: 1108.82
+ │    ├── key: (6)
+ │    ├── fd: (6)-->(7)
+ │    ├── distribution: test
+ │    ├── prune: (6,7)
+ │    ├── interesting orderings: (+6)
+ │    └── unfiltered-cols: (6-9)
+ └── filters
+      └── k:6 = a:1 [outer=(1,6), constraints=(‹×›), fd=(1)==(6), (6)==(1)]
+
+query T
 EXPLAIN (OPT) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
 ----
 distribute
@@ -1504,6 +1720,19 @@ distribute
            │    ├── scan tc
            │    └── filters
            │         └── (a + (b * 2)) > 1
+           └── projections
+                └── a * b
+
+query T
+EXPLAIN (OPT, REDACT) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
+----
+distribute
+ └── sort
+      └── project
+           ├── select
+           │    ├── scan tc
+           │    └── filters
+           │         └── (a + (b * ‹×›)) > ‹×›
            └── projections
                 └── a * b
 
@@ -1552,6 +1781,54 @@ distribute
            │    │    └── interesting orderings: (+1)
            │    └── filters
            │         └── (a:1 + (b:2 * 2)) > 1 [outer=(1,2), immutable]
+           └── projections
+                └── a:1 * b:2 [as=column6:6, outer=(1,2), immutable]
+
+query T
+EXPLAIN (OPT, VERBOSE, REDACT) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
+----
+distribute
+ ├── columns: a:1 b:2  [hidden: column6:6]
+ ├── immutable
+ ├── stats: [rows=333.3333]
+ ├── cost: 1418.32951
+ ├── fd: (1,2)-->(6)
+ ├── ordering: +6
+ ├── distribution: test
+ ├── input distribution:
+ ├── prune: (1,2,6)
+ ├── interesting orderings: (+1)
+ └── sort
+      ├── columns: a:1 b:2 column6:6
+      ├── immutable
+      ├── stats: [rows=333.3333]
+      ├── cost: 1218.30951
+      ├── fd: (1,2)-->(6)
+      ├── ordering: +6
+      ├── prune: (1,2,6)
+      ├── interesting orderings: (+1)
+      └── project
+           ├── columns: column6:6 a:1 b:2
+           ├── immutable
+           ├── stats: [rows=333.3333]
+           ├── cost: 1145.73667
+           ├── fd: (1,2)-->(6)
+           ├── prune: (1,2,6)
+           ├── interesting orderings: (+1)
+           ├── select
+           │    ├── columns: a:1 b:2
+           │    ├── immutable
+           │    ├── stats: [rows=333.3333]
+           │    ├── cost: 1139.05
+           │    ├── interesting orderings: (+1)
+           │    ├── scan tc
+           │    │    ├── columns: a:1 b:2
+           │    │    ├── stats: [rows=1000]
+           │    │    ├── cost: 1129.02
+           │    │    ├── prune: (1,2)
+           │    │    └── interesting orderings: (+1)
+           │    └── filters
+           │         └── (a:1 + (b:2 * ‹×›)) > ‹×› [outer=(1,2), immutable]
            └── projections
                 └── a:1 * b:2 [as=column6:6, outer=(1,2), immutable]
 
@@ -1606,6 +1883,62 @@ distribute
            │              │         ├── variable: b:2 [type=int]
            │              │         └── const: 2 [type=int]
            │              └── const: 1 [type=int]
+           └── projections
+                └── mult [as=column6:6, type=int, outer=(1,2), immutable]
+                     ├── variable: a:1 [type=int]
+                     └── variable: b:2 [type=int]
+
+query T
+EXPLAIN (OPT, TYPES, REDACT) SELECT * FROM tc WHERE a + 2 * b > 1 ORDER BY a*b
+----
+distribute
+ ├── columns: a:1(int) b:2(int)  [hidden: column6:6(int)]
+ ├── immutable
+ ├── stats: [rows=333.3333]
+ ├── cost: 1418.32951
+ ├── fd: (1,2)-->(6)
+ ├── ordering: +6
+ ├── distribution: test
+ ├── input distribution:
+ ├── prune: (1,2,6)
+ ├── interesting orderings: (+1)
+ └── sort
+      ├── columns: a:1(int) b:2(int) column6:6(int)
+      ├── immutable
+      ├── stats: [rows=333.3333]
+      ├── cost: 1218.30951
+      ├── fd: (1,2)-->(6)
+      ├── ordering: +6
+      ├── prune: (1,2,6)
+      ├── interesting orderings: (+1)
+      └── project
+           ├── columns: column6:6(int) a:1(int) b:2(int)
+           ├── immutable
+           ├── stats: [rows=333.3333]
+           ├── cost: 1145.73667
+           ├── fd: (1,2)-->(6)
+           ├── prune: (1,2,6)
+           ├── interesting orderings: (+1)
+           ├── select
+           │    ├── columns: a:1(int) b:2(int)
+           │    ├── immutable
+           │    ├── stats: [rows=333.3333]
+           │    ├── cost: 1139.05
+           │    ├── interesting orderings: (+1)
+           │    ├── scan tc
+           │    │    ├── columns: a:1(int) b:2(int)
+           │    │    ├── stats: [rows=1000]
+           │    │    ├── cost: 1129.02
+           │    │    ├── prune: (1,2)
+           │    │    └── interesting orderings: (+1)
+           │    └── filters
+           │         └── gt [type=bool, outer=(1,2), immutable]
+           │              ├── plus [type=int]
+           │              │    ├── variable: a:1 [type=int]
+           │              │    └── mult [type=int]
+           │              │         ├── variable: b:2 [type=int]
+           │              │         └── const: ‹×› [type=int]
+           │              └── const: ‹×› [type=int]
            └── projections
                 └── mult [as=column6:6, type=int, outer=(1,2), immutable]
                      ├── variable: a:1 [type=int]
@@ -1894,6 +2227,9 @@ vectorized: <hidden>
 maximum memory usage: <hidden>
 network usage: <hidden>
 regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
 ·
 • values
   nodes: <hidden>
@@ -1905,7 +2241,7 @@ regions: <hidden>
 query T
 EXPLAIN (OPT, MEMO) SELECT * FROM tc JOIN t ON k=a
 ----
-memo (optimized, ~12KB, required=[presentation: info:10] [distribution: test])
+memo (optimized, ~17KB, required=[presentation: info:10] [distribution: test])
  ├── G1: (explain G2 [presentation: a:1,b:2,k:6,v:7] [distribution: test])
  │    └── [presentation: info:10] [distribution: test]
  │         ├── best: (explain G2="[presentation: a:1,b:2,k:6,v:7] [distribution: test]" [presentation: a:1,b:2,k:6,v:7] [distribution: test])
@@ -1982,7 +2318,7 @@ TABLE t
  ├── tableoid oid [hidden] [system]
  └── PRIMARY INDEX t_pkey
       └── k int not null
-memo (optimized, ~12KB, required=[presentation: info:10] [distribution: test])
+memo (optimized, ~17KB, required=[presentation: info:10] [distribution: test])
  ├── G1: (explain G2 [presentation: a:1,b:2,k:6,v:7] [distribution: test])
  │    └── [presentation: info:10] [distribution: test]
  │         ├── best: (explain G2="[presentation: a:1,b:2,k:6,v:7] [distribution: test]" [presentation: a:1,b:2,k:6,v:7] [distribution: test])

@@ -1,8 +1,8 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "multiregionccltestutils",
+    testonly = 1,
     srcs = ["testutils.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils",
     visibility = ["//visibility:public"],
@@ -14,5 +14,3 @@ go_library(
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
-
-get_x_data(name = "get_x_data")

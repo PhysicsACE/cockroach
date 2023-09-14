@@ -12,7 +12,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"sort"
 	"testing"
 	"time"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl" // To start tenants.
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationtestutils"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -28,14 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -47,18 +46,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func getHighWaterMark(ingestionJobID int, sqlDB *gosql.DB) (*hlc.Timestamp, error) {
+func getReplicatedTime(ingestionJobID int, sqlDB *gosql.DB) (hlc.Timestamp, error) {
 	var progressBytes []byte
 	if err := sqlDB.QueryRow(
-		`SELECT progress FROM system.jobs WHERE id = $1`, ingestionJobID,
+		`SELECT progress FROM crdb_internal.system_jobs WHERE id = $1`, ingestionJobID,
 	).Scan(&progressBytes); err != nil {
-		return nil, err
+		return hlc.Timestamp{}, err
 	}
-	var payload jobspb.Progress
-	if err := protoutil.Unmarshal(progressBytes, &payload); err != nil {
-		return nil, err
+	var progress jobspb.Progress
+	if err := protoutil.Unmarshal(progressBytes, &progress); err != nil {
+		return hlc.Timestamp{}, err
 	}
-	return payload.GetHighWater(), nil
+	return replicationutils.ReplicatedTimeFromProgress(&progress), nil
 }
 
 func getTestRandomClientURI(tenantID roachpb.TenantID, tenantName roachpb.TenantName) string {
@@ -69,35 +68,6 @@ func getTestRandomClientURI(tenantID roachpb.TenantID, tenantName roachpb.Tenant
 	dupProbability := 0.2
 	return makeTestStreamURI(valueRange, kvsPerResolved, numPartitions, kvFrequency,
 		dupProbability, tenantID, tenantName)
-}
-
-func sstMaker(t *testing.T, keyValues []roachpb.KeyValue) kvpb.RangeFeedSSTable {
-	sort.Slice(keyValues, func(i, j int) bool {
-		return keyValues[i].Key.Compare(keyValues[j].Key) < 0
-	})
-	batchTS := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-	kvs := make(storageutils.KVs, 0, len(keyValues))
-	for i, keyVal := range keyValues {
-		if i > 0 && keyVal.Key.Equal(keyValues[i-1].Key) {
-			continue
-		}
-		kvs = append(kvs, storage.MVCCKeyValue{
-			Key: storage.MVCCKey{
-				Key:       keyVal.Key,
-				Timestamp: batchTS,
-			},
-			Value: keyVal.Value.RawBytes,
-		})
-	}
-	data, start, end := storageutils.MakeSST(t, clustersettings.MakeTestingClusterSettings(), kvs)
-	return kvpb.RangeFeedSSTable{
-		Data: data,
-		Span: roachpb.Span{
-			Key:    start,
-			EndKey: end,
-		},
-		WriteTS: batchTS,
-	}
 }
 
 // streamClientValidatorWrapper wraps a Validator and exposes additional methods
@@ -177,6 +147,8 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 	const oldTenantID = 10
 	oldTenantName := roachpb.TenantName("10")
 	// The destination tenant is going to be assigned ID 2.
+	// TODO(ssd,knz): This is a hack, we should really retrieve the tenant ID
+	// from beyond the point CREATE TENANT has run below.
 	const newTenantID = 2
 	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(keys.MakeSQLCodec(roachpb.MustMakeTenantID(oldTenantID)),
 		nil /* tableRekeys */, []execinfrapb.TenantRekey{{
@@ -194,7 +166,7 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 	client.RegisterInterception(completeJobAfterCheckpoints)
 	client.RegisterInterception(validateFnWithValidator(t, streamValidator))
 	client.RegisterSSTableGenerator(func(keyValues []roachpb.KeyValue) kvpb.RangeFeedSSTable {
-		return sstMaker(t, keyValues)
+		return replicationtestutils.SSTMaker(t, keyValues)
 	})
 
 	var receivedRevertRequest chan struct{}
@@ -204,7 +176,13 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			// Test hangs with test tenant. More investigation is required.
 			// Tracked with #76378.
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
+			Knobs: base.TestingKnobs{
+				TenantTestingKnobs: &sql.TenantTestingKnobs{
+					// Needed to pin down the ID of the replication target.
+					EnableTenantIDReuse: true,
+				},
+			},
 		},
 	}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
@@ -221,6 +199,9 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 		TestingResponseFilter: jobutils.BulkOpResponseFilter(&allowResponse),
 	}
 	params.ServerArgs.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
+	params.ServerArgs.Knobs.Streaming = &sql.StreamingTestingKnobs{
+		SkipSpanConfigReplication: true,
+	}
 
 	numNodes := 3
 	tc := testcluster.StartTestCluster(t, numNodes, params)
@@ -246,6 +227,13 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 
 	_, err = conn.Exec(query)
 	require.NoError(t, err)
+
+	// Check that the tenant ID that was created is the one we expect.
+	var tenantID int
+	err = conn.QueryRow(`SELECT id FROM system.tenants WHERE name = '30'`).Scan(&tenantID)
+	require.NoError(t, err)
+	require.Equal(t, newTenantID, tenantID)
+
 	_, ingestionJobID := replicationtestutils.GetStreamJobIds(t, ctx, sqlDB, "30")
 
 	// Start the ingestion stream and wait for at least one AddSSTable to ensure the job is running.
@@ -258,14 +246,14 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 	close(canBeCompletedCh)
 
 	// Ensure that the job has made some progress.
-	var highwater hlc.Timestamp
+	var replicatedTime hlc.Timestamp
 	testutils.SucceedsSoon(t, func() error {
-		hw, err := getHighWaterMark(ingestionJobID, conn)
+		var err error
+		replicatedTime, err = getReplicatedTime(ingestionJobID, conn)
 		require.NoError(t, err)
-		if hw == nil {
-			return errors.New("highwatermark is unset, no progress has been reported")
+		if replicatedTime.IsEmpty() {
+			return errors.New("ReplicatedTime is unset, no progress has been reported")
 		}
-		highwater = *hw
 		return nil
 	})
 
@@ -273,7 +261,7 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 	// cancellation, and subsequently rollback data above our frontier timestamp.
 	//
 	// Pick a cutover time just before the latest resolved timestamp.
-	cutoverTime := timeutil.Unix(0, highwater.WallTime).UTC().Add(-1 * time.Microsecond).Round(time.Microsecond)
+	cutoverTime := timeutil.Unix(0, replicatedTime.WallTime).UTC().Add(-1 * time.Microsecond).Round(time.Microsecond)
 	_, err = conn.Exec(`ALTER TENANT "30" COMPLETE REPLICATION TO SYSTEM TIME $1::string`, cutoverTime)
 	require.NoError(t, err)
 
@@ -291,9 +279,9 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tenantPrefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(uint64(newTenantID)))
-	t.Logf("counting kvs in span %v", tenantPrefix)
-	maxIngestedTS := assertExactlyEqualKVs(t, tc, streamValidator, revertRangeTargetTime, tenantPrefix)
+	tenantSpan := keys.MakeTenantSpan(roachpb.MustMakeTenantID(uint64(newTenantID)))
+	t.Logf("counting kvs in span %v", tenantSpan)
+	maxIngestedTS := assertExactlyEqualKVs(t, tc, streamValidator, revertRangeTargetTime, tenantSpan)
 	// Sanity check that the max ts in the store is less than the revert range
 	// target timestamp.
 	require.True(t, maxIngestedTS.LessEq(revertRangeTargetTime))
@@ -308,18 +296,20 @@ func assertExactlyEqualKVs(
 	tc *testcluster.TestCluster,
 	streamValidator *streamClientValidator,
 	frontierTimestamp hlc.Timestamp,
-	tenantPrefix roachpb.Key,
+	tenantSpan roachpb.Span,
 ) hlc.Timestamp {
 	// Iterate over the store.
 	store := tc.GetFirstStoreFromServer(t, 0)
-	it := store.TODOEngine().NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
-		LowerBound: tenantPrefix,
-		UpperBound: tenantPrefix.PrefixEnd(),
+	it, err := store.TODOEngine().NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+		LowerBound: tenantSpan.Key,
+		UpperBound: tenantSpan.EndKey,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer it.Close()
 	var prevKey roachpb.Key
 	var valueTimestampTuples []roachpb.KeyValue
-	var err error
 	var maxKVTimestampSeen hlc.Timestamp
 	var matchingKVs int
 	for it.SeekGE(storage.MVCCKey{}); ; it.Next() {
@@ -329,18 +319,18 @@ func assertExactlyEqualKVs(
 			}
 			break
 		}
-		if maxKVTimestampSeen.Less(it.Key().Timestamp) {
-			maxKVTimestampSeen = it.Key().Timestamp
+		if maxKVTimestampSeen.Less(it.UnsafeKey().Timestamp) {
+			maxKVTimestampSeen = it.UnsafeKey().Timestamp
 		}
-		newKey := (prevKey != nil && !it.Key().Key.Equal(prevKey)) || prevKey == nil
-		prevKey = it.Key().Key
+		newKey := (prevKey != nil && !it.UnsafeKey().Key.Equal(prevKey)) || prevKey == nil
+		prevKey = it.UnsafeKey().Clone().Key
 
 		if newKey {
 			// All value ts should have been drained at this point, otherwise there is
 			// a mismatch between the streamed and ingested data.
 			require.Equal(t, 0, len(valueTimestampTuples))
 			valueTimestampTuples, err = streamValidator.getValuesForKeyBelowTimestamp(
-				string(it.Key().Key), frontierTimestamp)
+				string(it.UnsafeKey().Key), frontierTimestamp)
 			require.NoError(t, err)
 		}
 
@@ -357,10 +347,10 @@ func assertExactlyEqualKVs(
 		v, err := it.Value()
 		require.NoError(t, err)
 		require.Equal(t, roachpb.KeyValue{
-			Key: it.Key().Key,
+			Key: it.UnsafeKey().Key,
 			Value: roachpb.Value{
 				RawBytes:  v,
-				Timestamp: it.Key().Timestamp,
+				Timestamp: it.UnsafeKey().Timestamp,
 			},
 		}, latestVersionInChain)
 		matchingKVs++

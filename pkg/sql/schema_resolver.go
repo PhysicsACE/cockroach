@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -129,7 +130,7 @@ func (sr *schemaResolver) LookupObject(
 
 	// Check if we are looking up a type which matches a built-in type in
 	// CockroachDB but is an extension type on the public schema in PostgreSQL.
-	if flags.DesiredObjectKind == tree.TypeObject && scName == tree.PublicSchema {
+	if flags.DesiredObjectKind == tree.TypeObject && scName == catconstants.PublicSchemaName {
 		if alias, ok := types.PublicSchemaAliases[obName]; ok {
 			if flags.RequireMutable {
 				return true, catalog.ResolvedObjectPrefix{}, nil, pgerror.Newf(pgcode.WrongObjectType, "type %q is a built-in type", obName)
@@ -144,7 +145,7 @@ func (sr *schemaResolver) LookupObject(
 				return found, prefix, nil, err
 			}
 			if dbDesc.HasPublicSchemaWithDescriptor() {
-				publicSchemaID := dbDesc.GetSchemaID(tree.PublicSchema)
+				publicSchemaID := dbDesc.GetSchemaID(catconstants.PublicSchemaName)
 				return true, prefix, typedesc.MakeSimpleAlias(alias, publicSchemaID), nil
 			}
 			return true, prefix, typedesc.MakeSimpleAlias(alias, keys.PublicSchemaID), nil
@@ -153,6 +154,14 @@ func (sr *schemaResolver) LookupObject(
 
 	b := sr.descCollection.ByName(sr.txn)
 	if !sr.skipDescriptorCache && !flags.RequireMutable {
+		// The caller requires this descriptor to *not* be leased,
+		// so lets assert this here. Normally the planner / resolver
+		// will propagate flags so we don' need to check on a
+		// look up level.
+		if flags.AssertNotLeased {
+			return false, prefix, nil,
+				errors.AssertionFailedf("unable to get leased descriptor for (%q), resolver was not configured properly", obName)
+		}
 		b = sr.descCollection.ByNameWithLeased(sr.txn)
 	}
 	if flags.IncludeOffline {
@@ -200,6 +209,15 @@ func (sr *schemaResolver) LookupSchema(
 	return true, catalog.ResolvedObjectPrefix{Database: db, Schema: sc}, nil
 }
 
+func (sr *schemaResolver) LookupDatabase(ctx context.Context, dbName string) error {
+	g := sr.byNameGetterBuilder().Get()
+	_, err := g.Database(ctx, dbName)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // CurrentDatabase implements the tree.QualifiedNameResolver interface.
 func (sr *schemaResolver) CurrentDatabase() string {
 	return sr.sessionDataStack.Top().Database
@@ -223,7 +241,10 @@ func (sr *schemaResolver) GetQualifiedTableNameByID(
 func (sr *schemaResolver) getQualifiedTableName(
 	ctx context.Context, desc catalog.TableDescriptor,
 ) (*tree.TableName, error) {
-	dbDesc, err := sr.descCollection.ByID(sr.txn).Get().Database(ctx, desc.GetParentID())
+	// When getting the fully qualified name allow use of leased descriptors,
+	// since these will not involve any round trip.
+	descGetter := sr.descCollection.ByIDWithLeased(sr.txn)
+	dbDesc, err := descGetter.Get().Database(ctx, desc.GetParentID())
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +258,7 @@ func (sr *schemaResolver) getQualifiedTableName(
 	// information from the namespace table.
 	var schemaName tree.Name
 	schemaID := desc.GetParentSchemaID()
-	scDesc, err := sr.descCollection.ByID(sr.txn).Get().Schema(ctx, schemaID)
+	scDesc, err := descGetter.Get().Schema(ctx, schemaID)
 	switch {
 	case scDesc != nil:
 		schemaName = tree.Name(scDesc.GetName())
@@ -267,7 +288,7 @@ func (sr *schemaResolver) getQualifiedTableName(
 // view or sequence represented by the provided ID and table kind.
 func (sr *schemaResolver) GetQualifiedFunctionNameByID(
 	ctx context.Context, id int64,
-) (*tree.FunctionName, error) {
+) (*tree.RoutineName, error) {
 	fn, err := sr.descCollection.ByIDWithLeased(sr.txn).WithoutNonPublic().Get().Function(ctx, descpb.ID(id))
 	if err != nil {
 		return nil, err
@@ -277,17 +298,17 @@ func (sr *schemaResolver) GetQualifiedFunctionNameByID(
 
 func (sr *schemaResolver) getQualifiedFunctionName(
 	ctx context.Context, fnDesc catalog.FunctionDescriptor,
-) (*tree.FunctionName, error) {
-	dbDesc, err := sr.descCollection.ByID(sr.txn).Get().Database(ctx, fnDesc.GetParentID())
+) (*tree.RoutineName, error) {
+	dbDesc, err := sr.descCollection.ByIDWithLeased(sr.txn).Get().Database(ctx, fnDesc.GetParentID())
 	if err != nil {
 		return nil, err
 	}
-	scDesc, err := sr.descCollection.ByID(sr.txn).Get().Schema(ctx, fnDesc.GetParentSchemaID())
+	scDesc, err := sr.descCollection.ByIDWithLeased(sr.txn).Get().Schema(ctx, fnDesc.GetParentSchemaID())
 	if err != nil {
 		return nil, err
 	}
 
-	fnName := tree.MakeQualifiedFunctionName(dbDesc.GetName(), scDesc.GetName(), fnDesc.GetName())
+	fnName := tree.MakeQualifiedRoutineName(dbDesc.GetName(), scDesc.GetName(), fnDesc.GetName())
 	return &fnName, nil
 }
 
@@ -421,7 +442,7 @@ func (sr *schemaResolver) ResolveFunction(
 		return nil, pgerror.Newf(pgcode.InvalidName, "invalid function name: %s", name)
 	}
 
-	fn, err := name.ToFunctionName()
+	fn, err := name.ToRoutineName()
 	if err != nil {
 		return nil, err
 	}
@@ -435,14 +456,14 @@ func (sr *schemaResolver) ResolveFunction(
 	if err != nil {
 		return nil, err
 	}
-	udfDef, err := maybeLookUpUDF(ctx, sr, path, fn)
+	routine, err := maybeLookupRoutine(ctx, sr, path, fn)
 	if err != nil {
 		return nil, err
 	}
 
 	switch {
-	case builtinDef != nil && udfDef != nil:
-		return builtinDef.MergeWith(udfDef)
+	case builtinDef != nil && routine != nil:
+		return builtinDef.MergeWith(routine)
 	case builtinDef != nil:
 		props, _ := builtinsregistry.GetBuiltinProperties(builtinDef.Name)
 		if props.UnsupportedWithIssue != 0 {
@@ -458,8 +479,8 @@ func (sr *schemaResolver) ResolveFunction(
 			return nil, pgerror.Wrapf(unImplErr, pgcode.InvalidParameterValue, "%s()", builtinDef.Name)
 		}
 		return builtinDef, nil
-	case udfDef != nil:
-		return udfDef, nil
+	case routine != nil:
+		return routine, nil
 	default:
 		return nil, makeFunctionUndefinedError(ctx, name, path, fn, sr)
 	}
@@ -472,12 +493,12 @@ func makeFunctionUndefinedError(
 	ctx context.Context,
 	name *tree.UnresolvedName,
 	path tree.SearchPath,
-	fn tree.FunctionName,
+	fn tree.RoutineName,
 	sr *schemaResolver,
 ) error {
 	var lowerName tree.UnresolvedName
 	if fn.ExplicitSchema {
-		lowerName = tree.MakeUnresolvedName(strings.ToLower(name.Parts[0]), strings.ToLower(name.Parts[1]))
+		lowerName = tree.MakeUnresolvedName(strings.ToLower(name.Parts[1]), strings.ToLower(name.Parts[0]))
 	} else {
 		lowerName = tree.MakeUnresolvedName(strings.ToLower(name.Parts[0]))
 	}
@@ -506,8 +527,8 @@ func makeFunctionUndefinedError(
 	))
 }
 
-func maybeLookUpUDF(
-	ctx context.Context, sr *schemaResolver, path tree.SearchPath, fn tree.FunctionName,
+func maybeLookupRoutine(
+	ctx context.Context, sr *schemaResolver, path tree.SearchPath, fn tree.RoutineName,
 ) (*tree.ResolvedFunctionDefinition, error) {
 	if sr.txn == nil {
 		return nil, nil
@@ -598,13 +619,13 @@ func maybeLookUpUDF(
 
 func (sr *schemaResolver) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (name *tree.FunctionName, fn *tree.Overload, err error) {
+) (name *tree.RoutineName, fn *tree.Overload, err error) {
 	if !funcdesc.IsOIDUserDefinedFunc(oid) {
 		qol, ok := tree.OidToQualifiedBuiltinOverload[oid]
 		if !ok {
 			return nil, nil, errors.Wrapf(tree.ErrFunctionUndefined, "function %d not found", oid)
 		}
-		fnName := tree.MakeQualifiedFunctionName(sr.CurrentDatabase(), qol.Schema, tree.OidToBuiltinName[oid])
+		fnName := tree.MakeQualifiedRoutineName(sr.CurrentDatabase(), qol.Schema, tree.OidToBuiltinName[oid])
 		return &fnName, qol.Overload, nil
 	}
 
@@ -623,6 +644,47 @@ func (sr *schemaResolver) ResolveFunctionByOID(
 		return nil, nil, err
 	}
 	return fnName, ret, nil
+}
+
+func (sr *schemaResolver) ResolveProcedure(
+	ctx context.Context, name *tree.UnresolvedObjectName, path tree.SearchPath,
+) (*tree.Overload, error) {
+	if name.NumParts > 3 || len(name.Parts[0]) == 0 {
+		return nil, pgerror.Newf(pgcode.InvalidName, "invalid function name: %s", name)
+	}
+	proc := name.ToRoutineName()
+	if proc.ExplicitCatalog && proc.Catalog() != sr.CurrentDatabase() {
+		return nil, pgerror.New(pgcode.FeatureNotSupported, "cross-database procedure references not allowed")
+	}
+
+	// Get procedures.
+	routine, err := maybeLookupRoutine(ctx, sr, path, proc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find the procedure overload.
+	var o *tree.Overload
+	for _, qo := range routine.Overloads {
+		if !qo.IsProcedure {
+			continue
+		}
+		// TODO(mgartner): Consider arguments to disambiguate multiple overloads
+		// with the same name.
+		o = qo.Overload
+		break
+	}
+
+	if o == nil {
+		return nil, sqlerrors.NewProcedureUndefinedError(name)
+	}
+
+	_, o, err = sr.ResolveFunctionByOID(ctx, o.Oid)
+	if err != nil {
+		return nil, err
+	}
+
+	return o, nil
 }
 
 // NewSkippingCacheSchemaResolver constructs a schemaResolver which always skip

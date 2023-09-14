@@ -76,7 +76,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	// We're going to serve multiple node IDs with that one context. Disable node ID checks.
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
-	rpcSrv, err := rpc.NewServer(rpcContext)
+	rpcSrv, err := rpc.NewServer(ctx, rpcContext)
 	require.NoError(t, err)
 	defer rpcSrv.Stop()
 
@@ -87,18 +87,18 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	// The outbox uses this stopper to run a goroutine.
 	outboxStopper := stop.NewStopper()
 	defer outboxStopper.Stop(ctx)
-	nodeDialer := nodedialer.New(rpcContext, staticAddressResolver(ln.Addr()))
+	instanceDialer := nodedialer.New(rpcContext, staticAddressResolver(ln.Addr()))
 	flowCtx := execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
-			Settings:      st,
-			PodNodeDialer: nodeDialer,
-			Stopper:       outboxStopper,
+			Settings:          st,
+			SQLInstanceDialer: instanceDialer,
+			Stopper:           outboxStopper,
 		},
 		NodeID: base.TestingIDContainer,
 	}
 
 	streamID := execinfrapb.StreamID(1)
-	outbox := flowinfra.NewOutbox(&flowCtx, execinfra.StaticSQLInstanceID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+	outbox := flowinfra.NewOutbox(&flowCtx, 0 /* processorID */, execinfra.StaticSQLInstanceID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 	outbox.Init(types.OneIntCol)
 
 	// WaitGroup for the outbox and inbound stream. If the WaitGroup is done, no

@@ -10,7 +10,6 @@ package backupccl
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
 	"net/url"
 	"os"
@@ -25,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -63,7 +62,7 @@ CREATE TABLE data.sc.t2 (a data.welcome);
 
 	const full, inc, inc2 = localFoo + "/full", localFoo + "/inc", localFoo + "/inc2"
 
-	beforeTS := sqlDB.QueryStr(t, `SELECT now()::timestamp::string`)[0][0]
+	beforeTS := sqlDB.QueryStr(t, `SELECT now()::timestamptz::string`)[0][0]
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data TO $1 AS OF SYSTEM TIME '%s'`, beforeTS), full)
 
 	res := sqlDB.QueryStr(t, `
@@ -94,7 +93,7 @@ ORDER BY object_type, object_name`, full)
 
 	// Backup the changes by appending to the base and by making a separate
 	// inc backup.
-	incTS := sqlDB.QueryStr(t, `SELECT now()::timestamp::string`)[0][0]
+	incTS := sqlDB.QueryStr(t, `SELECT now()::timestamptz::string`)[0][0]
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data TO $1 AS OF SYSTEM TIME '%s'`, incTS), full)
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data TO $1 AS OF SYSTEM TIME '%s' INCREMENTAL FROM $2`, incTS), inc, full)
 
@@ -125,9 +124,9 @@ ORDER BY object_type, object_name`, full)
 	// Truncate decimal places so Go's very rigid parsing will work.
 	// TODO(bardin): Consider using a third-party library for this, or some kind
 	// of time-freezing on the test cluster.
-	truncateBackupTimeRE := regexp.MustCompile(`^(.*\.[0-9]{2})[0-9]*$`)
+	truncateBackupTimeRE := regexp.MustCompile(`^(.*\.[0-9]{2})[0-9]*\+00$`)
 	matchResult := truncateBackupTimeRE.FindStringSubmatch(beforeTS)
-	require.NotNil(t, matchResult)
+	require.NotNil(t, matchResult, "%s does not match %s", beforeTS, truncateBackupTimeRE)
 	backupTime, err := time.Parse("2006-01-02 15:04:05.00", matchResult[1])
 	require.NoError(t, err)
 	backupFolder := backupTime.Format(backupbase.DateBasedIntoFolderName)
@@ -169,7 +168,7 @@ ORDER BY object_type, object_name`, full)
 
 	// Backup the changes again, by appending to the base and by making a
 	// separate inc backup.
-	inc2TS := sqlDB.QueryStr(t, `SELECT now()::timestamp::string`)[0][0]
+	inc2TS := sqlDB.QueryStr(t, `SELECT now()::timestamptz::string`)[0][0]
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data TO $1 AS OF SYSTEM TIME '%s'`, inc2TS), full)
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data TO $1 AS OF SYSTEM TIME '%s' INCREMENTAL FROM $2, $3`, inc2TS), inc2, full, inc)
 
@@ -589,7 +588,7 @@ func TestShowBackupTenantView(t *testing.T) {
 	defer cleanupFn()
 	srv := tc.Server(0)
 
-	_ = security.EmbeddedTenantIDs()
+	_ = securitytest.EmbeddedTenantIDs()
 
 	_, conn2 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(2)})
 	defer conn2.Close()
@@ -628,13 +627,13 @@ func TestShowBackupTenants(t *testing.T) {
 	srv := tc.Server(0)
 
 	// NB: tenant certs for 10, 11, 20 are embedded. See:
-	_ = security.EmbeddedTenantIDs()
+	_ = securitytest.EmbeddedTenantIDs()
 
 	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
 	defer conn10.Close()
 	tenant10 := sqlutils.MakeSQLRunner(conn10)
 	tenant10.Exec(t, `CREATE DATABASE foo; CREATE TABLE foo.bar(i int primary key); INSERT INTO foo.bar VALUES (110), (210)`)
-	beforeTS := systemDB.QueryStr(t, `SELECT now()::timestamp::string`)[0][0]
+	beforeTS := systemDB.QueryStr(t, `SELECT now()::timestamptz::string`)[0][0]
 
 	systemDB.Exec(t, fmt.Sprintf(`BACKUP TENANT 10 TO 'nodelocal://1/t10' AS OF SYSTEM TIME '%s'`, beforeTS))
 
@@ -681,14 +680,7 @@ func TestShowBackupPrivileges(t *testing.T) {
 	sqlDB.Exec(t, `CREATE USER testuser`)
 	sqlDB.Exec(t, `CREATE TABLE privs (a INT)`)
 
-	pgURL, cleanup := sqlutils.PGUrl(t, srv.ServingSQLAddr(),
-		"TestShowBackupPrivileges-testuser", url.User("testuser"))
-	defer cleanup()
-	testuser, err := gosql.Open("postgres", pgURL.String())
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, testuser.Close())
-	}()
+	testuser := srv.ApplicationLayer().SQLConnForUser(t, "testuser", "")
 
 	// Make an initial backup.
 	const full = localFoo + "/full"
@@ -698,7 +690,7 @@ func TestShowBackupPrivileges(t *testing.T) {
 	// Make a second full backup using non into syntax.
 	sqlDB.Exec(t, `BACKUP TO $1;`, full)
 
-	_, err = testuser.Exec(`SHOW BACKUPS IN $1`, full)
+	_, err := testuser.Exec(`SHOW BACKUPS IN $1`, full)
 	require.True(t, testutils.IsError(err,
 		"only users with the admin role or the EXTERNALIOIMPLICITACCESS system privilege are allowed to access the specified nodelocal URI"))
 
@@ -734,7 +726,7 @@ func TestShowBackupWithDebugIDs(t *testing.T) {
 
 	const full = localFoo + "/full"
 
-	beforeTS := sqlDB.QueryStr(t, `SELECT now()::timestamp::string`)[0][0]
+	beforeTS := sqlDB.QueryStr(t, `SELECT now()::timestamptz::string`)[0][0]
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data TO $1 AS OF SYSTEM TIME '%s'`, beforeTS), full)
 
 	// extract the object IDs for the database and public schema

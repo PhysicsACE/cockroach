@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/logtags"
 	"github.com/kr/pretty"
@@ -40,6 +41,8 @@ func TestJSONFormats(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	sysIDPayload := testIDPayload{tenantID: "1"}
+	ctx = context.WithValue(ctx, serverident.ServerIdentificationContextKey{}, sysIDPayload)
 	ctx = logtags.AddTag(ctx, "noval", nil)
 	ctx = logtags.AddTag(ctx, "s", "1")
 	ctx = logtags.AddTag(ctx, "long", "2")
@@ -53,8 +56,8 @@ func TestJSONFormats(t *testing.T) {
 		}(),
 		// Normal (non-header) entries.
 		{},
-		{IDPayload: serverident.IDPayload{ClusterID: "abc", NodeID: "123"}},
-		{IDPayload: serverident.IDPayload{TenantIDInternal: "456", SQLInstanceID: "123"}},
+		{IDPayload: serverident.IDPayload{TenantID: "1", TenantName: "system", ClusterID: "abc", NodeID: "123"}},
+		{IDPayload: serverident.IDPayload{TenantID: "456", TenantName: "vc42", SQLInstanceID: "123"}},
 		makeStructuredEntry(ctx, severity.INFO, channel.DEV, 0, &logpb.TestingStructuredLogEvent{
 			CommonEventDetails: logpb.CommonEventDetails{
 				Timestamp: 123,
@@ -67,11 +70,16 @@ func TestJSONFormats(t *testing.T) {
 		makeUnstructuredEntry(ctx, severity.ERROR, channel.HEALTH, 0, true, "hello %s", "world"),
 	}
 
+	l, err := timeutil.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
 	formats := []logFormatter{
-		formatFluentJSONCompact{},
-		formatFluentJSONFull{},
-		formatJSONCompact{},
-		formatJSONFull{},
+		&formatJSONFull{fluentTag: true, tags: tagCompact},
+		&formatJSONFull{fluentTag: true, tags: tagVerbose},
+		&formatJSONFull{tags: tagCompact},
+		&formatJSONFull{},
+		&formatJSONFull{datetimeFormat: "2006-01-02 xx 15:04:05+07", loc: l},
 	}
 
 	// We only use the datadriven framework for the ability to rewrite the output.

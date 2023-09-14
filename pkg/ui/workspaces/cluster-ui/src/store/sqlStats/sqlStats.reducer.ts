@@ -13,50 +13,51 @@ import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { DOMAIN_NAME } from "../utils";
 import { StatementsRequest } from "src/api/statementsApi";
 import { TimeScale } from "../../timeScaleDropdown";
-import moment from "moment";
+import moment from "moment-timezone";
+import { createInitialState, RequestState } from "src/api/types";
 
 export type StatementsResponse = cockroach.server.serverpb.StatementsResponse;
 
-export type SQLStatsState = {
-  data: StatementsResponse;
-  lastError: Error;
-  valid: boolean;
-  lastUpdated: moment.Moment | null;
-};
+export type SQLStatsState = RequestState<StatementsResponse>;
 
-const initialState: SQLStatsState = {
-  data: null,
-  lastError: null,
-  valid: false,
-  lastUpdated: null,
-};
+const initialState = createInitialState<StatementsResponse>();
 
 export type UpdateTimeScalePayload = {
   ts: TimeScale;
 };
 
+// This is actually statements only, despite the SQLStatsState name.
+// We can rename this in the future. Leaving it now to reduce backport surface area.
 const sqlStatsSlice = createSlice({
   name: `${DOMAIN_NAME}/sqlstats`,
   initialState,
   reducers: {
     received: (state, action: PayloadAction<StatementsResponse>) => {
+      state.inFlight = false;
       state.data = action.payload;
       state.valid = true;
-      state.lastError = null;
+      state.error = null;
       state.lastUpdated = moment.utc();
+      state.inFlight = false;
     },
     failed: (state, action: PayloadAction<Error>) => {
       state.valid = false;
-      state.lastError = action.payload;
+      state.error = action.payload;
       state.lastUpdated = moment.utc();
+      state.inFlight = false;
     },
     invalidated: state => {
+      state.inFlight = false;
       state.valid = false;
     },
-    refresh: (_, action: PayloadAction<StatementsRequest>) => {},
-    request: (_, action: PayloadAction<StatementsRequest>) => {},
-    updateTimeScale: (_, action: PayloadAction<UpdateTimeScalePayload>) => {},
-    reset: (_, action: PayloadAction<StatementsRequest>) => {},
+    refresh: (state, _action: PayloadAction<StatementsRequest>) => {
+      state.inFlight = true;
+    },
+    request: (state, _action: PayloadAction<StatementsRequest>) => {
+      state.inFlight = true;
+    },
+    updateTimeScale: (_, _action: PayloadAction<UpdateTimeScalePayload>) => {},
+    reset: (_, _action: PayloadAction<StatementsRequest>) => {},
   },
 });
 

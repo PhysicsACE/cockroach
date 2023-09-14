@@ -1,8 +1,8 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "bench",
+    testonly = 1,
     srcs = ["doc.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/opt/bench",
     visibility = ["//visibility:public"],
@@ -34,6 +34,7 @@ go_test(
         "//pkg/sql/opt/testutils/testcat",
         "//pkg/sql/opt/xform",
         "//pkg/sql/parser",
+        "//pkg/sql/parser/statements",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/volatility",
@@ -43,5 +44,3 @@ go_test(
         "//pkg/util/randutil",
     ],
 )
-
-get_x_data(name = "get_x_data")

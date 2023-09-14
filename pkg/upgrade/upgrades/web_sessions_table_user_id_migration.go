@@ -53,21 +53,57 @@ WHERE w.user_id IS NULL AND w.username = u.username
 LIMIT 1000
 `
 
+const deleteRowsForDroppedUsersWebSessionsTableStmt = `
+DELETE FROM system.web_sessions
+WHERE user_id IS NULL
+LIMIT 1000
+`
+
+const setUserIDColumnToNotNullWebSessionsTableStmt = `
+ALTER TABLE system.web_sessions
+ALTER COLUMN user_id SET NOT NULL
+`
+
 func backfillWebSessionsTableUserIDColumn(
 	ctx context.Context, cs clusterversion.ClusterVersion, d upgrade.TenantDeps,
 ) error {
 	ie := d.DB.Executor()
-	for {
-		rowsAffected, err := ie.ExecEx(ctx, "backfill-user-id-col-web-sessions-table", nil, /* txn */
-			sessiondata.NodeUserSessionDataOverride,
-			backfillUserIDColumnWebSessionsTableStmt,
-		)
-		if err != nil {
-			return err
+	for _, op := range []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "backfill-user-id-col-web-sessions-table",
+			query: backfillUserIDColumnWebSessionsTableStmt,
+		},
+		{
+			name:  "delete-rows-for-dropped-users-web-sessions-table",
+			query: deleteRowsForDroppedUsersWebSessionsTableStmt,
+		},
+	} {
+		for {
+			rowsAffected, err := ie.ExecEx(ctx, op.name, nil /* txn */, sessiondata.NodeUserSessionDataOverride, op.query)
+			if err != nil {
+				return err
+			}
+			if rowsAffected == 0 {
+				break
+			}
 		}
-		if rowsAffected == 0 {
-			break
-		}
+	}
+
+	// After we finish backfilling, we can set the user_id column to be NOT NULL
+	// since any existing rows will now have non-NULL values in the user_id column
+	// and any new rows inserted after the previous version (when the user_id column
+	// was added) will have had their user_id value populated at insertion time.
+	op := operation{
+		name:           "set-user-id-not-null-web-sessions-table",
+		schemaList:     []string{"user_id"},
+		query:          setUserIDColumnToNotNullWebSessionsTableStmt,
+		schemaExistsFn: columnExistsAndIsNotNull,
+	}
+	if err := migrateTable(ctx, cs, d, op, keys.WebSessionsTableID, systemschema.WebSessionsTable); err != nil {
+		return err
 	}
 
 	return nil

@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
@@ -10,6 +9,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/util/timeutil",
     ],
@@ -39,5 +39,3 @@ go_proto_library(
         "@com_github_gogo_protobuf//gogoproto",
     ],
 )
-
-get_x_data(name = "get_x_data")

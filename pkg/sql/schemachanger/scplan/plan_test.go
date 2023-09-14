@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -74,16 +76,16 @@ func TestPlanDataDriven(t *testing.T) {
 				return ""
 			case "ops", "deps":
 				var plan scplan.Plan
-				sctestutils.WithBuilderDependenciesFromTestServer(s, func(deps scbuild.Dependencies) {
+				sctestutils.WithBuilderDependenciesFromTestServer(s.ApplicationLayer(), s.NodeID(), func(deps scbuild.Dependencies) {
 					stmts, err := parser.Parse(d.Input)
 					require.NoError(t, err)
 					var state scpb.CurrentState
 					for i := range stmts {
-						state, err = scbuild.Build(ctx, deps, state, stmts[i].AST)
+						state, err = scbuild.Build(ctx, deps, state, stmts[i].AST, nil /* memAcc */)
 						require.NoError(t, err)
 					}
 
-					plan = sctestutils.MakePlan(t, state, scop.EarliestPhase)
+					plan = sctestutils.MakePlan(t, state, scop.EarliestPhase, nil /* memAcc */)
 					sctestutils.TruncateJobOps(&plan)
 					validatePlan(t, &plan)
 				})
@@ -93,7 +95,7 @@ func TestPlanDataDriven(t *testing.T) {
 				}
 				return marshalDeps(t, &plan)
 			case "unimplemented":
-				sctestutils.WithBuilderDependenciesFromTestServer(s, func(deps scbuild.Dependencies) {
+				sctestutils.WithBuilderDependenciesFromTestServer(s.ApplicationLayer(), s.NodeID(), func(deps scbuild.Dependencies) {
 					stmts, err := parser.Parse(d.Input)
 					require.NoError(t, err)
 					require.Len(t, stmts, 1)
@@ -101,7 +103,7 @@ func TestPlanDataDriven(t *testing.T) {
 					stmt := stmts[0]
 					alter, ok := stmt.AST.(*tree.AlterTable)
 					require.Truef(t, ok, "not an ALTER TABLE statement: %s", stmt.SQL)
-					_, err = scbuild.Build(ctx, deps, scpb.CurrentState{}, alter)
+					_, err = scbuild.Build(ctx, deps, scpb.CurrentState{}, alter, nil /* memAcc */)
 					require.Truef(t, scerrors.HasNotImplemented(err), "expected unimplemented, got %v", err)
 				})
 				return ""
@@ -124,9 +126,9 @@ func TestPlanDataDriven(t *testing.T) {
 func validatePlan(t *testing.T, plan *scplan.Plan) {
 	stages := plan.Stages
 	for i, stage := range stages {
-		if stage.IsResetPreCommitStage() {
-			// Skip the reset stage. Otherwise, the re-planned plan will also have
-			// a reset stage and the assertions won't be verified.
+		if stage.Phase == scop.PreCommitPhase && stage.Ordinal == 2 {
+			// Skip the pre-commit main stage. Otherwise, the re-planned plan
+			// will have a reset stage and the assertions won't be verified.
 			continue
 		}
 		expected := make([]scstage.Stage, len(stages[i:]))
@@ -140,7 +142,7 @@ func validatePlan(t *testing.T, plan *scplan.Plan) {
 		}
 		e := marshalOps(t, plan.TargetState, expected)
 		cs := plan.CurrentState.WithCurrentStatuses(stage.Before)
-		truncatedPlan := sctestutils.MakePlan(t, cs, stage.Phase)
+		truncatedPlan := sctestutils.MakePlan(t, cs, stage.Phase, nil /* memAcc */)
 		sctestutils.TruncateJobOps(&truncatedPlan)
 		a := marshalOps(t, plan.TargetState, truncatedPlan.Stages)
 		require.Equalf(t, e, a, "plan mismatch when re-planning %d stage(s) later", i)
@@ -238,4 +240,57 @@ func marshalOps(t *testing.T, ts scpb.TargetState, stages []scstage.Stage) strin
 		sb.WriteString(indentText(stageOps, "    "))
 	}
 	return sb.String()
+}
+
+// TestExplainPlanIsMemoryMonitored tests that explaining a plan is properly
+// memory monitored.
+// Such monitoring is important to prevent OOM for explaining a large plan as
+// it can take up a lot of memory to serialize the plan into a string.
+func TestExplainPlanIsMemoryMonitored(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		SQLMemoryPoolSize: 10 << 20, /* 10MiB */
+	})
+	defer s.Stopper().Stop(context.Background())
+	tt, nodeID := s.ApplicationLayer(), s.NodeID()
+	tdb := sqlutils.MakeSQLRunner(db)
+
+	tdb.Exec(t, `use defaultdb;`)
+	tdb.Exec(t, `select crdb_internal.generate_test_objects('test',  1000);`)
+	tdb.Exec(t, `use system;`)
+
+	var incumbent scpb.CurrentState
+	sctestutils.WithBuilderDependenciesFromTestServer(tt, nodeID, func(dependencies scbuild.Dependencies) {
+		stmt, err := parser.ParseOne(`DROP DATABASE defaultdb CASCADE`)
+		require.NoError(t, err)
+		incumbent, err = scbuild.Build(ctx, dependencies, scpb.CurrentState{}, stmt.AST, nil /* memAcc */)
+		require.NoError(t, err)
+	})
+
+	monitor := mon.NewMonitor(
+		"test-sc-plan-mon",
+		mon.MemoryResource,
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment */
+		math.MaxInt64, /* noteworthy */
+		tt.ClusterSettings(),
+	)
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(5.243e+6 /* 5MiB */))
+	memAcc := monitor.MakeBoundAccount()
+	plan := sctestutils.MakePlan(t, incumbent, scop.EarliestPhase, &memAcc)
+
+	_, err := plan.ExplainCompact()
+	require.Regexp(t, `test-sc-plan-mon: memory budget exceeded: .*`, err.Error())
+	memAcc.Clear(ctx)
+
+	_, err = plan.ExplainVerbose()
+	require.Regexp(t, `test-sc-plan-mon: memory budget exceeded: .*`, err.Error())
+	memAcc.Clear(ctx)
+
+	// SHAPE plans don't depend on the number of elements and won't
+	// exceed the memory budget, so we don't test them for errors.
 }

@@ -258,6 +258,12 @@ func (ba *BatchRequest) IsSinglePushTxnRequest() bool {
 	return ba.isSingleRequestWithMethod(PushTxn)
 }
 
+// IsSingleRecoverTxnRequest returns true iff the batch contains a single request,
+// and that request is a RecoverTxnRequest.
+func (ba *BatchRequest) IsSingleRecoverTxnRequest() bool {
+	return ba.isSingleRequestWithMethod(RecoverTxn)
+}
+
 // IsSingleHeartbeatTxnRequest returns true iff the batch contains a single
 // request, and that request is a HeartbeatTxn.
 func (ba *BatchRequest) IsSingleHeartbeatTxnRequest() bool {
@@ -389,14 +395,7 @@ func (ba *BatchRequest) IsCompleteTransaction() bool {
 		}
 	}
 	// Unreachable.
-	var sb strings.Builder
-	for i, args := range ba.Requests {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		sb.WriteString(args.String())
-	}
-	panic(fmt.Sprintf("unreachable. Batch requests: %s", sb.String()))
+	panic(fmt.Sprintf("unreachable. Batch requests: %s", TruncatedRequestsString(ba.Requests, 1024)))
 }
 
 // hasFlag returns true iff one of the requests within the batch contains the
@@ -827,6 +826,15 @@ func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 				s.Printf(" %s", et.InternalCommitTrigger.Kind())
 			}
 			s.Printf(") [%s]", h.Key)
+		} else if rt, ok := req.(*RecoverTxnRequest); ok {
+			h := req.Header()
+			s.Printf("%s(%s, ", req.Method(), rt.Txn.Short())
+			if rt.ImplicitlyCommitted {
+				s.Printf("commit")
+			} else {
+				s.Printf("abort")
+			}
+			s.Printf(") [%s]", h.Key)
 		} else {
 			h := req.Header()
 			if req.Method() == PushTxn {
@@ -846,6 +854,9 @@ func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 	}
 	if ba.WaitPolicy != lock.WaitPolicy_Block {
 		s.Printf(", [wait-policy: %s]", ba.WaitPolicy)
+	}
+	if ba.AmbiguousReplayProtection {
+		s.Printf(", [protect-ambiguous-replay]")
 	}
 	if ba.CanForwardReadTimestamp {
 		s.Printf(", [can-forward-ts]")

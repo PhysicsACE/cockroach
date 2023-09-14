@@ -36,7 +36,10 @@ func registerSQLSmith(r registry.Registry) {
 		"seed":                      sqlsmith.Setups["seed"],
 		sqlsmith.RandTableSetupName: sqlsmith.Setups[sqlsmith.RandTableSetupName],
 		"tpch-sf1": func(r *rand.Rand) []string {
-			return []string{`RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit' WITH into_db = 'defaultdb';`}
+			return []string{`
+RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit'
+WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
+`}
 		},
 		"tpcc": func(r *rand.Rand) []string {
 			const version = "version=2.1.0,fks=true,interleaved=false,seed=1,warehouses=1"
@@ -54,7 +57,10 @@ func registerSQLSmith(r registry.Registry) {
 			} {
 				stmts = append(
 					stmts,
-					fmt.Sprintf("RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit' WITH into_db = 'defaultdb';",
+					fmt.Sprintf(`
+RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit'
+WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
+`,
 						t, version,
 					),
 				)
@@ -142,17 +148,33 @@ func registerSQLSmith(r registry.Registry) {
 		}
 
 		// We will enable panic injection on this connection in the vectorized
-		// engine (and will ignore the injected errors) in order to test that
-		// the panic-catching mechanism of error propagation works as expected.
+		// engine and optimizer (and will ignore the injected errors) in order
+		// to test that the panic-catching mechanism of error propagation works
+		// as expected.
 		// Note: it is important to enable this testing knob only after all
 		// other setup queries have already completed, including the smither
 		// instantiation (otherwise, the setup might fail because of the
 		// injected panics).
-		injectPanicsStmt := "SET testing_vectorize_inject_panics=true;"
-		if _, err := conn.Exec(injectPanicsStmt); err != nil {
+		injectVectorizePanicsStmt := "SET testing_vectorize_inject_panics=true;"
+		if _, err := conn.Exec(injectVectorizePanicsStmt); err != nil {
 			t.Fatal(err)
 		}
-		logStmt(injectPanicsStmt)
+		logStmt(injectVectorizePanicsStmt)
+		injectOptimizerPanicsStmt := "SET testing_optimizer_inject_panics=true;"
+		// Because we've already enabled the vectorized panic injection,
+		// enabling the optimizer panic injection might fail due to the injected
+		// vectorized panic. To go around this, we will retry this statement at
+		// most 100 times.
+		const maxRetries = 100
+		for attempt := 1; ; attempt++ {
+			if _, err = conn.Exec(injectOptimizerPanicsStmt); err == nil {
+				break
+			}
+			if attempt == maxRetries {
+				t.Fatalf("failed to enable optimizer panic injection with %d retries: %v", maxRetries, err)
+			}
+		}
+		logStmt(injectOptimizerPanicsStmt)
 
 		t.Status("smithing")
 		until := time.After(t.Spec().(*registry.TestSpec).Timeout / 2)
@@ -172,7 +194,8 @@ func registerSQLSmith(r registry.Registry) {
 			stmt := ""
 			err := func() error {
 				done := make(chan error, 1)
-				go func(context.Context) {
+				m := c.NewMonitor(ctx, c.Node(1))
+				m.Go(func(context.Context) error {
 					// Generate can potentially panic in bad cases, so
 					// to avoid Go routines from dying we are going
 					// catch that here, and only pass the error into
@@ -188,15 +211,11 @@ func registerSQLSmith(r registry.Registry) {
 					if stmt == "" {
 						// If an empty statement is generated, then ignore it.
 						done <- errors.Newf("Empty statement returned by generate")
-						return
+						return nil
 					}
 
-					// At the moment, CockroachDB doesn't support pgwire query
-					// cancellation which is needed for correct handling of context
-					// cancellation, so instead of using a context with timeout, we opt
-					// in for using CRDB's 'statement_timeout'.
-					// TODO(yuzefovich): once #41335 is implemented, go back to using a
-					// context with timeout.
+					// TODO(yuzefovich): investigate why using the context with
+					// a timeout results in poisoning the connection (#101208).
 					_, err := conn.Exec(stmt)
 					if err == nil {
 						logStmt(stmt)
@@ -207,7 +226,9 @@ func registerSQLSmith(r registry.Registry) {
 						}
 					}
 					done <- err
-				}(ctx)
+					return nil
+				})
+				defer m.Wait()
 				select {
 				case <-time.After(timeout * 2):
 					// SQLSmith generates queries that either perform full table scans of
@@ -225,11 +246,10 @@ func registerSQLSmith(r registry.Registry) {
 			if err != nil {
 				es := err.Error()
 				if strings.Contains(es, "internal error") {
-					// TODO(yuzefovich): we temporarily ignore internal errors
-					// that are because of #40929.
 					var expectedError bool
 					for _, exp := range []string{
-						"could not parse \"0E-2019\" as type decimal",
+						// Optimizer panic-injection surfaces as an internal error.
+						"injected panic in optimizer",
 					} {
 						expectedError = expectedError || strings.Contains(es, exp)
 					}
@@ -290,14 +310,19 @@ func registerSQLSmith(r registry.Registry) {
 			Name:            fmt.Sprintf("sqlsmith/setup=%s/setting=%s", setup, setting),
 			Owner:           registry.OwnerSQLQueries,
 			Cluster:         clusterSpec,
+			Leases:          registry.MetamorphicLeases,
 			NativeLibs:      registry.LibGEOS,
 			Timeout:         time.Minute * 20,
 			RequiresLicense: true,
 			// NB: sqlsmith failures should never block a release.
 			NonReleaseBlocker: true,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+				if c.Spec().Cloud != spec.GCE && !c.IsLocal() {
+					t.Skip("uses gs://cockroach-fixtures; see https://github.com/cockroachdb/cockroach/issues/105968")
+				}
 				runSQLSmith(ctx, t, c, setup, setting)
 			},
+			ExtraLabels: []string{"O-rsg"},
 		})
 	}
 

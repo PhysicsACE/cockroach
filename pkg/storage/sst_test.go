@@ -79,7 +79,7 @@ func TestCheckSSTConflictsMaxIntents(t *testing.T) {
 		require.NoError(t, batch.PutMVCC(mvccKey, mvccValue))
 	}
 	for _, key := range intents {
-		require.NoError(t, MVCCPut(ctx, batch, nil, roachpb.Key(key), txn1TS, hlc.ClockTimestamp{}, roachpb.MakeValueFromString("intent"), txn1))
+		require.NoError(t, MVCCPut(ctx, batch, roachpb.Key(key), txn1TS, roachpb.MakeValueFromString("intent"), MVCCWriteOptions{Txn: txn1}))
 	}
 	require.NoError(t, batch.Commit(true))
 	batch.Close()
@@ -89,16 +89,16 @@ func TestCheckSSTConflictsMaxIntents(t *testing.T) {
 		t.Run(fmt.Sprintf("maxIntents=%d", tc.maxIntents), func(t *testing.T) {
 			for _, usePrefixSeek := range []bool{false, true} {
 				t.Run(fmt.Sprintf("usePrefixSeek=%v", usePrefixSeek), func(t *testing.T) {
-					// Provoke and check WriteIntentErrors.
+					// Provoke and check LockConflictError.
 					startKey, endKey := MVCCKey{Key: roachpb.Key(start)}, MVCCKey{Key: roachpb.Key(end)}
 					_, err := CheckSSTConflicts(ctx, sstFile.Bytes(), engine, startKey, endKey, startKey.Key, endKey.Key.Next(),
 						false /*disallowShadowing*/, hlc.Timestamp{} /*disallowShadowingBelow*/, hlc.Timestamp{} /* sstReqTS */, tc.maxIntents, usePrefixSeek)
 					require.Error(t, err)
-					writeIntentErr := &kvpb.WriteIntentError{}
-					require.ErrorAs(t, err, &writeIntentErr)
+					lcErr := &kvpb.LockConflictError{}
+					require.ErrorAs(t, err, &lcErr)
 
 					actual := []string{}
-					for _, i := range writeIntentErr.Intents {
+					for _, i := range lcErr.Locks {
 						actual = append(actual, string(i.Key))
 					}
 					require.Equal(t, tc.expectIntents, actual)

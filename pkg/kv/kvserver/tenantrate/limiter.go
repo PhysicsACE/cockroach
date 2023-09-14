@@ -15,10 +15,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/tokenbucket"
 )
 
 // Limiter is used to rate-limit KV requests for a given tenant.
@@ -50,7 +52,6 @@ import (
 //
 // The Limiter is backed by a FIFO queue which provides fairness.
 type Limiter interface {
-
 	// Wait acquires the quota necessary to admit a read or write request. This
 	// acquisition cannot be released.  Calls to Wait will block until the buckets
 	// contain adequate resources. If a request attempts to write more than the
@@ -72,6 +73,13 @@ type limiter struct {
 	tenantID roachpb.TenantID
 	qp       *quotapool.AbstractPool
 	metrics  tenantMetrics
+
+	// authorizer is used to determine of the tenant should be unlimited or not.
+	//
+	// If this starts showing up in profiles, we could cache the result and create
+	// some infrastructure to update the cache when the capability actually
+	// changes.
+	authorizer tenantcapabilities.Authorizer
 }
 
 // init initializes a new limiter.
@@ -80,12 +88,14 @@ func (rl *limiter) init(
 	tenantID roachpb.TenantID,
 	config Config,
 	metrics tenantMetrics,
+	authorizer tenantcapabilities.Authorizer,
 	options ...quotapool.Option,
 ) {
 	*rl = limiter{
-		parent:   parent,
-		tenantID: tenantID,
-		metrics:  metrics,
+		parent:     parent,
+		tenantID:   tenantID,
+		metrics:    metrics,
+		authorizer: authorizer,
 	}
 	// Note: if multiple token buckets are needed, consult the history of
 	// this file as of 0e70529f84 for a sample implementation.
@@ -110,11 +120,14 @@ func (rl *limiter) init(
 
 // Wait is part of the Limiter interface.
 func (rl *limiter) Wait(ctx context.Context, reqInfo tenantcostmodel.RequestInfo) error {
-	r := newWaitRequest(reqInfo)
-	defer putWaitRequest(r)
+	exempt := rl.authorizer.IsExemptFromRateLimiting(ctx, rl.tenantID)
+	if !exempt {
+		r := newWaitRequest(reqInfo)
+		defer putWaitRequest(r)
 
-	if err := rl.qp.Acquire(ctx, r); err != nil {
-		return err
+		if err := rl.qp.Acquire(ctx, r); err != nil {
+			return err
+		}
 	}
 
 	if reqInfo.IsWrite() {
@@ -128,27 +141,41 @@ func (rl *limiter) Wait(ctx context.Context, reqInfo tenantcostmodel.RequestInfo
 
 // RecordRead is part of the Limiter interface.
 func (rl *limiter) RecordRead(ctx context.Context, respInfo tenantcostmodel.ResponseInfo) {
+	exempt := rl.authorizer.IsExemptFromRateLimiting(ctx, rl.tenantID)
+
 	rl.metrics.readBatchesAdmitted.Inc(1)
 	rl.metrics.readRequestsAdmitted.Inc(respInfo.ReadCount())
 	rl.metrics.readBytesAdmitted.Inc(respInfo.ReadBytes())
-	rl.qp.Update(func(res quotapool.Resource) (shouldNotify bool) {
-		tb := res.(*tokenBucket)
-		amount := tb.config.ReadBatchUnits
-		amount += float64(respInfo.ReadCount()) * tb.config.ReadRequestUnits
-		amount += float64(respInfo.ReadBytes()) * tb.config.ReadUnitsPerByte
-		tb.Adjust(quotapool.Tokens(-amount))
-		// Do not notify the head of the queue. In the best case we did not disturb
-		// the time at which it can be fulfilled and in the worst case, we made it
-		// further in the future.
-		return false
-	})
+	if !exempt {
+		rl.qp.Update(func(res quotapool.Resource) (shouldNotify bool) {
+			tb := res.(*tokenBucket)
+			amount := tb.config.ReadBatchUnits
+			amount += float64(respInfo.ReadCount()) * tb.config.ReadRequestUnits
+			amount += float64(respInfo.ReadBytes()) * tb.config.ReadUnitsPerByte
+			tb.Adjust(tokenbucket.Tokens(-amount))
+			// Do not notify the head of the queue. In the best case we did not disturb
+			// the time at which it can be fulfilled and in the worst case, we made it
+			// further in the future.
+			return false
+		})
+	}
+}
+
+// Release cleans up resources reserved for this limiter.
+func (rl *limiter) Release() {
+	rl.metrics.unlink()
+	rl.qp.Close("released")
+}
+
+func (rl *limiter) TenantID() roachpb.TenantID {
+	return rl.tenantID
 }
 
 func (rl *limiter) updateConfig(config Config) {
 	rl.qp.Update(func(res quotapool.Resource) (shouldNotify bool) {
 		tb := res.(*tokenBucket)
 		tb.config = config
-		tb.UpdateConfig(quotapool.TokensPerSecond(config.Rate), quotapool.Tokens(config.Burst))
+		tb.UpdateConfig(tokenbucket.TokensPerSecond(config.Rate), tokenbucket.Tokens(config.Burst))
 		return true
 	})
 }
@@ -156,7 +183,7 @@ func (rl *limiter) updateConfig(config Config) {
 // tokenBucket represents the token bucket for KV Compute Units and its
 // associated configuration. It implements quotapool.Resource.
 type tokenBucket struct {
-	quotapool.TokenBucket
+	tokenbucket.TokenBucket
 
 	config Config
 }
@@ -164,8 +191,8 @@ type tokenBucket struct {
 var _ quotapool.Resource = (*tokenBucket)(nil)
 
 func (tb *tokenBucket) init(config Config, timeSource timeutil.TimeSource) {
-	tb.TokenBucket.Init(
-		quotapool.TokensPerSecond(config.Rate), quotapool.Tokens(config.Burst), timeSource,
+	tb.TokenBucket.InitWithNowFn(
+		tokenbucket.TokensPerSecond(config.Rate), tokenbucket.Tokens(config.Burst), timeSource.Now,
 	)
 	tb.config = config
 }
@@ -210,7 +237,7 @@ func (req *waitRequest) Acquire(
 		// value, in case the quota pool is in debt and the read should block.
 		needed = 0
 	}
-	return tb.TryToFulfill(quotapool.Tokens(needed))
+	return tb.TryToFulfill(tokenbucket.Tokens(needed))
 }
 
 // ShouldWait is part of quotapool.Request.

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -98,7 +99,7 @@ func (s *Receiver) PushUpdates(stream ctpb.SideTransport_PushUpdatesServer) erro
 // for closed timestamp info about this range.
 func (s *Receiver) GetClosedTimestamp(
 	ctx context.Context, rangeID roachpb.RangeID, leaseholderNode roachpb.NodeID,
-) (hlc.Timestamp, ctpb.LAI) {
+) (hlc.Timestamp, kvpb.LeaseAppliedIndex) {
 	s.mu.RLock()
 	conn, ok := s.mu.conns[leaseholderNode]
 	s.mu.RUnlock()
@@ -136,7 +137,7 @@ func (s *Receiver) onRecvErr(ctx context.Context, nodeID roachpb.NodeID, err err
 	defer s.mu.Unlock()
 
 	if err != io.EOF {
-		log.Warningf(ctx, "closed timestamps side-transport connection dropped from node: %d", nodeID)
+		log.Warningf(ctx, "closed timestamps side-transport connection dropped from node: %d (%s)", nodeID, err)
 	} else {
 		log.VEventf(ctx, 2, "closed timestamps side-transport connection dropped from node: %d (%s)", nodeID, err)
 	}
@@ -190,7 +191,7 @@ type Stores interface {
 	// ForwardSideTransportClosedTimestampForRange forwards the side-transport
 	// closed timestamp for the local replica(s) of the given range.
 	ForwardSideTransportClosedTimestampForRange(
-		ctx context.Context, rangeID roachpb.RangeID, closedTS hlc.Timestamp, lai ctpb.LAI)
+		ctx context.Context, rangeID roachpb.RangeID, closedTS hlc.Timestamp, lai kvpb.LeaseAppliedIndex)
 }
 
 func newIncomingStream(s *Receiver, stores Stores) *incomingStream {
@@ -208,7 +209,7 @@ func newIncomingStream(s *Receiver, stores Stores) *incomingStream {
 // does not have state for the range.
 func (r *incomingStream) GetClosedTimestamp(
 	ctx context.Context, rangeID roachpb.RangeID,
-) (hlc.Timestamp, ctpb.LAI) {
+) (hlc.Timestamp, kvpb.LeaseAppliedIndex) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	info, ok := r.mu.tracked[rangeID]

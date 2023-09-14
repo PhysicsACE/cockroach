@@ -566,7 +566,7 @@ define Upsert {
 # as they appear in the table schema.
 #
 # The passthrough parameter contains all the result columns that are part of
-# the input node that the update node needs to return (passing through from
+# the input node that the delete node needs to return (passing through from
 # the input). The pass through columns are used to return any column from the
 # USING tables that are referenced in the RETURNING clause.
 define Delete {
@@ -621,17 +621,12 @@ define CreateTableAs {
 
 # CreateView implements a CREATE VIEW statement.
 define CreateView {
+    CreateView *tree.CreateView
     Schema cat.Schema
-    ViewName *cat.DataSourceName
-    IfNotExists bool
-    Replace bool
-    Persistence tree.Persistence
-    Materialized bool
     ViewQuery string
     Columns colinfo.ResultColumns
     deps opt.SchemaDeps
     typeDeps opt.SchemaTypeDeps
-    withData bool
 }
 
 # SequenceSelect implements a scan of a sequence as a data source.
@@ -769,7 +764,7 @@ define AlterRangeRelocate {
 # CreateFunction implements CREATE FUNCTION.
 define CreateFunction {
     Schema cat.Schema
-    Cf *tree.CreateFunction
+    Cr *tree.CreateRoutine
     Deps opt.SchemaDeps
     TypeDeps opt.SchemaTypeDeps
 }
@@ -784,4 +779,9 @@ define LiteralValues {
 # ShowCompletions implements SHOW COMPLETIONS.
 define ShowCompletions {
     Command *tree.ShowCompletions
+}
+
+# Call implements CALL for invoking a procedure.
+define Call {
+    Proc *tree.RoutineExpr
 }

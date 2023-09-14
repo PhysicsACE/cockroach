@@ -13,6 +13,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -61,13 +63,13 @@ func appender(s string) []byte {
 	return mustMarshal(v)
 }
 
-func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Batch) error) {
+func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b WriteBatch) error) {
 	e := NewDefaultInMemForTesting()
 	defer e.Close()
 
-	var b Batch
+	var b WriteBatch
 	if writeOnly {
-		b = e.NewUnindexedBatch(true /* writeOnly */)
+		b = e.NewWriteBatch()
 	} else {
 		b = e.NewBatch()
 	}
@@ -77,7 +79,7 @@ func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Batch
 
 	// Write an engine value to be deleted.
 	require.NoError(t, e.PutUnversioned(mvccKey("b").Key, []byte("value")))
-	require.NoError(t, b.ClearUnversioned(mvccKey("b").Key))
+	require.NoError(t, b.ClearUnversioned(mvccKey("b").Key, ClearOptions{}))
 
 	// Write an engine value to be merged.
 	require.NoError(t, e.PutUnversioned(mvccKey("c").Key, appender("foo")))
@@ -90,12 +92,25 @@ func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Batch
 	require.NoError(t, e.PutUnversioned(mvccKey("d").Key, []byte("before")))
 	require.NoError(t, b.SingleClearEngineKey(EngineKey{Key: mvccKey("d").Key}))
 
+	// Write a MVCC value to be deleted with a known value size.
+	keyF := mvccKey("f")
+	keyF.Timestamp.WallTime = 1
+	valueF := MVCCValue{Value: roachpb.Value{RawBytes: []byte("fvalue")}}
+	encodedValueF, err := EncodeMVCCValue(valueF)
+	require.NoError(t, err)
+	require.NoError(t, e.PutMVCC(keyF, valueF))
+	require.NoError(t, b.ClearMVCC(keyF, ClearOptions{
+		ValueSizeKnown: true,
+		ValueSize:      uint32(len(encodedValueF)),
+	}))
+
 	// Check all keys are in initial state (nothing from batch has gone
 	// through to engine until commit).
 	expValues := []MVCCKeyValue{
 		{Key: mvccKey("b"), Value: []byte("value")},
 		{Key: mvccKey("c"), Value: appender("foo")},
 		{Key: mvccKey("d"), Value: []byte("before")},
+		{Key: keyF, Value: encodedValueF},
 	}
 	kvs, err := Scan(e, localMax, roachpb.KeyMax, 0)
 	require.NoError(t, err)
@@ -107,9 +122,9 @@ func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Batch
 		{Key: mvccKey("c"), Value: appender("foobar")},
 		{Key: mvccKey("e"), Value: []byte{}},
 	}
-	if !writeOnly {
+	if r, ok := b.(Reader); !writeOnly && ok {
 		// Scan values from batch directly.
-		kvs, err = Scan(b, localMax, roachpb.KeyMax, 0)
+		kvs, err = Scan(r, localMax, roachpb.KeyMax, 0)
 		require.NoError(t, err)
 		require.Equal(t, expValues, kvs)
 	}
@@ -126,7 +141,7 @@ func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Batch
 func TestBatchBasics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	testBatchBasics(t, false /* writeOnly */, func(e Engine, b Batch) error {
+	testBatchBasics(t, false /* writeOnly */, func(e Engine, b WriteBatch) error {
 		return b.Commit(false /* sync */)
 	})
 }
@@ -171,13 +186,17 @@ func TestReadOnlyBasics(t *testing.T) {
 			_ = ro.MVCCIterate(a.Key, a.Key, MVCCKeyIterKind, IterKeyTypePointsOnly,
 				func(MVCCKeyValue, MVCCRangeKeyStack) error { return iterutil.StopIteration() })
 		},
-		func() { ro.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax}).Close() },
 		func() {
-			ro.NewMVCCIterator(MVCCKeyIterKind, IterOptions{
+			iter, _ := ro.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax})
+			iter.Close()
+		},
+		func() {
+			iter, _ := ro.NewMVCCIterator(MVCCKeyIterKind, IterOptions{
 				MinTimestampHint: hlc.MinTimestamp,
 				MaxTimestampHint: hlc.MaxTimestamp,
 				UpperBound:       roachpb.KeyMax,
-			}).Close()
+			})
+			iter.Close()
 		},
 	}
 	defer func() {
@@ -198,7 +217,7 @@ func TestReadOnlyBasics(t *testing.T) {
 	// For a read-only ReadWriter, all Writer methods should panic.
 	failureTestCases := []func(){
 		func() { _ = ro.ApplyBatchRepr(nil, false) },
-		func() { _ = ro.ClearUnversioned(a.Key) },
+		func() { _ = ro.ClearUnversioned(a.Key, ClearOptions{}) },
 		func() { _ = ro.SingleClearEngineKey(EngineKey{Key: a.Key}) },
 		func() { _ = ro.ClearRawRange(a.Key, a.Key, true, true) },
 		func() { _ = ro.Merge(a, nil) },
@@ -214,7 +233,7 @@ func TestReadOnlyBasics(t *testing.T) {
 	if err := e.PutUnversioned(mvccKey("b").Key, []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.ClearUnversioned(mvccKey("b").Key); err != nil {
+	if err := e.ClearUnversioned(mvccKey("b").Key, ClearOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.PutUnversioned(mvccKey("c").Key, appender("foo")); err != nil {
@@ -248,30 +267,37 @@ func TestReadOnlyBasics(t *testing.T) {
 func TestBatchRepr(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	testBatchBasics(t, false /* writeOnly */, func(e Engine, b Batch) error {
+	// Disable metamorphism in the value-encoding; our asserts include the
+	// length of the encoded value to test delete-sized.
+
+	DisableMetamorphicSimpleValueEncoding(t)
+	testBatchBasics(t, false /* writeOnly */, func(e Engine, b WriteBatch) error {
 		repr := b.Repr()
 
-		r, err := NewPebbleBatchReader(repr)
+		r, err := NewBatchReader(repr)
 		require.NoError(t, err)
 
-		const expectedCount = 5
+		const expectedCount = 6
 		require.Equal(t, expectedCount, r.Count())
-		count, err := PebbleBatchCount(repr)
+		count, err := BatchCount(repr)
 		require.NoError(t, err)
 		require.Equal(t, expectedCount, count)
 
 		var ops []string
 		for i := 0; i < r.Count(); i++ {
 			require.True(t, r.Next())
-			switch r.BatchType() {
-			case BatchTypeDeletion:
+			switch r.KeyKind() {
+			case pebble.InternalKeyKindDelete:
 				ops = append(ops, fmt.Sprintf("delete(%s)", string(r.Key())))
-			case BatchTypeValue:
+			case pebble.InternalKeyKindDeleteSized:
+				v, _ := binary.Uvarint(r.Value())
+				ops = append(ops, fmt.Sprintf("delete-sized(%s,%d)", string(r.Key()), v))
+			case pebble.InternalKeyKindSet:
 				ops = append(ops, fmt.Sprintf("put(%s,%s)", string(r.Key()), string(r.Value())))
-			case BatchTypeMerge:
+			case pebble.InternalKeyKindMerge:
 				// The merge value is a protobuf and not easily displayable.
 				ops = append(ops, fmt.Sprintf("merge(%s)", string(r.Key())))
-			case BatchTypeSingleDeletion:
+			case pebble.InternalKeyKindSingleDelete:
 				ops = append(ops, fmt.Sprintf("single_delete(%s)", string(r.Key())))
 			}
 		}
@@ -286,6 +312,7 @@ func TestBatchRepr(t *testing.T) {
 			"merge(c\x00)",
 			"put(e\x00,)",
 			"single_delete(d\x00)",
+			"delete-sized(f\x00\x00\x00\x00\x00\x00\x00\x00\x01\t,17)",
 		}
 		require.Equal(t, expOps, ops)
 
@@ -296,7 +323,7 @@ func TestBatchRepr(t *testing.T) {
 func TestWriteBatchBasics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	testBatchBasics(t, true /* writeOnly */, func(e Engine, b Batch) error {
+	testBatchBasics(t, true /* writeOnly */, func(e Engine, b WriteBatch) error {
 		return b.Commit(false /* sync */)
 	})
 }
@@ -382,7 +409,7 @@ func TestBatchGet(t *testing.T) {
 	if err := b.PutUnversioned(mvccKey("a").Key, []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.ClearUnversioned(mvccKey("b").Key); err != nil {
+	if err := b.ClearUnversioned(mvccKey("b").Key, ClearOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Merge(mvccKey("c"), appender("bar")); err != nil {
@@ -434,7 +461,7 @@ func TestBatchMerge(t *testing.T) {
 	if err := b.PutUnversioned(mvccKey("a").Key, appender("a-value")); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.ClearUnversioned(mvccKey("b").Key); err != nil {
+	if err := b.ClearUnversioned(mvccKey("b").Key, ClearOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Merge(mvccKey("c"), appender("c-value")); err != nil {
@@ -577,7 +604,10 @@ func TestBatchScanWithDelete(t *testing.T) {
 	if err := e.PutUnversioned(mvccKey("a").Key, []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.ClearUnversioned(mvccKey("a").Key); err != nil {
+	if err := b.ClearUnversioned(mvccKey("a").Key, ClearOptions{
+		ValueSizeKnown: true,
+		ValueSize:      uint32(len("value")),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	kvs, err := Scan(b, localMax, roachpb.KeyMax, 0)
@@ -610,7 +640,10 @@ func TestBatchScanMaxWithDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Now, delete "a" in batch.
-	if err := b.ClearUnversioned(mvccKey("a").Key); err != nil {
+	if err := b.ClearUnversioned(mvccKey("a").Key, ClearOptions{
+		ValueSizeKnown: true,
+		ValueSize:      uint32(len("value1")),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	// A scan with max=1 should scan "b".
@@ -661,7 +694,7 @@ func TestUnindexedBatchThatSupportsReader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b := e.NewUnindexedBatch(false /* writeOnly */)
+	b := e.NewUnindexedBatch()
 	defer b.Close()
 	if err := b.PutUnversioned(mvccKey("b").Key, []byte("c")); err != nil {
 		t.Fatal(err)
@@ -669,13 +702,16 @@ func TestUnindexedBatchThatSupportsReader(t *testing.T) {
 
 	// Verify that reads on the distinct batch go to the underlying engine, not
 	// to the unindexed batch.
-	iter := b.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax})
+	iter, err := b.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax})
+	if err != nil {
+		t.Fatal(err)
+	}
 	iter.SeekGE(mvccKey("a"))
 	if ok, err := iter.Valid(); !ok {
 		t.Fatalf("expected iterator to be valid, err=%v", err)
 	}
-	if string(iter.Key().Key) != "b" {
-		t.Fatalf("expected b, but got %s", iter.Key())
+	if string(iter.UnsafeKey().Key) != "b" {
+		t.Fatalf("expected b, but got %s", iter.UnsafeKey())
 	}
 	iter.Close()
 
@@ -684,22 +720,26 @@ func TestUnindexedBatchThatSupportsReader(t *testing.T) {
 	require.Equal(t, []byte("c"), mvccGetRaw(t, e, mvccKey("b")))
 }
 
-func TestUnindexedBatchThatDoesNotSupportReaderPanics(t *testing.T) {
+func TestWriteBatchPanicsAsReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	e := NewDefaultInMemForTesting()
 	defer e.Close()
 
-	batch := e.NewUnindexedBatch(true /* writeOnly */)
+	batch := e.NewWriteBatch()
 	defer batch.Close()
+
+	// The underlying type returned by NewWriteBatch does implement Reader.
+	// Ensure that if a user coerces the WriteBatch into a Reader, it panics.
+	r := batch.(Reader)
 
 	// The various Reader methods on the batch should panic.
 	a := mvccKey("a")
 	b := mvccKey("b")
 	testCases := []func(){
-		func() { _ = batch.MVCCIterate(a.Key, b.Key, MVCCKeyIterKind, IterKeyTypePointsOnly, nil) },
-		func() { _ = batch.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax}) },
+		func() { _ = r.MVCCIterate(a.Key, b.Key, MVCCKeyIterKind, IterKeyTypePointsOnly, nil) },
+		func() { _, _ = r.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax}) },
 	}
 	for i, f := range testCases {
 		func() {
@@ -742,7 +782,10 @@ func TestBatchIteration(t *testing.T) {
 	}
 
 	iterOpts := IterOptions{UpperBound: k3.Key}
-	iter := b.NewMVCCIterator(MVCCKeyIterKind, iterOpts)
+	iter, err := b.NewMVCCIterator(MVCCKeyIterKind, iterOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer iter.Close()
 
 	// Forward iteration,
@@ -750,8 +793,8 @@ func TestBatchIteration(t *testing.T) {
 	if ok, err := iter.Valid(); !ok {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(iter.Key(), k1) {
-		t.Fatalf("expected %s, got %s", k1, iter.Key())
+	if !reflect.DeepEqual(iter.UnsafeKey(), k1) {
+		t.Fatalf("expected %s, got %s", k1, iter.UnsafeKey())
 	}
 	checkValErr := func(v []byte, err error) []byte {
 		require.NoError(t, err)
@@ -764,8 +807,8 @@ func TestBatchIteration(t *testing.T) {
 	if ok, err := iter.Valid(); !ok {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(iter.Key(), k2) {
-		t.Fatalf("expected %s, got %s", k2, iter.Key())
+	if !reflect.DeepEqual(iter.UnsafeKey(), k2) {
+		t.Fatalf("expected %s, got %s", k2, iter.UnsafeKey())
 	}
 	if !reflect.DeepEqual(checkValErr(iter.Value()), v2) {
 		t.Fatalf("expected %s, got %s", v2, checkValErr(iter.Value()))
@@ -774,7 +817,7 @@ func TestBatchIteration(t *testing.T) {
 	if ok, err := iter.Valid(); err != nil {
 		t.Fatal(err)
 	} else if ok {
-		t.Fatalf("expected invalid, got valid at key %s", iter.Key())
+		t.Fatalf("expected invalid, got valid at key %s", iter.UnsafeKey())
 	}
 
 	// Reverse iteration.
@@ -782,8 +825,8 @@ func TestBatchIteration(t *testing.T) {
 	if ok, err := iter.Valid(); !ok {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(iter.Key(), k2) {
-		t.Fatalf("expected %s, got %s", k2, iter.Key())
+	if !reflect.DeepEqual(iter.UnsafeKey(), k2) {
+		t.Fatalf("expected %s, got %s", k2, iter.UnsafeKey())
 	}
 	if !reflect.DeepEqual(checkValErr(iter.Value()), v2) {
 		t.Fatalf("expected %s, got %s", v2, checkValErr(iter.Value()))
@@ -793,8 +836,8 @@ func TestBatchIteration(t *testing.T) {
 	if ok, err := iter.Valid(); !ok || err != nil {
 		t.Fatalf("expected success, but got invalid: %v", err)
 	}
-	if !reflect.DeepEqual(iter.Key(), k1) {
-		t.Fatalf("expected %s, got %s", k1, iter.Key())
+	if !reflect.DeepEqual(iter.UnsafeKey(), k1) {
+		t.Fatalf("expected %s, got %s", k1, iter.UnsafeKey())
 	}
 	if !reflect.DeepEqual(checkValErr(iter.Value()), v1) {
 		t.Fatalf("expected %s, got %s", v1, checkValErr(iter.Value()))
@@ -823,7 +866,7 @@ func TestBatchCombine(t *testing.T) {
 				}
 				k := fmt.Sprint(v)
 
-				b := e.NewUnindexedBatch(true /* writeOnly */)
+				b := e.NewWriteBatch()
 				if err := b.PutUnversioned(mvccKey(k).Key, []byte(k)); err != nil {
 					errs <- errors.Wrap(err, "put failed")
 					return
@@ -857,7 +900,8 @@ func TestDecodeKey(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	e, err := Open(context.Background(), InMemory(), cluster.MakeClusterSettings(), CacheSize(1<<20 /* 1 MiB */))
+	e, err := Open(context.Background(), InMemory(),
+		cluster.MakeTestingClusterSettings(), CacheSize(1<<20 /* 1 MiB */))
 	assert.NoError(t, err)
 	defer e.Close()
 
@@ -865,7 +909,6 @@ func TestDecodeKey(t *testing.T) {
 		{Key: []byte("foo")},
 		{Key: []byte("foo"), Timestamp: hlc.Timestamp{WallTime: 1}},
 		{Key: []byte("foo"), Timestamp: hlc.Timestamp{WallTime: 1, Logical: 1}},
-		{Key: []byte("foo"), Timestamp: hlc.Timestamp{WallTime: 1, Logical: 1, Synthetic: true}},
 	}
 	for _, test := range tests {
 		t.Run(test.String(), func(t *testing.T) {
@@ -882,7 +925,7 @@ func TestDecodeKey(t *testing.T) {
 			}
 			repr := b.Repr()
 
-			r, err := NewPebbleBatchReader(repr)
+			r, err := NewBatchReader(repr)
 			if err != nil {
 				t.Fatalf("%+v", err)
 			}
@@ -900,7 +943,7 @@ func TestDecodeKey(t *testing.T) {
 	}
 }
 
-func TestPebbleBatchReader(t *testing.T) {
+func TestBatchReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -919,43 +962,43 @@ func TestPebbleBatchReader(t *testing.T) {
 	require.NoError(t, b.PutEngineRangeKey(roachpb.Key("rangeFrom"), roachpb.Key("rangeTo"), []byte{7}, []byte("engineRangeKey")))
 
 	// Clear some already empty keys.
-	require.NoError(t, b.ClearMVCC(pointKey("mvccKey", 9)))
+	require.NoError(t, b.ClearMVCC(pointKey("mvccKey", 9), ClearOptions{}))
 	require.NoError(t, b.ClearMVCCRangeKey(rangeKey("rangeFrom", "rangeTo", 9)))
 	require.NoError(t, b.ClearRawRange(roachpb.Key("clearFrom"), roachpb.Key("clearTo"), true, true))
 
 	// Read it back.
 	expect := []struct {
-		batchType BatchType
+		keyKind   pebble.InternalKeyKind
 		key       string
 		ts        int
 		endKey    string
 		value     []byte
 		rangeKeys []EngineRangeKeyValue
 	}{
-		{BatchTypeValue, "engineKey", 0, "", []byte("engineValue"), nil},
-		{BatchTypeValue, "mvccKey", 1, "", stringValueRaw("mvccValue"), nil},
-		{BatchTypeValue, "mvccTombstone", 1, "", []byte{}, nil},
-		{BatchTypeRangeKeySet, "rangeFrom", 0, "rangeTo", nil, []EngineRangeKeyValue{
+		{pebble.InternalKeyKindSet, "engineKey", 0, "", []byte("engineValue"), nil},
+		{pebble.InternalKeyKindSet, "mvccKey", 1, "", stringValueRaw("mvccValue"), nil},
+		{pebble.InternalKeyKindSet, "mvccTombstone", 1, "", []byte{}, nil},
+		{pebble.InternalKeyKindRangeKeySet, "rangeFrom", 0, "rangeTo", nil, []EngineRangeKeyValue{
 			{Version: []byte{7}, Value: []byte("engineRangeKey")},
 		}},
 
-		{BatchTypeDeletion, "mvccKey", 9, "", nil, nil},
-		{BatchTypeRangeKeyUnset, "rangeFrom", 0, "rangeTo", nil, []EngineRangeKeyValue{
+		{pebble.InternalKeyKindDelete, "mvccKey", 9, "", nil, nil},
+		{pebble.InternalKeyKindRangeKeyUnset, "rangeFrom", 0, "rangeTo", nil, []EngineRangeKeyValue{
 			{Version: EncodeMVCCTimestampSuffix(wallTS(9)), Value: nil},
 		}},
-		{BatchTypeRangeDeletion, "clearFrom", 0, "clearTo", []byte("clearTo\000"), nil},
-		{BatchTypeRangeKeyDelete, "clearFrom", 0, "clearTo", []byte("clearTo\000"), nil},
+		{pebble.InternalKeyKindRangeDelete, "clearFrom", 0, "clearTo", []byte("clearTo\000"), nil},
+		{pebble.InternalKeyKindRangeKeyDelete, "clearFrom", 0, "clearTo", []byte("clearTo\000"), nil},
 	}
 
-	r, err := NewPebbleBatchReader(b.Repr())
+	r, err := NewBatchReader(b.Repr())
 	require.NoError(t, err)
 
 	require.Equal(t, len(expect), r.Count())
 
 	for _, e := range expect {
-		t.Logf("batchType=%v key=%s endKey=%s", e.batchType, e.key, e.endKey)
+		t.Logf("keyKind=%v key=%s endKey=%s", e.keyKind, e.key, e.endKey)
 		require.True(t, r.Next())
-		require.Equal(t, e.batchType, r.BatchType())
+		require.Equal(t, e.keyKind, r.KeyKind())
 
 		key, err := r.MVCCKey()
 		require.NoError(t, err)
@@ -974,12 +1017,12 @@ func TestPebbleBatchReader(t *testing.T) {
 			require.Error(t, err)
 		}
 
-		switch e.batchType {
-		case BatchTypeRangeKeySet, BatchTypeRangeKeyUnset:
+		switch e.keyKind {
+		case pebble.InternalKeyKindRangeKeySet, pebble.InternalKeyKindRangeKeyUnset:
 			rkvs, err := r.EngineRangeKeys()
 			require.NoError(t, err)
 			require.Equal(t, e.rangeKeys, rkvs)
-		case BatchTypeDeletion:
+		case pebble.InternalKeyKindDelete:
 			require.Nil(t, e.value)
 		default:
 			require.Equal(t, e.value, r.Value())

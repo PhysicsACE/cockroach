@@ -44,6 +44,8 @@ message CommonConnectionDetails {
   // proxy or other intermediate server, this field will contain the
   // address of the intermediate server.
   string remote_address = 3 [(gogoproto.jsontag) = ",omitempty"];
+  // The connection's hex encoded session id.
+  string session_id = 4 [(gogoproto.customname) = "SessionID", (gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
 }
 
 // CommonConnectionDetails are payload fields common to all
@@ -121,6 +123,9 @@ enum AuthFailReason {
   CREDENTIALS_INVALID = 6;
   // CREDENTIALS_EXPIRED occur when the credentials provided by the client are expired.
   CREDENTIALS_EXPIRED = 7;
+  // NO_REPLICATION_ROLEOPTION occurs when the connection requires a replication role option,
+  // but the user does not have it.
+  NO_REPLICATION_ROLEOPTION = 8;
 }
 
 // ClientAuthenticationFailed is reported when a client session
@@ -133,9 +138,9 @@ message ClientAuthenticationFailed {
   CommonConnectionDetails conn = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
   CommonSessionDetails session = 3 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
   // The reason for the authentication failure.
-  AuthFailReason reason = 4 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
+  AuthFailReason reason = 4 [(gogoproto.jsontag) = ",includeempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
   // The detailed error for the authentication failure.
-  string detail = 5 [(gogoproto.jsontag) = ",omitempty"];
+  string detail = 5 [(gogoproto.jsontag) = ",omitempty", (gogoproto.customtype) = "github.com/cockroachdb/redact.RedactableString", (gogoproto.nullable) = false, (gogoproto.moretags) = "redact:\"mixed\""];
   // The authentication method used.
   string method = 6 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
 }

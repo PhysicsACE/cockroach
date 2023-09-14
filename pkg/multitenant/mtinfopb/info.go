@@ -15,6 +15,7 @@ import (
 
 	// We manually import this to satisfy a dependency in info.proto.
 	_ "github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/errors"
 )
 
 // TenantServiceMode describes how tenants can be served to clients.
@@ -35,6 +36,8 @@ const (
 	// This mode causes KV nodes to spontaneously start the SQL service
 	// for the tenant.
 	ServiceModeShared TenantServiceMode = 2
+	// MaxServiceMode is a sentinel value.
+	MaxServiceMode TenantServiceMode = ServiceModeShared
 )
 
 // String implements fmt.Stringer.
@@ -71,6 +74,8 @@ const (
 	// DataStateDrop indicates tenant data is being deleted. Not
 	// available for SQL sessions.
 	DataStateDrop TenantDataState = 2
+	// MaxDataState is a sentinel value.
+	MaxDataState TenantDataState = DataStateDrop
 )
 
 // String implements fmt.Stringer.
@@ -81,7 +86,7 @@ func (s TenantDataState) String() string {
 	case DataStateReady:
 		return "ready"
 	case DataStateDrop:
-		return "drop"
+		return "dropping"
 	default:
 		return fmt.Sprintf("unimplemented-%d", int(s))
 	}
@@ -89,14 +94,14 @@ func (s TenantDataState) String() string {
 
 // TenantDataStateValues facilitates the string -> TenantDataState conversion.
 var TenantDataStateValues = map[string]TenantDataState{
-	"add":   DataStateAdd,
-	"ready": DataStateReady,
-	"drop":  DataStateDrop,
+	"add":      DataStateAdd,
+	"ready":    DataStateReady,
+	"dropping": DataStateDrop,
 }
 
 // TenantInfo captures both a ProtoInfo and the SQLInfo columns that
 // go alongside it, sufficient to represent an entire row in
-// system.tenans.
+// system.tenants.
 type TenantInfo struct {
 	ProtoInfo
 	SQLInfo
@@ -107,5 +112,18 @@ func (m *TenantInfoWithUsage) ToInfo() *TenantInfo {
 	return &TenantInfo{
 		ProtoInfo: m.ProtoInfo,
 		SQLInfo:   m.SQLInfo,
+	}
+}
+
+func (d ProtoInfo_DeprecatedDataState) ToDataState() (TenantDataState, error) {
+	switch d {
+	case ProtoInfo_READY:
+		return DataStateReady, nil
+	case ProtoInfo_ADD:
+		return DataStateAdd, nil
+	case ProtoInfo_DROP:
+		return DataStateDrop, nil
+	default:
+		return 0, errors.AssertionFailedf("invalid DeprecatedDataState: %d", d)
 	}
 }

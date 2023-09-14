@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -49,6 +50,28 @@ var replanRestoreFrequency = settings.RegisterDurationSetting(
 	settings.PositiveDuration,
 )
 
+var memoryMonitorSSTs = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"bulkio.restore.memory_monitor_ssts",
+	"if true, restore will limit number of simultaneously open SSTs to keep memory usage under the configured memory fraction",
+	false,
+	settings.WithName("bulkio.restore.sst_memory_limit.enabled"),
+)
+
+type restoreJobMetadata struct {
+	jobID                jobspb.JobID
+	dataToRestore        restorationData
+	restoreTime          hlc.Timestamp
+	encryption           *jobspb.BackupEncryptionOptions
+	kmsEnv               cloud.KMSEnv
+	uris                 []string
+	backupLocalityInfo   []jobspb.RestoreDetails_BackupLocalityInfo
+	spanFilter           spanCoveringFilter
+	numImportSpans       int
+	useSimpleImportSpans bool
+	execLocality         roachpb.Locality
+}
+
 // distRestore plans a 2 stage distSQL flow for a distributed restore. It
 // streams back progress updates over the given progCh. The first stage is a
 // splitAndScatter processor on every node that is running a compatible version.
@@ -61,29 +84,16 @@ var replanRestoreFrequency = settings.RegisterDurationSetting(
 func distRestore(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
-	jobID int64,
-	pkIDs map[uint64]bool,
-	encryption *jobspb.BackupEncryptionOptions,
-	kmsEnv cloud.KMSEnv,
-	tableRekeys []execinfrapb.TableRekey,
-	tenantRekeys []execinfrapb.TenantRekey,
-	restoreTime hlc.Timestamp,
-	validateOnly bool,
-	uris []string,
-	requiredSpans []roachpb.Span,
-	backupLocalityInfo []jobspb.RestoreDetails_BackupLocalityInfo,
-	lowWaterMark roachpb.Key,
-	targetSize int64,
-	numNodes int,
-	numImportSpans int,
-	useSimpleImportSpans bool,
+	md restoreJobMetadata,
 	progCh chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
+	tracingAggCh chan *execinfrapb.TracingAggregatorEvents,
 ) error {
 	defer close(progCh)
+	defer close(tracingAggCh)
 	var noTxn *kv.Txn
 
-	if encryption != nil && encryption.Mode == jobspb.EncryptionMode_KMS {
-		kms, err := cloud.KMSFromURI(ctx, encryption.KMSInfo.Uri, kmsEnv)
+	if md.encryption != nil && md.encryption.Mode == jobspb.EncryptionMode_KMS {
+		kms, err := cloud.KMSFromURI(ctx, md.encryption.KMSInfo.Uri, md.kmsEnv)
 		if err != nil {
 			return err
 		}
@@ -94,7 +104,7 @@ func distRestore(
 			}
 		}()
 
-		encryption.Key, err = kms.Decrypt(ctx, encryption.KMSInfo.EncryptedDataKey)
+		md.encryption.Key, err = kms.Decrypt(ctx, md.encryption.KMSInfo.EncryptedDataKey)
 		if err != nil {
 			return errors.Wrap(err,
 				"failed to decrypt data key before starting BackupDataProcessor")
@@ -103,27 +113,33 @@ func distRestore(
 	// Wrap the relevant BackupEncryptionOptions to be used by the Restore
 	// processor.
 	var fileEncryption *kvpb.FileEncryptionOptions
-	if encryption != nil {
-		fileEncryption = &kvpb.FileEncryptionOptions{Key: encryption.Key}
+	if md.encryption != nil {
+		fileEncryption = &kvpb.FileEncryptionOptions{Key: md.encryption.Key}
 	}
 
+	memMonSSTs := memoryMonitorSSTs.Get(execCtx.ExecCfg().SV())
 	makePlan := func(ctx context.Context, dsp *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
 
-		planCtx, sqlInstanceIDs, err := dsp.SetupAllNodesPlanning(ctx, execCtx.ExtendedEvalContext(), execCtx.ExecCfg())
+		planCtx, sqlInstanceIDs, err := dsp.SetupAllNodesPlanningWithOracle(
+			ctx, execCtx.ExtendedEvalContext(), execCtx.ExecCfg(),
+			physicalplan.DefaultReplicaChooser, md.execLocality,
+		)
 		if err != nil {
 			return nil, nil, err
 		}
 
+		numNodes := len(sqlInstanceIDs)
 		p := planCtx.NewPhysicalPlan()
 
 		restoreDataSpec := execinfrapb.RestoreDataSpec{
-			JobID:        jobID,
-			RestoreTime:  restoreTime,
-			Encryption:   fileEncryption,
-			TableRekeys:  tableRekeys,
-			TenantRekeys: tenantRekeys,
-			PKIDs:        pkIDs,
-			ValidateOnly: validateOnly,
+			JobID:             int64(md.jobID),
+			RestoreTime:       md.restoreTime,
+			Encryption:        fileEncryption,
+			TableRekeys:       md.dataToRestore.getRekeys(),
+			TenantRekeys:      md.dataToRestore.getTenantRekeys(),
+			PKIDs:             md.dataToRestore.getPKIDs(),
+			ValidateOnly:      md.dataToRestore.isValidateOnly(),
+			MemoryMonitorSSTs: memMonSSTs,
 		}
 
 		// Plan SplitAndScatter in a round-robin fashion.
@@ -166,7 +182,7 @@ func distRestore(
 		// It tries to take the cluster size into account so that larger clusters
 		// distribute more chunks amongst them so that after scattering there isn't
 		// a large varience in the distribution of entries.
-		chunkSize := int(math.Sqrt(float64(numImportSpans))) / numNodes
+		chunkSize := int(math.Sqrt(float64(md.numImportSpans))) / numNodes
 		if chunkSize == 0 {
 			chunkSize = 1
 		}
@@ -174,22 +190,26 @@ func distRestore(
 		id := execCtx.ExecCfg().NodeInfo.NodeID.SQLInstanceID()
 
 		spec := &execinfrapb.GenerativeSplitAndScatterSpec{
-			TableRekeys:          tableRekeys,
-			TenantRekeys:         tenantRekeys,
-			ValidateOnly:         validateOnly,
-			URIs:                 uris,
-			Encryption:           encryption,
-			EndTime:              restoreTime,
-			Spans:                requiredSpans,
-			BackupLocalityInfo:   backupLocalityInfo,
-			HighWater:            lowWaterMark,
-			UserProto:            execCtx.User().EncodeProto(),
-			TargetSize:           targetSize,
-			ChunkSize:            int64(chunkSize),
-			NumEntries:           int64(numImportSpans),
-			NumNodes:             int64(numNodes),
-			UseSimpleImportSpans: useSimpleImportSpans,
-			JobID:                jobID,
+			TableRekeys:              md.dataToRestore.getRekeys(),
+			TenantRekeys:             md.dataToRestore.getTenantRekeys(),
+			ValidateOnly:             md.dataToRestore.isValidateOnly(),
+			URIs:                     md.uris,
+			Encryption:               md.encryption,
+			EndTime:                  md.restoreTime,
+			Spans:                    md.dataToRestore.getSpans(),
+			BackupLocalityInfo:       md.backupLocalityInfo,
+			HighWater:                md.spanFilter.highWaterMark,
+			UserProto:                execCtx.User().EncodeProto(),
+			TargetSize:               md.spanFilter.targetSize,
+			ChunkSize:                int64(chunkSize),
+			NumEntries:               int64(md.numImportSpans),
+			NumNodes:                 int64(numNodes),
+			UseSimpleImportSpans:     md.useSimpleImportSpans,
+			UseFrontierCheckpointing: md.spanFilter.useFrontierCheckpointing,
+			JobID:                    int64(md.jobID),
+		}
+		if md.spanFilter.useFrontierCheckpointing {
+			spec.CheckpointedSpans = persistFrontier(md.spanFilter.checkpointFrontier, 0)
 		}
 
 		proc := physicalplan.Processor{
@@ -278,6 +298,10 @@ func distRestore(
 				// Send the progress up a level to be written to the manifest.
 				progCh <- meta.BulkProcessorProgress
 			}
+
+			if meta.AggregatorEvents != nil {
+				tracingAggCh <- meta.AggregatorEvents
+			}
 			return nil
 		}
 
@@ -293,6 +317,9 @@ func distRestore(
 			evalCtx.Tracing,
 		)
 		defer recv.Release()
+
+		execCfg := execCtx.ExecCfg()
+		jobsprofiler.StorePlanDiagram(ctx, execCfg.DistSQLSrv.Stopper, p, execCfg.InternalDB, md.jobID)
 
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := *evalCtx

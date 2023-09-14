@@ -29,11 +29,11 @@ stubComponentInModule("src/views/statements/statementDetails", "default");
 stubComponentInModule("src/views/transactions/transactionsPage", "default");
 stubComponentInModule("src/views/transactions/transactionDetails", "default");
 stubComponentInModule(
-  "src/views/statements/recentStatementDetailsConnected",
+  "src/views/statements/activeStatementDetailsConnected",
   "default",
 );
 stubComponentInModule(
-  "src/views/transactions/recentTransactionDetailsConnected",
+  "src/views/transactions/activeTransactionDetailsConnected",
   "default",
 );
 stubComponentInModule("src/views/insights/workloadInsightsPage", "default");
@@ -65,7 +65,7 @@ const LOADING_CLUSTER_STATUS = /Loading cluster status.*/;
 const NODE_LOG_HEADER = /Logs Node.*/;
 const JOBS_HEADER = "Jobs";
 const SQL_ACTIVITY_HEADER = "SQL Activity";
-const ADVANCED_DEBUG_HEADER = "Advanced Debugging";
+const ADVANCED_DEBUG_HEADER = "Advanced Debug";
 const REDUX_DEBUG_HEADER = "Redux State";
 const CUSTOM_METRICS_CHART_HEADER = "Custom Chart";
 const ENQUEUE_RANGE_HEADER = "Manually enqueue range in a replica queue";
@@ -75,7 +75,7 @@ const PROBLEM_RANGES_HEADER = "Problem Ranges Report";
 const LOCALITIES_REPORT_HEADER = "Localities";
 const NODE_DIAGNOSTICS_REPORT_HEADER = "Node Diagnostics";
 const DECOMMISSIONED_HISTORY_REPORT = "Decommissioned Node History";
-const NETWORK_DIAGNOSTICS_REPORT_HEADER = "Network Diagnostics";
+const NETWORK_DIAGNOSTICS_REPORT_HEADER = "Network";
 const CLUSTER_SETTINGS_REPORT = "Cluster Settings";
 const CERTIFICATES_REPORT_HEADER = "Certificates";
 const RANGE_REPORT_HEADER = /Range Report for.*/;
@@ -394,7 +394,7 @@ describe("Routing to", () => {
       screen.getByRole("tab", { name: "Statements", selected: true });
     });
 
-    test("routes to <RecentStatementsView> component with view=active", () => {
+    test("routes to <ActivetStatementsView> component with view=active", () => {
       navigateToPath("/sql-activity?tab=Statements&view=active");
       screen.getByRole("tab", { name: "Statements", selected: true });
     });
@@ -414,7 +414,7 @@ describe("Routing to", () => {
       screen.getByRole("tab", { name: "Transactions", selected: true });
     });
 
-    test("routes to <RecentTransactionsView> component with view=active", () => {
+    test("routes to <ActiveTransactionsView> component with view=active", () => {
       navigateToPath("/sql-activity?tab=Transactions&view=active");
       screen.getByRole("tab", { name: "Transactions", selected: true });
     });
@@ -430,14 +430,14 @@ describe("Routing to", () => {
   // Active execution details.
 
   describe("'/execution' path", () => {
-    test("'/execution/statement/statementID' routes to <RecentStatementDetails>", () => {
+    test("'/execution/statement/statementID' routes to <ActiveStatementDetails>", () => {
       navigateToPath("/execution/statement/stmtID");
-      screen.getByTestId("recentStatementDetailsConnected");
+      screen.getByTestId("activeStatementDetailsConnected");
     });
 
-    test("'/execution/transaction/transactionID' routes to <RecentTransactionDetails>", () => {
+    test("'/execution/transaction/transactionID' routes to <ActiveTransactionDetails>", () => {
       navigateToPath("/execution/transaction/transactionID");
-      screen.getByTestId("recentTransactionDetailsConnected");
+      screen.getByTestId("activeTransactionDetailsConnected");
     });
   });
   {
@@ -471,7 +471,9 @@ describe("Routing to", () => {
   describe("'/debug' path", () => {
     test("routes to <Debug> component", () => {
       navigateToPath("/debug");
-      screen.getByText(ADVANCED_DEBUG_HEADER);
+      screen.getByText(ADVANCED_DEBUG_HEADER, {
+        selector: "h3",
+      });
     });
   });
 
@@ -580,14 +582,19 @@ describe("Routing to", () => {
   describe("'/reports/network' path", () => {
     test("routes to <Network> component", () => {
       navigateToPath("/reports/network");
-      screen.getByText(NETWORK_DIAGNOSTICS_REPORT_HEADER);
+      screen.getByText(NETWORK_DIAGNOSTICS_REPORT_HEADER, {
+        selector: "h3",
+      });
+      expect(history.location.pathname).toBe("/reports/network/region");
     });
   });
 
   describe("'/reports/network/:nodeIDAttr' path", () => {
     test("routes to <Network> component", () => {
       navigateToPath("/reports/network/1");
-      screen.getByText(NETWORK_DIAGNOSTICS_REPORT_HEADER);
+      screen.getByText(NETWORK_DIAGNOSTICS_REPORT_HEADER, {
+        selector: "h3",
+      });
     });
   });
 

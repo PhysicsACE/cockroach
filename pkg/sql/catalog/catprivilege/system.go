@@ -23,11 +23,14 @@ var (
 		catconstants.NamespaceTableName,
 		catconstants.DescriptorTableName,
 		catconstants.DescIDSequenceTableName,
+		catconstants.TenantIDSequenceTableName,
 		catconstants.TenantsTableName,
 		catconstants.ProtectedTimestampsMetaTableName,
 		catconstants.ProtectedTimestampsRecordsTableName,
 		catconstants.StatementStatisticsTableName,
 		catconstants.TransactionStatisticsTableName,
+		catconstants.StatementActivityTableName,
+		catconstants.TransactionActivityTableName,
 	}
 
 	readWriteSystemTables = []catconstants.SystemTableName{
@@ -60,7 +63,9 @@ var (
 		catconstants.TenantUsageTableName,
 		catconstants.SQLInstancesTableName,
 		catconstants.SpanConfigurationsTableName,
+		catconstants.TaskPayloadsTableName,
 		catconstants.TenantSettingsTableName,
+		catconstants.TenantTasksTableName,
 		catconstants.SpanCountTableName,
 		catconstants.SystemPrivilegeTableName,
 		catconstants.SystemExternalConnectionsTableName,
@@ -69,6 +74,7 @@ var (
 		catconstants.SpanStatsBuckets,
 		catconstants.SpanStatsSamples,
 		catconstants.SpanStatsTenantBoundaries,
+		catconstants.RegionalLiveness,
 	}
 
 	readWriteSystemSequences = []catconstants.SystemTableName{

@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -68,7 +68,7 @@ func (p *planner) DeclareCursor(ctx context.Context, s *tree.DeclareCursor) (pla
 			}
 
 			// Try to plan the cursor query to make sure that it's valid.
-			stmt := makeStatement(parser.Statement{AST: s.Select}, clusterunique.ID{})
+			stmt := makeStatement(statements.Statement[tree.Statement]{AST: s.Select}, clusterunique.ID{})
 			pt := planTop{}
 			pt.init(&stmt, &p.instrumentation)
 			opc := &p.optPlanningCtx
@@ -102,10 +102,9 @@ func (p *planner) DeclareCursor(ctx context.Context, s *tree.DeclareCursor) (pla
 			if err != nil {
 				return nil, errors.Wrap(err, "failed to DECLARE CURSOR")
 			}
-			inputState := p.txn.GetLeafTxnInputState(ctx)
 			cursor := &sqlCursor{
 				Rows:       rows,
-				readSeqNum: inputState.ReadSeqNum,
+				readSeqNum: p.txn.GetReadSeqNum(),
 				txn:        p.txn,
 				statement:  statement,
 				created:    timeutil.Now(),
@@ -173,12 +172,11 @@ type fetchNode struct {
 }
 
 func (f *fetchNode) startExec(params runParams) error {
-	state := f.cursor.txn.GetLeafTxnInputState(params.ctx)
 	// We need to make sure that we're reading at the same read sequence number
 	// that we had when we created the cursor, to preserve the "sensitivity"
 	// semantics of cursors, which demand that data written after the cursor
 	// was declared is not visible to the cursor.
-	f.origTxnSeqNum = state.ReadSeqNum
+	f.origTxnSeqNum = f.cursor.txn.GetReadSeqNum()
 	return f.cursor.txn.SetReadSeqNum(f.cursor.readSeqNum)
 }
 
@@ -301,6 +299,32 @@ type sqlCursors interface {
 	addCursor(tree.Name, *sqlCursor) error
 	// list returns all open cursors in the set.
 	list() map[tree.Name]*sqlCursor
+}
+
+// emptySqlCursors is the default impl used by the planner when the
+// connExecutor is not available.
+type emptySqlCursors struct{}
+
+var _ sqlCursors = emptySqlCursors{}
+
+func (e emptySqlCursors) closeAll(bool) error {
+	return errors.AssertionFailedf("closeAll not supported in emptySqlCursors")
+}
+
+func (e emptySqlCursors) closeCursor(tree.Name) error {
+	return errors.AssertionFailedf("closeCursor not supported in emptySqlCursors")
+}
+
+func (e emptySqlCursors) getCursor(tree.Name) *sqlCursor {
+	return nil
+}
+
+func (e emptySqlCursors) addCursor(tree.Name, *sqlCursor) error {
+	return errors.AssertionFailedf("addCursor not supported in emptySqlCursors")
+}
+
+func (e emptySqlCursors) list() map[tree.Name]*sqlCursor {
+	return nil
 }
 
 // cursorMap is a sqlCursors that's backed by an actual map.

@@ -52,14 +52,14 @@ git tag "${build_name}"
 tc_end_block "Tag the release"
 
 tc_start_block "Compile and publish artifacts"
-BAZEL_SUPPORT_EXTRA_DOCKER_ARGS="-e TC_BUILDTYPE_ID -e TC_BUILD_BRANCH=$build_name -e gcs_credentials -e gcs_bucket=$gcs_bucket" run_bazel << 'EOF'
+BAZEL_SUPPORT_EXTRA_DOCKER_ARGS="-e TC_BUILDTYPE_ID -e TC_BUILD_BRANCH=$build_name -e build_name=$build_name -e gcs_credentials -e gcs_bucket=$gcs_bucket" run_bazel << 'EOF'
 bazel build --config ci //pkg/cmd/publish-provisional-artifacts
 BAZEL_BIN=$(bazel info bazel-bin --config ci)
 export google_credentials="$gcs_credentials"
 source "build/teamcity-support.sh"  # For log_into_gcloud
 log_into_gcloud
 export GOOGLE_APPLICATION_CREDENTIALS="$PWD/.google-credentials.json"
-$BAZEL_BIN/pkg/cmd/publish-provisional-artifacts/publish-provisional-artifacts_/publish-provisional-artifacts -provisional -release --gcs-bucket="$gcs_bucket" --output-directory=artifacts
+$BAZEL_BIN/pkg/cmd/publish-provisional-artifacts/publish-provisional-artifacts_/publish-provisional-artifacts -provisional -release --gcs-bucket="$gcs_bucket" --output-directory=artifacts --build-tag-override="$build_name"
 EOF
 tc_end_block "Compile and publish artifacts"
 
@@ -68,7 +68,7 @@ configure_docker_creds
 docker_login_with_google
 
 gcr_tag="${gcr_repository}:${build_name}"
-declare -a docker_manifest_amends
+declare -a dockerhub_arch_tags
 
 for platform_name in amd64 arm64; do
   cp --recursive "build/deploy" "build/deploy-${platform_name}"
@@ -87,10 +87,11 @@ for platform_name in amd64 arm64; do
   build_docker_tag="${gcr_repository}:${platform_name}-${build_name}"
   docker build --no-cache --pull --platform "linux/${platform_name}" --tag="${build_docker_tag}" "build/deploy-${platform_name}"
   docker push "$build_docker_tag"
-  docker_manifest_amends+=("--amend" "${build_docker_tag}")
+dockerhub_arch_tags+=("${build_docker_tag}")
 done
 
-docker manifest create "${gcr_tag}" "${docker_manifest_amends[@]}"
+docker manifest rm "${gcr_tag}" || :
+docker manifest create "${gcr_tag}" "${dockerhub_arch_tags[@]}"
 docker manifest push "${gcr_tag}"
 tc_end_block "Make and push multiarch docker images"
 
@@ -112,7 +113,7 @@ cp --recursive licenses "build/deploy-${platform_name}"
 mv build/deploy-${platform_name}/lib/* build/deploy-${platform_name}/
 rmdir build/deploy-${platform_name}/lib
 
-docker build --no-cache --pull --platform "linux/amd64" --tag="${gcr_tag_fips}" --build-arg additional_packages=openssl "build/deploy-${platform_name}"
+docker build --no-cache --pull --platform "linux/amd64" --tag="${gcr_tag_fips}" --build-arg fips_enabled=1 "build/deploy-${platform_name}"
 docker push "$gcr_tag_fips"
 
 tc_end_block "Make and push FIPS docker image"

@@ -44,7 +44,7 @@ func (d *delegator) delegateShowTables(n *tree.ShowTables) (tree.Statement, erro
 	// name to have an explicit catalog but no explicit schema. This would arise
 	// when doing SHOW TABLES FROM <db>. Without this logic, we would not show the
 	// tables from other schemas than public.
-	if name.ExplicitSchema && name.ExplicitCatalog && name.SchemaName == tree.PublicSchemaName &&
+	if name.ExplicitSchema && name.ExplicitCatalog && name.SchemaName == catconstants.PublicSchemaName &&
 		n.ExplicitSchema && !n.ExplicitCatalog && n.SchemaName == name.CatalogName {
 		name.SchemaName, name.ExplicitSchema = "", false
 	}
@@ -112,5 +112,5 @@ ORDER BY schema_name, table_name
 		estimatedRowCountJoin,
 		lexbase.EscapeSQLString(string(name.CatalogName)),
 	)
-	return parse(query)
+	return d.parse(query)
 }

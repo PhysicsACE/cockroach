@@ -274,11 +274,6 @@ func (so *importRegionOperator) ResetMultiRegionZoneConfigsForDatabase(
 	return errors.WithStack(errRegionOperator)
 }
 
-// OptimizeSystemDatabase is part of the eval.RegionOperator interface.
-func (so *importRegionOperator) OptimizeSystemDatabase(_ context.Context) error {
-	return errors.WithStack(errRegionOperator)
-}
-
 // Implements the eval.SequenceOperators interface.
 type importSequenceOperators struct{}
 
@@ -325,6 +320,13 @@ func (so *importSequenceOperators) GetLatestValueInSessionForSequenceByID(
 	ctx context.Context, seqID int64,
 ) (int64, error) {
 	return 0, errSequenceOperators
+}
+
+// GetLastSequenceValueByID implements the eval.SequenceOperators interface.
+func (so *importSequenceOperators) GetLastSequenceValueByID(
+	ctx context.Context, seqID uint32,
+) (int64, bool, error) {
+	return 0, false, errSequenceOperators
 }
 
 // SetSequenceValueByID implements the eval.SequenceOperators interface.
@@ -424,7 +426,7 @@ func (r fkResolver) GetQualifiedTableNameByID(
 // GetQualifiedFunctionNameByID implements the resolver.SchemaResolver interface.
 func (r fkResolver) GetQualifiedFunctionNameByID(
 	ctx context.Context, id int64,
-) (*tree.FunctionName, error) {
+) (*tree.RoutineName, error) {
 	return nil, errSchemaResolver
 }
 
@@ -438,6 +440,6 @@ func (r fkResolver) ResolveFunction(
 // ResolveFunctionByOID implements the resolver.SchemaResolver interface.
 func (r fkResolver) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (*tree.FunctionName, *tree.Overload, error) {
+) (*tree.RoutineName, *tree.Overload, error) {
 	return nil, nil, errSchemaResolver
 }

@@ -110,12 +110,12 @@ func createRangeData(
 	locks := []storage.LockTableKey{
 		{
 			Key:      keys.RangeDescriptorKey(desc.StartKey), // mark [1] above as intent
-			Strength: lock.Exclusive,
-			TxnUUID:  testTxnID.GetBytes(),
+			Strength: lock.Intent,
+			TxnUUID:  testTxnID,
 		}, {
 			Key:      desc.StartKey.AsRawKey(), // mark [2] above as intent
-			Strength: lock.Exclusive,
-			TxnUUID:  testTxnID.GetBytes(),
+			Strength: lock.Intent,
+			TxnUUID:  testTxnID,
 		},
 	}
 
@@ -126,7 +126,7 @@ func createRangeData(
 	})
 
 	for _, pk := range ps {
-		require.NoError(t, storage.MVCCPut(ctx, eng, nil, pk.Key, pk.Timestamp, localTS, value, nil))
+		require.NoError(t, storage.MVCCPut(ctx, eng, pk.Key, pk.Timestamp, value, storage.MVCCWriteOptions{LocalTimestamp: localTS}))
 	}
 	for _, rk := range rs {
 		require.NoError(t, eng.PutMVCCRangeKey(rk, storage.MVCCValue{}))
@@ -148,6 +148,7 @@ func verifyIterateReplicaKeySpans(
 	desc *roachpb.RangeDescriptor,
 	eng storage.Engine,
 	replicatedOnly bool,
+	replicatedSpansFilter ReplicatedSpansFilter,
 ) {
 	readWriter := eng.NewSnapshot()
 	defer readWriter.Close()
@@ -161,7 +162,7 @@ func verifyIterateReplicaKeySpans(
 		"pretty",
 	})
 
-	require.NoError(t, IterateReplicaKeySpans(desc, readWriter, replicatedOnly,
+	require.NoError(t, IterateReplicaKeySpans(desc, readWriter, replicatedOnly, replicatedSpansFilter,
 		func(iter storage.EngineIterator, span roachpb.Span, keyType storage.IterKeyType) error {
 			var err error
 			for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {
@@ -180,11 +181,17 @@ func verifyIterateReplicaKeySpans(
 						var err error
 						mvccKey, err = key.ToMVCCKey()
 						require.NoError(t, err)
+						if replicatedSpansFilter == ReplicatedSpansExcludeUser && desc.KeySpan().AsRawSpanWithNoLocals().ContainsKey(key.Key) {
+							t.Fatalf("unexpected user key when user key are expected to be skipped: %s", mvccKey)
+						}
 					} else { // lock key
 						ltk, err := key.ToLockTableKey()
 						require.NoError(t, err)
 						mvccKey = storage.MVCCKey{
 							Key: ltk.Key,
+						}
+						if replicatedSpansFilter == ReplicatedSpansUserOnly {
+							t.Fatalf("unexpected lock table key when only table keys requested: %s", ltk.Key)
 						}
 					}
 					tbl.Append([]string{
@@ -271,21 +278,33 @@ func TestReplicaDataIterator(t *testing.T) {
 		parName := fmt.Sprintf("r%d", tc.desc.RangeID)
 		t.Run(parName, func(t *testing.T) {
 			testutils.RunTrueAndFalse(t, "replicatedOnly", func(t *testing.T, replicatedOnly bool) {
-				name := "all"
-				if replicatedOnly {
-					name = "replicatedOnly"
+				replicatedSpans := []ReplicatedSpansFilter{ReplicatedSpansAll, ReplicatedSpansExcludeUser, ReplicatedSpansUserOnly}
+				for i := range replicatedSpans {
+					replicatedKeysName := "all"
+					switch replicatedSpans[i] {
+					case ReplicatedSpansExcludeUser:
+						replicatedKeysName = "exclude-user"
+					case ReplicatedSpansUserOnly:
+						replicatedKeysName = "user-only"
+					}
+					t.Run(fmt.Sprintf("replicatedSpans=%v", replicatedKeysName), func(t *testing.T) {
+						name := "all"
+						if replicatedOnly {
+							name = "replicatedOnly"
+						}
+						w := echotest.NewWalker(t, filepath.Join(path, parName, name, replicatedKeysName))
+
+						w.Run(t, "output", func(t *testing.T) string {
+							var innerBuf strings.Builder
+							tbl := tablewriter.NewWriter(&innerBuf)
+							// Print contents of the Replica according to the iterator.
+							verifyIterateReplicaKeySpans(t, tbl, &tc.desc, eng, replicatedOnly, replicatedSpans[i])
+
+							tbl.Render()
+							return innerBuf.String()
+						})(t)
+					})
 				}
-				w := echotest.NewWalker(t, filepath.Join(path, parName, name))
-
-				w.Run(t, "output", func(t *testing.T) string {
-					var innerBuf strings.Builder
-					tbl := tablewriter.NewWriter(&innerBuf)
-					// Print contents of the Replica according to the iterator.
-					verifyIterateReplicaKeySpans(t, tbl, &tc.desc, eng, replicatedOnly)
-
-					tbl.Render()
-					return innerBuf.String()
-				})(t)
 			})
 		})
 	}
@@ -349,9 +368,9 @@ func TestIterateMVCCReplicaKeySpansSpansSet(t *testing.T) {
 				p, r := iter.HasPointAndRange()
 				if p {
 					if !reverse {
-						actualKeys = append(actualKeys, iter.Key())
+						actualKeys = append(actualKeys, iter.UnsafeKey().Clone())
 					} else {
-						actualKeys = append([]storage.MVCCKey{iter.Key()}, actualKeys...)
+						actualKeys = append([]storage.MVCCKey{iter.UnsafeKey().Clone()}, actualKeys...)
 					}
 				}
 				if r {
@@ -445,11 +464,11 @@ func TestReplicaDataIteratorGlobalRangeKey(t *testing.T) {
 				if replicatedOnly {
 					expectedSpans = MakeReplicatedKeySpans(&desc)
 				} else {
-					expectedSpans = makeAllKeySpans(&desc)
+					expectedSpans = MakeAllKeySpans(&desc)
 				}
 
 				var actualSpans []roachpb.Span
-				require.NoError(t, IterateReplicaKeySpans(&desc, snapshot, replicatedOnly,
+				require.NoError(t, IterateReplicaKeySpans(&desc, snapshot, replicatedOnly, ReplicatedSpansAll,
 					func(iter storage.EngineIterator, span roachpb.Span, keyType storage.IterKeyType) error {
 						// We should never see any point keys.
 						require.Equal(t, storage.IterKeyTypeRangesOnly, keyType)
@@ -481,7 +500,7 @@ func TestReplicaKeyRanges(t *testing.T) {
 		StartKey: roachpb.RKeyMin,
 		EndKey:   roachpb.RKeyMax,
 	}
-	checkOrdering(t, makeAllKeySpans(&desc))
+	checkOrdering(t, MakeAllKeySpans(&desc))
 	checkOrdering(t, MakeReplicatedKeySpans(&desc))
 	checkOrdering(t, makeReplicatedKeySpansExceptLockTable(&desc))
 }
@@ -535,7 +554,7 @@ func benchReplicaEngineDataIterator(b *testing.B, numRanges, numKeysPerRange, va
 
 	for _, desc := range descs {
 		var keyBuf roachpb.Key
-		keySpans := makeAllKeySpans(&desc)
+		keySpans := MakeAllKeySpans(&desc)
 		for i := 0; i < numKeysPerRange; i++ {
 			keyBuf = append(keyBuf[:0], keySpans[i%len(keySpans)].Key...)
 			keyBuf = append(keyBuf, 0, 0, 0, 0)
@@ -556,7 +575,7 @@ func benchReplicaEngineDataIterator(b *testing.B, numRanges, numKeysPerRange, va
 
 	for i := 0; i < b.N; i++ {
 		for _, desc := range descs {
-			err := IterateReplicaKeySpans(&desc, snapshot, false, /* replicatedOnly */
+			err := IterateReplicaKeySpans(&desc, snapshot, false /* replicatedOnly */, ReplicatedSpansAll,
 				func(iter storage.EngineIterator, _ roachpb.Span, _ storage.IterKeyType) error {
 					var err error
 					for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {

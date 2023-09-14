@@ -39,7 +39,9 @@ func TestWorkload(t *testing.T) {
 	scope := log.Scope(t)
 	defer scope.Close(t)
 	dir := scope.GetDirectory()
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // NOTE: Required to cleanup dnscache refresh Go routine
+
 	tc, _, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
 		t,
 		3, /* numServers */
@@ -59,7 +61,7 @@ func TestWorkload(t *testing.T) {
 	tdb.Exec(t, "CREATE USER testuser")
 	tdb.Exec(t, "CREATE DATABASE schemachange")
 	tdb.Exec(t, "GRANT admin TO testuser")
-	tdb.Exec(t, "SET CLUSTER SETTING sql.trace.log_statement_execute = true")
+	tdb.Exec(t, "SET CLUSTER SETTING sql.log.all_statements.enabled = true")
 
 	// Grab a backup and also print the namespace and descriptor tables upon
 	// failure.
@@ -76,11 +78,11 @@ func TestWorkload(t *testing.T) {
 		}
 		printRows(tdb.Query(t, "SELECT id, encode(descriptor, 'hex') FROM system.descriptor"))
 		printRows(tdb.Query(t, "SELECT * FROM system.namespace"))
-		tdb.Exec(t, "BACKUP DATABASE schemachange TO 'nodelocal://0/backup'")
+		tdb.Exec(t, "BACKUP DATABASE schemachange TO 'nodelocal://1/backup'")
 		t.Logf("backup in %s", dir)
 	}()
 
-	pgURL, cleanup := sqlutils.PGUrl(t, tc.Server(0).ServingSQLAddr(), t.Name(), url.User("testuser"))
+	pgURL, cleanup := sqlutils.PGUrl(t, tc.Server(0).AdvSQLAddr(), t.Name(), url.User("testuser"))
 	defer cleanup()
 
 	const concurrency = 2

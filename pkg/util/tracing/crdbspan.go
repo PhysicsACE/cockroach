@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/gogo/protobuf/types"
@@ -267,16 +268,16 @@ func (t *Trace) trimSpans(maxSpans int) {
 	if t.NumSpans <= maxSpans {
 		return
 	}
-	t.trimSpansRecursive(t.NumSpans - maxSpans)
+	t.trimSpansRecursive(t.NumSpans-maxSpans, true /* isRoot */)
 }
 
-func (t *Trace) trimSpansRecursive(toDrop int) {
+func (t *Trace) trimSpansRecursive(toDrop int, isRoot bool) {
 	if toDrop <= 0 {
 		toDrop := toDrop // copy escaping to the heap
-		panic(fmt.Sprintf("invalid toDrop < 0: %d", toDrop))
+		panic(errors.AssertionFailedf("invalid toDrop < 0: %d", toDrop))
 	}
 	if t.NumSpans <= toDrop {
-		panic(fmt.Sprintf("NumSpans expected to be > toDrop; NumSpans: %d, toDrop: %d", t.NumSpans, toDrop))
+		panic(errors.AssertionFailedf("NumSpans expected to be > toDrop; NumSpans: %d, toDrop: %d", t.NumSpans, toDrop))
 	}
 
 	// Look at the spans ordered by size descendingly, so that we drop the fewest children
@@ -312,17 +313,35 @@ func (t *Trace) trimSpansRecursive(toDrop int) {
 		// spansToDrop.
 		recurseIdx = childrenIdx[spansToDrop]
 		if t.Children[recurseIdx].NumSpans < toDropFromNextChild {
-			panic("expected next child to have enough spans")
+			panic(errors.AssertionFailedf("expected next child to have enough spans"))
 		}
-		t.Children[recurseIdx].trimSpansRecursive(toDropFromNextChild)
+		t.Children[recurseIdx].trimSpansRecursive(toDropFromNextChild, false /* isRoot */)
 		t.NumSpans -= toDropFromNextChild
 		t.DroppedIndirectChildren = true
-		t.Root.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_indirect_children", "")
+		if isRoot {
+			// The original recursive root Trace `t`'s Root member is expected to have independently allocated
+			// tags structures. However, child spans are potentially share memory for tags, logs, and stats
+			// information across goroutines which are not protected by a mutex. See (*Trace).PartialClone for
+			// more details - deep copying these structures is avoided to reduce allocations.
+			//
+			// To avoid multiple goroutines racing to add tags to child spans with unprotected tags structures,
+			// we only indicate on the recursive root Trace's Root member that indirect children have been dropped.
+			t.Root.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_indirect_children", "")
+		}
 	}
 
 	if spansToDrop > 0 {
 		t.DroppedDirectChildren = true
-		t.Root.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_children", "")
+		if isRoot {
+			// The original recursive root Trace `t`'s Root member is expected to have independently allocated
+			// tags structures. However, child spans are potentially share memory for tags, logs, and stats
+			// information across goroutines which are not protected by a mutex. See (*Trace).PartialClone for
+			// more details - deep copying these structures is avoided to reduce allocations.
+			//
+			// To avoid multiple goroutines racing to add tags to child spans with unprotected tags structures,
+			// we only indicate on the recursive root Trace's Root member that children have been dropped.
+			t.Root.EnsureTagGroup(tracingpb.AnonymousTagGroupName).AddTag("_dropped_children", "")
+		}
 		// We're going to drop the fattest spansToDrop spans.
 		childrenToDropIdx := childrenIdx[:spansToDrop]
 
@@ -575,7 +594,6 @@ func (s *crdbSpan) finish() bool {
 			return false
 		}
 		s.mu.finished = true
-
 		if s.recordingType() != tracingpb.RecordingOff {
 			duration := timeutil.Since(s.startTime)
 			if duration == 0 {
@@ -701,7 +719,7 @@ func (s *crdbSpan) getRecordingImpl(
 	case tracingpb.RecordingOff:
 		return Trace{}
 	default:
-		panic("unreachable")
+		panic(errors.AssertionFailedf("unreachable"))
 	}
 }
 
@@ -881,7 +899,7 @@ func (s *crdbSpan) recordFinishedChildrenLocked(childRec Trace) {
 	case tracingpb.RecordingOff:
 		break
 	default:
-		panic(fmt.Sprintf("unrecognized recording mode: %v", s.recordingType()))
+		panic(errors.AssertionFailedf("unrecognized recording mode: %v", s.recordingType()))
 	}
 
 	// Update s' ChildrenMetadata to capture all the spans in childRec.
@@ -952,22 +970,38 @@ func (s *crdbSpan) getLazyTagLocked(key string) (interface{}, bool) {
 // notifyEventListeners recursively notifies all the EventListeners registered
 // with this span and any ancestor spans in the Recording, of a StructuredEvent.
 //
+// This span is notified _before_ its ancestors.
+//
+// If any of the span's EventListeners return EventConsumed status, then the
+// ancestors are **not** notified about this Structured item.
+//
 // If s has a parent, then we notify the parent of the StructuredEvent outside
 // the child (our current receiver) lock. This is as per the lock ordering
 // convention between parents and children.
 func (s *crdbSpan) notifyEventListeners(item Structured) {
 	s.mu.Lock()
+	var unlocked bool
+	defer func() {
+		if !unlocked {
+			s.mu.Unlock()
+		}
+	}()
 
 	// Check if the span has been finished concurrently with this notify call.
 	// This can happen when the signal comes from a child span; in that case the
 	// child calls into the parent without holding the child's lock, so the call
 	// can race with parent.Finish().
 	if s.mu.finished {
-		s.mu.Unlock()
 		return
 	}
 
-	// Pass the event to the parent, if necessary.
+	// Notify s' eventListeners first, before passing the event to parent.
+	for _, listener := range s.eventListeners {
+		if listener.Notify(item) == EventConsumed {
+			return
+		}
+	}
+
 	if s.mu.recording.notifyParentOnStructuredEvent {
 		parent := s.mu.parent.Span.i.crdb
 		// Take a reference of s' parent before releasing the mutex. This ensures
@@ -976,15 +1010,8 @@ func (s *crdbSpan) notifyEventListeners(item Structured) {
 		parentRef := makeSpanRef(s.mu.parent.Span)
 		defer parentRef.release()
 		s.mu.Unlock()
+		unlocked = true
 		parent.notifyEventListeners(item)
-	} else {
-		s.mu.Unlock()
-	}
-
-	// We can operate on s' eventListeners without holding the mutex because the
-	// slice is only written to once during span creation.
-	for _, listener := range s.eventListeners {
-		listener.Notify(item)
 	}
 }
 
@@ -1068,9 +1095,11 @@ func (s *crdbSpan) appendStructuredEventsRecursivelyLocked(
 	for _, c := range s.mu.openChildren {
 		if c.collectRecording || includeDetachedChildren {
 			sp := c.span()
-			sp.mu.Lock()
-			buffer = sp.appendStructuredEventsRecursivelyLocked(buffer, includeDetachedChildren)
-			sp.mu.Unlock()
+			buffer = func() []tracingpb.StructuredRecord {
+				sp.mu.Lock()
+				defer sp.mu.Unlock()
+				return sp.appendStructuredEventsRecursivelyLocked(buffer, includeDetachedChildren)
+			}()
 		}
 	}
 	return s.mu.recording.finishedChildren.appendStructuredEventsRecursively(buffer)
@@ -1106,10 +1135,12 @@ func (s *crdbSpan) getChildrenMetadataRecursivelyLocked(
 	for _, c := range s.mu.openChildren {
 		if c.collectRecording || includeDetachedChildren {
 			sp := c.span()
-			sp.mu.Lock()
-			sp.getChildrenMetadataRecursivelyLocked(childrenMetadata,
-				true /*includeRootMetadata */, includeDetachedChildren)
-			sp.mu.Unlock()
+			func() {
+				sp.mu.Lock()
+				defer sp.mu.Unlock()
+				sp.getChildrenMetadataRecursivelyLocked(childrenMetadata,
+					true /*includeRootMetadata */, includeDetachedChildren)
+			}()
 		}
 	}
 }
@@ -1338,7 +1369,7 @@ func (s *crdbSpan) childFinished(child *crdbSpan) {
 		// completion before c.finish() was called, c wouldn't have called
 		// s.childFinished(c) because it would no longer have had a parent).
 		if !s.mu.finished {
-			panic("unexpectedly failed to find child of non-finished parent")
+			panic(errors.AssertionFailedf("unexpectedly failed to find child of non-finished parent"))
 		}
 		// Since s has been finished, there's nothing more to do.
 		return
@@ -1359,7 +1390,7 @@ func (s *crdbSpan) childFinished(child *crdbSpan) {
 	// that here.
 	if s.mu.finished {
 		if !s.mu.finishing {
-			panic("child unexpectedly calling into finished parent")
+			panic(errors.AssertionFailedf("child unexpectedly calling into finished parent"))
 		}
 	}
 
@@ -1370,7 +1401,7 @@ func (s *crdbSpan) childFinished(child *crdbSpan) {
 		// re-allocated yet. It shouldn't be re-allocated, because each span holds a
 		// reference to itself that's only dropped at the end of Span.Finish() (and
 		// the child at this point is in the middle of its Finish() call).
-		panic(fmt.Sprintf("span's reference count unexpectedly dropped to zero: %s", child.operation))
+		panic(errors.AssertionFailedf("span's reference count unexpectedly dropped to zero: %s", child.operation))
 	}
 
 	// Unlink the child.

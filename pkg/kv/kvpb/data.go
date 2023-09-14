@@ -8,20 +8,22 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package kvpb contains basic utilities for the kv layer.
 package kvpb
 
 import (
-	"context"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // PrepareTransactionForRetry returns a new Transaction to be used for retrying
 // the original Transaction. Depending on the error, this might return an
-// already-existing Transaction with an incremented epoch, or a completely new
-// Transaction.
+// already-existing Transaction with an incremented epoch and timestamp, an
+// already-existing Transaction with the same epoch and an incremented
+// timestamp, or a completely new Transaction. For details, see the comment on
+// TransactionRetryWithProtoRefreshError.NextTransaction.
 //
 // The caller should generally check that the error was meant for this
 // Transaction before calling this.
@@ -29,18 +31,19 @@ import (
 // pri is the priority that should be used when giving the restarted transaction
 // the chance to get a higher priority. Not used when the transaction is being
 // aborted.
-//
-// In case retryErr tells us that a new Transaction needs to be created,
-// isolation and name help initialize this new transaction.
 func PrepareTransactionForRetry(
-	ctx context.Context, pErr *Error, pri roachpb.UserPriority, clock *hlc.Clock,
-) roachpb.Transaction {
-	if pErr.TransactionRestart() == TransactionRestart_NONE {
-		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
+	pErr *Error, pri roachpb.UserPriority, clock *hlc.Clock,
+) (roachpb.Transaction, error) {
+	if pErr == nil {
+		return roachpb.Transaction{}, errors.AssertionFailedf("nil error")
 	}
-
+	if pErr.TransactionRestart() == TransactionRestart_NONE {
+		return roachpb.Transaction{}, errors.AssertionFailedf(
+			"invalid retryable error (%T): %s", pErr.GetDetail(), pErr)
+	}
 	if pErr.GetTxn() == nil {
-		log.Fatalf(ctx, "missing txn for retryable error: %s", pErr)
+		return roachpb.Transaction{}, errors.AssertionFailedf(
+			"missing txn for retryable error: %s", pErr)
 	}
 
 	txn := *pErr.GetTxn()
@@ -60,12 +63,14 @@ func PrepareTransactionForRetry(
 		txn = roachpb.MakeTransaction(
 			txn.Name,
 			nil, // baseKey
+			txn.IsoLevel,
 			// We have errTxnPri, but this wants a roachpb.UserPriority. So
 			// we're going to overwrite the priority below.
 			roachpb.NormalUserPriority,
 			now.ToTimestamp(),
 			clock.MaxOffset().Nanoseconds(),
 			txn.CoordinatorNodeID,
+			admissionpb.WorkPriority(txn.AdmissionPriority),
 		)
 		// Use the priority communicated back by the server.
 		txn.Priority = errTxnPri
@@ -82,8 +87,8 @@ func PrepareTransactionForRetry(
 		if tErr.Reason == RETRY_SERIALIZABLE {
 			// For RETRY_SERIALIZABLE case, we want to bump timestamp further than
 			// timestamp cache.
-			// This helps transactions that had their commit timestamp fixed (See
-			// roachpb.Transaction.CommitTimestampFixed for details on when it happens)
+			// This helps transactions that had their read timestamp fixed (See
+			// roachpb.Transaction.ReadTimestampFixed for details on when it happens)
 			// or transactions that hit read-write contention and can't bump
 			// read timestamp because of later writes.
 			// Upon retry, we want those transactions to restart on now() instead of
@@ -102,16 +107,47 @@ func PrepareTransactionForRetry(
 	case *WriteTooOldError:
 		// Increase the timestamp to the ts at which we've actually written.
 		txn.WriteTimestamp.Forward(tErr.RetryTimestamp())
+	case *IntentMissingError:
+		// IntentMissingErrors are not expected to be handled at this level;
+		// We instead expect the txnPipeliner to transform them into a
+		// TransactionRetryErrors(RETRY_ASYNC_WRITE_FAILURE) error.
+		return roachpb.Transaction{}, errors.AssertionFailedf(
+			"unexpected intent missing error (%T); should be transformed into retry error", pErr.GetDetail())
 	default:
-		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
+		return roachpb.Transaction{}, errors.AssertionFailedf(
+			"invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
 	}
 	if !aborted {
 		if txn.Status.IsFinalized() {
-			log.Fatalf(ctx, "transaction unexpectedly finalized in (%T): %s", pErr.GetDetail(), pErr)
+			return roachpb.Transaction{}, errors.AssertionFailedf(
+				"transaction unexpectedly finalized in (%T): %s", pErr.GetDetail(), pErr)
 		}
-		txn.Restart(pri, txn.Priority, txn.WriteTimestamp)
+		// If the transaction is not aborted, the retry error instead tells the
+		// transaction to adjust its current read snapshot (to txn.WriteTimestamp)
+		// to avoid some form of isolation or consistency related retry condition.
+		// The handling of these errors is isolation level dependent.
+		//
+		// For isolation levels that use a single read timestamp across the entire
+		// transaction (snapshot and serializable), transactions are only permitted
+		// to adjust their read snapshot if they restart from the beginning and
+		// discard all prior writes. In these cases, we perform the restart below by
+		// incrementing the transaction's epoch.
+		//
+		// For isolation levels that use per-statement read timestamps which may
+		// differ between statements (read committed), transactions are permitted to
+		// adjust their read snapshot mid-transaction as long as they restart the
+		// current statement. In these cases, we advance the transaction's read
+		// timestamp below without incrementing the epoch and without discarding any
+		// prior writes. The user of the transaction (e.g. the SQL layer) is
+		// responsible for employing savepoints to selectively discard the writes
+		// from the current statement when it retries that statement.
+		if !txn.IsoLevel.PerStatementReadSnapshot() {
+			txn.Restart(pri, txn.Priority, txn.WriteTimestamp)
+		} else {
+			txn.BumpReadTimestamp(txn.WriteTimestamp)
+		}
 	}
-	return txn
+	return txn, nil
 }
 
 // TransactionRefreshTimestamp returns whether the supplied error is a retry
@@ -143,3 +179,28 @@ func TransactionRefreshTimestamp(pErr *Error) (bool, hlc.Timestamp) {
 	}
 	return true, timestamp
 }
+
+// LeaseAppliedIndex is attached to every Raft message and is used for replay
+// protection.
+type LeaseAppliedIndex uint64
+
+// SafeValue implements the redact.SafeValue interface.
+func (s LeaseAppliedIndex) SafeValue() {}
+
+// RaftTerm represents the term of a raft message. This corresponds to Term in
+// HardState.Term in the Raft library. That type is a uint64, so it is necessary
+// to cast to/from that type when dealing with the Raft library, however
+// internally RaftTerm is used for all fields in CRDB.
+type RaftTerm uint64
+
+// SafeValue implements the redact.SafeValue interface.
+func (s RaftTerm) SafeValue() {}
+
+// RaftIndex represents the term of a raft message. This corresponds to Index in
+// HardState.Index in the Raft library. That type is a uint64, so it is
+// necessary to cast to/from that type when dealing with the Raft library,
+// however internally RaftIndex is used for all fields in CRDB.
+type RaftIndex uint64
+
+// SafeValue implements the redact.SafeValue interface.
+func (s RaftIndex) SafeValue() {}

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
@@ -62,7 +63,7 @@ func (j *Job) maybeWithTxn(txn isql.Txn) Updater {
 
 func (u Updater) update(ctx context.Context, useReadLock bool, updateFn UpdateFn) (retErr error) {
 	if u.txn == nil {
-		return u.j.registry.internalDB.Txn(ctx, func(
+		return u.j.registry.db.Txn(ctx, func(
 			ctx context.Context, txn isql.Txn,
 		) error {
 			u.txn = txn
@@ -101,7 +102,7 @@ func (u Updater) update(ctx context.Context, useReadLock bool, updateFn UpdateFn
 	row, err := u.txn.QueryRowEx(
 		ctx, "select-job", u.txn.KV(),
 		sessiondata.RootUserSessionDataOverride,
-		getSelectStmtForJobUpdate(j.session != nil, useReadLock), j.ID(),
+		getSelectStmtForJobUpdate(ctx, j.session != nil, useReadLock, u.j.registry.settings.Version), j.ID(),
 	)
 	if err != nil {
 		return err
@@ -198,23 +199,35 @@ func (u Updater) update(ctx context.Context, useReadLock bool, updateFn UpdateFn
 		addSetter("status", ju.md.Status)
 	}
 
+	var payloadBytes []byte
 	if ju.md.Payload != nil {
 		payload = ju.md.Payload
-		payloadBytes, err := protoutil.Marshal(payload)
+		var err error
+		payloadBytes, err = protoutil.Marshal(payload)
 		if err != nil {
 			return err
 		}
-		addSetter("payload", payloadBytes)
 	}
 
+	var progressBytes []byte
 	if ju.md.Progress != nil {
 		progress = ju.md.Progress
 		progress.ModifiedMicros = timeutil.ToUnixMicros(u.now())
-		progressBytes, err := protoutil.Marshal(progress)
+		var err error
+		progressBytes, err = protoutil.Marshal(progress)
 		if err != nil {
 			return err
 		}
-		addSetter("progress", progressBytes)
+	}
+
+	if !u.j.registry.settings.Version.IsActive(ctx, clusterversion.V23_1StopWritingPayloadAndProgressToSystemJobs) {
+		if payloadBytes != nil {
+			addSetter("payload", payloadBytes)
+		}
+
+		if progressBytes != nil {
+			addSetter("progress", progressBytes)
+		}
 	}
 
 	if ju.md.RunStats != nil {
@@ -223,23 +236,45 @@ func (u Updater) update(ctx context.Context, useReadLock bool, updateFn UpdateFn
 		addSetter("num_runs", ju.md.RunStats.NumRuns)
 	}
 
-	updateStmt := fmt.Sprintf(
-		"UPDATE system.jobs SET %s WHERE id = $1",
-		strings.Join(setters, ", "),
-	)
-	n, err := u.txn.ExecEx(
-		ctx, "job-update", u.txn.KV(),
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
-		updateStmt, params...,
-	)
-	if err != nil {
-		return err
-	}
-	if n != 1 {
-		return errors.Errorf(
-			"expected exactly one row affected, but %d rows affected by job update", n,
+	if len(setters) != 0 {
+		updateStmt := fmt.Sprintf(
+			"UPDATE system.jobs SET %s WHERE id = $1",
+			strings.Join(setters, ", "),
 		)
+		n, err := u.txn.ExecEx(
+			ctx, "job-update", u.txn.KV(),
+			sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+			updateStmt, params...,
+		)
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return errors.Errorf(
+				"expected exactly one row affected, but %d rows affected by job update", n,
+			)
+		}
 	}
+
+	// Insert the job payload and details into the system.jobs_info table if the
+	// associated cluster version is active.
+	//
+	// TODO(adityamaru): Stop writing the payload and details to the system.jobs
+	// table once we are outside the compatability window for 22.2.
+	if u.j.registry.settings.Version.IsActive(ctx, clusterversion.V23_1CreateSystemJobInfoTable) {
+		infoStorage := j.InfoStorage(u.txn)
+		if payloadBytes != nil {
+			if err := infoStorage.WriteLegacyPayload(ctx, payloadBytes); err != nil {
+				return err
+			}
+		}
+		if progressBytes != nil {
+			if err := infoStorage.WriteLegacyProgress(ctx, progressBytes); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -327,7 +362,7 @@ func UpdateHighwaterProgressed(highWater hlc.Timestamp, md JobMetadata, ju *JobU
 //
 // Sample usage:
 //
-//	err := j.Update(ctx, func(_ *client.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+//	err := j.Update(ctx, func(_ *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 //	  if md.Status != StatusRunning {
 //	    return errors.New("job no longer running")
 //	  }
@@ -348,21 +383,56 @@ func (u Updater) now() time.Time {
 }
 
 // getSelectStmtForJobUpdate constructs the select statement used in Job.update.
-func getSelectStmtForJobUpdate(hasSession, useReadLock bool) string {
+func getSelectStmtForJobUpdate(
+	ctx context.Context, hasSession, useReadLock bool, version clusterversion.Handle,
+) string {
 	const (
-		selectWithoutSession = `SELECT status, payload, progress`
-		selectWithSession    = selectWithoutSession + `, claim_session_id`
-		from                 = ` FROM system.jobs WHERE id = $1`
-		fromForUpdate        = from + ` FOR UPDATE`
-		backoffColumns       = ", COALESCE(last_run, created), COALESCE(num_runs, 0)"
+		selectWithoutSession = `
+WITH
+	latestpayload AS (SELECT job_id, value FROM system.job_info AS payload WHERE info_key = 'legacy_payload' AND job_id = $1 ORDER BY written DESC LIMIT 1),
+	latestprogress AS (SELECT job_id, value FROM system.job_info AS progress WHERE info_key = 'legacy_progress' AND job_id = $1 ORDER BY written DESC LIMIT 1)
+	SELECT
+		status, payload.value AS payload, progress.value AS progress`
+		selectWithSession = selectWithoutSession + `, claim_session_id`
+		from              = `
+	FROM system.jobs AS j
+	INNER JOIN latestpayload AS payload ON j.id = payload.job_id
+	LEFT JOIN latestprogress AS progress ON j.id = progress.job_id
+	WHERE id = $1
+`
+		fromForUpdate = from + `FOR UPDATE`
+
+		// TODO(adityamaru): Delete deprecated queries once we are outside the 22.2
+		// compatibility window.
+		deprecatedSelectWithoutSession = `SELECT status, payload, progress`
+		deprecatedSelectWithSession    = deprecatedSelectWithoutSession + `, claim_session_id`
+		deprecatedFrom                 = ` FROM system.jobs WHERE id = $1`
+		deprecatedFromForUpdate        = deprecatedFrom + ` FOR UPDATE`
+		backoffColumns                 = ", COALESCE(last_run, created), COALESCE(num_runs, 0)"
 	)
-	stmt := selectWithoutSession
-	if hasSession {
-		stmt = selectWithSession
+
+	var stmt string
+	if version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled) {
+		stmt = selectWithoutSession
+		if hasSession {
+			stmt = selectWithSession
+		}
+		stmt = stmt + backoffColumns
+		if useReadLock {
+			return stmt + fromForUpdate
+		}
+		stmt = stmt + from
+	} else {
+		stmt = deprecatedSelectWithoutSession
+		if hasSession {
+			stmt = deprecatedSelectWithSession
+		}
+		stmt = stmt + backoffColumns
+		if useReadLock {
+			return stmt + deprecatedFromForUpdate
+		}
+		stmt = stmt + deprecatedFrom
 	}
-	stmt = stmt + backoffColumns
-	if useReadLock {
-		return stmt + fromForUpdate
-	}
-	return stmt + from
+
+	return stmt
 }

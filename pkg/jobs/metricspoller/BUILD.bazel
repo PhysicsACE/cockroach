@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -13,7 +12,9 @@ go_library(
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
         "//pkg/jobs/jobsprotectedts",
+        "//pkg/kv/kvserver/protectedts/ptpb",
         "//pkg/roachpb",
+        "//pkg/scheduledjobs",
         "//pkg/security/username",
         "//pkg/settings/cluster",
         "//pkg/sql",
@@ -29,5 +30,3 @@ go_library(
         "@com_github_prometheus_client_model//go",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -34,6 +34,7 @@ func TestDefaultRaftConfig(t *testing.T) {
 	leaseActive, leaseRenewal := cfg.RangeLeaseDurations()
 	nodeActive, nodeRenewal := cfg.NodeLivenessDurations()
 	raftElectionTimeout := cfg.RaftElectionTimeout()
+	raftReproposalTimeout := cfg.RaftTickInterval * time.Duration(cfg.RaftReproposalTimeoutTicks)
 	raftHeartbeatInterval := cfg.RaftTickInterval * time.Duration(cfg.RaftHeartbeatIntervalTicks)
 
 	{
@@ -41,6 +42,7 @@ func TestDefaultRaftConfig(t *testing.T) {
 		s += spew.Sdump(cfg)
 		s += fmt.Sprintf("RaftHeartbeatInterval: %s\n", raftHeartbeatInterval)
 		s += fmt.Sprintf("RaftElectionTimeout: %s\n", raftElectionTimeout)
+		s += fmt.Sprintf("RaftReproposalTimeout: %s\n", raftReproposalTimeout)
 		s += fmt.Sprintf("RangeLeaseDurations: active=%s renewal=%s\n", leaseActive, leaseRenewal)
 		s += fmt.Sprintf("RangeLeaseAcquireTimeout: %s\n", cfg.RangeLeaseAcquireTimeout())
 		s += fmt.Sprintf("NodeLivenessDurations: active=%s renewal=%s\n", nodeActive, nodeRenewal)
@@ -133,12 +135,7 @@ func TestRaftMaxInflightBytes(t *testing.T) {
 		maxInfl uint64
 		want    uint64
 	}{
-		// If any of these tests fail, sync the corresponding default values with
-		// config.go, and update the comments that reason about default values.
-		{want: 256 << 20},                    // assert 255 MB is still default
-		{maxMsgs: 128, want: 256 << 20},      // assert 128 is still default
-		{msgSize: 32 << 10, want: 256 << 20}, // assert 32 KB is still default
-
+		{want: 32 << 20},                  // default
 		{maxMsgs: 1 << 30, want: 1 << 45}, // large maxMsgs
 		{msgSize: 1 << 50, want: 1 << 57}, // large msgSize
 

@@ -15,6 +15,8 @@ import (
 	"io"
 	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
@@ -36,10 +38,6 @@ type CollectionStats struct {
 func CollectRemoteReplicaInfo(
 	ctx context.Context, c serverpb.AdminClient,
 ) (loqrecoverypb.ClusterReplicaInfo, CollectionStats, error) {
-	cInfo, err := c.Cluster(ctx, &serverpb.ClusterRequest{})
-	if err != nil {
-		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, err
-	}
 	cc, err := c.RecoveryCollectReplicaInfo(ctx, &serverpb.RecoveryCollectReplicaInfoRequest{})
 	if err != nil {
 		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, err
@@ -50,6 +48,7 @@ func CollectRemoteReplicaInfo(
 	var clusterReplInfo []loqrecoverypb.NodeReplicaInfo
 	var nodeReplicas []loqrecoverypb.ReplicaInfo
 	var currentNode roachpb.NodeID
+	var metadata loqrecoverypb.ClusterMetadata
 	for {
 		info, err := cc.Recv()
 		if err != nil {
@@ -80,12 +79,23 @@ func CollectRemoteReplicaInfo(
 			if s.NodeID == currentNode {
 				nodeReplicas = nil
 			}
+		} else if m := info.GetMetadata(); m != nil {
+			metadata = *m
 		}
 	}
+	// We don't want to process data outside of safe version range for this CLI
+	// binary. RPC allows us to communicate with a cluster that is newer than
+	// the binary, but it will not version gate the data to binary version so we
+	// can receive entries that we won't be able to persist and process correctly.
+	if err := checkVersionAllowedByBinary(metadata.Version); err != nil {
+		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, errors.Wrap(err,
+			"unsupported cluster info version")
+	}
 	return loqrecoverypb.ClusterReplicaInfo{
-			ClusterID:   cInfo.ClusterID,
+			ClusterID:   metadata.ClusterID,
 			Descriptors: descriptors,
 			LocalInfo:   clusterReplInfo,
+			Version:     metadata.Version,
 		}, CollectionStats{
 			Nodes:       len(nodes),
 			Stores:      len(stores),
@@ -100,6 +110,19 @@ func CollectStoresReplicaInfo(
 	if len(stores) == 0 {
 		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, errors.New("no stores were provided for info collection")
 	}
+
+	// Synthesizing version from engine ensures that binary is compatible with
+	// the store, so we don't need to do any extra checks.
+	binaryVersion := clusterversion.ByKey(clusterversion.BinaryVersionKey)
+	binaryMinSupportedVersion := clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)
+	version, err := kvstorage.SynthesizeClusterVersionFromEngines(
+		ctx, stores, binaryVersion, binaryMinSupportedVersion,
+	)
+	if err != nil {
+		return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, errors.WithHint(err,
+			"ensure that used cli has compatible version with storage")
+	}
+
 	var clusterUUID uuid.UUID
 	nodes := make(map[roachpb.NodeID]struct{})
 	var replicas []loqrecoverypb.ReplicaInfo
@@ -115,7 +138,7 @@ func CollectStoresReplicaInfo(
 			return loqrecoverypb.ClusterReplicaInfo{}, CollectionStats{}, errors.New("can't collect info from stored that belong to different clusters")
 		}
 		nodes[ident.NodeID] = struct{}{}
-		if err := visitStoreReplicas(ctx, reader, ident.StoreID, ident.NodeID,
+		if err := visitStoreReplicas(ctx, reader, ident.StoreID, ident.NodeID, version,
 			func(info loqrecoverypb.ReplicaInfo) error {
 				replicas = append(replicas, info)
 				return nil
@@ -126,6 +149,7 @@ func CollectStoresReplicaInfo(
 	return loqrecoverypb.ClusterReplicaInfo{
 			ClusterID: clusterUUID.String(),
 			LocalInfo: []loqrecoverypb.NodeReplicaInfo{{Replicas: replicas}},
+			Version:   version.Version,
 		}, CollectionStats{
 			Nodes:  len(nodes),
 			Stores: len(stores),
@@ -137,6 +161,7 @@ func visitStoreReplicas(
 	reader storage.Reader,
 	storeID roachpb.StoreID,
 	nodeID roachpb.NodeID,
+	targetVersion clusterversion.ClusterVersion,
 	send func(info loqrecoverypb.ReplicaInfo) error,
 ) error {
 	if err := kvstorage.IterateRangeDescriptorsFromDisk(ctx, reader, func(desc roachpb.RangeDescriptor) error {
@@ -160,14 +185,17 @@ func visitStoreReplicas(
 			return err
 		}
 
-		localIsLeaseholder := rstate.Lease != nil && rstate.Lease.Replica.StoreID == storeID
+		var localIsLeaseholder bool
+		if targetVersion.IsActive(clusterversion.V23_1) {
+			localIsLeaseholder = rstate.Lease != nil && rstate.Lease.Replica.StoreID == storeID
+		}
 
 		return send(loqrecoverypb.ReplicaInfo{
 			StoreID:                  storeID,
 			NodeID:                   nodeID,
 			Desc:                     desc,
 			RaftAppliedIndex:         rstate.RaftAppliedIndex,
-			RaftCommittedIndex:       hstate.Commit,
+			RaftCommittedIndex:       kvpb.RaftIndex(hstate.Commit),
 			RaftLogDescriptorChanges: rangeUpdates,
 			LocalAssumesLeaseholder:  localIsLeaseholder,
 		})
@@ -181,7 +209,7 @@ func visitStoreReplicas(
 // lo (inclusive) and hi (exclusive) and searches for changes to range
 // descriptors, as identified by presence of a commit trigger.
 func GetDescriptorChangesFromRaftLog(
-	rangeID roachpb.RangeID, lo, hi uint64, reader storage.Reader,
+	rangeID roachpb.RangeID, lo, hi kvpb.RaftIndex, reader storage.Reader,
 ) ([]loqrecoverypb.DescriptorChangeInfo, error) {
 	var changes []loqrecoverypb.DescriptorChangeInfo
 	if err := raftlog.Visit(reader, rangeID, lo, hi, func(ent raftpb.Entry) error {

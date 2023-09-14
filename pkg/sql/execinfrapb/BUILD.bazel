@@ -1,8 +1,7 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "execinfrapb",
@@ -55,11 +54,11 @@ go_library(
         "//pkg/util/protoutil",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
-        "//pkg/util/timeutil",
         "//pkg/util/tracing/tracingpb",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_dustin_go_humanize//:go-humanize",
         "@com_github_gogo_protobuf//types",
         "@org_golang_google_grpc//:go_default_library",
@@ -80,6 +79,7 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/keys",
+        "//pkg/roachpb",
         "//pkg/security/username",
         "//pkg/settings/cluster",
         "//pkg/sql",
@@ -164,5 +164,3 @@ disallowed_imports_test(
     "execinfrapb",
     ["//pkg/sql/sem/builtins"],
 )
-
-get_x_data(name = "get_x_data")

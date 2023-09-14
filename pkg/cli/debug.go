@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/syncbench"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -41,9 +42,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -63,6 +66,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/tool"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/ttycolor"
@@ -94,8 +99,13 @@ Create a ballast file to fill the store directory up to a given amount
 
 // PopulateStorageConfigHook is a callback set by CCL code.
 // It populates any needed fields in the StorageConfig.
-// It must do nothing in OSS code.
+// It must stay unset in OSS code.
 var PopulateStorageConfigHook func(*base.StorageConfig) error
+
+// EncryptedStorePathsHook is a callback set by CCL code.
+// It returns the store paths that are encrypted.
+// It must stay unset in OSS code.
+var EncryptedStorePathsHook func() []string
 
 func parsePositiveInt(arg string) (int64, error) {
 	i, err := strconv.ParseInt(arg, 10, 64)
@@ -468,7 +478,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 	defer snapshot.Close()
 
 	var results int
-	return rditer.IterateReplicaKeySpans(&desc, snapshot, debugCtx.replicated,
+	return rditer.IterateReplicaKeySpans(&desc, snapshot, debugCtx.replicated, rditer.ReplicatedSpansAll,
 		func(iter storage.EngineIterator, _ roachpb.Span, keyType storage.IterKeyType) error {
 			for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {
 				switch keyType {
@@ -588,6 +598,7 @@ func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 
 var decodeKeyOptions struct {
 	encoding keyFormat
+	userKey  bool
 }
 
 var debugDecodeKeyCmd = &cobra.Command{
@@ -595,6 +606,8 @@ var debugDecodeKeyCmd = &cobra.Command{
 	Short: "decode <key>",
 	Long: `
 Decode encoded keys provided as command arguments and pretty-print them.
+Decode command could be used with either encoded engine keys that contain
+timestamp or user keys used in range descriptors, range keys etc.
 Key encoding type could be changed using encoding flag.
 For example:
 
@@ -617,11 +630,15 @@ For example:
 			if err != nil {
 				return err
 			}
-			k, err := storage.DecodeMVCCKey(b)
-			if err != nil {
-				return err
+			if decodeKeyOptions.userKey {
+				fmt.Println(roachpb.Key(b))
+			} else {
+				k, err := storage.DecodeMVCCKey(b)
+				if err != nil {
+					return err
+				}
+				fmt.Println(k)
 			}
-			fmt.Println(k)
 		}
 		return nil
 	},
@@ -865,6 +882,10 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+var debugPebbleOpts = struct {
+	sharedStorageURI string
+}{}
+
 // DebugPebbleCmd is the root of all debug pebble commands.
 // Exported to allow modification by CCL code.
 var DebugPebbleCmd = &cobra.Command{
@@ -921,7 +942,7 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 	}
 
 	{
-		approxBytesBefore, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)
+		approxBytesBefore, _, _, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)
 		if err != nil {
 			return errors.Wrap(err, "while computing approximate size before compaction")
 		}
@@ -951,7 +972,7 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s\n", db.GetMetrics())
 
 	{
-		approxBytesAfter, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)
+		approxBytesAfter, _, _, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)
 		if err != nil {
 			return errors.Wrap(err, "while computing approximate size after compaction")
 		}
@@ -1257,10 +1278,13 @@ func runDebugIntentCount(cmd *cobra.Command, args []string) error {
 		}
 	})
 
-	iter := db.NewEngineIterator(storage.IterOptions{
+	iter, err := db.NewEngineIterator(storage.IterOptions{
 		LowerBound: keys.LockTableSingleKeyStart,
 		UpperBound: keys.LockTableSingleKeyEnd,
 	})
+	if err != nil {
+		return err
+	}
 	defer iter.Close()
 	seekKey := storage.EngineKey{Key: keys.LockTableSingleKeyStart}
 
@@ -1369,7 +1393,7 @@ func (m lockValueFormatter) Format(f fmt.State, c rune) {
 // It is necessary because an FS must be passed to tool.New before
 // the command line flags are parsed (i.e. before we can determine
 // if we have an encrypted FS).
-var pebbleToolFS = &swappableFS{vfs.Default}
+var pebbleToolFS = &autoDecryptFS{}
 
 func init() {
 	DebugCmd.AddCommand(debugCmds...)
@@ -1394,12 +1418,24 @@ func init() {
 	// To be able to read Cockroach-written Pebble manifests/SSTables, comparator
 	// and merger functions must be specified to pebble that match the ones used
 	// to write those files.
-	pebbleTool := tool.New(tool.Mergers(storage.MVCCMerger),
+	pebbleTool := tool.New(
+		tool.Mergers(storage.MVCCMerger),
 		tool.DefaultComparer(storage.EngineComparer),
-		tool.FS(&absoluteFS{pebbleToolFS}),
+		tool.FS(pebbleToolFS),
+		tool.OpenErrEnhancer(func(err error) error {
+			if pebble.IsCorruptionError(err) {
+				// None of the wrappers provided by the error library allow adding a
+				// message that shows up with "%s" after the original message.
+				// nolint:errwrap
+				return errors.Newf("%v\nIf this is an encrypted store, make sure the correct encryption key is set.", err)
+			}
+			return err
+		}),
 	)
 	DebugPebbleCmd.AddCommand(pebbleTool.Commands...)
-	initPebbleCmds(DebugPebbleCmd)
+	f := DebugPebbleCmd.PersistentFlags()
+	f.StringVarP(&debugPebbleOpts.sharedStorageURI, cliflags.SharedStorage.Name, cliflags.SharedStorage.Shorthand, "", cliflags.SharedStorage.Usage())
+	initPebbleCmds(DebugPebbleCmd, pebbleTool)
 	DebugCmd.AddCommand(DebugPebbleCmd)
 
 	doctorExamineCmd.AddCommand(doctorExamineClusterCmd, doctorExamineZipDirCmd)
@@ -1415,7 +1451,7 @@ func init() {
 
 	DebugCmd.AddCommand(debugJobTraceFromClusterCmd)
 
-	f := debugSyncBenchCmd.Flags()
+	f = debugSyncBenchCmd.Flags()
 	f.IntVarP(&syncBenchOpts.Concurrency, "concurrency", "c", syncBenchOpts.Concurrency,
 		"number of concurrent writers")
 	f.DurationVarP(&syncBenchOpts.Duration, "duration", "d", syncBenchOpts.Duration,
@@ -1451,6 +1487,8 @@ func init() {
 		cliflags.ConfirmActions.Usage())
 	f.UintVar(&formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Name,
 		formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Usage())
+	f.BoolVar(&debugRecoverExecuteOpts.ignoreInternalVersion, cliflags.RecoverIgnoreInternalVersion.Name,
+		debugRecoverExecuteOpts.ignoreInternalVersion, cliflags.RecoverIgnoreInternalVersion.Usage())
 
 	f = debugMergeLogsCmd.Flags()
 	f.Var(flagutil.Time(&debugMergeLogsOpts.from), "from",
@@ -1480,6 +1518,7 @@ func init() {
 
 	f = debugDecodeKeyCmd.Flags()
 	f.Var(&decodeKeyOptions.encoding, "encoding", "key argument encoding")
+	f.BoolVar(&decodeKeyOptions.userKey, "user-key", false, "key type")
 
 	f = debugDecodeProtoCmd.Flags()
 	f.StringVar(&debugDecodeProtoName, "schema", "cockroach.sql.sqlbase.Descriptor",
@@ -1510,7 +1549,7 @@ func init() {
 		"the output file to use for the trace. If left empty, output to stderr.")
 }
 
-func initPebbleCmds(cmd *cobra.Command) {
+func initPebbleCmds(cmd *cobra.Command, pebbleTool *tool.T) {
 	for _, c := range cmd.Commands() {
 		wrapped := c.PreRunE
 		c.PreRunE = func(cmd *cobra.Command, args []string) error {
@@ -1519,32 +1558,53 @@ func initPebbleCmds(cmd *cobra.Command) {
 					return err
 				}
 			}
-			return pebbleCryptoInitializer()
+			if debugPebbleOpts.sharedStorageURI != "" {
+				es, err := cloud.ExternalStorageFromURI(
+					context.Background(),
+					debugPebbleOpts.sharedStorageURI,
+					base.ExternalIODirConfig{},
+					cluster.MakeClusterSettings(),
+					nil, /* blobClientFactory: */
+					username.PublicRoleName(),
+					nil, /* db */
+					nil, /* limiters */
+					cloud.NilMetrics,
+				)
+				if err != nil {
+					return err
+				}
+				wrapper := storage.MakeExternalStorageWrapper(context.Background(), es)
+				factory := remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
+					"": wrapper,
+				})
+				pebbleTool.ConfigureSharedStorage(factory, true /* createOnShared */, "" /* createOnSharedLocator */)
+			}
+			pebbleCryptoInitializer(cmd.Context())
+			return nil
 		}
-		initPebbleCmds(c)
+		initPebbleCmds(c, pebbleTool)
 	}
 }
 
-func pebbleCryptoInitializer() error {
-	storageConfig := base.StorageConfig{
-		Settings: serverCfg.Settings,
-		Dir:      serverCfg.Stores.Specs[0].Path,
-	}
+func pebbleCryptoInitializer(ctx context.Context) {
+	if EncryptedStorePathsHook != nil && PopulateStorageConfigHook != nil {
+		encryptedPaths := EncryptedStorePathsHook()
+		resolveFn := func(dir string) (vfs.FS, error) {
+			storageConfig := base.StorageConfig{
+				Settings: serverCfg.Settings,
+				Dir:      dir,
+			}
+			if err := PopulateStorageConfigHook(&storageConfig); err != nil {
+				return nil, err
+			}
+			_, encryptedEnv, err := storage.ResolveEncryptedEnvOptions(
+				ctx, &storageConfig, vfs.Default, false /* readOnly */)
+			if err != nil {
+				return nil, err
+			}
+			return encryptedEnv.FS, nil
 
-	if PopulateStorageConfigHook != nil {
-		if err := PopulateStorageConfigHook(&storageConfig); err != nil {
-			return err
 		}
+		pebbleToolFS.Init(encryptedPaths, resolveFn)
 	}
-
-	_, encryptedEnv, err := storage.ResolveEncryptedEnvOptions(&storageConfig, vfs.Default, false /* readOnly */)
-	if err != nil {
-		return err
-	}
-	if encryptedEnv != nil {
-		pebbleToolFS.set(encryptedEnv.FS)
-	} else {
-		pebbleToolFS.set(vfs.Default)
-	}
-	return nil
 }

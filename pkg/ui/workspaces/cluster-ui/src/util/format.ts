@@ -8,6 +8,8 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+import moment from "moment-timezone";
+import { CoordinatedUniversalTime } from "src/contexts";
 import { longToInt } from "./fixLong";
 
 export const kibi = 1024;
@@ -22,7 +24,16 @@ export const byteUnits: string[] = [
   "ZiB",
   "YiB",
 ];
-export const durationUnits: string[] = ["ns", "µs", "ms", "s"];
+
+export const durationUnitsDescending = [
+  { units: "hr", value: 60 * 60 * 1_000_000_000 },
+  { units: "min", value: 60 * 1_000_000_000 },
+  { units: "s", value: 1_000_000_000 },
+  { units: "ms", value: 1_000_000 },
+  { units: "µs", value: 1_000 },
+  { units: "ns", value: 1 },
+];
+
 export const countUnits: string[] = ["", "k", "m", "b"];
 
 interface UnitValue {
@@ -133,15 +144,48 @@ export function Percentage(
 }
 
 /**
+ * PercentageCustom creates a string representation of a fraction as a percentage.
+ * Accepts a precision parameter as optional indicating how many digits
+ * after the decimal point are desired. (e.g. precision 2 returns 8.37 %)
+ * If the number is zero or grater than 1, it works the same way as the Percentage
+ * function above, if is between 0 and 1, it looks for the first non-zero
+ * decimal number, up to 10 decimal points, otherwise shows ~0.0%
+ */
+export function PercentageCustom(
+  numerator: number,
+  denominator: number,
+  precision?: number,
+): string {
+  if (denominator === 0) {
+    return "--%";
+  }
+  const pct = (numerator / denominator) * 100;
+  if (pct <= 0 || pct >= 1) {
+    return Percentage(numerator, denominator, precision);
+  }
+  const pctString = pct.toFixed(10);
+  let finalPct = "0.";
+  let found = false;
+  for (let index = 2; index < pctString.length && !found; index++) {
+    finalPct = `${finalPct}${pctString[index]}`;
+    if (pctString[index] != "0") {
+      found = true;
+    }
+  }
+  if (found) {
+    return finalPct + " %";
+  }
+  return "~0.0 %";
+}
+
+/**
  * ComputeDurationScale calculates an appropriate scale factor and unit to use
  * to display a given duration value, without actually converting the value.
  */
-export function ComputeDurationScale(nanoseconds: number): UnitValue {
-  const scale = ComputePrefixExponent(nanoseconds, 1000, durationUnits);
-  return {
-    value: Math.pow(1000, scale),
-    units: durationUnits[scale],
-  };
+export function ComputeDurationScale(ns: number): UnitValue {
+  return durationUnitsDescending.find(
+    ({ value }) => ns / value >= 1 || value == 1,
+  );
 }
 
 /**
@@ -168,31 +212,25 @@ export function DurationCheckSample(nanoseconds: number): string {
   return Duration(nanoseconds);
 }
 
-/**
- * Cast nanoseconds to provided scale units
- */
-// tslint:disable-next-line: variable-name
-export const DurationFitScale =
-  (scale: string) =>
-  (nanoseconds: number): string => {
-    if (!nanoseconds) {
-      return `0.00 ${scale}`;
-    }
-    const n = durationUnits.indexOf(scale);
-    return `${(nanoseconds / Math.pow(1000, n)).toFixed(2)} ${scale}`;
-  };
-
 export const DATE_FORMAT = "MMM DD, YYYY [at] H:mm";
 export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT =
   "MMM DD, YYYY [at] H:mm:ss:ms";
 
 /**
- * Alternate 24 hour UTC formats
+ * Alternate 24 hour formats
  */
-export const DATE_FORMAT_24_UTC = "MMM DD, YYYY [at] H:mm UTC";
-export const DATE_WITH_SECONDS_FORMAT_24_UTC = "MMM DD, YYYY [at] H:mm:ss UTC";
-export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_UTC =
-  "MMM DD, YYYY [at] H:mm:ss:ms UTC";
+export const DATE_FORMAT_24_TZ = "MMM DD, YYYY [at] H:mm z";
+export const DATE_WITH_SECONDS_FORMAT_24_TZ = "MMM DD, YYYY [at] H:mm:ss z";
+export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_TZ =
+  "MMM DD, YYYY [at] H:mm:ss:ms z";
+
+export function FormatWithTimezone(
+  m: moment.Moment,
+  formatString = DATE_WITH_SECONDS_FORMAT_24_TZ,
+  timezone = CoordinatedUniversalTime,
+): string {
+  return moment.tz(m, timezone).format(formatString);
+}
 
 export function RenderCount(yesCount: Long, totalCount: Long): string {
   if (longToInt(yesCount) == 0) {
@@ -282,7 +320,7 @@ function add(a: string, b: string): string {
 // to an int64 (in string form).
 export function HexStringToInt64String(s: string): string {
   let dec = "0";
-  s.split("").forEach(function (chr: string) {
+  s?.split("").forEach(function (chr: string) {
     const n = parseInt(chr, 16);
     for (let t = 8; t; t >>= 1) {
       dec = add(dec, dec);
@@ -351,4 +389,52 @@ export function EncodeDatabaseTableIndexUri(
 
 export function EncodeDatabaseUri(db: string): string {
   return `/database/${EncodeUriName(db)}`;
+}
+
+interface BreakLineReplacement {
+  [key: string]: string;
+}
+
+const breakLinesKeywords: BreakLineReplacement = {
+  " FROM ": " FROM ",
+  " WHERE ": "   WHERE ",
+  " AND ": "    AND ",
+  " ORDER ": " ORDER ",
+  " LIMIT ": " LIMIT ",
+  " JOIN ": "   JOIN ",
+  " ON ": "    ON ",
+  " VALUES ": "   VALUES ",
+};
+const LINE_BREAK_LIMIT = 100;
+
+export function FormatQuery(query: string): string {
+  if (query == null) {
+    return "";
+  }
+  Object.keys(breakLinesKeywords).forEach(key => {
+    query = query.replace(new RegExp(key, "g"), `\n${breakLinesKeywords[key]}`);
+  });
+  const lines = query.split("\n").map(line => {
+    if (line.length <= LINE_BREAK_LIMIT) {
+      return line;
+    }
+    return breakLongLine(line, LINE_BREAK_LIMIT);
+  });
+
+  return lines.join("\n");
+}
+
+function breakLongLine(line: string, limit: number): string {
+  if (line.length <= limit) {
+    return line;
+  }
+  const idxComma = line.indexOf(",", limit);
+  if (idxComma == -1) {
+    return line;
+  }
+
+  return `${line.substring(0, idxComma + 1)}\n${breakLongLine(
+    line.substring(idxComma + 1).trim(),
+    limit,
+  )}`;
 }

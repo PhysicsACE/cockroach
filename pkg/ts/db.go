@@ -21,9 +21,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 var (
@@ -46,7 +46,7 @@ var TimeseriesStorageEnabled = settings.RegisterBoolSetting(
 	"if set, periodic timeseries data is stored within the cluster; disabling is not recommended "+
 		"unless you are storing the data elsewhere",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // Resolution10sStorageTTL defines the maximum age of data that will be retained
 // at he 10 second resolution. Data older than this is subject to being "rolled
@@ -57,25 +57,7 @@ var Resolution10sStorageTTL = settings.RegisterDurationSetting(
 	"the maximum age of time series data stored at the 10 second resolution. Data older than this "+
 		"is subject to rollup and deletion.",
 	resolution10sDefaultRollupThreshold,
-).WithPublic()
-
-// deprecatedResolution30StoreDuration is retained for backward compatibility during a version upgrade.
-var deprecatedResolution30StoreDuration = func() *settings.DurationSetting {
-	s := settings.RegisterDurationSetting(
-		settings.TenantWritable,
-		"timeseries.storage.30m_resolution_ttl", "replaced by timeseries.storage.resolution_30m.ttl",
-		resolution30mDefaultPruneThreshold,
-	)
-	s.SetRetired()
-	return s
-}()
-
-func init() {
-	// The setting is not used any more, but we need to keep its
-	// definition for backward compatibility until the next release
-	// cycle.
-	_ = deprecatedResolution30StoreDuration
-}
+	settings.WithPublic)
 
 // Resolution30mStorageTTL defines the maximum age of data that will be
 // retained at he 30 minute resolution. Data older than this is subject to
@@ -86,7 +68,7 @@ var Resolution30mStorageTTL = settings.RegisterDurationSetting(
 	"the maximum age of time series data stored at the 30 minute resolution. Data older than this "+
 		"is subject to deletion.",
 	resolution30mDefaultPruneThreshold,
-).WithPublic()
+	settings.WithPublic)
 
 // DB provides Cockroach's Time Series API.
 type DB struct {
@@ -148,7 +130,7 @@ func (db *DB) PollSource(
 	frequency time.Duration,
 	r Resolution,
 	stopper *stop.Stopper,
-) {
+) (firstDone <-chan struct{}) {
 	ambient.AddLogTag("ts-poll", nil)
 	p := &poller{
 		AmbientContext: ambient,
@@ -158,37 +140,47 @@ func (db *DB) PollSource(
 		r:              r,
 		stopper:        stopper,
 	}
-	p.start()
+	return p.start()
 }
 
 // start begins the goroutine for this poller, which will periodically request
 // time series data from the DataSource and store it.
-func (p *poller) start() {
+func (p *poller) start() (firstDone <-chan struct{}) {
+	ch := make(chan struct{})
 	// Poll once immediately and synchronously.
-	p.poll()
 	bgCtx := p.AnnotateCtx(context.Background())
-	_ = p.stopper.RunAsyncTask(bgCtx, "ts-poller", func(context.Context) {
-		ticker := time.NewTicker(p.frequency)
+	if p.stopper.RunAsyncTask(bgCtx, "ts-poller", func(ctx context.Context) {
+		ch := ch // goroutine-local copy
+		ticker := timeutil.NewTimer()
+		ticker.Reset(0)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				p.poll()
+				ticker.Read = true
+				ticker.Reset(p.frequency)
+				p.poll(ctx)
+				if ch != nil {
+					close(ch)
+					ch = nil
+				}
 			case <-p.stopper.ShouldQuiesce():
 				return
 			}
 		}
-	})
+	}) != nil {
+		close(ch)
+	}
+	return ch
 }
 
 // poll retrieves data from the underlying DataSource a single time, storing any
 // returned time series data on the server.
-func (p *poller) poll() {
+func (p *poller) poll(ctx context.Context) {
 	if !TimeseriesStorageEnabled.Get(&p.db.st.SV) {
 		return
 	}
 
-	ctx := p.AnnotateCtx(context.Background())
 	if err := p.stopper.RunTask(ctx, "ts.poller: poll", func(ctx context.Context) {
 		data := p.source.GetTimeSeriesData()
 		if len(data) == 0 {
@@ -198,7 +190,7 @@ func (p *poller) poll() {
 		const opName = "ts-poll"
 		ctx, span := p.AnnotateCtxWithSpan(ctx, opName)
 		defer span.Finish()
-		if err := contextutil.RunWithTimeout(ctx, opName, storeDataTimeout,
+		if err := timeutil.RunWithTimeout(ctx, opName, storeDataTimeout,
 			func(ctx context.Context) error {
 				return p.db.StoreData(ctx, p.r, data)
 			},

@@ -83,12 +83,13 @@ func (f *rowBasedFlow) setupProcessors(
 	ctx context.Context, spec *execinfrapb.FlowSpec, inputSyncs [][]execinfra.RowSource,
 ) error {
 	processors := make([]execinfra.Processor, 0, len(spec.Processors))
+	outputs := make([]execinfra.RowReceiver, 0, len(spec.Processors))
 
 	// Populate processors: see which processors need their own goroutine and
 	// which are fused with their consumer.
 	for i := range spec.Processors {
 		pspec := &spec.Processors[i]
-		p, err := f.makeProcessor(ctx, pspec, inputSyncs[i])
+		p, output, err := f.makeProcessorAndOutput(ctx, pspec, inputSyncs[i])
 		if err != nil {
 			return err
 		}
@@ -165,10 +166,10 @@ func (f *rowBasedFlow) setupProcessors(
 		}
 		if !fuse() {
 			processors = append(processors, p)
+			outputs = append(outputs, output)
 		}
 	}
-	f.SetProcessors(processors)
-	return nil
+	return f.SetProcessorsAndOutputs(processors, outputs)
 }
 
 // findProcByOutputStreamID looks in spec for a processor that has a
@@ -200,11 +201,11 @@ func findProcByOutputStreamID(
 	return nil
 }
 
-func (f *rowBasedFlow) makeProcessor(
+func (f *rowBasedFlow) makeProcessorAndOutput(
 	ctx context.Context, ps *execinfrapb.ProcessorSpec, inputs []execinfra.RowSource,
-) (execinfra.Processor, error) {
+) (execinfra.Processor, execinfra.RowReceiver, error) {
 	if len(ps.Output) != 1 {
-		return nil, errors.Errorf("only single-output processors supported")
+		return nil, nil, errors.Errorf("only single-output processors supported")
 	}
 	var output execinfra.RowReceiver
 	spec := &ps.Output[0]
@@ -212,17 +213,17 @@ func (f *rowBasedFlow) makeProcessor(
 		// There is no entity that corresponds to a pass-through router - we just
 		// use its output stream directly.
 		if len(spec.Streams) != 1 {
-			return nil, errors.Errorf("expected one stream for passthrough router")
+			return nil, nil, errors.Errorf("expected one stream for passthrough router")
 		}
 		var err error
-		output, err = f.setupOutboundStream(spec.Streams[0])
+		output, err = f.setupOutboundStream(spec.Streams[0], ps.ProcessorID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else {
-		r, err := f.setupRouter(spec)
+		r, err := f.setupRouter(spec, ps.ProcessorID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		output = r
 		f.AddStartable(r)
@@ -237,7 +238,6 @@ func (f *rowBasedFlow) makeProcessor(
 
 	output = &copyingRowReceiver{RowReceiver: output}
 
-	outputs := []execinfra.RowReceiver{output}
 	proc, err := rowexec.NewProcessor(
 		ctx,
 		&f.FlowCtx,
@@ -245,11 +245,10 @@ func (f *rowBasedFlow) makeProcessor(
 		&ps.Core,
 		&ps.Post,
 		inputs,
-		outputs,
 		f.GetLocalProcessors(),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Initialize any routers (the setupRouter case above) and outboxes.
@@ -257,11 +256,11 @@ func (f *rowBasedFlow) makeProcessor(
 	rowRecv := output.(*copyingRowReceiver).RowReceiver
 	switch o := rowRecv.(type) {
 	case router:
-		o.init(ctx, &f.FlowCtx, types)
+		o.init(ctx, &f.FlowCtx, ps.ProcessorID, types)
 	case *flowinfra.Outbox:
 		o.Init(types)
 	}
-	return proc, nil
+	return proc, output, nil
 }
 
 // setupInputSyncs populates a slice of input syncs, one for each Processor in
@@ -400,7 +399,7 @@ func (f *rowBasedFlow) setupInboundStream(
 // RowChannel is looked up in the localStreams map; otherwise an outgoing
 // mailbox is created.
 func (f *rowBasedFlow) setupOutboundStream(
-	spec execinfrapb.StreamEndpointSpec,
+	spec execinfrapb.StreamEndpointSpec, processorID int32,
 ) (execinfra.RowReceiver, error) {
 	sid := spec.StreamID
 	switch spec.Type {
@@ -409,7 +408,7 @@ func (f *rowBasedFlow) setupOutboundStream(
 
 	case execinfrapb.StreamEndpointSpec_REMOTE:
 		atomic.AddInt32(&f.numOutboxes, 1)
-		outbox := flowinfra.NewOutbox(&f.FlowCtx, spec.TargetNodeID, sid, &f.numOutboxes, f.FlowCtx.Gateway)
+		outbox := flowinfra.NewOutbox(&f.FlowCtx, processorID, spec.TargetNodeID, sid, &f.numOutboxes, f.FlowCtx.Gateway)
 		f.AddStartable(outbox)
 		return outbox, nil
 
@@ -432,11 +431,13 @@ func (f *rowBasedFlow) setupOutboundStream(
 // setupRouter initializes a router and the outbound streams.
 //
 // Pass-through routers are not supported; they should be handled separately.
-func (f *rowBasedFlow) setupRouter(spec *execinfrapb.OutputRouterSpec) (router, error) {
+func (f *rowBasedFlow) setupRouter(
+	spec *execinfrapb.OutputRouterSpec, processorID int32,
+) (router, error) {
 	streams := make([]execinfra.RowReceiver, len(spec.Streams))
 	for i := range spec.Streams {
 		var err error
-		streams[i], err = f.setupOutboundStream(spec.Streams[i])
+		streams[i], err = f.setupOutboundStream(spec.Streams[i], processorID)
 		if err != nil {
 			return nil, err
 		}

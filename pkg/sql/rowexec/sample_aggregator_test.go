@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
@@ -163,12 +164,12 @@ func runSampleAggregator(
 			Sketches:      sketchSpecs,
 		}
 		p, err := newSamplerProcessor(
-			context.Background(), &flowCtx, 0 /* processorID */, spec, in[i], &execinfrapb.PostProcessSpec{}, outputs[i],
+			context.Background(), &flowCtx, 0 /* processorID */, spec, in[i], &execinfrapb.PostProcessSpec{},
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Run(context.Background())
+		p.Run(context.Background(), outputs[i])
 	}
 	// Randomly interleave the output rows from the samplers into a single buffer.
 	samplerResults := distsqlutils.NewRowBuffer(samplerOutTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
@@ -197,12 +198,12 @@ func runSampleAggregator(
 	}
 
 	agg, err := newSampleAggregator(
-		context.Background(), &flowCtx, 0 /* processorID */, spec, samplerResults, &execinfrapb.PostProcessSpec{}, finalOut,
+		context.Background(), &flowCtx, 0 /* processorID */, spec, samplerResults, &execinfrapb.PostProcessSpec{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	agg.Run(context.Background())
+	agg.Run(context.Background(), finalOut)
 	// Make sure there was no error.
 	finalOut.GetRowsNoMeta(t)
 	r := sqlutils.MakeSQLRunner(sqlDB)
@@ -250,7 +251,7 @@ func runSampleAggregator(
 
 			for _, b := range h.Buckets {
 				ed, _, err := rowenc.EncDatumFromBuffer(
-					types.Int, catenumpb.DatumEncoding_ASCENDING_KEY, b.UpperBound,
+					catenumpb.DatumEncoding_ASCENDING_KEY, b.UpperBound,
 				)
 				if err != nil {
 					t.Fatal(err)
@@ -305,6 +306,7 @@ func runSampleAggregator(
 
 func TestSampleAggregator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	server, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer server.Stopper().Stop(context.Background())

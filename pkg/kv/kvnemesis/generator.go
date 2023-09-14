@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
 	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
@@ -63,17 +64,34 @@ type OperationConfig struct {
 // composition of the operations in the txn is controlled by TxnClientOps and
 // TxnBatchOps
 type ClosureTxnConfig struct {
+	// CommitSerializable is a serializable transaction that commits normally.
+	CommitSerializable int
+	// CommitSnapshot is a snapshot transaction that commits normally.
+	CommitSnapshot int
+	// CommitReadCommitted is a read committed transaction that commits normally.
+	CommitReadCommitted int
+	// RollbackSerializable is a serializable transaction that encounters an error
+	// at the end and has to roll back.
+	RollbackSerializable int
+	// RollbackSnapshot is a snapshot transaction that encounters an error at the
+	// end and has to roll back.
+	RollbackSnapshot int
+	// RollbackReadCommitted is a read committed transaction that encounters an
+	// error at the end and has to roll back.
+	RollbackReadCommitted int
+	// CommitSerializableInBatch is a serializable transaction that commits via
+	// the CommitInBatchMethod. This is an important part of the 1pc txn fastpath.
+	CommitSerializableInBatch int
+	// CommitSnapshotInBatch is a snapshot transaction that commits via the
+	// CommitInBatchMethod. This is an important part of the 1pc txn fastpath.
+	CommitSnapshotInBatch int
+	// CommitReadCommittedInBatch is a read committed transaction that commits
+	// via the CommitInBatchMethod. This is an important part of the 1pc txn
+	// fastpath.
+	CommitReadCommittedInBatch int
+
 	TxnClientOps ClientOperationConfig
 	TxnBatchOps  BatchOperationConfig
-
-	// Commit is a transaction that commits normally.
-	Commit int
-	// Rollback is a transaction that encounters an error at the end and has to
-	// roll back.
-	Rollback int
-	// CommitInBatch is a transaction that commits via the CommitInBatchMethod.
-	// This is an important part of the 1pc txn fastpath.
-	CommitInBatch int
 	// When CommitInBatch is selected, CommitBatchOps controls the composition of
 	// the kv.Batch used.
 	CommitBatchOps ClientOperationConfig
@@ -88,11 +106,23 @@ type ClientOperationConfig struct {
 	// GetMissingForUpdate is an operation that Gets a key that definitely
 	// doesn't exist using a locking read.
 	GetMissingForUpdate int
+	// GetMissingSkipLocked is an operation that Gets a key that definitely
+	// doesn't exist while skipping locked keys.
+	GetMissingSkipLocked int
+	// GetMissingForUpdateSkipLocked is an operation that Gets a key that
+	// definitely doesn't exist using a locking read while skipping locked keys.
+	GetMissingForUpdateSkipLocked int
 	// GetExisting is an operation that Gets a key that likely exists.
 	GetExisting int
 	// GetExistingForUpdate is an operation that Gets a key that likely exists
 	// using a locking read.
 	GetExistingForUpdate int
+	// GetExistingSkipLocked is an operation that Gets a key that likely exists
+	// while skipping locked keys.
+	GetExistingSkipLocked int
+	// GetExistingForUpdateSkipLocked is an operation that Gets a key that likely
+	// exists using a locking read while skipping locked keys.
+	GetExistingForUpdateSkipLocked int
 	// PutMissing is an operation that Puts a key that definitely doesn't exist.
 	PutMissing int
 	// PutExisting is an operation that Puts a key that likely exists.
@@ -102,12 +132,25 @@ type ClientOperationConfig struct {
 	// ScanForUpdate is an operation that Scans a key range that may contain
 	// values using a per-key locking scan.
 	ScanForUpdate int
+	// ScanSkipLocked is an operation that Scans a key range that may contain
+	// values while skipping locked keys.
+	ScanSkipLocked int
+	// ScanForUpdateSkipLocked is an operation that Scans a key range that may
+	// contain values using a per-key locking scan while skipping locked keys.
+	ScanForUpdateSkipLocked int
 	// ReverseScan is an operation that Scans a key range that may contain
 	// values in reverse key order.
 	ReverseScan int
 	// ReverseScanForUpdate is an operation that Scans a key range that may
 	// contain values using a per-key locking scan in reverse key order.
 	ReverseScanForUpdate int
+	// ReverseScanSkipLocked is an operation that Scans a key range that may
+	// contain values in reverse key order while skipping locked keys.
+	ReverseScanSkipLocked int
+	// ReverseScanForUpdateSkipLocked is an operation that Scans a key range that
+	// may contain values using a per-key locking scan in reverse key order while
+	// skipping locked keys.
+	ReverseScanForUpdateSkipLocked int
 	// DeleteMissing is an operation that Deletes a key that definitely doesn't exist.
 	DeleteMissing int
 	// DeleteExisting is an operation that Deletes a key that likely exists.
@@ -184,21 +227,27 @@ type ChangeZoneConfig struct {
 // yet pass (for example, if the new operation finds a kv bug or edge case).
 func newAllOperationsConfig() GeneratorConfig {
 	clientOpConfig := ClientOperationConfig{
-		GetMissing:                1,
-		GetMissingForUpdate:       1,
-		GetExisting:               1,
-		GetExistingForUpdate:      1,
-		PutMissing:                1,
-		PutExisting:               1,
-		Scan:                      1,
-		ScanForUpdate:             1,
-		ReverseScan:               1,
-		ReverseScanForUpdate:      1,
-		DeleteMissing:             1,
-		DeleteExisting:            1,
-		DeleteRange:               1,
-		DeleteRangeUsingTombstone: 1,
-		AddSSTable:                1,
+		GetMissing:                     1,
+		GetMissingForUpdate:            1,
+		GetExisting:                    1,
+		GetExistingForUpdate:           1,
+		GetExistingSkipLocked:          1,
+		GetExistingForUpdateSkipLocked: 1,
+		PutMissing:                     1,
+		PutExisting:                    1,
+		Scan:                           1,
+		ScanForUpdate:                  1,
+		ScanSkipLocked:                 1,
+		ScanForUpdateSkipLocked:        1,
+		ReverseScan:                    1,
+		ReverseScanForUpdate:           1,
+		ReverseScanSkipLocked:          1,
+		ReverseScanForUpdateSkipLocked: 1,
+		DeleteMissing:                  1,
+		DeleteExisting:                 1,
+		DeleteRange:                    1,
+		DeleteRangeUsingTombstone:      1,
+		AddSSTable:                     1,
 	}
 	batchOpConfig := BatchOperationConfig{
 		Batch: 4,
@@ -208,12 +257,18 @@ func newAllOperationsConfig() GeneratorConfig {
 		DB:    clientOpConfig,
 		Batch: batchOpConfig,
 		ClosureTxn: ClosureTxnConfig{
-			Commit:         5,
-			Rollback:       5,
-			CommitInBatch:  5,
-			TxnClientOps:   clientOpConfig,
-			TxnBatchOps:    batchOpConfig,
-			CommitBatchOps: clientOpConfig,
+			CommitSerializable:         2,
+			CommitSnapshot:             2,
+			CommitReadCommitted:        2,
+			RollbackSerializable:       2,
+			RollbackSnapshot:           2,
+			RollbackReadCommitted:      2,
+			CommitSerializableInBatch:  2,
+			CommitSnapshotInBatch:      2,
+			CommitReadCommittedInBatch: 2,
+			TxnClientOps:               clientOpConfig,
+			TxnBatchOps:                batchOpConfig,
+			CommitBatchOps:             clientOpConfig,
 		},
 		Split: SplitConfig{
 			SplitNew:   1,
@@ -276,6 +331,18 @@ func NewDefaultConfig() GeneratorConfig {
 	// #45586 has already been addressed.
 	config.Ops.ClosureTxn.CommitBatchOps.GetExisting = 0
 	config.Ops.ClosureTxn.CommitBatchOps.GetMissing = 0
+	// SkipLocked is a batch-level attribute, not an operation-level attribute. To
+	// avoid mixing skip locked and non-skip locked requests, we disable these ops
+	// in the batchOpConfig.
+	// TODO(nvanbenschoten): support multi-operation SkipLocked batches.
+	config.Ops.Batch.Ops.GetMissingSkipLocked = 0
+	config.Ops.Batch.Ops.GetMissingForUpdateSkipLocked = 0
+	config.Ops.Batch.Ops.GetExistingSkipLocked = 0
+	config.Ops.Batch.Ops.GetExistingForUpdateSkipLocked = 0
+	config.Ops.Batch.Ops.ScanSkipLocked = 0
+	config.Ops.Batch.Ops.ScanForUpdateSkipLocked = 0
+	config.Ops.Batch.Ops.ReverseScanSkipLocked = 0
+	config.Ops.Batch.Ops.ReverseScanForUpdateSkipLocked = 0
 	// AddSSTable cannot be used in transactions, nor in batches.
 	config.Ops.Batch.Ops.AddSSTable = 0
 	config.Ops.ClosureTxn.CommitBatchOps.AddSSTable = 0
@@ -459,18 +526,26 @@ func (g *generator) selectOp(rng *rand.Rand, contextuallyValid []opGen) Operatio
 func (g *generator) registerClientOps(allowed *[]opGen, c *ClientOperationConfig) {
 	addOpGen(allowed, randGetMissing, c.GetMissing)
 	addOpGen(allowed, randGetMissingForUpdate, c.GetMissingForUpdate)
+	addOpGen(allowed, randGetMissingSkipLocked, c.GetMissingSkipLocked)
+	addOpGen(allowed, randGetMissingForUpdateSkipLocked, c.GetMissingForUpdateSkipLocked)
 	addOpGen(allowed, randPutMissing, c.PutMissing)
 	addOpGen(allowed, randDelMissing, c.DeleteMissing)
 	if len(g.keys) > 0 {
 		addOpGen(allowed, randGetExisting, c.GetExisting)
 		addOpGen(allowed, randGetExistingForUpdate, c.GetExistingForUpdate)
+		addOpGen(allowed, randGetExistingSkipLocked, c.GetExistingSkipLocked)
+		addOpGen(allowed, randGetExistingForUpdateSkipLocked, c.GetExistingForUpdateSkipLocked)
 		addOpGen(allowed, randPutExisting, c.PutExisting)
 		addOpGen(allowed, randDelExisting, c.DeleteExisting)
 	}
 	addOpGen(allowed, randScan, c.Scan)
 	addOpGen(allowed, randScanForUpdate, c.ScanForUpdate)
+	addOpGen(allowed, randScanSkipLocked, c.ScanSkipLocked)
+	addOpGen(allowed, randScanForUpdateSkipLocked, c.ScanForUpdateSkipLocked)
 	addOpGen(allowed, randReverseScan, c.ReverseScan)
 	addOpGen(allowed, randReverseScanForUpdate, c.ReverseScanForUpdate)
+	addOpGen(allowed, randReverseScanSkipLocked, c.ReverseScanSkipLocked)
+	addOpGen(allowed, randReverseScanForUpdateSkipLocked, c.ReverseScanForUpdateSkipLocked)
 	addOpGen(allowed, randDelRange, c.DeleteRange)
 	addOpGen(allowed, randDelRangeUsingTombstone, c.DeleteRangeUsingTombstone)
 	addOpGen(allowed, randAddSSTable, c.AddSSTable)
@@ -484,9 +559,21 @@ func randGetMissing(_ *generator, rng *rand.Rand) Operation {
 	return get(randKey(rng))
 }
 
-func randGetMissingForUpdate(_ *generator, rng *rand.Rand) Operation {
-	op := get(randKey(rng))
+func randGetMissingForUpdate(g *generator, rng *rand.Rand) Operation {
+	op := randGetMissing(g, rng)
 	op.Get.ForUpdate = true
+	return op
+}
+
+func randGetMissingSkipLocked(g *generator, rng *rand.Rand) Operation {
+	op := randGetMissing(g, rng)
+	op.Get.SkipLocked = true
+	return op
+}
+
+func randGetMissingForUpdateSkipLocked(g *generator, rng *rand.Rand) Operation {
+	op := randGetMissingForUpdate(g, rng)
+	op.Get.SkipLocked = true
 	return op
 }
 
@@ -496,9 +583,20 @@ func randGetExisting(g *generator, rng *rand.Rand) Operation {
 }
 
 func randGetExistingForUpdate(g *generator, rng *rand.Rand) Operation {
-	key := randMapKey(rng, g.keys)
-	op := get(key)
+	op := randGetExisting(g, rng)
 	op.Get.ForUpdate = true
+	return op
+}
+
+func randGetExistingSkipLocked(g *generator, rng *rand.Rand) Operation {
+	op := randGetExisting(g, rng)
+	op.Get.SkipLocked = true
+	return op
+}
+
+func randGetExistingForUpdateSkipLocked(g *generator, rng *rand.Rand) Operation {
+	op := randGetExistingForUpdate(g, rng)
+	op.Get.SkipLocked = true
 	return op
 }
 
@@ -519,30 +617,39 @@ func randAddSSTable(g *generator, rng *rand.Rand) Operation {
 	ctx := context.Background()
 
 	sstTimestamp := hlc.MinTimestamp // replaced via SSTTimestampToRequestTimestamp
-	numKeys := rng.Intn(16) + 1      // number of point keys
+	numPointKeys := rng.Intn(16) + 1 // number of point keys (but see below)
+	numRangeKeys := rng.Intn(3) + 1  // number of range keys (but see below)
 	probReplace := 0.2               // probability to replace existing key, if possible
 	probTombstone := 0.2             // probability to write a tombstone
 	asWrites := rng.Float64() < 0.2  // IngestAsWrites
+
+	if r := rng.Float64(); r < 0.8 {
+		// 80% probability of only point keys.
+		numRangeKeys = 0
+	} else if r < 0.9 {
+		// 10% probability of only range keys.
+		numPointKeys = 0
+	}
+	// else 10% probability of mixed point/range keys.
 
 	// AddSSTable requests cannot span multiple ranges, so we try to fit them
 	// within an existing range. This may race with a concurrent split, in which
 	// case the AddSSTable will fail, but that's ok -- most should still succeed.
 	rangeStart, rangeEnd := randRangeSpan(rng, g.currentSplits)
-	rangeKeys := keysBetween(g.keys, rangeStart, rangeEnd)
+	curKeys := keysBetween(g.keys, rangeStart, rangeEnd)
 
 	// Generate keys first, to write them in order and without duplicates. We pick
 	// either existing or new keys depending on probReplace, making sure they're
-	// unique.
-	//
-	// TODO(erikgrinaker): For now, only ingest point keys. We currently don't
-	// ingest range keys in production code, although we soon will.
+	// unique. We generate keys both for point keys and for the start bound of
+	// range keys, such that we afterwards can pick out a set of range keys that
+	// don't overlap any other keys.
 	sstKeys := []string{}
 	sstKeysMap := map[string]struct{}{}
-	for len(sstKeys) < numKeys {
+	for len(sstKeys) < numPointKeys+numRangeKeys {
 		var key string
-		if len(rangeKeys) > 0 && rng.Float64() < probReplace {
+		if len(curKeys) > 0 && rng.Float64() < probReplace {
 			// Pick a random existing key when appropriate.
-			key = rangeKeys[rng.Intn(len(rangeKeys))]
+			key = curKeys[rng.Intn(len(curKeys))]
 		} else {
 			// Generate a new random key in the range.
 			key = randKeyBetween(rng, rangeStart, rangeEnd)
@@ -554,9 +661,58 @@ func randAddSSTable(g *generator, rng *rand.Rand) Operation {
 	}
 	sort.Strings(sstKeys)
 
+	// Pick range key slots. We generated range key start bounds and point keys in
+	// sstKeys above, so we can pick random free range key slots between a random
+	// sstKeys and the next one. Later, we'll randomly shorten the range keys.
+	sstRangeKeysSlots := map[string]string{} // startKey->endKey
+	for len(sstRangeKeysSlots) < numRangeKeys {
+		i := rng.Intn(len(sstKeys))
+		startKey := sstKeys[i]
+		endKey := tk(math.MaxUint64)
+		if i+1 < len(sstKeys) {
+			endKey = sstKeys[i+1]
+		}
+		if _, ok := sstRangeKeysSlots[startKey]; !ok {
+			sstRangeKeysSlots[startKey] = endKey
+		}
+	}
+
+	// Separate sstKeys out into point keys and range keys. For the range keys,
+	// randomly constrain the bounds within their slot.
+	var sstPointKeys []storage.MVCCKey
+	var sstRangeKeys []storage.MVCCRangeKey
+	for _, key := range sstKeys {
+		if endKey, ok := sstRangeKeysSlots[key]; !ok {
+			// Point key. Just add it to sstPointKeys.
+			sstPointKeys = append(sstPointKeys, storage.MVCCKey{
+				Key:       roachpb.Key(key),
+				Timestamp: sstTimestamp,
+			})
+		} else {
+			// Range key. With 50% probability, shorten the start/end keys.
+			if rng.Float64() < 0.5 {
+				key = randKeyBetween(rng, key, endKey)
+			}
+			if rng.Float64() < 0.5 {
+				endKey = randKeyBetween(rng, tk(fk(key)+1), endKey)
+			}
+			sstRangeKeys = append(sstRangeKeys, storage.MVCCRangeKey{
+				StartKey:  roachpb.Key(key),
+				EndKey:    roachpb.Key(endKey),
+				Timestamp: sstTimestamp,
+			})
+		}
+	}
+
+	// Determine the SST span.
 	sstSpan := roachpb.Span{
 		Key:    roachpb.Key(sstKeys[0]),
 		EndKey: roachpb.Key(tk(fk(sstKeys[len(sstKeys)-1]) + 1)),
+	}
+	if len(sstRangeKeys) > 0 {
+		if last := sstRangeKeys[len(sstRangeKeys)-1]; last.EndKey.Compare(sstSpan.EndKey) > 0 {
+			sstSpan.EndKey = last.EndKey.Clone()
+		}
 	}
 
 	// Unlike other write operations, AddSSTable sends raw MVCC values directly
@@ -578,13 +734,19 @@ func randAddSSTable(g *generator, rng *rand.Rand) Operation {
 	w := storage.MakeIngestionSSTWriter(ctx, st, f)
 	defer w.Close()
 
-	for _, key := range sstKeys {
-		v := sstValue
+	for _, key := range sstPointKeys {
+		// Randomly write a tombstone instead of a value.
+		value := sstValue
 		if rng.Float64() < probTombstone {
-			v = sstTombstone
+			value = sstTombstone
 		}
-		err := w.PutMVCC(storage.MVCCKey{Key: roachpb.Key(key), Timestamp: sstTimestamp}, v)
-		if err != nil {
+		if err := w.PutMVCC(key, value); err != nil {
+			panic(err)
+		}
+	}
+	for _, rangeKey := range sstRangeKeys {
+		// Range keys are always range tombstones.
+		if err := w.PutMVCCRangeKey(rangeKey, sstTombstone); err != nil {
 			panic(err)
 		}
 	}
@@ -606,6 +768,18 @@ func randScanForUpdate(g *generator, rng *rand.Rand) Operation {
 	return op
 }
 
+func randScanSkipLocked(g *generator, rng *rand.Rand) Operation {
+	op := randScan(g, rng)
+	op.Scan.SkipLocked = true
+	return op
+}
+
+func randScanForUpdateSkipLocked(g *generator, rng *rand.Rand) Operation {
+	op := randScanForUpdate(g, rng)
+	op.Scan.SkipLocked = true
+	return op
+}
+
 func randReverseScan(g *generator, rng *rand.Rand) Operation {
 	op := randScan(g, rng)
 	op.Scan.Reverse = true
@@ -615,6 +789,18 @@ func randReverseScan(g *generator, rng *rand.Rand) Operation {
 func randReverseScanForUpdate(g *generator, rng *rand.Rand) Operation {
 	op := randReverseScan(g, rng)
 	op.Scan.ForUpdate = true
+	return op
+}
+
+func randReverseScanSkipLocked(g *generator, rng *rand.Rand) Operation {
+	op := randReverseScan(g, rng)
+	op.Scan.SkipLocked = true
+	return op
+}
+
+func randReverseScanForUpdateSkipLocked(g *generator, rng *rand.Rand) Operation {
+	op := randReverseScanForUpdate(g, rng)
+	op.Scan.SkipLocked = true
 	return op
 }
 
@@ -785,16 +971,31 @@ func makeRandBatch(c *ClientOperationConfig) opGenFunc {
 }
 
 func (g *generator) registerClosureTxnOps(allowed *[]opGen, c *ClosureTxnConfig) {
+	const Commit, Rollback = ClosureTxnType_Commit, ClosureTxnType_Rollback
+	const SSI, SI, RC = isolation.Serializable, isolation.Snapshot, isolation.ReadCommitted
 	addOpGen(allowed,
-		makeClosureTxn(ClosureTxnType_Commit, &c.TxnClientOps, &c.TxnBatchOps, nil /* commitInBatch*/), c.Commit)
+		makeClosureTxn(Commit, SSI, &c.TxnClientOps, &c.TxnBatchOps, nil /* commitInBatch*/), c.CommitSerializable)
 	addOpGen(allowed,
-		makeClosureTxn(ClosureTxnType_Rollback, &c.TxnClientOps, &c.TxnBatchOps, nil /* commitInBatch*/), c.Rollback)
+		makeClosureTxn(Commit, SI, &c.TxnClientOps, &c.TxnBatchOps, nil /* commitInBatch*/), c.CommitSnapshot)
 	addOpGen(allowed,
-		makeClosureTxn(ClosureTxnType_Commit, &c.TxnClientOps, &c.TxnBatchOps, &c.CommitBatchOps), c.CommitInBatch)
+		makeClosureTxn(Commit, RC, &c.TxnClientOps, &c.TxnBatchOps, nil /* commitInBatch*/), c.CommitReadCommitted)
+	addOpGen(allowed,
+		makeClosureTxn(Rollback, SSI, &c.TxnClientOps, &c.TxnBatchOps, nil /* commitInBatch*/), c.RollbackSerializable)
+	addOpGen(allowed,
+		makeClosureTxn(Rollback, SI, &c.TxnClientOps, &c.TxnBatchOps, nil /* commitInBatch*/), c.RollbackSnapshot)
+	addOpGen(allowed,
+		makeClosureTxn(Rollback, RC, &c.TxnClientOps, &c.TxnBatchOps, nil /* commitInBatch*/), c.RollbackReadCommitted)
+	addOpGen(allowed,
+		makeClosureTxn(Commit, SSI, &c.TxnClientOps, &c.TxnBatchOps, &c.CommitBatchOps), c.CommitSerializableInBatch)
+	addOpGen(allowed,
+		makeClosureTxn(Commit, SI, &c.TxnClientOps, &c.TxnBatchOps, &c.CommitBatchOps), c.CommitSnapshotInBatch)
+	addOpGen(allowed,
+		makeClosureTxn(Commit, RC, &c.TxnClientOps, &c.TxnBatchOps, &c.CommitBatchOps), c.CommitReadCommittedInBatch)
 }
 
 func makeClosureTxn(
 	txnType ClosureTxnType,
+	iso isolation.Level,
 	txnClientOps *ClientOperationConfig,
 	txnBatchOps *BatchOperationConfig,
 	commitInBatch *ClientOperationConfig,
@@ -808,7 +1009,7 @@ func makeClosureTxn(
 		for i := range ops {
 			ops[i] = g.selectOp(rng, allowed)
 		}
-		op := closureTxn(txnType, ops...)
+		op := closureTxn(txnType, iso, ops...)
 		if commitInBatch != nil {
 			if txnType != ClosureTxnType_Commit {
 				panic(errors.AssertionFailedf(`CommitInBatch must commit got: %s`, txnType))
@@ -822,16 +1023,32 @@ func makeClosureTxn(
 // fk stands for "from key", i.e. decode the uint64 the key represents.
 // Panics on error.
 func fk(k string) uint64 {
-	k = k[len(GeneratorDataSpan().Key):]
-	_, s, err := encoding.DecodeUnsafeStringAscendingDeepCopy([]byte(k), nil)
+	i, err := fkE(k)
 	if err != nil {
 		panic(err)
+	}
+	return i
+}
+
+// fkE is like fk, but returns an error instead of panicking.
+func fkE(k string) (uint64, error) {
+	span := GeneratorDataSpan()
+	if !span.ContainsKey(roachpb.Key(k)) {
+		return 0, errors.New("key too short")
+	}
+	k = k[len(span.Key):]
+	_, s, err := encoding.DecodeUnsafeStringAscendingDeepCopy([]byte(k), nil)
+	if err != nil {
+		return 0, err
 	}
 	sl, err := hex.DecodeString(s)
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
-	return binary.BigEndian.Uint64(sl)
+	if len(sl) < 8 {
+		return 0, errors.New("slice too short")
+	}
+	return binary.BigEndian.Uint64(sl), nil
 }
 
 // tk stands for toKey, i.e. encode the uint64 into its key representation.
@@ -948,12 +1165,18 @@ func opSlice(ops ...Operation) []Operation {
 	return ops
 }
 
-func closureTxn(typ ClosureTxnType, ops ...Operation) Operation {
-	return Operation{ClosureTxn: &ClosureTxnOperation{Ops: ops, Type: typ}}
+func closureTxn(typ ClosureTxnType, iso isolation.Level, ops ...Operation) Operation {
+	return Operation{ClosureTxn: &ClosureTxnOperation{Ops: ops, Type: typ, IsoLevel: iso}}
 }
 
-func closureTxnCommitInBatch(commitInBatch []Operation, ops ...Operation) Operation {
-	o := closureTxn(ClosureTxnType_Commit, ops...)
+func closureTxnSSI(typ ClosureTxnType, ops ...Operation) Operation {
+	return closureTxn(typ, isolation.Serializable, ops...)
+}
+
+func closureTxnCommitInBatch(
+	iso isolation.Level, commitInBatch []Operation, ops ...Operation,
+) Operation {
+	o := closureTxn(ClosureTxnType_Commit, iso, ops...)
 	if len(commitInBatch) > 0 {
 		o.ClosureTxn.CommitInBatch = &BatchOperation{Ops: commitInBatch}
 	}
@@ -968,6 +1191,10 @@ func getForUpdate(key string) Operation {
 	return Operation{Get: &GetOperation{Key: []byte(key), ForUpdate: true}}
 }
 
+func getSkipLocked(key string) Operation {
+	return Operation{Get: &GetOperation{Key: []byte(key), SkipLocked: true}}
+}
+
 func put(key string, seq kvnemesisutil.Seq) Operation {
 	return Operation{Put: &PutOperation{Key: []byte(key), Seq: seq}}
 }
@@ -980,12 +1207,20 @@ func scanForUpdate(key, endKey string) Operation {
 	return Operation{Scan: &ScanOperation{Key: []byte(key), EndKey: []byte(endKey), ForUpdate: true}}
 }
 
+func scanSkipLocked(key, endKey string) Operation {
+	return Operation{Scan: &ScanOperation{Key: []byte(key), EndKey: []byte(endKey), SkipLocked: true}}
+}
+
 func reverseScan(key, endKey string) Operation {
 	return Operation{Scan: &ScanOperation{Key: []byte(key), EndKey: []byte(endKey), Reverse: true}}
 }
 
 func reverseScanForUpdate(key, endKey string) Operation {
 	return Operation{Scan: &ScanOperation{Key: []byte(key), EndKey: []byte(endKey), Reverse: true, ForUpdate: true}}
+}
+
+func reverseScanSkipLocked(key, endKey string) Operation {
+	return Operation{Scan: &ScanOperation{Key: []byte(key), EndKey: []byte(endKey), Reverse: true, SkipLocked: true}}
 }
 
 func del(key string, seq kvnemesisutil.Seq) Operation {

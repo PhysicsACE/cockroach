@@ -61,7 +61,7 @@ func verifyPercsWithAbsoluteEpsilon(t *testing.T, a []float64, s *Stream) {
 			upper = len(a)
 		}
 		w, min, max := a[k-1], a[lower-1], a[upper-1]
-		if g := s.Query(quantile); g < min || g > max {
+		if g := s.Query(quantile, true); g < min || g > max {
 			t.Errorf("q=%f: want %v [%f,%f], got %v", quantile, w, min, max, g)
 		}
 	}
@@ -76,7 +76,7 @@ func verifyLowPercsWithRelativeEpsilon(t *testing.T, a []float64, s *Stream) {
 		lowerRank := int((1 - RelativeEpsilon) * qu * n)
 		upperRank := int(math.Ceil((1 + RelativeEpsilon) * qu * n))
 		w, min, max := a[k-1], a[lowerRank-1], a[upperRank-1]
-		if g := s.Query(qu); g < min || g > max {
+		if g := s.Query(qu, true); g < min || g > max {
 			t.Errorf("q=%f: want %v [%f,%f], got %v", qu, w, min, max, g)
 		}
 	}
@@ -91,16 +91,16 @@ func verifyHighPercsWithRelativeEpsilon(t *testing.T, a []float64, s *Stream) {
 		lowerRank := int((1 - (1+RelativeEpsilon)*(1-qu)) * n)
 		upperRank := int(math.Ceil((1 - (1-RelativeEpsilon)*(1-qu)) * n))
 		w, min, max := a[k-1], a[lowerRank-1], a[upperRank-1]
-		if g := s.Query(qu); g < min || g > max {
+		if g := s.Query(qu, true); g < min || g > max {
 			t.Errorf("q=%f: want %v [%f,%f], got %v", qu, w, min, max, g)
 		}
 	}
 }
 
-func populateStream(s *Stream) []float64 {
+func populateStream(s *Stream, randSource *rand.Rand) []float64 {
 	a := make([]float64, 0, 1e5+100)
 	for i := 0; i < cap(a); i++ {
-		v := rand.NormFloat64()
+		v := randSource.NormFloat64()
 		// Add 5% asymmetric outliers.
 		if i%20 == 0 {
 			v = v*v + 1
@@ -112,14 +112,13 @@ func populateStream(s *Stream) []float64 {
 }
 
 func TestTargetedQuery(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s := NewTargeted(Targets)
-	a := populateStream(s)
+	a := populateStream(s, randSource)
 	verifyPercsWithAbsoluteEpsilon(t, a, s)
 }
 
 func TestTargetedQuerySmallSampleSize(t *testing.T) {
-	rand.Seed(42)
 	s := NewTargeted(TargetsSmallEpsilon)
 	a := []float64{1, 2, 3, 4, 5}
 	for _, v := range a {
@@ -135,7 +134,7 @@ func TestTargetedQuerySmallSampleSize(t *testing.T) {
 			0.90: 5,
 			0.99: 5,
 		} {
-			if got := s.Query(φ); got != want {
+			if got := s.Query(φ, true); got != want {
 				t.Errorf("want %f for φ=%f, got %f", want, φ, got)
 			}
 		}
@@ -143,48 +142,48 @@ func TestTargetedQuerySmallSampleSize(t *testing.T) {
 }
 
 func TestLowBiasedQuery(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s := NewLowBiased(RelativeEpsilon)
-	a := populateStream(s)
+	a := populateStream(s, randSource)
 	verifyLowPercsWithRelativeEpsilon(t, a, s)
 }
 
 func TestHighBiasedQuery(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s := NewHighBiased(RelativeEpsilon)
-	a := populateStream(s)
+	a := populateStream(s, randSource)
 	verifyHighPercsWithRelativeEpsilon(t, a, s)
 }
 
 // BrokenTestTargetedMerge is broken, see Merge doc comment.
 func BrokenTestTargetedMerge(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s1 := NewTargeted(Targets)
 	s2 := NewTargeted(Targets)
-	a := populateStream(s1)
-	a = append(a, populateStream(s2)...)
+	a := populateStream(s1, randSource)
+	a = append(a, populateStream(s2, randSource)...)
 	s1.Merge(s2.Samples())
 	verifyPercsWithAbsoluteEpsilon(t, a, s1)
 }
 
 // BrokenTestLowBiasedMerge is broken, see Merge doc comment.
 func BrokenTestLowBiasedMerge(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s1 := NewLowBiased(RelativeEpsilon)
 	s2 := NewLowBiased(RelativeEpsilon)
-	a := populateStream(s1)
-	a = append(a, populateStream(s2)...)
+	a := populateStream(s1, randSource)
+	a = append(a, populateStream(s2, randSource)...)
 	s1.Merge(s2.Samples())
 	verifyLowPercsWithRelativeEpsilon(t, a, s2)
 }
 
 // BrokenTestHighBiasedMerge is broken, see Merge doc comment.
 func BrokenTestHighBiasedMerge(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s1 := NewHighBiased(RelativeEpsilon)
 	s2 := NewHighBiased(RelativeEpsilon)
-	a := populateStream(s1)
-	a = append(a, populateStream(s2)...)
+	a := populateStream(s1, randSource)
+	a = append(a, populateStream(s2, randSource)...)
 	s1.Merge(s2.Samples())
 	verifyHighPercsWithRelativeEpsilon(t, a, s2)
 }
@@ -200,7 +199,7 @@ func TestUncompressed(t *testing.T) {
 	// Before compression, Query should have 100% accuracy.
 	for quantile := range Targets {
 		w := quantile * 100
-		if g := q.Query(quantile); g != w {
+		if g := q.Query(quantile, true); g != w {
 			t.Errorf("want %f, got %f", w, g)
 		}
 	}
@@ -219,14 +218,42 @@ func TestUncompressedSamples(t *testing.T) {
 func TestUncompressedOne(t *testing.T) {
 	q := NewTargeted(map[float64]float64{0.99: 0.01})
 	q.Insert(3.14)
-	if g := q.Query(0.90); g != 3.14 {
+	if g := q.Query(0.90, true); g != 3.14 {
 		t.Error("want PI, got", g)
 	}
 }
 
 func TestDefaults(t *testing.T) {
-	if g := NewTargeted(map[float64]float64{0.99: 0.001}).Query(0.99); g != 0 {
+	if g := NewTargeted(map[float64]float64{0.99: 0.001}).Query(0.99, true); g != 0 {
 		t.Errorf("want 0, got %f", g)
+	}
+}
+
+func TestQueryFlush(t *testing.T) {
+	q := NewTargeted(map[float64]float64{0.99: 0.001})
+	for i := 1; i <= 100; i++ {
+		q.Insert(float64(i))
+	}
+	// A flush after all inserts should make all following `Query`
+	// give the same result with shouldFlush true or false.
+	q.flush()
+	if p := q.Query(0.90, true); p != 91 {
+		t.Error("want 91, got", p)
+	}
+	if p := q.Query(0.90, false); p != 91 {
+		t.Error("want 91, got", p)
+	}
+
+	// Do an insert without forcing a flush. The Query with
+	// shouldFlush false will ignore the new value and return
+	// the same result as before.
+	q.Insert(float64(101))
+	if p := q.Query(0.90, false); p != 91 {
+		t.Error("want 91, got", p)
+	}
+	// The Query with flush will update the value.
+	if p := q.Query(0.90, true); p != 92 {
+		t.Error("want 92, got", p)
 	}
 }
 

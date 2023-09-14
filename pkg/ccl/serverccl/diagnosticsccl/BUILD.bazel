@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_test")
 
 go_test(
@@ -8,8 +7,10 @@ go_test(
         "reporter_test.go",
     ],
     args = ["-test.timeout=295s"],
+    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
+        "//pkg/ccl",
         "//pkg/ccl/kvccl/kvtenantccl",
         "//pkg/clusterversion",
         "//pkg/config/zonepb",
@@ -37,5 +38,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

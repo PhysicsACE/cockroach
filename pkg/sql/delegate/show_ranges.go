@@ -161,8 +161,10 @@ SELECT
 	}
 	// As well as the span boundaries, if any.
 	buf.WriteString(`
-  s.start_key AS span_start_key,
-  s.end_key AS span_end_key
+  s.start_key AS object_start_key,
+  s.end_key AS object_end_key,
+  IF(s.start_key < r.start_key, r.start_key, s.start_key) AS per_range_start_key,
+  IF(s.end_key < r.end_key, s.end_key, r.end_key) AS per_range_end_key
 FROM crdb_internal.ranges_no_leases r
 `)
 
@@ -321,8 +323,6 @@ AND s.end_key > r.start_key`)
 	//                            ...
 	//
 
-	buf.WriteString(",\nnamed_ranges AS (")
-
 	mode := n.Options.Mode
 	if n.Source == tree.ShowRangesIndex {
 		// The index view needs to see table_id/index_id propagate. We
@@ -337,6 +337,40 @@ AND s.end_key > r.start_key`)
 	if n.Source == tree.ShowRangesCluster && mode != tree.UniqueRanges {
 		dbNameCol = ", database_name"
 	}
+
+	// Include all_span_stats if DETAILS is a requested option.
+	if n.Options.Details {
+		var arrayArgs string
+		if mode == tree.UniqueRanges {
+			arrayArgs = "SELECT DISTINCT (start_key, end_key)"
+		} else {
+			arrayArgs = "SELECT (per_range_start_key, per_range_end_key)"
+		}
+		fmt.Fprintf(&buf, `,
+all_span_stats AS (
+	SELECT
+		start_key,
+		end_key,
+		jsonb_build_object(
+			'approximate_disk_bytes', stats->'approximate_disk_bytes',
+			'key_count', stats->'total_stats'->'key_count',
+			'key_bytes', stats->'total_stats'->'key_bytes',
+			'val_count', stats->'total_stats'->'val_count',
+			'val_bytes', stats->'total_stats'->'val_bytes',
+			'sys_count', stats->'total_stats'->'sys_count',
+			'sys_bytes', stats->'total_stats'->'sys_bytes',
+			'live_count', stats->'total_stats'->'live_count',
+			'live_bytes', stats->'total_stats'->'live_bytes',
+			'intent_count', stats->'total_stats'->'intent_count',
+			'intent_bytes', stats->'total_stats'->'intent_bytes'
+		) as stats
+	FROM crdb_internal.tenant_span_stats(ARRAY(%s FROM ranges))
+)`,
+			arrayArgs,
+		)
+	}
+
+	buf.WriteString(",\nnamed_ranges AS (")
 
 	switch mode {
 	case tree.UniqueRanges:
@@ -372,6 +406,24 @@ AND s.end_key > r.start_key`)
 	// columns from crdb_internal.ranges.
 	if n.Options.Details {
 		fmt.Fprintf(&buf, ",\n  %s", colinfo.RangesExtraRenders)
+
+		// When the row identifier is a range ID, we must find span stats
+		// that match the range start and end keys.
+		// Otherwise, we are free to use the "span_(end|start)_key" identifier.
+		var startKey string
+		var endKey string
+		if mode == tree.UniqueRanges {
+			startKey = "r.start_key"
+			endKey = "r.end_key"
+		} else {
+			startKey = "r.per_range_start_key"
+			endKey = "r.per_range_end_key"
+		}
+
+		fmt.Fprintf(&buf, `, (SELECT stats FROM all_span_stats sps WHERE %s = sps.start_key AND %s = sps.end_key LIMIT 1) AS span_stats`,
+			startKey,
+			endKey,
+		)
 	}
 	buf.WriteString("\nFROM named_ranges r)\n")
 
@@ -413,7 +465,7 @@ AND s.end_key > r.start_key`)
 		// prefix when possible.
 		switch n.Options.Mode {
 		case tree.UniqueRanges, tree.ExpandTables:
-			// Note: we cannot use span_start/end_key reliably here, because
+			// Note: we cannot use object_start/end_key reliably here, because
 			// when Mode == tree.UniqueRanges the DISTINCT clause has
 			// eliminated it. So we must recompute the span manually.
 			fmt.Fprintf(&buf, `
@@ -432,13 +484,13 @@ AND s.end_key > r.start_key`)
 		case tree.ExpandIndexes:
 			buf.WriteString(`
   CASE
-    WHEN r.start_key = span_start_key THEN '…/<IndexMin>'
+    WHEN r.start_key = object_start_key THEN '…/<IndexMin>'
     WHEN r.start_key = crdb_internal.table_span(table_id)[1] THEN '…/<TableMin>'
     WHEN r.start_key < crdb_internal.table_span(table_id)[1] THEN '<before:'||crdb_internal.pretty_key(r.start_key,-1)||'>'
     ELSE '…'||crdb_internal.pretty_key(r.start_key, 1)
   END AS start_key,
   CASE
-    WHEN r.end_key = span_end_key THEN '…/…/<IndexMax>'
+    WHEN r.end_key = object_end_key THEN '…/…/<IndexMax>'
     WHEN r.end_key = crdb_internal.table_span(table_id)[2] THEN '…/<TableMax>'
     WHEN r.end_key > crdb_internal.table_span(table_id)[2] THEN '<after:'||crdb_internal.pretty_key(r.end_key,-1)||'>'
     ELSE '…'||crdb_internal.pretty_key(r.end_key, 1)
@@ -451,15 +503,15 @@ AND s.end_key > r.start_key`)
 	case tree.ShowRangesIndex:
 		buf.WriteString(`
   CASE
-    WHEN r.start_key = span_start_key THEN '…/<IndexMin>'
+    WHEN r.start_key = object_start_key THEN '…/<IndexMin>'
     WHEN r.start_key = crdb_internal.table_span(table_id)[1] THEN '…/TableMin'
-    WHEN r.start_key < span_start_key THEN '<before:'||crdb_internal.pretty_key(r.start_key,-1)||'>'
+    WHEN r.start_key < object_start_key THEN '<before:'||crdb_internal.pretty_key(r.start_key,-1)||'>'
     ELSE '…'||crdb_internal.pretty_key(r.start_key, 2)
   END AS start_key,
   CASE
-    WHEN r.end_key = span_end_key THEN '…/<IndexMax>'
+    WHEN r.end_key = object_end_key THEN '…/<IndexMax>'
     WHEN r.end_key = crdb_internal.table_span(table_id)[2] THEN '…/<TableMax>'
-    WHEN r.end_key > span_end_key THEN '<after:'||crdb_internal.pretty_key(r.end_key,-1)||'>'
+    WHEN r.end_key > object_end_key THEN '<after:'||crdb_internal.pretty_key(r.end_key,-1)||'>'
     ELSE '…'||crdb_internal.pretty_key(r.end_key, 2)
   END AS end_key,
 `)
@@ -589,24 +641,24 @@ AND s.end_key > r.start_key`)
 			prefix = "'…'||"
 		}
 		fmt.Fprintf(&buf, `,
-  %[2]scrdb_internal.pretty_key(span_start_key, %[1]d) AS index_start_key,
-  %[2]scrdb_internal.pretty_key(span_end_key, %[1]d) AS index_end_key`, shift, prefix)
+  %[2]scrdb_internal.pretty_key(per_range_start_key, %[1]d) AS index_start_key,
+  %[2]scrdb_internal.pretty_key(per_range_end_key, %[1]d) AS index_end_key`, shift, prefix)
 
 		if n.Options.Keys {
 			buf.WriteString(`,
-  span_start_key AS raw_index_start_key,
-  span_end_key AS raw_index_end_key`)
+  per_range_start_key AS raw_index_start_key,
+  per_range_end_key AS raw_index_end_key`)
 		}
 
 	case tree.ExpandTables:
 		buf.WriteString(`,
-  crdb_internal.pretty_key(span_start_key, -1) AS table_start_key,
-  crdb_internal.pretty_key(span_end_key, -1) AS table_end_key`)
+  crdb_internal.pretty_key(per_range_start_key, -1) AS table_start_key,
+  crdb_internal.pretty_key(per_range_end_key, -1) AS table_end_key`)
 
 		if n.Options.Keys {
 			buf.WriteString(`,
-  span_start_key AS raw_table_start_key,
-  span_end_key AS raw_table_end_key`)
+  per_range_start_key AS raw_table_start_key,
+  per_range_end_key AS raw_table_end_key`)
 		}
 	}
 
@@ -656,13 +708,14 @@ AND s.end_key > r.start_key`)
 			}
 			fmt.Fprintf(&buf, ",\n  %s", tree.NameString(colinfo.Ranges[i].Name))
 		}
+		buf.WriteString(",\n  span_stats")
 	}
 
 	// Complete this CTE. and add an order if needed.
 	buf.WriteString("\nFROM intermediate r ORDER BY r.start_key")
 	switch n.Options.Mode {
 	case tree.ExpandIndexes, tree.ExpandTables:
-		buf.WriteString(", r.span_start_key")
+		buf.WriteString(", r.per_range_start_key")
 	}
 
 	//
@@ -690,7 +743,7 @@ AND s.end_key > r.start_key`)
 		// debugging invalid syntax more difficult.
 		fullQuery = fmt.Sprintf(`SELECT %s AS query`, lexbase.EscapeSQLString(fullQuery))
 	}
-	return parse(fullQuery)
+	return d.parse(fullQuery)
 }
 
 // In the shared logic above, we propagate the set of columns

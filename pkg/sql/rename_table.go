@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -88,6 +89,11 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 				tableDesc.ParentID, dependent.ID, "rename",
 			)
 		}
+	}
+
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
+		return nil, err
 	}
 
 	return &renameTableNode{n: n, oldTn: &oldTn, newTn: &newTn, tableDesc: tableDesc}, nil
@@ -227,6 +233,21 @@ func (n *renameTableNode) startExec(params runParams) error {
 		return err
 	}
 
+	metadataUpdater := descmetadata.NewMetadataUpdater(
+		ctx,
+		p.InternalSQLTxn(),
+		p.Descriptors(),
+		&p.ExecCfg().Settings.SV,
+		p.SessionData(),
+	)
+
+	// If this table has row level ttl enabled, update the schedule_name of all
+	// row-level-ttl jobs with the name table name. If row level TTL is not
+	// enabled, UpdateTTLScheduleName will no-op for us.
+	if err := metadataUpdater.UpdateTTLScheduleLabel(ctx, tableDesc); err != nil {
+		return err
+	}
+
 	// Log Rename Table event. This is an auditable log event and is recorded
 	// in the same transaction as the table descriptor update.
 	return p.logEvent(ctx,
@@ -266,14 +287,7 @@ func (p *planner) dependentError(
 func (p *planner) dependentFunctionError(
 	typeName, objName string, fnDesc catalog.FunctionDescriptor, op string,
 ) error {
-	return errors.WithHintf(
-		sqlerrors.NewDependentObjectErrorf(
-			"cannot %s %s %q because function %q depends on it",
-			op, typeName, objName, fnDesc.GetName(),
-		),
-		"you can drop %s instead.",
-		fnDesc.GetName(),
-	)
+	return sqlerrors.NewDependentBlocksOpError(op, typeName, objName, "function", fnDesc.GetName())
 }
 
 func (p *planner) dependentViewError(
@@ -294,10 +308,7 @@ func (p *planner) dependentViewError(
 		}
 		viewName = viewFQName.FQString()
 	}
-	return errors.WithHintf(
-		sqlerrors.NewDependentObjectErrorf("cannot %s %s %q because view %q depends on it",
-			op, typeName, objName, viewName),
-		"you can drop %s instead.", viewName)
+	return sqlerrors.NewDependentBlocksOpError(op, typeName, objName, "view", viewName)
 }
 
 // checkForCrossDbReferences validates if any cross DB references

@@ -35,7 +35,7 @@ func (d *delegator) delegateShowFunctions(n *tree.ShowFunctions) (tree.Statement
 	// name to have an explicit catalog but no explicit schema. This would arise
 	// when doing SHOW FUNCTIONS FROM <db>. Without this logic, we would not show the
 	// tables from other schemas than public.
-	if name.ExplicitSchema && name.ExplicitCatalog && name.SchemaName == tree.PublicSchemaName &&
+	if name.ExplicitSchema && name.ExplicitCatalog && name.SchemaName == catconstants.PublicSchemaName &&
 		n.ExplicitSchema && !n.ExplicitCatalog && n.SchemaName == name.CatalogName {
 		name.SchemaName, name.ExplicitSchema = "", false
 	}
@@ -56,7 +56,7 @@ func (d *delegator) delegateShowFunctions(n *tree.ShowFunctions) (tree.Statement
 SELECT n.nspname as schema_name,
   p.proname as function_name,
   p.prorettype::REGTYPE::TEXT as result_data_type,
-	COALESCE((SELECT trim('{}' FROM replace(array_agg(unnest(proargtypes)::REGTYPE::TEXT)::TEXT, ',', ', '))), '') as argument_data_types,
+	COALESCE((SELECT trim('{}' FROM replace((SELECT array_agg(unnested::REGTYPE::TEXT) FROM unnest(proargtypes) AS unnested)::TEXT, ',', ', '))), '') as argument_data_types,
   CASE p.prokind
 	  WHEN 'a' THEN 'agg'
 	  WHEN 'w' THEN 'window'
@@ -80,5 +80,5 @@ ORDER BY 1, 2, 4;
 		&name.CatalogName,
 		schemaClause,
 	)
-	return parse(query)
+	return d.parse(query)
 }

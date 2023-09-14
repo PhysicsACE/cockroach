@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -45,7 +46,8 @@ func declareKeysAddSSTable(
 	rs ImmutableRangeState,
 	header *kvpb.Header,
 	req kvpb.Request,
-	latchSpans, lockSpans *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
 ) {
 	args := req.(*kvpb.AddSSTableRequest)
@@ -77,8 +79,7 @@ var AddSSTableRewriteConcurrency = settings.RegisterIntSetting(
 	settings.SystemOnly,
 	"kv.bulk_io_write.sst_rewrite_concurrency.per_call",
 	"concurrency to use when rewriting sstable timestamps by block, or 0 to use a loop",
-	// TODO(radu): temporarily disabled because of #97076.
-	0, // int64(util.ConstantWithMetamorphicTestRange("addsst-rewrite-concurrency", 4, 0, 16)),
+	int64(util.ConstantWithMetamorphicTestRange("addsst-rewrite-concurrency", 4, 0, 16)),
 	settings.NonNegativeInt,
 )
 
@@ -156,6 +157,33 @@ func EvalAddSSTable(
 		}
 	}
 
+	if args.RemoteFile.Path != "" {
+		if len(args.Data) > 0 {
+			return result.Result{}, errors.AssertionFailedf(
+				"AddSSTable requests cannot add bytes and remote file at same time")
+		}
+		log.Infof(ctx, "AddSSTable of remote file: %s in %s", args.RemoteFile.Path, args.RemoteFile.Locator)
+		stats := *args.MVCCStats
+		stats.ContainsEstimates++
+
+		ms.Add(stats)
+
+		mvccHistoryMutation := &kvserverpb.ReplicatedEvalResult_MVCCHistoryMutation{
+			Spans: []roachpb.Span{{Key: start.Key, EndKey: end.Key}},
+		}
+		return result.Result{
+			Replicated: kvserverpb.ReplicatedEvalResult{
+				AddSSTable: &kvserverpb.ReplicatedEvalResult_AddSSTable{
+					RemoteFileLoc:   args.RemoteFile.Locator,
+					RemoteFilePath:  args.RemoteFile.Path,
+					BackingFileSize: args.RemoteFile.BackingFileSize,
+					Span:            roachpb.Span{Key: start.Key, EndKey: end.Key},
+				},
+				MVCCHistoryMutation: mvccHistoryMutation,
+			},
+		}, nil
+	}
+
 	// Reject AddSSTable requests not writing at the request timestamp if requested.
 	if AddSSTableRequireAtRequestTimestamp.Get(&cArgs.EvalCtx.ClusterSettings().SV) &&
 		sstToReqTS.IsEmpty() {
@@ -194,13 +222,13 @@ func EvalAddSSTable(
 	}
 
 	var statsDelta enginepb.MVCCStats
-	maxIntents := storage.MaxIntentsPerWriteIntentError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
+	maxIntents := storage.MaxIntentsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
 	checkConflicts := args.DisallowConflicts || args.DisallowShadowing ||
 		!args.DisallowShadowingBelow.IsEmpty()
 	if checkConflicts {
 		// If requested, check for MVCC conflicts with existing keys. This enforces
 		// all MVCC invariants by returning WriteTooOldError for any existing
-		// values at or above the SST timestamp, returning WriteIntentError to
+		// values at or above the SST timestamp, returning LockConflictError to
 		// resolve any encountered intents, and accurately updating MVCC stats.
 		//
 		// Additionally, if DisallowShadowing or DisallowShadowingBelow is set, it
@@ -245,7 +273,7 @@ func EvalAddSSTable(
 		if err != nil {
 			return result.Result{}, errors.Wrap(err, "scanning intents")
 		} else if len(intents) > 0 {
-			return result.Result{}, &kvpb.WriteIntentError{Intents: intents}
+			return result.Result{}, &kvpb.LockConflictError{Locks: roachpb.AsLocks(intents)}
 		}
 	}
 
@@ -376,19 +404,22 @@ func EvalAddSSTable(
 	// addition, and instead just use this key-only iterator. If a caller actually
 	// needs to know what data is there, it must issue its own real Scan.
 	if args.ReturnFollowingLikelyNonEmptySpanStart {
-		existingIter := spanset.DisableReaderAssertions(readWriter).NewMVCCIterator(
+		existingIter, err := spanset.DisableReaderAssertions(readWriter).NewMVCCIterator(
 			storage.MVCCKeyIterKind, // don't care if it is committed or not, just that it isn't empty.
 			storage.IterOptions{
 				KeyTypes:   storage.IterKeyTypePointsAndRanges,
 				UpperBound: reply.RangeSpan.EndKey,
 			},
 		)
+		if err != nil {
+			return result.Result{}, errors.Wrap(err, "error when creating iterator for non-empty span")
+		}
 		defer existingIter.Close()
 		existingIter.SeekGE(end)
 		if ok, err := existingIter.Valid(); err != nil {
 			return result.Result{}, errors.Wrap(err, "error while searching for non-empty span start")
 		} else if ok {
-			reply.FollowingLikelyNonEmptySpanStart = existingIter.Key().Key
+			reply.FollowingLikelyNonEmptySpanStart = existingIter.UnsafeKey().Key.Clone()
 		}
 	}
 

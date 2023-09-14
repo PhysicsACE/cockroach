@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -47,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -488,7 +490,7 @@ func TestSendRPCOrder(t *testing.T) {
 				RangeID:       rangeID, // Not used in this test, but why not.
 				RoutingPolicy: tc.routingPolicy,
 			}
-			req := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("b"), false)
+			req := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("b"), kvpb.NonLocking)
 			_, pErr := kv.SendWrappedWith(ctx, ds, header, req)
 			require.Nil(t, pErr)
 		})
@@ -615,8 +617,8 @@ func TestImmutableBatchArgs(t *testing.T) {
 	ds := NewDistSender(cfg)
 
 	txn := roachpb.MakeTransaction(
-		"test", nil /* baseKey */, roachpb.NormalUserPriority,
-		clock.Now(), clock.MaxOffset().Nanoseconds(), int32(ds.getNodeID()),
+		"test", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority,
+		clock.Now(), clock.MaxOffset().Nanoseconds(), int32(ds.getNodeID()), 0,
 	)
 	origTxnTs := txn.WriteTimestamp
 
@@ -949,7 +951,7 @@ func TestNoBackoffOnNotLeaseHolderErrorFromFollowerRead(t *testing.T) {
 		Lease: lease,
 	})
 
-	get := kvpb.NewGet(roachpb.Key("a"), false /* forUpdate */)
+	get := kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking)
 	_, pErr := kv.SendWrapped(ctx, ds, get)
 	require.Nil(t, pErr)
 	require.Equal(t, []roachpb.NodeID{1, 2}, sentTo)
@@ -1021,7 +1023,7 @@ func TestNoBackoffOnNotLeaseHolderErrorWithoutLease(t *testing.T) {
 
 	// Send a request. It should try all three replicas once: the first two fail
 	// with NLHE, the third one succeeds. None of them should trigger backoffs.
-	_, pErr := kv.SendWrapped(ctx, ds, kvpb.NewGet(roachpb.Key("a"), false /* forUpdate */))
+	_, pErr := kv.SendWrapped(ctx, ds, kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking))
 	require.NoError(t, pErr.GoError())
 	require.Equal(t, []roachpb.NodeID{1, 2, 3}, sentTo)
 	require.Equal(t, int64(0), ds.Metrics().InLeaseTransferBackoffs.Count())
@@ -1117,7 +1119,7 @@ func TestDistSenderMovesOnFromReplicaWithStaleLease(t *testing.T) {
 		Lease: cachedLease,
 	})
 
-	get := kvpb.NewGet(roachpb.Key("a"), false /* forUpdate */)
+	get := kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking)
 	_, pErr := kv.SendWrapped(ctx, ds, get)
 	require.Nil(t, pErr)
 
@@ -1239,7 +1241,7 @@ func TestDistSenderIgnoresNLHEBasedOnOldRangeGeneration(t *testing.T) {
 				Lease: cachedLease,
 			})
 
-			get := kvpb.NewGet(roachpb.Key("a"), false /* forUpdate */)
+			get := kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking)
 			_, pErr := kv.SendWrapped(ctx, ds, get)
 			require.Nil(t, pErr)
 
@@ -1348,7 +1350,7 @@ func TestDistSenderRetryOnTransportErrors(t *testing.T) {
 				Lease: cachedLease,
 			})
 
-			get := kvpb.NewGet(roachpb.Key("a"), false /* forUpdate */)
+			get := kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking)
 			_, pErr := kv.SendWrapped(ctx, ds, get)
 			if spec.shouldRetry {
 				require.True(t, secondReplicaTried, "Second replica was not retried")
@@ -1902,7 +1904,7 @@ func TestRetryOnWrongReplicaError(t *testing.T) {
 		Settings:           cluster.MakeTestingClusterSettings(),
 	}
 	ds := NewDistSender(cfg)
-	scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false)
+	scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), kvpb.NonLocking)
 	if _, err := kv.SendWrapped(context.Background(), ds, scan); err != nil {
 		t.Errorf("scan encountered error: %s", err)
 	}
@@ -2006,7 +2008,7 @@ func TestRetryOnWrongReplicaErrorWithSuggestion(t *testing.T) {
 		RPCRetryOptions: &retry.Options{MaxRetries: 1},
 	}
 	ds := NewDistSender(cfg)
-	scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false)
+	scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), kvpb.NonLocking)
 	if _, err := kv.SendWrapped(context.Background(), ds, scan); err != nil {
 		t.Errorf("scan encountered error: %s", err)
 	}
@@ -2126,7 +2128,7 @@ func TestSendRPCRetry(t *testing.T) {
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
 	ds := NewDistSender(cfg)
-	scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false)
+	scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), kvpb.NonLocking)
 	sr, err := kv.SendWrappedWith(ctx, ds, kvpb.Header{MaxSpanRequestKeys: 1}, scan)
 	if err != nil {
 		t.Fatal(err)
@@ -2252,7 +2254,7 @@ func TestDistSenderDescriptorUpdatesOnSuccessfulRPCs(t *testing.T) {
 
 			// Send a request that's going to receive a response with a RangeInfo.
 			k := roachpb.Key("a")
-			get := kvpb.NewGet(k, false /* forUpdate */)
+			get := kvpb.NewGet(k, kvpb.NonLocking)
 			ba := &kvpb.BatchRequest{}
 			ba.Add(get)
 			_, pErr := ds.Send(ctx, ba)
@@ -2365,7 +2367,7 @@ func TestSendRPCRangeNotFoundError(t *testing.T) {
 		Settings:          cluster.MakeTestingClusterSettings(),
 	}
 	ds = NewDistSender(cfg)
-	get := kvpb.NewGet(roachpb.Key("b"), false /* forUpdate */)
+	get := kvpb.NewGet(roachpb.Key("b"), kvpb.NonLocking)
 	_, err := kv.SendWrapped(ctx, ds, get)
 	if err != nil {
 		t.Fatal(err)
@@ -2450,17 +2452,19 @@ func TestMultiRangeGapReverse(t *testing.T) {
 
 	txn := roachpb.MakeTransaction(
 		"foo",
-		nil, // baseKey
-		1.0, // userPriority
+		nil,                    // baseKey
+		isolation.Serializable, // isoLevel
+		1.0,                    // userPriority
 		clock.Now(),
 		0, // maxOffsetNs
 		1, // coordinatorNodeID
+		0,
 	)
 
 	ba := &kvpb.BatchRequest{}
 	ba.Txn = &txn
-	ba.Add(kvpb.NewReverseScan(splits[0], splits[1], false))
-	ba.Add(kvpb.NewReverseScan(splits[2], splits[3], false))
+	ba.Add(kvpb.NewReverseScan(splits[0], splits[1], kvpb.NonLocking))
+	ba.Add(kvpb.NewReverseScan(splits[2], splits[3], kvpb.NonLocking))
 
 	// Before fixing https://github.com/cockroachdb/cockroach/issues/18174, this
 	// would error with:
@@ -2561,7 +2565,7 @@ func TestMultiRangeMergeStaleDescriptor(t *testing.T) {
 		Settings: cluster.MakeTestingClusterSettings(),
 	}
 	ds := NewDistSender(cfg)
-	scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false)
+	scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), kvpb.NonLocking)
 	// Set the Txn info to avoid an OpRequiresTxnError.
 	reply, err := kv.SendWrappedWith(ctx, ds, kvpb.Header{
 		MaxSpanRequestKeys: 10,
@@ -2915,7 +2919,8 @@ func TestTruncateWithLocalSpanAndDescriptor(t *testing.T) {
 	ba.Add(kvpb.NewScan(
 		keys.RangeDescriptorKey(roachpb.RKey("a")),
 		keys.RangeDescriptorKey(roachpb.RKey("c")),
-		false /* forUpdate */))
+		kvpb.NonLocking,
+	))
 
 	if _, pErr := ds.Send(ctx, ba); pErr != nil {
 		t.Fatal(pErr)
@@ -3260,8 +3265,8 @@ func TestParallelCommitsDetectIntentMissingCause(t *testing.T) {
 
 	key := roachpb.Key("a")
 	txn := roachpb.MakeTransaction(
-		"test", key, roachpb.NormalUserPriority,
-		clock.Now(), clock.MaxOffset().Nanoseconds(), 1, /* coordinatorNodeID */
+		"test", key, isolation.Serializable, roachpb.NormalUserPriority,
+		clock.Now(), clock.MaxOffset().Nanoseconds(), 1 /* coordinatorNodeID */, 0,
 	)
 
 	txnRecordPresent := true
@@ -3494,6 +3499,55 @@ func TestSenderTransport(t *testing.T) {
 	}
 }
 
+// TestPProfLabelsAppliedToBatchRequestHeader tests that pprof labels on the
+// sender's context are copied to the BatchRequest.Header.
+func TestPProfLabelsAppliedToBatchRequestHeader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	clock := hlc.NewClockForTesting(nil)
+	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
+	g := makeGossip(t, stopper, rpcContext)
+
+	observedLabels := make(map[string]string)
+	testFn := func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
+		for i := 0; i < len(ba.Header.ProfileLabels)-1; i += 2 {
+			observedLabels[ba.Header.ProfileLabels[i]] = ba.Header.ProfileLabels[i+1]
+		}
+		return ba.CreateReply(), nil
+	}
+
+	cfg := DistSenderConfig{
+		AmbientCtx: log.MakeTestingAmbientCtxWithNewTracer(),
+		Clock:      clock,
+		NodeDescs:  g,
+		RPCContext: rpcContext,
+		TestingKnobs: ClientTestingKnobs{
+			TransportFactory: adaptSimpleTransport(testFn),
+		},
+		RangeDescriptorDB: defaultMockRangeDescriptorDB,
+		Settings:          cluster.MakeTestingClusterSettings(),
+	}
+	ds := NewDistSender(cfg)
+	ba := &kvpb.BatchRequest{}
+	ba.Add(kvpb.NewPut(roachpb.Key("a"), roachpb.MakeValueFromString("value")))
+	expectedLabels := map[string]string{"key": "value", "key2": "value2"}
+	var labels []string
+	for k, v := range expectedLabels {
+		labels = append(labels, k, v)
+	}
+	var undo func()
+	ctx, undo = pprofutil.SetProfilerLabels(ctx, labels...)
+	defer undo()
+	if _, err := ds.Send(ctx, ba); err != nil {
+		t.Fatalf("put encountered error: %s", err)
+	}
+	require.Equal(t, expectedLabels, observedLabels)
+}
+
 func TestGatewayNodeID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -3598,8 +3652,8 @@ func TestMultipleErrorsMerged(t *testing.T) {
 	)
 
 	txn := roachpb.MakeTransaction(
-		"test", nil /* baseKey */, roachpb.NormalUserPriority,
-		clock.Now(), clock.MaxOffset().Nanoseconds(), 1, /* coordinatorNodeID */
+		"test", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority,
+		clock.Now(), clock.MaxOffset().Nanoseconds(), 1 /* coordinatorNodeID */, 0,
 	)
 	// We're also going to check that the highest bumped WriteTimestamp makes it
 	// to the merged error.
@@ -3609,8 +3663,8 @@ func TestMultipleErrorsMerged(t *testing.T) {
 	retryErr := kvpb.NewTransactionRetryError(kvpb.RETRY_SERIALIZABLE, "test err")
 	abortErr := kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_ABORTED_RECORD_FOUND)
 	conditionFailedErr := &kvpb.ConditionFailedError{}
-	writeIntentErr := &kvpb.WriteIntentError{}
-	sendErr := sendError{}
+	lockConflictErr := &kvpb.LockConflictError{}
+	sendErr := &sendError{}
 	ambiguousErr := &kvpb.AmbiguousResultError{}
 	randomErr := &kvpb.IntegerOverflowError{}
 
@@ -3680,19 +3734,19 @@ func TestMultipleErrorsMerged(t *testing.T) {
 			err2:   randomErr,
 			expErr: "results in overflow",
 		},
-		// WriteIntentError also has a low score since it's "not ambiguous".
+		// LockConflictError also has a low score since it's "not ambiguous".
 		{
-			err1:   writeIntentErr,
+			err1:   lockConflictErr,
 			err2:   ambiguousErr,
 			expErr: "result is ambiguous",
 		},
 		{
-			err1:   writeIntentErr,
+			err1:   lockConflictErr,
 			err2:   sendErr,
 			expErr: "failed to send RPC",
 		},
 		{
-			err1:   writeIntentErr,
+			err1:   lockConflictErr,
 			err2:   randomErr,
 			expErr: "results in overflow",
 		},
@@ -3985,19 +4039,19 @@ func TestCanSendToFollower(t *testing.T) {
 			kvpb.Header{
 				Txn: &roachpb.Transaction{},
 			},
-			kvpb.NewGet(roachpb.Key("a"), false /* forUpdate */),
+			kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking),
 			1,
 		},
 		{
 			true,
 			kvpb.Header{},
-			kvpb.NewGet(roachpb.Key("a"), false /* forUpdate */),
+			kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking),
 			1,
 		},
 		{
 			false,
 			kvpb.Header{},
-			kvpb.NewGet(roachpb.Key("a"), false /* forUpdate */),
+			kvpb.NewGet(roachpb.Key("a"), kvpb.NonLocking),
 			2,
 		},
 	} {
@@ -4188,7 +4242,7 @@ func TestEvictMetaRange(t *testing.T) {
 		}
 		ds := NewDistSender(cfg)
 
-		scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("b"), false)
+		scan := kvpb.NewScan(roachpb.Key("a"), roachpb.Key("b"), kvpb.NonLocking)
 		if _, pErr := kv.SendWrapped(ctx, ds, scan); pErr != nil {
 			t.Fatalf("scan encountered error: %s", pErr)
 		}
@@ -4203,7 +4257,7 @@ func TestEvictMetaRange(t *testing.T) {
 		// Simulate a split on the meta2 range and mark it as stale.
 		isStale = true
 
-		scan = kvpb.NewScan(roachpb.Key("b"), roachpb.Key("c"), false)
+		scan = kvpb.NewScan(roachpb.Key("b"), roachpb.Key("c"), kvpb.NonLocking)
 		if _, pErr := kv.SendWrapped(ctx, ds, scan); pErr != nil {
 			t.Fatalf("scan encountered error: %s", pErr)
 		}
@@ -4387,7 +4441,7 @@ func TestEvictionTokenCoalesce(t *testing.T) {
 			// Return a sendError so DistSender retries the first range lookup in the
 			// user key-space for both batches.
 			if previouslyWaited := waitForInitialPuts(); !previouslyWaited {
-				return nil, newSendError("boom")
+				return nil, TestNewSendError("boom")
 			}
 			return br, nil
 		}
@@ -4517,13 +4571,13 @@ func TestRequestSubdivisionAfterDescriptorChange(t *testing.T) {
 	splitKey := keys.MustAddr(keyB)
 
 	get := func(k roachpb.Key) kvpb.Request {
-		return kvpb.NewGet(k, false /* forUpdate */)
+		return kvpb.NewGet(k, kvpb.NonLocking)
 	}
 	scan := func(k roachpb.Key) kvpb.Request {
-		return kvpb.NewScan(k, k.Next(), false /* forUpdate */)
+		return kvpb.NewScan(k, k.Next(), kvpb.NonLocking)
 	}
 	revScan := func(k roachpb.Key) kvpb.Request {
-		return kvpb.NewReverseScan(k, k.Next(), false /* forUpdate */)
+		return kvpb.NewReverseScan(k, k.Next(), kvpb.NonLocking)
 	}
 
 	for _, tc := range []struct {
@@ -4656,7 +4710,7 @@ func TestRequestSubdivisionAfterDescriptorChangeWithUnavailableReplicasTerminate
 	splitKey := keys.MustAddr(keyB)
 
 	get := func(k roachpb.Key) kvpb.Request {
-		return kvpb.NewGet(k, false /* forUpdate */)
+		return kvpb.NewGet(k, kvpb.NonLocking)
 	}
 
 	ctx := context.Background()
@@ -4692,7 +4746,7 @@ func TestRequestSubdivisionAfterDescriptorChangeWithUnavailableReplicasTerminate
 	transportFn := func(_ context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
 		atomic.AddInt32(&numAttempts, 1)
 		require.Equal(t, 1, len(ba.Requests))
-		return nil, newSendError("boom")
+		return nil, TestNewSendError("boom")
 	}
 	rpcRetryOptions := &retry.Options{
 		MaxRetries: 5, // maxAttempts = 6
@@ -4749,13 +4803,13 @@ func TestDescriptorChangeAfterRequestSubdivision(t *testing.T) {
 	laterSplitKey2 := keys.MustAddr(keyD)
 
 	get := func(k roachpb.Key) kvpb.Request {
-		return kvpb.NewGet(k, false /* forUpdate */)
+		return kvpb.NewGet(k, kvpb.NonLocking)
 	}
 	scan := func(k roachpb.Key) kvpb.Request {
-		return kvpb.NewScan(k, k.Next(), false /* forUpdate */)
+		return kvpb.NewScan(k, k.Next(), kvpb.NonLocking)
 	}
 	revScan := func(k roachpb.Key) kvpb.Request {
-		return kvpb.NewReverseScan(k, k.Next(), false /* forUpdate */)
+		return kvpb.NewReverseScan(k, k.Next(), kvpb.NonLocking)
 	}
 
 	for _, tc := range []struct {
@@ -5117,7 +5171,7 @@ func TestSendToReplicasSkipsStaleReplicas(t *testing.T) {
 				get.Key = roachpb.Key("a")
 				ba.Add(get)
 				_, err = ds.sendToReplicas(ctx, ba, tok, false /* withCommit */)
-				require.IsType(t, sendError{}, err)
+				require.IsType(t, &sendError{}, err)
 				require.Regexp(t, "NotLeaseHolderError", err)
 				cached := rc.GetCached(ctx, tc.initialDesc.StartKey, false /* inverted */)
 				require.NotNil(t, cached)
@@ -5135,9 +5189,7 @@ func TestSendToReplicasSkipsStaleReplicas(t *testing.T) {
 	}
 }
 
-// Test that DistSender.computeSendRUMultiplier returns the right computed read
-// and write RU multipliers.
-func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
+func TestDistSenderComputeNetworkCost(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	stopper := stop.NewStopper()
@@ -5157,11 +5209,19 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 	// Set regional cost multiplier table.
 	//                     | us-east1 | eu-central1 | asia-southeast1
 	//     -----------------------------------------------------------
-	//        us-east1     |    1     |     1.5     |       2.6
-	//       eu-central1   |   1.5    |      1      |       3.5
-	//     asia-southeast1 |   2.6    |     3.5     |        1
-	tenantcostmodel.RegionalCostMultiplierTableSetting.Override(ctx, &st.SV,
-		`{"regions":["us-east1","eu-central1","asia-southeast1"],"matrix":[[1,1.5,2.6],[1,3.5],[1]]}`)
+	//        us-east1     |    0     |      1      |       1.5
+	//       eu-central1   |    2     |      0      |       2.5
+	//     asia-southeast1 |    3     |     3.5     |        0
+	costTable := `{"regionPairs": [
+		{"fromRegion": "us-east1", "toRegion": "eu-central1", "cost": 1},
+		{"fromRegion": "us-east1", "toRegion": "asia-southeast1", "cost": 1.5},
+		{"fromRegion": "eu-central1", "toRegion": "us-east1", "cost": 2},
+		{"fromRegion": "eu-central1", "toRegion": "asia-southeast1", "cost": 2.5},
+		{"fromRegion": "asia-southeast1", "toRegion": "us-east1", "cost": 3},
+		{"fromRegion": "asia-southeast1", "toRegion": "eu-central1", "cost": 3.5}
+	]}`
+	require.NoError(t, tenantcostmodel.CrossRegionNetworkCostSetting.Validate(nil, costTable))
+	tenantcostmodel.CrossRegionNetworkCostSetting.Override(ctx, &st.SV, costTable)
 
 	modelCfg := tenantcostmodel.ConfigFromSettings(&st.SV)
 
@@ -5210,15 +5270,15 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 		desc          *roachpb.RangeDescriptor
 		replicas      ReplicaSlice
 		curReplica    *roachpb.ReplicaDescriptor
-		expectedRead  tenantcostmodel.RUMultiplier
-		expectedWrite tenantcostmodel.RUMultiplier
+		expectedRead  tenantcostmodel.NetworkCost
+		expectedWrite tenantcostmodel.NetworkCost
 	}{
 		{
 			name:          "no kv interceptor",
 			cfg:           &DistSenderConfig{},
 			desc:          newRangeDescriptor(5),
-			expectedRead:  1,
-			expectedWrite: 5,
+			expectedRead:  0,
+			expectedWrite: 0,
 		},
 		{
 			name: "no cost config",
@@ -5226,8 +5286,8 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 				KVInterceptor: &mockTenantSideCostController{},
 			},
 			desc:          newRangeDescriptor(2),
-			expectedRead:  1,
-			expectedWrite: 2,
+			expectedRead:  0,
+			expectedWrite: 0,
 		},
 		{
 			name: "no locality in current node",
@@ -5235,22 +5295,8 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 				KVInterceptor: &mockTenantSideCostController{cfg: &modelCfg},
 			},
 			desc:          newRangeDescriptor(1),
-			expectedRead:  1,
-			expectedWrite: 1,
-		},
-		{
-			name: "replicas=nil/no replica slice",
-			cfg: &DistSenderConfig{
-				KVInterceptor: &mockTenantSideCostController{cfg: &modelCfg},
-				NodeDescs:     &mockNodeStore{}, // no output replicas
-				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
-					{Key: "region", Value: "eu-central1"},
-				}},
-			},
-			desc:          newRangeDescriptor(8),
-			replicas:      nil, // no input replicas
-			expectedRead:  1,
-			expectedWrite: 8,
+			expectedRead:  0,
+			expectedWrite: 0,
 		},
 		{
 			name: "replicas=nil/replicas no locality",
@@ -5272,13 +5318,20 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 			desc: newRangeDescriptor(2),
 			// Points to descriptor with NodeID 2.
 			curReplica:    &roachpb.ReplicaDescriptor{NodeID: 2, ReplicaID: 3},
-			expectedRead:  1,
-			expectedWrite: 2,
+			expectedRead:  0,
+			expectedWrite: 0,
 		},
 		{
 			name: "replicas!=nil/replicas no locality",
 			cfg: &DistSenderConfig{
 				KVInterceptor: &mockTenantSideCostController{cfg: &modelCfg},
+				NodeDescs: &mockNodeStore{
+					nodes: []roachpb.NodeDescriptor{
+						{NodeID: 1, Address: util.UnresolvedAddr{}},
+						{NodeID: 2, Address: util.UnresolvedAddr{}},
+						{NodeID: 3, Address: util.UnresolvedAddr{}},
+					},
+				},
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "region", Value: "eu-central1"},
 				}},
@@ -5290,8 +5343,8 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 				makeReplicaInfo(3, ""), // Missing region.
 			},
 			curReplica:    &roachpb.ReplicaDescriptor{ReplicaID: 3},
-			expectedRead:  1,
-			expectedWrite: 10,
+			expectedRead:  0,
+			expectedWrite: 0,
 		},
 		{
 			name: "some node descriptors not in gossip",
@@ -5299,9 +5352,9 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 				KVInterceptor: &mockTenantSideCostController{cfg: &modelCfg},
 				NodeDescs: &mockNodeStore{
 					nodes: []roachpb.NodeDescriptor{
-						makeNodeDescriptor(1, "us-east1"),        // 1.5
-						makeNodeDescriptor(2, "eu-central1"),     // 1
-						makeNodeDescriptor(3, "asia-southeast1"), // 3.5
+						makeNodeDescriptor(1, "us-east1"),        // 2.0
+						makeNodeDescriptor(2, "eu-central1"),     // 0
+						makeNodeDescriptor(3, "asia-southeast1"), // 2.5
 					},
 				},
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
@@ -5310,11 +5363,10 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 					{Key: "dc", Value: "dc3"},
 				}},
 			},
-			desc: newRangeDescriptor(6),
-			// Points to descriptor with NodeID 6.
+			desc:          newRangeDescriptor(6),
 			curReplica:    &roachpb.ReplicaDescriptor{NodeID: 6, ReplicaID: 7},
-			expectedRead:  1,
-			expectedWrite: 9,
+			expectedRead:  0,
+			expectedWrite: 2.0 + 2.5,
 		},
 		{
 			name: "all node descriptors in gossip",
@@ -5322,7 +5374,7 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 				KVInterceptor: &mockTenantSideCostController{cfg: &modelCfg},
 				NodeDescs: &mockNodeStore{
 					nodes: []roachpb.NodeDescriptor{
-						makeNodeDescriptor(1, "us-east1"), // 2.6
+						makeNodeDescriptor(1, "us-east1"), // 3.0
 					},
 				},
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
@@ -5331,9 +5383,9 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 			},
 			desc: newRangeDescriptor(1),
 			// Points to descriptor with NodeID 1.
-			curReplica:    &roachpb.ReplicaDescriptor{ReplicaID: 2},
-			expectedRead:  2.6,
-			expectedWrite: 2.6,
+			curReplica:    &roachpb.ReplicaDescriptor{NodeID: 1, ReplicaID: 2},
+			expectedRead:  1.5,
+			expectedWrite: 3.0,
 		},
 		{
 			name: "local operations on global table",
@@ -5341,9 +5393,9 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 				KVInterceptor: &mockTenantSideCostController{cfg: &modelCfg},
 				NodeDescs: &mockNodeStore{
 					nodes: []roachpb.NodeDescriptor{
-						makeNodeDescriptor(1, "us-east1"),        // 1 * 3
-						makeNodeDescriptor(2, "eu-central1"),     // 1.5
-						makeNodeDescriptor(3, "asia-southeast1"), // 2.6
+						makeNodeDescriptor(1, "us-east1"),        // 0 * 3
+						makeNodeDescriptor(2, "eu-central1"),     // 1.0
+						makeNodeDescriptor(3, "asia-southeast1"), // 1.5
 					},
 				},
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
@@ -5359,8 +5411,8 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 			}(),
 			// Points to descriptor with NodeID 1.
 			curReplica:    &roachpb.ReplicaDescriptor{ReplicaID: 2},
-			expectedRead:  1,
-			expectedWrite: 7.1,
+			expectedRead:  0,
+			expectedWrite: 1.0 + 1.5,
 		},
 		{
 			name: "remote operations on global table",
@@ -5368,9 +5420,9 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 				KVInterceptor: &mockTenantSideCostController{cfg: &modelCfg},
 				NodeDescs: &mockNodeStore{
 					nodes: []roachpb.NodeDescriptor{
-						makeNodeDescriptor(1, "us-east1"),        // 2.6 * 3
+						makeNodeDescriptor(1, "us-east1"),        // 3.0
 						makeNodeDescriptor(2, "eu-central1"),     // 3.5
-						makeNodeDescriptor(3, "asia-southeast1"), // 1
+						makeNodeDescriptor(3, "asia-southeast1"), // 0
 					},
 				},
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
@@ -5384,25 +5436,24 @@ func TestDistSenderComputeSendRUMultiplier(t *testing.T) {
 				rd.InternalReplicas[4].NodeID = 1
 				return rd
 			}(),
-			// Points to descriptor with NodeID 1.
-			curReplica:    &roachpb.ReplicaDescriptor{ReplicaID: 2},
-			expectedRead:  2.6,
-			expectedWrite: 12.3,
+			curReplica:    &roachpb.ReplicaDescriptor{NodeID: 1, ReplicaID: 2},
+			expectedRead:  1.5,
+			expectedWrite: 3.0*3 + 3.5,
 		},
 	} {
-		for _, isRead := range []bool{true, false} {
-			t.Run(fmt.Sprintf("isRead=%t/%s", isRead, tc.name), func(t *testing.T) {
+		for _, isWrite := range []bool{true, false} {
+			t.Run(fmt.Sprintf("isWrite=%t/%s", isWrite, tc.name), func(t *testing.T) {
 				tc.cfg.AmbientCtx = log.MakeTestingAmbientContext(tracing.NewTracer())
 				tc.cfg.RPCContext = rpcContext
 				tc.cfg.RangeDescriptorDB = rddb
 				tc.cfg.Settings = st
 				ds := NewDistSender(*tc.cfg)
 
-				res := ds.computeSendRUMultiplier(ctx, tc.desc, tc.replicas, tc.curReplica, isRead)
-				if isRead {
-					require.InDelta(t, float64(tc.expectedRead), float64(res), 0.01)
-				} else {
+				res := ds.computeNetworkCost(ctx, tc.desc, tc.curReplica, isWrite)
+				if isWrite {
 					require.InDelta(t, float64(tc.expectedWrite), float64(res), 0.01)
+				} else {
+					require.InDelta(t, float64(tc.expectedRead), float64(res), 0.01)
 				}
 			})
 		}
@@ -5597,6 +5648,79 @@ func TestDistSenderRPCMetrics(t *testing.T) {
 	// Expect that the metrics for both of the returned errors were incremented.
 	require.Equal(t, ds.metrics.ErrCounts[kvpb.NotLeaseHolderErrType].Count(), int64(1))
 	require.Equal(t, ds.metrics.ErrCounts[kvpb.ConditionFailedErrType].Count(), int64(1))
+}
+
+// TestDistSenderCrossLocalityMetrics verifies that
+// updateCrossLocalityMetricsOnReplicaAddressedBatch{Request|Response} correctly
+// updates cross-region, cross-zone byte count metrics for batch requests sent
+// and batch responses received.
+func TestDistSenderCrossLocalityMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	const expectedInc = 10
+
+	metricsNames := []string{
+		"distsender.batch_requests.replica_addressed.bytes",
+		"distsender.batch_requests.cross_region.bytes",
+		"distsender.batch_requests.cross_zone.bytes",
+		"distsender.batch_responses.replica_addressed.bytes",
+		"distsender.batch_responses.cross_region.bytes",
+		"distsender.batch_responses.cross_zone.bytes",
+	}
+	for _, tc := range []struct {
+		crossLocalityType    roachpb.LocalityComparisonType
+		expectedMetricChange [6]int64
+		forRequest           bool
+	}{
+		{crossLocalityType: roachpb.LocalityComparisonType_CROSS_REGION,
+			expectedMetricChange: [6]int64{expectedInc, expectedInc, 0, 0, 0, 0},
+			forRequest:           true,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_SAME_REGION_CROSS_ZONE,
+			expectedMetricChange: [6]int64{expectedInc, 0, expectedInc, 0, 0, 0},
+			forRequest:           true,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_SAME_REGION_SAME_ZONE,
+			expectedMetricChange: [6]int64{expectedInc, 0, 0, 0, 0, 0},
+			forRequest:           true,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_CROSS_REGION,
+			expectedMetricChange: [6]int64{0, 0, 0, expectedInc, expectedInc, 0},
+			forRequest:           false,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_SAME_REGION_CROSS_ZONE,
+			expectedMetricChange: [6]int64{0, 0, 0, expectedInc, 0, expectedInc},
+			forRequest:           false,
+		},
+		{crossLocalityType: roachpb.LocalityComparisonType_SAME_REGION_SAME_ZONE,
+			expectedMetricChange: [6]int64{0, 0, 0, expectedInc, 0, 0},
+			forRequest:           false,
+		},
+	} {
+		t.Run(fmt.Sprintf("%-v", tc.crossLocalityType), func(t *testing.T) {
+			metrics := makeDistSenderMetrics()
+			beforeMetrics, err := metrics.getDistSenderCounterMetrics(metricsNames)
+			if err != nil {
+				t.Error(err)
+			}
+			if tc.forRequest {
+				metrics.updateCrossLocalityMetricsOnReplicaAddressedBatchRequest(tc.crossLocalityType, expectedInc)
+			} else {
+				metrics.updateCrossLocalityMetricsOnReplicaAddressedBatchResponse(tc.crossLocalityType, expectedInc)
+			}
+
+			afterMetrics, err := metrics.getDistSenderCounterMetrics(metricsNames)
+			if err != nil {
+				t.Error(err)
+			}
+			metricsDiff := getMapsDiff(beforeMetrics, afterMetrics)
+			expectedDiff := make(map[string]int64, 6)
+			for i, inc := range tc.expectedMetricChange {
+				expectedDiff[metricsNames[i]] = inc
+			}
+			require.Equal(t, metricsDiff, expectedDiff)
+		})
+	}
 }
 
 // TestDistSenderNLHEFromUninitializedReplicaDoesNotCauseUnboundedBackoff

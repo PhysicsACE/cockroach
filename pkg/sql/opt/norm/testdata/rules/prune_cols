@@ -4757,30 +4757,13 @@ project
            │    ├── volatile
            │    ├── key: ()
            │    ├── fd: ()-->(11-19,23)
-           │    ├── ensure-upsert-distinct-on
+           │    ├── values
            │    │    ├── columns: column1:11!null column2:12!null column3:13!null d_default:14 rowid_default:15
-           │    │    ├── grouping columns: rowid_default:15
-           │    │    ├── error: "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
            │    │    ├── cardinality: [1 - 1]
            │    │    ├── volatile
            │    │    ├── key: ()
            │    │    ├── fd: ()-->(11-15)
-           │    │    ├── values
-           │    │    │    ├── columns: column1:11!null column2:12!null column3:13!null d_default:14 rowid_default:15
-           │    │    │    ├── cardinality: [1 - 1]
-           │    │    │    ├── volatile
-           │    │    │    ├── key: ()
-           │    │    │    ├── fd: ()-->(11-15)
-           │    │    │    └── (1, 2, 'c', CAST(NULL AS INT8), unique_rowid())
-           │    │    └── aggregations
-           │    │         ├── first-agg [as=column1:11, outer=(11)]
-           │    │         │    └── column1:11
-           │    │         ├── first-agg [as=column2:12, outer=(12)]
-           │    │         │    └── column2:12
-           │    │         ├── first-agg [as=column3:13, outer=(13)]
-           │    │         │    └── column3:13
-           │    │         └── first-agg [as=d_default:14, outer=(14)]
-           │    │              └── d_default:14
+           │    │    └── (1, 2, 'c', CAST(NULL AS INT8), unique_rowid())
            │    ├── scan returning_test
            │    │    ├── columns: a:16 b:17 c:18 d:19 rowid:23!null
            │    │    ├── key: (23)
@@ -5292,3 +5275,43 @@ project
       └── aggregations
            └── const-agg
                 └── concat_agg
+
+exec-ddl
+CREATE TABLE p100478 (
+  region STRING NOT NULL,
+  id INT,
+  PRIMARY KEY (region, id),
+  UNIQUE INDEX p_id_idx (id)
+)
+----
+
+exec-ddl
+CREATE TABLE c100478 (
+  region STRING NOT NULL,
+  id INT PRIMARY KEY,
+  p_id INT NOT NULL,
+  FOREIGN KEY (region, p_id) REFERENCES p100478 (region, id)
+)
+----
+
+# A join which doesn't prune columns which could potentially appear in derived
+# ON clause conditions should not result in infinite rule recursion.
+norm expect=(EliminateGroupByProject,PruneJoinLeftCols,PruneJoinRightCols) disable=(EliminateJoinUnderProjectLeft,EliminateJoinUnderProjectRight,EliminateJoinUnderGroupByLeft,EliminateJoinUnderGroupByRight)
+SELECT p.id FROM p100478 p JOIN c100478 ON p_id = p.id GROUP BY p.id
+----
+distinct-on
+ ├── columns: id:2!null
+ ├── grouping columns: p.id:2!null
+ ├── key: (2)
+ └── inner-join (hash)
+      ├── columns: p.region:1!null p.id:2!null c100478.region:5!null p_id:7!null
+      ├── multiplicity: left-rows(zero-or-more), right-rows(exactly-one)
+      ├── fd: (2)-->(1), (2)==(7), (7)==(2)
+      ├── scan p100478 [as=p]
+      │    ├── columns: p.region:1!null p.id:2!null
+      │    ├── key: (2)
+      │    └── fd: (2)-->(1)
+      ├── scan c100478
+      │    └── columns: c100478.region:5!null p_id:7!null
+      └── filters
+           └── p_id:7 = p.id:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]

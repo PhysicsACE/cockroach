@@ -22,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowdispatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -34,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -112,24 +113,22 @@ type raftTransportTestContext struct {
 	transports     map[roachpb.NodeID]*kvserver.RaftTransport
 	nodeRPCContext *rpc.Context
 	gossip         *gossip.Gossip
+	st             *cluster.Settings
 }
 
-func newRaftTransportTestContext(t testing.TB) *raftTransportTestContext {
+func newRaftTransportTestContext(t testing.TB, st *cluster.Settings) *raftTransportTestContext {
 	ctx := context.Background()
 	tr := tracing.NewTracer()
 	rttc := &raftTransportTestContext{
 		t:          t,
 		stopper:    stop.NewStopper(stop.WithTracer(tr)),
 		transports: map[roachpb.NodeID]*kvserver.RaftTransport{},
+		st:         st,
 	}
-	rttc.nodeRPCContext = rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:        roachpb.SystemTenantID,
-		Config:          testutils.NewNodeTestBaseContext(),
-		Clock:           &timeutil.DefaultTimeSource{},
-		ToleratedOffset: time.Nanosecond,
-		Stopper:         rttc.stopper,
-		Settings:        cluster.MakeTestingClusterSettings(),
-	})
+	opts := rpc.DefaultContextOptions()
+	opts.Stopper = rttc.stopper
+	opts.Settings = st
+	rttc.nodeRPCContext = rpc.NewContext(ctx, opts)
 	// Ensure that tests using this test context and restart/shut down
 	// their servers do not inadvertently start talking to servers from
 	// unrelated concurrent tests.
@@ -152,7 +151,12 @@ func (rttc *raftTransportTestContext) Stop() {
 // before they can be used in other methods of
 // raftTransportTestContext. The node will be gossiped immediately.
 func (rttc *raftTransportTestContext) AddNode(nodeID roachpb.NodeID) *kvserver.RaftTransport {
-	transport, addr := rttc.AddNodeWithoutGossip(nodeID, util.TestAddr, rttc.stopper)
+	transport, addr := rttc.AddNodeWithoutGossip(
+		nodeID, util.TestAddr, rttc.stopper,
+		kvflowdispatch.NewDummyDispatch(), kvserver.NoopStoresFlowControlIntegration{},
+		kvserver.NoopRaftTransportDisconnectListener{},
+		nil,
+	)
 	rttc.GossipNode(nodeID, addr)
 	return transport
 }
@@ -162,18 +166,28 @@ func (rttc *raftTransportTestContext) AddNode(nodeID roachpb.NodeID) *kvserver.R
 // raftTransportTestContext. Unless you are testing the effects of
 // delaying gossip, use AddNode instead.
 func (rttc *raftTransportTestContext) AddNodeWithoutGossip(
-	nodeID roachpb.NodeID, addr net.Addr, stopper *stop.Stopper,
+	nodeID roachpb.NodeID,
+	addr net.Addr,
+	stopper *stop.Stopper,
+	kvflowTokenDispatch kvflowcontrol.DispatchReader,
+	kvflowHandles kvflowcontrol.Handles,
+	disconnectListener kvserver.RaftTransportDisconnectListener,
+	knobs *kvserver.RaftTransportTestingKnobs,
 ) (*kvserver.RaftTransport, net.Addr) {
-	grpcServer, err := rpc.NewServer(rttc.nodeRPCContext)
+	grpcServer, err := rpc.NewServer(context.Background(), rttc.nodeRPCContext)
 	require.NoError(rttc.t, err)
 	ctwWithTracer := log.MakeTestingAmbientCtxWithNewTracer()
 	transport := kvserver.NewRaftTransport(
 		ctwWithTracer,
-		cluster.MakeTestingClusterSettings(),
+		rttc.st,
 		ctwWithTracer.Tracer,
 		nodedialer.New(rttc.nodeRPCContext, gossip.AddressResolver(rttc.gossip)),
 		grpcServer,
 		rttc.stopper,
+		kvflowTokenDispatch,
+		kvflowHandles,
+		disconnectListener,
+		knobs,
 	)
 	rttc.transports[nodeID] = transport
 	ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, addr)
@@ -201,7 +215,7 @@ func (rttc *raftTransportTestContext) ListenStore(
 	nodeID roachpb.NodeID, storeID roachpb.StoreID,
 ) channelServer {
 	ch := newChannelServer(100, 10*time.Millisecond)
-	rttc.transports[nodeID].Listen(storeID, ch)
+	rttc.transports[nodeID].ListenIncomingRaftMessages(storeID, ch)
 	return ch
 }
 
@@ -223,7 +237,7 @@ func (rttc *raftTransportTestContext) Send(
 func TestSendAndReceive(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rttc := newRaftTransportTestContext(t)
+	rttc := newRaftTransportTestContext(t, cluster.MakeTestingClusterSettings())
 	defer rttc.Stop()
 
 	// Create several servers, each of which has two stores (A raft
@@ -391,7 +405,7 @@ func TestSendAndReceive(t *testing.T) {
 func TestInOrderDelivery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rttc := newRaftTransportTestContext(t)
+	rttc := newRaftTransportTestContext(t, cluster.MakeTestingClusterSettings())
 	defer rttc.Stop()
 
 	const numMessages = 100
@@ -429,7 +443,7 @@ func TestInOrderDelivery(t *testing.T) {
 func TestRaftTransportCircuitBreaker(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rttc := newRaftTransportTestContext(t)
+	rttc := newRaftTransportTestContext(t, cluster.MakeTestingClusterSettings())
 	defer rttc.Stop()
 
 	serverReplica := roachpb.ReplicaDescriptor{
@@ -437,7 +451,15 @@ func TestRaftTransportCircuitBreaker(t *testing.T) {
 		StoreID:   2,
 		ReplicaID: 2,
 	}
-	_, serverAddr := rttc.AddNodeWithoutGossip(serverReplica.NodeID, util.TestAddr, rttc.stopper)
+	_, serverAddr := rttc.AddNodeWithoutGossip(
+		serverReplica.NodeID,
+		util.TestAddr,
+		rttc.stopper,
+		kvflowdispatch.NewDummyDispatch(),
+		kvserver.NoopStoresFlowControlIntegration{},
+		kvserver.NoopRaftTransportDisconnectListener{},
+		nil,
+	)
 	serverChannel := rttc.ListenStore(serverReplica.NodeID, serverReplica.StoreID)
 
 	clientReplica := roachpb.ReplicaDescriptor{
@@ -445,7 +467,8 @@ func TestRaftTransportCircuitBreaker(t *testing.T) {
 		StoreID:   1,
 		ReplicaID: 1,
 	}
-	clientTransport := rttc.AddNode(clientReplica.NodeID)
+	_ = rttc.AddNode(clientReplica.NodeID)
+	rttc.GossipNode(serverReplica.NodeID, &util.UnresolvedAddr{NetworkField: "invalid", AddressField: "127.0.0.1:999999999"})
 
 	// Sending repeated messages should begin dropping once the circuit breaker
 	// does trip.
@@ -464,7 +487,7 @@ func TestRaftTransportCircuitBreaker(t *testing.T) {
 	// snuck in.
 	testutils.SucceedsSoon(t, func() error {
 		if !rttc.Send(clientReplica, serverReplica, 1, raftpb.Message{Commit: 2}) {
-			clientTransport.GetCircuitBreaker(serverReplica.NodeID, rpc.DefaultClass).Reset()
+			return errors.New("messages still dropped")
 		}
 		select {
 		case req := <-serverChannel.ch:
@@ -483,7 +506,7 @@ func TestRaftTransportCircuitBreaker(t *testing.T) {
 func TestRaftTransportIndependentRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rttc := newRaftTransportTestContext(t)
+	rttc := newRaftTransportTestContext(t, cluster.MakeTestingClusterSettings())
 	defer rttc.Stop()
 
 	server := roachpb.ReplicaDescriptor{
@@ -502,7 +525,7 @@ func TestRaftTransportIndependentRanges(t *testing.T) {
 	const numMessages = 50
 	channelServer := newChannelServer(numMessages*2, 10*time.Millisecond)
 	channelServer.brokenRange = 13
-	serverTransport.Listen(server.StoreID, channelServer)
+	serverTransport.ListenIncomingRaftMessages(server.StoreID, channelServer)
 
 	for i := 0; i < numMessages; i++ {
 		for _, rangeID := range []roachpb.RangeID{1, 13} {
@@ -530,7 +553,7 @@ func TestRaftTransportIndependentRanges(t *testing.T) {
 func TestReopenConnection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rttc := newRaftTransportTestContext(t)
+	rttc := newRaftTransportTestContext(t, cluster.MakeTestingClusterSettings())
 	defer rttc.Stop()
 
 	// Use a special stopper for the initial server so that we can fully stop it
@@ -542,7 +565,15 @@ func TestReopenConnection(t *testing.T) {
 		ReplicaID: 2,
 	}
 	serverTransport, serverAddr :=
-		rttc.AddNodeWithoutGossip(serverReplica.NodeID, util.TestAddr, serverStopper)
+		rttc.AddNodeWithoutGossip(
+			serverReplica.NodeID,
+			util.TestAddr,
+			serverStopper,
+			kvflowdispatch.NewDummyDispatch(),
+			kvserver.NoopStoresFlowControlIntegration{},
+			kvserver.NoopRaftTransportDisconnectListener{},
+			nil,
+		)
 	rttc.GossipNode(serverReplica.NodeID, serverAddr)
 	rttc.ListenStore(serverReplica.NodeID, serverReplica.StoreID)
 
@@ -555,7 +586,7 @@ func TestReopenConnection(t *testing.T) {
 	rttc.ListenStore(clientReplica.NodeID, clientReplica.StoreID)
 
 	// Take down the old server and start a new one at the same address.
-	serverTransport.Stop(serverReplica.StoreID)
+	serverTransport.StopIncomingRaftMessages(serverReplica.StoreID)
 	serverStopper.Stop(context.Background())
 
 	// With the old server down, nothing is listening no the address right now
@@ -573,7 +604,15 @@ func TestReopenConnection(t *testing.T) {
 		ReplicaID: 3,
 	}
 
-	rttc.AddNodeWithoutGossip(replacementReplica.NodeID, serverAddr, rttc.stopper)
+	rttc.AddNodeWithoutGossip(
+		replacementReplica.NodeID,
+		serverAddr,
+		rttc.stopper,
+		kvflowdispatch.NewDummyDispatch(),
+		kvserver.NoopStoresFlowControlIntegration{},
+		kvserver.NoopRaftTransportDisconnectListener{},
+		nil,
+	)
 	replacementChannel := rttc.ListenStore(replacementReplica.NodeID, replacementReplica.StoreID)
 
 	// Try sending a message to the old server's store (at the address its
@@ -629,7 +668,7 @@ func TestReopenConnection(t *testing.T) {
 func TestSendFailureToConnectDoesNotHangRaft(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rttc := newRaftTransportTestContext(t)
+	rttc := newRaftTransportTestContext(t, cluster.MakeTestingClusterSettings())
 	defer rttc.Stop()
 
 	// Create a single server from which we're going to call send.

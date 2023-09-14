@@ -67,7 +67,7 @@ func runTPCHBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpchBen
 	}
 
 	t.Status("starting nodes")
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), roachNodes)
+	c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings(), roachNodes)
 
 	m := c.NewMonitor(ctx, roachNodes)
 	m.Go(func(ctx context.Context) error {
@@ -76,7 +76,7 @@ func runTPCHBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpchBen
 
 		t.Status("setting up dataset")
 		err := loadTPCHDataset(
-			ctx, t, c, conn, b.ScaleFactor, m, roachNodes, true, /* disableMergeQueue */
+			ctx, t, c, conn, b.ScaleFactor, m, roachNodes, true /* disableMergeQueue */, false, /* secure */
 		)
 		if err != nil {
 			return err
@@ -124,7 +124,7 @@ func getNumQueriesInFile(filename, url string) (int, error) {
 		_ = os.Remove(tempFile.Name())
 	}()
 
-	queries, err := querybench.GetQueries(tempFile.Name())
+	queries, err := querybench.GetQueries(tempFile.Name(), "")
 	if err != nil {
 		return 0, err
 	}
@@ -172,9 +172,10 @@ func registerTPCHBenchSpec(r registry.Registry, b tpchBenchSpec) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    strings.Join(nameParts, "/"),
-		Owner:   registry.OwnerSQLQueries,
-		Cluster: r.MakeClusterSpec(numNodes),
+		Name:      strings.Join(nameParts, "/"),
+		Owner:     registry.OwnerSQLQueries,
+		Benchmark: true,
+		Cluster:   r.MakeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCHBench(ctx, t, c, b)
 		},

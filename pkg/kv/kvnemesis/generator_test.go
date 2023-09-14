@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/echotest"
@@ -107,13 +108,21 @@ func TestRandStep(t *testing.T) {
 			switch o := op.GetValue().(type) {
 			case *GetOperation:
 				if _, ok := keys[string(o.Key)]; ok {
-					if o.ForUpdate {
+					if o.SkipLocked && o.ForUpdate {
+						client.GetExistingForUpdateSkipLocked++
+					} else if o.SkipLocked {
+						client.GetExistingSkipLocked++
+					} else if o.ForUpdate {
 						client.GetExistingForUpdate++
 					} else {
 						client.GetExisting++
 					}
 				} else {
-					if o.ForUpdate {
+					if o.SkipLocked && o.ForUpdate {
+						client.GetMissingForUpdateSkipLocked++
+					} else if o.SkipLocked {
+						client.GetMissingSkipLocked++
+					} else if o.ForUpdate {
 						client.GetMissingForUpdate++
 					} else {
 						client.GetMissing++
@@ -126,14 +135,26 @@ func TestRandStep(t *testing.T) {
 					client.PutMissing++
 				}
 			case *ScanOperation:
-				if o.Reverse && o.ForUpdate {
-					client.ReverseScanForUpdate++
-				} else if o.Reverse {
-					client.ReverseScan++
-				} else if o.ForUpdate {
-					client.ScanForUpdate++
+				if o.Reverse {
+					if o.SkipLocked && o.ForUpdate {
+						client.ReverseScanForUpdateSkipLocked++
+					} else if o.SkipLocked {
+						client.ReverseScanSkipLocked++
+					} else if o.ForUpdate {
+						client.ReverseScanForUpdate++
+					} else {
+						client.ReverseScan++
+					}
 				} else {
-					client.Scan++
+					if o.SkipLocked && o.ForUpdate {
+						client.ScanForUpdateSkipLocked++
+					} else if o.SkipLocked {
+						client.ScanSkipLocked++
+					} else if o.ForUpdate {
+						client.ScanForUpdate++
+					} else {
+						client.Scan++
+					}
 				}
 			case *DeleteOperation:
 				if _, ok := keys[string(o.Key)]; ok {
@@ -172,12 +193,39 @@ func TestRandStep(t *testing.T) {
 		case *ClosureTxnOperation:
 			countClientOps(&counts.ClosureTxn.TxnClientOps, &counts.ClosureTxn.TxnBatchOps, o.Ops...)
 			if o.CommitInBatch != nil {
-				counts.ClosureTxn.CommitInBatch++
+				switch o.IsoLevel {
+				case isolation.Serializable:
+					counts.ClosureTxn.CommitSerializableInBatch++
+				case isolation.Snapshot:
+					counts.ClosureTxn.CommitSnapshotInBatch++
+				case isolation.ReadCommitted:
+					counts.ClosureTxn.CommitReadCommittedInBatch++
+				default:
+					t.Fatalf("unexpected isolation level %s", o.IsoLevel)
+				}
 				countClientOps(&counts.ClosureTxn.CommitBatchOps, nil, o.CommitInBatch.Ops...)
 			} else if o.Type == ClosureTxnType_Commit {
-				counts.ClosureTxn.Commit++
+				switch o.IsoLevel {
+				case isolation.Serializable:
+					counts.ClosureTxn.CommitSerializable++
+				case isolation.Snapshot:
+					counts.ClosureTxn.CommitSnapshot++
+				case isolation.ReadCommitted:
+					counts.ClosureTxn.CommitReadCommitted++
+				default:
+					t.Fatalf("unexpected isolation level %s", o.IsoLevel)
+				}
 			} else if o.Type == ClosureTxnType_Rollback {
-				counts.ClosureTxn.Rollback++
+				switch o.IsoLevel {
+				case isolation.Serializable:
+					counts.ClosureTxn.RollbackSerializable++
+				case isolation.Snapshot:
+					counts.ClosureTxn.RollbackSnapshot++
+				case isolation.ReadCommitted:
+					counts.ClosureTxn.RollbackReadCommitted++
+				default:
+					t.Fatalf("unexpected isolation level %s", o.IsoLevel)
+				}
 			}
 		case *SplitOperation:
 			if _, ok := splits[string(o.Key)]; ok {

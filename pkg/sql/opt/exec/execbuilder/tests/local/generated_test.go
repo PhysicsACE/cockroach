@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
@@ -51,6 +52,11 @@ func TestMain(m *testing.M) {
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
+
+	defer serverutils.TestingSetDefaultTenantSelectionOverride(
+		base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(76378),
+	)()
+
 	os.Exit(m.Run())
 }
 
@@ -189,6 +195,13 @@ func TestExecBuild_explain_gist(
 	runExecBuildLogicTest(t, "explain_gist")
 }
 
+func TestExecBuild_explain_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "explain_redact")
+}
+
 func TestExecBuild_explain_shape(
 	t *testing.T,
 ) {
@@ -208,6 +221,13 @@ func TestExecBuild_fk(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "fk")
+}
+
+func TestExecBuild_fk_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "fk_read_committed")
 }
 
 func TestExecBuild_forecast(
@@ -236,6 +256,13 @@ func TestExecBuild_group_join(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "group_join")
+}
+
+func TestExecBuild_guardrails(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "guardrails")
 }
 
 func TestExecBuild_hash_sharded_index(
@@ -336,6 +363,13 @@ func TestExecBuild_join_order(
 	runExecBuildLogicTest(t, "join_order")
 }
 
+func TestExecBuild_json(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "json")
+}
+
 func TestExecBuild_limit(
 	t *testing.T,
 ) {
@@ -383,6 +417,13 @@ func TestExecBuild_not_visible_index(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "not_visible_index")
+}
+
+func TestExecBuild_observability(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "observability")
 }
 
 func TestExecBuild_orderby(
@@ -462,6 +503,13 @@ func TestExecBuild_select_for_update(
 	runExecBuildLogicTest(t, "select_for_update")
 }
 
+func TestExecBuild_select_for_update_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "select_for_update_read_committed")
+}
+
 func TestExecBuild_select_index(
 	t *testing.T,
 ) {
@@ -509,6 +557,13 @@ func TestExecBuild_sql_fn(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "sql_fn")
+}
+
+func TestExecBuild_sql_statistics_persisted(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "sql_statistics_persisted")
 }
 
 func TestExecBuild_srfs(

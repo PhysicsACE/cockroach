@@ -103,8 +103,12 @@ func (v *VersionSetting) SettingsListDefault() string {
 // Typ is part of the Setting interface.
 func (*VersionSetting) Typ() string {
 	// This is named "m" (instead of "v") for backwards compatibility reasons.
-	return "m"
+	return VersionSettingValueType
 }
+
+// VersionSettingValueType is the value type string (m originally for
+// "migration") used in the system.settings table.
+const VersionSettingValueType = "m"
 
 // String is part of the Setting interface.
 func (v *VersionSetting) String(sv *Values) string {
@@ -177,6 +181,9 @@ func (v *VersionSetting) setToDefault(ctx context.Context, sv *Values) {}
 
 // RegisterVersionSetting adds the provided version setting to the global
 // registry.
-func RegisterVersionSetting(class Class, key, desc string, setting *VersionSetting) {
+func RegisterVersionSetting(
+	class Class, key InternalKey, desc string, setting *VersionSetting, opts ...SettingOption,
+) {
 	register(class, key, desc, setting)
+	setting.apply(opts)
 }

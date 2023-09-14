@@ -12,20 +12,22 @@ package tests
 
 import (
 	"context"
-	gosql "database/sql"
 	"errors"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
 )
@@ -34,16 +36,11 @@ import (
 // optimization is applied when doing a simple INSERT with a prepared statement.
 func TestInsertFastPathExtendedProtocol(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
-
-	var db *gosql.DB
-
-	params, _ := CreateTestServerParams()
-	params.Settings = cluster.MakeTestingClusterSettings()
-
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
-	defer tc.Stopper().Stop(ctx)
-	db = tc.ServerConn(0)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
 	_, err := db.Exec(`CREATE TABLE fast_path_test(val int);`)
 	require.NoError(t, err)
 
@@ -85,21 +82,16 @@ func TestInsertFastPathExtendedProtocol(t *testing.T) {
 // executed in the same transaction as a DDL.
 func TestInsertFastPathDisableDDLExtendedProtocol(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
-
-	var db *gosql.DB
-
-	params, _ := CreateTestServerParams()
-	params.Settings = cluster.MakeTestingClusterSettings()
-
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
-	defer tc.Stopper().Stop(ctx)
-	db = tc.ServerConn(0)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
 	_, err := db.Exec(`CREATE TABLE fast_path_test(val int, j int);`)
 	require.NoError(t, err)
 
 	// Use pgx so that we can introspect error codes returned from cockroach.
-	pgURL, cleanup := sqlutils.PGUrl(t, tc.Server(0).ServingSQLAddr(), "", url.User("root"))
+	pgURL, cleanup := sqlutils.PGUrl(t, s.ApplicationLayer().AdvSQLAddr(), "", url.User("root"))
 	defer cleanup()
 	conf, err := pgx.ParseConfig(pgURL.String())
 	require.NoError(t, err)
@@ -151,43 +143,50 @@ func TestInsertFastPathDisableDDLExtendedProtocol(t *testing.T) {
 // in an implicit transaction.
 func TestErrorDuringExtendedProtocolCommit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
-	var db *gosql.DB
-
 	var shouldErrorOnAutoCommit syncutil.AtomicBool
-	params, _ := CreateTestServerParams()
+	var traceID atomic.Uint64
+	var params base.TestServerArgs
 	params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
 		DisableAutoCommitDuringExec: true,
 		BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
 			if strings.Contains(stmt, "SELECT 'cat'") {
 				shouldErrorOnAutoCommit.Set(true)
+				traceID.Store(uint64(tracing.SpanFromContext(ctx).TraceID()))
 			}
 		},
 		BeforeAutoCommit: func(ctx context.Context, stmt string) error {
 			if shouldErrorOnAutoCommit.Get() {
-				shouldErrorOnAutoCommit.Set(false)
-				return errors.New("injected error")
+				// Only inject the error if we're in the same trace as the one we
+				// saw when executing our test query. This is so we know that this
+				// autocommit corresponds to our test qyery rather than an internal
+				// query.
+				if traceID.Load() == uint64(tracing.SpanFromContext(ctx).TraceID()) {
+					shouldErrorOnAutoCommit.Set(false)
+					return errors.New("injected error")
+				}
 			}
 			return nil
 		},
 	}
 	params.Settings = cluster.MakeTestingClusterSettings()
 
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
-	defer tc.Stopper().Stop(ctx)
-	db = tc.ServerConn(0)
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
 
 	conn, err := db.Conn(ctx)
 	require.NoError(t, err)
 	var i int
-	var s string
+	var str string
 	// Use placeholders to force usage of extended protocol.
-	err = conn.QueryRowContext(ctx, "SELECT 'cat', $1::int8", 1).Scan(&s, &i)
+	err = conn.QueryRowContext(ctx, "SELECT 'cat', $1::int8", 1).Scan(&str, &i)
 	require.EqualError(t, err, "pq: injected error")
 	// Check that the error was handled correctly, and another statement
 	// doesn't confuse the server.
-	err = conn.QueryRowContext(ctx, "SELECT 'dog', $1::int8", 2).Scan(&s, &i)
+	err = conn.QueryRowContext(ctx, "SELECT 'dog', $1::int8", 2).Scan(&str, &i)
 	require.NoError(t, err)
 	require.Equal(t, 2, i)
 }

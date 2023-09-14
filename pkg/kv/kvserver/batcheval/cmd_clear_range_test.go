@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -151,8 +152,8 @@ func TestCmdClearRange(t *testing.T) {
 				// Write some random point keys within the cleared span, above the range tombstones.
 				for i := 0; i < tc.keyCount; i++ {
 					key := roachpb.Key(fmt.Sprintf("%04d", i))
-					require.NoError(t, storage.MVCCPut(ctx, eng, nil, key,
-						hlc.Timestamp{WallTime: int64(4+i%2) * 1e9}, hlc.ClockTimestamp{}, value, nil))
+					require.NoError(t, storage.MVCCPut(ctx, eng, key,
+						hlc.Timestamp{WallTime: int64(4+i%2) * 1e9}, value, storage.MVCCWriteOptions{}))
 				}
 
 				// Calculate the range stats.
@@ -186,7 +187,8 @@ func TestCmdClearRange(t *testing.T) {
 				// particular, to test the additional seeks necessary to peek for
 				// adjacent range keys that we may truncate (for stats purposes) which
 				// should not cross the range bounds.
-				var latchSpans, lockSpans spanset.SpanSet
+				var latchSpans spanset.SpanSet
+				var lockSpans lockspanset.LockSpanSet
 				declareKeysClearRange(&desc, &cArgs.Header, cArgs.Args, &latchSpans, &lockSpans, 0)
 				batch := &wrappedBatch{Batch: spanset.NewBatchAt(eng.NewBatch(), &latchSpans, cArgs.Header.Timestamp)}
 				defer batch.Close()
@@ -203,11 +205,14 @@ func TestCmdClearRange(t *testing.T) {
 				require.Equal(t, tc.expClearIter, batch.clearIterCount == 1)
 
 				// Ensure that the data is gone.
-				iter := eng.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+				iter, err := eng.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 					KeyTypes:   storage.IterKeyTypePointsAndRanges,
 					LowerBound: startKey,
 					UpperBound: endKey,
 				})
+				if err != nil {
+					t.Fatal(err)
+				}
 				defer iter.Close()
 				iter.SeekGE(storage.MVCCKey{Key: keys.LocalMax})
 				ok, err := iter.Valid()

@@ -420,57 +420,72 @@ func DecodeIndexKeyPrefix(
 
 // DecodeIndexKey decodes the values that are a part of the specified index
 // key (setting vals).
-//
-// The remaining bytes in the index key are returned which will either be an
-// encoded column ID for the primary key index, the primary key suffix for
-// non-unique secondary indexes or unique secondary indexes containing NULL or
-// empty.
+// numVals returns the number of vals populated - this can be less than
+// len(vals) if key ran out of bytes while populating vals.
 func DecodeIndexKey(
-	codec keys.SQLCodec,
-	types []*types.T,
-	vals []EncDatum,
-	colDirs []catenumpb.IndexColumn_Direction,
-	key []byte,
-) (remainingKey []byte, foundNull bool, _ error) {
+	codec keys.SQLCodec, vals []EncDatum, colDirs []catenumpb.IndexColumn_Direction, key []byte,
+) (numVals int, _ error) {
 	key, err := codec.StripTenantPrefix(key)
 	if err != nil {
-		return nil, false, err
+		return 0, err
 	}
 	key, _, _, err = DecodePartialTableIDIndexID(key)
 	if err != nil {
-		return nil, false, err
+		return 0, err
 	}
-	remainingKey, foundNull, err = DecodeKeyVals(types, vals, colDirs, key)
+	_, numVals, err = DecodeKeyVals(vals, colDirs, key)
+	return numVals, err
+}
+
+// DecodeIndexKeyToDatums decodes a key to tree.Datums. It is similar to
+// DecodeIndexKey, but eagerly decodes the []EncDatum to tree.Datums.
+func DecodeIndexKeyToDatums(
+	codec keys.SQLCodec,
+	types []*types.T,
+	colDirs []catenumpb.IndexColumn_Direction,
+	key []byte,
+	a *tree.DatumAlloc,
+) (tree.Datums, error) {
+	vals := make([]EncDatum, len(types))
+	numVals, err := DecodeIndexKey(codec, vals, colDirs, key)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	return remainingKey, foundNull, nil
+	datums := make(tree.Datums, 0, numVals)
+	for i, encDatum := range vals[:numVals] {
+		if err := encDatum.EnsureDecoded(types[i], a); err != nil {
+			return nil, err
+		}
+		datums = append(datums, encDatum.Datum)
+	}
+	return datums, nil
 }
 
 // DecodeKeyVals decodes the values that are part of the key. The decoded
 // values are stored in the vals. If this slice is nil, the direction
 // used will default to encoding.Ascending.
-// DecodeKeyVals returns whether or not NULL was encountered in the key.
+// remainingKey returns any bytes leftover after populating vals.
+// numVals returns the number of vals populated - this can be less than
+// len(vals) if key ran out of bytes while populating vals.
 func DecodeKeyVals(
-	types []*types.T, vals []EncDatum, directions []catenumpb.IndexColumn_Direction, key []byte,
-) (remainingKey []byte, foundNull bool, _ error) {
+	vals []EncDatum, directions []catenumpb.IndexColumn_Direction, key []byte,
+) (remainingKey []byte, numVals int, _ error) {
 	if directions != nil && len(directions) != len(vals) {
-		return nil, false, errors.Errorf("encoding directions doesn't parallel vals: %d vs %d.",
+		return nil, 0, errors.Errorf("encoding directions doesn't parallel vals: %d vs %d.",
 			len(directions), len(vals))
 	}
-	for j := range vals {
+	for ; numVals < len(vals) && len(key) > 0; numVals++ {
 		enc := catenumpb.DatumEncoding_ASCENDING_KEY
-		if directions != nil && (directions[j] == catenumpb.IndexColumn_DESC) {
+		if directions != nil && (directions[numVals] == catenumpb.IndexColumn_DESC) {
 			enc = catenumpb.DatumEncoding_DESCENDING_KEY
 		}
 		var err error
-		vals[j], key, err = EncDatumFromBuffer(types[j], enc, key)
+		vals[numVals], key, err = EncDatumFromBuffer(enc, key)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, err
 		}
-		foundNull = foundNull || vals[j].IsNull()
 	}
-	return key, foundNull, nil
+	return key, numVals, nil
 }
 
 // DecodeKeyValsUsingSpec is a variant of DecodeKeyVals which uses
@@ -485,7 +500,7 @@ func DecodeKeyValsUsingSpec(
 			enc = catenumpb.DatumEncoding_DESCENDING_KEY
 		}
 		var err error
-		vals[j], key, err = EncDatumFromBuffer(c.Type, enc, key)
+		vals[j], key, err = EncDatumFromBuffer(enc, key)
 		if err != nil {
 			return nil, false, err
 		}
@@ -609,7 +624,7 @@ func EncodeInvertedIndexTableKeys(
 	case types.TSVectorFamily:
 		return tsearch.EncodeInvertedIndexKeys(inKey, val.(*tree.DTSVector).TSVector)
 	}
-	return nil, errors.AssertionFailedf("trying to apply inverted index to unsupported type %s", datum.ResolvedType())
+	return nil, errors.AssertionFailedf("trying to apply inverted index to unsupported type %s", datum.ResolvedType().SQLStringForError())
 }
 
 // EncodeContainingInvertedIndexSpans returns the spans that must be scanned in
@@ -637,7 +652,7 @@ func EncodeContainingInvertedIndexSpans(
 		return encodeContainingArrayInvertedIndexSpans(val.(*tree.DArray), nil /* inKey */)
 	default:
 		return nil, errors.AssertionFailedf(
-			"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
+			"trying to apply inverted index to unsupported type %s", datum.ResolvedType().SQLStringForError(),
 		)
 	}
 }
@@ -668,7 +683,7 @@ func EncodeContainedInvertedIndexSpans(
 		return json.EncodeContainedInvertedIndexSpans(nil /* inKey */, val.(*tree.DJSON).JSON)
 	default:
 		return nil, errors.AssertionFailedf(
-			"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
+			"trying to apply inverted index to unsupported type %s", datum.ResolvedType().SQLStringForError(),
 		)
 	}
 }
@@ -699,13 +714,16 @@ func EncodeExistsInvertedIndexSpans(
 	case types.ArrayFamily:
 		if val.ResolvedType().ArrayContents().Family() != types.StringFamily {
 			return nil, errors.AssertionFailedf(
-				"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
+				"trying to apply inverted index to unsupported type %s", datum.ResolvedType().SQLStringForError(),
 			)
 		}
 		var expr inverted.Expression
 		for _, d := range val.(*tree.DArray).Array {
-			s := string(*d.(*tree.DString))
-			newExpr, err := json.EncodeExistsInvertedIndexSpans(nil /* inKey */, s)
+			ds, ok := tree.AsDString(d)
+			if !ok {
+				continue
+			}
+			newExpr, err := json.EncodeExistsInvertedIndexSpans(nil /* inKey */, string(ds))
 			if err != nil {
 				return nil, err
 			}
@@ -720,7 +738,7 @@ func EncodeExistsInvertedIndexSpans(
 		return expr, nil
 	default:
 		return nil, errors.AssertionFailedf(
-			"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
+			"trying to apply inverted index to unsupported type %s", datum.ResolvedType().SQLStringForError(),
 		)
 	}
 }
@@ -748,7 +766,7 @@ func EncodeOverlapsInvertedIndexSpans(
 		return encodeOverlapsArrayInvertedIndexSpans(val.(*tree.DArray), nil /* inKey */)
 	default:
 		return nil, errors.AssertionFailedf(
-			"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
+			"trying to apply inverted index to unsupported type %s", datum.ResolvedType().SQLStringForError(),
 		)
 	}
 }
@@ -1079,6 +1097,14 @@ func EncodePrimaryIndex(
 		// The decoders expect that column family 0 is encoded with a TUPLE value tag, so we
 		// don't want to use the untagged value encoding.
 		if len(family.ColumnIDs) == 1 && family.ColumnIDs[0] == family.DefaultColumnID && family.ID != 0 {
+			// Single column value families which are not stored can be skipped, these
+			// may exist temporarily while adding a column.
+			if !storedColumns.Contains(family.DefaultColumnID) {
+				if cdatum, ok := values[colMap.GetDefault(family.DefaultColumnID)].(tree.CompositeDatum); !ok ||
+					!cdatum.IsComposite() {
+					return nil
+				}
+			}
 			datum := findColumnValue(family.DefaultColumnID, colMap, values)
 			// We want to include this column if its value is non-null or
 			// we were requested to include all of the columns.
@@ -1446,7 +1472,7 @@ func GetValueColumns(index catalog.Index) []ValueEncodedColumn {
 		id := index.GetCompositeColumnID(i)
 		// Inverted indexes on a composite type (i.e. an array of composite types)
 		// should not add the indexed column to the value.
-		if index.GetType() == descpb.IndexDescriptor_INVERTED && id == index.GetKeyColumnID(0) {
+		if index.GetType() == descpb.IndexDescriptor_INVERTED && id == index.InvertedColumnID() {
 			continue
 		}
 		cols = append(cols, ValueEncodedColumn{ColID: id, IsComposite: true})

@@ -104,7 +104,7 @@ func registerGORM(r registry.Registry) {
 		err = c.RunE(
 			ctx,
 			node,
-			fmt.Sprintf(`cd %s && go get -u -t ./... && go mod download && go mod tidy `, gormTestPath),
+			fmt.Sprintf(`cd %s && go mod tidy && go mod download`, gormTestPath),
 		)
 		require.NoError(t, err)
 
@@ -134,9 +134,10 @@ func registerGORM(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:    "gorm",
-		Owner:   registry.OwnerSQLSessions,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `orm`},
+		Leases:  registry.MetamorphicLeases,
+		Tags:    registry.Tags(`default`, `orm`),
 		Run:     runGORM,
 	})
 }

@@ -18,15 +18,20 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationtestutils"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,7 +48,7 @@ import (
 // tenant. This operation will fail the test if it is run prior to the
 // replication stream activating the tenant.
 //
-// - wait-until-high-watermark ts=<ts>
+// - wait-until-replicated-time ts=<ts>
 // Wait until the replication job has reached the specified timestamp.
 //
 // - cutover ts=<ts>
@@ -54,10 +59,13 @@ import (
 // - compare-replication-results: runs the specified SQL query on both the
 // "source" and "destination" tenants and asserts that the results are equal
 //
-// - compare-tenant-fingerprints from=<start-time> to=<end-time> [with_revisions]
+// - compare-tenant-fingerprints from=<start-time> to=<end-time> [with_revisions,table_fingerprints]
 // Runs `crdb_internal.fingerprint` on both the "source" and "destination"
 // tenants with the provided options and asserts that the generated fingerprints
 // are equal.
+//
+//   - the table_fingerprints option conducts another round of fingerprinting over each table in the
+//     clusters. (Primarily used to test fingerprint helper functions).
 //
 // - sleep ms=TIME
 // Sleep for TIME milliseconds.
@@ -73,6 +81,17 @@ import (
 // Executes the specified SQL query as the specified tenant, and prints the
 // results.
 //
+//   - job as=<source-system | destination-system > args
+//
+// Takes some action on the replication job. Some arguments:
+//
+//   - wait-for-state=<succeeded|paused|failed|reverting|cancelled>: wait for
+//     the job referenced by the tag to reach the specified state.
+//
+//   - pause: pauses the job.
+//
+//   - resume: resumes the job.
+//
 // - skip issue-num=N
 // Skips the test.
 func TestDataDriven(t *testing.T) {
@@ -87,6 +106,15 @@ func TestDataDriven(t *testing.T) {
 			for v := range ds.vars {
 				d.Input = strings.ReplaceAll(d.Input, v, ds.vars[v])
 			}
+
+			// A few built-in replacements since we
+			// already have these IDs in many cases, we
+			// don't need to force the caller to get them
+			// again.
+			d.Input = strings.ReplaceAll(d.Input, "$_producerJobID", fmt.Sprintf("%d", ds.producerJobID))
+			d.Input = strings.ReplaceAll(d.Input, "$_ingestionJobID", fmt.Sprintf("%d", ds.ingestionJobID))
+			d.Expected = strings.ReplaceAll(d.Expected, "$_producerJobID", fmt.Sprintf("%d", ds.producerJobID))
+			d.Expected = strings.ReplaceAll(d.Expected, "$_ingestionJobID", fmt.Sprintf("%d", ds.ingestionJobID))
 
 			switch d.Cmd {
 			case "skip":
@@ -105,24 +133,20 @@ func TestDataDriven(t *testing.T) {
 				})
 
 			case "start-replication-stream":
-				ds.producerJobID, ds.replicationJobID = ds.replicationClusters.StartStreamReplication(ctx)
+				ds.producerJobID, ds.ingestionJobID = ds.replicationClusters.StartStreamReplication(ctx)
 
-			case "wait-until-high-watermark":
-				var highWaterMark string
-				d.ScanArgs(t, "ts", &highWaterMark)
-				varValue, ok := ds.vars[highWaterMark]
+			case "wait-until-replicated-time":
+				var replicatedTimeTarget string
+				d.ScanArgs(t, "ts", &replicatedTimeTarget)
+				varValue, ok := ds.vars[replicatedTimeTarget]
 				if ok {
-					highWaterMark = varValue
+					replicatedTimeTarget = varValue
 				}
-				timestamp, _, err := tree.ParseDTimestamp(nil, highWaterMark, time.Microsecond)
-				require.NoError(t, err)
-				hw := hlc.Timestamp{WallTime: timestamp.UnixNano()}
-				ds.replicationClusters.WaitUntilHighWatermark(hw, jobspb.JobID(ds.replicationJobID))
-
+				ds.replicationClusters.WaitUntilReplicatedTime(stringToHLC(t, replicatedTimeTarget),
+					jobspb.JobID(ds.ingestionJobID))
 			case "start-replicated-tenant":
-				cleanupTenant := ds.replicationClusters.CreateDestTenantSQL(ctx)
+				cleanupTenant := ds.replicationClusters.StartDestTenant(ctx)
 				ds.cleanupFns = append(ds.cleanupFns, cleanupTenant)
-
 			case "let":
 				if len(d.CmdArgs) == 0 {
 					t.Fatalf("Must specify at least one variable name.")
@@ -156,30 +180,27 @@ func TestDataDriven(t *testing.T) {
 				if ok {
 					cutoverTime = varValue
 				}
+				var async bool
+				if d.HasArg("async") {
+					async = true
+				}
 				timestamp, _, err := tree.ParseDTimestamp(nil, cutoverTime, time.Microsecond)
 				require.NoError(t, err)
-				ds.replicationClusters.Cutover(ds.producerJobID, ds.replicationJobID, timestamp.Time)
+				ds.replicationClusters.Cutover(ds.producerJobID, ds.ingestionJobID, timestamp.Time, async)
+				return ""
 
 			case "exec-sql":
 				var as string
 				d.ScanArgs(t, "as", &as)
-				switch as {
-				case "source-system":
-					ds.replicationClusters.SrcSysSQL.Exec(t, d.Input)
-				case "source-tenant":
-					ds.replicationClusters.SrcTenantSQL.Exec(t, d.Input)
-				case "destination-system":
-					ds.replicationClusters.DestSysSQL.Exec(t, d.Input)
-				case "destination-tenant":
-					ds.replicationClusters.DestTenantSQL.Exec(t, d.Input)
-				default:
-					t.Fatalf("unsupported value to run SQL query as: %s", as)
-				}
+				ds.execAs(t, as, d.Input)
+				return ""
 
 			case "query-sql":
 				var as string
 				d.ScanArgs(t, "as", &as)
-
+				if d.HasArg("retry") {
+					ds.queryAsWithRetry(t, as, d.Input, d.Expected)
+				}
 				return ds.queryAs(t, as, d.Input)
 
 			case "compare-replication-results":
@@ -208,7 +229,19 @@ func TestDataDriven(t *testing.T) {
 				ds.replicationClusters.DestSysSQL.QueryRow(t, fmt.Sprintf(fingerprintQuery,
 					ds.replicationClusters.Args.DestTenantName, from, allRevisions, to)).Scan(&fingerprintDestTenant)
 				require.NotZero(t, fingerprintDestTenant)
+				if fingerprintSrcTenant != fingerprintDestTenant {
+					require.NoError(t, replicationutils.InvestigateFingerprints(ctx,
+						ds.replicationClusters.SrcTenantConn,
+						ds.replicationClusters.DestTenantConn, stringToHLC(t, from), stringToHLC(t, to)))
+					t.Fatalf("tenant level fingerpint mismatch, but table level fingerprints match")
+				}
 				require.Equal(t, fingerprintSrcTenant, fingerprintDestTenant)
+
+				if d.HasArg("table_fingerprints") {
+					require.NoError(t, replicationutils.InvestigateFingerprints(ctx,
+						ds.replicationClusters.SrcTenantConn,
+						ds.replicationClusters.DestTenantConn, stringToHLC(t, from), stringToHLC(t, to)))
+				}
 
 			case "sleep":
 				var msStr string
@@ -224,6 +257,87 @@ func TestDataDriven(t *testing.T) {
 				time.Sleep(time.Duration(ms) * time.Millisecond)
 				return ""
 
+			case "job":
+				var (
+					as     string
+					jobID  int
+					runner *sqlutils.SQLRunner
+				)
+				d.ScanArgs(t, "as", &as)
+				if as == "source-system" {
+					jobID = ds.producerJobID
+					runner = ds.replicationClusters.SrcSysSQL
+				} else if as == "destination-system" {
+					jobID = ds.ingestionJobID
+					runner = ds.replicationClusters.DestSysSQL
+				} else {
+					t.Fatalf("job cmd only works on consumer and producer jobs run on system tenant")
+				}
+				if d.HasArg("pause") {
+					ds.execAs(t, as, fmt.Sprintf(`PAUSE JOB %d`, jobID))
+				} else if d.HasArg("resume") {
+					ds.execAs(t, as, fmt.Sprintf(`RESUME JOB %d`, jobID))
+				} else if d.HasArg("wait-for-state") {
+					var state string
+					d.ScanArgs(t, "wait-for-state", &state)
+					jobPBID := jobspb.JobID(jobID)
+					switch state {
+					case "succeeded":
+						jobutils.WaitForJobToSucceed(t, runner, jobPBID)
+					case "cancelled":
+						jobutils.WaitForJobToCancel(t, runner, jobPBID)
+					case "paused":
+						jobutils.WaitForJobToPause(t, runner, jobPBID)
+					case "failed":
+						jobutils.WaitForJobToFail(t, runner, jobPBID)
+					case "reverting":
+						jobutils.WaitForJobReverting(t, runner, jobPBID)
+					case "running":
+						jobutils.WaitForJobToRun(t, runner, jobPBID)
+					default:
+						t.Fatalf("unknown state %s", state)
+					}
+				}
+				return ""
+			case "list-ttls":
+				var (
+					as string
+				)
+				d.ScanArgs(t, "as", &as)
+				var codec keys.SQLCodec
+				switch {
+				case strings.HasPrefix(as, "source"):
+					codec = keys.MakeSQLCodec(ds.replicationClusters.Args.SrcTenantID)
+				case strings.HasPrefix(as, "destination"):
+					codec = keys.MakeSQLCodec(ds.replicationClusters.Args.DestTenantID)
+				default:
+					t.Fatalf("%s does not begin with 'source' or 'destination'", as)
+				}
+
+				getTableID := func(arg string) uint32 {
+					var tableID string
+					d.ScanArgs(t, arg, &tableID)
+					varValue, ok := ds.vars[tableID]
+					if ok {
+						tableID = varValue
+					}
+					parsedID, err := strconv.Atoi(tableID)
+					if err != nil {
+						t.Fatalf("could not convert table ID %s", tableID)
+					}
+					return uint32(parsedID)
+				}
+
+				startKey := codec.TablePrefix(getTableID("min_table_id"))
+				endKey := codec.TablePrefix(getTableID("max_table_id"))
+
+				listQuery := fmt.Sprintf(
+					`SELECT crdb_internal.pb_to_json('cockroach.roachpb.SpanConfig', config)->'gcPolicy'->'ttlSeconds'
+FROM system.span_configurations
+WHERE start_key >= '\x%x' AND start_key <= '\x%x'
+ORDER BY start_key;`, startKey, endKey)
+				return ds.queryAsWithRetry(t, as, listQuery, d.Expected)
+
 			default:
 				t.Fatalf("unsupported instruction: %s", d.Cmd)
 			}
@@ -232,16 +346,25 @@ func TestDataDriven(t *testing.T) {
 	})
 }
 
+func stringToHLC(t *testing.T, timestamp string) hlc.Timestamp {
+	parsedTimestamp, _, err := tree.ParseDTimestamp(nil, timestamp, time.Microsecond)
+	require.NoError(t, err)
+	return hlc.Timestamp{WallTime: parsedTimestamp.UnixNano()}
+}
+
 type datadrivenTestState struct {
-	producerJobID, replicationJobID int
-	replicationClusters             *replicationtestutils.TenantStreamingClusters
-	cleanupFns                      []func() error
-	vars                            map[string]string
+	producerJobID       int
+	ingestionJobID      int
+	replicationClusters *replicationtestutils.TenantStreamingClusters
+	cleanupFns          []func() error
+	vars                map[string]string
 }
 
 func (d *datadrivenTestState) cleanup(t *testing.T) {
-	for _, cleanup := range d.cleanupFns {
-		require.NoError(t, cleanup())
+	// To mimic the calling pattern of deferred functions in a single goroutine,
+	// call cleanup functions in the opposite order they were appended.
+	for i := len(d.cleanupFns) - 1; i >= 0; i-- {
+		require.NoError(t, d.cleanupFns[i]())
 	}
 }
 
@@ -263,6 +386,33 @@ func (d *datadrivenTestState) queryAs(t *testing.T, as, query string) string {
 	output, err := sqlutils.RowsToDataDrivenOutput(rows)
 	require.NoError(t, err)
 	return output
+}
+
+func (d *datadrivenTestState) queryAsWithRetry(t *testing.T, as, query, expected string) string {
+	var output string
+	testutils.SucceedsSoon(t, func() error {
+		output = d.queryAs(t, as, query)
+		if output != expected {
+			return errors.Newf("latest output: %s\n expected: %s", output, expected)
+		}
+		return nil
+	})
+	return output
+}
+
+func (d *datadrivenTestState) execAs(t *testing.T, as, query string) {
+	switch as {
+	case "source-system":
+		d.replicationClusters.SrcSysSQL.Exec(t, query)
+	case "source-tenant":
+		d.replicationClusters.SrcTenantSQL.Exec(t, query)
+	case "destination-system":
+		d.replicationClusters.DestSysSQL.Exec(t, query)
+	case "destination-tenant":
+		d.replicationClusters.DestTenantSQL.Exec(t, query)
+	default:
+		t.Fatalf("unsupported value to run SQL query as: %s", as)
+	}
 }
 
 func newDatadrivenTestState() datadrivenTestState {

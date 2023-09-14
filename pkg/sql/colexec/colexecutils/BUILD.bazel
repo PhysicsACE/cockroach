@@ -1,6 +1,5 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "colexecutils",
@@ -52,7 +51,6 @@ go_test(
     ],
     args = ["-test.timeout=295s"],
     embed = [":colexecutils"],
-    tags = ["no-remote"],
     deps = [
         "//pkg/col/coldata",
         "//pkg/col/coldataext",
@@ -86,5 +84,3 @@ disallowed_imports_test(
         "pkg/sql/colexec/",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -17,8 +17,10 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/ingeststopped"
 	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -44,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -85,6 +88,11 @@ func (r *importResumer) TestingSetAfterImportKnob(fn func(summary roachpb.RowCou
 var _ jobs.TraceableJob = &importResumer{}
 
 func (r *importResumer) ForceRealSpan() bool {
+	return true
+}
+
+// DumpTraceAfterRun implements the TraceableJob interface.
+func (r *importResumer) DumpTraceAfterRun() bool {
 	return true
 }
 
@@ -144,8 +152,8 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 				if err != nil {
 					return err
 				}
-				schemaMetadata.oldSchemaIDToName[dbDesc.GetSchemaID(tree.PublicSchema)] = tree.PublicSchema
-				schemaMetadata.newSchemaIDToName[dbDesc.GetSchemaID(tree.PublicSchema)] = tree.PublicSchema
+				schemaMetadata.oldSchemaIDToName[dbDesc.GetSchemaID(catconstants.PublicSchemaName)] = catconstants.PublicSchemaName
+				schemaMetadata.newSchemaIDToName[dbDesc.GetSchemaID(catconstants.PublicSchemaName)] = catconstants.PublicSchemaName
 
 				preparedDetails, err = r.prepareTablesForIngestion(ctx, p, curDetails, txn.KV(), descsCol,
 					schemaMetadata)
@@ -226,7 +234,7 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			// If we are importing from PGDUMP, qualify the table name with the schema
 			// name since we support non-public schemas.
 			if details.Format.Format == roachpb.IOFileFormat_PgDump {
-				schemaName := tree.PublicSchema
+				schemaName := catconstants.PublicSchemaName
 				if schema, ok := schemaIDToName[i.Desc.GetUnexposedParentSchemaID()]; ok {
 					schemaName = schema
 				}
@@ -599,10 +607,12 @@ func prepareNewTablesForIngestion(
 	// Write the new TableDescriptors and flip the namespace entries over to
 	// them. After this call, any queries on a table will be served by the newly
 	// imported data.
+	includePublicSchemaCreatePriv := sql.PublicSchemaCreatePrivilegeEnabled.Get(&p.ExecCfg().Settings.SV)
 	if err := ingesting.WriteDescriptors(
-		ctx, p.ExecCfg().Codec, txn, p.User(), descsCol,
-		nil /* databases */, nil /* schemas */, tableDescs, nil /* types */, nil, /* functions */
-		tree.RequestedDescriptors, seqValKVs, "" /* inheritParentName */); err != nil {
+		ctx, txn, p.User(), descsCol, nil /* databases */, nil /* schemas */, tableDescs,
+		nil /* types */, nil /* functions */, tree.RequestedDescriptors, seqValKVs,
+		"" /* inheritParentName */, includePublicSchemaCreatePriv,
+	); err != nil {
 		return nil, errors.Wrapf(err, "creating importTables")
 	}
 
@@ -681,7 +691,7 @@ func (r *importResumer) prepareSchemasForIngestion(
 
 	// Finally create the schemas on disk.
 	for i, mutDesc := range mutableSchemaDescs {
-		b := &kv.Batch{}
+		b := txn.KV().NewBatch()
 		kvTrace := p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 		if err := descsCol.WriteDescToBatch(ctx, kvTrace, mutDesc, b); err != nil {
 			return nil, err
@@ -824,7 +834,7 @@ func getPublicSchemaDescForDatabase(
 	if err := sql.DescsTxn(ctx, execCfg, func(
 		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
-		publicSchemaID := db.GetSchemaID(tree.PublicSchema)
+		publicSchemaID := db.GetSchemaID(catconstants.PublicSchemaName)
 		scDesc, err = descriptors.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Schema(ctx, publicSchemaID)
 		return err
 	}); err != nil {
@@ -867,7 +877,7 @@ func parseAndCreateBundleTableDescs(
 	}
 	defer store.Close()
 
-	raw, err := store.ReadFile(ctx, "")
+	raw, _, err := store.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
 	if err != nil {
 		return tableDescs, schemaDescs, err
 	}
@@ -1036,7 +1046,10 @@ func (r *importResumer) writeStubStatisticsForImportedTables(
 			// single-column stats to avoid the appearance of perfectly correlated
 			// columns.
 			multiColEnabled := false
-			statistics, err := sql.StubTableStats(desc, jobspb.ImportStatsName, multiColEnabled)
+			defaultHistogramBuckets := stats.GetDefaultHistogramBuckets(execCfg.SV(), desc)
+			statistics, err := sql.StubTableStats(
+				desc, jobspb.ImportStatsName, multiColEnabled, defaultHistogramBuckets,
+			)
 			if err == nil {
 				for _, statistic := range statistics {
 					statistic.RowCount = rowCount
@@ -1328,7 +1341,7 @@ func constructSchemaAndTableKey(
 	_ clusterversion.Handle,
 ) (schemaAndTableName, error) {
 	schemaName, ok := schemaIDToName[tableDesc.GetUnexposedParentSchemaID()]
-	if !ok && schemaName != tree.PublicSchema {
+	if !ok && schemaName != catconstants.PublicSchemaName {
 		return schemaAndTableName{}, errors.Newf("invalid parent schema %s with ID %d for table %s",
 			schemaName, tableDesc.UnexposedParentSchemaID, tableDesc.GetName())
 	}
@@ -1410,6 +1423,20 @@ func (r *importResumer) OnFailOrCancel(
 	logutil.LogJobCompletion(ctx, importJobRecoveryEventType, r.job.ID(), false, jobErr, r.res.Rows)
 
 	addToFileFormatTelemetry(details.Format.Format.String(), "failed")
+
+	// If the import completed preparation and started writing, verify it has
+	// stopped writing before proceeding to revert it.
+	if details.PrepareComplete {
+		log.Infof(ctx, "need to verify that no nodes are still importing since job had started writing...")
+		const maxWait = time.Minute * 5
+		if err := ingeststopped.WaitForNoIngestingNodes(ctx, p, r.job, maxWait); err != nil {
+			log.Errorf(ctx, "unable to verify that attempted IMPORT job %d had stopped writing before reverting after %s: %v", r.job.ID(), maxWait, err)
+		} else {
+			log.Infof(ctx, "verified no nodes still ingesting on behalf of job %d", r.job.ID())
+		}
+
+	}
+
 	cfg := execCtx.(sql.JobExecContext).ExecCfg()
 	var jobsToRunAfterTxnCommit []jobspb.JobID
 	if err := sql.DescsTxn(ctx, cfg, func(

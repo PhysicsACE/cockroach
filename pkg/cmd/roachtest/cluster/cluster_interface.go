@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 )
 
 // Cluster is the interface through which a given roachtest interacts with the
@@ -54,6 +55,8 @@ type Cluster interface {
 	Start(ctx context.Context, l *logger.Logger, startOpts option.StartOpts, settings install.ClusterSettings, opts ...option.Option)
 	StopE(ctx context.Context, l *logger.Logger, stopOpts option.StopOpts, opts ...option.Option) error
 	Stop(ctx context.Context, l *logger.Logger, stopOpts option.StopOpts, opts ...option.Option)
+	SignalE(ctx context.Context, l *logger.Logger, sig int, opts ...option.Option) error
+	Signal(ctx context.Context, l *logger.Logger, sig int, opts ...option.Option)
 	StopCockroachGracefullyOnNode(ctx context.Context, l *logger.Logger, node int) error
 	NewMonitor(context.Context, ...option.Option) Monitor
 
@@ -70,6 +73,7 @@ type Cluster interface {
 	ExternalPGUrl(ctx context.Context, l *logger.Logger, node option.NodeListOption, tenant string) ([]string, error)
 
 	// SQL clients to nodes.
+
 	Conn(ctx context.Context, l *logger.Logger, node int, opts ...func(*option.ConnOption)) *gosql.DB
 	ConnE(ctx context.Context, l *logger.Logger, node int, opts ...func(*option.ConnOption)) (*gosql.DB, error)
 
@@ -105,12 +109,15 @@ type Cluster interface {
 	Spec() spec.ClusterSpec
 	Name() string
 	IsLocal() bool
+	// IsSecure returns true iff the cluster uses TLS.
 	IsSecure() bool
+	// Architecture returns CPU architecture of the nodes.
+	Architecture() vm.CPUArch
 
 	// Deleting CockroachDB data and logs on nodes.
 
-	WipeE(ctx context.Context, l *logger.Logger, opts ...option.Option) error
-	Wipe(ctx context.Context, opts ...option.Option)
+	WipeE(ctx context.Context, l *logger.Logger, preserveCerts bool, opts ...option.Option) error
+	Wipe(ctx context.Context, preserveCerts bool, opts ...option.Option)
 
 	// Internal niche tools.
 
@@ -128,8 +135,39 @@ type Cluster interface {
 	) error
 
 	FetchTimeseriesData(ctx context.Context, l *logger.Logger) error
+	FetchDebugZip(ctx context.Context, l *logger.Logger, dest string) error
 	RefetchCertsFromNode(ctx context.Context, node int) error
 
 	StartGrafana(ctx context.Context, l *logger.Logger, promCfg *prometheus.Config) error
 	StopGrafana(ctx context.Context, l *logger.Logger, dumpDir string) error
+
+	// Volume snapshot related APIs.
+	//
+	// NB: The --local case for these snapshot APIs are that they all no-op. But
+	// it should be transparent to roachtests. The assumption this interface
+	// makes is that the calling roachtest that needed to CreateSnapshot will
+	// proceed with then using the already populated disks. Disks that it
+	// populated having not found any existing snapshots. So --local runs don't
+	// rely on the remaining snapshot methods to actually do anything.
+
+	// CreateSnapshot creates volume snapshots of the cluster using the given
+	// prefix. These snapshots can later be retrieved, deleted or applied to
+	// already instantiated clusters.
+	//
+	CreateSnapshot(ctx context.Context, snapshotPrefix string) ([]vm.VolumeSnapshot, error)
+	// ListSnapshots lists the individual volume snapshots that satisfy the
+	// search criteria.
+	ListSnapshots(ctx context.Context, vslo vm.VolumeSnapshotListOpts) ([]vm.VolumeSnapshot, error)
+	// DeleteSnapshots permanently deletes the given snapshots.
+	DeleteSnapshots(ctx context.Context, snapshots ...vm.VolumeSnapshot) error
+	// ApplySnapshots applies the given volume snapshots to the underlying
+	// cluster. This is a destructive operation as far as existing state is
+	// concerned - all already-attached volumes are detached and deleted to make
+	// room for new snapshot-derived volumes. The new volumes are created using
+	// the same specs (size, disk type, etc.) as the original cluster.
+	//
+	// TODO(irfansharif): The implementation tacitly assumes one volume
+	// per-node, but this could be changed. Another assumption is that all
+	// volumes are created identically.
+	ApplySnapshots(ctx context.Context, snapshots []vm.VolumeSnapshot) error
 }

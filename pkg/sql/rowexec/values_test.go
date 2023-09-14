@@ -31,6 +31,8 @@ import (
 
 func TestValuesProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	rng, _ := randutil.NewTestRand()
 	for _, numRows := range []int{0, 1, 10, 13, 15} {
 		for _, numCols := range []int{0, 1, 3} {
@@ -52,11 +54,11 @@ func TestValuesProcessor(t *testing.T) {
 					Mon:     evalCtx.TestingMon,
 				}
 
-				v, err := newValuesProcessor(context.Background(), &flowCtx, 0 /* processorID */, &spec, &execinfrapb.PostProcessSpec{}, out)
+				v, err := newValuesProcessor(context.Background(), &flowCtx, 0 /* processorID */, &spec, &execinfrapb.PostProcessSpec{})
 				if err != nil {
 					t.Fatal(err)
 				}
-				v.Run(context.Background())
+				v.Run(context.Background(), out)
 				if !out.ProducerClosed() {
 					t.Fatalf("output RowReceiver not closed")
 				}
@@ -125,11 +127,11 @@ func BenchmarkValuesProcessor(b *testing.B) {
 				b.SetBytes(int64(8 * numRows * numCols))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					v, err := newValuesProcessor(ctx, &flowCtx, 0 /* processorID */, &spec, &post, &output)
+					v, err := newValuesProcessor(ctx, &flowCtx, 0 /* processorID */, &spec, &post)
 					if err != nil {
 						b.Fatal(err)
 					}
-					v.Run(ctx)
+					v.Run(ctx, &output)
 				}
 			})
 		}

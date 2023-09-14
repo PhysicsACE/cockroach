@@ -50,6 +50,7 @@ type Outbox struct {
 	execinfra.RowChannel
 
 	flowCtx       *execinfra.FlowCtx
+	processorID   int32
 	streamID      execinfrapb.StreamID
 	sqlInstanceID base.SQLInstanceID
 	// The rows received from the RowChannel will be forwarded on this stream once
@@ -79,7 +80,7 @@ type Outbox struct {
 	}
 
 	statsCollectionEnabled bool
-	stats                  execinfrapb.ComponentStats
+	streamStats, flowStats execinfrapb.ComponentStats
 
 	// numOutboxes is an atomic that keeps track of how many outboxes are left.
 	// When there is one outbox left, the flow-level stats are added to the last
@@ -97,17 +98,19 @@ var _ Startable = &Outbox{}
 // NewOutbox creates a new Outbox.
 func NewOutbox(
 	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	sqlInstanceID base.SQLInstanceID,
 	streamID execinfrapb.StreamID,
 	numOutboxes *int32,
 	isGatewayNode bool,
 ) *Outbox {
-	m := &Outbox{flowCtx: flowCtx, sqlInstanceID: sqlInstanceID}
+	m := &Outbox{flowCtx: flowCtx, processorID: processorID, sqlInstanceID: sqlInstanceID}
 	m.encoder.SetHeaderFields(flowCtx.ID, streamID)
 	m.streamID = streamID
 	m.numOutboxes = numOutboxes
 	m.isGatewayNode = isGatewayNode
-	m.stats.Component = flowCtx.StreamComponentID(streamID)
+	m.streamStats.Component = flowCtx.StreamComponentID(streamID)
+	m.flowStats.Component = flowCtx.FlowComponentID()
 	return m
 }
 
@@ -147,7 +150,7 @@ func (m *Outbox) AddRow(
 			mustFlush = true
 		}
 		if m.statsCollectionEnabled {
-			m.stats.NetTx.TuplesSent.Add(1)
+			m.streamStats.NetTx.TuplesSent.Add(1)
 		}
 	}
 	m.numRows++
@@ -171,13 +174,11 @@ func (m *Outbox) flush(ctx context.Context) error {
 	}
 	msg := m.encoder.FormMessage(ctx)
 
-	if log.V(3) {
-		log.Infof(ctx, "flushing outbox")
-	}
+	log.VEvent(ctx, 2, "Outbox flushing")
 	sendErr := m.stream.Send(msg)
 	if m.statsCollectionEnabled {
-		m.stats.NetTx.BytesSent.Add(int64(msg.Size()))
-		m.stats.NetTx.MessagesSent.Add(1)
+		m.streamStats.NetTx.BytesSent.Add(int64(msg.Size()))
+		m.streamStats.NetTx.MessagesSent.Add(1)
 	}
 	for _, rpm := range msg.Data.Metadata {
 		if metricsMeta, ok := rpm.Value.(*execinfrapb.RemoteProducerMetadata_Metrics_); ok {
@@ -188,11 +189,9 @@ func (m *Outbox) flush(ctx context.Context) error {
 		HandleStreamErr(ctx, "flushing", sendErr, m.flowCtxCancel, m.outboxCtxCancel)
 		// Make sure the stream is not used any more.
 		m.stream = nil
-		if log.V(1) {
-			log.Errorf(ctx, "outbox flush error: %s", sendErr)
-		}
-	} else if log.V(3) {
-		log.Infof(ctx, "outbox flushed")
+		log.VErrEventf(ctx, 1, "Outbox flush error: %s", sendErr)
+	} else {
+		log.VEvent(ctx, 2, "Outbox flushed")
 	}
 	if sendErr != nil {
 		return sendErr
@@ -227,35 +226,42 @@ func (m *Outbox) mainLoop(ctx context.Context, wg *sync.WaitGroup) (retErr error
 	ctx, m.outboxCtxCancel = context.WithCancel(ctx)
 
 	var span *tracing.Span
-	ctx, span = execinfra.ProcessorSpan(ctx, "outbox")
+	ctx, span = execinfra.ProcessorSpan(ctx, m.flowCtx, "outbox", m.processorID)
 	defer span.Finish()
 	if span != nil {
 		m.statsCollectionEnabled = span.RecordingType() != tracingpb.RecordingOff
 		if span.IsVerbose() {
-			span.SetTag(execinfrapb.FlowIDTagKey, attribute.StringValue(m.flowCtx.ID.String()))
 			span.SetTag(execinfrapb.StreamIDTagKey, attribute.IntValue(int(m.streamID)))
 		}
 	}
 
-	conn, err := execinfra.GetConnForOutbox(
-		ctx, m.flowCtx.Cfg.PodNodeDialer, m.sqlInstanceID, SettingFlowStreamTimeout.Get(&m.flowCtx.Cfg.Settings.SV),
-	)
-	if err != nil {
-		// Log any Dial errors. This does not have a verbosity check due to being
-		// a critical part of query execution: if this step doesn't work, the
-		// receiving side might end up hanging or timing out.
-		log.Infof(ctx, "outbox: connection dial error: %+v", err)
-		return err
-	}
-	client := execinfrapb.NewDistSQLClient(conn)
-	if log.V(2) {
-		log.Infof(ctx, "outbox: calling FlowStream")
-	}
-	m.stream, err = client.FlowStream(ctx)
-	if err != nil {
-		if log.V(1) {
-			log.Infof(ctx, "FlowStream error: %s", err)
+	if err := func() error {
+		conn, err := execinfra.GetConnForOutbox(
+			ctx, m.flowCtx.Cfg.SQLInstanceDialer, m.sqlInstanceID, SettingFlowStreamTimeout.Get(&m.flowCtx.Cfg.Settings.SV),
+		)
+		if err != nil {
+			// Log any Dial errors. This does not have a verbosity check due to being
+			// a critical part of query execution: if this step doesn't work, the
+			// receiving side might end up hanging or timing out.
+			log.Infof(ctx, "outbox: connection dial error: %+v", err)
+			return err
 		}
+		client := execinfrapb.NewDistSQLClient(conn)
+		if log.V(2) {
+			log.Infof(ctx, "outbox: calling FlowStream")
+		}
+		m.stream, err = client.FlowStream(ctx)
+		if err != nil {
+			if log.V(1) {
+				log.Infof(ctx, "FlowStream error: %s", err)
+			}
+			return err
+		}
+		return nil
+	}(); err != nil {
+		// An error during stream setup - the whole query will fail, so we might
+		// as well proactively cancel the flow on this node.
+		m.flowCtxCancel()
 		return err
 	}
 	if log.V(2) {
@@ -301,19 +307,18 @@ func (m *Outbox) mainLoop(ctx context.Context, wg *sync.WaitGroup) (retErr error
 						return err
 					}
 					if !m.isGatewayNode && m.numOutboxes != nil && atomic.AddInt32(m.numOutboxes, -1) == 0 {
-						// TODO(cathymw): maxMemUsage shouldn't be attached to span stats that are associated with streams,
-						// since it's a flow level stat. However, due to the row exec engine infrastructure, it is too
-						// complicated to attach this to a flow level span. If the row exec engine gets removed, getting
-						// maxMemUsage from streamStats should be removed as well.
-						m.stats.FlowStats.MaxMemUsage.Set(uint64(m.flowCtx.Mon.MaximumBytes()))
-						m.stats.FlowStats.MaxDiskUsage.Set(uint64(m.flowCtx.DiskMonitor.MaximumBytes()))
-						m.stats.FlowStats.ConsumedRU.Set(uint64(m.flowCtx.TenantCPUMonitor.EndCollection(ctx)))
+						m.flowStats.FlowStats.MaxMemUsage.Set(uint64(m.flowCtx.Mon.MaximumBytes()))
+						m.flowStats.FlowStats.MaxDiskUsage.Set(uint64(m.flowCtx.DiskMonitor.MaximumBytes()))
+						m.flowStats.FlowStats.ConsumedRU.Set(uint64(m.flowCtx.TenantCPUMonitor.EndCollection(ctx)))
 					}
-					span.RecordStructured(&m.stats)
-					if trace := tracing.SpanFromContext(ctx).GetConfiguredRecording(); trace != nil {
-						err := m.AddRow(ctx, nil, &execinfrapb.ProducerMetadata{TraceData: trace})
-						if err != nil {
-							return err
+					span.RecordStructured(&m.streamStats)
+					span.RecordStructured(&m.flowStats)
+					if !m.flowCtx.Gateway {
+						if trace := tracing.SpanFromContext(ctx).GetConfiguredRecording(); trace != nil {
+							err := m.AddRow(ctx, nil, &execinfrapb.ProducerMetadata{TraceData: trace})
+							if err != nil {
+								return err
+							}
 						}
 					}
 				}
@@ -383,6 +388,7 @@ func (m *Outbox) startWatchdogGoroutine(
 	stream := m.stream
 	wg.Add(1)
 	if err := m.flowCtx.Cfg.Stopper.RunAsyncTask(ctx, "watchdog", func(ctx context.Context) {
+		defer wg.Done()
 		for {
 			signal, err := stream.Recv()
 			if err != nil {
@@ -403,17 +409,11 @@ func (m *Outbox) startWatchdogGoroutine(
 			}
 		}
 		close(ch)
-		wg.Done()
 	}); err != nil {
 		wg.Done()
 		return nil, err
 	}
 	return ch, nil
-}
-
-func (m *Outbox) run(ctx context.Context, wg *sync.WaitGroup) {
-	m.setErr(m.mainLoop(ctx, wg))
-	wg.Done()
 }
 
 // Start starts the outbox.
@@ -423,7 +423,10 @@ func (m *Outbox) Start(ctx context.Context, wg *sync.WaitGroup, flowCtxCancel co
 	}
 	m.flowCtxCancel = flowCtxCancel
 	wg.Add(1)
-	go m.run(ctx, wg)
+	go func() {
+		defer wg.Done()
+		m.setErr(m.mainLoop(ctx, wg))
+	}()
 }
 
 // setErr sets the error stored in the Outbox if it hasn't been set previously.

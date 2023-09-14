@@ -35,7 +35,7 @@ import (
 )
 
 var retryableError = kvpb.NewTransactionRetryWithProtoRefreshError(
-	``, uuid.MakeV4(), roachpb.Transaction{})
+	``, uuid.MakeV4(), 0 /* prevTxnEpoch */, roachpb.Transaction{})
 
 func withTimestamp(op Operation, ts int) Operation {
 	op.Result().OptionalTimestamp = hlc.Timestamp{WallTime: int64(ts)}
@@ -193,6 +193,7 @@ func TestValidate(t *testing.T) {
 
 	type sstKV struct {
 		key       string
+		endKey    string
 		tombstone bool
 	}
 
@@ -210,16 +211,27 @@ func TestValidate(t *testing.T) {
 
 		for _, kv := range kvs {
 			key := roachpb.Key(kv.key)
+			endKey := roachpb.Key(kv.endKey)
 			value := storage.MVCCValue{MVCCValueHeader: vh}
 			if !kv.tombstone {
 				value.Value = roachpb.MakeValueFromString(sv(seq))
 			}
-			require.NoError(t, w.PutMVCC(storage.MVCCKey{Key: key, Timestamp: ts}, value))
+
+			if len(endKey) == 0 {
+				require.NoError(t, w.PutMVCC(storage.MVCCKey{Key: key, Timestamp: ts}, value))
+			} else {
+				require.NoError(t, w.PutMVCCRangeKey(
+					storage.MVCCRangeKey{StartKey: key, EndKey: endKey, Timestamp: ts}, value))
+			}
 
 			if len(span.Key) == 0 || key.Compare(span.Key) < 0 {
 				span.Key = key.Clone()
 			}
-			if ek := roachpb.Key(tk(fk(kv.key) + 1)); ek.Compare(span.EndKey) > 0 {
+			if len(endKey) > 0 {
+				if endKey.Compare(span.EndKey) > 0 {
+					span.EndKey = endKey.Clone()
+				}
+			} else if ek := roachpb.Key(tk(fk(kv.key) + 1)); ek.Compare(span.EndKey) > 0 {
 				span.EndKey = ek.Clone()
 			}
 		}
@@ -325,7 +337,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(del(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResultOK(put(k1, s3)),
 					withResultOK(del(k1, s4)),
 					withResultOK(put(k1, s5)),
@@ -361,7 +373,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally committed put with the correct writes",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 				), t1)),
 			},
@@ -371,7 +383,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally committed delete with the correct writes",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 				), t1)),
 			},
@@ -380,7 +392,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally committed put with first write missing",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k2, s2)),
 				), t1)),
@@ -390,7 +402,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally committed delete with first write missing",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 					withResult(del(k2, s2)),
 				), t1)),
@@ -400,7 +412,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally committed put with second write missing",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k2, s2)),
 				), t1)),
@@ -410,7 +422,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally committed delete with second write missing",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 					withResult(del(k2, s2)),
 				), t1)),
@@ -420,7 +432,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally committed put with write timestamp disagreement",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k2, s2)),
 				), t1)),
@@ -430,7 +442,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally committed delete with write timestamp disagreement",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 					withResult(del(k2, s2)),
 				), t1)),
@@ -442,7 +454,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally rolled back put with write (correctly) missing",
 			steps: []Step{
-				step(withResultErr(closureTxn(ClosureTxnType_Rollback,
+				step(withResultErr(closureTxnSSI(ClosureTxnType_Rollback,
 					withResult(put(k1, s1)),
 				), errors.New(`rollback`))),
 			},
@@ -451,7 +463,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally rolled back delete with write (correctly) missing",
 			steps: []Step{
-				step(withResultErr(closureTxn(ClosureTxnType_Rollback,
+				step(withResultErr(closureTxnSSI(ClosureTxnType_Rollback,
 					withResult(del(k1, s1)),
 				), errors.New(`rollback`))),
 			},
@@ -460,7 +472,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally rolled back put with write (incorrectly) present",
 			steps: []Step{
-				step(withResultErr(closureTxn(ClosureTxnType_Rollback,
+				step(withResultErr(closureTxnSSI(ClosureTxnType_Rollback,
 					withResult(put(k1, s1)),
 				), errors.New(`rollback`))),
 			},
@@ -469,7 +481,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally rolled back delete with write (incorrectly) present",
 			steps: []Step{
-				step(withResultErr(closureTxn(ClosureTxnType_Rollback,
+				step(withResultErr(closureTxnSSI(ClosureTxnType_Rollback,
 					withResult(del(k1, s1)),
 				), errors.New(`rollback`))),
 			},
@@ -478,7 +490,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally rolled back batch put with write (correctly) missing",
 			steps: []Step{
-				step(withResultErr(closureTxn(ClosureTxnType_Rollback,
+				step(withResultErr(closureTxnSSI(ClosureTxnType_Rollback,
 					withResult(batch(
 						withResult(put(k1, s1)),
 					)),
@@ -489,7 +501,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactionally rolled back batch delete with write (correctly) missing",
 			steps: []Step{
-				step(withResultErr(closureTxn(ClosureTxnType_Rollback,
+				step(withResultErr(closureTxnSSI(ClosureTxnType_Rollback,
 					withResult(batch(
 						withResult(del(k1, s1)),
 					)),
@@ -500,7 +512,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed puts of the same key",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k1, s2)),
 				), t1)),
@@ -522,7 +534,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed deletes of the same key",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 					withResult(del(k1, s2)),
 				), t1)),
@@ -532,7 +544,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed writes (put, delete) of the same key",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(del(k1, s2)),
 				), t1)),
@@ -542,7 +554,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed writes (delete, put) of the same key",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 					withResult(put(k1, s2)),
 				), t1)),
@@ -552,7 +564,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed puts of the same key with extra write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k1, s2)),
 				), t2)),
@@ -562,7 +574,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed deletes of the same key with extra write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 					withResult(del(k1, s2)),
 				), t1)),
@@ -572,7 +584,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed writes (put, delete) of the same key with extra write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResultOK(put(k1, s1)),
 					withResultOK(del(k1, s2)),
 				), t1)),
@@ -582,7 +594,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "ambiguous put-put transaction committed",
 			steps: []Step{
-				step(withAmbResult(closureTxn(ClosureTxnType_Commit,
+				step(withAmbResult(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k2, s2)),
 				))),
@@ -592,7 +604,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "ambiguous put-del transaction committed",
 			steps: []Step{
-				step(withAmbResult(closureTxn(ClosureTxnType_Commit,
+				step(withAmbResult(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(del(k2, s2)),
 				))),
@@ -606,7 +618,7 @@ func TestValidate(t *testing.T) {
 			// them if any of the writes show up.
 			name: "ambiguous del-del transaction committed",
 			steps: []Step{
-				step(withAmbResult(closureTxn(ClosureTxnType_Commit,
+				step(withAmbResult(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 					withResult(del(k1, s2)),
 				))),
@@ -616,7 +628,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "ambiguous del-del transaction committed but wrong seq",
 			steps: []Step{
-				step(withAmbResult(closureTxn(ClosureTxnType_Commit,
+				step(withAmbResult(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s1)),
 					withResult(del(k1, s2)),
 				))),
@@ -626,7 +638,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "ambiguous put-put transaction did not commit",
 			steps: []Step{
-				step(withAmbResult(closureTxn(ClosureTxnType_Commit,
+				step(withAmbResult(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k2, s2)),
 				))),
@@ -636,7 +648,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "ambiguous put-del transaction did not commit",
 			steps: []Step{
-				step(withAmbResult(closureTxn(ClosureTxnType_Commit,
+				step(withAmbResult(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(del(k2, s2)),
 				))),
@@ -646,7 +658,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "ambiguous put-put transaction committed but has validation error",
 			steps: []Step{
-				step(withAmbResult(closureTxn(ClosureTxnType_Commit,
+				step(withAmbResult(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k2, s2)),
 				))),
@@ -656,7 +668,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "ambiguous put-del transaction committed but has validation error",
 			steps: []Step{
-				step(withAmbResult(withTimestamp(closureTxn(ClosureTxnType_Commit,
+				step(withAmbResult(withTimestamp(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(del(k2, s2)),
 				), t2))),
@@ -854,7 +866,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s2), t3)),
 				step(withResultTS(put(k2, s3), t2)),
 				step(withResultTS(put(k2, s4), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withReadResult(get(k2), v3),
 				), t3)),
@@ -869,7 +881,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k2, s2), t2)),
 				step(withResultTS(del(k1, s3), t3)),
 				step(withResultTS(del(k2, s4), t4)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withReadResult(get(k2), v2),
 					withReadResult(get(k3), ``),
@@ -885,7 +897,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s2), t2)),
 				step(withResultTS(put(k2, s3), t2)),
 				step(withResultTS(put(k2, s4), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withReadResult(get(k2), v3),
 				), t3)),
@@ -898,11 +910,11 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k2, s2), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResultOK(del(k1, s3)),
 					withResultOK(del(k2, s4)),
 				), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withReadResult(get(k2), v2),
 					withReadResult(get(k3), ``),
@@ -915,7 +927,7 @@ func TestValidate(t *testing.T) {
 			name: "transactional reads and deletes after write with non-empty time overlap",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withResult(del(k1, s2)),
 					withReadResult(get(k1), ``),
@@ -930,7 +942,7 @@ func TestValidate(t *testing.T) {
 			name: "transactional reads and deletes after write with empty time overlap",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withResult(del(k1, s2)),
 					withReadResult(get(k1), ``),
@@ -947,7 +959,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t2)),
 				step(withResultTS(put(k2, s3), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withReadResult(get(k2), ``),
 				), t1)),
@@ -961,7 +973,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t2)),
 				step(withResultTS(put(k2, s3), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withReadResult(get(k2), ``),
 				), t1)),
@@ -974,7 +986,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withResult(put(k2, s3)),
 				), t2)),
@@ -987,7 +999,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withResultOK(put(k2, s3)),
 				), t2)),
@@ -998,7 +1010,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "transaction with read before and after write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withResult(put(k1, s1)),
 					withReadResult(get(k1), v1),
@@ -1010,7 +1022,7 @@ func TestValidate(t *testing.T) {
 			name: "transaction with read before and after delete",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withResult(del(k1, s2)),
 					withReadResult(get(k1), ``),
@@ -1021,7 +1033,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "transaction with incorrect read before write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withResult(put(k1, s1)),
 					withReadResult(get(k1), v1),
@@ -1033,7 +1045,7 @@ func TestValidate(t *testing.T) {
 			name: "transaction with incorrect read before delete",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withResult(del(k1, s2)),
 					withReadResult(get(k1), ``),
@@ -1044,7 +1056,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "transaction with incorrect read after write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withResult(put(k1, s1)),
 					withReadResult(get(k1), ``),
@@ -1056,7 +1068,7 @@ func TestValidate(t *testing.T) {
 			name: "transaction with incorrect read after delete",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), v1),
 					withResultOK(del(k1, s2)),
 					withReadResult(get(k1), v1),
@@ -1067,7 +1079,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed puts of the same key with reads",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withResult(put(k1, s1)),
 					withReadResult(get(k1), v1),
@@ -1080,7 +1092,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed put/delete ops of the same key with reads",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withResult(put(k1, s1)),
 					withReadResult(get(k1), v1),
@@ -1093,7 +1105,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed put/delete ops of the same key with incorrect read",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withReadResult(get(k1), ``),
 					withResult(put(k1, s1)),
 					withReadResult(get(k1), v1),
@@ -1106,7 +1118,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactional put with correct commit time",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 				), t1)),
 			},
@@ -1115,7 +1127,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one transactional put with incorrect commit time",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 				), t1)),
 			},
@@ -1126,7 +1138,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				// NB: this Delete comes first in operation order, but the write is delayed.
 				step(withResultTS(del(k1, s1), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k2, s2)),
 					withResult(del(k1, s3)),
 				), t2)),
@@ -1138,7 +1150,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(del(k1, s1), t2)),
 				step(withResultTS(del(k2, s2), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(del(k1, s3)),
 					withResult(del(k2, s4)),
 				), t1)),
@@ -1149,7 +1161,7 @@ func TestValidate(t *testing.T) {
 			name: "one transactional scan followed by delete within time range",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withResult(del(k1, s2)),
 				), t2)),
@@ -1161,7 +1173,7 @@ func TestValidate(t *testing.T) {
 			name: "one transactional scan followed by delete outside time range",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withResult(del(k1, s2)),
 				), t4)),
@@ -1243,7 +1255,7 @@ func TestValidate(t *testing.T) {
 			name: "one tranactional scan after write and delete returning extra key",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k2, s2)),
 					withResult(del(k1, s3)),
 				), t2)),
@@ -1276,11 +1288,11 @@ func TestValidate(t *testing.T) {
 		{
 			name: "one scan after writes and delete returning missing key",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k1, s1)),
 					withResult(put(k2, s2)),
 				), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k2, v2)),
 					withResult(del(k1, s3)),
 				), t2)),
@@ -1391,7 +1403,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s2), t3)),
 				step(withResultTS(put(k2, s3), t2)),
 				step(withResultTS(put(k2, s4), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1), scanKV(k2, v3)),
 					withScanResultTS(scan(k2, k4), noTS, scanKV(k2, v3)),
 				), t2)),
@@ -1407,7 +1419,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k2, s3), t1)),
 				step(withResultTS(del(k2, s4), t2)),
 				step(withResultTS(put(k2, s5), t4)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withScanResultTS(scan(k2, k4), noTS),
 				), t2)),
@@ -1422,7 +1434,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s2), t2)),
 				step(withResultTS(put(k2, s3), t2)),
 				step(withResultTS(put(k2, s4), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1), scanKV(k2, v3)),
 					withScanResultTS(scan(k2, k4), noTS, scanKV(k2, v3)),
 				), t2)),
@@ -1437,7 +1449,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s2), t2)),
 				step(withResultTS(put(k2, s3), t1)),
 				step(withResultTS(del(k2, s4), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withScanResultTS(scan(k2, k4), noTS),
 				), t3)),
@@ -1451,7 +1463,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t2)),
 				step(withResultTS(put(k2, s3), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withScanResultTS(scan(k2, k4), noTS),
 				), t2)),
@@ -1465,7 +1477,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t2)),
 				step(withResultTS(put(k2, s3), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withScanResultTS(scan(k2, k4), noTS),
 				), t1)),
@@ -1478,7 +1490,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withResult(put(k2, s3)),
 				), t2)),
@@ -1491,7 +1503,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k1, s2), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withResult(put(k2, s3)),
 				), t2)),
@@ -1502,7 +1514,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "transaction with scan before and after write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS),
 					withResult(put(k1, s1)),
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
@@ -1513,7 +1525,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "transaction with incorrect scan before write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
 					withResult(put(k1, s1)),
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
@@ -1524,7 +1536,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "transaction with incorrect scan after write",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS),
 					withResult(put(k1, s1)),
 					withScanResultTS(scan(k1, k3), noTS),
@@ -1535,7 +1547,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "two transactionally committed puts of the same key with scans",
 			steps: []Step{
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withScanResultTS(scan(k1, k3), noTS),
 					withResult(put(k1, s1)),
 					withScanResultTS(scan(k1, k3), noTS, scanKV(k1, v1)),
@@ -1567,7 +1579,7 @@ func TestValidate(t *testing.T) {
 			name: "one deleterange after write",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s2), noTS, roachpb.Key(k1)),
 				), t2)),
 			},
@@ -1577,7 +1589,7 @@ func TestValidate(t *testing.T) {
 			name: "one deleterange after write returning wrong value",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s2), t2),
 				), t2)),
 			},
@@ -1587,7 +1599,7 @@ func TestValidate(t *testing.T) {
 			name: "one deleterange after write missing write",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s2), t2, roachpb.Key(k1)),
 				), t1)),
 			},
@@ -1597,7 +1609,7 @@ func TestValidate(t *testing.T) {
 			name: "one deleterange after write extra deletion",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s2), t2, roachpb.Key(k1), roachpb.Key(k2)),
 				), t2)),
 			},
@@ -1607,7 +1619,7 @@ func TestValidate(t *testing.T) {
 			name: "one deleterange after write with spurious deletion",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s2), t2, roachpb.Key(k1), roachpb.Key(k2)),
 				), t2)),
 			},
@@ -1619,7 +1631,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k2, s2), t2)),
 				step(withResultTS(put(k3, s3), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s4), noTS, roachpb.Key(k1), roachpb.Key(k2)),
 				), t4)),
 				step(withScanResultTS(scan(k1, k4), t4, scanKV(k3, v3))),
@@ -1632,7 +1644,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k2, s2), t2)),
 				step(withResultTS(put(k3, s3), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s4), noTS, roachpb.Key(k1), roachpb.Key(k2), roachpb.Key(k3)),
 				), t4)),
 			},
@@ -1644,7 +1656,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k2, s2), t2)),
 				step(withResultTS(put(k3, s3), t3)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s4), noTS, roachpb.Key(k1), roachpb.Key(k2)),
 				), t4)),
 				step(withScanResultTS(scan(k1, k4), t5, scanKV(k3, v3))),
@@ -1658,7 +1670,7 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k2, s2), t2)),
 				step(withResultTS(del(k1, s3), t4)),
 				step(withResultTS(put(k1, s4), t5)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s5), noTS, roachpb.Key(k1), roachpb.Key(k2)),
 				), t3)),
 			},
@@ -1668,7 +1680,7 @@ func TestValidate(t *testing.T) {
 			name: "one transactional deleterange followed by put after writes",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s2), noTS, roachpb.Key(k1)),
 					withResult(put(k2, s3)),
 				), t2)),
@@ -1679,7 +1691,7 @@ func TestValidate(t *testing.T) {
 			name: "one transactional deleterange followed by put after writes with write timestamp disagreement",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s2), noTS, roachpb.Key(k1)),
 					withResult(put(k2, s3)),
 				), t2)),
@@ -1690,7 +1702,7 @@ func TestValidate(t *testing.T) {
 			name: "one transactional put shadowed by deleterange after writes",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k2, s2)),
 					withDeleteRangeResult(delRange(k1, k3, s3), noTS, roachpb.Key(k1), roachpb.Key(k2)),
 				), t2)),
@@ -1701,7 +1713,7 @@ func TestValidate(t *testing.T) {
 			name: "one transactional put shadowed by deleterange after writes with write timestamp disagreement",
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withResult(put(k2, s2)),
 					withDeleteRangeResult(delRange(k1, k3, s3), noTS, roachpb.Key(k1), roachpb.Key(k2)),
 				), t2)),
@@ -1713,7 +1725,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k4, s2), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s3), noTS, roachpb.Key(k1), roachpb.Key(k4)),
 				), t3)),
 			},
@@ -1724,7 +1736,7 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k4, s2), t2)),
-				step(withResultTS(closureTxn(ClosureTxnType_Commit,
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
 					withDeleteRangeResult(delRange(k1, k3, s3), noTS, roachpb.Key(k1), roachpb.Key(k4)),
 				), t3)),
 			},
@@ -1854,11 +1866,13 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(makeAddSSTable(s1, []sstKV{
 					{key: k1, tombstone: false},
 					{key: k2, tombstone: true},
+					{key: k3, endKey: k4, tombstone: true},
 				}), t1)),
 			},
 			kvs: kvs(
 				kv(k1, t1, s1),
 				tombstone(k2, t1, s1),
+				rd(k3, k4, t1, s1),
 			),
 		},
 		{
@@ -1866,18 +1880,120 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(put(k2, s1), t1)),
+				step(withResultTS(put(k3, s1), t1)),
+				step(withResultTS(put(k4, s1), t1)),
 				step(withResultTS(makeAddSSTable(s2, []sstKV{
 					{key: k1, tombstone: false},
 					{key: k2, tombstone: true},
+					{key: k3, endKey: k4, tombstone: true},
 				}), t2)),
-				step(withScanResultTS(scan(k1, k3), t3, scanKV(k1, v2))),
+				step(withScanResultTS(scan(k1, k5), t3, scanKV(k1, v2), scanKV(k4, v1))),
 			},
 			kvs: kvs(
 				kv(k1, t1, s1),
 				kv(k1, t2, s2),
 				kv(k2, t1, s1),
 				tombstone(k2, t2, s2),
+				rd(k3, k4, t2, s2),
+				kv(k3, t1, s1),
+				kv(k4, t1, s1),
 			),
+		},
+		{
+			name: "one read skip locked after write",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withReadResultTS(getSkipLocked(k1), v1, t1)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one read skip locked after write returning wrong value",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withReadResultTS(getSkipLocked(k1), v2, t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one read skip locked after write returning no value",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withReadResultTS(getSkipLocked(k1), ``, t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one scan skip locked after writes",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(scanSkipLocked(k1, k3), t4, scanKV(k1, v1), scanKV(k2, v2))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one scan skip locked after writes returning wrong value",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(scanSkipLocked(k1, k3), t3, scanKV(k1, v3), scanKV(k2, v2))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one scan skip locked after writes returning no values",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(scanSkipLocked(k1, k3), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one scan skip locked after writes returning some values",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(scanSkipLocked(k1, k3), t3, scanKV(k2, v2))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one reverse scan skip locked after writes",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(reverseScanSkipLocked(k1, k3), t3, scanKV(k2, v2), scanKV(k1, v1))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one reverse scan skip locked after writes returning wrong value",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(reverseScanSkipLocked(k1, k3), t3, scanKV(k2, v2), scanKV(k1, v3))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one reverse scan skip locked after writes returning no values",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(reverseScanSkipLocked(k1, k3), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one reverse scan skip locked after writes returning some values",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(reverseScanSkipLocked(k1, k3), t3, scanKV(k2, v2))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
 		},
 	}
 

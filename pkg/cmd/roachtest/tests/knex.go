@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const supportedKnexTag = "2.0.0"
+const supportedKnexTag = "2.5.1"
 
 // This test runs one of knex's test suite against a single cockroach
 // node.
@@ -63,7 +63,7 @@ func registerKnex(r registry.Registry) {
 			c,
 			node,
 			"add nodesource repository",
-			`sudo apt install ca-certificates && curl -fsSL https://deb.nodesource.com/setup_16.x | sudo -E bash -`,
+			`sudo apt install ca-certificates && curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -`,
 		)
 		require.NoError(t, err)
 
@@ -128,10 +128,11 @@ func registerKnex(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:       "knex",
-		Owner:      registry.OwnerSQLSessions,
+		Owner:      registry.OwnerSQLFoundations,
 		Cluster:    r.MakeClusterSpec(1),
+		Leases:     registry.MetamorphicLeases,
 		NativeLibs: registry.LibGEOS,
-		Tags:       []string{`default`, `orm`},
+		Tags:       registry.Tags(`default`, `orm`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runKnex(ctx, t, c)
 		},

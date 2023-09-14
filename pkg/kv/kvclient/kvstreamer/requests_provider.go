@@ -11,11 +11,13 @@
 package kvstreamer
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/bitmap"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -75,6 +77,16 @@ type singleRangeBatch struct {
 	// subRequestIdx is only allocated in InOrder mode when
 	// Hints.SingleRowLookup is false and some Scan requests were enqueued.
 	subRequestIdx []int32
+	// isScanStarted tracks whether we have already received at least one
+	// response for the corresponding ScanRequest (i.e. whether the ScanRequest
+	// has been started). In particular, if enqueuedReqs[i] is a
+	// ScanRequest, then isScanStarted.IsSet(i) will return true once at least
+	// one ScanResponse was received while evaluating enqueuedReqs[i].
+	//
+	// This bitmap is preserved and "accumulated" across singleRangeBatches.
+	//
+	// isScanStarted is only allocated if at least one Scan request was enqueued.
+	isScanStarted *bitmap.Bitmap
 	// numGetsInReqs tracks the number of Get requests in reqs.
 	numGetsInReqs int64
 	// reqsReservedBytes tracks the memory reservation against the budget for
@@ -82,8 +94,8 @@ type singleRangeBatch struct {
 	reqsReservedBytes int64
 	// overheadAccountedFor tracks the memory reservation against the budget for
 	// the overhead of the reqs slice (i.e. of kvpb.RequestUnion objects) as
-	// well as the positions and the subRequestIdx slices. Since we reuse these
-	// slices for the resume requests, this can be released only when the
+	// well as positions, subRequestIdx, and isScanStarted. Since we reuse these
+	// things for the resume requests, this can be released only when the
 	// BatchResponse doesn't have any resume spans.
 	overheadAccountedFor int64
 	// minTargetBytes, if positive, indicates the minimum TargetBytes limit that
@@ -131,6 +143,16 @@ func (r singleRangeBatch) subPriority() int32 {
 		return 0
 	}
 	return r.subRequestIdx[0]
+}
+
+// String implements fmt.Stringer.
+func (r singleRangeBatch) String() string {
+	return fmt.Sprintf(
+		"{reqs:%s keys:%v pos:%v subIdx:%v start:%v gets:%v reserved:%v overhead:%v minTarget:%v}",
+		kvpb.TruncatedRequestsString(r.reqs, 1024), r.reqsKeys, r.positions,
+		r.subRequestIdx, r.isScanStarted, r.numGetsInReqs, r.reqsReservedBytes, r.overheadAccountedFor,
+		r.minTargetBytes,
+	)
 }
 
 // requestsProvider encapsulates the logic of supplying the requests to serve in
@@ -181,6 +203,9 @@ type requestsProvider interface {
 	// emptyLocked returns true if there are no requests to serve at the moment.
 	// The lock of the provider must be already held.
 	emptyLocked() bool
+	// lengthLocked returns the number of requests that have yet to be served at
+	// the moment. The lock of the provider must be already held.
+	lengthLocked() int
 	// nextLocked returns the next request to serve. In OutOfOrder mode, the
 	// request is arbitrary, in InOrder mode, the request is the current
 	// head-of-the-line. The lock of the provider must be already held. Panics
@@ -225,6 +250,11 @@ func (b *requestsProviderBase) emptyLocked() bool {
 	return len(b.requests) == 0
 }
 
+func (b *requestsProviderBase) lengthLocked() int {
+	b.Mutex.AssertHeld()
+	return len(b.requests)
+}
+
 func (b *requestsProviderBase) close() {
 	b.Lock()
 	defer b.Unlock()
@@ -233,8 +263,7 @@ func (b *requestsProviderBase) close() {
 }
 
 // outOfOrderRequestsProvider is a requestProvider that returns requests in an
-// arbitrary order (namely in the same order as the requests are enqueued and
-// added).
+// arbitrary order (namely in the LIFO order of requests being enqueued).
 type outOfOrderRequestsProvider struct {
 	*requestsProviderBase
 }
@@ -253,6 +282,9 @@ func (p *outOfOrderRequestsProvider) enqueue(requests []singleRangeBatch) {
 	if len(p.requests) > 0 {
 		panic(errors.AssertionFailedf("outOfOrderRequestsProvider has old requests in enqueue"))
 	}
+	if len(requests) == 0 {
+		panic(errors.AssertionFailedf("outOfOrderRequestsProvider enqueuing zero requests"))
+	}
 	p.requests = requests
 	p.hasWork.Signal()
 }
@@ -269,6 +301,8 @@ func (p *outOfOrderRequestsProvider) nextLocked() singleRangeBatch {
 	if len(p.requests) == 0 {
 		panic(errors.AssertionFailedf("nextLocked called when requestsProvider is empty"))
 	}
+	// Use the last request so that we could reuse its slot if resume request is
+	// added.
 	return p.requests[len(p.requests)-1]
 }
 
@@ -277,6 +311,8 @@ func (p *outOfOrderRequestsProvider) removeNextLocked() {
 	if len(p.requests) == 0 {
 		panic(errors.AssertionFailedf("removeNextLocked called when requestsProvider is empty"))
 	}
+	// Use the last request so that we could reuse its slot if resume request is
+	// added.
 	p.requests = p.requests[:len(p.requests)-1]
 }
 
@@ -376,6 +412,9 @@ func (p *inOrderRequestsProvider) enqueue(requests []singleRangeBatch) {
 	defer p.Unlock()
 	if len(p.requests) > 0 {
 		panic(errors.AssertionFailedf("inOrderRequestsProvider has old requests in enqueue"))
+	}
+	if len(requests) == 0 {
+		panic(errors.AssertionFailedf("inOrderRequestsProvider enqueuing zero requests"))
 	}
 	p.requests = requests
 	p.heapInit()

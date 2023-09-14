@@ -14,6 +14,7 @@ import (
 	"container/heap"
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -43,7 +44,7 @@ type CandidateReplica interface {
 	RaftStatus() *raft.Status
 	// GetFirstIndex returns the index of the first entry in the replica's Raft
 	// log.
-	GetFirstIndex() uint64
+	GetFirstIndex() kvpb.RaftIndex
 	// DescAndSpanConfig returns the authoritative range descriptor as well
 	// as the span config for the replica.
 	DescAndSpanConfig() (*roachpb.RangeDescriptor, roachpb.SpanConfig)
@@ -102,10 +103,17 @@ func NewReplicaRankings() *ReplicaRankings {
 // TODO(kvoli): When adding another load dimension to be balanced upon, it will
 // be necessary to clarify the semantics of this API. This is especially true
 // since the UI is coupled to this function.
-func NewReplicaAccumulator(dimension load.Dimension) *RRAccumulator {
-	res := &RRAccumulator{}
-	res.dim.val = func(r CandidateReplica) float64 {
-		return r.RangeUsageInfo().Load().Dim(dimension)
+func NewReplicaAccumulator(dims ...load.Dimension) *RRAccumulator {
+	res := &RRAccumulator{
+		dims: map[load.Dimension]*rrPriorityQueue{},
+	}
+	for _, dim := range dims {
+		// Reassign dim variable to ensure correct values is captured down below in val() func.
+		dim := dim
+		res.dims[dim] = &rrPriorityQueue{}
+		res.dims[dim].val = func(r CandidateReplica) float64 {
+			return r.RangeUsageInfo().Load().Dim(dim)
+		}
 	}
 	return res
 }
@@ -118,13 +126,13 @@ func (rr *ReplicaRankings) Update(acc *RRAccumulator) {
 }
 
 // TopLoad returns the highest load CandidateReplicas that are tracked.
-func (rr *ReplicaRankings) TopLoad() []CandidateReplica {
+func (rr *ReplicaRankings) TopLoad(dimension load.Dimension) []CandidateReplica {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 	// If we have a new set of data, consume it. Otherwise, just return the most
 	// recently consumed data.
-	if rr.mu.dimAccumulator != nil && rr.mu.dimAccumulator.dim.Len() > 0 {
-		rr.mu.byDim = consumeAccumulator(&rr.mu.dimAccumulator.dim)
+	if rr.mu.dimAccumulator != nil && rr.mu.dimAccumulator.dims[dimension].Len() > 0 {
+		rr.mu.byDim = consumeAccumulator(rr.mu.dimAccumulator.dims[dimension])
 	}
 	return rr.mu.byDim
 }
@@ -138,23 +146,32 @@ func (rr *ReplicaRankings) TopLoad() []CandidateReplica {
 // prevents concurrent loaders of data from messing with each other -- the last
 // `update`d accumulator will win.
 type RRAccumulator struct {
-	dim rrPriorityQueue
+	dims map[load.Dimension]*rrPriorityQueue
 }
 
 // AddReplica adds a replica to the replica accumulator.
 func (a *RRAccumulator) AddReplica(repl CandidateReplica) {
+	for dim := range a.dims {
+		a.addReplicaForDimension(repl, dim)
+	}
+}
+
+func (a *RRAccumulator) addReplicaForDimension(repl CandidateReplica, dim load.Dimension) {
+	rr := a.dims[dim]
 	// If the heap isn't full, just push the new replica and return.
-	if a.dim.Len() < numTopReplicasToTrack {
-		heap.Push(&a.dim, repl)
+	if rr.Len() < numTopReplicasToTrack {
+
+		heap.Push(a.dims[dim], repl)
 		return
 	}
 
 	// Otherwise, conditionally push if the new replica is more deserving than
 	// the current tip of the heap.
-	if a.dim.val(repl) > a.dim.val(a.dim.entries[0]) {
-		heap.Pop(&a.dim)
-		heap.Push(&a.dim, repl)
+	if rr.val(repl) > rr.val(rr.entries[0]) {
+		heap.Pop(rr)
+		heap.Push(rr, repl)
 	}
+
 }
 
 func consumeAccumulator(pq *rrPriorityQueue) []CandidateReplica {
@@ -208,77 +225,68 @@ func (pq *rrPriorityQueue) Pop() interface{} {
 type ReplicaRankingMap struct {
 	mu struct {
 		syncutil.Mutex
-		items RRAccumulatorByTenant
+		dimAccumulators *RRAccumulatorByTenant
+		// byDims map keeps last computed values per tenant.
+		byDims map[roachpb.TenantID][]CandidateReplica
 	}
 }
 
 // NewReplicaRankingsMap returns a new ReplicaRankingMap struct.
 func NewReplicaRankingsMap() *ReplicaRankingMap {
-	return &ReplicaRankingMap{}
+	rr := &ReplicaRankingMap{}
+	rr.mu.byDims = map[roachpb.TenantID][]CandidateReplica{}
+	rr.mu.dimAccumulators = NewTenantReplicaAccumulator()
+	return rr
 }
 
 // NewTenantReplicaAccumulator returns a new RRAccumulatorByTenant.
-func NewTenantReplicaAccumulator() *RRAccumulatorByTenant {
-	return &RRAccumulatorByTenant{}
+func NewTenantReplicaAccumulator(dims ...load.Dimension) *RRAccumulatorByTenant {
+	return &RRAccumulatorByTenant{
+		dims:   dims,
+		accums: map[roachpb.TenantID]*RRAccumulator{},
+	}
 }
 
 // Update sets the accumulator for replica tracking to be the passed in value.
 func (rr *ReplicaRankingMap) Update(acc *RRAccumulatorByTenant) {
 	rr.mu.Lock()
-	rr.mu.items = *acc
+	rr.mu.dimAccumulators = acc
 	rr.mu.Unlock()
 }
 
-// TopQPS returns the highest QPS CandidateReplicas that are tracked.
-func (rr *ReplicaRankingMap) TopQPS(tenantID roachpb.TenantID) []CandidateReplica {
+// TopLoad returns the highest load CandidateReplicas that are tracked.
+func (rr *ReplicaRankingMap) TopLoad(
+	tenantID roachpb.TenantID, dimension load.Dimension,
+) []CandidateReplica {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
-	r, ok := rr.mu.items[tenantID]
+	r, ok := rr.mu.dimAccumulators.accums[tenantID]
 	if !ok {
 		return []CandidateReplica{}
 	}
-	if r.Len() > 0 {
-		r.entries = consumeAccumulator(&r)
-		rr.mu.items[tenantID] = r
+	if dim, ok := r.dims[dimension]; ok && dim.Len() > 0 {
+		rr.mu.byDims[tenantID] = consumeAccumulator(dim)
 	}
-	return r.entries
+	return rr.mu.byDims[tenantID]
 }
 
 // RRAccumulatorByTenant accumulates replicas per tenant to update the replicas tracked by ReplicaRankingMap.
 // It should be used in the same way as RRAccumulator (see doc string).
-type RRAccumulatorByTenant map[roachpb.TenantID]rrPriorityQueue
+type RRAccumulatorByTenant struct {
+	accums map[roachpb.TenantID]*RRAccumulator
+	dims   []load.Dimension
+}
 
 // AddReplica adds a replica to the replica accumulator.
-func (a RRAccumulatorByTenant) AddReplica(repl CandidateReplica) {
-	// Do not consider ranges as hot when they are accessed once or less times.
-	if repl.RangeUsageInfo().QueriesPerSecond <= 1 {
-		return
-	}
-
+func (ra RRAccumulatorByTenant) AddReplica(repl CandidateReplica) {
 	tID, ok := repl.Repl().TenantID()
 	if !ok {
 		return
 	}
-
-	r, ok := a[tID]
+	acc, ok := ra.accums[tID]
 	if !ok {
-		q := rrPriorityQueue{
-			val: func(r CandidateReplica) float64 { return r.RangeUsageInfo().QueriesPerSecond },
-		}
-		heap.Push(&q, repl)
-		a[tID] = q
-		return
+		acc = NewReplicaAccumulator(ra.dims...)
 	}
-
-	if r.Len() < numTopReplicasToTrack {
-		heap.Push(&r, repl)
-		a[tID] = r
-		return
-	}
-
-	if repl.RangeUsageInfo().QueriesPerSecond > r.entries[0].RangeUsageInfo().QueriesPerSecond {
-		heap.Pop(&r)
-		heap.Push(&r, repl)
-		a[tID] = r
-	}
+	acc.AddReplica(repl)
+	ra.accums[tID] = acc
 }

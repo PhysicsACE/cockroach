@@ -510,9 +510,9 @@ var specs = []stmtSpec{
 	},
 	{
 		name:    "alter_func_stmt",
-		inline:  []string{"alter_func_options_stmt", "alter_func_rename_stmt", "alter_func_owner_stmt", "alter_func_set_schema_stmt", "alter_func_dep_extension_stmt", "alter_func_opt_list", "common_func_opt_item", "opt_restrict", "opt_no"},
+		inline:  []string{"alter_func_options_stmt", "alter_func_rename_stmt", "alter_func_owner_stmt", "alter_func_set_schema_stmt", "alter_func_dep_extension_stmt", "alter_func_opt_list", "common_routine_opt_item", "opt_restrict", "opt_no"},
 		replace: map[string]string{"'RENAME' 'TO' name": "'RENAME' 'TO' function_new_name"},
-		unlink:  []string{"alter_func_options_stmt", "alter_func_rename_stmt", "alter_func_owner_stmt", "alter_func_set_schema_stmt", "alter_func_dep_extension_stmt", "alter_func_opt_list", "common_func_opt_item", "opt_restrict", "opt_no", "function_new_name"},
+		unlink:  []string{"alter_func_options_stmt", "alter_func_rename_stmt", "alter_func_owner_stmt", "alter_func_set_schema_stmt", "alter_func_dep_extension_stmt", "alter_func_opt_list", "common_routine_opt_item", "opt_restrict", "opt_no", "function_new_name"},
 		nosplit: true,
 	},
 	{
@@ -812,13 +812,12 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "create_func_stmt",
-		inline: []string{"opt_or_replace", "opt_func_param_with_default_list", "opt_return_set", "func_return_type", "opt_create_func_opt_list", "create_func_opt_list", "common_func_opt_item", "create_func_opt_item", "routine_return_stmt", "func_param_with_default_list", "func_param_with_default", "func_as"},
-		unlink: []string{"opt_or_replace", "opt_func_param_with_default_list", "opt_return_set", "func_return_type", "opt_create_func_opt_list", "create_func_opt_list", "create_func_opt_item", "common_func_opt_item", "routine_return_stmt", "non_reserved_word_or_sconst", "func_param_with_default_list", "func_param_with_default", "a_expr", "func_as"},
+		inline: []string{"opt_or_replace", "opt_routine_param_with_default_list", "opt_return_set", "opt_create_routine_opt_list", "create_routine_opt_list", "common_routine_opt_item", "create_routine_opt_item", "routine_return_stmt", "routine_param_with_default_list", "routine_param_with_default", "routine_as", "opt_link_sym"},
+		unlink: []string{"opt_or_replace", "opt_routine_param_with_default_list", "opt_return_set", "opt_create_routine_opt_list", "create_routine_opt_list", "create_routine_opt_item", "common_routine_opt_item", "routine_return_stmt", "non_reserved_word_or_sconst", "routine_param_with_default_list", "routine_param_with_default", "a_expr", "routine_as"},
 		replace: map[string]string{
 			"func_as":                     "'SCONST'",
 			"non_reserved_word_or_sconst": "'SQL'",
 			"'DEFAULT'":                   "",
-			"'SETOF'":                     "",
 			"'='":                         "",
 			"a_expr":                      ""},
 		nosplit: true,
@@ -856,7 +855,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "delete_stmt",
-		inline: []string{"opt_with_clause", "with_clause", "cte_list", "table_expr_opt_alias_idx", "table_name_opt_idx", "opt_where_clause", "where_clause", "returning_clause", "opt_sort_clause", "opt_limit_clause", "opt_only", "opt_descendant"},
+		inline: []string{"opt_with_clause", "with_clause", "cte_list", "table_expr_opt_alias_idx", "table_name_opt_idx", "opt_where_clause", "where_clause", "returning_clause", "opt_sort_clause", "opt_limit_clause", "opt_only", "opt_descendant", "opt_using_clause", "from_list"},
 		replace: map[string]string{
 			"relation_expr": "table_name",
 		},
@@ -1000,7 +999,7 @@ var specs = []stmtSpec{
 		name:   "explain_stmt",
 		inline: []string{"explain_option_list"},
 		replace: map[string]string{
-			"explain_option_name": "( 'VERBOSE' | 'TYPES' | 'OPT' | 'DISTSQL' | 'VEC' )",
+			"explain_option_name": "( 'VERBOSE' | 'TYPES' | 'OPT' | 'ENV' | 'MEMO' | 'REDACT' | 'DISTSQL' | 'VEC' )",
 		},
 		exclude: []*regexp.Regexp{
 			regexp.MustCompile("'ANALYZE'"),
@@ -1012,7 +1011,7 @@ var specs = []stmtSpec{
 		stmt:   "explain_stmt",
 		inline: []string{"explain_option_list"},
 		replace: map[string]string{
-			"explain_option_name": "( 'PLAN' | 'DISTSQL' | 'DEBUG' )",
+			"explain_option_name": "( 'PLAN' | 'VERBOSE' | 'TYPES' | 'DEBUG' | 'REDACT' | 'DISTSQL')",
 		},
 		unlink: []string{"'DISTSQL'"},
 	},
@@ -1638,6 +1637,14 @@ var specs = []stmtSpec{
 	{
 		name:   "opt_frame_clause",
 		inline: []string{"frame_extent"},
+	},
+	{
+		name:   "backup_options",
+		inline: []string{"include_all_clusters"},
+	},
+	{
+		name:   "restore_options",
+		inline: []string{"include_all_clusters", "virtual_cluster_name", "virtual_cluster_opt"},
 	},
 }
 

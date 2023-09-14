@@ -1,8 +1,10 @@
 col/coldata
 col/colserde
 keys
+kv/kvclient/kvcoord
 kv/kvclient/rangecache
 kv/kvpb
+kv/kvserver/intentresolver
 roachpb
 sql/catalog/descs
 sql/colcontainer

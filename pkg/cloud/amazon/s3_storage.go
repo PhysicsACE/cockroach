@@ -37,11 +37,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -425,7 +425,7 @@ func MakeS3Storage(
 	case cloud.AuthParamImplicit:
 		if args.IOConf.DisableImplicitCredentials {
 			return nil, errors.New(
-				"implicit credentials disallowed for s3 due to --external-io-implicit-credentials flag")
+				"implicit credentials disallowed for s3 due to --external-io-disable-implicit-credentials flag")
 		}
 	default:
 		return nil, errors.Errorf("unsupported value %s for %s", conf.Auth, cloud.AuthParam)
@@ -712,92 +712,96 @@ func (s *s3Storage) Writer(ctx context.Context, basename string) (io.WriteCloser
 			SSEKMSKeyId:          nilIfEmpty(s.conf.ServerKMSID),
 			StorageClass:         nilIfEmpty(s.conf.StorageClass),
 		})
+		err = interpretAWSError(err)
 		return errors.Wrap(err, "upload failed")
 	}), nil
 }
 
+// openStreamAt opens a stream of object data, starting at offset <pos>.
+// If endPos is non-zero, returns data up to that offset (exclusive).
 func (s *s3Storage) openStreamAt(
-	ctx context.Context, basename string, pos int64,
+	ctx context.Context, basename string, pos int64, endPos int64,
 ) (*s3.GetObjectOutput, error) {
 	client, err := s.getClient(ctx)
 	if err != nil {
 		return nil, err
 	}
 	req := &s3.GetObjectInput{Bucket: s.bucket, Key: aws.String(path.Join(s.prefix, basename))}
-	if pos != 0 {
+	if endPos != 0 {
+		if pos >= endPos {
+			return nil, io.EOF
+		}
+		// Range header end position is inclusive.
+		req.Range = aws.String(fmt.Sprintf("bytes=%d-%d", pos, endPos-1))
+	} else if pos != 0 {
 		req.Range = aws.String(fmt.Sprintf("bytes=%d-", pos))
 	}
 
 	out, err := client.GetObjectWithContext(ctx, req)
 	if err != nil {
-		if aerr := (awserr.Error)(nil); errors.As(err, &aerr) {
-			switch aerr.Code() {
-			// Relevant 404 errors reported by AWS.
-			case s3.ErrCodeNoSuchBucket, s3.ErrCodeNoSuchKey:
-				// nolint:errwrap
-				return nil, errors.Wrapf(
-					errors.Wrap(cloud.ErrFileDoesNotExist, "s3 object does not exist"),
-					"%v",
-					err.Error(),
-				)
-			}
+		err = interpretAWSError(err)
+		if errors.Is(err, cloud.ErrFileDoesNotExist) {
+			// keep this string in case anyone is depending on it
+			err = errors.Wrap(err, "s3 object does not exist")
 		}
 		return nil, errors.Wrap(err, "failed to get s3 object")
 	}
 	return out, nil
 }
 
-// ReadFile is shorthand for ReadFileAt with offset 0.
-func (s *s3Storage) ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error) {
-	reader, _, err := s.ReadFileAt(ctx, basename, 0)
-	return reader, err
-}
-
-// ReadFileAt opens a reader at the requested offset.
-func (s *s3Storage) ReadFileAt(
-	ctx context.Context, basename string, offset int64,
-) (ioctx.ReadCloserCtx, int64, error) {
-	ctx, sp := tracing.ChildSpan(ctx, "s3.ReadFileAt")
+// ReadFile is part of the cloud.ExternalStorage interface.
+func (s *s3Storage) ReadFile(
+	ctx context.Context, basename string, opts cloud.ReadOptions,
+) (_ ioctx.ReadCloserCtx, fileSize int64, _ error) {
+	ctx, sp := tracing.ChildSpan(ctx, "s3.ReadFile")
 	defer sp.Finish()
-	sp.SetTag("path", attribute.StringValue(path.Join(s.prefix, basename)))
 
-	stream, err := s.openStreamAt(ctx, basename, offset)
+	path := path.Join(s.prefix, basename)
+	sp.SetTag("path", attribute.StringValue(path))
+	endOffset := int64(0)
+	if opts.LengthHint != 0 {
+		endOffset = opts.Offset + opts.LengthHint
+	}
+
+	stream, err := s.openStreamAt(ctx, basename, opts.Offset, endOffset)
 	if err != nil {
 		return nil, 0, err
 	}
-	var size int64
-	if offset != 0 {
-		if stream.ContentRange == nil {
-			return nil, 0, errors.New("expected content range for read at offset")
+	if !opts.NoFileSize {
+		if opts.Offset != 0 {
+			if stream.ContentRange == nil {
+				return nil, 0, errors.New("expected content range for read at offset")
+			}
+			fileSize, err = cloud.CheckHTTPContentRangeHeader(*stream.ContentRange, opts.Offset)
+			if err != nil {
+				return nil, 0, err
+			}
+		} else {
+			if stream.ContentLength == nil {
+				log.Warningf(ctx, "Content length missing from S3 GetObject (is this actually s3?); attempting to lookup size with separate call...")
+				// Some not-actually-s3 services may not set it, or set it in a way the
+				// official SDK finds it (e.g. if they don't use the expected checksummer)
+				// so try a Size() request.
+				x, err := s.Size(ctx, basename)
+				if err != nil {
+					err = interpretAWSError(err)
+					return nil, 0, errors.Wrap(err, "content-length missing from GetObject and Size() failed")
+				}
+				fileSize = x
+			} else {
+				fileSize = *stream.ContentLength
+			}
 		}
-		size, err = cloud.CheckHTTPContentRangeHeader(*stream.ContentRange, offset)
+	}
+	opener := func(ctx context.Context, pos int64) (io.ReadCloser, int64, error) {
+		s, err := s.openStreamAt(ctx, basename, pos, endOffset)
 		if err != nil {
 			return nil, 0, err
 		}
-	} else {
-		if stream.ContentLength == nil {
-			log.Warningf(ctx, "Content length missing from S3 GetObject (is this actually s3?); attempting to lookup size with separate call...")
-			// Some not-actually-s3 services may not set it, or set it in a way the
-			// official SDK finds it (e.g. if they don't use the expected checksummer)
-			// so try a Size() request.
-			x, err := s.Size(ctx, basename)
-			if err != nil {
-				return nil, 0, errors.Wrap(err, "content-length missing from GetObject and Size() failed")
-			}
-			size = x
-		} else {
-			size = *stream.ContentLength
-		}
+		return s.Body, fileSize, nil
 	}
-	opener := func(ctx context.Context, pos int64) (io.ReadCloser, error) {
-		s, err := s.openStreamAt(ctx, basename, pos)
-		if err != nil {
-			return nil, err
-		}
-		return s.Body, nil
-	}
-	return cloud.NewResumingReader(ctx, opener, stream.Body, offset,
-		cloud.IsResumableHTTPError, s3ErrDelay), size, nil
+	return cloud.NewResumingReader(ctx, opener, stream.Body, opts.Offset, fileSize, path,
+		cloud.ResumingReaderRetryOnErrFnForSettings(ctx, s.settings), s3ErrDelay), fileSize, nil
 }
 
 func (s *s3Storage) List(ctx context.Context, prefix, delim string, fn cloud.ListingFn) error {
@@ -842,10 +846,48 @@ func (s *s3Storage) List(ctx context.Context, prefix, delim string, fn cloud.Lis
 	if err := client.ListObjectsPagesWithContext(
 		ctx, s3Input, pageFn,
 	); err != nil {
+		err = interpretAWSError(err)
 		return errors.Wrap(err, `failed to list s3 bucket`)
 	}
 
 	return fnErr
+}
+
+// interpretAWSError attempts to surface safe information that otherwise would be redacted
+func interpretAWSError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if strings.Contains(err.Error(), "AssumeRole") {
+		err = errors.Wrap(err, "AssumeRole")
+	}
+
+	if strings.Contains(err.Error(), "AccessDenied") {
+		err = errors.Wrap(err, "AccessDenied")
+	}
+
+	if aerr := (awserr.Error)(nil); errors.As(err, &aerr) {
+		code := aerr.Code()
+
+		if code != "" {
+			// nolint:errwrap
+			err = errors.Wrapf(err, "%v", code)
+
+			switch code {
+			// Relevant 404 errors reported by AWS.
+			case s3.ErrCodeNoSuchBucket, s3.ErrCodeNoSuchKey:
+				// nolint:errwrap
+				err = errors.Wrapf(
+					errors.Wrap(cloud.ErrFileDoesNotExist, "s3 object does not exist"),
+					"%v",
+					err.Error(),
+				)
+			}
+		}
+	}
+
+	return err
 }
 
 func (s *s3Storage) Delete(ctx context.Context, basename string) error {
@@ -853,7 +895,7 @@ func (s *s3Storage) Delete(ctx context.Context, basename string) error {
 	if err != nil {
 		return err
 	}
-	return contextutil.RunWithTimeout(ctx, "delete s3 object",
+	return timeutil.RunWithTimeout(ctx, "delete s3 object",
 		cloud.Timeout.Get(&s.settings.SV),
 		func(ctx context.Context) error {
 			_, err := client.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
@@ -870,7 +912,7 @@ func (s *s3Storage) Size(ctx context.Context, basename string) (int64, error) {
 		return 0, err
 	}
 	var out *s3.HeadObjectOutput
-	err = contextutil.RunWithTimeout(ctx, "get s3 object header",
+	err = timeutil.RunWithTimeout(ctx, "get s3 object header",
 		cloud.Timeout.Get(&s.settings.SV),
 		func(ctx context.Context) error {
 			var err error
@@ -881,6 +923,7 @@ func (s *s3Storage) Size(ctx context.Context, basename string) (int64, error) {
 			return err
 		})
 	if err != nil {
+		err = interpretAWSError(err)
 		return 0, errors.Wrap(err, "failed to get s3 object headers")
 	}
 	return *out.ContentLength, nil

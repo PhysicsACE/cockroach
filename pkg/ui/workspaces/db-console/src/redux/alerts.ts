@@ -14,7 +14,7 @@
  */
 
 import _ from "lodash";
-import moment from "moment";
+import moment from "moment-timezone";
 import { createSelector } from "reselect";
 import { Store, Dispatch, Action, AnyAction } from "redux";
 import { ThunkAction } from "redux-thunk";
@@ -38,12 +38,16 @@ import {
 } from "./apiReducers";
 import {
   singleVersionSelector,
+  numNodesByVersionsTagSelector,
   numNodesByVersionsSelector,
 } from "src/redux/nodes";
 import { AdminUIState, AppDispatch } from "./state";
 import * as docsURL from "src/util/docs";
 import { getDataFromServer } from "../util/dataFromServer";
-import { selectClusterSettings } from "./clusterSettings";
+import {
+  selectClusterSettings,
+  selectClusterSettingVersion,
+} from "./clusterSettings";
 import { longToInt } from "src/util/fixLong";
 
 export enum AlertLevel {
@@ -141,7 +145,7 @@ export const staggeredVersionDismissedSetting = new LocalSetting(
  * This excludes decommissioned nodes.
  */
 export const staggeredVersionWarningSelector = createSelector(
-  numNodesByVersionsSelector,
+  numNodesByVersionsTagSelector,
   staggeredVersionDismissedSetting.selector,
   (versionsMap, versionMismatchDismissed): Alert => {
     if (versionMismatchDismissed) {
@@ -541,13 +545,14 @@ export const clusterPreserveDowngradeOptionOvertimeSelector = createSelector(
     }
     const lastUpdatedTime = moment.unix(longToInt(lastUpdated.seconds));
     const diff = moment.duration(moment().diff(lastUpdatedTime)).asHours();
-    const maximumSetTime = 48;
-    if (diff < maximumSetTime) {
+    if (diff <= 0) {
       return undefined;
     }
     return {
       level: AlertLevel.WARNING,
-      title: `Cluster setting cluster.preserve_downgrade_option has been set for greater than ${maximumSetTime} hours`,
+      title: `Cluster setting cluster.preserve_downgrade_option has been set for ${diff.toFixed(
+        1,
+      )} hours`,
       text: `You can see a list of all nodes and their versions below.
         Once all cluster nodes have been upgraded, and you have validated the stability and performance of
         your workload on the new version, you must reset the cluster.preserve_downgrade_option cluster
@@ -555,6 +560,69 @@ export const clusterPreserveDowngradeOptionOvertimeSelector = createSelector(
         RESET CLUSTER SETTING cluster.preserve_downgrade_option;`,
       dismiss: (dispatch: AppDispatch) => {
         dispatch(clusterPreserveDowngradeOptionDismissedSetting.set(true));
+        return Promise.resolve();
+      },
+    };
+  },
+);
+
+////////////////////////////////////////
+// Upgrade not finalized.
+////////////////////////////////////////
+export const upgradeNotFinalizedDismissedSetting = new LocalSetting(
+  "upgrade_not_finalized_dismissed",
+  localSettingsSelector,
+  false,
+);
+
+/**
+ * Warning when all the nodes are running on the new version, but the cluster is not finalized.
+ */
+export const upgradeNotFinalizedWarningSelector = createSelector(
+  selectClusterSettings,
+  numNodesByVersionsSelector,
+  selectClusterSettingVersion,
+  upgradeNotFinalizedDismissedSetting.selector,
+  (
+    settings,
+    versionsMap,
+    clusterVersion,
+    upgradeNotFinalizedDismissed,
+  ): Alert => {
+    if (upgradeNotFinalizedDismissed || !settings) {
+      return undefined;
+    }
+    // Don't show this warning if nodes are on different versions, since there is
+    // already an alert for that (staggeredVersionWarningSelector).
+    if (!versionsMap || versionsMap.size !== 1 || !clusterVersion) {
+      return undefined;
+    }
+    // Don't show this warning if cluster.preserve_downgrade_option is set,
+    // because it's expected for the upgrade not be finalized on that case and there is
+    // an alert for that (clusterPreserveDowngradeOptionOvertimeSelector)
+    const clusterPreserveDowngradeOption =
+      settings["cluster.preserve_downgrade_option"];
+    const value = clusterPreserveDowngradeOption?.value;
+    const lastUpdated = clusterPreserveDowngradeOption?.last_updated;
+    if (value && lastUpdated) {
+      return undefined;
+    }
+
+    const nodesVersion = versionsMap.keys().next().value;
+    // Prod: node version is 23.1 and cluster version is 23.1.
+    // Dev: node version is 23.1 and cluster version is 23.1-2.
+    if (clusterVersion.startsWith(nodesVersion)) {
+      return undefined;
+    }
+
+    return {
+      level: AlertLevel.WARNING,
+      title: "Upgrade not finalized.",
+      text: `All nodes are running on version ${nodesVersion}, but the cluster is on version ${clusterVersion}. 
+      Features might not be available in this state.`,
+      link: docsURL.upgradeTroubleshooting,
+      dismiss: (dispatch: AppDispatch) => {
+        dispatch(upgradeNotFinalizedDismissedSetting.set(true));
         return Promise.resolve();
       },
     };
@@ -569,6 +637,7 @@ export const clusterPreserveDowngradeOptionOvertimeSelector = createSelector(
 export const overviewListAlertsSelector = createSelector(
   staggeredVersionWarningSelector,
   clusterPreserveDowngradeOptionOvertimeSelector,
+  upgradeNotFinalizedWarningSelector,
   (...alerts: Alert[]): Alert[] => {
     return _.without(alerts, null, undefined);
   },
@@ -653,15 +722,19 @@ export function alertDataSync(store: Store<AdminUIState>) {
     // Always refresh health.
     dispatch(refreshHealth());
 
+    const { Insecure } = getDataFromServer();
     // We should not send out requests to the endpoints below if
     // the user has not successfully logged in since the requests
     // will always return with a 401 error.
-    if (
-      !state.login ||
-      !state.login.loggedInUser ||
-      state.login.loggedInUser == ``
-    ) {
-      return;
+    // Insecure mode is an exception, where login state is irrelevant.
+    if (!Insecure) {
+      if (
+        !state.login ||
+        !state.login.loggedInUser ||
+        state.login.loggedInUser == ``
+      ) {
+        return;
+      }
     }
 
     // Load persistent settings which have not yet been loaded.

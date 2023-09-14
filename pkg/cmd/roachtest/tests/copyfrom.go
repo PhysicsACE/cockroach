@@ -13,7 +13,7 @@ package tests
 import (
 	"context"
 	"fmt"
-	"runtime"
+	"net/url"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -60,22 +60,12 @@ CREATE INDEX  l_sk_pk ON lineitem (l_suppkey, l_partkey);
 `
 
 func initTest(ctx context.Context, t test.Test, c cluster.Cluster, sf int) {
-	if runtime.GOOS == "linux" {
-		if err := repeatRunE(
-			ctx, t, c, c.All(), "update apt-get", `sudo apt-get -qq update`,
-		); err != nil {
+	if !c.IsLocal() {
+		if err := c.Install(ctx, t.L(), c.All(), "postgresql"); err != nil {
 			t.Fatal(err)
 		}
-		if err := repeatRunE(
-			ctx,
-			t,
-			c,
-			c.All(),
-			"install dependencies",
-			`sudo apt-get install -qq postgresql`,
-		); err != nil {
-			t.Fatal(err)
-		}
+	} else {
+		t.L().Printf("when running locally, ensure that psql is installed")
 	}
 	csv := fmt.Sprintf(tpchLineitemFmt, sf)
 	c.Run(ctx, c.Node(1), "rm -f /tmp/lineitem-table.csv")
@@ -127,18 +117,29 @@ func runCopyFromCRDB(ctx context.Context, t test.Test, c cluster.Cluster, sf int
 	initTest(ctx, t, c, sf)
 	db, err := c.ConnE(ctx, t.L(), 1)
 	require.NoError(t, err)
-	stmt := fmt.Sprintf("ALTER ROLE ALL SET copy_from_atomic_enabled = %t", atomic)
-	_, err = db.ExecContext(ctx, stmt)
-	require.NoError(t, err)
+	stmts := []string{
+		"CREATE USER importer",
+		fmt.Sprintf("ALTER ROLE importer SET copy_from_atomic_enabled = %t", atomic),
+	}
+	for _, stmt := range stmts {
+		_, err = db.ExecContext(ctx, stmt)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	urls, err := c.InternalPGUrl(ctx, t.L(), c.Node(1), "")
 	require.NoError(t, err)
 	m := c.NewMonitor(ctx, c.All())
 	m.Go(func(ctx context.Context) error {
-		// psql w/ url first are doesn't support --db arg so have to do this.
-		url := strings.Replace(urls[0], "?", "/defaultdb?", 1)
-		c.Run(ctx, c.Node(1), fmt.Sprintf("psql %s -c 'SELECT 1'", url))
-		c.Run(ctx, c.Node(1), fmt.Sprintf("psql %s -c '%s'", url, lineitemSchema))
-		runTest(ctx, t, c, fmt.Sprintf("psql '%s'", url))
+		// psql w/ url first doesn't support --db arg so have to do this.
+		urlstr := strings.Replace(urls[0], "?", "/defaultdb?", 1)
+		u, err := url.Parse(urlstr)
+		require.NoError(t, err)
+		u.User = url.User("importer")
+		urlstr = u.String()
+		c.Run(ctx, c.Node(1), fmt.Sprintf("psql %s -c 'SELECT 1'", urlstr))
+		c.Run(ctx, c.Node(1), fmt.Sprintf("psql %s -c '%s'", urlstr, lineitemSchema))
+		runTest(ctx, t, c, fmt.Sprintf("psql '%s'", urlstr))
 		return nil
 	})
 	m.Wait()
@@ -155,25 +156,31 @@ func registerCopyFrom(r registry.Registry) {
 	for _, tc := range testcases {
 		tc := tc
 		r.Add(registry.TestSpec{
-			Name:    fmt.Sprintf("copyfrom/crdb-atomic/sf=%d/nodes=%d", tc.sf, tc.nodes),
-			Owner:   registry.OwnerKV,
-			Cluster: r.MakeClusterSpec(tc.nodes),
+			Name:      fmt.Sprintf("copyfrom/crdb-atomic/sf=%d/nodes=%d", tc.sf, tc.nodes),
+			Owner:     registry.OwnerSQLQueries,
+			Benchmark: true,
+			Cluster:   r.MakeClusterSpec(tc.nodes),
+			Leases:    registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runCopyFromCRDB(ctx, t, c, tc.sf, true /*atomic*/)
 			},
 		})
 		r.Add(registry.TestSpec{
-			Name:    fmt.Sprintf("copyfrom/crdb-nonatomic/sf=%d/nodes=%d", tc.sf, tc.nodes),
-			Owner:   registry.OwnerKV,
-			Cluster: r.MakeClusterSpec(tc.nodes),
+			Name:      fmt.Sprintf("copyfrom/crdb-nonatomic/sf=%d/nodes=%d", tc.sf, tc.nodes),
+			Owner:     registry.OwnerSQLQueries,
+			Benchmark: true,
+			Cluster:   r.MakeClusterSpec(tc.nodes),
+			Leases:    registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runCopyFromCRDB(ctx, t, c, tc.sf, false /*atomic*/)
 			},
 		})
 		r.Add(registry.TestSpec{
-			Name:    fmt.Sprintf("copyfrom/pg/sf=%d/nodes=%d", tc.sf, tc.nodes),
-			Owner:   registry.OwnerKV,
-			Cluster: r.MakeClusterSpec(tc.nodes),
+			Name:      fmt.Sprintf("copyfrom/pg/sf=%d/nodes=%d", tc.sf, tc.nodes),
+			Owner:     registry.OwnerSQLQueries,
+			Benchmark: true,
+			Cluster:   r.MakeClusterSpec(tc.nodes),
+			Leases:    registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runCopyFromPG(ctx, t, c, tc.sf)
 			},

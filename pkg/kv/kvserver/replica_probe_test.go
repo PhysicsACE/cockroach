@@ -125,20 +125,22 @@ func TestReplicaProbeRequest(t *testing.T) {
 			kvpb.RoutingPolicy_LEASEHOLDER,
 			kvpb.RoutingPolicy_NEAREST,
 		} {
-			var b kv.Batch
-			b.AddRawRequest(probeReq)
-			b.Header.RoutingPolicy = policy
-			err := db.Run(ctx, &b)
-			if errors.HasType(err, (*kvpb.AmbiguousResultError)(nil)) {
-				// Rare but it can happen that we're proposing on a replica
-				// that is just about to get a snapshot. In that case we'll
-				// get:
-				//
-				// result is ambiguous: unable to determine whether command was applied via snapshot
-				t.Logf("ignoring: %s", err)
-				err = nil
-			}
-			require.NoError(t, err)
+			testutils.SucceedsSoon(t, func() error {
+				var b kv.Batch
+				b.AddRawRequest(probeReq)
+				b.Header.RoutingPolicy = policy
+				err := db.Run(ctx, &b)
+				if errors.HasType(err, (*kvpb.AmbiguousResultError)(nil)) {
+					// Rare but it can happen that we're proposing on a replica
+					// that is just about to get a snapshot. In that case we'll
+					// get:
+					//
+					// result is ambiguous: unable to determine whether command was applied via snapshot
+					return errors.Wrapf(err, "retrying")
+				}
+				require.NoError(t, err)
+				return nil
+			})
 		}
 	}
 	// Check expected number of probes seen on each Replica in the apply loop.
@@ -169,7 +171,7 @@ func TestReplicaProbeRequest(t *testing.T) {
 	// We can also probe directly at each Replica. This is the intended use case
 	// for Replica-level circuit breakers (#33007).
 	for _, srv := range tc.Servers {
-		repl, _, err := srv.Stores().GetReplicaForRangeID(ctx, desc.RangeID)
+		repl, _, err := srv.GetStores().(*kvserver.Stores).GetReplicaForRangeID(ctx, desc.RangeID)
 		require.NoError(t, err)
 		ba := &kvpb.BatchRequest{}
 		ba.Add(probeReq)
@@ -187,7 +189,7 @@ func TestReplicaProbeRequest(t *testing.T) {
 	seen.injectedErr = injErr
 	seen.Unlock()
 	for _, srv := range tc.Servers {
-		repl, _, err := srv.Stores().GetReplicaForRangeID(ctx, desc.RangeID)
+		repl, _, err := srv.GetStores().(*kvserver.Stores).GetReplicaForRangeID(ctx, desc.RangeID)
 		require.NoError(t, err)
 		ba := &kvpb.BatchRequest{}
 		ba.Timestamp = srv.Clock().Now()

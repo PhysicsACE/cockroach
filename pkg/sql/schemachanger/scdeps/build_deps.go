@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -109,32 +110,54 @@ func (d *buildDeps) MayResolveDatabase(
 
 // MayResolveSchema implements the scbuild.CatalogReader interface.
 func (d *buildDeps) MayResolveSchema(
-	ctx context.Context, name tree.ObjectNamePrefix,
+	ctx context.Context, name tree.ObjectNamePrefix, withOffline bool,
 ) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor) {
 	if !name.ExplicitCatalog {
 		name.CatalogName = tree.Name(d.schemaResolver.CurrentDatabase())
 	}
 	db := d.MayResolveDatabase(ctx, name.CatalogName)
-	schema, err := d.descsCollection.ByName(d.txn).MaybeGet().Schema(ctx, db, name.Schema())
+	byNameGetterBuilder := d.descsCollection.ByName(d.txn)
+	if withOffline {
+		byNameGetterBuilder = byNameGetterBuilder.WithOffline()
+	}
+	schema, err := byNameGetterBuilder.MaybeGet().Schema(ctx, db, name.Schema())
 	if err != nil {
 		panic(err)
 	}
 	return db, schema
 }
 
-func (d *buildDeps) MustResolvePrefix(
+func (d *buildDeps) MayResolvePrefix(
 	ctx context.Context, name tree.ObjectNamePrefix,
-) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor) {
-	if !name.ExplicitCatalog {
-		name.CatalogName = tree.Name(d.schemaResolver.CurrentDatabase())
-		name.ExplicitCatalog = true
-	}
-
+) (db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor) {
+	const withOffline = false
 	if name.ExplicitSchema {
-		db, sc := d.MayResolveSchema(ctx, name)
-		if sc == nil {
-			panic(errors.AssertionFailedf("prefix %s does not exist", name.String()))
+		if name.ExplicitCatalog {
+			db, sc = d.MayResolveSchema(ctx, name, withOffline)
+			return db, sc
 		}
+
+		// Two parts: D.T.
+		// Try to use the current database, and be satisfied if it's sufficient to find the object.
+		db, sc = d.MayResolveSchema(ctx, tree.ObjectNamePrefix{
+			CatalogName:     tree.Name(d.CurrentDatabase()),
+			SchemaName:      name.SchemaName,
+			ExplicitCatalog: true,
+			ExplicitSchema:  true,
+		},
+			withOffline)
+		if db != nil && sc != nil {
+			return db, sc
+		}
+
+		// No luck so far. Compatibility with CockroachDB v1.1: use D.public.T instead.
+		db, sc = d.MayResolveSchema(ctx, tree.ObjectNamePrefix{
+			CatalogName:     name.SchemaName,
+			SchemaName:      catconstants.PublicSchemaName,
+			ExplicitCatalog: true,
+			ExplicitSchema:  true,
+		},
+			withOffline)
 		return db, sc
 	}
 
@@ -143,13 +166,12 @@ func (d *buildDeps) MustResolvePrefix(
 	for scName, ok := iter.Next(); ok; scName, ok = iter.Next() {
 		name.SchemaName = tree.Name(scName)
 		name.ExplicitSchema = true
-		db, sc := d.MayResolveSchema(ctx, name)
+		db, sc = d.MayResolveSchema(ctx, name, false /* withOffline */)
 		if sc != nil {
 			return db, sc
 		}
 	}
-
-	panic(errors.AssertionFailedf("prefix %s does not exist", name.String()))
+	return nil, nil
 }
 
 // MayResolveTable implements the scbuild.CatalogReader interface.
@@ -157,7 +179,7 @@ func (d *buildDeps) MayResolveTable(
 	ctx context.Context, name tree.UnresolvedObjectName,
 ) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor) {
 	desc, prefix, err := resolver.ResolveExistingObject(ctx, d.schemaResolver, &name, tree.ObjectLookupFlags{
-		AvoidLeased:       true,
+		AssertNotLeased:   true,
 		DesiredObjectKind: tree.TableObject,
 	})
 	if err != nil {
@@ -174,7 +196,7 @@ func (d *buildDeps) MayResolveType(
 	ctx context.Context, name tree.UnresolvedObjectName,
 ) (catalog.ResolvedObjectPrefix, catalog.TypeDescriptor) {
 	desc, prefix, err := resolver.ResolveExistingObject(ctx, d.schemaResolver, &name, tree.ObjectLookupFlags{
-		AvoidLeased:       true,
+		AssertNotLeased:   true,
 		DesiredObjectKind: tree.TypeObject,
 	})
 	if err != nil {
@@ -238,7 +260,7 @@ func (d *buildDeps) ResolveFunction(
 // ResolveFunctionByOID implements the scbuild.CatalogReader interface.
 func (d *buildDeps) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (*tree.FunctionName, *tree.Overload, error) {
+) (*tree.RoutineName, *tree.Overload, error) {
 	return d.schemaResolver.ResolveFunctionByOID(ctx, oid)
 }
 
@@ -252,7 +274,7 @@ func (d *buildDeps) GetQualifiedTableNameByID(
 // GetQualifiedTableNameByID implements the scbuild.CatalogReader interface.
 func (d *buildDeps) GetQualifiedFunctionNameByID(
 	ctx context.Context, id int64,
-) (*tree.FunctionName, error) {
+) (*tree.RoutineName, error) {
 	return d.schemaResolver.GetQualifiedFunctionNameByID(ctx, id)
 }
 
@@ -379,6 +401,12 @@ func (d *buildDeps) IncrementSchemaChangeAlterCounter(counterType string, extra 
 		maybeExtra = extra[0]
 	}
 	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra(counterType, maybeExtra))
+}
+
+// IncrementSchemaChangeCreateCounter implements the scbuild.Dependencies
+// interface.
+func (d *buildDeps) IncrementSchemaChangeCreateCounter(counterType string) {
+	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter(counterType))
 }
 
 // IncrementSchemaChangeDropCounter implements the scbuild.Dependencies

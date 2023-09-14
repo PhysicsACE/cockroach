@@ -60,7 +60,7 @@ func EncodeProtobuf(p protoutil.Message) string {
 
 type updater struct {
 	sv *Values
-	m  map[string]struct{}
+	m  map[InternalKey]struct{}
 }
 
 // Updater is a helper for updating the in-memory settings.
@@ -70,18 +70,21 @@ type updater struct {
 // wrapped atomic settings values as we go and note which settings were updated,
 // then set the rest to default in ResetRemaining().
 type Updater interface {
-	Set(ctx context.Context, key string, value EncodedValue) error
+	Set(ctx context.Context, key InternalKey, value EncodedValue) error
 	ResetRemaining(ctx context.Context)
+	SetValueOrigin(ctx context.Context, key InternalKey, origin ValueOrigin)
 }
 
 // A NoopUpdater ignores all updates.
 type NoopUpdater struct{}
 
 // Set implements Updater. It is a no-op.
-func (u NoopUpdater) Set(ctx context.Context, key string, value EncodedValue) error { return nil }
+func (u NoopUpdater) Set(ctx context.Context, key InternalKey, value EncodedValue) error { return nil }
 
 // ResetRemaining implements Updater. It is a no-op.
 func (u NoopUpdater) ResetRemaining(context.Context) {}
+
+func (u NoopUpdater) SetValueOrigin(ctx context.Context, key InternalKey, origin ValueOrigin) {}
 
 // NewUpdater makes an Updater.
 func NewUpdater(sv *Values) Updater {
@@ -89,13 +92,13 @@ func NewUpdater(sv *Values) Updater {
 		return NoopUpdater{}
 	}
 	return updater{
-		m:  make(map[string]struct{}, len(registry)),
+		m:  make(map[InternalKey]struct{}, len(registry)),
 		sv: sv,
 	}
 }
 
 // Set attempts to parse and update a setting and notes that it was updated.
-func (u updater) Set(ctx context.Context, key string, value EncodedValue) error {
+func (u updater) Set(ctx context.Context, key InternalKey, value EncodedValue) error {
 	d, ok := registry[key]
 	if !ok {
 		if _, ok := retiredSettings[key]; ok {
@@ -108,7 +111,7 @@ func (u updater) Set(ctx context.Context, key string, value EncodedValue) error 
 	u.m[key] = struct{}{}
 
 	if expected := d.Typ(); value.Type != expected {
-		return errors.Errorf("setting '%s' defined as type %s, not %s", key, expected, value.Type)
+		return errors.Errorf("setting '%s' defined as type %s, not %s", d.Name(), expected, value.Type)
 	}
 
 	switch setting := d.(type) {
@@ -165,6 +168,13 @@ func (u updater) Set(ctx context.Context, key string, value EncodedValue) error 
 // ResetRemaining sets all settings not updated by the updater to their default values.
 func (u updater) ResetRemaining(ctx context.Context) {
 	for k, v := range registry {
+
+		if _, hasOverride := u.m[k]; hasOverride {
+			u.sv.setValueOrigin(ctx, v.getSlot(), OriginExplicitlySet)
+		} else {
+			u.sv.setValueOrigin(ctx, v.getSlot(), OriginDefault)
+		}
+
 		if u.sv.NonSystemTenant() && v.Class() == SystemOnly {
 			// Don't try to reset system settings on a non-system tenant.
 			continue
@@ -172,5 +182,13 @@ func (u updater) ResetRemaining(ctx context.Context) {
 		if _, ok := u.m[k]; !ok {
 			v.setToDefault(ctx, u.sv)
 		}
+	}
+}
+
+// SetValueOrigin sets the origin of the value of a given setting.
+func (u updater) SetValueOrigin(ctx context.Context, key InternalKey, origin ValueOrigin) {
+	d, ok := registry[key]
+	if ok {
+		u.sv.setValueOrigin(ctx, d.getSlot(), origin)
 	}
 }

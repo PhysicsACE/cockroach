@@ -38,7 +38,7 @@ const (
 // SSTable data, divided by this factor. Thereby, the magnitude of this factor
 // is inversely related to QPS sensitivity to AddSSTableRequests.
 var AddSSTableRequestSizeFactor = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.replica_stats.addsst_request_size_factor",
 	"the divisor that is applied to addsstable request sizes, then recorded in a leaseholders QPS; 0 means all requests are treated as cost 1",
 	// The default value of 50,000 was chosen as the default divisor, following manual testing that
@@ -46,7 +46,7 @@ var AddSSTableRequestSizeFactor = settings.RegisterIntSetting(
 	// increase accounted QPS by 1. Typically AddSSTableRequests are ~1mb in size, accounted as 20
 	// QPS.
 	50000,
-).WithPublic()
+	settings.WithPublic)
 
 // LocalityOracle provides a mapping between a node ID and it's corresponding
 // locality.

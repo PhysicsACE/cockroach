@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -10,13 +9,18 @@ go_library(
 
 go_test(
     name = "compose_test",
+    size = "enormous",
     srcs = ["compose_test.go"],
-    args = ["-test.timeout=295s"],
+    args = select({
+        "//build/toolchains:use_ci_timeouts": ["-test.timeout=895s"],
+        "//conditions:default": ["-test.timeout=3595s"],
+    }),
     data = [
         "//c-deps:libgeos",
         "//pkg/compose:compare/docker-compose.yml",
     ],
     embed = [":compose"],
+    exec_properties = {"Pool": "large"},
     gotags = ["compose"],
     tags = ["integration"],
     deps = [
@@ -24,5 +28,3 @@ go_test(
         "//pkg/util/envutil",
     ],
 )
-
-get_x_data(name = "get_x_data")

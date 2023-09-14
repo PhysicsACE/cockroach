@@ -76,7 +76,8 @@ var indexBackfillMergeNumWorkers = settings.RegisterIntSetting(
 // IndexBackfillMerger is a processor that merges entries from the corresponding
 // temporary index to a new index.
 type IndexBackfillMerger struct {
-	spec execinfrapb.IndexBackfillMergerSpec
+	processorID int32
+	spec        execinfrapb.IndexBackfillMergerSpec
 
 	desc catalog.TableDescriptor
 
@@ -85,8 +86,6 @@ type IndexBackfillMerger struct {
 	flowCtx *execinfra.FlowCtx
 
 	evalCtx *eval.Context
-
-	output execinfra.RowReceiver
 
 	mon            *mon.BytesMonitor
 	muBoundAccount muBoundAccount
@@ -105,13 +104,13 @@ func (ibm *IndexBackfillMerger) MustBeStreaming() bool {
 const indexBackfillMergeProgressReportInterval = 10 * time.Second
 
 // Run runs the processor.
-func (ibm *IndexBackfillMerger) Run(ctx context.Context) {
+func (ibm *IndexBackfillMerger) Run(ctx context.Context, output execinfra.RowReceiver) {
 	opName := "IndexBackfillMerger"
 	ctx = logtags.AddTag(ctx, opName, int(ibm.spec.Table.ID))
-	ctx, span := execinfra.ProcessorSpan(ctx, opName)
+	ctx, span := execinfra.ProcessorSpan(ctx, ibm.flowCtx, opName, ibm.processorID)
 	defer span.Finish()
-	defer ibm.output.ProducerDone()
-	defer execinfra.SendTraceData(ctx, ibm.output)
+	defer output.ProducerDone()
+	defer execinfra.SendTraceData(ctx, ibm.flowCtx, output)
 
 	mu := struct {
 		syncutil.Mutex
@@ -137,17 +136,24 @@ func (ibm *IndexBackfillMerger) Run(ctx context.Context) {
 		return prog
 	}
 
+	var outputMu syncutil.Mutex
 	pushProgress := func() {
 		p := getStoredProgressForPush()
 		if p.CompletedSpans != nil {
 			log.VEventf(ctx, 2, "sending coordinator completed spans: %+v", p.CompletedSpans)
 		}
-		ibm.output.Push(nil, &execinfrapb.ProducerMetadata{BulkProcessorProgress: &p})
+		// Even though the contract of execinfra.RowReceiver says that Push is
+		// thread-safe, in reality it's not always the case, so we protect it
+		// with a mutex. At the time of writing, the only source of concurrency
+		// for Push()ing is present due to testing knobs though.
+		outputMu.Lock()
+		defer outputMu.Unlock()
+		output.Push(nil, &execinfrapb.ProducerMetadata{BulkProcessorProgress: &p})
 	}
 
 	semaCtx := tree.MakeSemaContext()
 	if err := ibm.out.Init(ctx, &execinfrapb.PostProcessSpec{}, nil, &semaCtx, ibm.flowCtx.NewEvalCtx()); err != nil {
-		ibm.output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
+		output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
 		return
 	}
 
@@ -231,7 +237,7 @@ func (ibm *IndexBackfillMerger) Run(ctx context.Context) {
 			pushProgress()
 		case err = <-workersDoneCh:
 			if err != nil {
-				ibm.output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
+				output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
 			}
 			return
 		}
@@ -347,11 +353,12 @@ func (ibm *IndexBackfillMerger) merge(
 	) error {
 		var deletedCount int
 		txn.KV().AddCommitTrigger(func(ctx context.Context) {
+			commitTs, _ := txn.KV().CommitTimestamp()
 			log.VInfof(ctx, 2, "merged batch of %d keys (%d deletes) (span: %s) (commit timestamp: %s)",
 				len(sourceKeys),
 				deletedCount,
 				sourceSpan,
-				txn.KV().CommitTimestamp(),
+				commitTs,
 			)
 		})
 		if len(sourceKeys) == 0 {
@@ -497,23 +504,28 @@ func (ibm *IndexBackfillMerger) shrinkBoundAccount(ctx context.Context, shrinkBy
 	ibm.muBoundAccount.boundAccount.Shrink(ctx, shrinkBy)
 }
 
+// Resume is part of the execinfra.Processor interface.
+func (ibm *IndexBackfillMerger) Resume(output execinfra.RowReceiver) {
+	panic("not implemented")
+}
+
 // NewIndexBackfillMerger creates a new IndexBackfillMerger.
 func NewIndexBackfillMerger(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	spec execinfrapb.IndexBackfillMergerSpec,
-	output execinfra.RowReceiver,
 ) (*IndexBackfillMerger, error) {
 	mergerMon := execinfra.NewMonitor(ctx, flowCtx.Cfg.BackfillerMonitor,
 		"index-backfiller-merger-mon")
 
 	ibm := &IndexBackfillMerger{
-		spec:    spec,
-		desc:    tabledesc.NewUnsafeImmutable(&spec.Table),
-		flowCtx: flowCtx,
-		evalCtx: flowCtx.NewEvalCtx(),
-		output:  output,
-		mon:     mergerMon,
+		processorID: processorID,
+		spec:        spec,
+		desc:        tabledesc.NewUnsafeImmutable(&spec.Table),
+		flowCtx:     flowCtx,
+		evalCtx:     flowCtx.NewEvalCtx(),
+		mon:         mergerMon,
 	}
 
 	ibm.muBoundAccount.boundAccount = mergerMon.MakeBoundAccount()

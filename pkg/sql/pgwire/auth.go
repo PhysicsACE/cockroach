@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -25,9 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -98,7 +101,7 @@ func (c *conn) handleAuthentication(
 	tlsState, hbaEntry, authMethod, err := c.findAuthenticationMethod(authOpt)
 	if err != nil {
 		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_METHOD_NOT_FOUND, err)
-		return nil, c.sendError(ctx, execCfg, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
+		return nil, c.sendError(ctx, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
 	}
 
 	ac.SetAuthMethod(hbaEntry.Method.String())
@@ -111,7 +114,7 @@ func (c *conn) handleAuthentication(
 	connClose = behaviors.ConnClose
 	if err != nil {
 		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_UNKNOWN, err)
-		return connClose, c.sendError(ctx, execCfg, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
+		return connClose, c.sendError(ctx, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
 	}
 
 	// Choose the system identity that we'll use below for mapping
@@ -136,7 +139,7 @@ func (c *conn) handleAuthentication(
 	if err := c.checkClientUsernameMatchesMapping(ctx, ac, behaviors.MapRole, systemIdentity); err != nil {
 		log.Warningf(ctx, "unable to map incoming identity %q to any database user: %+v", systemIdentity, err)
 		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_USER_NOT_FOUND, err)
-		return connClose, c.sendError(ctx, execCfg, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
+		return connClose, c.sendError(ctx, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
 	}
 
 	// Once chooseDbRole() returns, we know that the actual DB username
@@ -145,7 +148,7 @@ func (c *conn) handleAuthentication(
 
 	// Check that the requested user exists and retrieve the hashed
 	// password in case password authentication is needed.
-	exists, canLoginSQL, _, isSuperuser, defaultSettings, pwRetrievalFn, err :=
+	exists, canLoginSQL, _, canUseReplicationMode, isSuperuser, defaultSettings, pwRetrievalFn, err :=
 		sql.GetUserSessionInitInfo(
 			ctx,
 			execCfg,
@@ -155,7 +158,7 @@ func (c *conn) handleAuthentication(
 	if err != nil {
 		log.Warningf(ctx, "user retrieval failed for user=%q: %+v", dbUser, err)
 		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_USER_RETRIEVAL_ERROR, err)
-		return connClose, c.sendError(ctx, execCfg, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
+		return connClose, c.sendError(ctx, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
 	}
 	c.sessionArgs.IsSuperuser = isSuperuser
 
@@ -164,25 +167,25 @@ func (c *conn) handleAuthentication(
 		// If the user does not exist, we show the same error used for invalid
 		// passwords, to make it harder for an attacker to determine if a user
 		// exists.
-		return connClose, c.sendError(ctx, execCfg, pgerror.WithCandidateCode(security.NewErrPasswordUserAuthFailed(dbUser), pgcode.InvalidPassword))
+		return connClose, c.sendError(ctx, pgerror.WithCandidateCode(security.NewErrPasswordUserAuthFailed(dbUser), pgcode.InvalidPassword))
 	}
 
 	if !canLoginSQL {
 		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_LOGIN_DISABLED, nil)
-		return connClose, c.sendError(ctx, execCfg, pgerror.Newf(pgcode.InvalidAuthorizationSpecification, "%s does not have login privilege", dbUser))
+		return connClose, c.sendError(ctx, pgerror.Newf(pgcode.InvalidAuthorizationSpecification, "%s does not have login privilege", dbUser))
 	}
 
 	// At this point, we know that the requested user exists and is
 	// allowed to log in. Now we can delegate to the selected AuthMethod
 	// implementation to complete the authentication.
 	if err := behaviors.Authenticate(ctx, systemIdentity, true /* public */, pwRetrievalFn); err != nil {
-		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_CREDENTIALS_INVALID, err)
+		ac.LogAuthFailed(ctx, eventpb.AuthFailReason_UNKNOWN, err)
 		if pErr := (*security.PasswordUserAuthError)(nil); errors.As(err, &pErr) {
 			err = pgerror.WithCandidateCode(err, pgcode.InvalidPassword)
 		} else {
 			err = pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification)
 		}
-		return connClose, c.sendError(ctx, execCfg, err)
+		return connClose, c.sendError(ctx, err)
 	}
 
 	// Add all the defaults to this session's defaults. If there is an
@@ -205,6 +208,21 @@ func (c *conn) handleAuthentication(
 			if _, ok := c.sessionArgs.SessionDefaults[keyVal[0]]; !ok {
 				c.sessionArgs.SessionDefaults[keyVal[0]] = keyVal[1]
 			}
+		}
+	}
+
+	// Check replication privilege.
+	if c.sessionArgs.SessionDefaults["replication"] != "" {
+		m, err := sql.ReplicationModeFromString(c.sessionArgs.SessionDefaults["replication"])
+		if err == nil && m != sessiondatapb.ReplicationMode_REPLICATION_MODE_DISABLED && !canUseReplicationMode {
+			ac.LogAuthFailed(ctx, eventpb.AuthFailReason_NO_REPLICATION_ROLEOPTION, nil)
+			return connClose, c.sendError(
+				ctx,
+				pgerror.Newf(
+					pgcode.InsufficientPrivilege,
+					"must be superuser or have REPLICATION role to start streaming replication",
+				),
+			)
 		}
 	}
 
@@ -399,22 +417,28 @@ type AuthConn interface {
 	LogAuthFailed(ctx context.Context, reason eventpb.AuthFailReason, err error)
 	// LogAuthOK logs when the authentication handshake has completed.
 	LogAuthOK(ctx context.Context)
+	// GetTenantSpecificMetrics returns the tenant-specific metrics for the connection.
+	GetTenantSpecificMetrics() *tenantSpecificMetrics
 }
 
 // authPipe is the implementation for the authenticator and AuthConn interfaces.
 // A single authPipe will serve as both an AuthConn and an authenticator; the
 // two represent the two "ends" of the pipe and we'll pass data between them.
 type authPipe struct {
-	c   *conn // Only used for writing, not for reading.
-	log bool
+	c             *conn // Only used for writing, not for reading.
+	log           bool
+	loggedFailure bool
 
 	connDetails eventpb.CommonConnectionDetails
 	authDetails eventpb.CommonSessionDetails
 	authMethod  string
 
 	ch chan []byte
+
+	// closeWriterDoneOnce wraps close(writerDone) to prevent a panic if
+	// noMorePwdData is called multiple times.
+	closeWriterDoneOnce sync.Once
 	// writerDone is a channel closed by noMorePwdData().
-	// Nil if noMorePwdData().
 	writerDone chan struct{}
 	readerDone chan authRes
 }
@@ -454,13 +478,13 @@ func (p *authPipe) sendPwdData(data []byte) error {
 }
 
 func (p *authPipe) noMorePwdData() {
-	if p.writerDone == nil {
-		return
-	}
-	// A reader blocked in GetPwdData() gets unblocked with an error.
-	close(p.writerDone)
-	p.writerDone = nil
+	p.closeWriterDoneOnce.Do(func() {
+		// A reader blocked in GetPwdData() gets unblocked with an error.
+		close(p.writerDone)
+	})
 }
+
+const writerDoneError = "client didn't send required auth data"
 
 // GetPwdData is part of the AuthConn interface.
 func (p *authPipe) GetPwdData() ([]byte, error) {
@@ -468,7 +492,7 @@ func (p *authPipe) GetPwdData() ([]byte, error) {
 	case data := <-p.ch:
 		return data, nil
 	case <-p.writerDone:
-		return nil, pgwirebase.NewProtocolViolationErrorf("client didn't send required auth data")
+		return nil, pgwirebase.NewProtocolViolationErrorf(writerDoneError)
 	}
 }
 
@@ -519,10 +543,14 @@ func (p *authPipe) LogAuthInfof(ctx context.Context, format string, args ...inte
 func (p *authPipe) LogAuthFailed(
 	ctx context.Context, reason eventpb.AuthFailReason, detailedErr error,
 ) {
-	if p.log {
-		var errStr string
+	if p.log && !p.loggedFailure {
+		// If a failure was already logged, then don't log another one. The
+		// assumption is that if an error is logged deeper in the call stack, the
+		// reason is likely to be more specific than at a higher point in the stack.
+		p.loggedFailure = true
+		var errStr redact.RedactableString
 		if detailedErr != nil {
-			errStr = detailedErr.Error()
+			errStr = redact.Sprint(detailedErr)
 		}
 		ev := &eventpb.ClientAuthenticationFailed{
 			CommonConnectionDetails: p.connDetails,
@@ -549,4 +577,9 @@ func (p *authPipe) SendAuthRequest(authType int32, data []byte) error {
 	c.msgBuilder.putInt32(authType)
 	c.msgBuilder.write(data)
 	return c.msgBuilder.finishMsg(c.conn)
+}
+
+// GetTenantSpecificMetrics is part of the AuthConn interface.
+func (p *authPipe) GetTenantSpecificMetrics() *tenantSpecificMetrics {
+	return p.c.metrics
 }

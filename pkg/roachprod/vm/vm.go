@@ -13,6 +13,7 @@ package vm
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -34,10 +35,30 @@ const (
 	TagLifetime = "lifetime"
 	// TagRoachprod is roachprod tag const, value is true & false.
 	TagRoachprod = "roachprod"
+	// TagUsage indicates where a certain resource is used. "roachtest" is used
+	// as the key for roachtest created resources.
+	TagUsage = "usage"
+	// TagArch is the CPU architecture tag const.
+	TagArch = "arch"
+
+	ArchARM64 = CPUArch("arm64")
+	ArchAMD64 = CPUArch("amd64")
+	ArchFIPS  = CPUArch("fips")
 )
+
+type CPUArch string
 
 // GetDefaultLabelMap returns a label map for a common set of labels.
 func GetDefaultLabelMap(opts CreateOpts) map[string]string {
+	// Add architecture override tag, only if it was specified.
+	if opts.Arch != "" {
+		return map[string]string{
+			TagCluster:   opts.ClusterName,
+			TagLifetime:  opts.Lifetime.String(),
+			TagRoachprod: "true",
+			TagArch:      opts.Arch,
+		}
+	}
 	return map[string]string{
 		TagCluster:   opts.ClusterName,
 		TagLifetime:  opts.Lifetime.String(),
@@ -52,11 +73,18 @@ type VM struct {
 	CreatedAt time.Time `json:"created_at"`
 	// If non-empty, indicates that some or all of the data in the VM instance
 	// is not present or otherwise invalid.
-	Errors   []error           `json:"errors"`
-	Lifetime time.Duration     `json:"lifetime"`
-	Labels   map[string]string `json:"labels"`
+	Errors      []error           `json:"errors"`
+	Lifetime    time.Duration     `json:"lifetime"`
+	Preemptible bool              `json:"preemptible"`
+	Labels      map[string]string `json:"labels"`
 	// The provider-internal DNS name for the VM instance
 	DNS string `json:"dns"`
+
+	// PublicDNS is the public DNS name that can be used to connect to the VM.
+	PublicDNS string `json:"public_dns"`
+	// The DNS provider to use for DNS operations performed for this VM.
+	DNSProvider string `json:"dns_provider"`
+
 	// The name of the cloud provider that hosts the VM instance
 	Provider string `json:"provider"`
 	// The provider-specific id for the instance.  This may or may not be the same as Name, depending
@@ -77,21 +105,23 @@ type VM struct {
 	// cloud that supports project (i.e. GCE). Empty otherwise.
 	Project string `json:"project"`
 
-	// SQLPort is the port on which the cockroach process is listening for SQL
-	// connections.
-	// Usually config.DefaultSQLPort, except for local clusters.
-	SQLPort int `json:"sql_port"`
-
-	// AdminUIPort is the port on which the cockroach process is listening for
-	// HTTP traffic for the Admin UI.
-	// Usually config.DefaultAdminUIPort, except for local clusters.
-	AdminUIPort int `json:"adminui_port"`
-
 	// LocalClusterName is only set for VMs in a local cluster.
 	LocalClusterName string `json:"local_cluster_name,omitempty"`
 
-	// NonBootAttachedVolumes are the non-bootable volumes attached to the VM.
+	// NonBootAttachedVolumes are the non-bootable, _persistent_ volumes attached to the VM.
 	NonBootAttachedVolumes []Volume `json:"non_bootable_volumes"`
+
+	// LocalDisks are the ephemeral SSD disks attached to the VM.
+	LocalDisks []Volume `json:"local_disks"`
+
+	// CostPerHour is the estimated cost per hour of this VM, in US dollars. 0 if
+	//there is no estimate available.
+	CostPerHour float64
+
+	// EmptyCluster indicates that the VM does not exist. Azure allows for empty
+	// clusters, but roachprod does not allow VM-less clusters except when deleting them.
+	// A fake VM will be used in this scenario.
+	EmptyCluster bool
 }
 
 // Name generates the name for the i'th node in a cluster.
@@ -101,9 +131,10 @@ func Name(cluster string, idx int) string {
 
 // Error values for VM.Error
 var (
-	ErrBadNetwork   = errors.New("could not determine network information")
-	ErrInvalidName  = errors.New("invalid VM name")
-	ErrNoExpiration = errors.New("could not determine expiration")
+	ErrBadNetwork    = errors.New("could not determine network information")
+	ErrBadScheduling = errors.New("could not determine scheduling information")
+	ErrInvalidName   = errors.New("invalid VM name")
+	ErrNoExpiration  = errors.New("could not determine expiration")
 )
 
 var regionRE = regexp.MustCompile(`(.*[^-])-?[a-z]$`)
@@ -140,13 +171,44 @@ func (vm *VM) ZoneEntry() (string, error) {
 	return fmt.Sprintf("%s 60 IN A %s\n", vm.Name, vm.PublicIP), nil
 }
 
-func (vm *VM) AttachVolume(v Volume) (deviceName string, err error) {
+func (vm *VM) AttachVolume(l *logger.Logger, v Volume) (deviceName string, _ error) {
 	vm.NonBootAttachedVolumes = append(vm.NonBootAttachedVolumes, v)
-	err = ForProvider(vm.Provider, func(provider Provider) error {
-		deviceName, err = provider.AttachVolumeToVM(v, vm)
+	if err := ForProvider(vm.Provider, func(provider Provider) error {
+		var err error
+		deviceName, err = provider.AttachVolume(l, v, vm)
 		return err
-	})
-	return deviceName, err
+	}); err != nil {
+		return "", err
+	}
+	return deviceName, nil
+}
+
+const vmNameFormat = "user-<clusterid>-<nodeid>"
+
+// ClusterName returns the cluster name a VM belongs to.
+func (vm *VM) ClusterName() (string, error) {
+	if vm.IsLocal() {
+		return vm.LocalClusterName, nil
+	}
+	name := vm.Name
+	parts := strings.Split(name, "-")
+	if len(parts) < 3 {
+		return "", fmt.Errorf("expected VM name in the form %s, got %s", vmNameFormat, name)
+	}
+	return strings.Join(parts[:len(parts)-1], "-"), nil
+}
+
+// UserName returns the username of a VM.
+func (vm *VM) UserName() (string, error) {
+	if vm.IsLocal() {
+		return config.Local, nil
+	}
+	name := vm.Name
+	parts := strings.Split(name, "-")
+	if len(parts) < 3 {
+		return "", fmt.Errorf("expected VM name in the form %s, got %s", vmNameFormat, name)
+	}
+	return parts[0], nil
 }
 
 // List represents a list of VMs.
@@ -188,6 +250,7 @@ type CreateOpts struct {
 	CustomLabels map[string]string
 
 	GeoDistributed bool
+	Arch           string
 	VMProviders    []string
 	SSDOpts        struct {
 		UseLocalSSD bool
@@ -208,6 +271,8 @@ func DefaultCreateOpts() CreateOpts {
 		GeoDistributed: false,
 		VMProviders:    []string{},
 		OsVolumeSize:   10,
+		// N.B. When roachprod is used via CLI, this will be overridden by {"roachprod":"true"}.
+		CustomLabels: map[string]string{"roachtest": "true"},
 	}
 	defaultCreateOpts.SSDOpts.UseLocalSSD = true
 	defaultCreateOpts.SSDOpts.NoExt4Barrier = true
@@ -245,6 +310,58 @@ type ProviderOpts interface {
 	ConfigureClusterFlags(*pflag.FlagSet, MultipleProjectsOption)
 }
 
+// VolumeSnapshot is an abstract representation of a specific volume snapshot.
+// This type is used across various cloud providers supported by roachprod.
+type VolumeSnapshot struct {
+	ID   string
+	Name string
+}
+
+type VolumeSnapshots []VolumeSnapshot
+
+func (v VolumeSnapshots) Len() int {
+	return len(v)
+}
+
+func (v VolumeSnapshots) Less(i, j int) bool {
+	// This sorting-by-name looks like it happens by default in the gcloud API,
+	// but it doesn't hurt to be paranoid. Since node index number is part of
+	// the fingerprint, this plays nicely with applying snapshots in index
+	// order. That matters -- if the workload is being run on the 10th node,
+	// it's not expecting to have CRDB state. Nor should we expect the 9-node
+	// CRDB cluster to have to work out that now the 10th roachprod node should
+	// be running the CRDB process post snapshot application.
+	return strings.Compare(v[i].Name, v[j].Name) < 0
+}
+
+func (v VolumeSnapshots) Swap(i, j int) {
+	v[i], v[j] = v[j], v[i]
+}
+
+var _ sort.Interface = VolumeSnapshots{}
+
+// VolumeSnapshotCreateOpts groups input callers can provide when creating
+// volume snapshots. Namely, what name it has, the labels it's created with, and
+// a description (visible through cloud consoles).
+type VolumeSnapshotCreateOpts struct {
+	Name        string
+	Labels      map[string]string
+	Description string
+}
+
+// VolumeSnapshotListOpts provides a way to search for specific volume
+// snapshots. Callers can regex match snapshot names, search by exact labels, or
+// filter only for snapshots created before some timestamp. Individual
+// parameters are optional and can be combined with others.
+type VolumeSnapshotListOpts struct {
+	NamePrefix    string
+	Labels        map[string]string
+	CreatedBefore time.Time
+}
+
+// Volume is an abstract representation of a specific volume/disks. This type is
+// used across various cloud providers supported by roachprod, and can typically
+// be snapshotted or attached, detached, mounted from existing VMs.
 type Volume struct {
 	ProviderResourceID string
 	ProviderVolumeType string
@@ -255,6 +372,7 @@ type Volume struct {
 	Size               int
 }
 
+// VolumeCreateOpts groups input callers can provide when creating volumes.
 type VolumeCreateOpts struct {
 	Name string
 	// N.B. Customer managed encryption is not supported at this time
@@ -269,25 +387,30 @@ type VolumeCreateOpts struct {
 }
 
 type ListOptions struct {
-	IncludeVolumes bool
+	IncludeVolumes       bool
+	IncludeEmptyClusters bool
+	ComputeEstimatedCost bool
 }
 
 // A Provider is a source of virtual machines running on some hosting platform.
 type Provider interface {
 	CreateProviderOpts() ProviderOpts
-	CleanSSH() error
+	CleanSSH(l *logger.Logger) error
 
 	// ConfigSSH takes a list of zones and configures SSH for machines in those
 	// zones for the given provider.
-	ConfigSSH(zones []string) error
+	ConfigSSH(l *logger.Logger, zones []string) error
 	Create(l *logger.Logger, names []string, opts CreateOpts, providerOpts ProviderOpts) error
-	Reset(vms List) error
-	Delete(vms List) error
-	Extend(vms List, lifetime time.Duration) error
+	Reset(l *logger.Logger, vms List) error
+	Delete(l *logger.Logger, vms List) error
+	Extend(l *logger.Logger, vms List, lifetime time.Duration) error
 	// Return the account name associated with the provider
-	FindActiveAccount() (string, error)
+	FindActiveAccount(l *logger.Logger) (string, error)
 	List(l *logger.Logger, opts ListOptions) (List, error)
 	// The name of the Provider, which will also surface in the top-level Providers map.
+
+	AddLabels(l *logger.Logger, vms List, labels map[string]string) error
+	RemoveLabels(l *logger.Logger, vms List, labels []string) error
 	Name() string
 
 	// Active returns true if the provider is properly installed and capable of
@@ -302,15 +425,30 @@ type Provider interface {
 	// provider.
 	ProjectActive(project string) bool
 
-	CreateVolume(vco VolumeCreateOpts) (Volume, error)
-	AttachVolumeToVM(volume Volume, vm *VM) (string, error)
-	SnapshotVolume(volume Volume, name, description string, labels map[string]string) (string, error)
+	// Volume and volume snapshot related APIs.
+
+	// CreateVolume creates a new volume using the given options.
+	CreateVolume(l *logger.Logger, vco VolumeCreateOpts) (Volume, error)
+	// ListVolumes lists all volumes already attached to the given VM.
+	ListVolumes(l *logger.Logger, vm *VM) ([]Volume, error)
+	// DeleteVolume detaches and deletes the given volume from the given VM.
+	DeleteVolume(l *logger.Logger, volume Volume, vm *VM) error
+	// AttachVolume attaches the given volume to the given VM.
+	AttachVolume(l *logger.Logger, volume Volume, vm *VM) (string, error)
+	// CreateVolumeSnapshot creates a snapshot of the given volume, using the
+	// given options.
+	CreateVolumeSnapshot(l *logger.Logger, volume Volume, vsco VolumeSnapshotCreateOpts) (VolumeSnapshot, error)
+	// ListVolumeSnapshots lists the individual volume snapshots that satisfy
+	// the search criteria.
+	ListVolumeSnapshots(l *logger.Logger, vslo VolumeSnapshotListOpts) ([]VolumeSnapshot, error)
+	// DeleteVolumeSnapshots permanently deletes the given snapshots.
+	DeleteVolumeSnapshots(l *logger.Logger, snapshot ...VolumeSnapshot) error
 }
 
 // DeleteCluster is an optional capability for a Provider which can
 // destroy an entire cluster in a single operation.
 type DeleteCluster interface {
-	DeleteCluster(name string) error
+	DeleteCluster(l *logger.Logger, name string) error
 }
 
 // Providers contains all known Provider instances. This is initialized by subpackage init() functions.
@@ -377,14 +515,14 @@ var cachedActiveAccounts map[string]string
 
 // FindActiveAccounts queries the active providers for the name of the user
 // account.
-func FindActiveAccounts() (map[string]string, error) {
+func FindActiveAccounts(l *logger.Logger) (map[string]string, error) {
 	source := cachedActiveAccounts
 
 	if source == nil {
 		// Ask each Provider for its active account name.
 		source = map[string]string{}
 		err := ProvidersSequential(AllProviderNames(), func(p Provider) error {
-			account, err := p.FindActiveAccount()
+			account, err := p.FindActiveAccount(l)
 			if err != nil {
 				return err
 			}
@@ -509,4 +647,23 @@ func DNSSafeAccount(account string) string {
 		}
 	}
 	return strings.Map(safe, account)
+}
+
+// SanitizeLabel returns a version of the string that can be used as a label.
+// This takes the lowest common denominator of the label requirements;
+// GCE: "The value can only contain lowercase letters, numeric characters, underscores and dashes.
+// The value can be at most 63 characters long"
+func SanitizeLabel(label string) string {
+	// Replace any non-alphanumeric characters with hyphens
+	re := regexp.MustCompile("[^a-zA-Z0-9]+")
+	label = re.ReplaceAllString(label, "-")
+	label = strings.ToLower(label)
+
+	// Truncate the label to 63 characters (the maximum allowed by GCP)
+	if len(label) > 63 {
+		label = label[:63]
+	}
+	// Remove any leading or trailing hyphens
+	label = strings.Trim(label, "-")
+	return label
 }

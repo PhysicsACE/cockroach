@@ -12,10 +12,17 @@ package state
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"google.golang.org/protobuf/proto"
 )
+
+var SingleRegionClusterOptions = [...]string{"single_region", "single_region_multi_store"}
+var MultiRegionClusterOptions = [...]string{"multi_region", "complex"}
+var AllClusterOptions = [...]string{"single_region", "single_region_multi_store", "multi_region", "complex"}
 
 // TODO(kvoli): Add a loader/translator for the existing
 // []*roachpb.StoreDescriptor configurations in kvserver/*_test.go and
@@ -198,17 +205,41 @@ var MultiRangeConfig = []RangeInfo{
 	},
 }
 
+// GetClusterInfo returns ClusterInfo for a given configName and panics if no
+// match is found in existing configurations.
+func GetClusterInfo(configName string) ClusterInfo {
+	switch configName {
+	case "single_region":
+		return SingleRegionConfig
+	case "single_region_multi_store":
+		return SingleRegionMultiStoreConfig
+	case "multi_region":
+		return MultiRegionConfig
+	case "complex":
+		return ComplexConfig
+	default:
+		panic(fmt.Sprintf("no matching cluster info found for %s", configName))
+	}
+}
+
 // RangeInfoWithReplicas returns a new RangeInfo using the supplied arguments.
 func RangeInfoWithReplicas(
-	startKey Key, replicas []StoreID, leaseholder StoreID, config *roachpb.SpanConfig,
+	startKey Key, voters, nonVoters []StoreID, leaseholder StoreID, config *roachpb.SpanConfig,
 ) RangeInfo {
 	desc := roachpb.RangeDescriptor{
 		StartKey:         startKey.ToRKey(),
-		InternalReplicas: make([]roachpb.ReplicaDescriptor, len(replicas)),
+		InternalReplicas: make([]roachpb.ReplicaDescriptor, len(voters)+len(nonVoters)),
 	}
-	for i, storeID := range replicas {
+	for i, storeID := range voters {
 		desc.InternalReplicas[i] = roachpb.ReplicaDescriptor{
 			StoreID: roachpb.StoreID(storeID),
+			Type:    roachpb.VOTER_FULL,
+		}
+	}
+	for i, storeID := range nonVoters {
+		desc.InternalReplicas[i+len(voters)] = roachpb.ReplicaDescriptor{
+			StoreID: roachpb.StoreID(storeID),
+			Type:    roachpb.NON_VOTER,
 		}
 	}
 	return RangeInfo{Descriptor: desc, Leaseholder: leaseholder, Config: config}
@@ -235,9 +266,31 @@ type ClusterInfo struct {
 	Regions        []Region
 }
 
+func (c ClusterInfo) String() (s string) {
+	buf := &strings.Builder{}
+	for i, r := range c.Regions {
+		buf.WriteString(fmt.Sprintf("\t\tregion:%s [", r.Name))
+		if len(r.Zones) == 0 {
+			panic(fmt.Sprintf("number of zones within region %s is zero", r.Name))
+		}
+		for j, z := range r.Zones {
+			buf.WriteString(fmt.Sprintf("zone=%s(nodes=%d,stores=%d)", z.Name, z.NodeCount, z.StoresPerNode))
+			if j != len(r.Zones)-1 {
+				buf.WriteString(", ")
+			}
+		}
+		buf.WriteString("]")
+		if i != len(c.Regions)-1 {
+			buf.WriteString("\n")
+		}
+	}
+	return buf.String()
+}
+
 type RangeInfo struct {
 	Descriptor  roachpb.RangeDescriptor
 	Config      *roachpb.SpanConfig
+	Size        int64
 	Leaseholder StoreID
 }
 
@@ -257,22 +310,34 @@ func LoadClusterInfo(c ClusterInfo, settings *config.SimulationSettings) State {
 	s := newState(settings)
 	// A new state has a single range - add the replica load for that range.
 	s.clusterinfo = c
-	// TODO(lidor): load locality info to be used by the allocator. Do we need a
-	// NodeDescriptor and higher level localities? or can we simulate those?
 	for _, r := range c.Regions {
+		regionTier := roachpb.Tier{
+			Key:   "region",
+			Value: r.Name,
+		}
 		for _, z := range r.Zones {
+			zoneTier := roachpb.Tier{
+				Key:   "zone",
+				Value: z.Name,
+			}
+			locality := roachpb.Locality{
+				Tiers: []roachpb.Tier{regionTier, zoneTier},
+			}
 			for i := 0; i < z.NodeCount; i++ {
 				node := s.AddNode()
+				s.SetNodeLocality(node.NodeID(), locality)
 				storesRequired := z.StoresPerNode
 				if storesRequired < 1 {
 					storesRequired = 1
 				}
 				for store := 0; store < storesRequired; store++ {
-					if _, ok := s.AddStore(node.NodeID()); !ok {
+					if newStore, ok := s.AddStore(node.NodeID()); !ok {
 						panic(fmt.Sprintf(
 							"Unable to load config: cannot add store %d",
 							node.NodeID(),
 						))
+					} else {
+						s.SetStoreCapacity(newStore.StoreID(), int64(c.DiskCapacityGB)*1<<30)
 					}
 				}
 			}
@@ -312,7 +377,7 @@ func LoadRangeInfo(s State, rangeInfos ...RangeInfo) {
 			))
 		}
 
-		if !s.SetSpanConfig(rng.RangeID(), *r.Config) {
+		if !s.SetSpanConfigForRange(rng.RangeID(), *r.Config) {
 			panic(fmt.Sprintf(
 				"Unable to load config: cannot set span config for range %s",
 				rng,
@@ -327,8 +392,9 @@ func LoadRangeInfo(s State, rangeInfos ...RangeInfo) {
 	for _, r := range rangeInfos {
 		startKey := ToKey(r.Descriptor.StartKey.AsRawKey())
 		rng := s.RangeFor(startKey)
+		s.SetRangeBytes(rng.RangeID(), r.Size)
 		for _, desc := range r.Descriptor.InternalReplicas {
-			if _, ok := s.AddReplica(rng.RangeID(), StoreID(desc.StoreID)); !ok {
+			if _, ok := s.AddReplica(rng.RangeID(), StoreID(desc.StoreID), desc.Type); !ok {
 				panic(fmt.Sprintf(
 					"Unable to load config: add replica to store %d failed at "+
 						"for range %s replicas %s",
@@ -343,4 +409,89 @@ func LoadRangeInfo(s State, rangeInfos ...RangeInfo) {
 			}
 		}
 	}
+}
+
+func GetRegionSurvivalConfig(
+	regionOne string, regionTwo string, regionThree string,
+) zonepb.ZoneConfig {
+	zoneConfig := zonepb.DefaultZoneConfig()
+	zoneConfig.NumReplicas = proto.Int32(5)
+	zoneConfig.NumVoters = proto.Int32(5)
+	zoneConfig.LeasePreferences = []zonepb.LeasePreference{
+		{
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne}},
+		},
+	}
+	zoneConfig.Constraints = []zonepb.ConstraintsConjunction{
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+			},
+		},
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionTwo},
+			},
+		},
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionThree},
+			},
+		},
+	}
+	zoneConfig.VoterConstraints = []zonepb.ConstraintsConjunction{
+		{
+			NumReplicas: 2,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+			},
+		},
+	}
+	return zoneConfig
+}
+
+func GetZoneSurvivalConfig(
+	regionOne string, regionTwo string, regionThree string,
+) zonepb.ZoneConfig {
+	zoneConfig := zonepb.DefaultZoneConfig()
+	zoneConfig.NumReplicas = proto.Int32(5)
+	zoneConfig.NumVoters = proto.Int32(3)
+	zoneConfig.LeasePreferences = []zonepb.LeasePreference{{
+		Constraints: []zonepb.Constraint{
+			{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+		},
+	}}
+
+	zoneConfig.Constraints = []zonepb.ConstraintsConjunction{
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+			},
+		},
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionTwo},
+			},
+		},
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionThree},
+			},
+		},
+	}
+
+	zoneConfig.VoterConstraints = []zonepb.ConstraintsConjunction{{
+		Constraints: []zonepb.Constraint{
+			{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+		},
+	},
+	}
+	return zoneConfig
 }

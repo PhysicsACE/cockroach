@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
@@ -36,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -244,7 +246,7 @@ func SetCmdDefaults(cmd *cobra.Command) *cobra.Command {
 
 // numOps keeps a global count of successful operations (if countErrors is
 // false) or of all operations (if countErrors is true).
-var numOps uint64
+var numOps atomic.Uint64
 
 // workerRun is an infinite loop in which the worker continuously attempts to
 // read / write blocks of random data into a table in cockroach DB. The function
@@ -287,7 +289,7 @@ func workerRun(
 			}
 		}
 
-		v := atomic.AddUint64(&numOps, 1)
+		v := numOps.Add(1)
 		if *maxOps > 0 && v >= *maxOps {
 			return
 		}
@@ -414,6 +416,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		*histogramsMaxLatency,
 		gen.Meta().Name,
 	)
+	reg.Registerer().MustRegister(collectors.NewGoCollector())
 	// Expose the prometheus gatherer.
 	go func() {
 		if err := http.ListenAndServe(
@@ -427,9 +430,17 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	var ops workload.QueryLoad
 	prepareStart := timeutil.Now()
 	log.Infof(ctx, "creating load generator...")
-	const prepareTimeout = 90 * time.Minute
-	prepareCtx, cancel := context.WithTimeout(ctx, prepareTimeout)
+	// We set up a timer that cancels this context after prepareTimeout,
+	// but we'll collect the stacks before we do, so that they can be
+	// logged.
+	prepareCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stacksCh := make(chan []byte, 1)
+	const prepareTimeout = 90 * time.Minute
+	defer time.AfterFunc(prepareTimeout, func() {
+		stacksCh <- allstacks.Get()
+		cancel()
+	}).Stop()
 	if prepareErr := func(ctx context.Context) error {
 		retry := retry.StartWithCtx(ctx, retry.Options{})
 		var err error
@@ -451,7 +462,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			// control of --duration, so we're avoiding retrying endlessly.
 			log.Errorf(ctx, "Attempt to create load generator failed. "+
 				"It's been more than %s since we started trying to create the load generator "+
-				"so we're giving up. Last failure: %s", prepareTimeout, err)
+				"so we're giving up. Last failure: %s\nStacks:\n%s", prepareTimeout, err, <-stacksCh)
 		}
 		return err
 	}(prepareCtx); prepareErr != nil {

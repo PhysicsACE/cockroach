@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -297,6 +298,16 @@ func TestTenantAuthRequest(t *testing.T) {
 	makeGetRangeDescriptorsReq := func(span roachpb.Span) *kvpb.GetRangeDescriptorsRequest {
 		return &kvpb.GetRangeDescriptorsRequest{
 			Span: span,
+		}
+	}
+
+	makeTimeseriesQueryReq := func(tenantID roachpb.TenantID) *tspb.TimeSeriesQueryRequest {
+		return &tspb.TimeSeriesQueryRequest{
+			Queries: []tspb.Query{
+				{
+					TenantID: tenantID,
+				},
+			},
 		}
 	}
 
@@ -817,6 +828,20 @@ func TestTenantAuthRequest(t *testing.T) {
 				expErr: `requested key span /Tenant/{10a-20b} not fully contained in tenant keyspace /Tenant/1{0-1}`,
 			},
 		},
+		"/cockroach.ts.tspb.TimeSeries/Query": {
+			{
+				req:    makeTimeseriesQueryReq(tenID),
+				expErr: noError,
+			},
+			{
+				req:    makeTimeseriesQueryReq(roachpb.TenantID{}),
+				expErr: `tsdb query with unspecified tenant not permitted`,
+			},
+			{
+				req:    makeTimeseriesQueryReq(roachpb.MustMakeTenantID(2)),
+				expErr: `tsdb query with invalid tenant not permitted`,
+			},
+		},
 
 		"/cockroach.rpc.Heartbeat/Ping": {
 			{req: &rpc.PingRequest{}, expErr: noError},
@@ -830,7 +855,7 @@ func TestTenantAuthRequest(t *testing.T) {
 			for _, tc := range tests {
 				t.Run("", func(t *testing.T) {
 					err := rpc.TestingAuthorizeTenantRequest(
-						ctx, &settings.Values{}, tenID, method, tc.req, tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+						ctx, &settings.Values{}, tenID, method, tc.req, tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 					)
 					if tc.expErr == noError {
 						require.NoError(t, err)
@@ -845,10 +870,56 @@ func TestTenantAuthRequest(t *testing.T) {
 	}
 }
 
+// TestSpecialTenantID ensures that tenant ID with special encodings
+// are handled properly by authz code.
+func TestSpecialTenantID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// specialTenantID can be set to any integer value such that the KV
+	// encoding of the PrefixEnd of the value, is different from the encoding
+	// of the value + 1.
+	// We know this is true of at least 109 and 511.
+	const specialTenantIDVal = 511
+
+	// First verify the special property.
+	keyStart := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(specialTenantIDVal))
+	keyEnd := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(specialTenantIDVal + 1))
+	require.NotEqual(t, keyEnd, keyStart.PrefixEnd()) // these two would otherwise be equal for non-special tenant IDs.
+
+	// Now check that all the virtual keyspace is properly authorized
+	// by the authz code for various special tenant IDs.
+	for _, tenIDval := range []uint64{1, 10, specialTenantIDVal, roachpb.MaxTenantID.ToUint64()} {
+		t.Run(fmt.Sprint(tenIDval), func(t *testing.T) {
+			tenID := roachpb.MustMakeTenantID(tenIDval)
+			tenantKeyspace := keys.MakeTenantSpan(tenID)
+
+			req := &kvpb.BatchRequest{Requests: makeReqs(
+				&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeaderFromSpan(tenantKeyspace)})}
+			ctx := context.Background()
+			err := rpc.TestingAuthorizeTenantRequest(
+				ctx, &settings.Values{},
+				tenID, "/cockroach.roachpb.Internal/Batch", req,
+				tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
+			)
+			require.NoError(t, err)
+		})
+	}
+}
+
 // TestTenantAuthCapabilityChecks ensures capability checks are performed
 // correctly by the tenant authorizer.
 func TestTenantAuthCapabilityChecks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	makeTimeseriesQueryReq := func(tenantID roachpb.TenantID) *tspb.TimeSeriesQueryRequest {
+		return &tspb.TimeSeriesQueryRequest{
+			Queries: []tspb.Query{
+				{
+					TenantID: tenantID,
+				},
+			},
+		}
+	}
 
 	tenID := roachpb.MustMakeTenantID(10)
 	for method, tests := range map[string][]struct {
@@ -876,6 +947,22 @@ func TestTenantAuthCapabilityChecks(t *testing.T) {
 				expErr: "tenant does not have capability",
 			},
 		},
+		"/cockroach.ts.tspb.TimeSeries/Query": {
+			{
+				req: makeTimeseriesQueryReq(tenID),
+				configureAuthorizer: func(authorizer *mockAuthorizer) {
+					authorizer.hasTSDBQueryCapability = true
+				},
+				expErr: "",
+			},
+			{
+				req: makeTimeseriesQueryReq(tenID),
+				configureAuthorizer: func(authorizer *mockAuthorizer) {
+					authorizer.hasTSDBQueryCapability = false
+				},
+				expErr: "tenant does not have capability",
+			},
+		},
 	} {
 		ctx := context.Background()
 		for _, tc := range tests {
@@ -896,9 +983,17 @@ func TestTenantAuthCapabilityChecks(t *testing.T) {
 }
 
 type mockAuthorizer struct {
-	hasCapabilityForBatch   bool
-	hasNodestatusCapability bool
-	hasTSDBQueryCapability  bool
+	hasCapabilityForBatch              bool
+	hasNodestatusCapability            bool
+	hasTSDBQueryCapability             bool
+	hasNodelocalStorageCapability      bool
+	hasExemptFromRateLimiterCapability bool
+}
+
+func (m mockAuthorizer) HasProcessDebugCapability(
+	ctx context.Context, tenID roachpb.TenantID,
+) error {
+	return errors.New("tenant does not have capability")
 }
 
 var _ tenantcapabilities.Authorizer = &mockAuthorizer{}
@@ -930,4 +1025,17 @@ func (m mockAuthorizer) HasTSDBQueryCapability(ctx context.Context, tenID roachp
 		return nil
 	}
 	return errors.New("tenant does not have capability")
+}
+
+func (m mockAuthorizer) HasNodelocalStorageCapability(
+	ctx context.Context, tenID roachpb.TenantID,
+) error {
+	if m.hasNodelocalStorageCapability {
+		return nil
+	}
+	return errors.New("tenant does not have capability")
+}
+
+func (m mockAuthorizer) IsExemptFromRateLimiting(context.Context, roachpb.TenantID) bool {
+	return m.hasExemptFromRateLimiterCapability
 }

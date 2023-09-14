@@ -8,13 +8,13 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 import { InlineAlert } from "@cockroachlabs/ui-components";
-import moment from "moment";
+import moment from "moment-timezone";
 import React, { useEffect } from "react";
 import { Helmet } from "react-helmet";
 import { RouteComponentProps } from "react-router-dom";
 import { Schedules } from "src/api/schedulesApi";
 import { Delayed } from "src/delayed";
-import { Dropdown, DropdownOption } from "src/dropdown";
+import { Dropdown } from "src/dropdown";
 import { Loading } from "src/loading";
 import { PageConfig, PageConfigItem } from "src/pageConfig";
 import { SortSetting } from "src/sortedtable";

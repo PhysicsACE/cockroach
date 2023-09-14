@@ -1,8 +1,8 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "opttester",
+    testonly = 1,
     srcs = [
         "explore_trace.go",
         "forcing_opt.go",
@@ -83,5 +83,3 @@ filegroup(
     srcs = glob(["testfixtures/**"]),
     visibility = ["//pkg/sql/opt:__subpackages__"],
 )
-
-get_x_data(name = "get_x_data")

@@ -133,6 +133,7 @@ type OptTester struct {
 	appliedRules RuleSet
 
 	builder strings.Builder
+	f       *norm.Factory
 }
 
 // Flags are control knobs for tests. Note that specific testcases can
@@ -270,6 +271,8 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 		semaCtx: tree.MakeSemaContext(),
 		evalCtx: eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
+	ot.f = &norm.Factory{}
+	ot.f.Init(ot.ctx, &ot.evalCtx, ot.catalog)
 	ot.evalCtx.SessionData().ReorderJoinsLimit = opt.DefaultJoinOrderLimit
 	ot.evalCtx.SessionData().OptimizerUseMultiColStats = true
 	ot.Flags.ctx = ot.ctx
@@ -295,6 +298,10 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
 	ot.evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
 	ot.evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = true
+	ot.evalCtx.SessionData().OptimizerAlwaysUseHistograms = true
+	ot.evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries = true
+	ot.evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = true
+	ot.evalCtx.SessionData().OptimizerUseImprovedJoinElimination = true
 
 	return ot
 }
@@ -549,6 +556,10 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //     build set=prefer_lookup_joins_for_fks=true
 //     DELETE FROM parent WHERE p = 3
 //     ----
+//
+//   - statement-bundle file=<path>
+//     Load the schema and stats from a statement bundle, file can be either a
+//     full path or a relative path to testdata.
 func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	// Allow testcases to override the flags.
 	for _, a := range d.CmdArgs {
@@ -809,6 +820,12 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		}
 		return result
 
+	case "statement-bundle":
+		if err := ot.StatementBundle(tb); err != nil {
+			d.Fatalf(tb, "%+v", err)
+		}
+		return ""
+
 	default:
 		d.Fatalf(tb, "unsupported command: %s", d.Cmd)
 		return ""
@@ -821,7 +838,9 @@ func (ot *OptTester) FormatExpr(e opt.Expr) string {
 	if rel, ok := e.(memo.RelExpr); ok {
 		mem = rel.Memo()
 	}
-	return memo.FormatExpr(ot.ctx, e, ot.Flags.ExprFormat, mem, ot.catalog)
+	return memo.FormatExpr(
+		ot.ctx, e, ot.Flags.ExprFormat, false /* redactableValues */, mem, ot.catalog,
+	)
 }
 
 func formatRuleSet(r RuleSet) string {
@@ -851,7 +870,7 @@ func (ot *OptTester) checkExpectedRules(tb testing.TB, d *datadriven.TestData) {
 }
 
 func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Expr) {
-	fillInLazyProps(e)
+	ot.fillInLazyProps(e)
 
 	if rel, ok := e.(memo.RelExpr); ok {
 		for _, cols := range ot.Flags.ColStats {
@@ -862,13 +881,13 @@ func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Ex
 }
 
 // Fills in lazily-derived properties (for display).
-func fillInLazyProps(e opt.Expr) {
+func (ot *OptTester) fillInLazyProps(e opt.Expr) {
 	if rel, ok := e.(memo.RelExpr); ok {
 		// These properties are derived from the normalized expression.
 		rel = rel.FirstExpr()
 
 		// Derive columns that are candidates for pruning.
-		norm.DerivePruneCols(rel, intsets.Fast{} /* disabledRules */)
+		ot.f.CustomFuncs().DerivePruneCols(rel, intsets.Fast{} /* disabledRules */)
 
 		// Derive columns that are candidates for null rejection.
 		norm.DeriveRejectNullCols(rel, intsets.Fast{} /* disabledRules */)
@@ -878,7 +897,7 @@ func fillInLazyProps(e opt.Expr) {
 	}
 
 	for i, n := 0, e.ChildCount(); i < n; i++ {
-		fillInLazyProps(e.Child(i))
+		ot.fillInLazyProps(e.Child(i))
 	}
 }
 
@@ -1273,13 +1292,14 @@ func (ot *OptTester) Memo() (string, error) {
 	if _, err := ot.optimizeExpr(o, nil); err != nil {
 		return "", err
 	}
-	return o.FormatMemo(ot.Flags.MemoFormat), nil
+	return o.FormatMemo(ot.Flags.MemoFormat, false /* redactableValues */), nil
 }
 
 // Expr parses the input directly into an expression; see exprgen.Build.
 func (ot *OptTester) Expr() (opt.Expr, error) {
 	var f norm.Factory
 	f.Init(ot.ctx, &ot.evalCtx, ot.catalog)
+	ot.f = &f
 	f.DisableOptimizations()
 
 	return exprgen.Build(ot.ctx, ot.catalog, &f, ot.sql)
@@ -1290,6 +1310,7 @@ func (ot *OptTester) Expr() (opt.Expr, error) {
 func (ot *OptTester) ExprNorm() (opt.Expr, error) {
 	var f norm.Factory
 	f.Init(ot.ctx, &ot.evalCtx, ot.catalog)
+	ot.f = &f
 	f.SetDisabledRules(ot.Flags.DisableRules)
 
 	if !ot.Flags.NoStableFolds {
@@ -1463,7 +1484,7 @@ func (ot *OptTester) OptSteps() (string, error) {
 			return "", err
 		}
 
-		next = os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat)
+		next = os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat, false /* redactableValues */)
 
 		// This call comes after setting "next", because we want to output the
 		// final expression, even though there were no diffs from the previous
@@ -1534,7 +1555,7 @@ func (ot *OptTester) optStepsNormDiff() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		expr := os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat)
+		expr := os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat, false /* redactableValues */)
 		name := "Initial"
 		if len(normSteps) > 0 {
 			rule := os.LastRuleName()
@@ -1599,11 +1620,14 @@ func (ot *OptTester) optStepsExploreDiff() (string, error) {
 			continue
 		}
 		newNodes := et.NewExprs()
-		before := et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat)
+		before := et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, false /* redactableValues */)
 
 		for i := range newNodes {
 			name := et.LastRuleName().String()
-			after := memo.FormatExpr(ot.ctx, newNodes[i], ot.Flags.ExprFormat, et.fo.o.Memo(), ot.catalog)
+			after := memo.FormatExpr(
+				ot.ctx, newNodes[i], ot.Flags.ExprFormat, false /* redactableValues */, et.fo.o.Memo(),
+				ot.catalog,
+			)
 
 			diff := difflib.UnifiedDiff{
 				A:        difflib.SplitLines(before),
@@ -1793,13 +1817,16 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 		ot.output("%s\n", et.LastRuleName())
 		ot.separator("=")
 		ot.output("Source expression:\n")
-		ot.indent(et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat))
+		ot.indent(et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, false /* redactableValues */))
 		if len(newNodes) == 0 {
 			ot.output("\nNo new expressions.\n")
 		}
 		for i := range newNodes {
 			ot.output("\nNew expression %d of %d:\n", i+1, len(newNodes))
-			ot.indent(memo.FormatExpr(ot.ctx, newNodes[i], ot.Flags.ExprFormat, et.fo.o.Memo(), ot.catalog))
+			ot.indent(memo.FormatExpr(
+				ot.ctx, newNodes[i], ot.Flags.ExprFormat, false /* redactableValues */, et.fo.o.Memo(),
+				ot.catalog,
+			))
 		}
 	}
 	return ot.builder.String(), nil
@@ -2236,6 +2263,7 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 func (ot *OptTester) makeOptimizer() *xform.Optimizer {
 	var o xform.Optimizer
 	o.Init(ot.ctx, &ot.evalCtx, ot.catalog)
+	ot.f = o.Factory()
 	o.Factory().SetDisabledRules(ot.Flags.DisableRules)
 	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
 		// Exploration rules are marked as "applied" if they generate one or
@@ -2263,8 +2291,8 @@ func (ot *OptTester) optimizeExpr(
 	if err != nil {
 		return nil, err
 	}
+	o.Memo().ResetLogProps(ot.ctx, &ot.evalCtx)
 	if ot.Flags.PerturbCost != 0 {
-		o.Memo().ResetLogProps(ot.ctx, &ot.evalCtx)
 		o.RecomputeCost()
 	}
 	return root, nil
@@ -2316,4 +2344,52 @@ func (ot *OptTester) ExecBuild(f exec.Factory, mem *memo.Memo, expr opt.Expr) (e
 		false, /* isANSIDML */
 	)
 	return bld.Build()
+}
+
+func (ot *OptTester) StatementBundle(tb testing.TB) error {
+	if ot.Flags.File == "" {
+		return errors.New("statement-bundle requires file argument")
+	}
+	dir := ot.Flags.File
+	f, err := os.Open(dir)
+	if err != nil {
+		// try relative path
+		dir = datapathutils.TestDataPath(tb, dir)
+		var err2 error
+		f, err2 = os.Open(dir)
+		if err2 != nil {
+			return errors.CombineErrors(err, err2)
+		}
+	}
+	s, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	// TODO(cucaroach): support direct from zip
+	if !s.IsDir() {
+		return errors.New("statement-bundle argument must be a directory")
+	}
+	schema, err := os.ReadFile(filepath.Join(dir, "schema.sql"))
+	if err != nil {
+		return err
+	}
+	testCatalog := ot.catalog.(*testcat.Catalog)
+	if err := testCatalog.ExecuteMultipleDDL(string(schema)); err != nil {
+		return err
+	}
+	pat := filepath.Join(dir, "stats-*.sql")
+	files, err := filepath.Glob(pat)
+	if err != nil {
+		return err
+	}
+	for _, sf := range files {
+		stats, err := os.ReadFile(sf)
+		if err != nil {
+			return err
+		}
+		if err := testCatalog.ExecuteMultipleDDL(string(stats)); err != nil {
+			return err
+		}
+	}
+	return nil
 }

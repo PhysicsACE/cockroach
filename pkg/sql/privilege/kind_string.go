@@ -36,16 +36,89 @@ func _() {
 	_ = x[CHANGEFEED-26]
 	_ = x[VIEWJOB-27]
 	_ = x[MODIFYSQLCLUSTERSETTING-28]
+	_ = x[REPLICATION-29]
+	_ = x[MANAGETENANT-30]
+	_ = x[VIEWSYSTEMTABLE-31]
+	_ = x[CREATEROLE-32]
+	_ = x[CREATELOGIN-33]
+	_ = x[CREATEDB-34]
+	_ = x[CONTROLJOB-35]
+	_ = x[largestKind-35]
 }
 
-const _Kind_name = "ALLCREATEDROPGRANTSELECTINSERTDELETEUPDATEUSAGEZONECONFIGCONNECTRULEMODIFYCLUSTERSETTINGEXTERNALCONNECTIONVIEWACTIVITYVIEWACTIVITYREDACTEDVIEWCLUSTERSETTINGCANCELQUERYNOSQLLOGINEXECUTEVIEWCLUSTERMETADATAVIEWDEBUGBACKUPRESTOREEXTERNALIOIMPLICITACCESSCHANGEFEEDVIEWJOBMODIFYSQLCLUSTERSETTING"
-
-var _Kind_index = [...]uint16{0, 3, 9, 13, 18, 24, 30, 36, 42, 47, 57, 64, 68, 88, 106, 118, 138, 156, 167, 177, 184, 203, 212, 218, 225, 249, 259, 266, 289}
-
 func (i Kind) String() string {
-	i -= 1
-	if i >= Kind(len(_Kind_index)-1) {
-		return "Kind(" + strconv.FormatInt(int64(i+1), 10) + ")"
+	switch i {
+	case ALL:
+		return "ALL"
+	case CREATE:
+		return "CREATE"
+	case DROP:
+		return "DROP"
+	case DEPRECATEDGRANT:
+		return "GRANT"
+	case SELECT:
+		return "SELECT"
+	case INSERT:
+		return "INSERT"
+	case DELETE:
+		return "DELETE"
+	case UPDATE:
+		return "UPDATE"
+	case USAGE:
+		return "USAGE"
+	case ZONECONFIG:
+		return "ZONECONFIG"
+	case CONNECT:
+		return "CONNECT"
+	case RULE:
+		return "RULE"
+	case MODIFYCLUSTERSETTING:
+		return "MODIFYCLUSTERSETTING"
+	case EXTERNALCONNECTION:
+		return "EXTERNALCONNECTION"
+	case VIEWACTIVITY:
+		return "VIEWACTIVITY"
+	case VIEWACTIVITYREDACTED:
+		return "VIEWACTIVITYREDACTED"
+	case VIEWCLUSTERSETTING:
+		return "VIEWCLUSTERSETTING"
+	case CANCELQUERY:
+		return "CANCELQUERY"
+	case NOSQLLOGIN:
+		return "NOSQLLOGIN"
+	case EXECUTE:
+		return "EXECUTE"
+	case VIEWCLUSTERMETADATA:
+		return "VIEWCLUSTERMETADATA"
+	case VIEWDEBUG:
+		return "VIEWDEBUG"
+	case BACKUP:
+		return "BACKUP"
+	case RESTORE:
+		return "RESTORE"
+	case EXTERNALIOIMPLICITACCESS:
+		return "EXTERNALIOIMPLICITACCESS"
+	case CHANGEFEED:
+		return "CHANGEFEED"
+	case VIEWJOB:
+		return "VIEWJOB"
+	case MODIFYSQLCLUSTERSETTING:
+		return "MODIFYSQLCLUSTERSETTING"
+	case REPLICATION:
+		return "REPLICATION"
+	case MANAGETENANT:
+		return "MANAGETENANT"
+	case VIEWSYSTEMTABLE:
+		return "VIEWSYSTEMTABLE"
+	case CREATEROLE:
+		return "CREATEROLE"
+	case CREATELOGIN:
+		return "CREATELOGIN"
+	case CREATEDB:
+		return "CREATEDB"
+	case CONTROLJOB:
+		return "CONTROLJOB"
+	default:
+		return "Kind(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _Kind_name[_Kind_index[i]:_Kind_index[i+1]]
 }

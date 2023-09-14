@@ -11,9 +11,9 @@
 package tabledesc
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -195,25 +195,6 @@ func (desc *wrapper) ValidateForwardReferences(
 	for _, col := range desc.Columns {
 		for _, fnID := range col.UsesFunctionIds {
 			vea.Report(desc.validateOutboundFuncRef(fnID, vdg))
-		}
-	}
-
-	// Row-level TTL is not compatible with foreign keys.
-	// This check should be in ValidateSelf but interferes with AllocateIDs.
-	if desc.HasRowLevelTTL() {
-		if len(desc.OutboundForeignKeys()) > 0 {
-			vea.Report(unimplemented.NewWithIssuef(
-				76407,
-				`foreign keys from table with TTL %q are not permitted`,
-				desc.GetName(),
-			))
-		}
-		if len(desc.InboundForeignKeys()) > 0 {
-			vea.Report(unimplemented.NewWithIssuef(
-				76407,
-				`foreign keys to table with TTL %q are not permitted`,
-				desc.GetName(),
-			))
 		}
 	}
 
@@ -881,7 +862,7 @@ func (desc *wrapper) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	// ValidateRowLevelTTL is also used before the table descriptor is fully
 	// initialized to validate the storage parameters.
 	vea.Report(ValidateTTLExpirationExpr(desc))
-	vea.Report(ValidateTTLExpirationColumn(desc))
+	vea.Report(ValidateTTLExpirationColumn(desc, vea.IsActive(clusterversion.V23_2TTLAllowDescPK)))
 
 	// Validate that there are no column with both a foreign key ON UPDATE and an
 	// ON UPDATE expression. This check is made to ensure that we know which ON
@@ -1316,6 +1297,10 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 			return errors.Newf("index is interleaved")
 		}
 
+		if (idx.GetInvisibility() == 0.0 && idx.IsNotVisible()) || (idx.GetInvisibility() != 0.0 && !idx.IsNotVisible()) {
+			return errors.Newf("invisibility is incompatible with value for not_visible")
+		}
+
 		if _, indexNameExists := indexNames[idx.GetName()]; indexNameExists {
 			for i := range desc.Indexes {
 				if desc.Indexes[i].Name == idx.GetName() {
@@ -1518,8 +1503,37 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 				return errors.AssertionFailedf("primary index %q has invalid encoding type %d in proto, expected %d",
 					idx.GetName(), idx.IndexDesc().EncodingType, catenumpb.PrimaryIndexEncoding)
 			}
-			if idx.IsNotVisible() {
+			if idx.GetInvisibility() != 0.0 {
 				return errors.Newf("primary index %q cannot be not visible", idx.GetName())
+			}
+
+			// Check that each non-virtual column is in the key or store columns of
+			// the primary index.
+			keyCols := idx.CollectKeyColumnIDs()
+			storeCols := idx.CollectPrimaryStoredColumnIDs()
+			for _, col := range desc.PublicColumns() {
+				if col.IsVirtual() {
+					if storeCols.Contains(col.GetID()) {
+						return errors.Newf(
+							"primary index %q store columns cannot contain virtual column ID %d",
+							idx.GetName(), col.GetID(),
+						)
+					}
+					// No need to check anything else for virtual columns.
+					continue
+				}
+				if !keyCols.Contains(col.GetID()) && !storeCols.Contains(col.GetID()) {
+					return errors.Newf(
+						"primary index %q must contain column ID %d in either key or store columns",
+						idx.GetName(), col.GetID(),
+					)
+				}
+			}
+		}
+		if !idx.Primary() && len(desc.Mutations) == 0 && desc.DeclarativeSchemaChangerState == nil {
+			if idx.IndexDesc().EncodingType != catenumpb.SecondaryIndexEncoding {
+				return errors.AssertionFailedf("secondary index %q has invalid encoding type %d in proto, expected %d",
+					idx.GetName(), idx.IndexDesc().EncodingType, catenumpb.SecondaryIndexEncoding)
 			}
 		}
 		// Ensure that index column ID subsets are well formed.
@@ -1806,8 +1820,8 @@ func (desc *wrapper) validateMinStaleRows(vea catalog.ValidationErrorAccumulator
 	if value != nil {
 		settingName := catpb.AutoStatsMinStaleTableSettingName
 		desc.verifyProperTableForStatsSetting(vea, settingName)
-		if err := settings.NonNegativeInt(*value); err != nil {
-			vea.Report(errors.Wrapf(err, "invalid integer value for %s", settingName))
+		if *value < 0 {
+			vea.Report(errors.Newf("invalid integer value for %s: cannot be set to a negative value: %d", settingName, *value))
 		}
 	}
 }
@@ -1818,8 +1832,8 @@ func (desc *wrapper) validateFractionStaleRows(
 	if value != nil {
 		settingName := catpb.AutoStatsFractionStaleTableSettingName
 		desc.verifyProperTableForStatsSetting(vea, settingName)
-		if err := settings.NonNegativeFloat(*value); err != nil {
-			vea.Report(errors.Wrapf(err, "invalid float value for %s", settingName))
+		if *value < 0 {
+			vea.Report(errors.Newf("invalid float value for %s: cannot set to a negative value: %f", settingName, *value))
 		}
 	}
 }

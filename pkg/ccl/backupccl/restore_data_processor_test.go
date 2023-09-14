@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuputils"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // register cloud storage providers
@@ -46,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/pebble/sstable"
@@ -115,7 +117,8 @@ func slurpSSTablesLatestKey(
 	}
 
 	var kvs []storage.MVCCKeyValue
-	it := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+	it, err := batch.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+	require.NoError(t, err)
 	defer it.Close()
 	for it.SeekGE(start); ; it.NextKey() {
 		if ok, err := it.Valid(); err != nil {
@@ -127,7 +130,7 @@ func slurpSSTablesLatestKey(
 		if err != nil {
 			t.Fatal(err)
 		}
-		kvs = append(kvs, storage.MVCCKeyValue{Key: it.Key(), Value: val.Value.RawBytes})
+		kvs = append(kvs, storage.MVCCKeyValue{Key: it.UnsafeKey().Clone(), Value: val.Value.RawBytes})
 	}
 	return kvs
 }
@@ -149,6 +152,7 @@ func clientKVsToEngineKVs(kvs []kv.KeyValue) []storage.MVCCKeyValue {
 
 func TestIngest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	ctx := context.Background()
 	t.Run("batch=default", func(t *testing.T) {
 		runTestIngest(t, func(_ *cluster.Settings) {})
@@ -165,6 +169,7 @@ func TestIngest(t *testing.T) {
 
 func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
@@ -236,6 +241,8 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 	}}
 
 	args := base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(107812),
+
 		Knobs:         knobs,
 		ExternalIODir: dir,
 		Settings:      cs,
@@ -245,8 +252,11 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 	// (which breaks the global-seqno rewrite used when the added sstable
 	// overlaps with existing data in the RocksDB instance). #16345.
 	args.StoreSpecs = []base.StoreSpec{{InMemory: false, Path: filepath.Join(dir, "testserver")}}
-	s, _, kvDB := serverutils.StartServer(t, args)
-	defer s.Stopper().Stop(ctx)
+	srv, _, kvDB := serverutils.StartServer(t, args)
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+
 	init(s.ClusterSettings())
 
 	evalCtx := eval.Context{Settings: s.ClusterSettings(), Tracer: s.AmbientCtx().Tracer}
@@ -262,17 +272,17 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 					opts...)
 			},
 			Settings:          s.ClusterSettings(),
-			Codec:             keys.SystemSQLCodec,
+			Codec:             s.Codec(),
 			BackupMonitor:     mon.NewUnlimitedMonitor(ctx, "test", mon.MemoryResource, nil, nil, 0, s.ClusterSettings()),
 			BulkSenderLimiter: limit.MakeConcurrentRequestLimiter("test", math.MaxInt),
 		},
 		EvalCtx: &eval.Context{
-			Codec:    keys.SystemSQLCodec,
+			Codec:    s.Codec(),
 			Settings: s.ClusterSettings(),
 		},
 	}
 
-	storage, err := cloud.ExternalStorageConfFromURI("nodelocal://0/foo", username.RootUserName())
+	storage, err := cloud.ExternalStorageConfFromURI("nodelocal://1/foo", username.RootUserName())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -392,12 +402,11 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 			}
 			expectedKVs := slurpSSTablesLatestKey(t, filepath.Join(dir, "foo"), slurp, srcPrefix, newPrefix)
 
-			mockRestoreDataProcessor, err := newTestingRestoreDataProcessor(&evalCtx, &flowCtx, mockRestoreDataSpec)
+			mockRestoreDataProcessor, err := newTestingRestoreDataProcessor(ctx, &evalCtx, &flowCtx, mockRestoreDataSpec)
 			require.NoError(t, err)
-			ssts := make(chan mergedSST, 1)
-			require.NoError(t, mockRestoreDataProcessor.openSSTs(ctx, restoreSpanEntry, ssts))
-			close(ssts)
-			sst := <-ssts
+			sst, res, err := mockRestoreDataProcessor.openSSTs(ctx, restoreSpanEntry, nil)
+			require.NoError(t, err)
+			require.Equal(t, resumeEntry{done: true, idx: len(restoreSpanEntry.Files)}, *res)
 			rewriter, err := MakeKeyRewriterFromRekeys(flowCtx.Codec(), mockRestoreDataSpec.TableRekeys,
 				mockRestoreDataSpec.TenantRekeys, false /* restoreTenantFromStream */)
 			require.NoError(t, err)
@@ -435,7 +444,10 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 }
 
 func newTestingRestoreDataProcessor(
-	evalCtx *eval.Context, flowCtx *execinfra.FlowCtx, spec execinfrapb.RestoreDataSpec,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	flowCtx *execinfra.FlowCtx,
+	spec execinfrapb.RestoreDataSpec,
 ) (*restoreDataProcessor, error) {
 	rd := &restoreDataProcessor{
 		ProcessorBase: execinfra.ProcessorBase{
@@ -445,6 +457,7 @@ func newTestingRestoreDataProcessor(
 		},
 		flowCtx: flowCtx,
 		spec:    spec,
+		qp:      backuputils.NewMemoryBackedQuotaPool(ctx, nil, "restore-mon", 0),
 	}
 	return rd, nil
 }

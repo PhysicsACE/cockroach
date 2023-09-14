@@ -1,5 +1,4 @@
-# disabled for tenants as they can't set storage.mvcc.range_tombstones.enabled
-new-cluster name=s1 nodes=1 disable-tenant
+new-cluster name=s1 nodes=1
 ----
 
 subtest restore-retry
@@ -17,11 +16,7 @@ exec-sql
 BACKUP INTO 'nodelocal://1/cluster_backup';
 ----
 
-new-cluster name=s2 nodes=1 share-io-dir=s1 disable-tenant
-----
-
-exec-sql
-SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true;
+new-cluster name=s2 nodes=1 share-io-dir=s1
 ----
 
 exec-sql
@@ -41,7 +36,7 @@ SET CLUSTER SETTING jobs.debug.pausepoints = 'restore.after_publishing_descripto
 ----
 
 restore expect-pausepoint tag=a
-RESTORE FROM LATEST IN 'nodelocal://0/cluster_backup';
+RESTORE FROM LATEST IN 'nodelocal://1/cluster_backup';
 ----
 job paused at pausepoint
 
@@ -59,7 +54,7 @@ sleep ms=2000
 ----
 
 restore
-RESTORE FROM LATEST IN 'nodelocal://0/cluster_backup';
+RESTORE FROM LATEST IN 'nodelocal://1/cluster_backup';
 ----
 
 subtest end

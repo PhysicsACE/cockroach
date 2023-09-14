@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"strings"
@@ -44,6 +45,7 @@ func TestPutGoogleCloud(t *testing.T) {
 
 	user := username.RootUserName()
 	testSettings := cluster.MakeTestingClusterSettings()
+	testID := cloudtestutils.NewTestID()
 
 	testutils.RunTrueAndFalse(t, "auth-specified-with-auth-param", func(t *testing.T, specified bool) {
 		credentials := os.Getenv("GOOGLE_CREDENTIALS_JSON")
@@ -51,9 +53,10 @@ func TestPutGoogleCloud(t *testing.T) {
 			skip.IgnoreLint(t, "GOOGLE_CREDENTIALS_JSON env var must be set")
 		}
 		encoded := base64.StdEncoding.EncodeToString([]byte(credentials))
-		uri := fmt.Sprintf("gs://%s/%s?%s=%s",
+		uri := fmt.Sprintf("gs://%s/%s-%d?%s=%s",
 			bucket,
 			"backup-test-specified",
+			testID,
 			CredentialsParam,
 			url.QueryEscape(encoded),
 		)
@@ -68,9 +71,10 @@ func TestPutGoogleCloud(t *testing.T) {
 			nil, /* db */
 			testSettings,
 		)
-		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s/%s?%s=%s&%s=%s",
+		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s-%d/%s?%s=%s&%s=%s",
 			bucket,
 			"backup-test-specified",
+			testID,
 			"listing-test",
 			cloud.AuthParam,
 			cloud.AuthParamSpecified,
@@ -88,15 +92,16 @@ func TestPutGoogleCloud(t *testing.T) {
 
 		cloudtestutils.CheckExportStore(
 			t,
-			fmt.Sprintf("gs://%s/%s?%s=%s", bucket, "backup-test-implicit",
+			fmt.Sprintf("gs://%s/%s-%d?%s=%s", bucket, "backup-test-implicit", testID,
 				cloud.AuthParam, cloud.AuthParamImplicit),
 			false,
 			user,
 			nil, /* db */
 			testSettings)
-		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s/%s?%s=%s",
+		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s-%d/%s?%s=%s",
 			bucket,
 			"backup-test-implicit",
+			testID,
 			"listing-test",
 			cloud.AuthParam,
 			cloud.AuthParamImplicit,
@@ -120,9 +125,10 @@ func TestPutGoogleCloud(t *testing.T) {
 		token, err := ts.Token()
 		require.NoError(t, err, "getting token")
 
-		uri := fmt.Sprintf("gs://%s/%s?%s=%s",
+		uri := fmt.Sprintf("gs://%s/%s-%d?%s=%s",
 			bucket,
 			"backup-test-specified",
+			testID,
 			BearerTokenParam,
 			token.AccessToken,
 		)
@@ -134,9 +140,10 @@ func TestPutGoogleCloud(t *testing.T) {
 			user,
 			nil, /* db */
 			testSettings)
-		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s/%s?%s=%s&%s=%s",
+		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s-%d/%s?%s=%s&%s=%s",
 			bucket,
 			"backup-test-specified",
+			testID,
 			"listing-test",
 			cloud.AuthParam,
 			cloud.AuthParamSpecified,
@@ -162,6 +169,8 @@ func TestGCSAssumeRole(t *testing.T) {
 		skip.IgnoreLint(t, "ASSUME_SERVICE_ACCOUNT env var must be set")
 	}
 
+	testID := cloudtestutils.NewTestID()
+
 	t.Run("specified", func(t *testing.T) {
 		credentials := os.Getenv("GOOGLE_CREDENTIALS_JSON")
 		if credentials == "" {
@@ -171,7 +180,7 @@ func TestGCSAssumeRole(t *testing.T) {
 
 		// Verify that specified permissions with the credentials do not give us
 		// access to the bucket.
-		cloudtestutils.CheckNoPermission(t, fmt.Sprintf("gs://%s/%s?%s=%s", limitedBucket, "backup-test-assume-role",
+		cloudtestutils.CheckNoPermission(t, fmt.Sprintf("gs://%s/%s-%d?%s=%s", limitedBucket, "backup-test-assume-role", testID,
 			CredentialsParam, url.QueryEscape(encoded)), user,
 			nil, /* db */
 			testSettings,
@@ -179,9 +188,10 @@ func TestGCSAssumeRole(t *testing.T) {
 
 		cloudtestutils.CheckExportStore(
 			t,
-			fmt.Sprintf("gs://%s/%s?%s=%s&%s=%s&%s=%s",
+			fmt.Sprintf("gs://%s/%s-%d?%s=%s&%s=%s&%s=%s",
 				limitedBucket,
 				"backup-test-assume-role",
+				testID,
 				cloud.AuthParam,
 				cloud.AuthParamSpecified,
 				AssumeRoleParam,
@@ -191,9 +201,10 @@ func TestGCSAssumeRole(t *testing.T) {
 			nil, /* db */
 			testSettings,
 		)
-		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s/%s?%s=%s&%s=%s&%s=%s",
+		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s-%d/%s?%s=%s&%s=%s&%s=%s",
 			limitedBucket,
 			"backup-test-assume-role",
+			testID,
 			"listing-test",
 			cloud.AuthParam,
 			cloud.AuthParamSpecified,
@@ -214,20 +225,21 @@ func TestGCSAssumeRole(t *testing.T) {
 
 		// Verify that implicit permissions with the credentials do not give us
 		// access to the bucket.
-		cloudtestutils.CheckNoPermission(t, fmt.Sprintf("gs://%s/%s?%s=%s", limitedBucket, "backup-test-assume-role",
+		cloudtestutils.CheckNoPermission(t, fmt.Sprintf("gs://%s/%s-%d?%s=%s", limitedBucket, "backup-test-assume-role", testID,
 			cloud.AuthParam, cloud.AuthParamImplicit), user,
 			nil, /* db */
 			testSettings,
 		)
 
-		cloudtestutils.CheckExportStore(t, fmt.Sprintf("gs://%s/%s?%s=%s&%s=%s", limitedBucket, "backup-test-assume-role",
+		cloudtestutils.CheckExportStore(t, fmt.Sprintf("gs://%s/%s-%d?%s=%s&%s=%s", limitedBucket, "backup-test-assume-role", testID,
 			cloud.AuthParam, cloud.AuthParamImplicit, AssumeRoleParam, assumedAccount), false, user,
 			nil, /* db */
 			testSettings,
 		)
-		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s/%s?%s=%s&%s=%s",
+		cloudtestutils.CheckListFiles(t, fmt.Sprintf("gs://%s/%s-%d/%s?%s=%s&%s=%s",
 			limitedBucket,
 			"backup-test-assume-role",
+			testID,
 			"listing-test",
 			cloud.AuthParam,
 			cloud.AuthParamImplicit,
@@ -269,9 +281,10 @@ func TestGCSAssumeRole(t *testing.T) {
 				// to access the storage.
 				for _, role := range roleChain {
 					q.Set(AssumeRoleParam, role)
-					roleURI := fmt.Sprintf("gs://%s/%s/%s?%s",
+					roleURI := fmt.Sprintf("gs://%s/%s-%d/%s?%s",
 						limitedBucket,
 						"backup-test-assume-role",
+						testID,
 						"listing-test",
 						q.Encode(),
 					)
@@ -283,9 +296,10 @@ func TestGCSAssumeRole(t *testing.T) {
 
 				// Finally, check that the chain of roles can be used to access the storage.
 				q.Set(AssumeRoleParam, roleChainStr)
-				uri := fmt.Sprintf("gs://%s/%s/%s?%s",
+				uri := fmt.Sprintf("gs://%s/%s-%d/%s?%s",
 					limitedBucket,
 					"backup-test-assume-role",
+					testID,
 					"listing-test",
 					q.Encode(),
 				)
@@ -345,7 +359,7 @@ func TestFileDoesNotExist(t *testing.T) {
 			cloud.NilMetrics,
 		)
 		require.NoError(t, err)
-		_, err = s.ReadFile(context.Background(), "")
+		_, _, err = s.ReadFile(context.Background(), "", cloud.ReadOptions{NoFileSize: true})
 		require.Error(t, err, "")
 		require.True(t, errors.Is(err, cloud.ErrFileDoesNotExist))
 	}
@@ -363,7 +377,7 @@ func TestFileDoesNotExist(t *testing.T) {
 			cloud.NilMetrics,
 		)
 		require.NoError(t, err)
-		_, err = s.ReadFile(context.Background(), "")
+		_, _, err = s.ReadFile(context.Background(), "", cloud.ReadOptions{NoFileSize: true})
 		require.Error(t, err, "")
 		require.True(t, errors.Is(err, cloud.ErrFileDoesNotExist))
 	}
@@ -407,15 +421,83 @@ func TestCompressedGCS(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	reader1, err := s1.ReadFile(context.Background(), "")
+	reader1, _, err := s1.ReadFile(context.Background(), "", cloud.ReadOptions{NoFileSize: true})
 	require.NoError(t, err)
-	reader2, err := s2.ReadFile(context.Background(), "")
+	reader2, _, err := s2.ReadFile(context.Background(), "", cloud.ReadOptions{NoFileSize: true})
 	require.NoError(t, err)
 
 	content1, err := ioctx.ReadAll(ctx, reader1)
 	require.NoError(t, err)
+	require.NoError(t, reader1.Close(context.Background()))
 	content2, err := ioctx.ReadAll(ctx, reader2)
 	require.NoError(t, err)
+	require.NoError(t, reader2.Close(context.Background()))
 
 	require.Equal(t, string(content1), string(content2))
+
+	// Test reading parts of the uncompressed object.
+	for i := 0; i < 10; i++ {
+		ofs := rand.Intn(len(content1) - 1)
+		l := rand.Intn(len(content1) - ofs)
+		reader, _, err := s1.ReadFile(context.Background(), "", cloud.ReadOptions{
+			Offset:     int64(ofs),
+			LengthHint: int64(l),
+			NoFileSize: true,
+		})
+		require.NoError(t, err)
+		content, err := ioctx.ReadAll(ctx, reader)
+		require.NoError(t, err)
+		require.NoError(t, reader.Close(context.Background()))
+		require.Equal(t, len(content), l)
+		require.Equal(t, string(content), string(content1[ofs:ofs+l]))
+	}
+}
+
+// TestReadFileAtReturnsSize tests that ReadFileAt returns
+// a cloud.ResumingReader that contains the size of the file.
+func TestReadFileAtReturnsSize(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	if !cloudtestutils.IsImplicitAuthConfigured() {
+		skip.IgnoreLint(t, "implicit auth is not configured")
+	}
+
+	bucket := os.Getenv("GOOGLE_BUCKET")
+	if bucket == "" {
+		skip.IgnoreLint(t, "GOOGLE_BUCKET env var must be set")
+	}
+
+	testID := cloudtestutils.NewTestID()
+	user := username.RootUserName()
+	ctx := context.Background()
+	testSettings := cluster.MakeTestingClusterSettings()
+	file := "testfile"
+	data := []byte("hello world")
+
+	gsURI := fmt.Sprintf("gs://%s/%s-%d?AUTH=implicit", bucket, "read-file-at-returns-size", testID)
+	conf, err := cloud.ExternalStorageConfFromURI(gsURI, user)
+	require.NoError(t, err)
+	args := cloud.ExternalStorageContext{
+		IOConf:          base.ExternalIODirConfig{},
+		Settings:        testSettings,
+		DB:              nil,
+		Options:         nil,
+		Limiters:        nil,
+		MetricsRecorder: cloud.NilMetrics,
+	}
+	s, err := makeGCSStorage(ctx, args, conf)
+	require.NoError(t, err)
+
+	w, err := s.Writer(ctx, file)
+	require.NoError(t, err)
+
+	_, err = w.Write(data)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	reader, _, err := s.ReadFile(ctx, file, cloud.ReadOptions{})
+	require.NoError(t, err)
+
+	rr, ok := reader.(*cloud.ResumingReader)
+	require.True(t, ok)
+	require.Equal(t, int64(len(data)), rr.Size)
 }

@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
@@ -167,9 +166,6 @@ type eventLogOptions struct {
 
 	// Additional redaction options, if necessary.
 	rOpts redactionOptions
-
-	// isCopy notes whether the current event is related to COPY.
-	isCopy bool
 }
 
 // redactionOptions contains instructions on how to redact the SQL
@@ -192,7 +188,7 @@ var defaultRedactionOptions = redactionOptions{
 func (p *planner) getCommonSQLEventDetails(opt redactionOptions) eventpb.CommonSQLEventDetails {
 	redactableStmt := formatStmtKeyAsRedactableString(
 		p.extendedEvalCtx.VirtualSchemas, p.stmt.AST,
-		p.extendedEvalCtx.Context.Annotations, opt.toFlags(),
+		p.extendedEvalCtx.Context.Annotations, opt.toFlags(), p,
 	)
 	commonSQLEventDetails := eventpb.CommonSQLEventDetails{
 		Statement:       redactableStmt,
@@ -282,8 +278,8 @@ func logEventInternalForSQLStatements(
 ) error {
 	// Inject the common fields into the payload provided by the caller.
 	injectCommonFields := func(event logpb.EventPayload) error {
-		if opts.isCopy {
-			// No txn is set for COPY, so use now instead.
+		if txn == nil {
+			// No txn is set (e.g. for COPY or BEGIN), so use now instead.
 			event.CommonDetails().Timestamp = timeutil.Now().UnixNano()
 		} else {
 			event.CommonDetails().Timestamp = txn.KV().ReadTimestamp().WallTime
@@ -441,7 +437,7 @@ var eventLogSystemTableEnabled = settings.RegisterBoolSetting(
 	"server.eventlog.enabled",
 	"if set, logged notable events are also stored in the table system.eventlog",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // EventLogTestingKnobs provides hooks and knobs for event logging.
 type EventLogTestingKnobs struct {
@@ -482,6 +478,9 @@ const (
 // of the provided transaction, using the provided internal executor.
 //
 // This converts to a call to insertEventRecords() with just 1 entry.
+//
+// Note: it is not safe to pass the same entry references to multiple
+// subsequent calls (it causes a race condition).
 func InsertEventRecords(
 	ctx context.Context, execCfg *ExecutorConfig, dst LogEventDestination, info ...logpb.EventPayload,
 ) {
@@ -517,6 +516,9 @@ func InsertEventRecords(
 //   - if there's at txn, after the txn commit time (i.e. we don't log
 //     if the txn ends up aborting), using a txn commit trigger.
 //   - otherwise (no txn), immediately.
+//
+// Note: it is not safe to pass the same entry references to multiple
+// subsequent calls (it causes a race condition).
 func insertEventRecords(
 	ctx context.Context,
 	execCfg *ExecutorConfig,
@@ -645,7 +647,7 @@ func asyncWriteToOtelAndSystemEventsTable(
 			retryOpts.MaxRetries = int(maxAttempts)
 			for r := retry.Start(retryOpts); r.Next(); {
 				// Don't try too long to write if the system table is unavailable.
-				if err := contextutil.RunWithTimeout(ctx, "record-events", perAttemptTimeout, func(ctx context.Context) error {
+				if err := timeutil.RunWithTimeout(ctx, "record-events", perAttemptTimeout, func(ctx context.Context) error {
 					return execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 						return writeToSystemEventsTable(ctx, txn, len(entries), query, args)
 					})

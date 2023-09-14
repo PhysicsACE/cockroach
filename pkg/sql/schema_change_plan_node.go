@@ -19,7 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
@@ -34,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -46,13 +49,15 @@ func (p *planner) FormatAstAsRedactableString(
 ) redact.RedactableString {
 	return formatStmtKeyAsRedactableString(p.getVirtualTabler(),
 		statement,
-		annotations, tree.FmtSimple)
+		annotations, tree.FmtSimple, p)
 }
 
 // SchemaChange provides the planNode for the new schema changer.
 func (p *planner) SchemaChange(ctx context.Context, stmt tree.Statement) (planNode, error) {
-
-	// TODO(ajwerner): Call featureflag.CheckEnabled appropriately.
+	err := checkSchemaChangeEnabled(ctx, p.ExecCfg(), p.stmt.AST.StatementTag())
+	if err != nil {
+		return nil, err
+	}
 	mode := p.extendedEvalCtx.SchemaChangerState.mode
 	// When new schema changer is on we will not support it for explicit
 	// transaction, since we don't know if subsequent statements don't
@@ -62,10 +67,11 @@ func (p *planner) SchemaChange(ctx context.Context, stmt tree.Statement) (planNo
 			mode == sessiondatapb.UseNewSchemaChangerUnsafe) && !p.extendedEvalCtx.TxnIsSingleStmt) {
 		return nil, nil
 	}
+
 	scs := p.extendedEvalCtx.SchemaChangerState
 	scs.stmts = append(scs.stmts, p.stmt.SQL)
 	deps := p.newSchemaChangeBuilderDependencies(scs.stmts)
-	state, err := scbuild.Build(ctx, deps, scs.state, stmt)
+	state, err := scbuild.Build(ctx, deps, scs.state, stmt, &scs.memAcc)
 	if scerrors.HasNotImplemented(err) &&
 		mode != sessiondatapb.UseNewSchemaChangerUnsafeAlways {
 		return nil, nil
@@ -78,6 +84,12 @@ func (p *planner) SchemaChange(ctx context.Context, stmt tree.Statement) (planNo
 		}
 		return nil, err
 	}
+
+	// If we successfully planned a schema change here, then update telemetry
+	// to indicate that we used the new schema changer.
+	telemetry.Inc(sqltelemetry.DeclarativeSchemaChangerCounter)
+	p.curPlan.instrumentation.schemaChangerMode = schemaChangerModeDeclarative
+
 	return &schemaChangePlanNode{
 		stmt:         stmt,
 		sql:          p.stmt.SQL,
@@ -173,8 +185,8 @@ func (p *planner) waitForDescriptorSchemaChanges(
 	ctx context.Context, descID descpb.ID, scs SchemaChangerState,
 ) error {
 
-	if knobs := p.ExecCfg().DeclarativeSchemaChangerTestingKnobs; knobs != nil &&
-		knobs.BeforeWaitingForConcurrentSchemaChanges != nil {
+	knobs := p.ExecCfg().DeclarativeSchemaChangerTestingKnobs
+	if knobs != nil && knobs.BeforeWaitingForConcurrentSchemaChanges != nil {
 		knobs.BeforeWaitingForConcurrentSchemaChanges(scs.stmts)
 	}
 
@@ -187,16 +199,11 @@ func (p *planner) waitForDescriptorSchemaChanges(
 
 	// Wait for the descriptor to no longer be claimed by a schema change.
 	start := timeutil.Now()
-	logEvery := log.Every(30 * time.Second)
+	logEvery := log.Every(10 * time.Second)
 	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
 		now := p.ExecCfg().Clock.Now()
-		if logEvery.ShouldLog() {
-			log.Infof(ctx,
-				"schema change waiting for concurrent schema changes on descriptor %d,"+
-					" waited %v so far", descID, timeutil.Since(start),
-			)
-		}
-		blocked := false
+		var isBlocked bool
+		var blockingJobIDs []catpb.JobID
 		if err := p.ExecCfg().InternalDB.DescsTxn(ctx, func(
 			ctx context.Context, txn descs.Txn,
 		) error {
@@ -207,15 +214,26 @@ func (p *planner) waitForDescriptorSchemaChanges(
 			if err != nil {
 				return err
 			}
-			blocked = desc.HasConcurrentSchemaChanges()
+			isBlocked = desc.HasConcurrentSchemaChanges()
+			blockingJobIDs = desc.ConcurrentSchemaChangeJobIDs()
 			return nil
 		}); err != nil {
 			return err
 		}
-		if !blocked {
+		if !isBlocked {
 			break
 		}
+		if logEvery.ShouldLog() {
+			log.Infof(ctx,
+				"schema change waiting for %v concurrent schema change job(s) %v on descriptor %d,"+
+					" waited %v so far", len(blockingJobIDs), blockingJobIDs, descID, timeutil.Since(start),
+			)
+		}
+		if knobs != nil && knobs.WhileWaitingForConcurrentSchemaChanges != nil {
+			knobs.WhileWaitingForConcurrentSchemaChanges(scs.stmts)
+		}
 	}
+
 	log.Infof(
 		ctx,
 		"done waiting for concurrent schema changes on descriptor %d after %v",
@@ -235,7 +253,7 @@ type schemaChangePlanNode struct {
 	// plannedState contains the state produced by the builder combining
 	// the nodes that existed preceding the current statement with the output of
 	// the built current statement. There maybe cases like CTE's, where we will
-	// need to re-plan if the lastState that the plannedState do not match, since
+	// need to re-plan if the lastState and the plannedState do not match, since
 	// we are executing DDL statements in an unexpected way.
 	plannedState scpb.CurrentState
 }
@@ -244,17 +262,20 @@ func (s *schemaChangePlanNode) startExec(params runParams) error {
 	p := params.p
 	scs := p.ExtendedEvalContext().SchemaChangerState
 
-	// Our current state does not match what was previously planned for, which means
-	// that potentially we are running CTE's with ALTER statements. So, we are going
-	// to re-plan the state to include the current statement since the statement
-	// phase was not executed.
+	// Current schema change state (as tracked in `scs.state` in the planner)
+	// does not match that when we previously planned and created `s` (as tracked
+	// in `s.lastState` and was previously set to `scs.state` in the planner).
+	// This is possible with CTEs with schema changes (e.g. builtin `AddGeometryColumn`
+	// can be in used in both a CTE and the main query), in which case we need to
+	// re-build the plan with an updated incumbent state.
 	if !reflect.DeepEqual(s.lastState.Current, scs.state.Current) {
 		deps := p.newSchemaChangeBuilderDependencies(scs.stmts)
-		state, err := scbuild.Build(params.ctx, deps, scs.state, s.stmt)
+		state, err := scbuild.Build(params.ctx, deps, scs.state, s.stmt, &scs.memAcc)
 		if err != nil {
 			return err
 		}
 		// Update with the re-planned state.
+		scs.memAcc.Shrink(params.ctx, s.plannedState.ByteSize())
 		s.plannedState = state
 	}
 

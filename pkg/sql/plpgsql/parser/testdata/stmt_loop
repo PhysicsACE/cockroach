@@ -1,0 +1,39 @@
+parse
+DECLARE
+BEGIN
+x := 1;
+LOOP
+  EXIT WHEN x = 10;
+  x := x + 1;
+END LOOP;
+END
+----
+DECLARE
+BEGIN
+x := 1;
+LOOP
+EXIT WHEN x = 10;
+x := x + 1;
+END LOOP;
+END
+
+
+parse
+DECLARE
+BEGIN
+x := 1;
+<<mathing>>
+LOOP
+  EXIT WHEN x = 10;
+  x := x + 1;
+END LOOP mathing;
+END
+----
+DECLARE
+BEGIN
+x := 1;
+LOOP
+EXIT WHEN x = 10;
+x := x + 1;
+END LOOP mathing;
+END

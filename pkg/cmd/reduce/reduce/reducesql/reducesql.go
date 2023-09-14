@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/reduce/reduce"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	// Import builtins.
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -31,6 +32,7 @@ var SQLPasses = []reduce.Pass{
 	removeWithCTEs,
 	removeWith,
 	removeCreateDefs,
+	removeCreateFuncParams,
 	removeComputedColumn,
 	removeValuesCols,
 	removeWithSelectExprs,
@@ -43,6 +45,7 @@ var SQLPasses = []reduce.Pass{
 	removeLimit,
 	removeOrderBy,
 	removeOrderByExprs,
+	removeNullsInOrderByExprs,
 	removeGroupBy,
 	removeGroupByExprs,
 	removeCreateNullDefs,
@@ -194,6 +197,21 @@ func (w sqlWalker) Transform(s string, i int) (out string, ok bool, err error) {
 				}
 				if node.AsSource != nil {
 					walk(node.AsSource)
+				}
+			case *tree.CreateRoutine:
+				for i := range node.Options {
+					if body, ok := node.Options[i].(tree.RoutineBodyStr); ok {
+						stmts, err := parser.Parse(string(body))
+						if err != nil {
+							// Ignore parsing errors.
+							continue
+						}
+						funcAsts := collectASTs(stmts)
+						for _, ast := range funcAsts {
+							walk(ast)
+						}
+						node.Options[i] = tree.RoutineBodyStr(joinASTs(asts))
+					}
 				}
 			case *tree.CTE:
 				walk(node.Stmt)
@@ -399,7 +417,7 @@ func Pretty(s string) (string, error) {
 	return joinASTs(collectASTs(stmts)), nil
 }
 
-func collectASTs(stmts parser.Statements) []tree.NodeFormatter {
+func collectASTs(stmts statements.Statements) []tree.NodeFormatter {
 	asts := make([]tree.NodeFormatter, len(stmts))
 	for i, stmt := range stmts {
 		asts[i] = stmt.AST
@@ -531,6 +549,37 @@ var (
 			return n
 		}
 		return 0
+	})
+	removeNullsInOrderByExprs = walkSQL("remove NULLS FIRST/LAST in ORDER BY exprs", func(xfi int, node interface{}) int {
+		hasOrderBy := true
+		var ob tree.OrderBy
+		switch node := node.(type) {
+		case *tree.Delete:
+			ob = node.OrderBy
+		case *tree.FuncExpr:
+			ob = node.OrderBy
+		case *tree.Select:
+			ob = node.OrderBy
+		case *tree.Update:
+			ob = node.OrderBy
+		case *tree.WindowDef:
+			ob = node.OrderBy
+		default:
+			hasOrderBy = false
+		}
+		if !hasOrderBy {
+			return 0
+		}
+		n := 0
+		for i := range ob {
+			if ob[i].NullsOrder != tree.DefaultNullsOrder {
+				n++
+				if xfi < n {
+					ob[i].NullsOrder = tree.DefaultNullsOrder
+				}
+			}
+		}
+		return n
 	})
 	removeGroupBy = walkSQL("remove GROUP BY", func(xfi int, node interface{}) int {
 		xf := xfi == 0
@@ -754,6 +803,17 @@ var (
 			n := len(node.Defs)
 			if xfi < n {
 				node.Defs = append(node.Defs[:xfi], node.Defs[xfi+1:]...)
+			}
+			return n
+		}
+		return 0
+	})
+	removeCreateFuncParams = walkSQL("remove CREATE FUNCTION parameters", func(xfi int, node interface{}) int {
+		switch node := node.(type) {
+		case *tree.CreateRoutine:
+			n := len(node.Params)
+			if xfi < n {
+				node.Params = append(node.Params[:xfi], node.Params[xfi+1:]...)
 			}
 			return n
 		}

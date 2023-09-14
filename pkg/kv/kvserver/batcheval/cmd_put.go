@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -29,7 +30,8 @@ func declareKeysPut(
 	rs ImmutableRangeState,
 	header *kvpb.Header,
 	req kvpb.Request,
-	latchSpans, lockSpans *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
 ) {
 	args := req.(*kvpb.PutRequest)
@@ -46,23 +48,27 @@ func Put(
 ) (result.Result, error) {
 	args := cArgs.Args.(*kvpb.PutRequest)
 	h := cArgs.Header
-	ms := cArgs.Stats
 
 	var ts hlc.Timestamp
 	if !args.Inline {
 		ts = h.Timestamp
 	}
+
+	opts := storage.MVCCWriteOptions{
+		Txn:                            h.Txn,
+		LocalTimestamp:                 cArgs.Now,
+		Stats:                          cArgs.Stats,
+		ReplayWriteTimestampProtection: h.AmbiguousReplayProtection,
+	}
+
 	var err error
 	if args.Blind {
-		err = storage.MVCCBlindPut(ctx, readWriter, ms, args.Key, ts, cArgs.Now, args.Value, h.Txn)
+		err = storage.MVCCBlindPut(ctx, readWriter, args.Key, ts, args.Value, opts)
 	} else {
-		err = storage.MVCCPut(ctx, readWriter, ms, args.Key, ts, cArgs.Now, args.Value, h.Txn)
+		err = storage.MVCCPut(ctx, readWriter, args.Key, ts, args.Value, opts)
 	}
-	// NB: even if MVCC returns an error, it may still have written an intent
-	// into the batch. This allows callers to consume errors like WriteTooOld
-	// without re-evaluating the batch. This behavior isn't particularly
-	// desirable, but while it remains, we need to assume that an intent could
-	// have been written even when an error is returned. This is harmless if the
-	// error is not consumed by the caller because the result will be discarded.
-	return result.FromAcquiredLocks(h.Txn, args.Key), err
+	if err != nil {
+		return result.Result{}, err
+	}
+	return result.FromAcquiredLocks(h.Txn, args.Key), nil
 }

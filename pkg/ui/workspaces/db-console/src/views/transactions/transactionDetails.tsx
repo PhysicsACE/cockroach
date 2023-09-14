@@ -9,21 +9,20 @@
 // licenses/APL.txt.
 
 import { connect } from "react-redux";
-import { createSelector } from "reselect";
-import { RouteComponentProps, withRouter } from "react-router-dom";
+import { withRouter } from "react-router-dom";
 import {
   refreshNodes,
-  refreshStatements,
+  refreshTxns,
   refreshTxnInsights,
   refreshUserSQLRoles,
 } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
-import { txnFingerprintIdAttr } from "src/util/constants";
-import { getMatchParamByName } from "src/util/query";
 import { nodeRegionsByIDSelector } from "src/redux/nodes";
 import {
-  selectData,
-  selectLastError,
+  reqSortSetting,
+  limitSetting,
+  selectTxns,
+  requestTimeLocalSetting,
 } from "src/views/transactions/transactionsPage";
 import {
   TransactionDetailsStateProps,
@@ -35,36 +34,8 @@ import { setGlobalTimeScaleAction } from "src/redux/statements";
 import { selectTimeScale } from "src/redux/timeScale";
 import { selectTxnInsightsByFingerprint } from "src/views/insights/insightsSelectors";
 import { selectHasAdminRole } from "src/redux/user";
-
-export const selectTransaction = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
-  (_state: AdminUIState, props: RouteComponentProps) => props,
-  (transactionState, props) => {
-    const transactions = transactionState.data?.transactions;
-    if (!transactions) {
-      return {
-        isLoading: true,
-        transaction: null,
-        lastUpdated: null,
-      };
-    }
-    const txnFingerprintId = getMatchParamByName(
-      props.match,
-      txnFingerprintIdAttr,
-    );
-
-    const transaction = transactions.filter(
-      txn =>
-        txn.stats_data.transaction_fingerprint_id.toString() ==
-        txnFingerprintId,
-    )[0];
-    return {
-      isLoading: false,
-      transaction: transaction,
-      lastUpdated: transactionState?.setAt?.utc(),
-    };
-  },
-);
+import { getMatchParamByName } from "src/util/query";
+import { txnFingerprintIdAttr } from "src/util/constants";
 
 export default withRouter(
   connect<TransactionDetailsStateProps, TransactionDetailsDispatchProps>(
@@ -72,33 +43,29 @@ export default withRouter(
       state: AdminUIState,
       props: TransactionDetailsProps,
     ): TransactionDetailsStateProps => {
-      const { isLoading, transaction, lastUpdated } = selectTransaction(
-        state,
-        props,
-      );
       return {
         timeScale: selectTimeScale(state),
-        error: selectLastError(state),
         isTenant: false,
         nodeRegions: nodeRegionsByIDSelector(state),
-        statements: selectData(state)?.statements,
-        transaction: transaction,
+        txnStatsResp: selectTxns(state),
         transactionFingerprintId: getMatchParamByName(
           props.match,
           txnFingerprintIdAttr,
         ),
-        isLoading: isLoading,
-        lastUpdated: lastUpdated,
         transactionInsights: selectTxnInsightsByFingerprint(state, props),
         hasAdminRole: selectHasAdminRole(state),
+        limit: limitSetting.selector(state),
+        reqSortSetting: reqSortSetting.selector(state),
+        requestTime: requestTimeLocalSetting.selector(state),
       };
     },
     {
-      refreshData: refreshStatements,
+      refreshData: refreshTxns,
       refreshNodes,
       refreshUserSQLRoles,
       onTimeScaleChange: setGlobalTimeScaleAction,
       refreshTransactionInsights: refreshTxnInsights,
+      onRequestTimeChange: (t: moment.Moment) => requestTimeLocalSetting.set(t),
     },
   )(TransactionDetails),
 );

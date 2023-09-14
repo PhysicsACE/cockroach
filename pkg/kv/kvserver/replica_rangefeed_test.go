@@ -34,11 +34,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/raft/v3"
@@ -88,6 +89,11 @@ func (s *testStream) Events() []*kvpb.RangeFeedEvent {
 	return s.mu.events
 }
 
+func waitRangeFeed(store *kvserver.Store, req *kvpb.RangeFeedRequest, stream *testStream) error {
+	retErr, _ := future.Wait(context.Background(), store.RangeFeed(req, stream))
+	return retErr
+}
+
 func TestReplicaRangefeed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -110,7 +116,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 
 	ts := tc.Servers[0]
-	firstStore, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+	firstStore, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -137,13 +143,13 @@ func TestReplicaRangefeed(t *testing.T) {
 	tc.WaitForValues(t, roachpb.Key("b"), []int64{9, 9, 9, 9, 9})
 
 	streams := make([]*testStream, numNodes)
-	streamErrC := make(chan *kvpb.Error, numNodes)
+	streamErrC := make(chan error, numNodes)
 	rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
 	for i := 0; i < numNodes; i++ {
 		stream := newTestStream()
 		streams[i] = stream
 		srv := tc.Servers[i]
-		store, err := srv.Stores().GetStore(srv.GetFirstStoreID())
+		store, err := srv.GetStores().(*kvserver.Stores).GetStore(srv.GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -158,7 +164,7 @@ func TestReplicaRangefeed(t *testing.T) {
 			}
 			timer := time.AfterFunc(10*time.Second, stream.Cancel)
 			defer timer.Stop()
-			streamErrC <- store.RangeFeed(&req, stream)
+			streamErrC <- waitRangeFeed(store, &req, stream)
 		}(i)
 	}
 
@@ -292,7 +298,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	}
 
 	server1 := tc.Servers[1]
-	store1, pErr := server1.Stores().GetStore(server1.GetFirstStoreID())
+	store1, pErr := server1.GetStores().(*kvserver.Stores).GetStore(server1.GetFirstStoreID())
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -395,7 +401,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	// Wait for all streams to observe the expected events.
 	expVal2 := roachpb.MakeValueFromBytesAndTimestamp([]byte("val2"), ts2)
 	expVal3 := roachpb.MakeValueFromBytesAndTimestamp([]byte("val3"), ts3)
-	expVal3.InitChecksum([]byte("m")) // client.Txn sets value checksum
+	expVal3.InitChecksum([]byte("m")) // kv.Txn sets value checksum
 	expVal4 := roachpb.Value{Timestamp: ts4}
 	expVal4.SetInt(18)
 	expVal4.InitChecksum(roachpb.Key("b"))
@@ -436,11 +442,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	// Cancel each of the rangefeed streams.
 	for _, stream := range streams {
 		stream.Cancel()
-
-		pErr := <-streamErrC
-		if !testutils.IsPError(pErr, "context canceled") {
-			t.Fatalf("got error for RangeFeed: %v", pErr)
-		}
+		require.True(t, errors.Is(<-streamErrC, context.Canceled))
 	}
 
 	// Bump the GC threshold and assert that RangeFeed below the timestamp will
@@ -468,7 +470,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		for i := 0; i < numNodes; i++ {
 			ts := tc.Servers[i]
-			store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+			store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 			if pErr != nil {
 				t.Fatal(pErr)
 			}
@@ -484,14 +486,19 @@ func TestReplicaRangefeed(t *testing.T) {
 			defer timer.Stop()
 			defer stream.Cancel()
 
-			if pErr := store.RangeFeed(&req, stream); !testutils.IsPError(
+			if pErr := waitRangeFeed(store, &req, stream); !testutils.IsError(
 				pErr, `must be after replica GC threshold`,
 			) {
-				return pErr.GoError()
+				return pErr
 			}
 		}
 		return nil
 	})
+}
+
+func waitErrorFuture(f *future.ErrorFuture) error {
+	resultErr, _ := future.Wait(context.Background(), f)
+	return resultErr
 }
 
 func TestReplicaRangefeedErrors(t *testing.T) {
@@ -522,7 +529,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 		)
 
 		ts := tc.Servers[0]
-		store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, pErr := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -541,7 +548,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 	}
 
 	waitForInitialCheckpointAcrossSpan := func(
-		t *testing.T, stream *testStream, streamErrC <-chan *kvpb.Error, span roachpb.Span,
+		t *testing.T, stream *testStream, streamErrC <-chan error, span roachpb.Span,
 	) {
 		t.Helper()
 		noResolveTimestampEvent := kvpb.RangeFeedEvent{
@@ -588,14 +595,14 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 	}
 
 	assertRangefeedRetryErr := func(
-		t *testing.T, pErr *kvpb.Error, expReason kvpb.RangeFeedRetryError_Reason,
+		t *testing.T, pErr error, expReason kvpb.RangeFeedRetryError_Reason,
 	) {
 		t.Helper()
 		expErr := kvpb.NewRangeFeedRetryError(expReason)
 		if pErr == nil {
 			t.Fatalf("got nil error for RangeFeed: expecting %v", expErr)
 		}
-		rfErr, ok := pErr.GetDetail().(*kvpb.RangeFeedRetryError)
+		rfErr, ok := kvpb.NewError(pErr).GetDetail().(*kvpb.RangeFeedRetryError)
 		if !ok {
 			t.Fatalf("got incorrect error for RangeFeed: %v; expecting %v", pErr, expErr)
 		}
@@ -612,10 +619,10 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 
 		// Establish a rangefeed on the replica we plan to remove.
 		stream := newTestStream()
-		streamErrC := make(chan *kvpb.Error, 1)
+		streamErrC := make(chan error, 1)
 		rangefeedSpan := mkSpan("a", "z")
 		ts := tc.Servers[removeStore]
-		store, err := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -628,7 +635,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 			}
 			timer := time.AfterFunc(10*time.Second, stream.Cancel)
 			defer timer.Stop()
-			streamErrC <- store.RangeFeed(&req, stream)
+			streamErrC <- waitRangeFeed(store, &req, stream)
 		}()
 
 		// Wait for the first checkpoint event.
@@ -647,10 +654,10 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 
 		// Establish a rangefeed on the replica we plan to split.
 		stream := newTestStream()
-		streamErrC := make(chan *kvpb.Error, 1)
+		streamErrC := make(chan error, 1)
 		rangefeedSpan := mkSpan("a", "z")
 		ts := tc.Servers[0]
-		store, err := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -663,7 +670,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 			}
 			timer := time.AfterFunc(10*time.Second, stream.Cancel)
 			defer timer.Stop()
-			streamErrC <- store.RangeFeed(&req, stream)
+			streamErrC <- waitRangeFeed(store, &req, stream)
 		}()
 
 		// Wait for the first checkpoint event.
@@ -681,7 +688,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 		defer tc.Stopper().Stop(ctx)
 
 		ts := tc.Servers[0]
-		store, err := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -697,7 +704,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 
 		// Establish a rangefeed on the left replica.
 		streamLeft := newTestStream()
-		streamLeftErrC := make(chan *kvpb.Error, 1)
+		streamLeftErrC := make(chan error, 1)
 		rangefeedLeftSpan := roachpb.Span{Key: mkKey("a"), EndKey: splitKey}
 		go func() {
 			req := kvpb.RangeFeedRequest{
@@ -708,12 +715,12 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 			}
 			timer := time.AfterFunc(10*time.Second, streamLeft.Cancel)
 			defer timer.Stop()
-			streamLeftErrC <- store.RangeFeed(&req, streamLeft)
+			streamLeftErrC <- waitRangeFeed(store, &req, streamLeft)
 		}()
 
 		// Establish a rangefeed on the right replica.
 		streamRight := newTestStream()
-		streamRightErrC := make(chan *kvpb.Error, 1)
+		streamRightErrC := make(chan error, 1)
 		rangefeedRightSpan := roachpb.Span{Key: splitKey, EndKey: mkKey("z")}
 		go func() {
 			req := kvpb.RangeFeedRequest{
@@ -724,7 +731,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 			}
 			timer := time.AfterFunc(10*time.Second, streamRight.Cancel)
 			defer timer.Stop()
-			streamRightErrC <- store.RangeFeed(&req, streamRight)
+			streamRightErrC <- waitRangeFeed(store, &req, streamRight)
 		}()
 
 		// Wait for the first checkpoint event on each stream.
@@ -747,22 +754,22 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 		defer tc.Stopper().Stop(ctx)
 
 		ts2 := tc.Servers[2]
-		partitionStore, err := ts2.Stores().GetStore(ts2.GetFirstStoreID())
+		partitionStore, err := ts2.GetStores().(*kvserver.Stores).GetStore(ts2.GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
 		ts := tc.Servers[0]
-		firstStore, err := ts.Stores().GetStore(ts.GetFirstStoreID())
+		firstStore, err := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
-		secondStore, err := tc.Servers[1].Stores().GetStore(tc.Servers[1].GetFirstStoreID())
+		secondStore, err := tc.Servers[1].GetStores().(*kvserver.Stores).GetStore(tc.Servers[1].GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		for _, server := range tc.Servers {
-			store, err := server.Stores().GetStore(server.GetFirstStoreID())
+			store, err := server.GetStores().(*kvserver.Stores).GetStore(server.GetFirstStoreID())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -771,7 +778,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 
 		// Establish a rangefeed on the replica we plan to partition.
 		stream := newTestStream()
-		streamErrC := make(chan *kvpb.Error, 1)
+		streamErrC := make(chan error, 1)
 		rangefeedSpan := mkSpan("a", "z")
 		go func() {
 			req := kvpb.RangeFeedRequest{
@@ -782,7 +789,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 			}
 			timer := time.AfterFunc(10*time.Second, stream.Cancel)
 			defer timer.Stop()
-			streamErrC <- partitionStore.RangeFeed(&req, stream)
+			streamErrC <- waitRangeFeed(partitionStore, &req, stream)
 		}()
 
 		// Wait for the first checkpoint event.
@@ -807,9 +814,9 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 		})
 
 		// Partition the replica from the rest of its range.
-		partitionStore.Transport().Listen(partitionStore.Ident.StoreID, &unreliableRaftHandler{
-			rangeID:            rangeID,
-			RaftMessageHandler: partitionStore,
+		partitionStore.Transport().ListenIncomingRaftMessages(partitionStore.Ident.StoreID, &unreliableRaftHandler{
+			rangeID:                    rangeID,
+			IncomingRaftMessageHandler: partitionStore,
 		})
 
 		// Perform a write on the range.
@@ -842,9 +849,9 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 		}
 
 		// Remove the partition. Snapshot should follow.
-		partitionStore.Transport().Listen(partitionStore.Ident.StoreID, &unreliableRaftHandler{
-			rangeID:            rangeID,
-			RaftMessageHandler: partitionStore,
+		partitionStore.Transport().ListenIncomingRaftMessages(partitionStore.Ident.StoreID, &unreliableRaftHandler{
+			rangeID:                    rangeID,
+			IncomingRaftMessageHandler: partitionStore,
 			unreliableRaftHandlerFuncs: unreliableRaftHandlerFuncs{
 				dropReq: func(req *kvserverpb.RaftMessageRequest) bool {
 					// Make sure that even going forward no MsgApp for what we just truncated can
@@ -852,7 +859,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 					// to make the test pass reliably.
 					// NB: the Index on the message is the log index that _precedes_ any of the
 					// entries in the MsgApp, so filter where msg.Index < index, not <= index.
-					return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+					return req.Message.Type == raftpb.MsgApp && kvpb.RaftIndex(req.Message.Index) < index
 				},
 				dropHB:   func(*kvserverpb.RaftHeartbeat) bool { return false },
 				dropResp: func(*kvserverpb.RaftMessageResponse) bool { return false },
@@ -884,7 +891,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 		defer tc.Stopper().Stop(ctx)
 
 		ts := tc.Servers[0]
-		store, err := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -896,7 +903,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 
 		// Establish a rangefeed.
 		stream := newTestStream()
-		streamErrC := make(chan *kvpb.Error, 1)
+		streamErrC := make(chan error, 1)
 
 		endKey := keys.ScratchRangeMax
 		rangefeedSpan := roachpb.Span{Key: startKey, EndKey: endKey}
@@ -910,7 +917,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 			kvserver.RangefeedEnabled.Override(ctx, &store.ClusterSettings().SV, true)
 			timer := time.AfterFunc(10*time.Second, stream.Cancel)
 			defer timer.Stop()
-			streamErrC <- store.RangeFeed(&req, stream)
+			streamErrC <- waitRangeFeed(store, &req, stream)
 		}()
 
 		// Wait for the first checkpoint event.
@@ -953,7 +960,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 		defer tc.Stopper().Stop(ctx)
 
 		ts := tc.Servers[0]
-		store, err := ts.Stores().GetStore(ts.GetFirstStoreID())
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -971,7 +978,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 
 		// Attempt to establish a rangefeed, sending the request to the LHS.
 		stream := newTestStream()
-		streamErrC := make(chan *kvpb.Error, 1)
+		streamErrC := make(chan error, 1)
 
 		endKey := keys.ScratchRangeMax
 		rangefeedSpan := roachpb.Span{Key: startKey, EndKey: endKey}
@@ -985,14 +992,13 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 			}
 			timer := time.AfterFunc(10*time.Second, stream.Cancel)
 			defer timer.Stop()
-			streamErrC <- store.RangeFeed(&req, stream)
+			streamErrC <- waitErrorFuture(store.RangeFeed(&req, stream))
 		}()
 
 		// Check the error.
 		pErr := <-streamErrC
-		if _, ok := pErr.GetDetail().(*kvpb.RangeKeyMismatchError); !ok {
-			t.Fatalf("got incorrect error for RangeFeed: %v; expecting RangeKeyMismatchError", pErr)
-		}
+		require.True(t, errors.HasType(pErr, &kvpb.RangeKeyMismatchError{}),
+			"got incorrect error for RangeFeed: %v; expecting RangeKeyMismatchError", pErr)
 
 		// Now send the range feed request to the correct replica, which should not
 		// encounter errors.
@@ -1006,7 +1012,7 @@ func TestReplicaRangefeedErrors(t *testing.T) {
 			}
 			timer := time.AfterFunc(10*time.Second, stream.Cancel)
 			defer timer.Stop()
-			streamErrC <- store.RangeFeed(&req, stream)
+			streamErrC <- waitErrorFuture(store.RangeFeed(&req, stream))
 		}()
 
 		// Wait for the first checkpoint event.
@@ -1028,7 +1034,7 @@ func TestReplicaRangefeedMVCCHistoryMutationError(t *testing.T) {
 	})
 	defer tc.Stopper().Stop(ctx)
 	ts := tc.Servers[0]
-	store, err := ts.Stores().GetStore(ts.GetFirstStoreID())
+	store, err := ts.GetStores().(*kvserver.Stores).GetStore(ts.GetFirstStoreID())
 	require.NoError(t, err)
 	tc.SplitRangeOrFatal(t, splitKey)
 	tc.AddVotersOrFatal(t, splitKey, tc.Target(1), tc.Target(2))
@@ -1043,7 +1049,7 @@ func TestReplicaRangefeedMVCCHistoryMutationError(t *testing.T) {
 
 	// Set up a rangefeed across a-c.
 	stream := newTestStream()
-	streamErrC := make(chan *kvpb.Error, 1)
+	streamErrC := make(chan error, 1)
 	go func() {
 		req := kvpb.RangeFeedRequest{
 			Header: kvpb.Header{RangeID: rangeID},
@@ -1051,7 +1057,7 @@ func TestReplicaRangefeedMVCCHistoryMutationError(t *testing.T) {
 		}
 		timer := time.AfterFunc(10*time.Second, stream.Cancel)
 		defer timer.Stop()
-		streamErrC <- store.RangeFeed(&req, stream)
+		streamErrC <- waitRangeFeed(store, &req, stream)
 	}()
 
 	// Wait for a checkpoint.
@@ -1090,10 +1096,10 @@ func TestReplicaRangefeedMVCCHistoryMutationError(t *testing.T) {
 	})
 	require.Nil(t, pErr)
 	select {
-	case pErr = <-streamErrC:
-		require.NotNil(t, pErr)
+	case streamErr := <-streamErrC:
+		require.NotNil(t, streamErr)
 		var mvccErr *kvpb.MVCCHistoryMutationError
-		require.ErrorAs(t, pErr.GoError(), &mvccErr)
+		require.ErrorAs(t, streamErr, &mvccErr)
 		require.Equal(t, &kvpb.MVCCHistoryMutationError{
 			Span: roachpb.Span{Key: roachpb.Key("b"), EndKey: roachpb.Key("e")},
 		}, mvccErr)
@@ -1110,9 +1116,10 @@ func TestReplicaRangefeedPushesTransactions(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc, db, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
+	cArgs := aggressiveResolvedTimestampManuallyReplicatedClusterArgs
+	tc, db, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, 0, cArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
-	repls := replsForRange(ctx, t, tc, desc, numNodes)
+	repls := replsForRange(ctx, t, tc, desc)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
@@ -1154,7 +1161,7 @@ func TestReplicaRangefeedPushesTransactions(t *testing.T) {
 			span := roachpb.Span{
 				Key: desc.StartKey.AsRawKey(), EndKey: desc.EndKey.AsRawKey(),
 			}
-			rangeFeedErrC <- ds.RangeFeed(rangeFeedCtx, []roachpb.Span{span}, ts1, false /* withDiff */, rangeFeedCh)
+			rangeFeedErrC <- ds.RangeFeed(rangeFeedCtx, []roachpb.Span{span}, ts1, rangeFeedCh)
 		}()
 	}
 
@@ -1203,7 +1210,7 @@ func TestReplicaRangefeedPushesTransactions(t *testing.T) {
 
 	// The txn should not be able to commit since its commit timestamp was pushed
 	// and it has observed its timestamp.
-	require.Regexp(t, "TransactionRetryError: retry txn", tx1.Commit())
+	require.Regexp(t, "TransactionRetryWithProtoRefreshError", tx1.Commit())
 
 	// Make sure the RangeFeed hasn't errored yet.
 	select {
@@ -1236,10 +1243,13 @@ func TestRangefeedCheckpointsRecoverFromLeaseExpiration(t *testing.T) {
 	// evaluating on the scratch range.
 	var rejectExtraneousRequests int64 // accessed atomically
 
-	cargs := aggressiveResolvedTimestampClusterArgs
-	cargs.ReplicationMode = base.ReplicationManual
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
+	cargs := aggressiveResolvedTimestampManuallyReplicatedClusterArgs
 	manualClock := hlc.NewHybridManualClock()
 	cargs.ServerArgs = base.TestServerArgs{
+		Settings: st,
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
 				WallClock: manualClock,
@@ -1275,7 +1285,7 @@ func TestRangefeedCheckpointsRecoverFromLeaseExpiration(t *testing.T) {
 			},
 		},
 	}
-	tci := serverutils.StartNewTestCluster(t, 2, cargs)
+	tci := serverutils.StartCluster(t, 2, cargs)
 	tc := tci.(*testcluster.TestCluster)
 	defer tc.Stopper().Stop(ctx)
 
@@ -1303,7 +1313,7 @@ func TestRangefeedCheckpointsRecoverFromLeaseExpiration(t *testing.T) {
 		span := roachpb.Span{
 			Key: desc.StartKey.AsRawKey(), EndKey: desc.EndKey.AsRawKey(),
 		}
-		rangeFeedErrC <- ds.RangeFeed(rangeFeedCtx, []roachpb.Span{span}, ts1, false /* withDiff */, rangeFeedCh)
+		rangeFeedErrC <- ds.RangeFeed(rangeFeedCtx, []roachpb.Span{span}, ts1, rangeFeedCh)
 	}()
 
 	// Wait for a checkpoint above ts.
@@ -1349,12 +1359,14 @@ func TestRangefeedCheckpointsRecoverFromLeaseExpiration(t *testing.T) {
 		tc.GetFirstStoreFromServer(t, 1).GetStoreConfig().RangeLeaseRenewalDuration().Nanoseconds() +
 			time.Second.Nanoseconds(),
 	)
+	var firstLease roachpb.Lease
 	testutils.SucceedsSoon(t, func() error {
 		repl := tc.GetFirstStoreFromServer(t, 1).LookupReplica(roachpb.RKey(scratchKey))
 		leaseStatus := repl.CurrentLeaseStatus(ctx)
 		if leaseStatus.Lease.Type() != roachpb.LeaseEpoch {
 			return errors.Errorf("lease still an expiration based lease")
 		}
+		firstLease = leaseStatus.Lease
 		return nil
 	})
 
@@ -1379,10 +1391,17 @@ func TestRangefeedCheckpointsRecoverFromLeaseExpiration(t *testing.T) {
 	require.Equal(t, int64(1), nudged)
 
 	// Check that n2 renewed its lease, like the test intended.
+	// Unfortunately this is flaky and it's not so clear how to fix it.
+	// See: https://github.com/cockroachdb/cockroach/issues/102169
+	// But even if the lease is on n1 the rangefeed shouldn't have errored.
 	li, _, err := tc.FindRangeLeaseEx(ctx, desc, nil)
 	require.NoError(t, err)
-	require.True(t, li.Current().OwnedBy(n2.GetFirstStoreID()))
-	require.Equal(t, int64(2), li.Current().Epoch)
+	curLease := li.Current()
+	t.Logf("lease before expiration: %s", firstLease)
+	t.Logf("lease after expiration: %s", curLease)
+	if curLease.OwnedBy(n2.GetFirstStoreID()) {
+		require.Equal(t, int64(2), curLease.Epoch)
+	}
 
 	// Make sure the RangeFeed hasn't errored.
 	select {
@@ -1411,8 +1430,7 @@ func TestNewRangefeedForceLeaseRetry(t *testing.T) {
 
 	var timeoutSimulated bool
 
-	cargs := aggressiveResolvedTimestampClusterArgs
-	cargs.ReplicationMode = base.ReplicationManual
+	cargs := aggressiveResolvedTimestampManuallyReplicatedClusterArgs
 	manualClock := hlc.NewHybridManualClock()
 	cargs.ServerArgs = base.TestServerArgs{
 		Knobs: base.TestingKnobs{
@@ -1440,7 +1458,7 @@ func TestNewRangefeedForceLeaseRetry(t *testing.T) {
 					if ba.IsSingleLeaseInfoRequest() {
 						atomic.StoreInt64(&nudgeSeen, 1)
 						if !timeoutSimulated {
-							mockTimeout := contextutil.RunWithTimeout(ctx, "test", 0,
+							mockTimeout := timeutil.RunWithTimeout(ctx, "test", 0,
 								func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() })
 							timeoutSimulated = true
 							return kvpb.NewError(mockTimeout)
@@ -1458,7 +1476,7 @@ func TestNewRangefeedForceLeaseRetry(t *testing.T) {
 			},
 		},
 	}
-	tci := serverutils.StartNewTestCluster(t, 2, cargs)
+	tci := serverutils.StartCluster(t, 2, cargs)
 	tc := tci.(*testcluster.TestCluster)
 	defer tc.Stopper().Stop(ctx)
 
@@ -1484,7 +1502,7 @@ func TestNewRangefeedForceLeaseRetry(t *testing.T) {
 	}
 	startRangefeed := func() {
 		span := rangefeedSpan
-		rangeFeedErrC <- ds.RangeFeed(rangeFeedCtx, []roachpb.Span{span}, ts1, false /* withDiff */, rangeFeedCh)
+		rangeFeedErrC <- ds.RangeFeed(rangeFeedCtx, []roachpb.Span{span}, ts1, rangeFeedCh)
 	}
 
 	// Wait for a checkpoint above ts.

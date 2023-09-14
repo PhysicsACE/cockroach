@@ -1,6 +1,5 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "builtins",
@@ -9,6 +8,7 @@ go_library(
         "all_builtins.go",
         "builtins.go",
         "compression.go",
+        "fingerprint_builtins.go",
         "fixed_oids.go",
         "generator_builtins.go",
         "generator_probe_ranges.go",
@@ -49,7 +49,6 @@ go_library(
         "//pkg/kv",
         "//pkg/kv/kvclient",
         "//pkg/kv/kvpb",
-        "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/repstream/streampb",
         "//pkg/roachpb",
@@ -68,6 +67,7 @@ go_library(
         "//pkg/sql/lexbase",
         "//pkg/sql/memsize",
         "//pkg/sql/oidext",
+        "//pkg/sql/opt/workloadindexrec",
         "//pkg/sql/parser",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
@@ -81,6 +81,7 @@ go_library(
         "//pkg/sql/sem/asof",
         "//pkg/sql/sem/builtins/builtinconstants",
         "//pkg/sql/sem/builtins/builtinsregistry",
+        "//pkg/sql/sem/builtins/pgcrypto",
         "//pkg/sql/sem/builtins/pgformat",
         "//pkg/sql/sem/cast",
         "//pkg/sql/sem/catconstants",
@@ -90,6 +91,7 @@ go_library(
         "//pkg/sql/sem/volatility",
         "//pkg/sql/sessiondata",
         "//pkg/sql/sessiondatapb",
+        "//pkg/sql/sqlerrors",
         "//pkg/sql/sqlliveness",
         "//pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil",
         "//pkg/sql/sqltelemetry",
@@ -97,14 +99,14 @@ go_library(
         "//pkg/sql/storageparam/indexstorageparam",
         "//pkg/sql/types",
         "//pkg/storage",
+        "//pkg/storage/enginepb",
         "//pkg/util",
         "//pkg/util/admission/admissionpb",
         "//pkg/util/arith",
         "//pkg/util/bitarray",
-        "//pkg/util/contextutil",
         "//pkg/util/duration",
         "//pkg/util/encoding",
-        "//pkg/util/errorutil",
+        "//pkg/util/envutil",
         "//pkg/util/errorutil/unimplemented",
         "//pkg/util/fuzzystrmatch",
         "//pkg/util/hlc",
@@ -118,6 +120,7 @@ go_library(
         "//pkg/util/randident",
         "//pkg/util/randident/randidentcfg",
         "//pkg/util/randutil",
+        "//pkg/util/rangedesc",
         "//pkg/util/ring",
         "//pkg/util/syncutil",
         "//pkg/util/timeofday",
@@ -175,7 +178,6 @@ go_test(
     embed = [":builtins"],
     deps = [
         "//pkg/base",
-        "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
@@ -197,8 +199,10 @@ go_test(
         "//pkg/sql/sem/volatility",
         "//pkg/sql/types",
         "//pkg/storage",
+        "//pkg/storage/enginepb",
         "//pkg/testutils",
         "//pkg/testutils/datapathutils",
+        "//pkg/testutils/fingerprintutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
@@ -217,6 +221,7 @@ go_test(
         "@com_github_lib_pq//oid",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_x_exp//constraints",
     ],
 )
 
@@ -230,5 +235,3 @@ disallowed_imports_test(
         "//pkg/sql/catalog/typedesc",
     ],
 )
-
-get_x_data(name = "get_x_data")

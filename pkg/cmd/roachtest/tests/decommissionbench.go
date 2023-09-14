@@ -51,7 +51,7 @@ const (
 	bytesUsedMetric    = "targetBytesUsed"
 
 	// Used to calculate estimated decommission time. Should remain in sync with
-	// setting `kv.snapshot_recovery.max_rate` in store_snapshot.go.
+	// setting `kv.snapshot_rebalance.max_rate` in store_snapshot.go.
 	defaultSnapshotRateMb = 32
 
 	// Skip message for tests not meant to be run nightly.
@@ -287,14 +287,16 @@ func registerDecommissionBenchSpec(r registry.Registry, benchSpec decommissionBe
 	r.Add(registry.TestSpec{
 		Name: fmt.Sprintf("decommissionBench/nodes=%d/warehouses=%d%s",
 			benchSpec.nodes, benchSpec.warehouses, extraName),
-		Owner: registry.OwnerKV,
+		Owner:     registry.OwnerKV,
+		Benchmark: true,
 		Cluster: r.MakeClusterSpec(
 			benchSpec.nodes+addlNodeCount+1,
 			specOptions...,
 		),
-		Timeout:           timeout,
-		NonReleaseBlocker: true,
-		Skip:              benchSpec.skip,
+		SkipPostValidations: registry.PostValidationNoDeadNodes,
+		Timeout:             timeout,
+		NonReleaseBlocker:   true,
+		Skip:                benchSpec.skip,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			if benchSpec.duration > 0 {
 				runDecommissionBenchLong(ctx, t, c, benchSpec, timeout)
@@ -378,19 +380,28 @@ func setupDecommissionBench(
 			"--vmodule=store_rebalancer=5,allocator=5,allocator_scorer=5,replicate_queue=5")
 		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.Node(i))
 	}
-
-	t.Status(fmt.Sprintf("initializing cluster with %d warehouses", benchSpec.warehouses))
-	c.Run(ctx, c.Node(pinnedNode), importCmd)
-
 	{
 		db := c.Conn(ctx, t.L(), pinnedNode)
 		defer db.Close()
 
+		// Note that we are waiting for 3 replicas only. We can't assume 5 replicas
+		// here because 5 only applies to system ranges so we will never reach this
+		// number globally. We also don't know if all upreplication succeeded, but
+		// at least we should have 2 voter replicas running by the time this method
+		// succeeds and that should be enough to make progress. Without this check
+		// import can saturate snapshots and leave underreplicated system ranges
+		// struggling.
+		// See GH issue #101532 for longer term solution.
+		if err := WaitForReplication(ctx, t, db, 3, atLeastReplicationFactor); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Status(fmt.Sprintf("initializing cluster with %d warehouses", benchSpec.warehouses))
+		c.Run(ctx, c.Node(pinnedNode), importCmd)
+
 		if benchSpec.snapshotRate != 0 {
 			for _, stmt := range []string{
 				fmt.Sprintf(`SET CLUSTER SETTING kv.snapshot_rebalance.max_rate='%dMiB'`,
-					benchSpec.snapshotRate),
-				fmt.Sprintf(`SET CLUSTER SETTING kv.snapshot_recovery.max_rate='%dMiB'`,
 					benchSpec.snapshotRate),
 			} {
 				t.Status(stmt)

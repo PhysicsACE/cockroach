@@ -26,12 +26,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -111,7 +114,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	}
 
 	cmdPos++
-	if err = buf.Push(ctx, Sync{}); err != nil {
+	if err = buf.Push(ctx, Sync{ExplicitFromClient: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -137,7 +140,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmdPos++
-	if err = buf.Push(ctx, Sync{}); err != nil {
+	if err = buf.Push(ctx, Sync{ExplicitFromClient: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -211,7 +214,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	}
 
 	cmdPos++
-	if err = buf.Push(ctx, Sync{}); err != nil {
+	if err = buf.Push(ctx, Sync{ExplicitFromClient: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,7 +239,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	}
 }
 
-func mustParseOne(s string) parser.Statement {
+func mustParseOne(s string) statements.Statement[tree.Statement] {
 	stmts, err := parser.Parse(s)
 	if err != nil {
 		log.Fatalf(context.Background(), "%v", err)
@@ -261,7 +264,14 @@ func mustParseOne(s string) parser.Statement {
 // need to read from it.
 func startConnExecutor(
 	ctx context.Context,
-) (*StmtBuf, <-chan []resWithPos, <-chan error, *stop.Stopper, ieResultReader, error) {
+) (
+	*StmtBuf,
+	<-chan []*streamingCommandResult,
+	<-chan error,
+	*stop.Stopper,
+	ieResultReader,
+	error,
+) {
 	// A lot of boilerplate for creating a connExecutor.
 	stopper := stop.NewStopper()
 	clock := hlc.NewClockForTesting(nil)
@@ -287,6 +297,7 @@ func startConnExecutor(
 	)
 	// This pool should never be Stop()ed because, if the test is failing, memory
 	// is not properly released.
+	collectionFactory := descs.NewBareBonesCollectionFactory(st, keys.SystemSQLCodec)
 	cfg := &ExecutorConfig{
 		AmbientCtx: ambientCtx,
 		Settings:   st,
@@ -315,6 +326,7 @@ func startConnExecutor(
 					NodeID:            nodeID,
 					TempFS:            tempFS,
 					ParentDiskMonitor: execinfra.NewTestDiskMonitor(ctx, st),
+					CollectionFactory: collectionFactory,
 				},
 				flowinfra.NewRemoteFlowRunner(ambientCtx, stopper, nil /* acc */),
 			),
@@ -324,7 +336,7 @@ func startConnExecutor(
 			stopper,
 			func(base.SQLInstanceID) bool { return true }, // everybody is available
 			nil, /* connHealthCheckerSystem */
-			nil, /* podNodeDialer */
+			nil, /* sqlInstanceDialer */
 			keys.SystemSQLCodec,
 			nil, /* sqlAddressResolver */
 			clock,
@@ -333,15 +345,15 @@ func startConnExecutor(
 		TestingKnobs:            ExecutorTestingKnobs{},
 		StmtDiagnosticsRecorder: stmtdiagnostics.NewRegistry(nil, st),
 		HistogramWindowInterval: base.DefaultHistogramWindowInterval(),
-		CollectionFactory:       descs.NewBareBonesCollectionFactory(st, keys.SystemSQLCodec),
+		CollectionFactory:       collectionFactory,
 	}
 
 	s := NewServer(cfg, pool)
 	buf := NewStmtBuf()
-	syncResults := make(chan []resWithPos, 1)
+	syncResults := make(chan []*streamingCommandResult, 1)
 	resultChannel := newAsyncIEResultChannel()
 	var cc ClientComm = &internalClientComm{
-		sync: func(res []resWithPos) {
+		sync: func(res []*streamingCommandResult) {
 			syncResults <- res
 		},
 		w: resultChannel,
@@ -349,7 +361,15 @@ func startConnExecutor(
 	sqlMetrics := MakeMemMetrics("test" /* endpoint */, time.Second /* histogramWindow */)
 
 	onDefaultIntSizeChange := func(int32) {}
-	conn, err := s.SetupConn(ctx, SessionArgs{}, buf, cc, sqlMetrics, onDefaultIntSizeChange)
+	conn, err := s.SetupConn(
+		ctx,
+		SessionArgs{},
+		buf,
+		cc,
+		sqlMetrics,
+		onDefaultIntSizeChange,
+		clusterunique.ID{},
+	)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -359,7 +379,12 @@ func startConnExecutor(
 	// routine, we're going to push commands into the StmtBuf and, from time to
 	// time, collect and check their results.
 	go func() {
-		finished <- s.ServeConn(ctx, conn, &mon.BoundAccount{}, nil /* cancel */)
+		finished <- s.ServeConn(
+			ctx,
+			conn,
+			&mon.BoundAccount{},
+			nil, /* cancel */
+		)
 	}()
 	return buf, syncResults, finished, stopper, resultChannel, nil
 }
@@ -373,19 +398,27 @@ func TestSessionCloseWithPendingTempTableInTxn(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	srv := s.SQLServer().(*Server)
 	stmtBuf := NewStmtBuf()
-	flushed := make(chan []resWithPos)
+	flushed := make(chan []*streamingCommandResult)
 	clientComm := &internalClientComm{
-		sync: func(res []resWithPos) {
+		sync: func(res []*streamingCommandResult) {
 			flushed <- res
 		},
 	}
 	onDefaultIntSizeChange := func(int32) {}
-	connHandler, err := srv.SetupConn(ctx, SessionArgs{User: username.RootUserName()}, stmtBuf, clientComm, MemoryMetrics{}, onDefaultIntSizeChange)
+	connHandler, err := srv.SetupConn(
+		ctx,
+		SessionArgs{User: username.RootUserName()},
+		stmtBuf,
+		clientComm,
+		MemoryMetrics{},
+		onDefaultIntSizeChange,
+		clusterunique.ID{},
+	)
 	require.NoError(t, err)
 
 	stmts, err := parser.Parse(`
@@ -399,11 +432,16 @@ CREATE TEMPORARY TABLE foo();
 	for _, stmt := range stmts {
 		require.NoError(t, stmtBuf.Push(ctx, ExecStmt{Statement: stmt}))
 	}
-	require.NoError(t, stmtBuf.Push(ctx, Sync{}))
+	require.NoError(t, stmtBuf.Push(ctx, Sync{ExplicitFromClient: false}))
 
 	done := make(chan error)
 	go func() {
-		done <- srv.ServeConn(ctx, connHandler, &mon.BoundAccount{}, nil /* cancel */)
+		done <- srv.ServeConn(
+			ctx,
+			connHandler,
+			&mon.BoundAccount{},
+			nil, /* cancel */
+		)
 	}()
 	results := <-flushed
 	require.Len(t, results, 6) // We expect results for 5 statements + sync.

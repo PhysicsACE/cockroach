@@ -10,7 +10,6 @@
 
 import React from "react";
 import { Anchor } from "src/anchor";
-import moment from "moment";
 
 import { Tooltip } from "@cockroachlabs/ui-components";
 import {
@@ -23,8 +22,7 @@ import {
   statementsSql,
   writtenToDisk,
 } from "src/util";
-
-export type NodeNames = { [nodeId: string]: string };
+import { Timezone } from "src/timestamp";
 
 // Single place for column names. Used in table columns and in columns selector.
 export const statisticsColumnLabels = {
@@ -37,7 +35,7 @@ export const statisticsColumnLabels = {
   database: "Database",
   diagnostics: "Diagnostics",
   executionCount: "Execution Count",
-  lastExecTimestamp: "Last Execution Time (UTC)",
+  lastExecTimestamp: "Last Execution Time",
   latencyMax: "Max Latency",
   latencyMin: "Min Latency",
   latencyP50: "P50 Latency",
@@ -56,10 +54,10 @@ export const statisticsColumnLabels = {
   rowsProcessed: "Rows Processed",
   sessionActiveDuration: "Session Active Duration",
   sessionDuration: "Session Duration",
-  sessionStart: "Session Start Time (UTC)",
+  sessionStart: "Session Start Time",
   sessionTxnCount: "Transaction Count",
   statementFingerprintId: "Statement Fingerprint ID",
-  statementStartTime: "Statement Start Time (UTC)",
+  statementStartTime: "Statement Start Time",
   statements: "Statements",
   statementsCount: "Statements",
   status: "Status",
@@ -129,7 +127,9 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         placement="bottom"
         content={"The timestamp at which the session started."}
       >
-        {getLabel("sessionStart")}
+        <>
+          {getLabel("sessionStart")} <Timezone />
+        </>
       </Tooltip>
     );
   },
@@ -201,7 +201,9 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         placement="bottom"
         content={"The timestamp at which the statement started."}
       >
-        {getLabel("statementStartTime")}
+        <>
+          {getLabel("statementStartTime")} <Timezone />
+        </>
       </Tooltip>
     );
   },
@@ -469,7 +471,9 @@ export const statisticsTableTitles: StatisticTableTitleType = {
           <p>Last time stamp on which the {contentModifier} was executed.</p>
         }
       >
-        {getLabel("lastExecTimestamp")}
+        <>
+          {getLabel("lastExecTimestamp")} <Timezone />
+        </>
       </Tooltip>
     );
   },
@@ -910,7 +914,7 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         style="tableTitle"
         content={
           <p>
-            The highest latency value in the sampled {contentModifier}
+            The highest latency value for all {contentModifier}
             executions with this fingerprint.
           </p>
         }
@@ -936,8 +940,8 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         style="tableTitle"
         content={
           <p>
-            The lowest latency value in the sampled {contentModifier} executions
-            with this fingerprint.
+            The lowest latency value for all {contentModifier} executions with
+            this fingerprint.
           </p>
         }
       >
@@ -962,8 +966,8 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         style="tableTitle"
         content={
           <p>
-            The 50th latency percentile for {contentModifier} executions with
-            this fingerprint.
+            The 50th latency percentile for sampled {contentModifier} executions
+            with this fingerprint.
           </p>
         }
       >
@@ -988,8 +992,8 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         style="tableTitle"
         content={
           <p>
-            The 90th latency percentile for {contentModifier} executions with
-            this fingerprint.
+            The 90th latency percentile for sampled {contentModifier} executions
+            with this fingerprint.
           </p>
         }
       >
@@ -1014,8 +1018,8 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         style="tableTitle"
         content={
           <p>
-            The 99th latency percentile for {contentModifier} executions with
-            this fingerprint.
+            The 99th latency percentile for sampled {contentModifier} executions
+            with this fingerprint.
           </p>
         }
       >

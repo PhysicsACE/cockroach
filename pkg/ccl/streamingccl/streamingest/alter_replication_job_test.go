@@ -41,7 +41,7 @@ func TestAlterTenantCompleteToTime(t *testing.T) {
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 
 	var cutoverTime time.Time
 	c.DestSysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&cutoverTime)
@@ -68,14 +68,14 @@ func TestAlterTenantCompleteToLatest(t *testing.T) {
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 
-	highWater := c.SrcCluster.Server(0).Clock().Now()
-	c.WaitUntilHighWatermark(highWater, jobspb.JobID(ingestionJobID))
+	targetReplicatedTime := c.SrcCluster.Server(0).Clock().Now()
+	c.WaitUntilReplicatedTime(targetReplicatedTime, jobspb.JobID(ingestionJobID))
 
 	var cutoverStr string
 	c.DestSysSQL.QueryRow(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO LATEST`,
 		args.DestTenantName).Scan(&cutoverStr)
 	cutoverOutput := replicationtestutils.DecimalTimeToHLC(t, cutoverStr)
-	require.GreaterOrEqual(t, cutoverOutput.GoTime(), highWater.GoTime())
+	require.GreaterOrEqual(t, cutoverOutput.GoTime(), targetReplicatedTime.GoTime())
 	require.LessOrEqual(t, cutoverOutput.GoTime(), c.SrcCluster.Server(0).Clock().Now().GoTime())
 	jobutils.WaitForJobToSucceed(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 }
@@ -94,7 +94,7 @@ func TestAlterTenantPauseResume(t *testing.T) {
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 
 	// Pause the replication job.
 	c.DestSysSQL.Exec(t, `ALTER TENANT $1 PAUSE REPLICATION`, args.DestTenantName)
@@ -104,7 +104,7 @@ func TestAlterTenantPauseResume(t *testing.T) {
 	c.DestSysSQL.Exec(t, `ALTER TENANT $1 RESUME REPLICATION`, args.DestTenantName)
 	jobutils.WaitForJobToRun(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 	var cutoverTime time.Time
 	c.DestSysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&cutoverTime)
 
@@ -114,7 +114,7 @@ func TestAlterTenantPauseResume(t *testing.T) {
 	cutoverOutput := replicationtestutils.DecimalTimeToHLC(t, cutoverStr)
 	require.Equal(t, cutoverTime, cutoverOutput.GoTime())
 	jobutils.WaitForJobToSucceed(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-	cleanupTenant := c.CreateDestTenantSQL(ctx)
+	cleanupTenant := c.StartDestTenant(ctx)
 	defer func() {
 		require.NoError(t, cleanupTenant())
 	}()
@@ -133,8 +133,8 @@ func TestAlterTenantPauseResume(t *testing.T) {
 
 	t.Run("pause-resume-in-readonly-txn", func(t *testing.T) {
 		c.DestSysSQL.Exec(t, `set default_transaction_read_only = on;`)
-		c.DestSysSQL.ExpectErr(t, "cannot execute ALTER TENANT REPLICATION in a read-only transaction", `ALTER TENANT $1 PAUSE REPLICATION`, "foo")
-		c.DestSysSQL.ExpectErr(t, "cannot execute ALTER TENANT REPLICATION in a read-only transaction", `ALTER TENANT $1 RESUME REPLICATION`, "foo")
+		c.DestSysSQL.ExpectErr(t, "cannot execute ALTER VIRTUAL CLUSTER REPLICATION in a read-only transaction", `ALTER TENANT $1 PAUSE REPLICATION`, "foo")
+		c.DestSysSQL.ExpectErr(t, "cannot execute ALTER VIRTUAL CLUSTER REPLICATION in a read-only transaction", `ALTER TENANT $1 RESUME REPLICATION`, "foo")
 		c.DestSysSQL.Exec(t, `set default_transaction_read_only = off;`)
 	})
 
@@ -176,12 +176,12 @@ func TestAlterTenantUpdateExistingCutoverTime(t *testing.T) {
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 
-	highWater := c.SrcCluster.Server(0).Clock().Now()
-	c.WaitUntilHighWatermark(highWater, jobspb.JobID(ingestionJobID))
+	replicatedTimeTarget := c.SrcCluster.Server(0).Clock().Now()
+	c.WaitUntilReplicatedTime(replicatedTimeTarget, jobspb.JobID(ingestionJobID))
 
 	// First cutover to a future time.
 	var cutoverStr string
-	cutoverTime := highWater.Add(time.Hour.Nanoseconds(), 0)
+	cutoverTime := replicatedTimeTarget.Add(time.Hour.Nanoseconds(), 0)
 	c.DestSysSQL.QueryRow(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`,
 		args.DestTenantName, cutoverTime.AsOfSystemTime()).Scan(&cutoverStr)
 	cutoverOutput := replicationtestutils.DecimalTimeToHLC(t, cutoverStr)
@@ -190,7 +190,7 @@ func TestAlterTenantUpdateExistingCutoverTime(t *testing.T) {
 	require.Equal(t, cutoverOutput, getCutoverTime())
 
 	// And cutover to an even further time.
-	cutoverTime = highWater.Add((time.Hour * 2).Nanoseconds(), 0)
+	cutoverTime = replicatedTimeTarget.Add((time.Hour * 2).Nanoseconds(), 0)
 	c.DestSysSQL.QueryRow(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`,
 		args.DestTenantName, cutoverTime.AsOfSystemTime()).Scan(&cutoverStr)
 	cutoverOutput = replicationtestutils.DecimalTimeToHLC(t, cutoverStr)
@@ -242,7 +242,7 @@ func TestAlterTenantFailUpdatingCutoverTime(t *testing.T) {
 
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 
 	require.Equal(c.T, "replicating", getTenantStatus())
 
@@ -303,8 +303,8 @@ func TestTenantStatusWithFutureCutoverTime(t *testing.T) {
 	waitBeforeCh := make(chan struct{})
 	waitAfterCh := make(chan struct{})
 	registry := c.DestSysServer.JobRegistry().(*jobs.Registry)
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-		jobspb.TypeStreamIngestion: func(raw jobs.Resumer) jobs.Resumer {
+	registry.TestingWrapResumerConstructor(jobspb.TypeReplicationStreamIngestion,
+		func(raw jobs.Resumer) jobs.Resumer {
 			r := blockingResumer{
 				orig:       raw,
 				waitBefore: waitBeforeCh,
@@ -312,8 +312,7 @@ func TestTenantStatusWithFutureCutoverTime(t *testing.T) {
 				ctx:        ctx,
 			}
 			return &r
-		},
-	}
+		})
 	defer ctxCancel()
 	unblockResumerStart := func() {
 		waitBeforeCh <- struct{}{}
@@ -338,7 +337,7 @@ func TestTenantStatusWithFutureCutoverTime(t *testing.T) {
 
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 
 	require.Equal(c.T, "replicating", getTenantStatus())
 
@@ -352,18 +351,19 @@ func TestTenantStatusWithFutureCutoverTime(t *testing.T) {
 	c.DestSysSQL.Exec(t, `ALTER TENANT $1 RESUME REPLICATION`, args.DestTenantName)
 	unblockResumerStart()
 	jobutils.WaitForJobToRun(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 
 	require.Equal(c.T, "replicating", getTenantStatus())
 
 	// Cutover to a time far in the future, to make sure we see the pending-cutover state.
 	var cutoverTime time.Time
 	c.DestSysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&cutoverTime)
-	cutoverTime.Add(time.Hour * 24)
+	cutoverTime = cutoverTime.Add(time.Hour * 24)
 	c.DestSysSQL.Exec(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`,
 		args.DestTenantName, cutoverTime)
 
 	require.Equal(c.T, "replication pending cutover", getTenantStatus())
+	c.DestSysSQL.Exec(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO LATEST`, args.DestTenantName)
 	unblockResumerExit()
 	jobutils.WaitForJobToSucceed(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 	require.Equal(c.T, "ready", getTenantStatus())
@@ -391,8 +391,8 @@ func TestTenantStatusWithLatestCutoverTime(t *testing.T) {
 	waitBeforeCh := make(chan struct{})
 	waitAfterCh := make(chan struct{})
 	registry := c.DestSysServer.JobRegistry().(*jobs.Registry)
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-		jobspb.TypeStreamIngestion: func(raw jobs.Resumer) jobs.Resumer {
+	registry.TestingWrapResumerConstructor(jobspb.TypeReplicationStreamIngestion,
+		func(raw jobs.Resumer) jobs.Resumer {
 			r := blockingResumer{
 				orig:       raw,
 				waitBefore: waitBeforeCh,
@@ -400,8 +400,7 @@ func TestTenantStatusWithLatestCutoverTime(t *testing.T) {
 				ctx:        ctx,
 			}
 			return &r
-		},
-	}
+		})
 	defer ctxCancel()
 	unblockResumerStart := func() {
 		waitBeforeCh <- struct{}{}
@@ -424,7 +423,7 @@ func TestTenantStatusWithLatestCutoverTime(t *testing.T) {
 
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 
 	require.Equal(c.T, "replicating", getTenantStatus())
 
@@ -461,7 +460,7 @@ func TestTenantReplicationStatus(t *testing.T) {
 
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 
 	registry := c.DestSysServer.JobRegistry().(*jobs.Registry)
 
@@ -498,7 +497,7 @@ func TestAlterTenantHandleFutureProtectedTimestamp(t *testing.T) {
 
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-	c.WaitUntilHighWatermark(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), jobspb.JobID(ingestionJobID))
 
 	c.DestSysSQL.Exec(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO LATEST`, args.DestTenantName)
 }

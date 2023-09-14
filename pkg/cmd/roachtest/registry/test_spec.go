@@ -12,7 +12,9 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -44,10 +46,18 @@ type TestSpec struct {
 	// associated cluster expires. The timeout is always truncated to 10m before
 	// the test's cluster expires.
 	Timeout time.Duration
+	// Denotes whether the test is a roachperf benchmark. If true, the test is expected, but not required, to produce
+	// artifacts in Test.PerfArtifactsDir(), which get exported to the roachperf dashboard
+	// (see getPerfArtifacts() in test_runner.go).
+	// N.B. performance tests may choose to _assert_ on latency, throughput, or some other perf. metric, _without_
+	// exporting artifacts to the dashboard. E.g., see 'registerKVContention' and 'verifyTxnPerSecond'.
+	// N.B. performance tests may have different requirements than correctness tests, e.g., machine type/architecture.
+	// Thus, they must be opted into explicitly via this field.
+	Benchmark bool
 	// Tags is a set of tags associated with the test that allow grouping
 	// tests. If no tags are specified, the set ["default"] is automatically
 	// given.
-	Tags []string
+	Tags map[string]struct{}
 	// Cluster provides the specification for the cluster to use for the test.
 	Cluster spec.ClusterSpec
 	// NativeLibs specifies the native libraries required to be present on
@@ -84,9 +94,51 @@ type TestSpec struct {
 	// cannot be run with encryption enabled.
 	EncryptionSupport EncryptionSupport
 
+	// Leases specifies the kind of leases to use for the cluster. Defaults
+	// to epoch leases.
+	Leases LeaseType
+
+	// SkipPostValidations is a bit-set of post-validations that should be skipped
+	// after the test completes. This is useful for tests that are known to be
+	// incompatible with some validations. By default, tests will run all
+	// validations.
+	SkipPostValidations PostValidation
+
 	// Run is the test function.
 	Run func(ctx context.Context, t test.Test, c cluster.Cluster)
+
+	// True iff results from this test should not be published externally,
+	// e.g. to GitHub.
+	RedactResults bool
+
+	// SnapshotPrefix is set by tests that make use of volume snapshots.
+	// Prefixes must be not only be unique across tests, but one cannot be a
+	// prefix of another.
+	//
+	// TODO(irfansharif): Search by taking in the other parts of the snapshot
+	// fingerprint, i.e. the node count, the version, etc. that appear in the
+	// infix. This will get rid of this awkward prefix naming restriction.
+	SnapshotPrefix string
+
+	// ExtraLabels are test-specific labels that will be added to the Github
+	// issue created when a failure occurs, in addition to default labels.
+	ExtraLabels []string
 }
+
+// PostValidation is a type of post-validation that runs after a test completes.
+type PostValidation int
+
+const (
+	// PostValidationReplicaDivergence detects replica divergence (i.e. ranges in
+	// which replicas have arrived at the same log position with different
+	// states).
+	PostValidationReplicaDivergence PostValidation = 1 << iota
+	// PostValidationInvalidDescriptors checks if there exists any descriptors in
+	// the crdb_internal.invalid_objects virtual table.
+	PostValidationInvalidDescriptors
+	// PostValidationNoDeadNodes checks if there are any dead nodes in the cluster.
+	PostValidationNoDeadNodes
+)
 
 // MatchType is the type of match a file has to a TestFilter.
 type MatchType int
@@ -108,17 +160,18 @@ func (t *TestSpec) Match(filter *TestFilter) MatchType {
 	if !filter.Name.MatchString(t.Name) {
 		return FailedFilter
 	}
-	if len(t.Tags) == 0 {
-		if !filter.Tag.MatchString("default") {
-			return FailedTags
-		}
+
+	if len(filter.Tags) == 0 {
 		return Matched
 	}
-	for _, t := range t.Tags {
-		if filter.Tag.MatchString(t) {
+
+	for tag := range filter.Tags {
+		// If the tag is a single CSV e.g. "foo,bar,baz", we match all the tags
+		if matchesAll(t.Tags, strings.Split(tag, ",")) {
 			return Matched
 		}
 	}
+
 	return FailedTags
 }
 
@@ -129,3 +182,58 @@ func PromSub(raw string) string {
 	invalidPromRE := regexp.MustCompile("[^a-zA-Z0-9_]")
 	return invalidPromRE.ReplaceAllLiteralString(raw, "_")
 }
+
+func matchesAll(testTags map[string]struct{}, filterTags []string) bool {
+	for _, tag := range filterTags {
+		negate := false
+		if tag[0] == '!' {
+			negate = true
+			tag = tag[1:]
+		}
+		_, tagExists := testTags[tag]
+
+		if negate == tagExists {
+			return false
+		}
+	}
+	return true
+}
+
+// Tags returns a set of strings.
+func Tags(values ...string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, s := range values {
+		set[s] = struct{}{}
+	}
+	return set
+}
+
+// LeaseType specifies the type of leases to use for the cluster.
+type LeaseType int
+
+func (l LeaseType) String() string {
+	switch l {
+	case DefaultLeases:
+		return "default"
+	case EpochLeases:
+		return "epoch"
+	case ExpirationLeases:
+		return "expiration"
+	case MetamorphicLeases:
+		return "metamorphic"
+	default:
+		return fmt.Sprintf("leasetype-%d", l)
+	}
+}
+
+const (
+	// DefaultLeases uses the default cluster lease type.
+	DefaultLeases = LeaseType(iota)
+	// EpochLeases uses epoch leases where possible.
+	EpochLeases
+	// ExpirationLeases uses expiration leases for all ranges.
+	ExpirationLeases
+	// MetamorphicLeases randomly chooses epoch or expiration
+	// leases (across the entire cluster)
+	MetamorphicLeases
+)

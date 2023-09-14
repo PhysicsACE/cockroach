@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -62,7 +61,7 @@ func TestTenantBackupWithCanceledImport(t *testing.T) {
 	tc, hostSQLDB, hostClusterCleanupFn := backupRestoreTestSetupEmpty(
 		t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 				Knobs: base.TestingKnobs{
 					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 				},
@@ -71,9 +70,6 @@ func TestTenantBackupWithCanceledImport(t *testing.T) {
 	)
 	defer hostClusterCleanupFn()
 
-	hostSQLDB.Exec(t, "SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true")
-	hostSQLDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true")
-
 	tenant10, err := tc.Servers[0].StartTenant(ctx, base.TestTenantArgs{
 		TenantID: roachpb.MustMakeTenantID(10),
 		TestingKnobs: base.TestingKnobs{
@@ -81,8 +77,7 @@ func TestTenantBackupWithCanceledImport(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	tenant10Conn, err := serverutils.OpenDBConnE(tenant10.SQLAddr(), "defaultdb", false, tenant10.Stopper())
-	require.NoError(t, err)
+	tenant10Conn := tenant10.SQLConn(t, "defaultdb")
 	tenant10DB := sqlutils.MakeSQLRunner(tenant10Conn)
 
 	tenant10DB.Exec(t, "CREATE DATABASE bank")
@@ -95,14 +90,14 @@ func TestTenantBackupWithCanceledImport(t *testing.T) {
 	importStmt := fmt.Sprintf(`IMPORT INTO "%s" CSV DATA ('workload:///csv/bank/bank?payload-bytes=100&row-end=1&row-start=0&rows=1000&seed=1&version=1.0.0')`, tableName)
 	tenant10DB.ExpectErr(t, "pause", importStmt)
 
-	hostSQLDB.Exec(t, "BACKUP TENANT 10 INTO 'nodelocal://0/tenant-backup'")
+	hostSQLDB.Exec(t, "BACKUP TENANT 10 INTO 'nodelocal://1/tenant-backup'")
 
 	tenant10DB.Exec(t, "SET CLUSTER SETTING jobs.debug.pausepoints = ''")
 	tenant10DB.Exec(t, "CANCEL JOB (SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'IMPORT' AND status = 'paused')")
 	tenant10DB.Exec(t, "SHOW JOBS WHEN COMPLETE (SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'IMPORT')")
 
-	hostSQLDB.Exec(t, "BACKUP TENANT 10 INTO LATEST IN 'nodelocal://0/tenant-backup'")
-	hostSQLDB.Exec(t, "RESTORE TENANT 10 FROM LATEST IN 'nodelocal://0/tenant-backup' WITH tenant_name = 'tenant-11'")
+	hostSQLDB.Exec(t, "BACKUP TENANT 10 INTO LATEST IN 'nodelocal://1/tenant-backup'")
+	hostSQLDB.Exec(t, "RESTORE TENANT 10 FROM LATEST IN 'nodelocal://1/tenant-backup' WITH virtual_cluster_name = 'tenant-11'")
 
 	tenant11, err := tc.Servers[0].StartTenant(ctx, base.TestTenantArgs{
 		TenantName:          "tenant-11",
@@ -110,8 +105,7 @@ func TestTenantBackupWithCanceledImport(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	tenant11Conn, err := serverutils.OpenDBConnE(tenant11.SQLAddr(), "bank", false, tenant11.Stopper())
-	require.NoError(t, err)
+	tenant11Conn := tenant11.SQLConn(t, "bank")
 	tenant11DB := sqlutils.MakeSQLRunner(tenant11Conn)
 	countQuery := fmt.Sprintf(`SELECT count(1) FROM bank."%s"`, tableName)
 	assertEqualQueries(t, tenant10DB, tenant11DB, countQuery)
@@ -137,7 +131,7 @@ func TestTenantBackupNemesis(t *testing.T) {
 	tc, hostSQLDB, hostClusterCleanupFn := backupRestoreTestSetupEmpty(
 		t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 				Knobs: base.TestingKnobs{
 					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 				},
@@ -146,10 +140,6 @@ func TestTenantBackupNemesis(t *testing.T) {
 	)
 	defer hostClusterCleanupFn()
 
-	// Range tombstones must be enabled for tenant backups to work correctly.
-	hostSQLDB.Exec(t, "SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true")
-	hostSQLDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true")
-
 	tenant10, err := tc.Servers[0].StartTenant(ctx, base.TestTenantArgs{
 		TenantID: roachpb.MustMakeTenantID(10),
 		TestingKnobs: base.TestingKnobs{
@@ -157,9 +147,7 @@ func TestTenantBackupNemesis(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	tenant10Conn, err := serverutils.OpenDBConnE(
-		tenant10.SQLAddr(), "defaultdb", false, tenant10.Stopper())
-	require.NoError(t, err)
+	tenant10Conn := tenant10.SQLConn(t, "defaultdb")
 	_, err = tenant10Conn.Exec("CREATE DATABASE bank")
 	require.NoError(t, err)
 	_, err = tenant10Conn.Exec("USE bank")
@@ -178,13 +166,13 @@ func TestTenantBackupNemesis(t *testing.T) {
 	_, err = workloadsql.Setup(ctx, tenant10Conn, bankData, l)
 	require.NoError(t, err)
 
-	backupLoc := "nodelocal://0/tenant-backup"
+	backupLoc := "nodelocal://1/tenant-backup"
 
 	backupDone := make(chan struct{})
 	g := ctxgroup.WithContext(ctx)
 	g.GoCtx(func(ctx context.Context) error {
 		pgURL, cleanupGoDB, err := sqlutils.PGUrlE(
-			tenant10.SQLAddr(), "workload-worker" /* prefix */, url.User(username.RootUser))
+			tenant10.AdvSQLAddr(), "workload-worker" /* prefix */, url.User(username.RootUser))
 		if err != nil {
 			return err
 		}
@@ -245,7 +233,7 @@ func TestTenantBackupNemesis(t *testing.T) {
 	})
 
 	require.NoError(t, g.Wait())
-	restoreQuery := fmt.Sprintf("RESTORE TENANT 10 FROM LATEST IN '%s' AS OF SYSTEM TIME %s WITH tenant_name = 'tenant-11'", backupLoc, aost)
+	restoreQuery := fmt.Sprintf("RESTORE TENANT 10 FROM LATEST IN '%s' AS OF SYSTEM TIME %s WITH virtual_cluster_name = 'tenant-11'", backupLoc, aost)
 	t.Logf("backup-nemesis: restoring tenant 10 into 11: %s", restoreQuery)
 	hostSQLDB.Exec(t, restoreQuery)
 
@@ -259,9 +247,7 @@ func TestTenantBackupNemesis(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	tenant11Conn, err := serverutils.OpenDBConnE(
-		tenant11.SQLAddr(), "bank", false, tenant11.Stopper())
-	require.NoError(t, err)
+	tenant11Conn := tenant11.SQLConn(t, "bank")
 
 	tenant10SQLDB := sqlutils.MakeSQLRunner(tenant10Conn)
 	tenant11SQLDB := sqlutils.MakeSQLRunner(tenant11Conn)

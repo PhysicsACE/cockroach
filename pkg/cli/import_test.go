@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -59,7 +60,7 @@ func runImportCLICommand(
 	data, err := os.ReadFile(dumpFilePath)
 	require.NoError(t, err)
 	userfileURI := constructUserfileDestinationURI(dumpFilePath, "", username.RootUserName())
-	checkUserFileContent(ctx, t, c.ExecutorConfig(), username.RootUserName(), userfileURI, data)
+	checkUserFileContent(ctx, t, c.Server.ExecutorConfig(), username.RootUserName(), userfileURI, data)
 	select {
 	case knobs.pauseAfterUpload <- struct{}{}:
 	case err := <-errCh:
@@ -72,10 +73,10 @@ func runImportCLICommand(
 
 	// Check that the dump file has been cleaned up after the import CLI command
 	// has completed.
-	store, err := c.ExecutorConfig().(sql.ExecutorConfig).DistSQLSrv.ExternalStorageFromURI(ctx,
+	store, err := c.Server.ExecutorConfig().(sql.ExecutorConfig).DistSQLSrv.ExternalStorageFromURI(ctx,
 		userfileURI, username.RootUserName())
 	require.NoError(t, err)
-	_, err = store.ReadFile(ctx, "")
+	_, _, err = store.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
 	testutils.IsError(err, "file doesn't exist")
 
 	var output []string

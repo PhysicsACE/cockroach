@@ -1,9 +1,13 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "liveness",
-    srcs = ["liveness.go"],
+    srcs = [
+        "cache.go",
+        "liveness.go",
+        "storage.go",
+        "test_helpers.go",
+    ],
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness",
     visibility = ["//visibility:public"],
     deps = [
@@ -14,10 +18,13 @@ go_library(
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/roachpb",
+        "//pkg/rpc",
+        "//pkg/rpc/nodedialer",
         "//pkg/server/telemetry",
+        "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/storage",
-        "//pkg/util/contextutil",
+        "//pkg/util/buildutil",
         "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/log",
@@ -45,14 +52,16 @@ go_test(
     embed = [":liveness"],
     deps = [
         "//pkg/base",
+        "//pkg/gossip",
         "//pkg/kv/kvserver",
-        "//pkg/kv/kvserver/allocator/storepool",
+        "//pkg/kv/kvserver/allocator/plan",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/roachpb",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/server/serverpb",
+        "//pkg/settings/cluster",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/skip",
@@ -62,7 +71,9 @@ go_test(
         "//pkg/util/log",
         "//pkg/util/protoutil",
         "//pkg/util/randutil",
+        "//pkg/util/stop",
         "//pkg/util/syncutil",
+        "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
         "@com_github_kr_pretty//:pretty",
@@ -70,5 +81,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

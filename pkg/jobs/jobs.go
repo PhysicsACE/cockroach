@@ -19,10 +19,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
@@ -37,37 +38,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"github.com/gogo/protobuf/jsonpb"
-)
-
-// jobDumpTraceMode is the type that represents the mode in which a traceable
-// job will dump a trace zip.
-type jobDumpTraceMode int64
-
-const (
-	// A Traceable job will not dump a trace zip.
-	noDump jobDumpTraceMode = iota
-	// A Traceable job will dump a trace zip on failure.
-	dumpOnFail
-	// A Traceable job will dump a trace zip in any of paused, canceled, failed,
-	// succeeded states.
-	dumpOnStop
-)
-
-var traceableJobDumpTraceMode = settings.RegisterEnumSetting(
-	settings.TenantWritable,
-	"jobs.trace.force_dump_mode",
-	"determines the state in which all traceable jobs will dump their cluster wide, inflight, "+
-		"trace recordings. Traces may be dumped never, on fail, "+
-		"or on any status change i.e paused, canceled, failed, succeeded.",
-	"never",
-	map[int64]string{
-		int64(noDump):     "never",
-		int64(dumpOnFail): "onFail",
-		int64(dumpOnStop): "onStop",
-	},
 )
 
 // Job manages logging the progress of long-running system processes, like
@@ -157,6 +131,9 @@ type TraceableJob interface {
 	// ForceRealSpan forces the registry to create a real Span instead of a
 	// low-overhead non-recordable noop span.
 	ForceRealSpan() bool
+	// DumpTraceAfterRun determines whether the job's trace is dumped to disk at
+	// the end of every adoption.
+	DumpTraceAfterRun() bool
 }
 
 func init() {
@@ -484,7 +461,7 @@ func (u Updater) PauseRequestedWithFunc(
 			return fmt.Errorf("job with status %s cannot be requested to be paused", md.Status)
 		}
 		if fn != nil {
-			execCtx, cleanup := u.j.registry.execCtx("pause request", md.Payload.UsernameProto.Decode())
+			execCtx, cleanup := u.j.registry.execCtx(ctx, "pause request", md.Payload.UsernameProto.Decode())
 			defer cleanup()
 			if err := fn(ctx, execCtx, txn, md.Progress); err != nil {
 				return err
@@ -720,11 +697,6 @@ func (j *Job) FractionCompleted() float32 {
 	return progress.GetFractionCompleted()
 }
 
-// GetInternalDB returns the internal executor factory.
-func (j *Job) GetInternalDB() isql.DB {
-	return j.registry.internalDB
-}
-
 // MarkIdle marks the job as Idle.  Idleness should not be toggled frequently
 // (no more than ~twice a minute) as the action is logged.
 func (j *Job) MarkIdle(isIdle bool) {
@@ -750,9 +722,81 @@ func HasJobNotFoundError(err error) bool {
 	return errors.HasType(err, (*JobNotFoundError)(nil))
 }
 
+func (j *Job) loadJobPayloadAndProgress(
+	ctx context.Context, st *cluster.Settings, txn isql.Txn,
+) (*jobspb.Payload, *jobspb.Progress, error) {
+	if txn == nil {
+		return nil, nil, errors.New("cannot load job payload and progress with a nil txn")
+	}
+
+	payload := &jobspb.Payload{}
+	progress := &jobspb.Progress{}
+	if st.Version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled) {
+		infoStorage := j.InfoStorage(txn)
+
+		payloadBytes, exists, err := infoStorage.GetLegacyPayload(ctx)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to get payload for job %d", j.ID())
+		}
+		if !exists {
+			return nil, nil, errors.Wrap(&JobNotFoundError{jobID: j.ID()}, "job payload not found in system.job_info")
+		}
+		if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
+			return nil, nil, err
+		}
+
+		progressBytes, exists, err := infoStorage.GetLegacyProgress(ctx)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to get progress for job %d", j.ID())
+		}
+		if !exists {
+			return nil, nil, errors.Wrap(&JobNotFoundError{jobID: j.ID()}, "job progress not found in system.job_info")
+		}
+		if err := protoutil.Unmarshal(progressBytes, progress); err != nil {
+			return nil, nil, &JobNotFoundError{jobID: j.ID()}
+		}
+
+		return payload, progress, nil
+	}
+
+	// If V23_1JobInfoTableIsBackfilled is not active we should read the payload
+	// and progress from the system.jobs table.
+	const (
+		queryNoSessionID   = "SELECT payload, progress FROM system.jobs WHERE id = $1"
+		queryWithSessionID = queryNoSessionID + " AND claim_session_id = $2"
+	)
+	sess := sessiondata.RootUserSessionDataOverride
+
+	var err error
+	var row tree.Datums
+	if j.session == nil {
+		row, err = txn.QueryRowEx(ctx, "load-job-payload-progress-query", txn.KV(), sess,
+			queryNoSessionID, j.ID())
+	} else {
+		row, err = txn.QueryRowEx(ctx, "load-job-payload-progress-query", txn.KV(), sess,
+			queryWithSessionID, j.ID(), j.session.ID().UnsafeBytes())
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if row == nil {
+		return nil, nil, &JobNotFoundError{jobID: j.ID()}
+	}
+	payload, err = UnmarshalPayload(row[0])
+	if err != nil {
+		return nil, nil, err
+	}
+	progress, err = UnmarshalProgress(row[1])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return payload, progress, nil
+}
+
 func (u Updater) load(ctx context.Context) (retErr error) {
 	if u.txn == nil {
-		return u.j.registry.internalDB.Txn(ctx, func(
+		return u.j.registry.db.Txn(ctx, func(
 			ctx context.Context, txn isql.Txn,
 		) error {
 			u.txn = txn
@@ -780,7 +824,7 @@ func (u Updater) load(ctx context.Context) (retErr error) {
 	}()
 
 	const (
-		queryNoSessionID   = "SELECT payload, progress, created_by_type, created_by_id, status FROM system.jobs WHERE id = $1"
+		queryNoSessionID   = "SELECT created_by_type, created_by_id, status FROM system.jobs WHERE id = $1"
 		queryWithSessionID = queryNoSessionID + " AND claim_session_id = $2"
 	)
 	sess := sessiondata.RootUserSessionDataOverride
@@ -800,19 +844,16 @@ func (u Updater) load(ctx context.Context) (retErr error) {
 	if row == nil {
 		return &JobNotFoundError{jobID: j.ID()}
 	}
-	payload, err = UnmarshalPayload(row[0])
+	createdBy, err = unmarshalCreatedBy(row[0], row[1])
 	if err != nil {
 		return err
 	}
-	progress, err = UnmarshalProgress(row[1])
+	status, err = unmarshalStatus(row[2])
 	if err != nil {
 		return err
 	}
-	createdBy, err = unmarshalCreatedBy(row[2], row[3])
-	if err != nil {
-		return err
-	}
-	status, err = unmarshalStatus(row[4])
+
+	payload, progress, err = j.loadJobPayloadAndProgress(ctx, j.registry.settings, u.txn)
 	return err
 }
 
@@ -906,8 +947,10 @@ func (sj *StartableJob) Start(ctx context.Context) (err error) {
 		return fmt.Errorf("cannot resume %T job which is not committed", sj.resumer)
 	}
 
-	if err := sj.registry.stopper.RunAsyncTask(ctx, sj.taskName(), func(ctx context.Context) {
-		sj.execErr = sj.registry.runJob(sj.resumerCtx, sj.resumer, sj.Job, StatusRunning, sj.taskName())
+	if err := sj.registry.stopper.RunAsyncTask(ctx, sj.taskName(), func(_ context.Context) {
+		resumeCtx, cancel := sj.registry.stopper.WithCancelOnQuiesce(sj.resumerCtx)
+		defer cancel()
+		sj.execErr = sj.registry.runJob(resumeCtx, sj.resumer, sj.Job, StatusRunning, sj.taskName())
 		close(sj.execDone)
 	}); err != nil {
 		return err
@@ -1078,4 +1121,53 @@ func FormatRetriableExecutionErrorLogToStringArray(
 		_ = arr.Append(tree.NewDString(msg))
 	}
 	return arr
+}
+
+// GetJobTraceID returns the current trace ID of the job from the job progress.
+func GetJobTraceID(ctx context.Context, db isql.DB, jobID jobspb.JobID) (tracingpb.TraceID, error) {
+	var traceID tracingpb.TraceID
+	if err := db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		jobInfo := InfoStorageForJob(txn, jobID)
+		progressBytes, exists, err := jobInfo.GetLegacyProgress(ctx)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return errors.New("progress not found")
+		}
+		var progress jobspb.Progress
+		if err := protoutil.Unmarshal(progressBytes, &progress); err != nil {
+			return errors.Wrap(err, "failed to unmarshal progress bytes")
+		}
+		traceID = progress.TraceID
+		return nil
+	}); err != nil {
+		return 0, errors.Wrapf(err, "failed to fetch trace ID for job %d", jobID)
+	}
+
+	return traceID, nil
+}
+
+// LoadJobProgress returns the job progress from the info table. Note that the
+// progress can be nil if none is recorded.
+func LoadJobProgress(
+	ctx context.Context, db isql.DB, jobID jobspb.JobID,
+) (*jobspb.Progress, error) {
+	var (
+		progressBytes []byte
+		exists        bool
+	)
+	if err := db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		infoStorage := InfoStorageForJob(txn, jobID)
+		var err error
+		progressBytes, exists, err = infoStorage.GetLegacyProgress(ctx)
+		return err
+	}); err != nil || !exists {
+		return nil, err
+	}
+	progress := &jobspb.Progress{}
+	if err := protoutil.Unmarshal(progressBytes, progress); err != nil {
+		return nil, err
+	}
+	return progress, nil
 }

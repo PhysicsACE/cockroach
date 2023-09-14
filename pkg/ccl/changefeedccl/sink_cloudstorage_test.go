@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/stretchr/testify/require"
 )
@@ -166,7 +167,7 @@ func TestCloudStorageSink(t *testing.T) {
 		// NB: compression added in single-node subtest.
 	}
 	ts := func(i int64) hlc.Timestamp { return hlc.Timestamp{WallTime: i} }
-	e, err := makeJSONEncoder(opts)
+	e, err := makeJSONEncoder(jsonEncoderOptions{EncodingOptions: opts})
 	require.NoError(t, err)
 
 	clientFactory := blobs.TestBlobServiceClient(settings.ExternalIODir)
@@ -184,7 +185,7 @@ func TestCloudStorageSink(t *testing.T) {
 	user := username.RootUserName()
 
 	sinkURI := func(t *testing.T, maxFileSize int64) sinkURL {
-		u, err := url.Parse(fmt.Sprintf("nodelocal://0/%s", testDir(t)))
+		u, err := url.Parse(fmt.Sprintf("nodelocal://1/%s", testDir(t)))
 		require.NoError(t, err)
 		sink := sinkURL{URL: u}
 		if maxFileSize != unlimitedFileSize {
@@ -211,8 +212,8 @@ func TestCloudStorageSink(t *testing.T) {
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
 
 		s, err := makeCloudStorageSink(
-			ctx, sinkURI(t, unlimitedFileSize), 1, settings,
-			opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, unlimitedFileSize), 1, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s.Close()) }()
@@ -263,8 +264,8 @@ func TestCloudStorageSink(t *testing.T) {
 				require.NoError(t, err)
 				timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
 				s, err := makeCloudStorageSink(
-					ctx, sinkURI(t, unlimitedFileSize), 1, settings,
-					opts, timestampOracle, externalStorageFromURI, user, nil,
+					ctx, sinkURI(t, unlimitedFileSize), 1, settings, opts,
+					timestampOracle, externalStorageFromURI, user, nil, nil,
 				)
 				require.NoError(t, err)
 				defer func() { require.NoError(t, s.Close()) }()
@@ -340,14 +341,14 @@ func TestCloudStorageSink(t *testing.T) {
 		require.NoError(t, err)
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
 		s1, err := makeCloudStorageSink(
-			ctx, sinkURI(t, unlimitedFileSize), 1,
-			settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, unlimitedFileSize), 1, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s1.Close()) }()
 		s2, err := makeCloudStorageSink(
-			ctx, sinkURI(t, unlimitedFileSize), 2,
-			settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, unlimitedFileSize), 2, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		defer func() { require.NoError(t, s2.Close()) }()
 		require.NoError(t, err)
@@ -376,14 +377,14 @@ func TestCloudStorageSink(t *testing.T) {
 		// this happens before checkpointing, some data is written again but
 		// this is unavoidable.
 		s1R, err := makeCloudStorageSink(
-			ctx, sinkURI(t, unbuffered), 1,
-			settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, unbuffered), 1, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s1R.Close()) }()
 		s2R, err := makeCloudStorageSink(
-			ctx, sinkURI(t, unbuffered), 2,
-			settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, unbuffered), 2, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s2R.Close()) }()
@@ -424,16 +425,16 @@ func TestCloudStorageSink(t *testing.T) {
 		require.NoError(t, err)
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
 		s1, err := makeCloudStorageSink(
-			ctx, sinkURI(t, unlimitedFileSize), 1,
-			settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, unlimitedFileSize), 1, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s1.Close()) }()
 		s1.(*cloudStorageSink).sinkID = 7         // Force a deterministic sinkID.
 		s1.(*cloudStorageSink).jobSessionID = "a" // Force deterministic job session ID.
 		s2, err := makeCloudStorageSink(
-			ctx, sinkURI(t, unlimitedFileSize), 1,
-			settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, unlimitedFileSize), 1, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s2.Close()) }()
@@ -471,8 +472,8 @@ func TestCloudStorageSink(t *testing.T) {
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
 		const targetMaxFileSize = 6
 		s, err := makeCloudStorageSink(
-			ctx, sinkURI(t, targetMaxFileSize), 1,
-			settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, targetMaxFileSize), 1, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s.Close()) }()
@@ -612,8 +613,8 @@ func TestCloudStorageSink(t *testing.T) {
 					sinkURIWithParam.addParam(changefeedbase.SinkParamPartitionFormat, tc.format)
 					t.Logf("format=%s sinkgWithParam: %s", tc.format, sinkURIWithParam.String())
 					s, err := makeCloudStorageSink(
-						ctx, sinkURIWithParam, 1,
-						settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+						ctx, sinkURIWithParam, 1, settings, opts,
+						timestampOracle, externalStorageFromURI, user, nil, nil,
 					)
 
 					require.NoError(t, err)
@@ -645,8 +646,8 @@ func TestCloudStorageSink(t *testing.T) {
 		require.NoError(t, err)
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
 		s, err := makeCloudStorageSink(
-			ctx, sinkURI(t, unlimitedFileSize), 1,
-			settings, opts, timestampOracle, externalStorageFromURI, user, nil,
+			ctx, sinkURI(t, unlimitedFileSize), 1, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil,
 		)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s.Close()) }()
@@ -705,8 +706,8 @@ func TestCloudStorageSink(t *testing.T) {
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
 		var targetMaxFileSize int64 = 10
 		s, err := makeCloudStorageSink(
-			ctx, sinkURI(t, targetMaxFileSize), 1, settings,
-			opts, timestampOracle, externalStorageFromURI, user, nil)
+			ctx, sinkURI(t, targetMaxFileSize), 1, settings, opts,
+			timestampOracle, externalStorageFromURI, user, nil, nil)
 		require.NoError(t, err)
 		defer func() { require.NoError(t, s.Close()) }()
 
@@ -747,4 +748,96 @@ func TestCloudStorageSink(t *testing.T) {
 			"w1\n",
 		}, slurpDir(t))
 	})
+
+	// Verify no goroutines leaked when using compression.
+	testWithAndWithoutAsyncFlushing(t, `no goroutine leaks with compression`, func(t *testing.T) {
+		before := opts.Compression
+		// Compression codecs include buffering that interferes with other tests,
+		// e.g. the bucketing test that configures very small flush sizes.
+		defer func() {
+			opts.Compression = before
+		}()
+
+		topic := makeTopic(`t1`)
+
+		for _, compression := range []string{"gzip", "zstd"} {
+			opts.Compression = compression
+			t.Run("compress="+stringOrDefault(compression, "none"), func(t *testing.T) {
+				timestampOracle := explicitTimestampOracle(ts(1))
+				s, err := makeCloudStorageSink(
+					ctx, sinkURI(t, unlimitedFileSize), 1, settings, opts,
+					timestampOracle, externalStorageFromURI, user, nil, nil,
+				)
+				require.NoError(t, err)
+
+				rng, _ := randutil.NewPseudoRand()
+				data := randutil.RandBytes(rng, 1024)
+				// Write few megs worth of data.
+				for n := 0; n < 20; n++ {
+					eventTS := ts(int64(n + 1))
+					require.NoError(t, s.EmitRow(ctx, topic, noKey, data, eventTS, eventTS, zeroAlloc))
+				}
+
+				// Close the sink.  That's it -- we rely on leaktest detector to determine
+				// if the underlying compressor leaked go routines.
+				require.NoError(t, s.Close())
+			})
+		}
+	})
+
+	// Verify no goroutines leaked when using compression with context cancellation.
+	testWithAndWithoutAsyncFlushing(t, `no goroutine leaks when context canceled`, func(t *testing.T) {
+		before := opts.Compression
+		// Compression codecs include buffering that interferes with other tests,
+		// e.g. the bucketing test that configures very small flush sizes.
+		defer func() {
+			opts.Compression = before
+		}()
+
+		topic := makeTopic(`t1`)
+
+		for _, compression := range []string{"gzip", "zstd"} {
+			opts.Compression = compression
+			t.Run("compress="+stringOrDefault(compression, "none"), func(t *testing.T) {
+				timestampOracle := explicitTimestampOracle(ts(1))
+				s, err := makeCloudStorageSink(
+					ctx, sinkURI(t, unlimitedFileSize), 1, settings, opts,
+					timestampOracle, externalStorageFromURI, user, nil, nil,
+				)
+				require.NoError(t, err)
+				defer func() {
+					require.NoError(t, s.Close())
+				}()
+
+				// We need to run the following code inside separate
+				// closure so that we capture the set of goroutines started
+				// while writing the data (and ignore goroutines started by the sink
+				// itself).
+				func() {
+					defer leaktest.AfterTest(t)()
+
+					rng, _ := randutil.NewPseudoRand()
+					data := randutil.RandBytes(rng, 1024)
+					// Write few megs worth of data.
+					for n := 0; n < 20; n++ {
+						eventTS := ts(int64(n + 1))
+						require.NoError(t, s.EmitRow(ctx, topic, noKey, data, eventTS, eventTS, zeroAlloc))
+					}
+					cancledCtx, cancel := context.WithCancel(ctx)
+					cancel()
+
+					// Write 1 more piece of data.  We want to make sure that when error happens
+					// (context cancellation in this case) that any resources used by compression
+					// codec are released (this is checked by leaktest).
+					require.Equal(t, context.Canceled, s.EmitRow(cancledCtx, topic, noKey, data, ts(1), ts(1), zeroAlloc))
+				}()
+			})
+		}
+	})
+}
+
+type explicitTimestampOracle hlc.Timestamp
+
+func (o explicitTimestampOracle) inclusiveLowerBoundTS() hlc.Timestamp {
+	return hlc.Timestamp(o)
 }

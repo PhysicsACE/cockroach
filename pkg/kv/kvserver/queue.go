@@ -18,16 +18,17 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/benignerror"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -58,11 +59,8 @@ var queueGuaranteedProcessingTimeBudget = settings.RegisterDurationSetting(
 	"the guaranteed duration before which the processing of a queue may "+
 		"time out",
 	defaultProcessTimeout,
+	settings.WithVisibility(settings.Reserved),
 )
-
-func init() {
-	queueGuaranteedProcessingTimeBudget.SetVisibility(settings.Reserved)
-}
 
 func defaultProcessTimeoutFunc(cs *cluster.Settings, _ replicaInQueue) time.Duration {
 	return queueGuaranteedProcessingTimeBudget.Get(&cs.SV)
@@ -78,8 +76,8 @@ func defaultProcessTimeoutFunc(cs *cluster.Settings, _ replicaInQueue) time.Dura
 // after them in the queue to time-out.
 //
 // The parameter controls which rate(s) to use.
-func makeRateLimitedTimeoutFunc(rateSettings ...*settings.ByteSizeSetting) queueProcessTimeoutFunc {
-	return makeRateLimitedTimeoutFuncByPermittedSlowdown(permittedRangeScanSlowdown, rateSettings...)
+func makeRateLimitedTimeoutFunc(rateSettings *settings.ByteSizeSetting) queueProcessTimeoutFunc {
+	return makeRateLimitedTimeoutFuncByPermittedSlowdown(permittedRangeScanSlowdown, rateSettings)
 }
 
 // permittedRangeScanSlowdown is the factor of the above the estimated duration
@@ -91,7 +89,7 @@ const permittedRangeScanSlowdown = 10
 // slowdown factor on the estimated queue processing duration based on the given rate settings.
 // See makeRateLimitedTimeoutFunc for more information.
 func makeRateLimitedTimeoutFuncByPermittedSlowdown(
-	permittedSlowdown int, rateSettings ...*settings.ByteSizeSetting,
+	permittedSlowdown int, rateSettings *settings.ByteSizeSetting,
 ) queueProcessTimeoutFunc {
 	return func(cs *cluster.Settings, r replicaInQueue) time.Duration {
 		minimumTimeout := queueGuaranteedProcessingTimeBudget.Get(&cs.SV)
@@ -99,16 +97,10 @@ func makeRateLimitedTimeoutFuncByPermittedSlowdown(
 		// Some tests set up a fake implementation of replicaInQueue in which
 		// case we fall back to the configured minimum timeout.
 		repl, ok := r.(interface{ GetMVCCStats() enginepb.MVCCStats })
-		if !ok || len(rateSettings) == 0 {
+		if !ok {
 			return minimumTimeout
 		}
-		minSnapshotRate := rateSettings[0].Get(&cs.SV)
-		for i := 1; i < len(rateSettings); i++ {
-			snapshotRate := rateSettings[i].Get(&cs.SV)
-			if snapshotRate < minSnapshotRate {
-				minSnapshotRate = snapshotRate
-			}
-		}
+		minSnapshotRate := rateSettings.Get(&cs.SV)
 		estimatedDuration := time.Duration(repl.GetMVCCStats().Total()/minSnapshotRate) * time.Second
 		timeout := estimatedDuration * time.Duration(permittedSlowdown)
 		if timeout < minimumTimeout {
@@ -260,7 +252,6 @@ type replicaInQueue interface {
 	IsInitialized() bool
 	IsDestroyed() (DestroyReason, error)
 	Desc() *roachpb.RangeDescriptor
-	maybeInitializeRaftGroup(context.Context)
 	redirectOnOrAcquireLease(context.Context) (kvserverpb.LeaseStatus, *kvpb.Error)
 	LeaseStatusAt(context.Context, hlc.ClockTimestamp) kvserverpb.LeaseStatus
 }
@@ -318,17 +309,13 @@ type queueConfig struct {
 	// on a range level and use it to ensure that only one node in the cluster
 	// processes that range.
 	needsLease bool
-	// needsRaftInitialized controls whether the Raft group will be initialized
-	// (if not already initialized) when deciding whether to process this
-	// replica.
-	needsRaftInitialized bool
-	// needsSystemConfig controls whether this queue requires a valid copy of the
-	// system config to operate on a replica. Not all queues require it, and it's
+	// needsSpanConfigs controls whether this queue requires a valid copy of the
+	// span configs to operate on a replica. Not all queues require it, and it's
 	// unsafe for certain queues to wait on it. For example, a raft snapshot may
-	// be needed in order to make it possible for the system config to become
-	// available (as observed in #16268), so the raft snapshot queue can't
-	// require the system config to already be available.
-	needsSystemConfig bool
+	// be needed in order to make it possible for the span config range to
+	// become available (as observed in #16268), so the raft snapshot queue
+	// can't require the span configs to already be available.
+	needsSpanConfigs bool
 	// acceptsUnsplitRanges controls whether this queue can process ranges that
 	// need to be split due to zone config settings. Ranges are checked before
 	// calling queueImpl.shouldQueue and queueImpl.process.
@@ -337,8 +324,8 @@ type queueConfig struct {
 	// want to try to replicate a range until we know which zone it is in and
 	// therefore how many replicas are required).
 	acceptsUnsplitRanges bool
-	// processDestroyedReplicas controls whether or not we want to process replicas
-	// that have been destroyed but not GCed.
+	// processDestroyedReplicas controls whether or not we want to process
+	// replicas that have been destroyed but not GCed.
 	processDestroyedReplicas bool
 	// processTimeout returns the timeout for processing a replica.
 	processTimeoutFunc queueProcessTimeoutFunc
@@ -346,12 +333,20 @@ type queueConfig struct {
 	successes *metric.Counter
 	// failures is a counter of replicas which failed processing.
 	failures *metric.Counter
+	// storeFailures is a counter of replicas that failed processing due to a
+	// StoreBenignError. These errors must be counted independently of the above
+	// failures metric.
+	storeFailures *metric.Counter
 	// pending is a gauge measuring current replica count pending.
 	pending *metric.Gauge
-	// processingNanos is a counter measuring total nanoseconds spent processing replicas.
+	// processingNanos is a counter measuring total nanoseconds spent processing
+	// replicas.
 	processingNanos *metric.Counter
 	// purgatory is a gauge measuring current replica count in purgatory.
 	purgatory *metric.Gauge
+	// disabledConfig is a reference to the cluster setting that controls enabling
+	// and disabling queues.
+	disabledConfig *settings.BoolSetting
 }
 
 // baseQueue is the base implementation of the replicaQueue interface. Queue
@@ -378,7 +373,7 @@ type queueConfig struct {
 //
 // Replicas are added asynchronously through `MaybeAddAsync` or `AddAsync`.
 // MaybeAddAsync checks the various requirements selected by the queue config
-// (needsSystemConfig, needsLease, acceptsUnsplitRanges) as well as the
+// (needsSpanConfigs, needsLease, acceptsUnsplitRanges) as well as the
 // queueImpl's `shouldQueue`. AddAsync does not check any of this and accept a
 // priority directly instead of getting it from `shouldQueue`. These methods run
 // with shared a maximum concurrency of `addOrMaybeAddSemSize`. If the maximum
@@ -445,8 +440,7 @@ type baseQueue struct {
 		priorityQ      priorityQueue                      // The priority queue
 		purgatory      map[roachpb.RangeID]PurgatoryError // Map of replicas to processing errors
 		stopped        bool
-		// Some tests in this package disable queues.
-		disabled bool
+		disabled       bool
 	}
 }
 
@@ -473,9 +467,9 @@ func newBaseQueue(name string, impl queueImpl, store *Store, cfg queueConfig) *b
 	ambient := store.cfg.AmbientCtx
 	ambient.AddLogTag(name, nil)
 
-	if !cfg.acceptsUnsplitRanges && !cfg.needsSystemConfig {
+	if !cfg.acceptsUnsplitRanges && !cfg.needsSpanConfigs {
 		log.Fatalf(ambient.AnnotateCtx(context.Background()),
-			"misconfigured queue: acceptsUnsplitRanges=false requires needsSystemConfig=true; got %+v", cfg)
+			"misconfigured queue: acceptsUnsplitRanges=false requires needsSpanConfigs=true; got %+v", cfg)
 	}
 
 	bq := baseQueue{
@@ -499,6 +493,10 @@ func newBaseQueue(name string, impl queueImpl, store *Store, cfg queueConfig) *b
 		},
 	}
 	bq.mu.replicas = map[roachpb.RangeID]*replicaItem{}
+	bq.SetDisabled(!cfg.disabledConfig.Get(&store.cfg.Settings.SV))
+	cfg.disabledConfig.SetOnChange(&store.cfg.Settings.SV, func(ctx context.Context) {
+		bq.SetDisabled(!cfg.disabledConfig.Get(&store.cfg.Settings.SV))
+	})
 
 	return &bq
 }
@@ -637,42 +635,66 @@ func (bq *baseQueue) AddAsync(ctx context.Context, repl replicaInQueue, prio flo
 
 func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.ClockTimestamp) {
 	ctx = repl.AnnotateCtx(ctx)
+	ctx = bq.AnnotateCtx(ctx)
+
+	ctx, undo := pprofutil.SetProfilerLabelsFromCtxTags(ctx)
+	defer undo()
+	if fn := bq.store.TestingKnobs().BaseQueueInterceptor; fn != nil {
+		// Passes the context and baseQueue parameters to the interceptor to verify
+		// the correct setting of the pprof label within the context.
+		fn(ctx, bq)
+	}
+
 	// Load the system config if it's needed.
 	var confReader spanconfig.StoreReader
-	if bq.needsSystemConfig {
+	if bq.needsSpanConfigs {
 		var err error
 		confReader, err = bq.store.GetConfReader(ctx)
 		if err != nil {
-			if errors.Is(err, errSysCfgUnavailable) && log.V(1) {
-				log.Warningf(ctx, "unable to retrieve system config, skipping: %v", err)
+			if errors.Is(err, errSpanConfigsUnavailable) && log.V(1) {
+				log.Warningf(ctx, "unable to retrieve span configs, skipping: %v", err)
 			}
 			return
 		}
 	}
 
 	bq.mu.Lock()
-	stopped := bq.mu.stopped || bq.mu.disabled
+	stopped := bq.mu.stopped
+	disabled := bq.mu.disabled
 	bq.mu.Unlock()
 
 	if stopped {
 		return
 	}
 
+	if disabled {
+		// The disabled queue bypass is used in tests which enable manual
+		// replication, however still require specific range(s) to be processed
+		// through the queue.
+		bypassDisabled := bq.store.TestingKnobs().BaseQueueDisabledBypassFilter
+		if bypassDisabled == nil || !bypassDisabled(repl.GetRangeID()) {
+			return
+		}
+	}
+
 	if !repl.IsInitialized() {
 		return
 	}
 
-	if bq.needsRaftInitialized {
-		repl.maybeInitializeRaftGroup(ctx)
-	}
-
-	if !bq.acceptsUnsplitRanges && confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey) {
-		// Range needs to be split due to span configs, but queue does not
-		// accept unsplit ranges.
-		if log.V(1) {
-			log.Infof(ctx, "split needed; not adding")
+	if !bq.acceptsUnsplitRanges {
+		// Queue does not accept unsplit ranges. Check to see if the range needs to
+		// be split because of spanconfigs.
+		needsSplit, err := confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey)
+		if err != nil {
+			log.Warningf(ctx, "unable to compute whether split is needed; not adding")
+			return
 		}
-		return
+		if needsSplit {
+			if log.V(1) {
+				log.Infof(ctx, "split needed; not adding")
+			}
+			return
+		}
 	}
 
 	if bq.needsLease {
@@ -722,10 +744,16 @@ func (bq *baseQueue) addInternal(
 	}
 
 	if bq.mu.disabled {
-		if log.V(3) {
-			log.Infof(ctx, "queue disabled")
+		// The disabled queue bypass is used in tests which enable manual
+		// replication, however still require specific range(s) to be processed
+		// through the queue.
+		bypassDisabled := bq.store.TestingKnobs().BaseQueueDisabledBypassFilter
+		if bypassDisabled == nil || !bypassDisabled(desc.RangeID) {
+			if log.V(3) {
+				log.Infof(ctx, "queue disabled")
+			}
+			return false, errQueueDisabled
 		}
-		return false, errQueueDisabled
 	}
 
 	// If the replica is currently in purgatory, don't re-add it.
@@ -822,6 +850,9 @@ func (bq *baseQueue) MaybeRemove(rangeID roachpb.RangeID) {
 // stopper signals exit.
 func (bq *baseQueue) processLoop(stopper *stop.Stopper) {
 	ctx := bq.AnnotateCtx(context.Background())
+	ctx, undo := pprofutil.SetProfilerLabelsFromCtxTags(ctx)
+	defer undo()
+
 	done := func() {
 		bq.mu.Lock()
 		bq.mu.stopped = true
@@ -931,10 +962,10 @@ func (bq *baseQueue) recordProcessDuration(ctx context.Context, dur time.Duratio
 func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) error {
 	// Load the system config if it's needed.
 	var confReader spanconfig.StoreReader
-	if bq.needsSystemConfig {
+	if bq.needsSpanConfigs {
 		var err error
 		confReader, err = bq.store.GetConfReader(ctx)
-		if errors.Is(err, errSysCfgUnavailable) {
+		if errors.Is(err, errSpanConfigsUnavailable) {
 			if log.V(1) {
 				log.Warningf(ctx, "unable to retrieve conf reader, skipping: %v", err)
 			}
@@ -945,16 +976,23 @@ func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) er
 		}
 	}
 
-	if !bq.acceptsUnsplitRanges && confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey) {
-		// Range needs to be split due to zone configs, but queue does
-		// not accept unsplit ranges.
-		log.VEventf(ctx, 3, "split needed; skipping")
-		return nil
+	if !bq.acceptsUnsplitRanges {
+		// Queue does not accept unsplit ranges. Check to see if the range needs to
+		// be spilt because of a span config.
+		needsSplit, err := confReader.NeedsSplit(ctx, repl.Desc().StartKey, repl.Desc().EndKey)
+		if err != nil {
+			log.Warningf(ctx, "unable to compute NeedsSplit, skipping: %v", err)
+			return nil
+		}
+		if needsSplit {
+			log.VEventf(ctx, 3, "split needed; skipping")
+			return nil
+		}
 	}
 
 	ctx, span := tracing.EnsureChildSpan(ctx, bq.Tracer, bq.processOpName())
 	defer span.Finish()
-	return contextutil.RunWithTimeout(ctx, fmt.Sprintf("%s queue process replica %d", bq.name, repl.GetRangeID()),
+	return timeutil.RunWithTimeout(ctx, fmt.Sprintf("%s queue process replica %d", bq.name, repl.GetRangeID()),
 		bq.processTimeoutFunc(bq.store.ClusterSettings(), repl), func(ctx context.Context) error {
 			log.VEventf(ctx, 1, "processing replica")
 
@@ -1005,17 +1043,6 @@ func (bq *baseQueue) processReplica(ctx context.Context, repl replicaInQueue) er
 			}
 			return nil
 		})
-}
-
-type benignError struct {
-	cause error
-}
-
-func (be *benignError) Error() string { return be.cause.Error() }
-func (be *benignError) Cause() error  { return be.cause }
-
-func isBenign(err error) bool {
-	return errors.HasType(err, (*benignError)(nil))
 }
 
 // IsPurgatoryError returns true iff the given error is a purgatory error.
@@ -1104,13 +1131,18 @@ func (bq *baseQueue) finishProcessingReplica(
 
 	// Handle failures.
 	if err != nil {
-		benign := isBenign(err)
+		benign := benignerror.IsBenign(err)
+		storeBenign := benignerror.IsStoreBenign(err)
 
 		// Increment failures metric.
 		//
 		// TODO(tschottdorf): once we start asserting zero failures in tests
 		// (and production), move benign failures into a dedicated category.
 		bq.failures.Inc(1)
+		if storeBenign {
+			bq.storeFailures.Inc(1)
+			requeue = true
+		}
 
 		// Determine whether a failure is a purgatory error. If it is, add
 		// the failing replica to purgatory. Note that even if the item was

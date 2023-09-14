@@ -86,6 +86,7 @@ func (s *Storage) CreateInstanceDataForTest(
 	sessionID sqlliveness.SessionID,
 	sessionExpiration hlc.Timestamp,
 	locality roachpb.Locality,
+	binaryVersion roachpb.Version,
 ) error {
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	return s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -95,8 +96,9 @@ func (s *Storage) CreateInstanceDataForTest(
 		if err != nil {
 			return err
 		}
-		key := s.rowcodec.encodeKey(region, instanceID)
-		value, err := s.rowcodec.encodeValue(rpcAddr, sqlAddr, sessionID, locality)
+
+		key := s.newRowCodec.encodeKey(region, instanceID)
+		value, err := s.newRowCodec.encodeValue(rpcAddr, sqlAddr, sessionID, locality, binaryVersion)
 		if err != nil {
 			return err
 		}
@@ -111,7 +113,7 @@ func (s *Storage) CreateInstanceDataForTest(
 func (s *Storage) GetInstanceDataForTest(
 	ctx context.Context, region []byte, instanceID base.SQLInstanceID,
 ) (sqlinstance.InstanceInfo, error) {
-	k := s.rowcodec.encodeKey(region, instanceID)
+	k := s.newRowCodec.encodeKey(region, instanceID)
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	row, err := s.db.Get(ctx, k)
 	if err != nil {
@@ -120,7 +122,7 @@ func (s *Storage) GetInstanceDataForTest(
 	if row.Value == nil {
 		return sqlinstance.InstanceInfo{}, sqlinstance.NonExistentInstanceError
 	}
-	rpcAddr, sqlAddr, sessionID, locality, _, err := s.rowcodec.decodeValue(*row.Value)
+	rpcAddr, sqlAddr, sessionID, locality, binaryVersion, _, err := s.newRowCodec.decodeValue(*row.Value)
 	if err != nil {
 		return sqlinstance.InstanceInfo{}, errors.Wrapf(err, "could not decode data for instance %d", instanceID)
 	}
@@ -130,6 +132,7 @@ func (s *Storage) GetInstanceDataForTest(
 		InstanceSQLAddr: sqlAddr,
 		SessionID:       sessionID,
 		Locality:        locality,
+		BinaryVersion:   binaryVersion,
 	}
 	return instanceInfo, nil
 }
@@ -142,8 +145,11 @@ func (s *Storage) GetAllInstancesDataForTest(
 	var rows []instancerow
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		var err error
-		rows, err = s.getInstanceRows(ctx, nil /*global*/, txn, lock.WaitPolicy_Block)
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+		rows, err = s.getInstanceRows(ctx, nil /*global*/, &version, txn, lock.WaitPolicy_Block)
 		return err
 	}); err != nil {
 		return nil, err

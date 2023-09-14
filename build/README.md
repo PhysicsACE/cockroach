@@ -111,8 +111,8 @@ back to this document and perform these steps:
 * [ ] Adjust version in the TeamCity agent image ([setup script](./packer/teamcity-agent.sh))
 * [ ] Rebuild and push the Docker image (following [Basic Process](#basic-process))
 * [ ] Update `build/teamcity/internal/release/build-and-publish-patched-go/impl.sh` with the new version and adjust SHA256 sums as necessary.
-* [ ] Run the `Internal / Cockroach / Build / Toolchains / Publish Patched Go for Mac` build configuration in TeamCity with your latest version of the script above. Note the job depends on another job `Build and Publish Patched Go`. That job prints out the SHA256 of all tarballs, which you will need to copy-paste into `WORKSPACE` (see below). `Publish Patched Go for Mac` is an extra step that publishes the *signed* `go` binaries for macOS. That job also prints out the SHA256 of the Mac tarballs in particular.
 * [ ] Adjust `GO_VERSION` and `GO_FIPS_COMMIT` for the FIPS Go toolchain ([source](./teamcity/internal/release/build-and-publish-patched-go/impl-fips.sh)).
+* [ ] Run the `Internal / Cockroach / Build / Toolchains / Publish Patched Go for Mac` build configuration in TeamCity with your latest version of the script above. Note the job depends on another job `Build and Publish Patched Go`. That job prints out the SHA256 of all tarballs, which you will need to copy-paste into `WORKSPACE` (see below). `Publish Patched Go for Mac` is an extra step that publishes the *signed* `go` binaries for macOS. That job also prints out the SHA256 of the Mac tarballs in particular.
 * [ ] Adjust `--@io_bazel_rules_go//go/toolchain:sdk_version` in [.bazelrc](../.bazelrc).
 * [ ] Bump the version in `WORKSPACE` under `go_download_sdk`. You may need to bump [rules_go](https://github.com/bazelbuild/rules_go/releases). Also edit the filenames listed in `sdks` and update all the hashes to match what you built in the step above.
 * [ ] Bump the version in `WORKSPACE` under `go_download_sdk` for the FIPS version of Go (`go_sdk_fips`).
@@ -137,19 +137,11 @@ Please follow the instructions above on updating the golang version, omitting th
 
 The `bazelbuilder` image is used exclusively for performing builds using Bazel. Only add dependencies to the image that are necessary for performing Bazel builds. (Since the Bazel build downloads most dependencies as needed, updates to the Bazel builder image should be very infrequent.) The `bazelbuilder` image is published both for `amd64` and `arm64` platforms. You can go through the process of publishing a new Bazel build
 
-- (One-time setup) Depending on how your Docker instance is configured, you may have to run `docker run --privileged --rm tonistiigi/binfmt --install all`. This will install `qemu` emulators on your system for platforms besides your native one.
 - Edit `build/bazelbuilder/Dockerfile` as desired.
-- Build the image for both platforms and publish the cross-platform manifest. Note that the non-native build for your image will be very slow since it will have to emulate.
-```
-    TAG=$(date +%Y%m%d-%H%M%S)
-    docker build --platform linux/amd64 -t cockroachdb/bazel:amd64-$TAG build/bazelbuilder
-    docker push cockroachdb/bazel:amd64-$TAG
-    docker build --platform linux/arm64 -t cockroachdb/bazel:arm64-$TAG build/bazelbuilder
-    docker push cockroachdb/bazel:arm64-$TAG
-    docker manifest create cockroachdb/bazel:$TAG --amend cockroachdb/bazel:amd64-$TAG --amend cockroachdb/bazel:arm64-$TAG
-    docker manifest push cockroachdb/bazel:$TAG
-```
-- Then, update `build/.bazelbuilderversion` with the new tag and commit all your changes.
+- Build the image by triggering the `Build and Push Bazel Builder Image` build in TeamCity. The generated image will be published to https://hub.docker.com/r/cockroachdb/bazel.
+- Update `build/.bazelbuilderversion` with the new tag and commit all your changes.
+- Build the FIPS image by triggering the `Build and Push FIPS Bazel Builder Image` build in TeamCity. The generated image will be published to https://hub.docker.com/r/cockroachdb/bazel-fips.
+- Update `build/.bazelbuilderversion-fips` with the new tag and commit all your changes.
 - Ensure the "Bazel CI" job passes on your PR before merging.
 
 #  Dependencies

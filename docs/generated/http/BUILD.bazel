@@ -9,6 +9,7 @@ genrule(
         "//pkg/gossip:gossip_proto",
         "//pkg/jobs/jobspb:jobspb_proto",
         "//pkg/kv/kvpb:kvpb_proto",
+        "//pkg/kv/kvserver/concurrency/isolation:isolation_proto",
         "//pkg/kv/kvserver/concurrency/lock:lock_proto",
         "//pkg/kv/kvserver/kvserverpb:kvserverpb_proto",
         "//pkg/kv/kvserver/liveness/livenesspb:livenesspb_proto",
@@ -17,6 +18,7 @@ genrule(
         "//pkg/multitenant/mtinfopb:mtinfopb_proto",
         "//pkg/multitenant/tenantcapabilities/tenantcapabilitiespb:tenantcapabilitiespb_proto",
         "//pkg/roachpb:roachpb_proto",
+        "//pkg/server/autoconfig/autoconfigpb:autoconfigpb_proto",
         "//pkg/server/diagnostics/diagnosticspb:diagnosticspb_proto",
         "//pkg/server/serverpb:serverpb_proto",
         "//pkg/server/status/statuspb:statuspb_proto",
@@ -55,6 +57,7 @@ genrule(
         "@com_google_protobuf//:duration_proto",
         "@com_google_protobuf//:timestamp_proto",
         "@go_googleapis//google/api:annotations_proto",
+        "@go_googleapis//google/api:http_proto",
         "@io_etcd_go_raft_v3//raftpb:raftpb_proto",
     ],
     outs = [

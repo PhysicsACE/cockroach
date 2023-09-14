@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -70,7 +71,10 @@ func registerTPCDSVec(r registry.Registry) {
 		}
 		t.Status("restoring TPCDS dataset for Scale Factor 1")
 		if _, err := clusterConn.Exec(
-			`RESTORE DATABASE tpcds FROM 'gs://cockroach-fixtures/workload/tpcds/scalefactor=1/backup?AUTH=implicit';`,
+			`
+RESTORE DATABASE tpcds FROM 'gs://cockroach-fixtures/workload/tpcds/scalefactor=1/backup?AUTH=implicit'
+WITH unsafe_restore_incompatible_version;
+`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -182,10 +186,14 @@ func registerTPCDSVec(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "tpcdsvec",
-		Owner:   registry.OwnerSQLQueries,
-		Cluster: r.MakeClusterSpec(3),
+		Name:      "tpcdsvec",
+		Owner:     registry.OwnerSQLQueries,
+		Benchmark: true,
+		Cluster:   r.MakeClusterSpec(3),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			if c.Spec().Cloud != spec.GCE && !c.IsLocal() {
+				t.Skip("uses gs://cockroach-fixtures; see https://github.com/cockroachdb/cockroach/issues/105968")
+			}
 			runTPCDSVec(ctx, t, c)
 		},
 	})

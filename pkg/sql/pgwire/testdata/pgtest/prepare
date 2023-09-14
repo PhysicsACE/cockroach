@@ -82,11 +82,40 @@ Execute {"Portal": "p"}
 Sync
 ----
 
-
 until
 ErrorResponse
 ReadyForQuery
 ----
 {"Type":"ParseComplete"}
 {"Type":"ErrorResponse","Code":"08P01"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Parse {"Name": "e", "Query": "EXPLAIN SELECT generate_series(1,10);"}
+Bind {"DestinationPortal": "pe", "PreparedStatement": "e"}
+Execute {"Portal": "pe"}
+Sync
+----
+
+until ignore=DataRow
+ReadyForQuery
+----
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"CommandComplete","CommandTag":"EXPLAIN"}
+{"Type":"ReadyForQuery","TxStatus":"I"}
+
+send
+Parse {"Name": "ea", "Query": "EXPLAIN ANALYZE SELECT generate_series(1,10);"}
+Bind {"DestinationPortal": "pea", "PreparedStatement": "ea"}
+Execute {"Portal": "pea"}
+Sync
+----
+
+until ignore=DataRow
+ReadyForQuery
+----
+{"Type":"ParseComplete"}
+{"Type":"BindComplete"}
+{"Type":"CommandComplete","CommandTag":"EXPLAIN"}
 {"Type":"ReadyForQuery","TxStatus":"I"}

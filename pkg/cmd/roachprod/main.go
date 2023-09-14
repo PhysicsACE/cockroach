@@ -19,21 +19,26 @@ import (
 	"os/user"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/grafana"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ui"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/fatih/color"
 	"github.com/spf13/cobra"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 )
 
 var rootCmd = &cobra.Command{
@@ -56,7 +61,8 @@ The above commands will create a "local" 3 node cluster, start a cockroach
 cluster on these nodes, run a sql command on the 2nd node, stop, wipe and
 destroy the cluster.
 `,
-	Version: "details:\n" + build.GetInfo().Long(),
+	Version:          "details:\n" + build.GetInfo().Long(),
+	PersistentPreRun: validateAndConfigure,
 }
 
 // Provide `cobra.Command` functions with a standard return code handler.
@@ -128,7 +134,7 @@ Local Clusters
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) (retErr error) {
 		createVMOpts.ClusterName = args[0]
-		return roachprod.Create(context.Background(), roachprodLibraryLogger, username, numNodes, createVMOpts, providerOptsContainer)
+		return roachprod.Create(context.Background(), config.Logger, username, numNodes, createVMOpts, providerOptsContainer)
 	}),
 }
 
@@ -147,7 +153,7 @@ if the user would like to update the keys on the remote hosts.
 
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) (retErr error) {
-		return roachprod.SetupSSH(context.Background(), roachprodLibraryLogger, args[0])
+		return roachprod.SetupSSH(context.Background(), config.Logger, args[0])
 	}),
 }
 
@@ -168,7 +174,7 @@ directories inside ${HOME}/local directory are removed.
 `,
 	Args: cobra.ArbitraryArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Destroy(roachprodLibraryLogger, destroyAllMine, destroyAllLocal, args...)
+		return roachprod.Destroy(config.Logger, destroyAllMine, destroyAllLocal, args...)
 	}),
 }
 
@@ -177,7 +183,7 @@ var cachedHostsCmd = &cobra.Command{
 	Short: "list all clusters (and optionally their host numbers) from local cache",
 	Args:  cobra.NoArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		roachprod.CachedClusters(roachprodLibraryLogger, func(clusterName string, numVMs int) {
+		roachprod.CachedClusters(config.Logger, func(clusterName string, numVMs int) {
 			if strings.HasPrefix(clusterName, "teamcity") {
 				return
 			}
@@ -245,20 +251,26 @@ hosts file.
 		if listJSON && listDetails {
 			return errors.New("'json' option cannot be combined with 'details' option")
 		}
-		filteredCloud, err := roachprod.List(roachprodLibraryLogger, listMine, listPattern)
+		filteredCloud, err := roachprod.List(config.Logger, listMine, listPattern, vm.ListOptions{ComputeEstimatedCost: true})
+
 		if err != nil {
 			return err
 		}
 
 		// sort by cluster names for stable output.
 		names := make([]string, len(filteredCloud.Clusters))
+		maxClusterName := 0
 		i := 0
 		for name := range filteredCloud.Clusters {
 			names[i] = name
+			if len(name) > maxClusterName {
+				maxClusterName = len(name)
+			}
 			i++
 		}
 		sort.Strings(names)
 
+		p := message.NewPrinter(language.English)
 		if listJSON {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
@@ -266,16 +278,81 @@ hosts file.
 				return err
 			}
 		} else {
+			machineType := func(clusterVMs vm.List) string {
+				res := clusterVMs[0].MachineType
+				// Display CPU architecture, other than amd64 (default).
+				if arch := clusterVMs[0].Labels["arch"]; arch != "" && arch != string(vm.ArchAMD64) {
+					res += fmt.Sprintf(" [%s]", arch)
+				}
+				return res
+			}
 			// Align columns left and separate with at least two spaces.
-			tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+			tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', tabwriter.AlignRight)
+			// N.B. colors use escape codes which don't play nice with tabwriter [1].
+			// We use a hacky workaround below to color the empty string.
+			// [1] https://github.com/golang/go/issues/12073
+
+			// Print header.
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n",
+				"Cluster", "Clouds", "Size", "VM",
+				color.HiWhiteString("$/hour"), color.HiWhiteString("$ Spent"),
+				color.HiWhiteString("Uptime"), color.HiWhiteString("TTL"),
+				color.HiWhiteString("$/TTL"))
+			// Print separator.
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n",
+				"", "", "",
+				color.HiWhiteString(""), color.HiWhiteString(""),
+				color.HiWhiteString(""), color.HiWhiteString(""),
+				color.HiWhiteString(""))
+			totalCostPerHour := 0.0
 			for _, name := range names {
 				c := filteredCloud.Clusters[name]
 				if listDetails {
-					c.PrintDetails(roachprodLibraryLogger)
+					c.PrintDetails(config.Logger)
 				} else {
-					fmt.Fprintf(tw, "%s\t%s\t%d", c.Name, c.Clouds(), len(c.VMs))
+					// N.B. Tabwriter doesn't support per-column alignment. It looks odd to have the cluster names right-aligned,
+					// so we make it left-aligned.
+					fmt.Fprintf(tw, "%s\t%s\t%d\t%s", name+strings.Repeat(" ", maxClusterName-len(name)), c.Clouds(),
+						len(c.VMs), machineType(c.VMs))
 					if !c.IsLocal() {
-						fmt.Fprintf(tw, "\t(%s)", c.LifetimeRemaining().Round(time.Second))
+						colorByCostBucket := func(cost float64) func(string, ...interface{}) string {
+							switch {
+							case cost <= 100:
+								return color.HiGreenString
+							case cost <= 1000:
+								return color.HiBlueString
+							default:
+								return color.HiRedString
+							}
+						}
+						timeRemaining := c.LifetimeRemaining().Round(time.Second)
+						formatTTL := func(ttl time.Duration) string {
+							if c.VMs[0].Preemptible {
+								return color.HiMagentaString(ttl.String())
+							} else {
+								return color.HiBlueString(ttl.String())
+							}
+						}
+						cost := c.CostPerHour
+						totalCostPerHour += cost
+						alive := timeutil.Since(c.CreatedAt).Round(time.Minute)
+						costSinceCreation := cost * float64(alive) / float64(time.Hour)
+						costRemaining := cost * float64(timeRemaining) / float64(time.Hour)
+						if cost > 0 {
+							fmt.Fprintf(tw, "\t%s\t%s\t%s\t%s\t%s\t",
+								color.HiGreenString(p.Sprintf("$%.2f", cost)),
+								colorByCostBucket(costSinceCreation)(p.Sprintf("$%.2f", costSinceCreation)),
+								color.HiWhiteString(alive.String()),
+								formatTTL(timeRemaining),
+								colorByCostBucket(costRemaining)(p.Sprintf("$%.2f", costRemaining)))
+						} else {
+							fmt.Fprintf(tw, "\t%s\t%s\t%s\t%s\t%s\t",
+								color.HiGreenString(""),
+								color.HiGreenString(""),
+								color.HiWhiteString(alive.String()),
+								formatTTL(timeRemaining),
+								color.HiGreenString(""))
+						}
 					} else {
 						fmt.Fprintf(tw, "\t(-)")
 					}
@@ -284,6 +361,10 @@ hosts file.
 			}
 			if err := tw.Flush(); err != nil {
 				return err
+			}
+
+			if totalCostPerHour > 0 {
+				_, _ = p.Printf("\nTotal cost per hour: $%.2f\n", totalCostPerHour)
 			}
 
 			// Optionally print any dangling instances with errors
@@ -317,7 +398,7 @@ var syncCmd = &cobra.Command{
 	Long:  ``,
 	Args:  cobra.NoArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		_, err := roachprod.Sync(roachprodLibraryLogger, vm.ListOptions{IncludeVolumes: listOpts.IncludeVolumes})
+		_, err := roachprod.Sync(config.Logger, vm.ListOptions{IncludeVolumes: listOpts.IncludeVolumes})
 		_ = rootCmd.GenBashCompletionFile(bashCompletion)
 		return err
 	}),
@@ -333,7 +414,7 @@ hourly by a cronjob so it is not necessary to run manually.
 `,
 	Args: cobra.NoArgs,
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.GC(roachprodLibraryLogger, dryrun)
+		return roachprod.GC(config.Logger, dryrun)
 	}),
 }
 
@@ -347,7 +428,7 @@ destroyed:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Extend(roachprodLibraryLogger, args[0], extendLifetime)
+		return roachprod.Extend(config.Logger, args[0], extendLifetime)
 	}),
 }
 
@@ -399,7 +480,7 @@ cluster setting will be set to its value.
 			install.EnvOption(nodeEnv),
 			install.NumRacksOption(numRacks),
 		}
-		return roachprod.Start(context.Background(), roachprodLibraryLogger, args[0], startOpts, clusterSettingsOpts...)
+		return roachprod.Start(context.Background(), config.Logger, args[0], startOpts, clusterSettingsOpts...)
 	}),
 }
 
@@ -429,7 +510,7 @@ SIGHUP), unless you also configure --max-wait.
 			wait = true
 		}
 		stopOpts := roachprod.StopOpts{Wait: wait, MaxWait: maxWait, ProcessTag: tag, Sig: sig}
-		return roachprod.Stop(context.Background(), roachprodLibraryLogger, args[0], stopOpts)
+		return roachprod.Stop(context.Background(), config.Logger, args[0], stopOpts)
 	}),
 }
 
@@ -472,7 +553,7 @@ environment variables to the cockroach process.
 			install.EnvOption(nodeEnv),
 			install.NumRacksOption(numRacks),
 		}
-		return roachprod.StartTenant(context.Background(), roachprodLibraryLogger, tenantCluster, hostCluster, startOpts, clusterSettingsOpts...)
+		return roachprod.StartTenant(context.Background(), config.Logger, tenantCluster, hostCluster, startOpts, clusterSettingsOpts...)
 	}),
 }
 
@@ -487,7 +568,7 @@ default cluster settings. It's intended to be used in conjunction with
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Init(context.Background(), roachprodLibraryLogger, args[0], startOpts)
+		return roachprod.Init(context.Background(), config.Logger, args[0], startOpts)
 	}),
 }
 
@@ -507,17 +588,18 @@ The "status" command outputs the binary and PID for the specified nodes:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		statuses, err := roachprod.Status(context.Background(), roachprodLibraryLogger, args[0], tag)
+		statuses, err := roachprod.Status(context.Background(), config.Logger, args[0], tag)
 		if err != nil {
 			return err
 		}
 		for _, status := range statuses {
 			if status.Err != nil {
-				roachprodLibraryLogger.Printf("  %2d: %s %s\n", status.NodeID, status.Err.Error())
+				config.Logger.Printf("  %2d: %s %s\n", status.NodeID, status.Err.Error())
 			} else if !status.Running {
-				roachprodLibraryLogger.Printf("  %2d: not running\n", status.NodeID)
+				// TODO(irfansharif): Surface the staged version here?
+				config.Logger.Printf("  %2d: not running\n", status.NodeID)
 			} else {
-				roachprodLibraryLogger.Printf("  %2d: %s %s\n", status.NodeID, status.Version, status.Pid)
+				config.Logger.Printf("  %2d: %s %s\n", status.NodeID, status.Version, status.Pid)
 			}
 		}
 		return nil
@@ -545,7 +627,7 @@ into a single stream.
 		} else {
 			dest = args[0] + ".logs"
 		}
-		return roachprod.Logs(roachprodLibraryLogger, args[0], dest, username, logsOpts)
+		return roachprod.Logs(config.Logger, args[0], dest, username, logsOpts)
 	}),
 }
 
@@ -568,21 +650,29 @@ of nodes, outputting a line whenever a change is detected:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		messages, err := roachprod.Monitor(context.Background(), roachprodLibraryLogger, args[0], monitorOpts)
+		eventChan, err := roachprod.Monitor(context.Background(), config.Logger, args[0], monitorOpts)
 		if err != nil {
 			return err
 		}
-		for msg := range messages {
-			if msg.Err != nil {
-				msg.Msg += "error: " + msg.Err.Error()
-			}
-			thisError := errors.Newf("%d: %s", msg.Node, msg.Msg)
-			if msg.Err != nil || strings.Contains(msg.Msg, "dead") {
-				err = errors.CombineErrors(err, thisError)
-			}
-			fmt.Println(thisError.Error())
+		for info := range eventChan {
+			fmt.Println(info.String())
 		}
-		return err
+
+		return nil
+	}),
+}
+
+var signalCmd = &cobra.Command{
+	Use:   "signal <cluster> <signal>",
+	Short: "send signal to cluster",
+	Long:  "Send a POSIX signal to the nodes in a cluster, specified by its integer code.",
+	Args:  cobra.ExactArgs(2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		sig, err := strconv.ParseInt(args[1], 10, 8)
+		if err != nil {
+			return errors.Wrapf(err, "invalid signal argument")
+		}
+		return roachprod.Signal(context.Background(), config.Logger, args[0], int(sig))
 	}),
 }
 
@@ -597,7 +687,7 @@ nodes.
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Wipe(context.Background(), roachprodLibraryLogger, args[0], wipePreserveCerts)
+		return roachprod.Wipe(context.Background(), config.Logger, args[0], wipePreserveCerts)
 	}),
 }
 
@@ -627,7 +717,7 @@ the 'zfs rollback' command:
 
 	Args: cobra.ExactArgs(2),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Reformat(context.Background(), roachprodLibraryLogger, args[0], args[1])
+		return roachprod.Reformat(context.Background(), config.Logger, args[0], args[1])
 	}),
 }
 
@@ -639,7 +729,8 @@ var runCmd = &cobra.Command{
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: wrap(func(_ *cobra.Command, args []string) error {
-		return roachprod.Run(context.Background(), roachprodLibraryLogger, args[0], extraSSHOptions, tag, secure, os.Stdout, os.Stderr, args[1:])
+		return roachprod.Run(context.Background(), config.Logger, args[0], extraSSHOptions, tag,
+			secure, os.Stdout, os.Stderr, args[1:], install.WithWaitOnFail())
 	}),
 }
 
@@ -650,7 +741,7 @@ var resetCmd = &cobra.Command{
 environments and will fall back to a no-op.`,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) (retErr error) {
-		return roachprod.Reset(roachprodLibraryLogger, args[0])
+		return roachprod.Reset(config.Logger, args[0])
 	}),
 }
 
@@ -663,7 +754,7 @@ var installCmd = &cobra.Command{
 `,
 	Args: cobra.MinimumNArgs(2),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Install(context.Background(), roachprodLibraryLogger, args[0], args[1:])
+		return roachprod.Install(context.Background(), config.Logger, args[0], args[1:])
 	}),
 }
 
@@ -678,7 +769,7 @@ var downloadCmd = &cobra.Command{
 		if len(args) == 4 {
 			dest = args[3]
 		}
-		return roachprod.Download(context.Background(), roachprodLibraryLogger, args[0], src, sha, dest)
+		return roachprod.Download(context.Background(), config.Logger, args[0], src, sha, dest)
 	}),
 }
 
@@ -700,7 +791,7 @@ Currently available application options are:
 		if len(args) == 2 {
 			versionArg = args[1]
 		}
-		urls, err := roachprod.StageURL(roachprodLibraryLogger, args[0], versionArg, stageOS)
+		urls, err := roachprod.StageURL(config.Logger, args[0], versionArg, stageOS, stageArch)
 		if err != nil {
 			return err
 		}
@@ -739,7 +830,7 @@ Some examples of usage:
 		if len(args) == 3 {
 			versionArg = args[2]
 		}
-		return roachprod.Stage(context.Background(), roachprodLibraryLogger, args[0], stageOS, stageDir, args[1], versionArg)
+		return roachprod.Stage(context.Background(), config.Logger, args[0], stageOS, stageArch, stageDir, args[1], versionArg)
 	}),
 }
 
@@ -753,7 +844,7 @@ start."
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.DistributeCerts(context.Background(), roachprodLibraryLogger, args[0])
+		return roachprod.DistributeCerts(context.Background(), config.Logger, args[0])
 	}),
 }
 
@@ -769,7 +860,7 @@ var putCmd = &cobra.Command{
 		if len(args) == 3 {
 			dest = args[2]
 		}
-		return roachprod.Put(context.Background(), roachprodLibraryLogger, args[0], src, dest, useTreeDist)
+		return roachprod.Put(context.Background(), config.Logger, args[0], src, dest, useTreeDist)
 	}),
 }
 
@@ -786,7 +877,7 @@ multiple nodes the destination file name will be prefixed with the node number.
 		if len(args) == 3 {
 			dest = args[2]
 		}
-		return roachprod.Get(roachprodLibraryLogger, args[0], src, dest)
+		return roachprod.Get(context.Background(), config.Logger, args[0], src, dest)
 	}),
 }
 
@@ -796,7 +887,7 @@ var sqlCmd = &cobra.Command{
 	Long:  "Run `cockroach sql` on a remote cluster.\n",
 	Args:  cobra.MinimumNArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.SQL(context.Background(), roachprodLibraryLogger, args[0], secure, tenantName, args[1:])
+		return roachprod.SQL(context.Background(), config.Logger, args[0], secure, tenantName, tenantInstance, args[1:])
 	}),
 }
 
@@ -807,10 +898,11 @@ var pgurlCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		urls, err := roachprod.PgURL(context.Background(), roachprodLibraryLogger, args[0], pgurlCertsDir, roachprod.PGURLOptions{
-			External:   external,
-			Secure:     secure,
-			TenantName: tenantName,
+		urls, err := roachprod.PgURL(context.Background(), config.Logger, args[0], pgurlCertsDir, roachprod.PGURLOptions{
+			External:       external,
+			Secure:         secure,
+			TenantName:     tenantName,
+			TenantInstance: tenantInstance,
 		})
 		if err != nil {
 			return err
@@ -842,7 +934,7 @@ Examples:
 		if cmd.CalledAs() == "pprof-heap" {
 			pprofOpts.Heap = true
 		}
-		return roachprod.Pprof(roachprodLibraryLogger, args[0], pprofOpts)
+		return roachprod.Pprof(context.Background(), config.Logger, args[0], pprofOpts)
 	}),
 }
 
@@ -854,7 +946,9 @@ var adminurlCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		urls, err := roachprod.AdminURL(roachprodLibraryLogger, args[0], adminurlPath, adminurlIPs, adminurlOpen, secure)
+		urls, err := roachprod.AdminURL(
+			context.Background(), config.Logger, args[0], tenantName, tenantInstance, adminurlPath, adminurlIPs, adminurlOpen, secure,
+		)
 		if err != nil {
 			return err
 		}
@@ -872,7 +966,7 @@ var ipCmd = &cobra.Command{
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		ips, err := roachprod.IP(context.Background(), roachprodLibraryLogger, args[0], external)
+		ips, err := roachprod.IP(config.Logger, args[0], external)
 		if err != nil {
 			return err
 		}
@@ -887,7 +981,7 @@ var versionCmd = &cobra.Command{
 	Use:   `version`,
 	Short: `print version information`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println(roachprod.Version(roachprodLibraryLogger))
+		fmt.Println(roachprod.Version(config.Logger))
 		return nil
 	},
 }
@@ -906,7 +1000,7 @@ var getProvidersCmd = &cobra.Command{
 
 var grafanaStartCmd = &cobra.Command{
 	Use:   `grafana-start <cluster>`,
-	Short: `spins up a prometheus and grafana instance on the last node in the cluster`,
+	Short: `spins up a prometheus and grafana instance on the last node in the cluster; NOTE: for arm64 clusters, use --arch arm64`,
 	Args:  cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
 		var grafanaDashboardJSONs []string
@@ -934,8 +1028,11 @@ var grafanaStartCmd = &cobra.Command{
 				return err
 			}
 		}
-
-		return roachprod.StartGrafana(context.Background(), roachprodLibraryLogger, args[0],
+		arch := vm.ArchAMD64
+		if grafanaArch == "arm64" {
+			arch = vm.ArchARM64
+		}
+		return roachprod.StartGrafana(context.Background(), config.Logger, args[0], arch,
 			grafanaConfigURL, grafanaDashboardJSONs, nil)
 	}),
 }
@@ -945,7 +1042,7 @@ var grafanaStopCmd = &cobra.Command{
 	Short: `spins down prometheus and grafana instances on the last node in the cluster`,
 	Args:  cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.StopGrafana(context.Background(), roachprodLibraryLogger, args[0], "")
+		return roachprod.StopGrafana(context.Background(), config.Logger, args[0], "")
 	}),
 }
 
@@ -957,7 +1054,7 @@ var grafanaDumpCmd = &cobra.Command{
 		if grafanaDumpDir == "" {
 			return errors.New("--dump-dir unspecified")
 		}
-		return roachprod.PrometheusSnapshot(context.Background(), roachprodLibraryLogger, args[0], grafanaDumpDir)
+		return roachprod.PrometheusSnapshot(context.Background(), config.Logger, args[0], grafanaDumpDir)
 	}),
 }
 
@@ -966,13 +1063,120 @@ var grafanaURLCmd = &cobra.Command{
 	Short: `returns a url to the grafana dashboard`,
 	Args:  cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		url, err := roachprod.GrafanaURL(context.Background(), roachprodLibraryLogger, args[0],
+		url, err := roachprod.GrafanaURL(context.Background(), config.Logger, args[0],
 			grafanaurlOpen)
 		if err != nil {
 			return err
 		}
 		fmt.Println(url)
 		return nil
+	}),
+}
+
+var snapshotCmd = &cobra.Command{
+	Use:   `snapshot`,
+	Short: "snapshot enables creating/listing/deleting/applying cluster snapshots",
+	Args:  cobra.MinimumNArgs(1),
+}
+
+var snapshotCreateCmd = &cobra.Command{
+	Use:   `create <cluster> <name> <description>`,
+	Short: "snapshot a named cluster, using the given snapshot name and description",
+	Args:  cobra.ExactArgs(3),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		cluster := args[0]
+		name := args[1]
+		desc := args[2]
+		snapshots, err := roachprod.CreateSnapshot(context.Background(), config.Logger, cluster, vm.VolumeSnapshotCreateOpts{
+			Name:        name,
+			Description: desc,
+		})
+		if err != nil {
+			return err
+		}
+		for _, snapshot := range snapshots {
+			config.Logger.Printf("created snapshot %s (id: %s)", snapshot.Name, snapshot.ID)
+		}
+		return nil
+	}),
+}
+
+var snapshotListCmd = &cobra.Command{
+	Use:   `list <provider> [<name>]`,
+	Short: "list all snapshots for the given cloud provider, optionally filtering by the given name",
+	Args:  cobra.RangeArgs(1, 2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		provider := args[0]
+		var name string
+		if len(args) == 2 {
+			name = args[1]
+		}
+		snapshots, err := roachprod.ListSnapshots(context.Background(), config.Logger, provider,
+			vm.VolumeSnapshotListOpts{
+				NamePrefix: name,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		for _, snapshot := range snapshots {
+			config.Logger.Printf("found snapshot %s (id: %s)", snapshot.Name, snapshot.ID)
+		}
+		return nil
+	}),
+}
+
+var snapshotDeleteCmd = &cobra.Command{
+	Use:   `delete <provider> <name>`,
+	Short: "delete all snapshots for the given cloud provider optionally filtering by the given name",
+	Args:  cobra.ExactArgs(2),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		ctx := context.Background()
+		provider, name := args[0], args[1]
+		snapshots, err := roachprod.ListSnapshots(ctx, config.Logger, provider,
+			vm.VolumeSnapshotListOpts{
+				NamePrefix: name,
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		for _, snapshot := range snapshots {
+			config.Logger.Printf("deleting snapshot %s (id: %s)", snapshot.Name, snapshot.ID)
+		}
+		if !dryrun {
+			if err := roachprod.DeleteSnapshots(ctx, config.Logger, provider, snapshots...); err != nil {
+				return err
+			}
+		}
+		config.Logger.Printf("done")
+		return nil
+	}),
+}
+
+var snapshotApplyCmd = &cobra.Command{
+	Use:   `apply <provider> <name> <cluster> `,
+	Short: "apply the named snapshots from the given cloud provider to the named cluster",
+	Args:  cobra.ExactArgs(3),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		ctx := context.Background()
+		provider, name, cluster := args[0], args[1], args[2]
+		snapshots, err := roachprod.ListSnapshots(ctx, config.Logger, provider,
+			vm.VolumeSnapshotListOpts{
+				NamePrefix: name,
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		return roachprod.ApplySnapshots(ctx, config.Logger, cluster, snapshots, vm.VolumeCreateOpts{
+			Size: 500, // TODO(irfansharif): Make this configurable?
+			Labels: map[string]string{
+				vm.TagUsage: "roachprod",
+			},
+		})
 	}),
 }
 
@@ -998,7 +1202,7 @@ var collectionStartCmd = &cobra.Command{
 		cluster := args[0]
 		return roachprod.StorageCollectionPerformAction(
 			context.Background(),
-			roachprodLibraryLogger,
+			config.Logger,
 			cluster,
 			"start",
 			volumeCreateOpts,
@@ -1014,7 +1218,7 @@ var collectionStopCmd = &cobra.Command{
 		cluster := args[0]
 		return roachprod.StorageCollectionPerformAction(
 			context.Background(),
-			roachprodLibraryLogger,
+			config.Logger,
 			cluster,
 			"stop",
 			volumeCreateOpts,
@@ -1030,7 +1234,7 @@ var collectionListVolumes = &cobra.Command{
 		cluster := args[0]
 		return roachprod.StorageCollectionPerformAction(
 			context.Background(),
-			roachprodLibraryLogger,
+			config.Logger,
 			cluster,
 			"list-volumes",
 			volumeCreateOpts,
@@ -1046,19 +1250,83 @@ var storageSnapshotCmd = &cobra.Command{
 		cluster := args[0]
 		name := args[1]
 		desc := args[2]
-		return roachprod.SnapshotVolume(context.Background(), roachprodLibraryLogger, cluster, name, desc)
+		_, err := roachprod.CreateSnapshot(context.Background(), config.Logger, cluster, vm.VolumeSnapshotCreateOpts{
+			Name:        name,
+			Description: desc,
+		})
+		return err
+	}),
+}
+
+// Before executing any command, validate and canonicalize args.
+func validateAndConfigure(cmd *cobra.Command, args []string) {
+	// Skip validation for commands that are self-sufficient.
+	switch cmd.Name() {
+	case "help", "version", "list":
+		return
+	}
+
+	printErrAndExit := func(err error) {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Validate architecture flag, if set.
+	if archOpt := cmd.Flags().Lookup("arch"); archOpt != nil && archOpt.Changed {
+		arch := vm.CPUArch(strings.ToLower(archOpt.Value.String()))
+
+		if arch != vm.ArchAMD64 && arch != vm.ArchARM64 && arch != vm.ArchFIPS {
+			printErrAndExit(fmt.Errorf("unsupported architecture %q", arch))
+		}
+		if string(arch) != archOpt.Value.String() {
+			// Set the canonical value.
+			_ = cmd.Flags().Set("arch", string(arch))
+		}
+	}
+}
+
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "check TeamCity for a new roachprod binary and update if available",
+	Long: "Will attempt to download the latest master branch roachprod binary from teamcity" +
+		" and swap the current roachprod with it. The current roachprod binary will be backed up" +
+		" and can be restored via `roachprod update --revert`.",
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		currentBinary, err := os.Executable()
+		if err != nil {
+			return err
+		}
+
+		if revertUpdate {
+			if upgrade.PromptYesNo("Revert to previous version? Note: this will replace the" +
+				" current roachprod binary with a previous roachprod.bak binary.") {
+				if err := upgrade.SwapBinary(currentBinary, currentBinary+".bak"); err != nil {
+					return err
+				}
+				fmt.Println("roachprod successfully reverted, run `roachprod -v` to confirm.")
+			}
+			return nil
+		}
+
+		newBinary := currentBinary + ".new"
+		if err := upgrade.DownloadLatestRoadprod(newBinary); err != nil {
+			return err
+		}
+
+		if upgrade.PromptYesNo("Continue with update? This will overwrite any existing roachprod.bak binary.") {
+			if err := upgrade.SwapBinary(currentBinary, newBinary); err != nil {
+				return errors.WithDetail(err, "unable to update binary")
+			}
+
+			fmt.Println("Update successful: run `roachprod -v` to confirm.")
+		}
+		return nil
 	}),
 }
 
 func main() {
-	loggerCfg := logger.Config{Stdout: os.Stdout, Stderr: os.Stderr}
-	var loggerError error
-	roachprodLibraryLogger, loggerError = loggerCfg.NewLogger("")
-	if loggerError != nil {
-		fmt.Fprintf(os.Stderr, "unable to configure logger: %s\n", loggerError)
-		os.Exit(1)
-	}
-
 	_ = roachprod.InitProviders()
 	providerOptsContainer = vm.CreateProviderOptionsContainer()
 	// The commands are displayed in the order they are added to rootCmd. Note
@@ -1074,7 +1342,6 @@ func main() {
 		syncCmd,
 		gcCmd,
 		setupSSHCmd,
-
 		statusCmd,
 		monitorCmd,
 		startCmd,
@@ -1082,6 +1349,7 @@ func main() {
 		startTenantCmd,
 		initCmd,
 		runCmd,
+		signalCmd,
 		wipeCmd,
 		reformatCmd,
 		installCmd,
@@ -1105,12 +1373,14 @@ func main() {
 		grafanaDumpCmd,
 		grafanaURLCmd,
 		rootStorageCmd,
+		snapshotCmd,
+		updateCmd,
 	)
 	setBashCompletionFunction()
 
 	// Add help about specifying nodes
 	for _, cmd := range []*cobra.Command{
-		getCmd, putCmd, runCmd, startCmd, statusCmd, stopCmd,
+		getCmd, putCmd, runCmd, startCmd, statusCmd, stopCmd, signalCmd,
 		wipeCmd, pgurlCmd, adminurlCmd, sqlCmd, installCmd,
 	} {
 		if cmd.Long == "" {

@@ -32,23 +32,14 @@ func TestTracker(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	reverseWorkPriorityDict := make(map[string]admissionpb.WorkPriority)
-	for k, v := range admissionpb.WorkPriorityDict {
-		reverseWorkPriorityDict[v] = k
-	}
-
 	ctx := context.Background()
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		var tracker *Tracker
-		knobs := &kvflowcontrol.TestingKnobs{
-			UntrackTokensInterceptor: func(tokens kvflowcontrol.Tokens, pos kvflowcontrolpb.RaftLogPosition) {
-
-			},
-		}
+		knobs := &kvflowcontrol.TestingKnobs{}
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "init":
-				tracker = New(kvflowcontrolpb.RaftLogPosition{Term: 1, Index: 0}, knobs)
+				tracker = New(kvflowcontrolpb.RaftLogPosition{Term: 1, Index: 0}, kvflowcontrol.Stream{}, knobs)
 				return ""
 
 			case "track":
@@ -73,7 +64,7 @@ func TestTracker(t *testing.T) {
 						switch {
 						case strings.HasPrefix(parts[i], "pri="):
 							var found bool
-							pri, found = reverseWorkPriorityDict[arg]
+							pri, found = admissionpb.TestingReverseWorkPriorityDict[arg]
 							require.True(t, found)
 
 						case strings.HasPrefix(parts[i], "tokens="):
@@ -90,7 +81,7 @@ func TestTracker(t *testing.T) {
 							t.Fatalf("unrecognized prefix: %s", parts[i])
 						}
 					}
-					tracker.Track(ctx, pri, tokens, logPosition)
+					require.True(t, tracker.Track(ctx, pri, tokens, logPosition))
 				}
 				return ""
 
@@ -98,12 +89,23 @@ func TestTracker(t *testing.T) {
 				require.NotNilf(t, tracker, "uninitialized tracker (did you use 'init'?)")
 				return tracker.TestingPrintIter()
 
+			case "inspect":
+				var buf strings.Builder
+				for _, tracked := range tracker.Inspect(ctx) {
+					buf.WriteString(fmt.Sprintf("pri=%s tokens=%s %s\n",
+						admissionpb.WorkPriority(tracked.Priority),
+						testingPrintTrimmedTokens(kvflowcontrol.Tokens(tracked.Tokens)),
+						tracked.RaftLogPosition,
+					))
+				}
+				return buf.String()
+
 			case "untrack":
 				require.NotNilf(t, tracker, "uninitialized tracker (did you use 'init'?)")
 				var priStr, logPositionStr string
 				d.ScanArgs(t, "pri", &priStr)
 				d.ScanArgs(t, "up-to-log-position", &logPositionStr)
-				pri, found := reverseWorkPriorityDict[priStr]
+				pri, found := admissionpb.TestingReverseWorkPriorityDict[priStr]
 				require.True(t, found)
 				logPosition := parseLogPosition(t, logPositionStr)
 

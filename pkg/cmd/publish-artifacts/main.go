@@ -96,22 +96,30 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 		o.VersionStr = flags.sha
 		o.AbsolutePath = filepath.Join(flags.pkgDir, "cockroach"+release.SuffixFromPlatform(platform))
 		o.CockroachSQLAbsolutePath = filepath.Join(flags.pkgDir, "cockroach-sql"+release.SuffixFromPlatform(platform))
+		o.Channel = release.ChannelFromPlatform(platform)
 
 		log.Printf("building %s", pretty.Sprint(o))
 		buildOneCockroach(providers, o, execFn)
+
+		// We build workload only for Linux.
+		if platform == release.PlatformLinux || platform == release.PlatformLinuxArm {
+			var o opts
+			o.Platform = platform
+			o.PkgDir = flags.pkgDir
+			o.Branch = flags.branch
+			o.VersionStr = flags.sha
+			buildAndPublishWorkload(providers, o, execFn)
+		}
 	}
-	// We build workload only for Linux.
-	var o opts
-	o.Platform = release.PlatformLinux
-	o.PkgDir = flags.pkgDir
-	o.Branch = flags.branch
-	o.VersionStr = flags.sha
-	buildAndPublishWorkload(providers, o, execFn)
 }
 
 func buildOneCockroach(providers []release.ObjectPutGetter, o opts, execFn release.ExecFn) {
 	log.Printf("building cockroach %s", pretty.Sprint(o))
-	if err := release.MakeRelease(o.Platform, release.BuildOptions{ExecFn: execFn}, o.PkgDir); err != nil {
+	buildOpts := release.BuildOptions{
+		ExecFn:  execFn,
+		Channel: o.Channel,
+	}
+	if err := release.MakeRelease(o.Platform, buildOpts, o.PkgDir); err != nil {
 		log.Fatal(err)
 	}
 	for _, provider := range providers {
@@ -134,10 +142,13 @@ func buildOneCockroach(providers []release.ObjectPutGetter, o opts, execFn relea
 
 func buildAndPublishWorkload(providers []release.ObjectPutGetter, o opts, execFn release.ExecFn) {
 	log.Printf("building workload %s", pretty.Sprint(o))
-	if err := release.MakeWorkload(release.BuildOptions{ExecFn: execFn}, o.PkgDir); err != nil {
+	if err := release.MakeWorkload(o.Platform, release.BuildOptions{ExecFn: execFn}, o.PkgDir); err != nil {
 		log.Fatal(err)
 	}
 	o.AbsolutePath = filepath.Join(o.PkgDir, "bin", "workload")
+	if o.Platform == release.PlatformLinuxArm {
+		o.AbsolutePath += release.SuffixFromPlatform(o.Platform)
+	}
 	for _, provider := range providers {
 		release.PutNonRelease(
 			provider,
@@ -160,4 +171,5 @@ type opts struct {
 	AbsolutePath             string
 	CockroachSQLAbsolutePath string
 	PkgDir                   string
+	Channel                  string
 }

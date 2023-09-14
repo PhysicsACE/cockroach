@@ -106,7 +106,7 @@ func (e *distSQLSpecExecFactory) ConstructValues(
 		planCtx := e.getPlanCtx(canDistribute)
 		colTypes := getTypesFromResultColumns(cols)
 		spec := e.dsp.createValuesSpec(planCtx, colTypes, len(rows), nil /* rawBytes */)
-		physPlan, err := e.dsp.createValuesPlan(planCtx, spec, colTypes)
+		physPlan, _, err := e.dsp.createValuesPlan(planCtx, spec, colTypes)
 		if err != nil {
 			return nil, err
 		}
@@ -149,7 +149,7 @@ func (e *distSQLSpecExecFactory) ConstructValues(
 		if err != nil {
 			return nil, err
 		}
-		physPlan, err = e.dsp.createValuesPlan(planCtx, spec, colTypes)
+		physPlan, _, err = e.dsp.createValuesPlan(planCtx, spec, colTypes)
 	}
 	if err != nil {
 		return nil, err
@@ -1042,23 +1042,18 @@ func (e *distSQLSpecExecFactory) ConstructCreateTableAs(
 }
 
 func (e *distSQLSpecExecFactory) ConstructCreateView(
+	createView *tree.CreateView,
 	schema cat.Schema,
-	viewName *cat.DataSourceName,
-	ifNotExists bool,
-	replace bool,
-	persistence tree.Persistence,
-	materialized bool,
 	viewQuery string,
 	columns colinfo.ResultColumns,
 	deps opt.SchemaDeps,
 	typeDeps opt.SchemaTypeDeps,
-	withData bool,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: create view")
 }
 
 func (e *distSQLSpecExecFactory) ConstructCreateFunction(
-	schema cat.Schema, cf *tree.CreateFunction, deps opt.SchemaDeps, typeDeps opt.SchemaTypeDeps,
+	schema cat.Schema, cf *tree.CreateRoutine, deps opt.SchemaDeps, typeDeps opt.SchemaTypeDeps,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: create function")
 }
@@ -1249,4 +1244,8 @@ func (e *distSQLSpecExecFactory) ConstructLiteralValues(
 	rows tree.ExprContainer, cols colinfo.ResultColumns,
 ) (exec.Node, error) {
 	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: literal values")
+}
+
+func (e *distSQLSpecExecFactory) ConstructCall(proc *tree.RoutineExpr) (exec.Node, error) {
+	return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: call")
 }

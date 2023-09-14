@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -89,6 +90,7 @@ func migrateTable(
 		}
 
 		// Wait for any in-flight schema changes to complete.
+		// Check legacy schema changer jobs.
 		if mutations := storedTable.GetMutationJobs(); len(mutations) > 0 {
 			for _, mutation := range mutations {
 				log.Infof(ctx, "waiting for the mutation job %v to complete", mutation.JobID)
@@ -99,7 +101,15 @@ func migrateTable(
 			}
 			continue
 		}
-
+		// Check declarative schema changer jobs.
+		if state := storedTable.GetDeclarativeSchemaChangerState(); state != nil && state.JobID != catpb.InvalidJobID {
+			log.Infof(ctx, "waiting for the mutation job %v to complete", state.JobID)
+			if _, err := d.InternalExecutor.Exec(ctx, "migration-mutations-wait",
+				nil, waitForJobStatement, state.JobID); err != nil {
+				return err
+			}
+			continue
+		}
 		// Ignore the schema change if the table already has the required schema.
 		// Expect all or none.
 		var exists bool
@@ -288,7 +298,6 @@ func indexDescForComparison(idx catalog.Index) *descpb.IndexDescriptor {
 
 	// Clear out the column IDs, but retain their length. Column IDs may
 	// change. Note that we retain the name slices. Those should match.
-	desc.StoreColumnIDs = nil
 	for i := range desc.StoreColumnIDs {
 		desc.StoreColumnIDs[i] = 0
 	}
@@ -297,6 +306,9 @@ func indexDescForComparison(idx catalog.Index) *descpb.IndexDescriptor {
 	}
 	for i := range desc.KeySuffixColumnIDs {
 		desc.KeySuffixColumnIDs[i] = 0
+	}
+	for i := range desc.CompositeColumnIDs {
+		desc.CompositeColumnIDs[i] = 0
 	}
 
 	desc.CreatedAtNanos = 0
@@ -337,6 +349,51 @@ func hasColumnFamily(
 			break
 		}
 	}
+	if expectedFamily == nil {
+		return false, errors.Errorf("column family %s does not exist", colFamily)
+	}
+
+	// Check that columns match.
+	storedFamilyCols := storedFamily.ColumnNames
+	expectedFamilyCols := expectedFamily.ColumnNames
+	if len(storedFamilyCols) != len(expectedFamilyCols) {
+		return false, nil
+	}
+	for i, storedCol := range storedFamilyCols {
+		if storedCol != expectedFamilyCols[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// onlyHasColumnFamily returns true if storedTable has only the given column
+// family, comparing with expectedTable. storedTable descriptor must be read
+// from system storage as compared to reading from the systemschema package. On
+// the contrary, expectedTable must be accessed directly from systemschema
+// package. This function returns an error if there is more than one column
+// family, or if the only column family does not match the provided family name.
+func onlyHasColumnFamily(
+	storedTable, expectedTable catalog.TableDescriptor, colFamily string,
+) (bool, error) {
+	var storedFamily, expectedFamily *descpb.ColumnFamilyDescriptor
+	storedFamilies := storedTable.GetFamilies()
+	if len(storedFamilies) > 1 {
+		return false, nil
+	}
+	if storedFamilies[0].Name == colFamily {
+		storedFamily = &storedFamilies[0]
+	}
+
+	if storedFamily == nil {
+		return false, nil
+	}
+
+	expectedFamilies := expectedTable.GetFamilies()
+	if expectedFamilies[0].Name == colFamily {
+		expectedFamily = &expectedFamilies[0]
+	}
+
 	if expectedFamily == nil {
 		return false, errors.Errorf("column family %s does not exist", colFamily)
 	}

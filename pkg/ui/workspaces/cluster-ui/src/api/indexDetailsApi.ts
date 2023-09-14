@@ -13,16 +13,17 @@ import {
   convertStatementRawFormatToAggregatedStatistics,
   executeInternalSql,
   fetchData,
+  formatApiResult,
   LARGE_RESULT_SIZE,
-  sqlApiErrorMessage,
+  SqlApiResponse,
   SqlExecutionRequest,
   sqlResultsAreEmpty,
   StatementRawFormat,
 } from "src/api";
-import moment from "moment";
+import moment from "moment-timezone";
 import { TimeScale, toRoundedDateRange } from "../timeScaleDropdown";
 import { AggregateStatistics } from "../statementsTable";
-import { INTERNAL_APP_NAME_PREFIX } from "../recentExecutions/recentStatementUtils";
+import { INTERNAL_APP_NAME_PREFIX } from "../activeExecutions/activeStatementUtils";
 
 export type TableIndexStatsRequest =
   cockroach.server.serverpb.TableIndexStatsRequest;
@@ -44,7 +45,7 @@ export const getIndexStats = (
 ): Promise<TableIndexStatsResponse> => {
   return fetchData(
     cockroach.server.serverpb.TableIndexStatsResponse,
-    `/_status/databases/${req.database}/tables/${req.table}/indexstats`,
+    `_status/databases/${req.database}/tables/${req.table}/indexstats`,
     null,
     null,
     "30M",
@@ -57,7 +58,7 @@ export const resetIndexStats = (
 ): Promise<ResetIndexUsageStatsResponse> => {
   return fetchData(
     cockroach.server.serverpb.ResetIndexUsageStatsResponse,
-    "/_status/resetindexusagestats",
+    "_status/resetindexusagestats",
     cockroach.server.serverpb.ResetIndexUsageStatsRequest,
     req,
     "30M",
@@ -89,7 +90,9 @@ export async function getStatementsUsingIndex({
   database,
   start,
   end,
-}: StatementsUsingIndexRequest): Promise<AggregateStatistics[]> {
+}: StatementsUsingIndexRequest): Promise<
+  SqlApiResponse<AggregateStatistics[]>
+> {
   const args: any = [`"${table}@${index}"`];
   let whereClause = "";
   if (start) {
@@ -100,7 +103,7 @@ export async function getStatementsUsingIndex({
   }
 
   const selectStatements = {
-    sql: `SELECT * FROM system.statement_statistics 
+    sql: `SELECT * FROM crdb_internal.statement_statistics_persisted 
             WHERE $1::jsonb <@ indexes_usage
                 AND app_name NOT LIKE '${INTERNAL_APP_NAME_PREFIX}%' 
                 ${whereClause}
@@ -117,18 +120,20 @@ export async function getStatementsUsingIndex({
   };
 
   const result = await executeInternalSql<StatementRawFormat>(req);
-  if (result.error) {
-    throw new Error(
-      `Error while retrieving list of statements: ${sqlApiErrorMessage(
-        result.error.message,
-      )}`,
+  if (sqlResultsAreEmpty(result)) {
+    return formatApiResult<AggregateStatistics[]>(
+      [],
+      result.error,
+      "retrieving list of statements per index",
     );
   }
-  if (sqlResultsAreEmpty(result)) {
-    return [];
-  }
 
-  return result.execution.txn_results[0].rows.map(s =>
+  const rows = result.execution.txn_results[0].rows.map(s =>
     convertStatementRawFormatToAggregatedStatistics(s),
+  );
+  return formatApiResult<AggregateStatistics[]>(
+    rows,
+    result.error,
+    "retrieving list of statements per index",
   );
 }

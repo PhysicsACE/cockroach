@@ -157,7 +157,12 @@ func downloadZips(
 	cmd.Dir = tmpdir
 	jsonBytes, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		var stderr []byte
+		if exitErr := (*exec.ExitError)(nil); errors.As(err, &exitErr) {
+			stderr = exitErr.Stderr
+		}
+		return nil, fmt.Errorf("failed to run go with arguments %+v; got stdout %s, stderr %s; %w",
+			downloadArgs, string(jsonBytes), string(stderr), err)
 	}
 	var jsonBuilder strings.Builder
 	ret := make(map[string]downloadedModule)
@@ -184,7 +189,12 @@ func listAllModules(tmpdir string) (map[string]listedModule, error) {
 	cmd.Dir = tmpdir
 	jsonBytes, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		var stderr []byte
+		if exitErr := (*exec.ExitError)(nil); errors.As(err, &exitErr) {
+			stderr = exitErr.Stderr
+		}
+		return nil, fmt.Errorf("failed to run `go list -mod=readonly -m -json all`; got stdout %s, stderr %s; %w",
+			string(jsonBytes), string(stderr), err)
 	}
 	ret := make(map[string]listedModule)
 	var jsonBuilder strings.Builder
@@ -335,7 +345,7 @@ func dumpNewDepsBzl(
 
 	fmt.Println(`load("@bazel_gazelle//:deps.bzl", "go_repository")
 
-# PRO-TIP: You can inject temorary changes to any of these dependencies by
+# PRO-TIP: You can inject temporary changes to any of these dependencies by
 # by pointing to an alternate remote to clone from. Delete the ` + "`sha256`" + `,
 # ` + "`strip_prefix`, and `urls` parameters, and add `vcs = \"git\"`" + ` as well as a
 # custom ` + "`remote` and `commit`" + `. For example:

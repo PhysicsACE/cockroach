@@ -521,7 +521,7 @@ func TestGossipNoForwardSelf(t *testing.T) {
 			localAddr := local.GetNodeAddr()
 			c := newClient(log.MakeTestingAmbientCtxWithNewTracer(), localAddr, makeMetrics())
 			peer.mu.Lock()
-			c.startLocked(peer, disconnectedCh, peerCtx, stopper, peerCtx.NewBreaker(""))
+			c.startLocked(peer, disconnectedCh, peerCtx, stopper)
 			peer.mu.Unlock()
 
 			disconnectedClient := <-disconnectedCh
@@ -707,7 +707,7 @@ func TestGossipJoinTwoClusters(t *testing.T) {
 		clock := hlc.NewClockForTesting(nil)
 		rpcContext := rpc.NewInsecureTestingContextWithClusterID(ctx, clock, stopper, clusterID)
 
-		server, err := rpc.NewServer(rpcContext)
+		server, err := rpc.NewServer(ctx, rpcContext)
 		require.NoError(t, err)
 
 		// node ID must be non-zero

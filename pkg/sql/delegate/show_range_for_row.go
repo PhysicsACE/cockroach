@@ -15,8 +15,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -29,11 +27,20 @@ func (d *delegator) delegateShowRangeForRow(n *tree.ShowRangeForRow) (tree.State
 	if err != nil {
 		return nil, err
 	}
-	if err := checkPrivilegesForShowRanges(d, idx.Table()); err != nil {
+	// Basic requirement is SELECT privileges
+	if err = d.catalog.CheckPrivilege(d.ctx, idx.Table(), privilege.SELECT); err != nil {
 		return nil, err
 	}
 	if idx.Table().IsVirtualTable() {
 		return nil, errors.New("SHOW RANGE FOR ROW may not be called on a virtual table")
+	}
+	// Use qualifyDataSourceNamesInAST similarly to the Builder so that
+	// CREATE TABLE AS can source from a delegated expression.
+	// For example: CREATE TABLE t2 AS SELECT * FROM [SHOW RANGE FROM TABLE t1 FOR ROW (0)];
+	if d.qualifyDataSourceNamesInAST {
+		resName.ExplicitSchema = true
+		resName.ExplicitCatalog = true
+		(n.TableOrIndex).Table = resName.ToUnresolvedObjectName().ToTableName()
 	}
 	span := idx.Span()
 	table := idx.Table()
@@ -84,7 +91,7 @@ WHERE (r.start_key <= crdb_internal.encode_key(%[1]d, %[2]d, %[3]s))
   AND (r.end_key   >  crdb_internal.encode_key(%[1]d, %[2]d, %[3]s)) ORDER BY r.start_key
 	`
 	// note: CatalogName.String() != Catalog()
-	return parse(
+	return d.parse(
 		fmt.Sprintf(
 			query,
 			table.ID(),
@@ -95,23 +102,4 @@ WHERE (r.start_key <= crdb_internal.encode_key(%[1]d, %[2]d, %[3]s))
 			idxSpanEnd,
 		),
 	)
-}
-
-func checkPrivilegesForShowRanges(d *delegator, table cat.Table) error {
-	// Basic requirement is SELECT priviliges
-	if err := d.catalog.CheckPrivilege(d.ctx, table, privilege.SELECT); err != nil {
-		return err
-	}
-	hasAdmin, err := d.catalog.HasAdminRole(d.ctx)
-	if err != nil {
-		return err
-	}
-	// User needs to either have admin access or have the correct ZONECONFIG privilege
-	if hasAdmin {
-		return nil
-	}
-	if err := d.catalog.CheckPrivilege(d.ctx, table, privilege.ZONECONFIG); err != nil {
-		return pgerror.Wrapf(err, pgcode.InsufficientPrivilege, "only users with the ZONECONFIG privilege or the admin role can use SHOW RANGES on %s", table.Name())
-	}
-	return nil
 }

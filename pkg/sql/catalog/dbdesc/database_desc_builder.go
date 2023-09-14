@@ -12,6 +12,7 @@ package dbdesc
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -21,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -139,12 +140,15 @@ func (ddb *databaseDescriptorBuilder) RunPostDeserializationChanges() (err error
 		)
 	}
 
-	privsChanged := catprivilege.MaybeFixPrivileges(
+	privsChanged, err := catprivilege.MaybeFixPrivileges(
 		&ddb.maybeModified.Privileges,
 		descpb.InvalidID,
 		descpb.InvalidID,
 		privilege.Database,
 		ddb.maybeModified.GetName())
+	if err != nil {
+		return err
+	}
 	if privsChanged || removedIncompatibleDatabasePrivs || createdDefaultPrivileges {
 		ddb.changes.Add(catalog.UpgradedPrivileges)
 	}
@@ -159,8 +163,22 @@ func (ddb *databaseDescriptorBuilder) RunRestoreChanges(
 	version clusterversion.ClusterVersion, descLookupFn func(id descpb.ID) catalog.Descriptor,
 ) error {
 	// Upgrade the declarative schema changer state.
-	if scpb.MigrateDescriptorState(version, ddb.maybeModified.DeclarativeSchemaChangerState) {
+	if scpb.MigrateDescriptorState(version, descpb.InvalidID, ddb.maybeModified.DeclarativeSchemaChangerState) {
 		ddb.changes.Add(catalog.UpgradedDeclarativeSchemaChangerState)
+	}
+	return nil
+}
+
+// StripDanglingBackReferences implements the catalog.DescriptorBuilder
+// interface.
+func (ddb *databaseDescriptorBuilder) StripDanglingBackReferences(
+	descIDMightExist func(id descpb.ID) bool, nonTerminalJobIDMightExist func(id jobspb.JobID) bool,
+) error {
+	for schemaName, schemaInfo := range ddb.maybeModified.Schemas {
+		if !descIDMightExist(schemaInfo.ID) {
+			delete(ddb.maybeModified.Schemas, schemaName)
+			ddb.changes.Add(catalog.StrippedDanglingBackReferences)
+		}
 	}
 	return nil
 }
@@ -303,7 +321,7 @@ func WithPublicSchemaID(publicSchemaID descpb.ID) NewInitialOption {
 		// not have a descriptor.
 		if publicSchemaID != keys.PublicSchemaID {
 			desc.Schemas = map[string]descpb.DatabaseDescriptor_SchemaInfo{
-				tree.PublicSchema: {ID: publicSchemaID},
+				catconstants.PublicSchemaName: {ID: publicSchemaID},
 			}
 		}
 	}

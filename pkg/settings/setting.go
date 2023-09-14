@@ -10,7 +10,27 @@
 
 package settings
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
+
+// SettingName represents the user-visible name of a cluster setting.
+// The name is suitable for:
+// - SHOW/SET CLUSTER SETTING.
+// - inclusion in error messages.
+//
+// For internal storage, use the InternalKey type instead.
+type SettingName string
+
+// InternalKey is the internal (storage) key for a cluster setting.
+// The internal key is suitable for use with:
+// - direct accesses to system.settings.
+// - rangefeed logic associated with system.settings.
+// - (in unit tests only) interchangeably with the name for SET CLUSTER SETTING.
+//
+// For user-visible displays, use the SettingName type instead.
+type InternalKey string
 
 // Setting is the interface exposing the metadata for a cluster setting.
 //
@@ -22,8 +42,21 @@ type Setting interface {
 	// Class returns the scope of the setting in multi-tenant scenarios.
 	Class() Class
 
-	// Key returns the name of the specific cluster setting.
-	Key() string
+	// InternalKey returns the internal key used to store the setting.
+	// To display the name of the setting (eg. in errors etc) or the
+	// SET/SHOW CLUSTER SETTING statements, use the Name() method instead.
+	//
+	// The internal key is suitable for use with:
+	// - direct accesses to system.settings.
+	// - rangefeed logic associated with system.settings.
+	// - (in unit tests only) interchangeably with the name for SET CLUSTER SETTING.
+	InternalKey() InternalKey
+
+	// Name is the user-visible (display) name of the setting.
+	// The name is suitable for:
+	// - SHOW/SET CLUSTER SETTING.
+	// - inclusion in error messages.
+	Name() SettingName
 
 	// Typ returns the short (1 char) string denoting the type of setting.
 	Typ() string
@@ -33,7 +66,7 @@ type Setting interface {
 	// CLUSTER SETTING <setting-name>`.
 	//
 	// If this object implements a non-reportable setting that was retrieved for
-	// reporting (see LookupForReporting), String hides the actual value.
+	// reporting (see LookupForReportingByKey), String hides the actual value.
 	String(sv *Values) string
 
 	// Description contains a helpful text explaining what the specific cluster
@@ -51,7 +84,7 @@ type Setting interface {
 // is not reportable).
 //
 // A non-masked setting must not be used in the context of reporting values (see
-// LookupForReporting).
+// LookupForReportingByKey).
 type NonMaskedSetting interface {
 	Setting
 
@@ -79,6 +112,9 @@ type NonMaskedSetting interface {
 	// ErrorHint returns a hint message to be displayed to the user when there's
 	// an error.
 	ErrorHint() (bool, string)
+
+	// ValueOrigin returns the origin of the current value.
+	ValueOrigin(ctx context.Context, sv *Values) ValueOrigin
 }
 
 // Class describes the scope of a setting in multi-tenant scenarios. While all
@@ -142,3 +178,33 @@ const (
 	// In short: "Go ahead but be careful."
 	Public
 )
+
+// ValueOrigin indicates the origin of the current value of a setting, e.g. if
+// it is coming from the in-code default or an explicit override.
+type ValueOrigin uint32
+
+const (
+	// OriginDefault indicates the value in use is the default value.
+	OriginDefault ValueOrigin = iota
+	// OriginExplicitlySet indicates the value is has been set explicitly.
+	OriginExplicitlySet
+	// OriginExternallySet indicates the value has been set externally, such as
+	// via a host-cluster override for this or all tenant(s).
+	OriginExternallySet
+)
+
+func (v ValueOrigin) String() string {
+	if v > OriginExternallySet {
+		return fmt.Sprintf("invalid (%d)", v)
+	}
+	return [...]string{"default", "override", "external-override"}[v]
+}
+
+// SafeValue implements the redact.SafeValue interface.
+func (ValueOrigin) SafeValue() {}
+
+// SafeValue implements the redact.SafeValue interface.
+func (SettingName) SafeValue() {}
+
+// SafeValue implements the redact.SafeValue interface.
+func (InternalKey) SafeValue() {}

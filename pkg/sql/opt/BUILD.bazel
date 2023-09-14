@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -12,6 +11,7 @@ go_library(
         "metadata.go",
         "operator.go",
         "ordering.go",
+        "panic_injection.go",
         "rule_name.go",
         "schema_dependencies.go",
         "table_meta.go",
@@ -25,6 +25,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/server/telemetry",
+        "//pkg/sql/catalog",
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
@@ -34,6 +35,7 @@ go_library(
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/privilege",
+        "//pkg/sql/sem/catid",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/tree/treebin",
@@ -43,6 +45,7 @@ go_library(
         "//pkg/util",
         "//pkg/util/buildutil",
         "//pkg/util/intsets",
+        "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_lib_pq//oid",
@@ -67,8 +70,10 @@ go_test(
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/norm",
+        "//pkg/sql/opt/props",
         "//pkg/sql/opt/testutils/testcat",
         "//pkg/sql/privilege",
+        "//pkg/sql/sem/catid",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
@@ -131,27 +136,16 @@ genrule(
         ":gen-rulenames",
     ],
     outs = ["rule_name_string.go"],
-    # golang.org/x/tools executes commands via
-    # golang.org/x/sys/execabs which requires all PATH lookups to
-    # result in absolute paths. To account for this, we resolve the
-    # relative path returned by location to an absolute path.
     cmd = """
       cp $(location rule_name.go) `dirname $(location :gen-rulenames)`/rule_name.go
-      GO_REL_PATH=`dirname $(location @go_sdk//:bin/go)`
-      GO_ABS_PATH=`cd $$GO_REL_PATH && pwd`
-      # Set GOPATH to something to workaround https://github.com/golang/go/issues/43938
-      env PATH=$$GO_ABS_PATH HOME=$(GENDIR) GOPATH=/nonexist-gopath \
-      $(location @com_github_cockroachdb_tools//cmd/stringer:stringer) -output=$@ \
-      -type=RuleName `dirname $(location :gen-rulenames)`/rule_name.go $(location :gen-rulenames)
+      $(location //pkg/build/bazel/util/tinystringer) -output=$@ \
+          -type=RuleName `dirname $(location :gen-rulenames)`/rule_name.go $(location :gen-rulenames)
     """,
     exec_tools = [
-        "@go_sdk//:bin/go",
-        "@com_github_cockroachdb_tools//cmd/stringer",
+        "//pkg/build/bazel/util/tinystringer",
     ],
     visibility = [
         ":__pkg__",
         "//pkg/gen:__pkg__",
     ],
 )
-
-get_x_data(name = "get_x_data")

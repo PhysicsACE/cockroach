@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
@@ -46,18 +47,26 @@ const (
 // to the mean range/lease count that permits lease-transfers away from that
 // store.
 // Made configurable for the sake of testing.
-var LeaseRebalanceThreshold = 0.05
+var LeaseRebalanceThreshold = settings.RegisterFloatSetting(
+	settings.SystemOnly,
+	"kv.allocator.lease_rebalance_threshold",
+	"minimum fraction away from the mean a store's lease count can be before "+
+		"it is considered for lease-transfers",
+	0.05,
+	settings.WithPublic)
 
 // LeaseRebalanceThresholdMin is the absolute number of leases above/below the
 // mean lease count that a store can have before considered overfull/underfull.
 // Made configurable for the sake of testing.
 var LeaseRebalanceThresholdMin = 5.0
 
-// baseLoadBasedLeaseRebalanceThreshold is the equivalent of
+// getBaseLoadBasedLeaseRebalanceThreshold returns the equivalent of
 // LeaseRebalanceThreshold for load-based lease rebalance decisions (i.e.
 // "follow-the-workload"). It's the base threshold for decisions that get
 // adjusted based on the load and latency of the involved ranges/nodes.
-var baseLoadBasedLeaseRebalanceThreshold = 2 * LeaseRebalanceThreshold
+func getBaseLoadBasedLeaseRebalanceThreshold(leaseRebalanceThreshold float64) float64 {
+	return 2 * leaseRebalanceThreshold
+}
 
 // MinLeaseTransferStatsDuration configures the minimum amount of time a
 // replica must wait for stats about request counts to accumulate before
@@ -74,7 +83,7 @@ var EnableLoadBasedLeaseRebalancing = settings.RegisterBoolSetting(
 	"kv.allocator.load_based_lease_rebalancing.enabled",
 	"set to enable rebalancing of range leases based on load and latency",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // leaseRebalancingAggressiveness enables users to tweak how aggressive their
 // cluster is at moving leases towards the localities where the most requests
@@ -1952,13 +1961,13 @@ func (a *Allocator) ScorerOptionsForScatter(ctx context.Context) *ScatterScorerO
 func (a *Allocator) ValidLeaseTargets(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
+	desc *roachpb.RangeDescriptor,
 	conf roachpb.SpanConfig,
 	existing []roachpb.ReplicaDescriptor,
 	leaseRepl interface {
 		StoreID() roachpb.StoreID
 		RaftStatus() *raft.Status
-		GetFirstIndex() uint64
-		Desc() *roachpb.RangeDescriptor
+		GetFirstIndex() kvpb.RaftIndex
 	},
 	opts allocator.TransferLeaseOptions,
 ) []roachpb.ReplicaDescriptor {
@@ -2005,9 +2014,8 @@ func (a *Allocator) ValidLeaseTargets(
 			// replica set, however are in the candidate list. Uninitialized
 			// replicas will always need a snapshot.
 			existingCandidates := []roachpb.ReplicaDescriptor{}
-			rangeDesc := leaseRepl.Desc()
 			for _, candidate := range candidates {
-				if _, ok := rangeDesc.GetReplicaDescriptor(candidate.StoreID); ok {
+				if _, ok := desc.GetReplicaDescriptor(candidate.StoreID); ok {
 					existingCandidates = append(existingCandidates, candidate)
 				} else {
 					validSnapshotCandidates = append(validSnapshotCandidates, candidate)
@@ -2018,7 +2026,7 @@ func (a *Allocator) ValidLeaseTargets(
 
 		status := leaseRepl.RaftStatus()
 		if a.knobs != nil && a.knobs.RaftStatusFn != nil {
-			status = a.knobs.RaftStatusFn(leaseRepl)
+			status = a.knobs.RaftStatusFn(desc, leaseRepl.StoreID())
 		}
 
 		candidates = append(validSnapshotCandidates, excludeReplicasInNeedOfSnapshots(
@@ -2132,7 +2140,7 @@ func (a *Allocator) leaseholderShouldMoveDueToPreferences(
 	leaseRepl interface {
 		StoreID() roachpb.StoreID
 		RaftStatus() *raft.Status
-		GetFirstIndex() uint64
+		GetFirstIndex() kvpb.RaftIndex
 	},
 	allExistingReplicas []roachpb.ReplicaDescriptor,
 ) bool {
@@ -2211,19 +2219,24 @@ func (a *Allocator) IOOverloadOptions() IOOverloadOptions {
 func (a *Allocator) TransferLeaseTarget(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
+	desc *roachpb.RangeDescriptor,
 	conf roachpb.SpanConfig,
 	existing []roachpb.ReplicaDescriptor,
 	leaseRepl interface {
 		StoreID() roachpb.StoreID
 		GetRangeID() roachpb.RangeID
 		RaftStatus() *raft.Status
-		GetFirstIndex() uint64
-		Desc() *roachpb.RangeDescriptor
+		GetFirstIndex() kvpb.RaftIndex
 	},
 	usageInfo allocator.RangeUsageInfo,
 	forceDecisionWithoutStats bool,
 	opts allocator.TransferLeaseOptions,
 ) roachpb.ReplicaDescriptor {
+	if a.knobs != nil {
+		if blockFn := a.knobs.BlockTransferTarget; blockFn != nil && blockFn() {
+			return roachpb.ReplicaDescriptor{}
+		}
+	}
 	excludeLeaseRepl := opts.ExcludeLeaseRepl
 	if a.leaseholderShouldMoveDueToPreferences(ctx, storePool, conf, leaseRepl, existing) ||
 		a.leaseholderShouldMoveDueToIOOverload(ctx, storePool, existing, leaseRepl.StoreID(), a.IOOverloadOptions()) {
@@ -2245,7 +2258,7 @@ func (a *Allocator) TransferLeaseTarget(
 		return roachpb.ReplicaDescriptor{}
 	}
 
-	validTargets := a.ValidLeaseTargets(ctx, storePool, conf, existing, leaseRepl, opts)
+	validTargets := a.ValidLeaseTargets(ctx, storePool, desc, conf, existing, leaseRepl, opts)
 
 	// Short-circuit if there are no valid targets out there.
 	if len(validTargets) == 0 || (len(validTargets) == 1 && validTargets[0].StoreID == leaseRepl.StoreID()) {
@@ -2480,13 +2493,13 @@ func getLoadDelta(
 func (a *Allocator) ShouldTransferLease(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
+	desc *roachpb.RangeDescriptor,
 	conf roachpb.SpanConfig,
 	existing []roachpb.ReplicaDescriptor,
 	leaseRepl interface {
 		StoreID() roachpb.StoreID
 		RaftStatus() *raft.Status
-		GetFirstIndex() uint64
-		Desc() *roachpb.RangeDescriptor
+		GetFirstIndex() kvpb.RaftIndex
 	},
 	usageInfo allocator.RangeUsageInfo,
 ) bool {
@@ -2496,6 +2509,7 @@ func (a *Allocator) ShouldTransferLease(
 	existing = a.ValidLeaseTargets(
 		ctx,
 		storePool,
+		desc,
 		conf,
 		existing,
 		leaseRepl,
@@ -2560,6 +2574,7 @@ func (a Allocator) FollowTheWorkloadPrefersLocal(
 		return false
 	}
 	adjustment := adjustments[candidate]
+	baseLoadBasedLeaseRebalanceThreshold := getBaseLoadBasedLeaseRebalanceThreshold(LeaseRebalanceThreshold.Get(&a.st.SV))
 	if adjustment > baseLoadBasedLeaseRebalanceThreshold {
 		log.KvDistribution.VEventf(ctx, 3,
 			"s%d is a better fit than s%d due to follow-the-workload (score: %.2f; threshold: %.2f)",
@@ -2625,7 +2640,7 @@ func (a Allocator) shouldTransferLeaseForAccessLocality(
 		}
 	}
 
-	log.KvDistribution.VEventf(ctx, 1,
+	log.KvDistribution.VEventf(ctx, 5,
 		"shouldTransferLease qpsStats: %+v, replicaLocalities: %+v, replicaWeights: %+v",
 		qpsStats, replicaLocalities, replicaWeights)
 	sourceWeight := math.Max(minReplicaWeight, replicaWeights[source.Node.NodeID])
@@ -2732,7 +2747,7 @@ func loadBasedLeaseRebalanceScore(
 	// Start with twice the base rebalance threshold in order to fight more
 	// strongly against thrashing caused by small variances in the distribution
 	// of request weights.
-	rebalanceThreshold := baseLoadBasedLeaseRebalanceThreshold - rebalanceAdjustment
+	rebalanceThreshold := getBaseLoadBasedLeaseRebalanceThreshold(LeaseRebalanceThreshold.Get(&st.SV)) - rebalanceAdjustment
 
 	overfullLeaseThreshold := int32(math.Ceil(meanLeases * (1 + rebalanceThreshold)))
 	overfullScore := source.Capacity.LeaseCount - overfullLeaseThreshold
@@ -2742,7 +2757,7 @@ func loadBasedLeaseRebalanceScore(
 
 	log.KvDistribution.VEventf(
 		ctx,
-		2,
+		5,
 		"node: %d, sourceWeight: %.2f, remoteWeight: %.2f, remoteLatency: %v, "+
 			"rebalanceThreshold: %.2f, meanLeases: %.2f, sourceLeaseCount: %d, overfullThreshold: %d, "+
 			"remoteLeaseCount: %d, underfullThreshold: %d, totalScore: %d",
@@ -2767,7 +2782,8 @@ func (a Allocator) shouldTransferLeaseForLeaseCountConvergence(
 
 	// Allow lease transfer if we're above the overfull threshold, which is
 	// mean*(1+LeaseRebalanceThreshold).
-	overfullLeaseThreshold := int32(math.Ceil(sl.CandidateLeases.Mean * (1 + LeaseRebalanceThreshold)))
+	leaseRebalanceThreshold := LeaseRebalanceThreshold.Get(&a.st.SV)
+	overfullLeaseThreshold := int32(math.Ceil(sl.CandidateLeases.Mean * (1 + leaseRebalanceThreshold)))
 	minOverfullThreshold := int32(math.Ceil(sl.CandidateLeases.Mean + LeaseRebalanceThresholdMin))
 	if overfullLeaseThreshold < minOverfullThreshold {
 		overfullLeaseThreshold = minOverfullThreshold
@@ -2777,7 +2793,7 @@ func (a Allocator) shouldTransferLeaseForLeaseCountConvergence(
 	}
 
 	if float64(source.Capacity.LeaseCount) > sl.CandidateLeases.Mean {
-		underfullLeaseThreshold := int32(math.Ceil(sl.CandidateLeases.Mean * (1 - LeaseRebalanceThreshold)))
+		underfullLeaseThreshold := int32(math.Ceil(sl.CandidateLeases.Mean * (1 - leaseRebalanceThreshold)))
 		minUnderfullThreshold := int32(math.Ceil(sl.CandidateLeases.Mean - LeaseRebalanceThresholdMin))
 		if underfullLeaseThreshold > minUnderfullThreshold {
 			underfullLeaseThreshold = minUnderfullThreshold
@@ -2816,7 +2832,7 @@ func (a Allocator) PreferredLeaseholders(
 			if !ok {
 				continue
 			}
-			if constraint.ConjunctionsCheck(storeDesc, preference.Constraints) {
+			if constraint.CheckStoreConjunction(storeDesc, preference.Constraints) {
 				preferred = append(preferred, repl)
 			}
 		}
@@ -2852,7 +2868,10 @@ func FilterBehindReplicas(
 // Other replicas may be filtered out if this function is called with the
 // `raftStatus` of a non-raft leader replica.
 func excludeReplicasInNeedOfSnapshots(
-	ctx context.Context, st *raft.Status, firstIndex uint64, replicas []roachpb.ReplicaDescriptor,
+	ctx context.Context,
+	st *raft.Status,
+	firstIndex kvpb.RaftIndex,
+	replicas []roachpb.ReplicaDescriptor,
 ) []roachpb.ReplicaDescriptor {
 	filled := 0
 	for _, repl := range replicas {

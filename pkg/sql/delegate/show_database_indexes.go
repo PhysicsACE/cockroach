@@ -47,7 +47,8 @@ SELECT
 	direction,
 	storing::BOOL,
 	implicit::BOOL,
-	is_visible::BOOL AS visible`
+	is_visible::BOOL AS visible,
+	visibility`
 
 	if n.WithComment {
 		getAllIndexesQuery += `,
@@ -66,5 +67,5 @@ FROM
 	getAllIndexesQuery += `
 ORDER BY 1, 2, 4`
 
-	return parse(fmt.Sprintf(getAllIndexesQuery, name.String()))
+	return d.parse(fmt.Sprintf(getAllIndexesQuery, name.String()))
 }

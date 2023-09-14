@@ -47,11 +47,13 @@ import {
   statisticsTableTitles,
   StatisticType,
 } from "../statsTableUtil/statsTableUtil";
+import { BarChartOptions } from "src/barCharts/barChartFactory";
 
 type ICollectedStatementStatistics =
   cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 import styles from "./statementsTable.module.scss";
 import { StatementDiagnosticsReport } from "../api";
+import { Timestamp } from "../timestamp";
 const cx = classNames.bind(styles);
 
 export interface AggregateStatistics {
@@ -73,7 +75,6 @@ export interface AggregateStatistics {
   diagnosticsReports?: StatementDiagnosticsReport[];
   // totalWorkload is the sum of service latency of all statements listed on the table.
   totalWorkload?: Long;
-  regions?: string[];
   regionNodes?: string[];
 }
 
@@ -101,6 +102,22 @@ export function shortStatement(
   }
 }
 
+function formatStringArray(databases: string): string {
+  try {
+    // Case where the database is returned as an array in a string form.
+    const d = JSON.parse(databases);
+    try {
+      // Case where the database is returned as an array of array in a string form.
+      return JSON.parse(d).join(", ");
+    } catch (e) {
+      return d.join(", ");
+    }
+  } catch (e) {
+    // Case where the database is a single value as a string.
+    return databases;
+  }
+}
+
 export function makeStatementsColumns(
   statements: AggregateStatistics[],
   selectedApps: string[],
@@ -122,12 +139,14 @@ export function makeStatementsColumns(
       label: cx("statements-table__col--bar-chart__label"),
     },
   };
-  const sampledExecStatsBarChartOptions = {
-    classes: defaultBarChartOptions.classes,
-    displayNoSamples: (d: ICollectedStatementStatistics) => {
-      return longToInt(d.stats.exec_stats?.count) == 0;
-    },
-  };
+
+  const sampledExecStatsBarChartOptions: BarChartOptions<ICollectedStatementStatistics> =
+    {
+      classes: defaultBarChartOptions.classes,
+      displayNoSamples: (d: ICollectedStatementStatistics) => {
+        return longToInt(d.stats.exec_stats?.count) == 0;
+      },
+    };
 
   const countBar = countBarChart(statements, defaultBarChartOptions);
   const bytesReadBar = bytesReadBarChart(statements, defaultBarChartOptions);
@@ -171,7 +190,7 @@ export function makeStatementsColumns(
       name: "database",
       title: statisticsTableTitles.database(statType),
       className: cx("statements-table__col-database"),
-      cell: (stmt: AggregateStatistics) => stmt.database,
+      cell: (stmt: AggregateStatistics) => formatStringArray(stmt.database),
       sort: (stmt: AggregateStatistics) => stmt.database,
       showByDefault: false,
     },
@@ -182,28 +201,6 @@ export function makeStatementsColumns(
       cell: (stmt: AggregateStatistics) =>
         stmt.applicationName?.length > 0 ? stmt.applicationName : unset,
       sort: (stmt: AggregateStatistics) => stmt.applicationName,
-      showByDefault: false,
-    },
-    {
-      name: "rowsProcessed",
-      title: statisticsTableTitles.rowsProcessed(statType),
-      className: cx("statements-table__col-rows-read"),
-      cell: (stmt: AggregateStatistics) =>
-        `${Count(Number(stmt.stats.rows_read.mean))} Reads / ${Count(
-          Number(stmt.stats.rows_written?.mean),
-        )} Writes`,
-      sort: (stmt: AggregateStatistics) =>
-        FixLong(
-          Number(stmt.stats.rows_read.mean) +
-            Number(stmt.stats.rows_written?.mean),
-        ),
-    },
-    {
-      name: "bytesRead",
-      title: statisticsTableTitles.bytesRead(statType),
-      cell: bytesReadBar,
-      sort: (stmt: AggregateStatistics) =>
-        FixLong(Number(stmt.stats.bytes_read.mean)),
     },
     {
       name: "time",
@@ -211,6 +208,18 @@ export function makeStatementsColumns(
       className: cx("statements-table__col-latency"),
       cell: latencyBar,
       sort: (stmt: AggregateStatistics) => stmt.stats.service_lat.mean,
+    },
+    {
+      name: "workloadPct",
+      title: statisticsTableTitles.workloadPct(statType),
+      cell: workloadPctBarChart(
+        statements,
+        defaultBarChartOptions,
+        totalWorkload,
+      ),
+      sort: (stmt: AggregateStatistics) =>
+        (stmt.stats.service_lat.mean * longToInt(stmt.stats.count)) /
+        totalWorkload,
     },
     {
       name: "contention",
@@ -270,6 +279,27 @@ export function makeStatementsColumns(
         FixLong(Number(stmt.stats.latency_info?.max)),
     },
     {
+      name: "rowsProcessed",
+      title: statisticsTableTitles.rowsProcessed(statType),
+      className: cx("statements-table__col-rows-read"),
+      cell: (stmt: AggregateStatistics) =>
+        `${Count(Number(stmt.stats.rows_read.mean))} Reads / ${Count(
+          Number(stmt.stats.rows_written?.mean),
+        )} Writes`,
+      sort: (stmt: AggregateStatistics) =>
+        FixLong(
+          Number(stmt.stats.rows_read.mean) +
+            Number(stmt.stats.rows_written?.mean),
+        ),
+    },
+    {
+      name: "bytesRead",
+      title: statisticsTableTitles.bytesRead(statType),
+      cell: bytesReadBar,
+      sort: (stmt: AggregateStatistics) =>
+        FixLong(Number(stmt.stats.bytes_read.mean)),
+    },
+    {
       name: "maxMemUsage",
       title: statisticsTableTitles.maxMemUsage(statType),
       cell: maxMemUsageBar,
@@ -291,24 +321,16 @@ export function makeStatementsColumns(
       sort: (stmt: AggregateStatistics) =>
         longToInt(stmt.stats.count) - longToInt(stmt.stats.first_attempt_count),
     },
-    {
-      name: "workloadPct",
-      title: statisticsTableTitles.workloadPct(statType),
-      cell: workloadPctBarChart(
-        statements,
-        defaultBarChartOptions,
-        totalWorkload,
-      ),
-      sort: (stmt: AggregateStatistics) =>
-        (stmt.stats.service_lat.mean * longToInt(stmt.stats.count)) /
-        totalWorkload,
-    },
     makeRegionsColumn(statType, isTenant),
     {
       name: "lastExecTimestamp",
       title: statisticsTableTitles.lastExecTimestamp(statType),
-      cell: (stmt: AggregateStatistics) =>
-        TimestampToMoment(stmt.stats.last_exec_timestamp).format(DATE_FORMAT),
+      cell: (stmt: AggregateStatistics) => (
+        <Timestamp
+          time={TimestampToMoment(stmt.stats.last_exec_timestamp)}
+          format={DATE_FORMAT}
+        />
+      ),
       sort: (stmt: AggregateStatistics) =>
         TimestampToNumber(stmt.stats.last_exec_timestamp),
       showByDefault: false,
@@ -356,9 +378,9 @@ function makeRegionsColumn(
       title: statisticsTableTitles.regions(statType),
       className: cx("statements-table__col-regions"),
       cell: (stmt: AggregateStatistics) => {
-        return longListWithTooltip(stmt.regions.sort().join(", "), 50);
+        return longListWithTooltip(stmt.stats.regions.sort().join(", "), 50);
       },
-      sort: (stmt: AggregateStatistics) => stmt.regions.sort().join(", "),
+      sort: (stmt: AggregateStatistics) => stmt.stats.regions.sort().join(", "),
     };
   } else {
     return {
@@ -417,7 +439,6 @@ export function populateRegionNodeForStatements(
           ")",
       );
     });
-    stmt.regions = Object.keys(regions).sort();
     stmt.regionNodes = regionNodes;
   });
 }

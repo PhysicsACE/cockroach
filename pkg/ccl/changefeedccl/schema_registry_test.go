@@ -11,7 +11,11 @@ package changefeedccl
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
@@ -33,6 +37,27 @@ func TestConfluentSchemaRegistry(t *testing.T) {
 		url := "gopher://myhost"
 		_, err := newConfluentSchemaRegistry(url, nil, nil)
 		require.Error(t, err)
+	})
+
+	t.Run("configure timeout", func(t *testing.T) {
+		regServer := cdctest.StartTestSchemaRegistry()
+		defer regServer.Close()
+		r, err := newConfluentSchemaRegistry(regServer.URL(), nil, nil)
+		require.NoError(t, err)
+		getTimeout := func(r schemaRegistry) time.Duration {
+			return r.(*schemaRegistryWithCache).base.(*confluentSchemaRegistry).client.Timeout
+		}
+		require.Equal(t, defaultSchemaRegistryTimeout, getTimeout(r))
+
+		// add explicit timeout param.
+		u, err := url.Parse(regServer.URL())
+		require.NoError(t, err)
+		values := u.Query()
+		values.Set(timeoutParam, "42ms")
+		u.RawQuery = values.Encode()
+		r, err = newConfluentSchemaRegistry(u.String(), nil, nil)
+		require.NoError(t, err)
+		require.Equal(t, 42*time.Millisecond, getTimeout(r))
 	})
 }
 
@@ -69,6 +94,48 @@ func TestConfluentSchemaRegistryExternalConnection(t *testing.T) {
 
 	_, err = newConfluentSchemaRegistry("external://no_endpoint", m, nil)
 	require.Error(t, err)
+
+}
+
+func TestConfluentSchemaRegistrySharedCache(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	regServer := cdctest.StartTestSchemaRegistry()
+	defer regServer.Close()
+	require.Equal(t, 0, regServer.RegistrationCount())
+
+	var wg sync.WaitGroup
+
+	// Multiple registrations of the same schema hit a shared cache.
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			r, err := newConfluentSchemaRegistry(regServer.URL(), nil, nil)
+			require.NoError(t, err)
+			_, err = r.RegisterSchemaForSubject(context.Background(), "subject1", "schema")
+			require.NoError(t, err)
+			wg.Done()
+
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, 1, regServer.RegistrationCount())
+
+	// Registrations of different schemas don't share a cache, even if the subject is the same.
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			r, err := newConfluentSchemaRegistry(regServer.URL(), nil, nil)
+			require.NoError(t, err)
+			_, err = r.RegisterSchemaForSubject(context.Background(), "subject1", fmt.Sprintf("schema1%d", i))
+			require.NoError(t, err)
+			wg.Done()
+
+		}(i)
+	}
+	wg.Wait()
+	require.Equal(t, 11, regServer.RegistrationCount())
 
 }
 
@@ -122,6 +189,7 @@ func TestConfluentSchemaRegistryRetryMetrics(t *testing.T) {
 			}
 			return nil
 		})
+		require.EqualValues(t, 0, sliMetrics.SchemaRegistrations.Value())
 		cancel()
 	})
 

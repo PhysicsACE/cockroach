@@ -16,6 +16,7 @@ import (
 	"reflect"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/errors"
 	_ "github.com/cockroachdb/errors/extgrpc" // register EncodeError support for gRPC Status
 	"github.com/cockroachdb/redact"
+	"github.com/gogo/protobuf/proto"
 )
 
 // Printer is an interface that lets us use what's common between the
@@ -98,9 +100,9 @@ const (
 	// written. We allow the transaction to continue after such errors; we also
 	// allow RollbackToSavepoint() to be called after such errors. In particular,
 	// this is useful for SQL which wants to allow rolling back to a savepoint
-	// after ConditionFailedErrors (uniqueness violations) and WriteIntentError
-	// (lock not available errors). With continuing after errors its important for
-	// the coordinator to track the timestamp at which intents might have been
+	// after ConditionFailedErrors (uniqueness violations) and LockConflictError
+	// (lock not available errors). With continuing after errors it's important
+	// for the coordinator to track the timestamp at which intents might have been
 	// written.
 	//
 	// Note that all the lower scores also are unambiguous in this sense, so this
@@ -150,10 +152,10 @@ func ErrPriority(err error) ErrorPriority {
 			return ErrorScoreTxnAbort
 		}
 		return ErrorScoreTxnRestart
-	case *ConditionFailedError, *WriteIntentError:
+	case *ConditionFailedError, *LockConflictError:
 		// We particularly care about returning the low ErrorScoreUnambiguousError
 		// because we don't want to transition a transaction that encounters a
-		// ConditionFailedError or a WriteIntentError to an error state. More
+		// ConditionFailedError or a LockConflictError to an error state. More
 		// specifically, we want to allow rollbacks to savepoint after one of these
 		// errors.
 		return ErrorScoreUnambiguousError
@@ -270,7 +272,7 @@ const (
 	TransactionPushErrType                  ErrorDetailType = 6
 	TransactionRetryErrType                 ErrorDetailType = 7
 	TransactionStatusErrType                ErrorDetailType = 8
-	WriteIntentErrType                      ErrorDetailType = 9
+	LockConflictErrType                     ErrorDetailType = 9
 	WriteTooOldErrType                      ErrorDetailType = 10
 	OpRequiresTxnErrType                    ErrorDetailType = 11
 	ConditionFailedErrType                  ErrorDetailType = 12
@@ -321,7 +323,7 @@ func init() {
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.TransactionPushError", &TransactionPushError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.TransactionRetryError", &TransactionRetryError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.TransactionStatusError", &TransactionStatusError{})
-	errors.RegisterTypeMigration(roachpbPath, "*roachpb.WriteIntentError", &WriteIntentError{})
+	errors.RegisterTypeMigration(roachpbPath, "*roachpb.WriteIntentError", &LockConflictError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.WriteTooOldError", &WriteTooOldError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.OpRequiresTxnError", &OpRequiresTxnError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.ConditionFailedError", &ConditionFailedError{})
@@ -713,23 +715,59 @@ func (e *TransactionAbortedError) SafeFormatError(p errors.Printer) (next error)
 	return nil
 }
 
-// NewTransactionRetryWithProtoRefreshError initializes a new TransactionRetryWithProtoRefreshError.
+type retryErrOptions struct {
+	conflictingTxn *enginepb.TxnMeta
+}
+
+// RetryErrOption is used to annotate optional fields in retry related errors.
+type RetryErrOption interface {
+	apply(*retryErrOptions)
+}
+
+type retryErrOptionFunc func(*retryErrOptions)
+
+func (f retryErrOptionFunc) apply(o *retryErrOptions) {
+	f(o)
+}
+
+// WithConflictingTxn is used to annotate a retry error with the conflicting
+// transaction metadata (optional). This is only used for cases where a refresh
+// fails with `REASON_INTENT`.
+func WithConflictingTxn(txn *enginepb.TxnMeta) RetryErrOption {
+	return retryErrOptionFunc(func(o *retryErrOptions) {
+		o.conflictingTxn = txn
+	})
+}
+
+// NewTransactionRetryWithProtoRefreshError initializes a new
+// TransactionRetryWithProtoRefreshError.
 //
-// txnID is the ID of the transaction being restarted.
-// txn is the transaction that the client should use for the next attempts.
+// prevTxnID is the ID of the transaction being retried.
+// prevTxnEpoch is the epoch of the transaction being retried.
+// nextTxn is the transaction that the client should use for the next attempts.
 //
 // TODO(tbg): the message passed here is usually pErr.String(), which is a bad
 // pattern (loses structure, thus redaction). We can leverage error chaining
 // to improve this: wrap `pErr.GoError()` with a barrier and then with the
 // TransactionRetryWithProtoRefreshError.
 func NewTransactionRetryWithProtoRefreshError(
-	msg redact.RedactableString, txnID uuid.UUID, txn roachpb.Transaction,
+	msg redact.RedactableString,
+	prevTxnID uuid.UUID,
+	prevTxnEpoch enginepb.TxnEpoch,
+	nextTxn roachpb.Transaction,
+	opts ...RetryErrOption,
 ) *TransactionRetryWithProtoRefreshError {
+	options := retryErrOptions{}
+	for _, o := range opts {
+		o.apply(&options)
+	}
 	return &TransactionRetryWithProtoRefreshError{
-		Msg:           msg.StripMarkers(),
-		MsgRedactable: msg,
-		TxnID:         txnID,
-		Transaction:   txn,
+		Msg:             msg.StripMarkers(),
+		MsgRedactable:   msg,
+		PrevTxnID:       prevTxnID,
+		PrevTxnEpoch:    prevTxnEpoch,
+		NextTransaction: nextTxn,
+		ConflictingTxn:  options.conflictingTxn,
 	}
 }
 
@@ -747,7 +785,28 @@ func (e *TransactionRetryWithProtoRefreshError) SafeFormatError(p errors.Printer
 // transaction, as opposed to continuing with the existing one at a bumped
 // epoch.
 func (e *TransactionRetryWithProtoRefreshError) PrevTxnAborted() bool {
-	return !e.TxnID.Equal(e.Transaction.ID)
+	return !e.PrevTxnID.Equal(e.NextTransaction.ID)
+}
+
+// PrevTxnEpochBumped returns true if the previous transaction was not aborted
+// but its epoch was bumped. In this case, the client can continue with the
+// existing transaction, but must restart from the beginning because its writes
+// were discarded.
+//
+// NOTE: the method panics if the previous transaction was aborted and the next
+// transaction has a different identity. Callers must first check PrevTxnAborted.
+func (e *TransactionRetryWithProtoRefreshError) PrevTxnEpochBumped() bool {
+	if e.PrevTxnAborted() {
+		panic("PrevTxnEpochBumped called on aborted txn")
+	}
+	return e.PrevTxnEpoch != e.NextTransaction.Epoch
+}
+
+// TxnMustRestartFromBeginning returns true if the previous transaction's writes
+// were discarded due to the retry error, meaning that it must restart from the
+// beginning.
+func (e *TransactionRetryWithProtoRefreshError) TxnMustRestartFromBeginning() bool {
+	return e.PrevTxnAborted() || e.PrevTxnEpochBumped()
 }
 
 // NewTransactionPushError initializes a new TransactionPushError.
@@ -780,12 +839,17 @@ var _ transactionRestartError = &TransactionPushError{}
 
 // NewTransactionRetryError initializes a new TransactionRetryError.
 func NewTransactionRetryError(
-	reason TransactionRetryReason, extraMsg redact.RedactableString,
+	reason TransactionRetryReason, extraMsg redact.RedactableString, opts ...RetryErrOption,
 ) *TransactionRetryError {
+	options := retryErrOptions{}
+	for _, o := range opts {
+		o.apply(&options)
+	}
 	return &TransactionRetryError{
 		Reason:             reason,
 		ExtraMsg:           extraMsg.StripMarkers(),
 		ExtraMsgRedactable: extraMsg,
+		ConflictingTxn:     options.conflictingTxn,
 	}
 }
 
@@ -848,27 +912,27 @@ func (e *TransactionStatusError) SafeFormatError(p errors.Printer) (next error) 
 
 var _ ErrorDetailInterface = &TransactionStatusError{}
 
-func (e *WriteIntentError) Error() string {
+func (e *LockConflictError) Error() string {
 	return redact.Sprint(e).StripMarkers()
 }
 
-func (e *WriteIntentError) SafeFormatError(p errors.Printer) (next error) {
+func (e *LockConflictError) SafeFormatError(p errors.Printer) (next error) {
 	e.printError(p)
 	return nil
 }
 
-func (e *WriteIntentError) printError(buf Printer) {
-	buf.Printf("conflicting intents on ")
+func (e *LockConflictError) printError(buf Printer) {
+	buf.Printf("conflicting locks on ")
 
-	// If we have a lot of intents, we only want to show the first and the last.
+	// If we have a lot of locks, we only want to show the first and the last.
 	const maxBegin = 5
 	const maxEnd = 5
-	var begin, end []roachpb.Intent
-	if len(e.Intents) <= maxBegin+maxEnd {
-		begin = e.Intents
+	var begin, end []roachpb.Lock
+	if len(e.Locks) <= maxBegin+maxEnd {
+		begin = e.Locks
 	} else {
-		begin = e.Intents[0:maxBegin]
-		end = e.Intents[len(e.Intents)-maxEnd : len(e.Intents)]
+		begin = e.Locks[0:maxBegin]
+		end = e.Locks[len(e.Locks)-maxEnd : len(e.Locks)]
 	}
 
 	for i := range begin {
@@ -888,13 +952,13 @@ func (e *WriteIntentError) printError(buf Printer) {
 	}
 
 	switch e.Reason {
-	case WriteIntentError_REASON_UNSPECIFIED:
+	case LockConflictError_REASON_UNSPECIFIED:
 		// Nothing to say.
-	case WriteIntentError_REASON_WAIT_POLICY:
+	case LockConflictError_REASON_WAIT_POLICY:
 		buf.Printf(" [reason=wait_policy]")
-	case WriteIntentError_REASON_LOCK_TIMEOUT:
+	case LockConflictError_REASON_LOCK_TIMEOUT:
 		buf.Printf(" [reason=lock_timeout]")
-	case WriteIntentError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED:
+	case LockConflictError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED:
 		buf.Printf(" [reason=lock_wait_queue_max_length_exceeded]")
 	default:
 		// Could panic, better to silently ignore in case new reasons are added.
@@ -902,11 +966,11 @@ func (e *WriteIntentError) printError(buf Printer) {
 }
 
 // Type is part of the ErrorDetailInterface.
-func (e *WriteIntentError) Type() ErrorDetailType {
-	return WriteIntentErrType
+func (e *LockConflictError) Type() ErrorDetailType {
+	return LockConflictErrType
 }
 
-var _ ErrorDetailInterface = &WriteIntentError{}
+var _ ErrorDetailInterface = &LockConflictError{}
 
 // NewWriteTooOldError creates a new write too old error. The function accepts
 // the timestamp of the operation that hit the error, along with the timestamp
@@ -928,11 +992,11 @@ func NewWriteTooOldError(operationTS, actualTS hlc.Timestamp, key roachpb.Key) *
 
 func (e *WriteTooOldError) SafeFormatError(p errors.Printer) (next error) {
 	if len(e.Key) > 0 {
-		p.Printf("WriteTooOldError: write for key %s at timestamp %s too old; wrote at %s",
+		p.Printf("WriteTooOldError: write for key %s at timestamp %s too old; must write at or above %s",
 			e.Key, e.Timestamp, e.ActualTimestamp)
 		return nil
 	}
-	p.Printf("WriteTooOldError: write at timestamp %s too old; wrote at %s",
+	p.Printf("WriteTooOldError: write at timestamp %s too old; must write at or above %s",
 		e.Timestamp, e.ActualTimestamp)
 	return nil
 }
@@ -1280,7 +1344,7 @@ var _ ErrorDetailInterface = &MVCCHistoryMutationError{}
 func NewIntentMissingError(key roachpb.Key, wrongIntent *roachpb.Intent) *IntentMissingError {
 	return &IntentMissingError{
 		Key:         key,
-		WrongIntent: wrongIntent,
+		WrongIntent: wrongIntent.AsLockPtr(),
 	}
 }
 
@@ -1439,12 +1503,27 @@ var _ ErrorDetailInterface = &MinTimestampBoundUnsatisfiableError{}
 // or 'intent' which caused the failed refresh, key is the key that we failed
 // refreshing, and ts is the timestamp of the committed value or intent that was written.
 func NewRefreshFailedError(
-	reason RefreshFailedError_Reason, key roachpb.Key, ts hlc.Timestamp,
+	ctx context.Context,
+	reason RefreshFailedError_Reason,
+	key roachpb.Key,
+	ts hlc.Timestamp,
+	opts ...RetryErrOption,
 ) *RefreshFailedError {
+	options := retryErrOptions{}
+	for _, o := range opts {
+		o.apply(&options)
+	}
+	if reason == RefreshFailedError_REASON_INTENT && options.conflictingTxn == nil {
+		log.Fatal(ctx, "conflictingTxn should be set if refresh failed with REASON_INTENT")
+	}
+	if reason != RefreshFailedError_REASON_INTENT && options.conflictingTxn != nil {
+		log.Fatal(ctx, "conflictingTxn should not be set if refresh failed without REASON_INTENT")
+	}
 	return &RefreshFailedError{
-		Reason:    reason,
-		Key:       key,
-		Timestamp: ts,
+		Reason:         reason,
+		Key:            key,
+		Timestamp:      ts,
+		ConflictingTxn: options.conflictingTxn,
 	}
 }
 
@@ -1536,6 +1615,25 @@ func NewNotLeaseHolderErrorWithSpeculativeLease(
 	return NewNotLeaseHolderError(speculativeLease, proposerStoreID, rangeDesc, msg)
 }
 
+// MissingRecordError is reported when a record is missing.
+type MissingRecordError struct{}
+
+func (e *MissingRecordError) Error() string {
+	return redact.Sprint(e).StripMarkers()
+}
+
+func (e *MissingRecordError) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("missing record")
+	return nil
+}
+
+func init() {
+	errors.RegisterLeafDecoder(errors.GetTypeKey((*MissingRecordError)(nil)), func(_ context.Context, _ string, _ []string, _ proto.Message) error {
+		return &MissingRecordError{}
+	})
+}
+
+var _ errors.SafeFormatter = &MissingRecordError{}
 var _ errors.SafeFormatter = &NotLeaseHolderError{}
 var _ errors.SafeFormatter = &RangeNotFoundError{}
 var _ errors.SafeFormatter = &RangeKeyMismatchError{}
@@ -1544,7 +1642,7 @@ var _ errors.SafeFormatter = &TransactionAbortedError{}
 var _ errors.SafeFormatter = &TransactionPushError{}
 var _ errors.SafeFormatter = &TransactionRetryError{}
 var _ errors.SafeFormatter = &TransactionStatusError{}
-var _ errors.SafeFormatter = &WriteIntentError{}
+var _ errors.SafeFormatter = &LockConflictError{}
 var _ errors.SafeFormatter = &WriteTooOldError{}
 var _ errors.SafeFormatter = &OpRequiresTxnError{}
 var _ errors.SafeFormatter = &ConditionFailedError{}

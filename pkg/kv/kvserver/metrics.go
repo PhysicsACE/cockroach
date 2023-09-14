@@ -18,6 +18,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -36,6 +37,12 @@ import (
 	"github.com/cockroachdb/pebble"
 	"go.etcd.io/raft/v3/raftpb"
 )
+
+func init() {
+	// Inject the TenantStorageMetricsSet available in the kvbase pkg to
+	// avoid import cycles.
+	kvbase.TenantsStorageMetricsSet = tenantsStorageMetricsSet()
+}
 
 var (
 	// Replica metrics.
@@ -127,6 +134,12 @@ var (
 		Measurement: "Lease Requests",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaLeaseRequestLatency = metric.Metadata{
+		Name:        "leases.requests.latency",
+		Help:        "Lease request latency (all types and outcomes, coalesced)",
+		Measurement: "Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 	metaLeaseTransferSuccessCount = metric.Metadata{
 		Name:        "leases.transfers.success",
 		Help:        "Number of successful lease transfers",
@@ -148,6 +161,25 @@ var (
 	metaLeaseEpochCount = metric.Metadata{
 		Name:        "leases.epoch",
 		Help:        "Number of replica leaseholders using epoch-based leases",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaLeaseLivenessCount = metric.Metadata{
+		Name:        "leases.liveness",
+		Help:        "Number of replica leaseholders for the liveness range(s)",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaLeaseViolatingPreferencesCount = metric.Metadata{
+		Name:        "leases.preferences.violating",
+		Help:        "Number of replica leaseholders which violate lease preferences",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaLeaseLessPreferredCount = metric.Metadata{
+		Name: "leases.preferences.less-preferred",
+		Help: "Number of replica leaseholders which satisfy a lease " +
+			"preference which is not the most preferred",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -321,7 +353,7 @@ var (
 	metaAverageQueriesPerSecond = metric.Metadata{
 		Name:        "rebalancing.queriespersecond",
 		Help:        "Number of kv-level requests received per second by the store, considering the last 30 minutes, as used in rebalancing decisions.",
-		Measurement: "Keys/Sec",
+		Measurement: "Queries/Sec",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaAverageWritesPerSecond = metric.Metadata{
@@ -344,13 +376,13 @@ var (
 	}
 	metaAverageWriteBytesPerSecond = metric.Metadata{
 		Name:        "rebalancing.writebytespersecond",
-		Help:        "Number of bytes read recently per second, considering the last 30 minutes.",
+		Help:        "Number of bytes written recently per second, considering the last 30 minutes.",
 		Measurement: "Bytes/Sec",
 		Unit:        metric.Unit_BYTES,
 	}
 	metaAverageReadBytesPerSecond = metric.Metadata{
 		Name:        "rebalancing.readbytespersecond",
-		Help:        "Number of bytes written per second, considering the last 30 minutes.",
+		Help:        "Number of bytes read recently per second, considering the last 30 minutes.",
 		Measurement: "Bytes/Sec",
 		Unit:        metric.Unit_BYTES,
 	}
@@ -359,6 +391,20 @@ var (
 		Help:        "Average CPU nanoseconds spent on processing replica operations in the last 30 minutes.",
 		Measurement: "Nanoseconds/Sec",
 		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaRecentReplicaCPUNanosPerSecond = metric.Metadata{
+		Name: "rebalancing.replicas.cpunanospersecond",
+		Help: "Histogram of average CPU nanoseconds spent on processing " +
+			"replica operations in the last 30 minutes.",
+		Measurement: "Nanoseconds/Sec",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaRecentReplicaQueriesPerSecond = metric.Metadata{
+		Name: "rebalancing.replicas.queriespersecond",
+		Help: "Histogram of average kv-level requests received per second by " +
+			"replicas on the store in the last 30 minutes.",
+		Measurement: "Queries/Sec",
+		Unit:        metric.Unit_COUNT,
 	}
 
 	// Metric for tracking follower reads.
@@ -416,7 +462,15 @@ var (
 		Unit:        metric.Unit_COUNT,
 	}
 
-	// RocksDB/Pebble metrics.
+	//Ingest metrics
+	metaIngestCount = metric.Metadata{
+		Name:        "storage.ingest.count",
+		Help:        "Number of successful ingestions performed",
+		Measurement: "Events",
+		Unit:        metric.Unit_COUNT,
+	}
+
+	// Pebble metrics.
 	metaRdbBlockCacheHits = metric.Metadata{
 		Name:        "rocksdb.block.cache.hits",
 		Help:        "Count of block cache hits",
@@ -432,12 +486,6 @@ var (
 	metaRdbBlockCacheUsage = metric.Metadata{
 		Name:        "rocksdb.block.cache.usage",
 		Help:        "Bytes used by the block cache",
-		Measurement: "Memory",
-		Unit:        metric.Unit_BYTES,
-	}
-	metaRdbBlockCachePinnedUsage = metric.Metadata{
-		Name:        "rocksdb.block.cache.pinned-usage",
-		Help:        "Bytes pinned by the block cache",
 		Measurement: "Memory",
 		Unit:        metric.Unit_BYTES,
 	}
@@ -616,6 +664,98 @@ Raft applied index at which this checkpoint was taken.`,
 		Unit:        metric.Unit_COUNT,
 	}
 
+	metaBlockBytes = metric.Metadata{
+		Name:        "storage.iterator.block-load.bytes",
+		Help:        "Bytes loaded by storage engine iterators (possibly cached). See storage.AggregatedIteratorStats for details.",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaBlockBytesInCache = metric.Metadata{
+		Name:        "storage.iterator.block-load.cached-bytes",
+		Help:        "Bytes loaded by storage engine iterators from the block cache. See storage.AggregatedIteratorStats for details.",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaBlockReadDuration = metric.Metadata{
+		Name:        "storage.iterator.block-load.read-duration",
+		Help:        "Cumulative time storage engine iterators spent loading blocks from durable storage. See storage.AggregatedIteratorStats for details.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaIterExternalSeeks = metric.Metadata{
+		Name:        "storage.iterator.external.seeks",
+		Help:        "Cumulative count of seeks performed on storage engine iterators. See storage.AggregatedIteratorStats for details.",
+		Measurement: "Iterator Ops",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaIterExternalSteps = metric.Metadata{
+		Name:        "storage.iterator.external.steps",
+		Help:        "Cumulative count of steps performed on storage engine iterators. See storage.AggregatedIteratorStats for details.",
+		Measurement: "Iterator Ops",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaIterInternalSeeks = metric.Metadata{
+		Name: "storage.iterator.internal.seeks",
+		Help: `Cumulative count of seeks performed internally within storage engine iterators.
+
+A value high relative to 'storage.iterator.external.seeks'
+is a good indication that there's an accumulation of garbage
+internally within the storage engine.
+
+See storage.AggregatedIteratorStats for details.`,
+		Measurement: "Iterator Ops",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaIterInternalSteps = metric.Metadata{
+		Name: "storage.iterator.internal.steps",
+		Help: `Cumulative count of steps performed internally within storage engine iterators.
+
+A value high relative to 'storage.iterator.external.steps'
+is a good indication that there's an accumulation of garbage
+internally within the storage engine.
+
+See storage.AggregatedIteratorStats for more details.`,
+		Measurement: "Iterator Ops",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaStorageCompactionsDuration = metric.Metadata{
+		Name: "storage.compactions.duration",
+		Help: `Cumulative sum of all compaction durations.
+
+The rate of this value provides the effective compaction concurrency of a store,
+which can be useful to determine whether the maximum compaction concurrency is
+fully utilized.`,
+		Measurement: "Processing Time",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaStorageCompactionsKeysPinnedCount = metric.Metadata{
+		Name: "storage.compactions.keys.pinned.count",
+		Help: `Cumulative count of storage engine KVs written to sstables during flushes and compactions due to open LSM snapshots.
+
+Various subsystems of CockroachDB take LSM snapshots to maintain a consistent view
+of the database over an extended duration. In order to maintain the consistent view,
+flushes and compactions within the storage engine must preserve keys that otherwise
+would have been dropped. This increases write amplification, and introduces keys
+that must be skipped during iteration. This metric records the cumulative count of
+KVs preserved during flushes and compactions over the lifetime of the process.
+`,
+		Measurement: "Keys",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaStorageCompactionsKeysPinnedBytes = metric.Metadata{
+		Name: "storage.compactions.keys.pinned.bytes",
+		Help: `Cumulative size of storage engine KVs written to sstables during flushes and compactions due to open LSM snapshots.
+
+Various subsystems of CockroachDB take LSM snapshots to maintain a consistent view
+of the database over an extended duration. In order to maintain the consistent view,
+flushes and compactions within the storage engine must preserve keys that otherwise
+would have been dropped. This increases write amplification, and introduces keys
+that must be skipped during iteration. This metric records the cumulative number of
+bytes preserved during flushes and compactions over the lifetime of the process.
+`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
 	metaSharedStorageBytesWritten = metric.Metadata{
 		Name:        "storage.shared-storage.write",
 		Help:        "Bytes written to external storage",
@@ -627,6 +767,79 @@ Raft applied index at which this checkpoint was taken.`,
 		Help:        "Bytes read from shared storage",
 		Measurement: "Bytes",
 		Unit:        metric.Unit_BYTES,
+	}
+	metaFlushableIngestCount = metric.Metadata{
+		Name:        "storage.flush.ingest.count",
+		Help:        "Flushes performing an ingest (flushable ingestions)",
+		Measurement: "Flushes",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaFlushableIngestTableCount = metric.Metadata{
+		Name:        "storage.flush.ingest.table.count",
+		Help:        "Tables ingested via flushes (flushable ingestions)",
+		Measurement: "Tables",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaFlushableIngestTableBytes = metric.Metadata{
+		Name:        "storage.flush.ingest.table.bytes",
+		Help:        "Bytes ingested via flushes (flushable ingestions)",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaBatchCommitCount = metric.Metadata{
+		Name:        "storage.batch-commit.count",
+		Help:        "Count of batch commits. See storage.AggregatedBatchCommitStats for details.",
+		Measurement: "Commit Ops",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaBatchCommitDuration = metric.Metadata{
+		Name: "storage.batch-commit.duration",
+		Help: "Cumulative time spent in batch commit. " +
+			"See storage.AggregatedBatchCommitStats for details.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaBatchCommitSemWaitDuration = metric.Metadata{
+		Name: "storage.batch-commit.sem-wait.duration",
+		Help: "Cumulative time spent in semaphore wait, for batch commit. " +
+			"See storage.AggregatedBatchCommitStats for details.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaBatchCommitWALQWaitDuration = metric.Metadata{
+		Name: "storage.batch-commit.wal-queue-wait.duration",
+		Help: "Cumulative time spent waiting for memory blocks in the WAL queue, for batch commit. " +
+			"See storage.AggregatedBatchCommitStats for details.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaBatchCommitMemStallDuration = metric.Metadata{
+		Name: "storage.batch-commit.mem-stall.duration",
+		Help: "Cumulative time spent in a write stall due to too many memtables, for batch commit. " +
+			"See storage.AggregatedBatchCommitStats for details.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaBatchCommitL0StallDuration = metric.Metadata{
+		Name: "storage.batch-commit.l0-stall.duration",
+		Help: "Cumulative time spent in a write stall due to high read amplification in L0, for batch commit. " +
+			"See storage.AggregatedBatchCommitStats for details.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaBatchCommitWALRotDuration = metric.Metadata{
+		Name: "storage.batch-commit.wal-rotation.duration",
+		Help: "Cumulative time spent waiting for WAL rotation, for batch commit. " +
+			"See storage.AggregatedBatchCommitStats for details.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaBatchCommitCommitWaitDuration = metric.Metadata{
+		Name: "storage.batch-commit.commit-wait.duration",
+		Help: "Cumulative time spent waiting for WAL sync, for batch commit. " +
+			"See storage.AggregatedBatchCommitStats for details.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 )
 
@@ -742,6 +955,53 @@ var (
 		Measurement: "Bytes",
 		Unit:        metric.Unit_BYTES,
 	}
+	metaRangeSnapshotRecvFailed = metric.Metadata{
+		Name:        "range.snapshots.recv-failed",
+		Help:        "Number of range snapshot initialization messages that errored out on the recipient, typically before any data is transferred",
+		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRangeSnapshotRecvUnusable = metric.Metadata{
+		Name:        "range.snapshots.recv-unusable",
+		Help:        "Number of range snapshot that were fully transmitted but determined to be unnecessary or unusable",
+		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRangeSnapShotCrossRegionSentBytes = metric.Metadata{
+		Name:        "range.snapshots.cross-region.sent-bytes",
+		Help:        "Number of snapshot bytes sent cross region",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRangeSnapShotCrossRegionRcvdBytes = metric.Metadata{
+		Name:        "range.snapshots.cross-region.rcvd-bytes",
+		Help:        "Number of snapshot bytes received cross region",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRangeSnapShotCrossZoneSentBytes = metric.Metadata{
+		Name: "range.snapshots.cross-zone.sent-bytes",
+		Help: `Number of snapshot bytes sent cross zone within same region or if
+		region tiers are not configured. This count increases for each snapshot sent
+		between different zones within the same region. However, if the region tiers
+		are not configured, this count may also include snapshot data sent between
+		different regions. Ensuring consistent configuration of region and zone
+		tiers across nodes helps to accurately monitor the data transmitted.`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRangeSnapShotCrossZoneRcvdBytes = metric.Metadata{
+		Name: "range.snapshots.cross-zone.rcvd-bytes",
+		Help: `Number of snapshot bytes received cross zone within same region or if
+		region tiers are not configured. This count increases for each snapshot
+		received between different zones within the same region. However, if the
+		region tiers are not configured, this count may also include snapshot data
+		received between different regions. Ensuring consistent configuration of
+		region and zone tiers across nodes helps to accurately monitor the data
+		transmitted.`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
 	metaRangeSnapshotSendQueueLength = metric.Metadata{
 		Name:        "range.snapshots.send-queue",
 		Help:        "Number of snapshots queued to send",
@@ -778,11 +1038,29 @@ var (
 		Measurement: "Snapshots",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaRangeSnapshotSendQueueSize = metric.Metadata{
+		Name:        "range.snapshots.send-queue-bytes",
+		Help:        "Total size of all snapshots in the snapshot send queue",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRangeSnapshotRecvQueueSize = metric.Metadata{
+		Name:        "range.snapshots.recv-queue-bytes",
+		Help:        "Total size of all snapshots in the snapshot receive queue",
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
 
 	metaRangeRaftLeaderTransfers = metric.Metadata{
 		Name:        "range.raftleadertransfers",
 		Help:        "Number of raft leader transfers",
 		Measurement: "Leader Transfers",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRangeRaftLeaderRemovals = metric.Metadata{
+		Name:        "range.raftleaderremovals",
+		Help:        "Number of times the current Raft leader was removed from a range",
+		Measurement: "Raft leader removals",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaRangeLossOfQuorumRecoveries = metric.Metadata{
@@ -807,7 +1085,7 @@ evaluating the network savings of not sending cross region traffic.
 		Unit:        metric.Unit_BYTES,
 	}
 	metaDelegateSnapshotSuccesses = metric.Metadata{
-		Name: "range.snapshot.delegate.successes",
+		Name: "range.snapshots.delegate.successes",
 		Help: `Number of snapshots that were delegated to a different node and
 resulted in success on that delegate. This does not count self delegated snapshots.
 `,
@@ -815,12 +1093,18 @@ resulted in success on that delegate. This does not count self delegated snapsho
 		Unit:        metric.Unit_COUNT,
 	}
 	metaDelegateSnapshotFailures = metric.Metadata{
-		Name: "range.snapshot.delegate.failures",
+		Name: "range.snapshots.delegate.failures",
 		Help: `Number of snapshots that were delegated to a different node and
 resulted in failure on that delegate. There are numerous reasons a failure can
 occur on a delegate such as timeout, the delegate Raft log being too far behind
 or the delegate being too busy to send.
 `,
+		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDelegateSnapshotInProgress = metric.Metadata{
+		Name:        "range.snapshots.delegate.in-progress",
+		Help:        `Number of delegated snapshots that are currently in-flight.`,
 		Measurement: "Snapshots",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -840,6 +1124,20 @@ or the delegate being too busy to send.
 		Name:        "raft.ticks",
 		Help:        "Number of Raft ticks queued",
 		Measurement: "Ticks",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRaftProposalsDropped = metric.Metadata{
+		Name:        "raft.dropped",
+		Help:        "Number of Raft proposals dropped (this counts individial raftpb.Entry, not raftpb.MsgProp)",
+		Measurement: "Proposals",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRaftProposalsDroppedLeader = metric.Metadata{
+		Name: "raft.dropped_leader",
+		Help: "Number of Raft proposals dropped by a Replica that believes itself to be the leader; " +
+			"each update also increments `raft.dropped` " +
+			"(this counts individial raftpb.Entry, not raftpb.MsgProp)",
+		Measurement: "Proposals",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaRaftWorkingDurationNanos = metric.Metadata{
@@ -944,6 +1242,32 @@ metric, which receives datapoints for each sub-batch processed in the process.`,
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
+	metaRaftReplicationLatency = metric.Metadata{
+		Name: "raft.replication.latency",
+		Help: `The duration elapsed between having evaluated a BatchRequest and it being
+reflected in the proposer's state machine (i.e. having applied fully).
+
+This encompasses time spent in the quota pool, in replication (including
+reproposals), and application, but notably *not* sequencing latency (i.e.
+contention and latch acquisition).
+
+No measurement is recorded for read-only commands as well as read-write commands
+which end up not writing (such as a DeleteRange on an empty span). Commands that
+result in 'above-replication' errors (i.e. txn retries, etc) are similarly
+excluded. Errors that arise while waiting for the in-flight replication result
+or result from application of the command are included.
+
+Note also that usually, clients are signalled at beginning of application, but
+the recorded measurement captures the entirety of log application.
+
+The duration is always measured on the proposer, even if the Raft leader and
+leaseholder are not colocated, or the request is proposed from a follower.
+
+Commands that use async consensus will still cause a measurement that reflects
+the actual replication latency, despite returning early to the client.`,
+		Measurement: "Latency",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaRaftSchedulerLatency = metric.Metadata{
 		Name: "raft.scheduler.latency",
 		Help: `Queueing durations for ranges waiting to be processed by the Raft scheduler.
@@ -960,6 +1284,34 @@ of processing.
 		Help:        "Number of Raft replicas campaigning after missed heartbeats from leader",
 		Measurement: "Elections called after timeout",
 		Unit:        metric.Unit_COUNT,
+	}
+	metaRaftStorageReadBytes = metric.Metadata{
+		Name: "raft.storage.read_bytes",
+		Help: `Counter of raftpb.Entry.Size() read from pebble for raft log entries.
+
+These are the bytes returned from the (raft.Storage).Entries method that were not
+returned via the raft entry cache. This metric plus the raft.entrycache.read_bytes
+metric represent the total bytes returned from the Entries method.
+
+Since pebble might serve these entries from the block cache, only a fraction of this
+throughput might manifest in disk metrics.
+
+Entries tracked in this metric incur an unmarshalling-related CPU and memory
+overhead that would not be incurred would the entries be served from the raft
+entry cache.
+
+The bytes returned here do not correspond 1:1 to bytes read from pebble. This
+metric measures the in-memory size of the raftpb.Entry, whereas we read its
+encoded representation from pebble. As there is no compression involved, these
+will generally be comparable.
+
+A common reason for elevated measurements on this metric is that a store is
+falling behind on raft log application. The raft entry cache generally tracks
+entries that were recently appended, so if log application falls behind the
+cache will already have moved on to newer entries.
+`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
 	}
 
 	// Raft message metrics.
@@ -1068,6 +1420,59 @@ handling consumes writes.
 		Unit:        metric.Unit_BYTES,
 	}
 
+	metaRaftRcvdBytes = metric.Metadata{
+		Name: "raft.rcvd.bytes",
+		Help: `Number of bytes in Raft messages received by this store. Note
+		that this does not include raft snapshot received.`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRaftRcvdCrossRegionBytes = metric.Metadata{
+		Name: "raft.rcvd.cross_region.bytes",
+		Help: `Number of bytes received by this store for cross region Raft messages
+		(when region tiers are configured). Note that this does not include raft
+		snapshot received.`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRaftRcvdCrossZoneBytes = metric.Metadata{
+		Name: "raft.rcvd.cross_zone.bytes",
+		Help: `Number of bytes received by this store for cross zone, same region
+		Raft messages (when region and zone tiers are configured). If region tiers
+		are not configured, this count may include data sent between different
+		regions. To ensure accurate monitoring of transmitted data, it is important
+		to set up a consistent locality configuration across nodes. Note that this
+		does not include raft snapshot received.`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRaftSentBytes = metric.Metadata{
+		Name: "raft.sent.bytes",
+		Help: `Number of bytes in Raft messages sent by this store. Note that
+		this does not include raft snapshot sent.`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRaftSentCrossRegionBytes = metric.Metadata{
+		Name: "raft.sent.cross_region.bytes",
+		Help: `Number of bytes sent by this store for cross region Raft messages
+		(when region tiers are configured). Note that this does not include raft
+		snapshot sent.`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+	metaRaftSentCrossZoneBytes = metric.Metadata{
+		Name: "raft.sent.cross_zone.bytes",
+		Help: `Number of bytes sent by this store for cross zone, same region Raft
+		messages (when region and zone tiers are configured). If region tiers are
+		not configured, this count may include data sent between different regions.
+		To ensure accurate monitoring of transmitted data, it is important to set up
+		a consistent locality configuration across nodes. Note that this does not
+		include raft snapshot sent.`,
+		Measurement: "Bytes",
+		Unit:        metric.Unit_BYTES,
+	}
+
 	metaRaftCoalescedHeartbeatsPending = metric.Metadata{
 		Name:        "raft.heartbeats.pending",
 		Help:        "Number of pending heartbeats and responses waiting to be coalesced",
@@ -1125,6 +1530,12 @@ The messages are dropped to help these replicas to recover from I/O overload.`,
 	}
 
 	// Replica queue metrics.
+	metaStoreFailures = metric.Metadata{
+		Name:        "storage.queue.store-failures",
+		Help:        "Number of replicas which failed processing in replica queues due to retryable store errors",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaMVCCGCQueueSuccesses = metric.Metadata{
 		Name:        "queue.gc.process.success",
 		Help:        "Number of replicas successfully processed by the MVCC GC queue",
@@ -1661,12 +2072,6 @@ throttled they do count towards 'delay.total' and 'delay.enginebackpressure'.
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
-	metaClosedTimestampFailuresToClose = metric.Metadata{
-		Name:        "kv.closed_timestamp.failures_to_close",
-		Help:        "Number of times the min prop tracker failed to close timestamps due to epoch mismatch or pending evaluations",
-		Measurement: "Attempts",
-		Unit:        metric.Unit_COUNT,
-	}
 
 	// Replica circuit breaker.
 	metaReplicaCircuitBreakerCurTripped = metric.Metadata{
@@ -1726,7 +2131,18 @@ Note that the measurement does not include the duration for replicating the eval
 		Measurement: "Flush Utilization",
 		Unit:        metric.Unit_PERCENT,
 	}
-
+	metaWALBytesWritten = metric.Metadata{
+		Name:        "storage.wal.bytes_written",
+		Help:        "The number of bytes the storage engine has written to the WAL",
+		Measurement: "Events",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaWALBytesIn = metric.Metadata{
+		Name:        "storage.wal.bytes_in",
+		Help:        "The number of logical bytes the storage engine has written to the WAL",
+		Measurement: "Events",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaStorageFsyncLatency = metric.Metadata{
 		Name:        "storage.wal.fsync.latency",
 		Help:        "The write ahead log fsync latency",
@@ -1777,12 +2193,16 @@ type StoreMetrics struct {
 	// Lease request metrics for successful and failed lease requests. These
 	// count proposals (i.e. it does not matter how many replicas apply the
 	// lease).
-	LeaseRequestSuccessCount  *metric.Counter
-	LeaseRequestErrorCount    *metric.Counter
-	LeaseTransferSuccessCount *metric.Counter
-	LeaseTransferErrorCount   *metric.Counter
-	LeaseExpirationCount      *metric.Gauge
-	LeaseEpochCount           *metric.Gauge
+	LeaseRequestSuccessCount       *metric.Counter
+	LeaseRequestErrorCount         *metric.Counter
+	LeaseRequestLatency            metric.IHistogram
+	LeaseTransferSuccessCount      *metric.Counter
+	LeaseTransferErrorCount        *metric.Counter
+	LeaseExpirationCount           *metric.Gauge
+	LeaseEpochCount                *metric.Gauge
+	LeaseLivenessCount             *metric.Gauge
+	LeaseViolatingPreferencesCount *metric.Gauge
+	LeaseLessPreferredCount        *metric.Gauge
 
 	// Storage metrics.
 	ResolveCommitCount *metric.Counter
@@ -1801,6 +2221,12 @@ type StoreMetrics struct {
 	AverageWriteBytesPerSecond *metric.GaugeFloat64
 	AverageReadBytesPerSecond  *metric.GaugeFloat64
 	AverageCPUNanosPerSecond   *metric.GaugeFloat64
+	// NB: Even though we could average the histogram in order to get
+	// AverageCPUNanosPerSecond from RecentReplicaCPUNanosPerSecond, we duplicate
+	// both for backwards compatibility since the cost of the gauge is small.
+	// This includes all replicas, including quiesced ones.
+	RecentReplicaCPUNanosPerSecond *metric.ManualWindowHistogram
+	RecentReplicaQueriesPerSecond  *metric.ManualWindowHistogram
 	// l0SublevelsWindowedMax doesn't get recorded to metrics itself, it maintains
 	// an ad-hoc history for gosipping information for allocator use.
 	l0SublevelsWindowedMax syncutil.AtomicFloat64
@@ -1825,39 +2251,67 @@ type StoreMetrics struct {
 	// before pebble, and this name is kept for backwards compatibility despite
 	// the backing metrics now originating from pebble.
 	//
-	// All of these are cumulative values. They are maintained by pebble and
+	// All of these are cumulative values. Most are maintained by pebble and
 	// so we have to expose them as gauges (lest we start tracking deltas from
 	// the respective last stats we got from pebble).
-	RdbBlockCacheHits           *metric.Gauge
-	RdbBlockCacheMisses         *metric.Gauge
-	RdbBlockCacheUsage          *metric.Gauge
-	RdbBlockCachePinnedUsage    *metric.Gauge
-	RdbBloomFilterPrefixChecked *metric.Gauge
-	RdbBloomFilterPrefixUseful  *metric.Gauge
-	RdbMemtableTotalSize        *metric.Gauge
-	RdbFlushes                  *metric.Gauge
-	RdbFlushedBytes             *metric.Gauge
-	RdbCompactions              *metric.Gauge
-	RdbIngestedBytes            *metric.Gauge
-	RdbCompactedBytesRead       *metric.Gauge
-	RdbCompactedBytesWritten    *metric.Gauge
-	RdbTableReadersMemEstimate  *metric.Gauge
-	RdbReadAmplification        *metric.Gauge
-	RdbNumSSTables              *metric.Gauge
-	RdbPendingCompaction        *metric.Gauge
-	RdbMarkedForCompactionFiles *metric.Gauge
-	RdbKeysRangeKeySets         *metric.Gauge
-	RdbKeysTombstones           *metric.Gauge
-	RdbL0BytesFlushed           *metric.Gauge
-	RdbL0Sublevels              *metric.Gauge
-	RdbL0NumFiles               *metric.Gauge
-	RdbBytesIngested            [7]*metric.Gauge        // idx = level
-	RdbLevelSize                [7]*metric.Gauge        // idx = level
-	RdbLevelScore               [7]*metric.GaugeFloat64 // idx = level
-	RdbWriteStalls              *metric.Gauge
-	RdbWriteStallNanos          *metric.Gauge
-	SharedStorageBytesRead      *metric.Gauge
-	SharedStorageBytesWritten   *metric.Gauge
+	//
+	// There's a bit of a semantic mismatch here because the mechanism of
+	// updating these metrics is a gauge (eg, we're reading the current value,
+	// not incrementing) but semantically some of them are monotonically
+	// increasing counters.
+	//
+	// TODO(jackson): Reconcile this mismatch so that metrics that are
+	// semantically counters are exported as such to Prometheus. See #99922.
+	RdbBlockCacheHits             *metric.Gauge
+	RdbBlockCacheMisses           *metric.Gauge
+	RdbBlockCacheUsage            *metric.Gauge
+	RdbBloomFilterPrefixChecked   *metric.Gauge
+	RdbBloomFilterPrefixUseful    *metric.Gauge
+	RdbMemtableTotalSize          *metric.Gauge
+	RdbFlushes                    *metric.Gauge
+	RdbFlushedBytes               *metric.Gauge
+	RdbCompactions                *metric.Gauge
+	RdbIngestedBytes              *metric.Gauge
+	RdbCompactedBytesRead         *metric.Gauge
+	RdbCompactedBytesWritten      *metric.Gauge
+	RdbTableReadersMemEstimate    *metric.Gauge
+	RdbReadAmplification          *metric.Gauge
+	RdbNumSSTables                *metric.Gauge
+	RdbPendingCompaction          *metric.Gauge
+	RdbMarkedForCompactionFiles   *metric.Gauge
+	RdbKeysRangeKeySets           *metric.Gauge
+	RdbKeysTombstones             *metric.Gauge
+	RdbL0BytesFlushed             *metric.Gauge
+	RdbL0Sublevels                *metric.Gauge
+	RdbL0NumFiles                 *metric.Gauge
+	RdbBytesIngested              [7]*metric.Gauge        // idx = level
+	RdbLevelSize                  [7]*metric.Gauge        // idx = level
+	RdbLevelScore                 [7]*metric.GaugeFloat64 // idx = level
+	RdbWriteStalls                *metric.Gauge
+	RdbWriteStallNanos            *metric.Gauge
+	SharedStorageBytesRead        *metric.Gauge
+	SharedStorageBytesWritten     *metric.Gauge
+	StorageCompactionsPinnedKeys  *metric.Gauge
+	StorageCompactionsPinnedBytes *metric.Gauge
+	StorageCompactionsDuration    *metric.Gauge
+	IterBlockBytes                *metric.Gauge
+	IterBlockBytesInCache         *metric.Gauge
+	IterBlockReadDuration         *metric.Gauge
+	IterExternalSeeks             *metric.Gauge
+	IterExternalSteps             *metric.Gauge
+	IterInternalSeeks             *metric.Gauge
+	IterInternalSteps             *metric.Gauge
+	FlushableIngestCount          *metric.Gauge
+	FlushableIngestTableCount     *metric.Gauge
+	FlushableIngestTableSize      *metric.Gauge
+	BatchCommitCount              *metric.Gauge
+	BatchCommitDuration           *metric.Gauge
+	BatchCommitSemWaitDuration    *metric.Gauge
+	BatchCommitWALQWaitDuration   *metric.Gauge
+	BatchCommitMemStallDuration   *metric.Gauge
+	BatchCommitL0StallDuration    *metric.Gauge
+	BatchCommitWALRotWaitDuration *metric.Gauge
+	BatchCommitCommitWaitDuration *metric.Gauge
 
 	RdbCheckpoints *metric.Gauge
 
@@ -1876,6 +2330,7 @@ type StoreMetrics struct {
 	RangeAdds                   *metric.Counter
 	RangeRemoves                *metric.Counter
 	RangeRaftLeaderTransfers    *metric.Counter
+	RangeRaftLeaderRemovals     *metric.Counter
 	RangeLossOfQuorumRecoveries *metric.Counter
 
 	// Range snapshot metrics.
@@ -1891,6 +2346,12 @@ type StoreMetrics struct {
 	RangeSnapshotRecoverySentBytes               *metric.Counter
 	RangeSnapshotRebalancingRcvdBytes            *metric.Counter
 	RangeSnapshotRebalancingSentBytes            *metric.Counter
+	RangeSnapshotRecvFailed                      *metric.Counter
+	RangeSnapshotRecvUnusable                    *metric.Counter
+	RangeSnapShotCrossRegionSentBytes            *metric.Counter
+	RangeSnapShotCrossRegionRcvdBytes            *metric.Counter
+	RangeSnapShotCrossZoneSentBytes              *metric.Counter
+	RangeSnapShotCrossZoneRcvdBytes              *metric.Counter
 
 	// Range snapshot queue metrics.
 	RangeSnapshotSendQueueLength     *metric.Gauge
@@ -1899,33 +2360,48 @@ type StoreMetrics struct {
 	RangeSnapshotRecvInProgress      *metric.Gauge
 	RangeSnapshotSendTotalInProgress *metric.Gauge
 	RangeSnapshotRecvTotalInProgress *metric.Gauge
+	RangeSnapshotSendQueueSize       *metric.Gauge
+	RangeSnapshotRecvQueueSize       *metric.Gauge
 
 	// Delegate snapshot metrics. These don't count self-delegated snapshots.
-	DelegateSnapshotSendBytes *metric.Counter
-	DelegateSnapshotSuccesses *metric.Counter
-	DelegateSnapshotFailures  *metric.Counter
+	DelegateSnapshotSendBytes  *metric.Counter
+	DelegateSnapshotSuccesses  *metric.Counter
+	DelegateSnapshotFailures   *metric.Counter
+	DelegateSnapshotInProgress *metric.Gauge
 
 	// Raft processing metrics.
-	RaftTicks                 *metric.Counter
-	RaftQuotaPoolPercentUsed  metric.IHistogram
-	RaftWorkingDurationNanos  *metric.Counter
-	RaftTickingDurationNanos  *metric.Counter
-	RaftCommandsApplied       *metric.Counter
-	RaftLogCommitLatency      metric.IHistogram
-	RaftCommandCommitLatency  metric.IHistogram
-	RaftHandleReadyLatency    metric.IHistogram
-	RaftApplyCommittedLatency metric.IHistogram
-	RaftSchedulerLatency      metric.IHistogram
-	RaftTimeoutCampaign       *metric.Counter
+	RaftTicks                  *metric.Counter
+	RaftProposalsDropped       *metric.Counter
+	RaftProposalsDroppedLeader *metric.Counter
+	RaftQuotaPoolPercentUsed   metric.IHistogram
+	RaftWorkingDurationNanos   *metric.Counter
+	RaftTickingDurationNanos   *metric.Counter
+	RaftCommandsApplied        *metric.Counter
+	RaftLogCommitLatency       metric.IHistogram
+	RaftCommandCommitLatency   metric.IHistogram
+	RaftHandleReadyLatency     metric.IHistogram
+	RaftApplyCommittedLatency  metric.IHistogram
+	RaftReplicationLatency     metric.IHistogram
+	RaftSchedulerLatency       metric.IHistogram
+	RaftTimeoutCampaign        *metric.Counter
+	RaftStorageReadBytes       *metric.Counter
+	WALBytesWritten            *metric.Gauge
+	WALBytesIn                 *metric.Gauge
 
 	// Raft message metrics.
 	//
 	// An array for conveniently finding the appropriate metric.
-	RaftRcvdMessages     [maxRaftMsgType + 1]*metric.Counter
-	RaftRcvdDropped      *metric.Counter
-	RaftRcvdDroppedBytes *metric.Counter
-	RaftRcvdQueuedBytes  *metric.Gauge
-	RaftRcvdSteppedBytes *metric.Counter
+	RaftRcvdMessages         [maxRaftMsgType + 1]*metric.Counter
+	RaftRcvdDropped          *metric.Counter
+	RaftRcvdDroppedBytes     *metric.Counter
+	RaftRcvdQueuedBytes      *metric.Gauge
+	RaftRcvdSteppedBytes     *metric.Counter
+	RaftRcvdBytes            *metric.Counter
+	RaftRcvdCrossRegionBytes *metric.Counter
+	RaftRcvdCrossZoneBytes   *metric.Counter
+	RaftSentBytes            *metric.Counter
+	RaftSentCrossRegionBytes *metric.Counter
+	RaftSentCrossZoneBytes   *metric.Counter
 
 	// Raft log metrics.
 	RaftLogFollowerBehindCount *metric.Gauge
@@ -1938,6 +2414,7 @@ type StoreMetrics struct {
 	RaftCoalescedHeartbeatsPending *metric.Gauge
 
 	// Replica queue metrics.
+	StoreFailures                             *metric.Counter
 	MVCCGCQueueSuccesses                      *metric.Counter
 	MVCCGCQueueFailures                       *metric.Counter
 	MVCCGCQueuePending                        *metric.Gauge
@@ -2039,6 +2516,9 @@ type StoreMetrics struct {
 	MaxLockWaitDurationNanos       *metric.Gauge
 	MaxLockWaitQueueWaitersForLock *metric.Gauge
 
+	// Ingestion metrics
+	IngestCount *metric.Gauge
+
 	// Closed timestamp metrics.
 	ClosedTimestampMaxBehindNanos *metric.Gauge
 
@@ -2086,6 +2566,8 @@ func (ref *tenantMetricsRef) assert(ctx context.Context) {
 // call acquire and release to properly reference count the metrics for
 // individual tenants.
 type TenantsStorageMetrics struct {
+	// NB: If adding more metrics to this struct, be sure to
+	// also update tenantsStorageMetricsSet().
 	LiveBytes      *aggmetric.AggGauge
 	KeyBytes       *aggmetric.AggGauge
 	ValBytes       *aggmetric.AggGauge
@@ -2112,6 +2594,33 @@ type TenantsStorageMetrics struct {
 	// except that should one ever look at this map through a debugger
 	// the int64->uint64 conversion has to be done manually.
 	tenants syncutil.IntMap // map[int64(roachpb.TenantID)]*tenantStorageMetrics
+}
+
+// tenantsStorageMetricsSet returns the set of all metric names contained
+// within TenantsStorageMetrics.
+//
+// see kvbase.TenantsStorageMetricsSet for public access. Assigned in init().
+func tenantsStorageMetricsSet() map[string]struct{} {
+	return map[string]struct{}{
+		metaLiveBytes.Name:      {},
+		metaKeyBytes.Name:       {},
+		metaValBytes.Name:       {},
+		metaRangeKeyBytes.Name:  {},
+		metaRangeValBytes.Name:  {},
+		metaTotalBytes.Name:     {},
+		metaIntentBytes.Name:    {},
+		metaLiveCount.Name:      {},
+		metaKeyCount.Name:       {},
+		metaValCount.Name:       {},
+		metaRangeKeyCount.Name:  {},
+		metaRangeValCount.Name:  {},
+		metaIntentCount.Name:    {},
+		metaIntentAge.Name:      {},
+		metaGcBytesAge.Name:     {},
+		metaSysBytes.Name:       {},
+		metaSysCount.Name:       {},
+		metaAbortSpanBytes.Name: {},
+	}
 }
 
 var _ metric.Struct = (*TenantsStorageMetrics)(nil)
@@ -2333,12 +2842,21 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		OverReplicatedRangeCount:  metric.NewGauge(metaOverReplicatedRangeCount),
 
 		// Lease request metrics.
-		LeaseRequestSuccessCount:  metric.NewCounter(metaLeaseRequestSuccessCount),
-		LeaseRequestErrorCount:    metric.NewCounter(metaLeaseRequestErrorCount),
-		LeaseTransferSuccessCount: metric.NewCounter(metaLeaseTransferSuccessCount),
-		LeaseTransferErrorCount:   metric.NewCounter(metaLeaseTransferErrorCount),
-		LeaseExpirationCount:      metric.NewGauge(metaLeaseExpirationCount),
-		LeaseEpochCount:           metric.NewGauge(metaLeaseEpochCount),
+		LeaseRequestSuccessCount: metric.NewCounter(metaLeaseRequestSuccessCount),
+		LeaseRequestErrorCount:   metric.NewCounter(metaLeaseRequestErrorCount),
+		LeaseRequestLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaLeaseRequestLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
+		}),
+		LeaseTransferSuccessCount:      metric.NewCounter(metaLeaseTransferSuccessCount),
+		LeaseTransferErrorCount:        metric.NewCounter(metaLeaseTransferErrorCount),
+		LeaseExpirationCount:           metric.NewGauge(metaLeaseExpirationCount),
+		LeaseEpochCount:                metric.NewGauge(metaLeaseEpochCount),
+		LeaseLivenessCount:             metric.NewGauge(metaLeaseLivenessCount),
+		LeaseViolatingPreferencesCount: metric.NewGauge(metaLeaseViolatingPreferencesCount),
+		LeaseLessPreferredCount:        metric.NewGauge(metaLeaseLessPreferredCount),
 
 		// Intent resolution metrics.
 		ResolveCommitCount: metric.NewCounter(metaResolveCommit),
@@ -2358,6 +2876,18 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		AverageWriteBytesPerSecond: metric.NewGaugeFloat64(metaAverageWriteBytesPerSecond),
 		AverageReadBytesPerSecond:  metric.NewGaugeFloat64(metaAverageReadBytesPerSecond),
 		AverageCPUNanosPerSecond:   metric.NewGaugeFloat64(metaAverageCPUNanosPerSecond),
+		RecentReplicaCPUNanosPerSecond: metric.NewManualWindowHistogram(
+			metaRecentReplicaCPUNanosPerSecond,
+			metric.ReplicaCPUTimeBuckets.
+				GetBucketsFromBucketConfig(),
+			true, /* withRotate */
+		),
+		RecentReplicaQueriesPerSecond: metric.NewManualWindowHistogram(
+			metaRecentReplicaQueriesPerSecond,
+			metric.ReplicaBatchRequestCountBuckets.
+				GetBucketsFromBucketConfig(),
+			true, /* withRotate */
+		),
 
 		// Follower reads metrics.
 		FollowerReadsCount: metric.NewCounter(metaFollowerReadsCount),
@@ -2371,37 +2901,71 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		ReadWithinUncertaintyIntervalErrorServerSideRetrySuccess: metric.NewCounter(metaReadWithinUncertaintyIntervalErrorServerSideRetrySuccess),
 		ReadWithinUncertaintyIntervalErrorServerSideRetryFailure: metric.NewCounter(metaReadWithinUncertaintyIntervalErrorServerSideRetryFailure),
 
-		// RocksDB/Pebble metrics.
-		RdbBlockCacheHits:           metric.NewGauge(metaRdbBlockCacheHits),
-		RdbBlockCacheMisses:         metric.NewGauge(metaRdbBlockCacheMisses),
-		RdbBlockCacheUsage:          metric.NewGauge(metaRdbBlockCacheUsage),
-		RdbBlockCachePinnedUsage:    metric.NewGauge(metaRdbBlockCachePinnedUsage),
-		RdbBloomFilterPrefixChecked: metric.NewGauge(metaRdbBloomFilterPrefixChecked),
-		RdbBloomFilterPrefixUseful:  metric.NewGauge(metaRdbBloomFilterPrefixUseful),
-		RdbMemtableTotalSize:        metric.NewGauge(metaRdbMemtableTotalSize),
-		RdbFlushes:                  metric.NewGauge(metaRdbFlushes),
-		RdbFlushedBytes:             metric.NewGauge(metaRdbFlushedBytes),
-		RdbCompactions:              metric.NewGauge(metaRdbCompactions),
-		RdbIngestedBytes:            metric.NewGauge(metaRdbIngestedBytes),
-		RdbCompactedBytesRead:       metric.NewGauge(metaRdbCompactedBytesRead),
-		RdbCompactedBytesWritten:    metric.NewGauge(metaRdbCompactedBytesWritten),
-		RdbTableReadersMemEstimate:  metric.NewGauge(metaRdbTableReadersMemEstimate),
-		RdbReadAmplification:        metric.NewGauge(metaRdbReadAmplification),
-		RdbNumSSTables:              metric.NewGauge(metaRdbNumSSTables),
-		RdbPendingCompaction:        metric.NewGauge(metaRdbPendingCompaction),
-		RdbMarkedForCompactionFiles: metric.NewGauge(metaRdbMarkedForCompactionFiles),
-		RdbKeysRangeKeySets:         metric.NewGauge(metaRdbKeysRangeKeySets),
-		RdbKeysTombstones:           metric.NewGauge(metaRdbKeysTombstones),
-		RdbL0BytesFlushed:           metric.NewGauge(metaRdbL0BytesFlushed),
-		RdbL0Sublevels:              metric.NewGauge(metaRdbL0Sublevels),
-		RdbL0NumFiles:               metric.NewGauge(metaRdbL0NumFiles),
-		RdbBytesIngested:            rdbBytesIngested,
-		RdbLevelSize:                rdbLevelSize,
-		RdbLevelScore:               rdbLevelScore,
-		RdbWriteStalls:              metric.NewGauge(metaRdbWriteStalls),
-		RdbWriteStallNanos:          metric.NewGauge(metaRdbWriteStallNanos),
-		SharedStorageBytesRead:      metric.NewGauge(metaSharedStorageBytesRead),
-		SharedStorageBytesWritten:   metric.NewGauge(metaSharedStorageBytesWritten),
+		// Pebble metrics.
+		//
+		// These are all gauges today because almost all of them are cumulative
+		// metrics recorded within Pebble. Internally within Pebble some of
+		// these are monotonically increasing counters. There's a bit of a
+		// semantic mismatch here because the mechanism of updating the metric
+		// is a gauge (eg, we're reading the current value, not incrementing)
+		// but the meaning of the metric itself is a counter.
+		// TODO(jackson): Reconcile this mismatch so that metrics that are
+		// semantically counters are exported as such to Prometheus. See #99922.
+		RdbBlockCacheHits:             metric.NewGauge(metaRdbBlockCacheHits),
+		RdbBlockCacheMisses:           metric.NewGauge(metaRdbBlockCacheMisses),
+		RdbBlockCacheUsage:            metric.NewGauge(metaRdbBlockCacheUsage),
+		RdbBloomFilterPrefixChecked:   metric.NewGauge(metaRdbBloomFilterPrefixChecked),
+		RdbBloomFilterPrefixUseful:    metric.NewGauge(metaRdbBloomFilterPrefixUseful),
+		RdbMemtableTotalSize:          metric.NewGauge(metaRdbMemtableTotalSize),
+		RdbFlushes:                    metric.NewGauge(metaRdbFlushes),
+		RdbFlushedBytes:               metric.NewGauge(metaRdbFlushedBytes),
+		RdbCompactions:                metric.NewGauge(metaRdbCompactions),
+		RdbIngestedBytes:              metric.NewGauge(metaRdbIngestedBytes),
+		RdbCompactedBytesRead:         metric.NewGauge(metaRdbCompactedBytesRead),
+		RdbCompactedBytesWritten:      metric.NewGauge(metaRdbCompactedBytesWritten),
+		RdbTableReadersMemEstimate:    metric.NewGauge(metaRdbTableReadersMemEstimate),
+		RdbReadAmplification:          metric.NewGauge(metaRdbReadAmplification),
+		RdbNumSSTables:                metric.NewGauge(metaRdbNumSSTables),
+		RdbPendingCompaction:          metric.NewGauge(metaRdbPendingCompaction),
+		RdbMarkedForCompactionFiles:   metric.NewGauge(metaRdbMarkedForCompactionFiles),
+		RdbKeysRangeKeySets:           metric.NewGauge(metaRdbKeysRangeKeySets),
+		RdbKeysTombstones:             metric.NewGauge(metaRdbKeysTombstones),
+		RdbL0BytesFlushed:             metric.NewGauge(metaRdbL0BytesFlushed),
+		RdbL0Sublevels:                metric.NewGauge(metaRdbL0Sublevels),
+		RdbL0NumFiles:                 metric.NewGauge(metaRdbL0NumFiles),
+		RdbBytesIngested:              rdbBytesIngested,
+		RdbLevelSize:                  rdbLevelSize,
+		RdbLevelScore:                 rdbLevelScore,
+		RdbWriteStalls:                metric.NewGauge(metaRdbWriteStalls),
+		RdbWriteStallNanos:            metric.NewGauge(metaRdbWriteStallNanos),
+		IterBlockBytes:                metric.NewGauge(metaBlockBytes),
+		IterBlockBytesInCache:         metric.NewGauge(metaBlockBytesInCache),
+		IterBlockReadDuration:         metric.NewGauge(metaBlockReadDuration),
+		IterExternalSeeks:             metric.NewGauge(metaIterExternalSeeks),
+		IterExternalSteps:             metric.NewGauge(metaIterExternalSteps),
+		IterInternalSeeks:             metric.NewGauge(metaIterInternalSeeks),
+		IterInternalSteps:             metric.NewGauge(metaIterInternalSteps),
+		SharedStorageBytesRead:        metric.NewGauge(metaSharedStorageBytesRead),
+		SharedStorageBytesWritten:     metric.NewGauge(metaSharedStorageBytesWritten),
+		StorageCompactionsPinnedKeys:  metric.NewGauge(metaStorageCompactionsKeysPinnedCount),
+		StorageCompactionsPinnedBytes: metric.NewGauge(metaStorageCompactionsKeysPinnedBytes),
+		StorageCompactionsDuration:    metric.NewGauge(metaStorageCompactionsDuration),
+		FlushableIngestCount:          metric.NewGauge(metaFlushableIngestCount),
+		FlushableIngestTableCount:     metric.NewGauge(metaFlushableIngestTableCount),
+		FlushableIngestTableSize:      metric.NewGauge(metaFlushableIngestTableBytes),
+		BatchCommitCount:              metric.NewGauge(metaBatchCommitCount),
+		BatchCommitDuration:           metric.NewGauge(metaBatchCommitDuration),
+		BatchCommitSemWaitDuration:    metric.NewGauge(metaBatchCommitSemWaitDuration),
+		BatchCommitWALQWaitDuration:   metric.NewGauge(metaBatchCommitWALQWaitDuration),
+		BatchCommitMemStallDuration:   metric.NewGauge(metaBatchCommitMemStallDuration),
+		BatchCommitL0StallDuration:    metric.NewGauge(metaBatchCommitL0StallDuration),
+		BatchCommitWALRotWaitDuration: metric.NewGauge(metaBatchCommitWALRotDuration),
+		BatchCommitCommitWaitDuration: metric.NewGauge(metaBatchCommitCommitWaitDuration),
+		WALBytesWritten:               metric.NewGauge(metaWALBytesWritten),
+		WALBytesIn:                    metric.NewGauge(metaWALBytesIn),
+
+		// Ingestion metrics
+		IngestCount: metric.NewGauge(metaIngestCount),
 
 		RdbCheckpoints: metric.NewGauge(metaRdbCheckpoints),
 
@@ -2426,61 +2990,80 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeSnapshotRecoverySentBytes:               metric.NewCounter(metaRangeSnapshotRecoverySentBytes),
 		RangeSnapshotRebalancingRcvdBytes:            metric.NewCounter(metaRangeSnapshotRebalancingRcvdBytes),
 		RangeSnapshotRebalancingSentBytes:            metric.NewCounter(metaRangeSnapshotRebalancingSentBytes),
+		RangeSnapshotRecvFailed:                      metric.NewCounter(metaRangeSnapshotRecvFailed),
+		RangeSnapshotRecvUnusable:                    metric.NewCounter(metaRangeSnapshotRecvUnusable),
+		RangeSnapShotCrossRegionSentBytes:            metric.NewCounter(metaRangeSnapShotCrossRegionSentBytes),
+		RangeSnapShotCrossRegionRcvdBytes:            metric.NewCounter(metaRangeSnapShotCrossRegionRcvdBytes),
+		RangeSnapShotCrossZoneSentBytes:              metric.NewCounter(metaRangeSnapShotCrossZoneSentBytes),
+		RangeSnapShotCrossZoneRcvdBytes:              metric.NewCounter(metaRangeSnapShotCrossZoneRcvdBytes),
 		RangeSnapshotSendQueueLength:                 metric.NewGauge(metaRangeSnapshotSendQueueLength),
 		RangeSnapshotRecvQueueLength:                 metric.NewGauge(metaRangeSnapshotRecvQueueLength),
 		RangeSnapshotSendInProgress:                  metric.NewGauge(metaRangeSnapshotSendInProgress),
 		RangeSnapshotRecvInProgress:                  metric.NewGauge(metaRangeSnapshotRecvInProgress),
 		RangeSnapshotSendTotalInProgress:             metric.NewGauge(metaRangeSnapshotSendTotalInProgress),
 		RangeSnapshotRecvTotalInProgress:             metric.NewGauge(metaRangeSnapshotRecvTotalInProgress),
+		RangeSnapshotSendQueueSize:                   metric.NewGauge(metaRangeSnapshotSendQueueSize),
+		RangeSnapshotRecvQueueSize:                   metric.NewGauge(metaRangeSnapshotRecvQueueSize),
 		RangeRaftLeaderTransfers:                     metric.NewCounter(metaRangeRaftLeaderTransfers),
+		RangeRaftLeaderRemovals:                      metric.NewCounter(metaRangeRaftLeaderRemovals),
 		RangeLossOfQuorumRecoveries:                  metric.NewCounter(metaRangeLossOfQuorumRecoveries),
 		DelegateSnapshotSendBytes:                    metric.NewCounter(metaDelegateSnapshotSendBytes),
 		DelegateSnapshotSuccesses:                    metric.NewCounter(metaDelegateSnapshotSuccesses),
 		DelegateSnapshotFailures:                     metric.NewCounter(metaDelegateSnapshotFailures),
+		DelegateSnapshotInProgress:                   metric.NewGauge(metaDelegateSnapshotInProgress),
 
 		// Raft processing metrics.
-		RaftTicks: metric.NewCounter(metaRaftTicks),
+		RaftTicks:                  metric.NewCounter(metaRaftTicks),
+		RaftProposalsDropped:       metric.NewCounter(metaRaftProposalsDropped),
+		RaftProposalsDroppedLeader: metric.NewCounter(metaRaftProposalsDroppedLeader),
 		RaftQuotaPoolPercentUsed: metric.NewHistogram(metric.HistogramOptions{
-			Metadata: metaRaftQuotaPoolPercentUsed,
-			Duration: histogramWindow,
-			MaxVal:   100,
-			SigFigs:  1,
-			Buckets:  metric.Percent100Buckets,
+			Metadata:     metaRaftQuotaPoolPercentUsed,
+			Duration:     histogramWindow,
+			MaxVal:       100,
+			SigFigs:      1,
+			BucketConfig: metric.Percent100Buckets,
 		}),
 		RaftWorkingDurationNanos: metric.NewCounter(metaRaftWorkingDurationNanos),
 		RaftTickingDurationNanos: metric.NewCounter(metaRaftTickingDurationNanos),
 		RaftCommandsApplied:      metric.NewCounter(metaRaftCommandsApplied),
 		RaftLogCommitLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaRaftLogCommitLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaRaftLogCommitLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
 		RaftCommandCommitLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaRaftCommandCommitLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaRaftCommandCommitLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
 		RaftHandleReadyLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaRaftHandleReadyLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaRaftHandleReadyLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
 		RaftApplyCommittedLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaRaftApplyCommittedLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaRaftApplyCommittedLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
+		}),
+		RaftReplicationLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:         metric.HistogramModePrometheus,
+			Metadata:     metaRaftReplicationLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
 		RaftSchedulerLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaRaftSchedulerLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaRaftSchedulerLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
-		RaftTimeoutCampaign: metric.NewCounter(metaRaftTimeoutCampaign),
+		RaftTimeoutCampaign:  metric.NewCounter(metaRaftTimeoutCampaign),
+		RaftStorageReadBytes: metric.NewCounter(metaRaftStorageReadBytes),
 
 		// Raft message metrics.
 		RaftRcvdMessages: [maxRaftMsgType + 1]*metric.Counter{
@@ -2497,10 +3080,16 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 			raftpb.MsgTransferLeader: metric.NewCounter(metaRaftRcvdTransferLeader),
 			raftpb.MsgTimeoutNow:     metric.NewCounter(metaRaftRcvdTimeoutNow),
 		},
-		RaftRcvdDropped:      metric.NewCounter(metaRaftRcvdDropped),
-		RaftRcvdDroppedBytes: metric.NewCounter(metaRaftRcvdDroppedBytes),
-		RaftRcvdQueuedBytes:  metric.NewGauge(metaRaftRcvdQueuedBytes),
-		RaftRcvdSteppedBytes: metric.NewCounter(metaRaftRcvdSteppedBytes),
+		RaftRcvdDropped:          metric.NewCounter(metaRaftRcvdDropped),
+		RaftRcvdDroppedBytes:     metric.NewCounter(metaRaftRcvdDroppedBytes),
+		RaftRcvdQueuedBytes:      metric.NewGauge(metaRaftRcvdQueuedBytes),
+		RaftRcvdSteppedBytes:     metric.NewCounter(metaRaftRcvdSteppedBytes),
+		RaftRcvdBytes:            metric.NewCounter(metaRaftRcvdBytes),
+		RaftRcvdCrossRegionBytes: metric.NewCounter(metaRaftRcvdCrossRegionBytes),
+		RaftRcvdCrossZoneBytes:   metric.NewCounter(metaRaftRcvdCrossZoneBytes),
+		RaftSentBytes:            metric.NewCounter(metaRaftSentBytes),
+		RaftSentCrossRegionBytes: metric.NewCounter(metaRaftSentCrossRegionBytes),
+		RaftSentCrossZoneBytes:   metric.NewCounter(metaRaftSentCrossZoneBytes),
 
 		// Raft log metrics.
 		RaftLogFollowerBehindCount: metric.NewGauge(metaRaftLogFollowerBehindCount),
@@ -2515,6 +3104,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftCoalescedHeartbeatsPending: metric.NewGauge(metaRaftCoalescedHeartbeatsPending),
 
 		// Replica queue metrics.
+		StoreFailures:                             metric.NewCounter(metaStoreFailures),
 		MVCCGCQueueSuccesses:                      metric.NewCounter(metaMVCCGCQueueSuccesses),
 		MVCCGCQueueFailures:                       metric.NewCounter(metaMVCCGCQueueFailures),
 		MVCCGCQueuePending:                        metric.NewGauge(metaMVCCGCQueuePending),
@@ -2621,19 +3211,23 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 
 		// Replica batch evaluation.
 		ReplicaReadBatchEvaluationLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaReplicaReadBatchEvaluationLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaReplicaReadBatchEvaluationLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
 		ReplicaWriteBatchEvaluationLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaReplicaWriteBatchEvaluationLatency,
-			Duration: histogramWindow,
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaReplicaWriteBatchEvaluationLatency,
+			Duration:     histogramWindow,
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
 		FlushUtilization: metric.NewGaugeFloat64(metaStorageFlushUtilization),
-		FsyncLatency:     metric.NewManualWindowHistogram(metaStorageFsyncLatency, pebble.FsyncLatencyBuckets),
+		FsyncLatency: metric.NewManualWindowHistogram(
+			metaStorageFsyncLatency,
+			pebble.FsyncLatencyBuckets,
+			false, /* withRotate */
+		),
 
 		ReplicaReadBatchDroppedLatchesBeforeEval: metric.NewCounter(metaReplicaReadBatchDroppedLatchesBeforeEval),
 		ReplicaReadBatchWithoutInterleavingIter:  metric.NewCounter(metaReplicaReadBatchWithoutInterleavingIter),
@@ -2704,10 +3298,6 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.RdbBlockCacheHits.Update(m.BlockCache.Hits)
 	sm.RdbBlockCacheMisses.Update(m.BlockCache.Misses)
 	sm.RdbBlockCacheUsage.Update(m.BlockCache.Size)
-	// TODO(jackson): Delete RdbBlockCachePinnedUsage or calculate the
-	// equivalent (the sum of IteratorMetrics.ReadAmp for all open iterator,
-	// times the block size).
-	sm.RdbBlockCachePinnedUsage.Update(0)
 	sm.RdbBloomFilterPrefixUseful.Update(m.Filter.Hits)
 	sm.RdbBloomFilterPrefixChecked.Update(m.Filter.Hits + m.Filter.Misses)
 	sm.RdbMemtableTotalSize.Update(int64(m.MemTable.Size))
@@ -2729,11 +3319,36 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.RdbWriteStallNanos.Update(m.WriteStallDuration.Nanoseconds())
 	sm.DiskSlow.Update(m.DiskSlowCount)
 	sm.DiskStalled.Update(m.DiskStallCount)
+	sm.IterBlockBytes.Update(int64(m.Iterator.BlockBytes))
+	sm.IterBlockBytesInCache.Update(int64(m.Iterator.BlockBytesInCache))
+	sm.IterBlockReadDuration.Update(int64(m.Iterator.BlockReadDuration))
+	sm.IterExternalSeeks.Update(int64(m.Iterator.ExternalSeeks))
+	sm.IterExternalSteps.Update(int64(m.Iterator.ExternalSteps))
+	sm.IterInternalSeeks.Update(int64(m.Iterator.InternalSeeks))
+	sm.IterInternalSteps.Update(int64(m.Iterator.InternalSteps))
+	sm.StorageCompactionsPinnedKeys.Update(int64(m.Snapshots.PinnedKeys))
+	sm.StorageCompactionsPinnedBytes.Update(int64(m.Snapshots.PinnedSize))
+	sm.StorageCompactionsDuration.Update(int64(m.Compact.Duration))
 	sm.SharedStorageBytesRead.Update(m.SharedStorageReadBytes)
 	sm.SharedStorageBytesWritten.Update(m.SharedStorageWriteBytes)
 	sm.RdbL0Sublevels.Update(int64(m.Levels[0].Sublevels))
 	sm.RdbL0NumFiles.Update(m.Levels[0].NumFiles)
 	sm.RdbL0BytesFlushed.Update(int64(m.Levels[0].BytesFlushed))
+	sm.FlushableIngestCount.Update(int64(m.Flush.AsIngestCount))
+	sm.FlushableIngestTableCount.Update(int64(m.Flush.AsIngestTableCount))
+	sm.FlushableIngestTableSize.Update(int64(m.Flush.AsIngestBytes))
+	sm.IngestCount.Update(int64(m.Ingest.Count))
+	sm.WALBytesWritten.Update(int64(m.WAL.BytesWritten))
+	sm.WALBytesIn.Update(int64(m.WAL.BytesIn))
+	sm.BatchCommitCount.Update(int64(m.BatchCommitStats.Count))
+	sm.BatchCommitDuration.Update(int64(m.BatchCommitStats.TotalDuration))
+	sm.BatchCommitSemWaitDuration.Update(int64(m.BatchCommitStats.SemaphoreWaitDuration))
+	sm.BatchCommitWALQWaitDuration.Update(int64(m.BatchCommitStats.WALQueueWaitDuration))
+	sm.BatchCommitMemStallDuration.Update(int64(m.BatchCommitStats.MemTableWriteStallDuration))
+	sm.BatchCommitL0StallDuration.Update(int64(m.BatchCommitStats.L0ReadAmpWriteStallDuration))
+	sm.BatchCommitWALRotWaitDuration.Update(int64(m.BatchCommitStats.WALRotationDuration))
+	sm.BatchCommitCommitWaitDuration.Update(int64(m.BatchCommitStats.CommitWaitDuration))
+
 	// Update the maximum number of L0 sub-levels seen.
 	sm.l0SublevelsTracker.Lock()
 	sm.l0SublevelsTracker.swag.Record(timeutil.Now(), float64(m.Levels[0].Sublevels))
@@ -2745,6 +3360,81 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 		sm.RdbBytesIngested[level].Update(int64(stats.BytesIngested))
 		sm.RdbLevelSize[level].Update(stats.Size)
 		sm.RdbLevelScore[level].Update(stats.Score)
+	}
+}
+
+// updateCrossLocalityMetricsOnSnapshotSent updates cross-locality related store
+// metrics when outgoing snapshots are sent to the outgoingSnapshotStream. The
+// metrics being updated include 1. cross-region metrics, which monitor
+// activities across different regions, and 2. cross-zone metrics, which monitor
+// activities across different zones within the same region or in cases where
+// region tiers are not configured.
+func (sm *StoreMetrics) updateCrossLocalityMetricsOnSnapshotSent(
+	comparisonResult roachpb.LocalityComparisonType, inc int64,
+) {
+	switch comparisonResult {
+	case roachpb.LocalityComparisonType_CROSS_REGION:
+		sm.RangeSnapShotCrossRegionSentBytes.Inc(inc)
+	case roachpb.LocalityComparisonType_SAME_REGION_CROSS_ZONE:
+		sm.RangeSnapShotCrossZoneSentBytes.Inc(inc)
+	}
+}
+
+// updateCrossLocalityMetricsOnSnapshotRcvd updates cross-locality related store
+// metrics when receiving SnapshotRequests through streaming and constructing
+// incoming snapshots. The metrics being updated include 1. cross-region
+// metrics, which monitor activities across different regions, and 2. cross-zone
+// metrics, which monitor activities across different zones within the same
+// region or in cases where region tiers are not configured.
+func (sm *StoreMetrics) updateCrossLocalityMetricsOnSnapshotRcvd(
+	comparisonResult roachpb.LocalityComparisonType, inc int64,
+) {
+	switch comparisonResult {
+	case roachpb.LocalityComparisonType_CROSS_REGION:
+		sm.RangeSnapShotCrossRegionRcvdBytes.Inc(inc)
+	case roachpb.LocalityComparisonType_SAME_REGION_CROSS_ZONE:
+		sm.RangeSnapShotCrossZoneRcvdBytes.Inc(inc)
+	}
+}
+
+// updateCrossLocalityMetricsOnIncomingRaftMsg updates store metrics for raft
+// messages that have been received via HandleRaftRequest. In the cases of
+// messages containing heartbeats or heartbeat_resps, they capture the byte
+// count of requests with coalesced heartbeats before any uncoalescing happens.
+// The metrics being updated include 1. total byte count of messages received 2.
+// cross-region metrics, which monitor activities across different regions, and
+// 3. cross-zone metrics, which monitor activities across different zones within
+// the same region or in cases where region tiers are not configured.
+func (sm *StoreMetrics) updateCrossLocalityMetricsOnIncomingRaftMsg(
+	comparisonResult roachpb.LocalityComparisonType, msgSize int64,
+) {
+	sm.RaftRcvdBytes.Inc(msgSize)
+	switch comparisonResult {
+	case roachpb.LocalityComparisonType_CROSS_REGION:
+		sm.RaftRcvdCrossRegionBytes.Inc(msgSize)
+	case roachpb.LocalityComparisonType_SAME_REGION_CROSS_ZONE:
+		sm.RaftRcvdCrossZoneBytes.Inc(msgSize)
+	}
+}
+
+// updateCrossLocalityMetricsOnOutgoingRaftMsg updates store metrics for raft
+// messages that are about to be sent via raftSendQueue. In the cases of
+// messages containing heartbeats or heartbeat_resps, they capture the byte
+// count of requests with coalesced heartbeats. The metrics being updated
+// include 1. total byte count of messages sent 2. cross-region metrics, which
+// monitor activities across different regions, and 3. cross-zone metrics, which
+// monitor activities across different zones within the same region or in cases
+// where region tiers are not configured. Note that these metrics may include
+// messages that get dropped by `SendAsync` due to a full outgoing queue.
+func (sm *StoreMetrics) updateCrossLocalityMetricsOnOutgoingRaftMsg(
+	comparisonResult roachpb.LocalityComparisonType, msgSize int64,
+) {
+	sm.RaftSentBytes.Inc(msgSize)
+	switch comparisonResult {
+	case roachpb.LocalityComparisonType_CROSS_REGION:
+		sm.RaftSentCrossRegionBytes.Inc(msgSize)
+	case roachpb.LocalityComparisonType_SAME_REGION_CROSS_ZONE:
+		sm.RaftSentCrossZoneBytes.Inc(msgSize)
 	}
 }
 

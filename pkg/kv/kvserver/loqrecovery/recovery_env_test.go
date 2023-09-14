@@ -20,7 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
@@ -114,8 +116,8 @@ type testReplicaInfo struct {
 	Generation roachpb.RangeGeneration `yaml:"Generation,omitempty"`
 
 	// Raft state.
-	RangeAppliedIndex  uint64                        `yaml:"RangeAppliedIndex"`
-	RaftCommittedIndex uint64                        `yaml:"RaftCommittedIndex"`
+	RangeAppliedIndex  kvpb.RaftIndex                `yaml:"RangeAppliedIndex"`
+	RaftCommittedIndex kvpb.RaftIndex                `yaml:"RaftCommittedIndex"`
 	DescriptorUpdates  []testReplicaDescriptorChange `yaml:"DescriptorUpdates,flow,omitempty"`
 
 	// TODO(oleg): Add ability to have descriptor intents in the store for testing purposes
@@ -189,8 +191,11 @@ type localDataView struct {
 
 // testDescriptorData yaml optimized representation of RangeDescriptor
 type testDescriptorData struct {
-	RangeID    roachpb.RangeID         `yaml:"RangeID"`
-	StartKey   string                  `yaml:"StartKey"`
+	RangeID  roachpb.RangeID `yaml:"RangeID"`
+	StartKey string          `yaml:"StartKey"`
+	// EndKey is optional, it will be filled up with next descriptor's StartKey
+	// if omitted
+	EndKey     string                  `yaml:"EndKey"`
 	Replicas   []replicaDescriptorView `yaml:"Replicas,flow"`
 	Generation roachpb.RangeGeneration `yaml:"Generation,omitempty"`
 }
@@ -323,7 +328,7 @@ func (e *quorumRecoveryEnv) handleReplicationData(t *testing.T, d datadriven.Tes
 
 		eng := e.getOrCreateStore(ctx, t, replica.StoreID, replica.NodeID)
 		if err = storage.MVCCPutProto(
-			ctx, eng, nil, key, clock.Now(), hlc.ClockTimestamp{}, nil /* txn */, &desc,
+			ctx, eng, key, clock.Now(), &desc, storage.MVCCWriteOptions{},
 		); err != nil {
 			t.Fatalf("failed to write range descriptor into store: %v", err)
 		}
@@ -344,7 +349,7 @@ func (e *quorumRecoveryEnv) handleReplicationData(t *testing.T, d datadriven.Tes
 				t.Fatalf("failed to serialize metadata entry for raft log")
 			}
 			if err := eng.PutUnversioned(keys.RaftLogKey(replica.RangeID,
-				uint64(i)+hardState.Commit+1), value); err != nil {
+				kvpb.RaftIndex(uint64(i)+hardState.Commit+1)), value); err != nil {
 				t.Fatalf("failed to insert raft log entry into store: %s", err)
 			}
 		}
@@ -408,7 +413,7 @@ func buildReplicaDescriptorFromTestData(
 		LeaseAppliedIndex: 0,
 		Desc:              &desc,
 		Lease:             &lease,
-		TruncatedState: &roachpb.RaftTruncatedState{
+		TruncatedState: &kvserverpb.RaftTruncatedState{
 			Index: 1,
 			Term:  1,
 		},
@@ -421,11 +426,11 @@ func buildReplicaDescriptorFromTestData(
 	hardState := raftpb.HardState{
 		Term:   0,
 		Vote:   0,
-		Commit: replica.RaftCommittedIndex,
+		Commit: uint64(replica.RaftCommittedIndex),
 	}
 	var raftLog []enginepb.MVCCMetadata
 	for i, u := range replica.DescriptorUpdates {
-		entry := raftLogFromPendingDescriptorUpdate(t, replica, u, desc, uint64(i))
+		entry := raftLogFromPendingDescriptorUpdate(t, replica, u, desc, kvpb.RaftIndex(i))
 		raftLog = append(raftLog, enginepb.MVCCMetadata{RawBytes: entry.RawBytes})
 	}
 	return replicaID, key, desc, replicaState, hardState, raftLog
@@ -436,7 +441,7 @@ func raftLogFromPendingDescriptorUpdate(
 	replica testReplicaInfo,
 	update testReplicaDescriptorChange,
 	desc roachpb.RangeDescriptor,
-	entryIndex uint64,
+	entryIndex kvpb.RaftIndex,
 ) roachpb.Value {
 	// We mimic EndTxn messages with commit triggers here. We don't construct
 	// full batches with descriptor updates as we only need data that would be
@@ -483,11 +488,11 @@ func raftLogFromPendingDescriptorUpdate(
 	if err != nil {
 		t.Fatalf("failed to serialize raftCommand: %v", err)
 	}
-	data := raftlog.EncodeRaftCommand(
+	data := raftlog.EncodeCommandBytes(
 		raftlog.EntryEncodingStandardWithoutAC, kvserverbase.CmdIDKey(fmt.Sprintf("%08d", entryIndex)), out)
 	ent := raftpb.Entry{
 		Term:  1,
-		Index: replica.RaftCommittedIndex + entryIndex,
+		Index: uint64(replica.RaftCommittedIndex + entryIndex),
 		Type:  raftpb.EntryNormal,
 		Data:  data,
 	}
@@ -499,7 +504,7 @@ func raftLogFromPendingDescriptorUpdate(
 }
 
 func parsePrettyKey(t *testing.T, pretty string) roachpb.RKey {
-	scanner := keysutil.MakePrettyScanner(nil /* tableParser */)
+	scanner := keysutil.MakePrettyScanner(nil /* tableParser */, nil /* tenantParser */)
 	key, err := scanner.Scan(pretty)
 	if err != nil {
 		t.Fatalf("failed to parse key %s: %v", pretty, err)
@@ -533,10 +538,14 @@ func (e *quorumRecoveryEnv) handleDescriptorData(t *testing.T, d datadriven.Test
 		if gen == 0 {
 			gen = roachpb.RangeGeneration(maxReplicaID)
 		}
+		endKeyStr := testDesc.EndKey
+		if endKeyStr == "" {
+			endKeyStr = nextStartKey
+		}
 		return roachpb.RangeDescriptor{
 			RangeID:          testDesc.RangeID,
 			StartKey:         parsePrettyKey(t, testDesc.StartKey),
-			EndKey:           parsePrettyKey(t, nextStartKey),
+			EndKey:           parsePrettyKey(t, endKeyStr),
 			InternalReplicas: replicas,
 			Generation:       gen,
 			NextReplicaID:    maxReplicaID + 1,
@@ -559,10 +568,7 @@ func (e *quorumRecoveryEnv) handleDescriptorData(t *testing.T, d datadriven.Test
 func (e *quorumRecoveryEnv) handleMakePlan(t *testing.T, d datadriven.TestData) (string, error) {
 	stores := e.parseStoresArg(t, d, false /* defaultToAll */)
 	nodes := e.parseNodesArg(t, d)
-	plan, report, err := PlanReplicas(context.Background(), loqrecoverypb.ClusterReplicaInfo{
-		Descriptors: e.replicas.Descriptors,
-		LocalInfo:   e.replicas.LocalInfo,
-	}, stores, nodes, e.uuidGen)
+	plan, report, err := PlanReplicas(context.Background(), e.replicas, stores, nodes, e.uuidGen)
 	if err != nil {
 		return "", err
 	}
@@ -616,9 +622,13 @@ func (e *quorumRecoveryEnv) getOrCreateStore(
 			StoreID:   storeID,
 		}
 		if err = storage.MVCCPutProto(
-			context.Background(), eng, nil, keys.StoreIdentKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &sIdent,
+			context.Background(), eng, keys.StoreIdentKey(), hlc.Timestamp{}, &sIdent, storage.MVCCWriteOptions{},
 		); err != nil {
 			t.Fatalf("failed to populate test store ident: %v", err)
+		}
+		v := clusterversion.ByKey(clusterversion.BinaryVersionKey)
+		if err := kvstorage.WriteClusterVersionToEngines(ctx, []storage.Engine{eng}, clusterversion.ClusterVersion{Version: v}); err != nil {
+			t.Fatalf("failed to populate test store cluster version: %v", err)
 		}
 		wrapped.engine = eng
 		wrapped.nodeID = nodeID
@@ -643,6 +653,12 @@ func (e *quorumRecoveryEnv) handleCollectReplicas(
 		if err = e.replicas.Merge(info); err != nil {
 			return "", err
 		}
+	}
+	if len(e.replicas.LocalInfo) == 0 {
+		// This is unrealistic as we don't have metadata. We need to fake it here
+		// to pass planner checks.
+		e.replicas.ClusterID = e.clusterID.String()
+		e.replicas.Version = clusterversion.ByKey(clusterversion.BinaryVersionKey)
 	}
 	e.replicas.Descriptors = e.meta
 	return "ok", nil

@@ -9,7 +9,7 @@
 // licenses/APL.txt.
 
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { fetchData } from "src/api";
+import { fetchData } from "src/api/fetchData";
 import {
   FixFingerprintHexValue,
   HexStringToInt64String,
@@ -18,11 +18,14 @@ import {
   stringToTimestamp,
 } from "src/util";
 import Long from "long";
-import { AggregateStatistics } from "../statementsTable";
-const STATEMENTS_PATH = "/_status/statements";
-const STATEMENT_DETAILS_PATH = "/_status/stmtdetails";
+import moment from "moment-timezone";
 
-export type StatementsRequest = cockroach.server.serverpb.StatementsRequest;
+import { AggregateStatistics } from "../statementsTable";
+const STATEMENTS_PATH = "_status/combinedstmts";
+const STATEMENT_DETAILS_PATH = "_status/stmtdetails";
+
+export type StatementsRequest =
+  cockroach.server.serverpb.CombinedStatementsStatsRequest;
 export type StatementDetailsRequest =
   cockroach.server.serverpb.StatementDetailsRequest;
 export type StatementDetailsResponse =
@@ -31,25 +34,85 @@ export type StatementDetailsResponseWithKey = {
   stmtResponse: StatementDetailsResponse;
   key: string;
 };
+
+export type SqlStatsResponse = cockroach.server.serverpb.IStatementsResponse;
+export const SqlStatsSortOptions = cockroach.server.serverpb.StatsSortOptions;
+export type SqlStatsSortType = cockroach.server.serverpb.StatsSortOptions;
+
+const FetchStatsMode =
+  cockroach.server.serverpb.CombinedStatementsStatsRequest.StatsType;
+
 export type ErrorWithKey = {
   err: Error;
   key: string;
 };
 
+export const DEFAULT_STATS_REQ_OPTIONS = {
+  limit: 100,
+  sortStmt: SqlStatsSortOptions.PCT_RUNTIME,
+  sortTxn: SqlStatsSortOptions.SERVICE_LAT,
+};
+
+// The required fields to create a stmts request.
+type StmtReqFields = {
+  limit: number;
+  sort: SqlStatsSortType;
+  start: moment.Moment;
+  end: moment.Moment;
+};
+
+export function createCombinedStmtsRequest({
+  limit,
+  sort,
+  start,
+  end,
+}: StmtReqFields): StatementsRequest {
+  return new cockroach.server.serverpb.CombinedStatementsStatsRequest({
+    start: Long.fromNumber(start.unix()),
+    end: Long.fromNumber(end.unix()),
+    limit: Long.fromNumber(limit ?? DEFAULT_STATS_REQ_OPTIONS.limit),
+    fetch_mode:
+      new cockroach.server.serverpb.CombinedStatementsStatsRequest.FetchMode({
+        sort: sort,
+      }),
+  });
+}
+
 export const getCombinedStatements = (
   req: StatementsRequest,
-): Promise<cockroach.server.serverpb.StatementsResponse> => {
+): Promise<SqlStatsResponse> => {
   const queryStr = propsToQueryString({
     start: req.start.toInt(),
     end: req.end.toInt(),
-    combined: req.combined,
+    "fetch_mode.stats_type": FetchStatsMode.StmtStatsOnly,
+    "fetch_mode.sort": req.fetch_mode?.sort,
+    limit: req.limit?.toInt() ?? DEFAULT_STATS_REQ_OPTIONS.limit,
   });
   return fetchData(
     cockroach.server.serverpb.StatementsResponse,
     `${STATEMENTS_PATH}?${queryStr}`,
     null,
     null,
-    "30M",
+    "10M",
+  );
+};
+
+export const getFlushedTxnStatsApi = (
+  req: StatementsRequest,
+): Promise<SqlStatsResponse> => {
+  const queryStr = propsToQueryString({
+    start: req.start?.toInt(),
+    end: req.end?.toInt(),
+    "fetch_mode.stats_type": FetchStatsMode.TxnStatsOnly,
+    "fetch_mode.sort": req.fetch_mode?.sort,
+    limit: req.limit?.toInt() ?? DEFAULT_STATS_REQ_OPTIONS.limit,
+  });
+  return fetchData(
+    cockroach.server.serverpb.StatementsResponse,
+    `${STATEMENTS_PATH}?${queryStr}`,
+    null,
+    null,
+    "10M",
   );
 };
 
@@ -80,8 +143,16 @@ export type StatementMetadata = {
   implicitTxn: boolean;
   query: string;
   querySummary: string;
-  stmtTyp: string;
+  stmtType: string;
   vec: boolean;
+};
+
+type LatencyInfo = {
+  max: number;
+  min: number;
+  p50: number;
+  p90: number;
+  p99: number;
 };
 
 type Statistics = {
@@ -90,7 +161,9 @@ type Statistics = {
   firstAttemptCnt: Long;
   idleLat: NumericStat;
   indexes: string[];
+  lastErrorCode: string;
   lastExecAt: string;
+  latencyInfo: LatencyInfo;
   maxRetries: Long;
   nodes: Long[];
   numRows: NumericStat;
@@ -163,9 +236,17 @@ export function convertStatementRawFormatToAggregatedStatistics(
       idle_lat: s.statistics.statistics.idleLat,
       index_recommendations: s.statistics.index_recommendations,
       indexes: s.statistics.statistics.indexes,
+      last_error_code: s.statistics.statistics.lastErrorCode,
       last_exec_timestamp: stringToTimestamp(
         s.statistics.statistics.lastExecAt,
       ),
+      latency_info: {
+        max: s.statistics.statistics.latencyInfo.max,
+        min: s.statistics.statistics.latencyInfo.min,
+        p50: s.statistics.statistics.latencyInfo.p50,
+        p90: s.statistics.statistics.latencyInfo.p90,
+        p99: s.statistics.statistics.latencyInfo.p99,
+      },
       max_retries: s.statistics.statistics.maxRetries,
       nodes: s.statistics.statistics.nodes,
       num_rows: s.statistics.statistics.numRows,
@@ -177,7 +258,7 @@ export function convertStatementRawFormatToAggregatedStatistics(
       rows_written: s.statistics.statistics.rowsWritten,
       run_lat: s.statistics.statistics.runLat,
       service_lat: s.statistics.statistics.svcLat,
-      sql_type: s.metadata.stmtTyp,
+      sql_type: s.metadata.stmtType,
     },
   };
 }

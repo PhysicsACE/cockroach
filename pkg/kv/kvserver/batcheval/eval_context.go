@@ -62,9 +62,9 @@ type EvalContext interface {
 	GetNodeLocality() roachpb.Locality
 
 	IsFirstRange() bool
-	GetFirstIndex() uint64
-	GetTerm(uint64) (uint64, error)
-	GetLeaseAppliedIndex() uint64
+	GetFirstIndex() kvpb.RaftIndex
+	GetTerm(index kvpb.RaftIndex) (kvpb.RaftTerm, error)
+	GetLeaseAppliedIndex() kvpb.LeaseAppliedIndex
 
 	Desc() *roachpb.RangeDescriptor
 	ContainsKey(key roachpb.Key) bool
@@ -172,7 +172,8 @@ type MockEvalCtx struct {
 	CPU                  float64
 	AbortSpan            *abortspan.AbortSpan
 	GCThreshold          hlc.Timestamp
-	Term, FirstIndex     uint64
+	Term                 kvpb.RaftTerm
+	FirstIndex           kvpb.RaftIndex
 	CanCreateTxnRecordFn func() (bool, kvpb.TransactionAbortedReason)
 	MinTxnCommitTSFn     func() hlc.Timestamp
 	Lease                roachpb.Lease
@@ -181,6 +182,7 @@ type MockEvalCtx struct {
 	RevokedLeaseSeq      roachpb.LeaseSequence
 	MaxBytes             int64
 	ApproxDiskBytes      uint64
+	EvalKnobs            kvserverbase.BatchEvalTestingKnobs
 }
 
 // EvalContext returns the MockEvalCtx as an EvalContext. It will reflect future
@@ -202,7 +204,7 @@ func (m *mockEvalCtxImpl) ClusterSettings() *cluster.Settings {
 	return m.MockEvalCtx.ClusterSettings
 }
 func (m *mockEvalCtxImpl) EvalKnobs() kvserverbase.BatchEvalTestingKnobs {
-	return kvserverbase.BatchEvalTestingKnobs{}
+	return m.MockEvalCtx.EvalKnobs
 }
 func (m *mockEvalCtxImpl) Clock() *hlc.Clock {
 	return m.MockEvalCtx.Clock
@@ -228,13 +230,13 @@ func (m *mockEvalCtxImpl) GetRangeID() roachpb.RangeID {
 func (m *mockEvalCtxImpl) IsFirstRange() bool {
 	panic("unimplemented")
 }
-func (m *mockEvalCtxImpl) GetFirstIndex() uint64 {
+func (m *mockEvalCtxImpl) GetFirstIndex() kvpb.RaftIndex {
 	return m.FirstIndex
 }
-func (m *mockEvalCtxImpl) GetTerm(uint64) (uint64, error) {
+func (m *mockEvalCtxImpl) GetTerm(kvpb.RaftIndex) (kvpb.RaftTerm, error) {
 	return m.Term, nil
 }
-func (m *mockEvalCtxImpl) GetLeaseAppliedIndex() uint64 {
+func (m *mockEvalCtxImpl) GetLeaseAppliedIndex() kvpb.LeaseAppliedIndex {
 	panic("unimplemented")
 }
 func (m *mockEvalCtxImpl) Desc() *roachpb.RangeDescriptor {

@@ -82,24 +82,36 @@ func newRemoteSession(l *logger.Logger, command *remoteCommand) *remoteSession {
 			debugName = GenFilenameFromArgs(20, command.cmd)
 		}
 
-		cl, err := l.ChildLogger(filepath.Join("ssh", fmt.Sprintf(
-			"ssh_%s_n%v_%s",
-			timeutil.Now().Format(`150405.000000000`),
-			command.node,
-			debugName,
-		)))
-
-		// Check the logger file since running roachprod from the cli will result in a fileless logger.
-		if err == nil && l.File != nil {
-			logfile = cl.File.Name()
-			loggingArgs = []string{
-				"-vvv", "-E", logfile,
+		// Check the logger file since running roachprod from the cli will
+		// result in a fileless logger.
+		if l.File != nil {
+			// We use the logger instance as a proxy to the artifacts dir in
+			// a roachtest run. The RootLogger's directory will be the root
+			// of the artifacts directory, which ensures that every ssh_*
+			// file ends up in the same location.
+			artifactsLogger := l
+			if rl := l.RootLogger(); rl.File != nil {
+				artifactsLogger = rl
 			}
-			cl.Close()
+			cl, err := artifactsLogger.ChildLogger(filepath.Join("ssh", fmt.Sprintf(
+				"ssh_%s_n%v_%s",
+				timeutil.Now().Format(`150405.000000000`),
+				command.node,
+				debugName,
+			)))
+
+			if err == nil {
+				logfile = cl.File.Name()
+				loggingArgs = []string{
+					"-vvv", "-E", logfile,
+				}
+				cl.Close()
+			} else {
+				l.Printf("could not create child logger: %v", err)
+			}
 		}
 	}
 
-	//const logfile = ""
 	args := []string{
 		command.user + "@" + command.host,
 
@@ -124,8 +136,11 @@ func newRemoteSession(l *logger.Logger, command *remoteCommand) *remoteSession {
 }
 
 func (s *remoteSession) errWithDebug(err error) error {
-	if err != nil && s.logfile != "" {
-		err = errors.Wrapf(err, "ssh verbose log retained in %s", filepath.Base(s.logfile))
+	err = rperrors.ClassifyCmdError(err)
+	// The verbose logs are noisy and not useful for most errors, so only
+	// retain them for potential flakes.
+	if errors.Is(err, rperrors.ErrSSH255) && s.logfile != "" {
+		err = errors.Wrap(err, "_potential_ SSH flake (`ssh -vvv` log retained under ssh/)")
 		s.logfile = "" // prevent removal on close
 	}
 	return err
@@ -147,7 +162,7 @@ func (s *remoteSession) CombinedOutput(ctx context.Context) ([]byte, error) {
 		s.Close()
 		return nil, ctx.Err()
 	case <-commandFinished:
-		return b, rperrors.ClassifyCmdError(err)
+		return b, err
 	}
 }
 
@@ -164,12 +179,12 @@ func (s *remoteSession) Run(ctx context.Context) error {
 		s.Close()
 		return ctx.Err()
 	case <-commandFinished:
-		return rperrors.ClassifyCmdError(err)
+		return err
 	}
 }
 
 func (s *remoteSession) Start() error {
-	return rperrors.ClassifyCmdError(s.errWithDebug(s.Cmd.Start()))
+	return s.errWithDebug(s.Cmd.Start())
 }
 
 func (s *remoteSession) SetStdin(r io.Reader) {

@@ -12,6 +12,7 @@ package spanstatsconsumer
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvissettings"
@@ -64,8 +65,7 @@ func (s *SpanStatsConsumer) UpdateBoundaries(ctx context.Context) error {
 func (s *SpanStatsConsumer) GetSamples(ctx context.Context) error {
 	mostRecentSampleTime, err := keyvisstorage.MostRecentSampleTime(ctx, s.ie)
 	if err != nil {
-		panic(errors.NewAssertionErrorWithWrappedErrf(
-			err, "read most recent sample time failed"))
+		return err
 	}
 
 	samplesRes, err := s.kvAccessor.GetSamples(ctx, mostRecentSampleTime)
@@ -73,17 +73,37 @@ func (s *SpanStatsConsumer) GetSamples(ctx context.Context) error {
 		return err
 	}
 
-	maxBuckets := keyvissettings.MaxBuckets.Get(&s.settings.SV)
-	for i, sample := range samplesRes.Samples {
-		samplesRes.Samples[i].SpanStats = downsample(sample.SpanStats, int(maxBuckets))
+	return keyvisstorage.WriteSamples(ctx, s.ie, samplesRes.Samples)
+}
+
+// maybeAggregateBoundaries aggregates boundaries if len(boundaries) <= max.
+func maybeAggregateBoundaries(boundaries []roachpb.Span, max int) ([]roachpb.Span, error) {
+	if len(boundaries) <= max {
+		return boundaries, nil
 	}
 
-	if err := keyvisstorage.WriteSamples(ctx, s.ie, samplesRes.Samples); err != nil {
-		panic(errors.NewAssertionErrorWithWrappedErrf(
-			err, "write samples failed"))
-	}
+	// combineFactor is the factor that the length of the boundaries slice is reduced by. For example,
+	// if len(boundaries) == 1000, and max == 100, combineFactor == 10.
+	// if len(boundaries) == 1001, and max == 100, combineFactor == 11.
+	combineFactor := int(math.Ceil(float64(len(boundaries)) / float64(max)))
+	combinedLength := int(math.Ceil(float64(len(boundaries)) / float64(combineFactor)))
+	combined := make([]roachpb.Span, combinedLength)
 
-	return nil
+	// Iterate through boundaries, incrementing by combineFactor.
+	for i := 0; i < combinedLength; i++ {
+		startIdx := i * combineFactor
+		if startIdx >= len(boundaries) {
+			return nil, errors.New("could not aggregate boundaries")
+		}
+		startSpan := boundaries[startIdx]
+		endIndex := startIdx + combineFactor - 1
+		if endIndex >= len(boundaries) {
+			combined[i] = startSpan
+		} else {
+			combined[i] = startSpan.Combine(boundaries[endIndex])
+		}
+	}
+	return combined, nil
 }
 
 // decideBoundaries decides the key spans that we want statistics
@@ -116,15 +136,12 @@ func (s *SpanStatsConsumer) decideBoundaries(ctx context.Context) ([]roachpb.Spa
 		s.ri.Next(ctx)
 	}
 
-	return boundaries, nil
+	maxBuckets := keyvissettings.MaxBuckets.Get(&s.settings.SV)
+	return maybeAggregateBoundaries(boundaries, int(maxBuckets))
 }
 
 // DeleteExpiredSamples deletes historical samples older than 2 weeks.
 func (s *SpanStatsConsumer) DeleteExpiredSamples(ctx context.Context) error {
-	twoWeeksAgo := timeutil.Now().AddDate(0, 0, -14)
-	if err := keyvisstorage.DeleteSamplesBeforeTime(ctx, s.ie, twoWeeksAgo); err != nil {
-		panic(errors.NewAssertionErrorWithWrappedErrf(
-			err, "delete expired samples failed"))
-	}
-	return nil
+	oneWeekAgo := timeutil.Now().AddDate(0, 0, -7)
+	return keyvisstorage.DeleteSamplesBeforeTime(ctx, s.ie, oneWeekAgo)
 }

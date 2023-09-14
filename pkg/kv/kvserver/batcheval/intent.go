@@ -55,7 +55,7 @@ func CollectIntentRows(
 	for i := range intents {
 		kv, err := readProvisionalVal(ctx, reader, usePrefixIter, &intents[i])
 		if err != nil {
-			if errors.HasType(err, (*kvpb.WriteIntentError)(nil)) ||
+			if errors.HasType(err, (*kvpb.LockConflictError)(nil)) ||
 				errors.HasType(err, (*kvpb.ReadWithinUncertaintyIntervalError)(nil)) {
 				log.Fatalf(ctx, "unexpected %T in CollectIntentRows: %+v", err, err)
 			}
@@ -109,6 +109,7 @@ func readProvisionalVal(
 func acquireUnreplicatedLocksOnKeys(
 	res *result.Result,
 	txn *roachpb.Transaction,
+	str lock.Strength,
 	scanFmt kvpb.ScanFormat,
 	scanRes *storage.MVCCScanResult,
 ) error {
@@ -117,13 +118,13 @@ func acquireUnreplicatedLocksOnKeys(
 	case kvpb.BATCH_RESPONSE:
 		var i int
 		return storage.MVCCScanDecodeKeyValues(scanRes.KVData, func(key storage.MVCCKey, _ []byte) error {
-			res.Local.AcquiredLocks[i] = roachpb.MakeLockAcquisition(txn, copyKey(key.Key), lock.Unreplicated)
+			res.Local.AcquiredLocks[i] = roachpb.MakeLockAcquisition(txn, copyKey(key.Key), lock.Unreplicated, str)
 			i++
 			return nil
 		})
 	case kvpb.KEY_VALUES:
 		for i, row := range scanRes.KVs {
-			res.Local.AcquiredLocks[i] = roachpb.MakeLockAcquisition(txn, copyKey(row.Key), lock.Unreplicated)
+			res.Local.AcquiredLocks[i] = roachpb.MakeLockAcquisition(txn, copyKey(row.Key), lock.Unreplicated, str)
 		}
 		return nil
 	case kvpb.COL_BATCH_RESPONSE:

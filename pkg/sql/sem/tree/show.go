@@ -21,6 +21,7 @@ package tree
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/errors"
@@ -151,6 +152,7 @@ type ShowBackupOptions struct {
 	DecryptionKMSURI     StringOrPlaceholderOptList
 	EncryptionPassphrase Expr
 	Privileges           bool
+	SkipSize             bool
 
 	// EncryptionInfoDir is a hidden option used when the user wants to run the deprecated
 	//
@@ -220,11 +222,21 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("kms = ")
 		ctx.FormatNode(&o.DecryptionKMSURI)
 	}
+	if o.SkipSize {
+		maybeAddSep()
+		ctx.WriteString("skip size")
+	}
 	if o.DebugMetadataSST {
+		maybeAddSep()
 		ctx.WriteString("debug_dump_metadata_sst")
 	}
 
 	// The following are only used in connection-check SHOW.
+	if o.CheckConnectionConcurrency != nil {
+		maybeAddSep()
+		ctx.WriteString("CONCURRENTLY = ")
+		ctx.FormatNode(o.CheckConnectionConcurrency)
+	}
 	if o.CheckConnectionTransferSize != nil {
 		maybeAddSep()
 		ctx.WriteString("TRANSFER = ")
@@ -234,11 +246,6 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		maybeAddSep()
 		ctx.WriteString("TIME = ")
 		ctx.FormatNode(o.CheckConnectionDuration)
-	}
-	if o.CheckConnectionConcurrency != nil {
-		maybeAddSep()
-		ctx.WriteString("CONCURRENTLY = ")
-		ctx.FormatNode(o.CheckConnectionConcurrency)
 	}
 }
 
@@ -251,6 +258,7 @@ func (o ShowBackupOptions) IsDefault() bool {
 		cmp.Equal(o.DecryptionKMSURI, options.DecryptionKMSURI) &&
 		o.EncryptionPassphrase == options.EncryptionPassphrase &&
 		o.Privileges == options.Privileges &&
+		o.SkipSize == options.SkipSize &&
 		o.DebugMetadataSST == options.DebugMetadataSST &&
 		o.EncryptionInfoDir == options.EncryptionInfoDir &&
 		o.CheckConnectionTransferSize == options.CheckConnectionTransferSize &&
@@ -320,6 +328,10 @@ func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
 	if err != nil {
 		return err
 	}
+	o.SkipSize, err = combineBools(o.SkipSize, other.SkipSize, "skip size")
+	if err != nil {
+		return err
+	}
 	o.DebugMetadataSST, err = combineBools(o.DebugMetadataSST, other.DebugMetadataSST,
 		"debug_dump_metadata_sst")
 	if err != nil {
@@ -344,7 +356,7 @@ func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
 	}
 
 	o.CheckConnectionConcurrency, err = combineExpr(o.CheckConnectionConcurrency, other.CheckConnectionConcurrency,
-		"time")
+		"concurrently")
 	if err != nil {
 		return err
 	}
@@ -493,6 +505,9 @@ type ShowJobs struct {
 	// If non-nil, only display jobs started by the specified
 	// schedules.
 	Schedules *Select
+
+	// Options contain any options that were specified in the `SHOW JOB` query.
+	Options *ShowJobOptions
 }
 
 // Format implements the NodeFormatter interface.
@@ -513,7 +528,32 @@ func (node *ShowJobs) Format(ctx *FmtCtx) {
 		ctx.WriteString(" FOR SCHEDULES ")
 		ctx.FormatNode(node.Schedules)
 	}
+	if node.Options != nil {
+		ctx.WriteString(" WITH")
+		ctx.FormatNode(node.Options)
+	}
 }
+
+// ShowJobOptions describes options for the SHOW JOB execution.
+type ShowJobOptions struct {
+	// ExecutionDetails, if true, will render job specific details about the job's
+	// execution. These details will provide improved observability into the
+	// execution of the job.
+	ExecutionDetails bool
+}
+
+func (s *ShowJobOptions) Format(ctx *FmtCtx) {
+	if s.ExecutionDetails {
+		ctx.WriteString(" EXECUTION DETAILS")
+	}
+}
+
+func (s *ShowJobOptions) CombineWith(other *ShowJobOptions) error {
+	s.ExecutionDetails = other.ExecutionDetails
+	return nil
+}
+
+var _ NodeFormatter = &ShowJobOptions{}
 
 // ShowChangefeedJobs represents a SHOW CHANGEFEED JOBS statement
 type ShowChangefeedJobs struct {
@@ -530,7 +570,7 @@ func (node *ShowChangefeedJobs) Format(ctx *FmtCtx) {
 	}
 }
 
-// ShowSurvivalGoal represents a SHOW REGIONS statement
+// ShowSurvivalGoal represents a SHOW SURVIVAL GOAL statement
 type ShowSurvivalGoal struct {
 	DatabaseName Name
 }
@@ -768,10 +808,18 @@ const (
 	ShowCreateModeSecondaryIndexes
 )
 
+type ShowCreateFormatOption int
+
+const (
+	ShowCreateFormatOptionNone ShowCreateFormatOption = iota
+	ShowCreateFormatOptionRedactedValues
+)
+
 // ShowCreate represents a SHOW CREATE statement.
 type ShowCreate struct {
-	Mode ShowCreateMode
-	Name *UnresolvedObjectName
+	Mode   ShowCreateMode
+	Name   *UnresolvedObjectName
+	FmtOpt ShowCreateFormatOption
 }
 
 // Format implements the NodeFormatter interface.
@@ -787,6 +835,11 @@ func (node *ShowCreate) Format(ctx *FmtCtx) {
 		ctx.WriteString("SECONDARY INDEXES FROM ")
 	}
 	ctx.FormatNode(node.Name)
+
+	switch node.FmtOpt {
+	case ShowCreateFormatOptionRedactedValues:
+		ctx.WriteString(" WITH REDACT")
+	}
 }
 
 // ShowCreateAllSchemas represents a SHOW CREATE ALL SCHEMAS statement.
@@ -1072,18 +1125,19 @@ func (node *ShowTableStats) Format(ctx *FmtCtx) {
 	ctx.WriteString("FOR TABLE ")
 	ctx.FormatNode(node.Table)
 	if len(node.Options) > 0 {
-		ctx.WriteString(" WITH ")
+		ctx.WriteString(" WITH OPTIONS (")
 		ctx.FormatNode(&node.Options)
+		ctx.WriteString(")")
 	}
 }
 
-// ShowTenantOptions represents the WITH clause in SHOW TENANT.
+// ShowTenantOptions represents the WITH clause in SHOW VIRTUAL CLUSTER.
 type ShowTenantOptions struct {
 	WithReplication  bool
 	WithCapabilities bool
 }
 
-// ShowTenant represents a SHOW TENANT statement.
+// ShowTenant represents a SHOW VIRTUAL CLUSTER statement.
 type ShowTenant struct {
 	TenantSpec *TenantSpec
 	ShowTenantOptions
@@ -1091,15 +1145,19 @@ type ShowTenant struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShowTenant) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW TENANT ")
+	ctx.WriteString("SHOW VIRTUAL CLUSTER ")
 	ctx.FormatNode(node.TenantSpec)
 
+	withs := []string{}
 	if node.WithReplication {
-		ctx.WriteString(" WITH REPLICATION STATUS")
+		withs = append(withs, "REPLICATION STATUS")
 	}
-
 	if node.WithCapabilities {
-		ctx.WriteString(" WITH CAPABILITIES")
+		withs = append(withs, "CAPABILITIES")
+	}
+	if len(withs) > 0 {
+		ctx.WriteString(" WITH ")
+		ctx.WriteString(strings.Join(withs, ", "))
 	}
 }
 
@@ -1265,6 +1323,7 @@ func (n *ShowSchedules) Format(ctx *FmtCtx) {
 type ShowDefaultPrivileges struct {
 	Roles       RoleSpecList
 	ForAllRoles bool
+	ForGrantee  bool
 	// If Schema is not specified, SHOW DEFAULT PRIVILEGES is being
 	// run on the current database.
 	Schema Name
@@ -1276,7 +1335,12 @@ var _ Statement = &ShowDefaultPrivileges{}
 func (n *ShowDefaultPrivileges) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW DEFAULT PRIVILEGES ")
 	if len(n.Roles) > 0 {
-		ctx.WriteString("FOR ROLE ")
+		if n.ForGrantee {
+			ctx.WriteString("FOR GRANTEE ")
+		} else {
+			ctx.WriteString("FOR ROLE ")
+		}
+
 		for i := range n.Roles {
 			if i > 0 {
 				ctx.WriteString(", ")

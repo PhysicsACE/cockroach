@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -11,11 +10,10 @@ go_library(
         "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/rpc",
+        "//pkg/util/circuit",
         "//pkg/util/log",
         "//pkg/util/stop",
-        "//pkg/util/syncutil",
         "//pkg/util/tracing",
-        "@com_github_cockroachdb_circuitbreaker//:circuitbreaker",
         "@com_github_cockroachdb_errors//:errors",
         "@org_golang_google_grpc//:go_default_library",
     ],
@@ -34,6 +32,7 @@ go_test(
         "//pkg/rpc",
         "//pkg/settings/cluster",
         "//pkg/testutils",
+        "//pkg/util/circuit",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
@@ -41,12 +40,10 @@ go_test(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
-        "@com_github_cockroachdb_circuitbreaker//:circuitbreaker",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_grpc//:go_default_library",
+        "@org_golang_google_grpc//codes",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -39,37 +39,37 @@ import (
 var (
 	MetaPreServeNewConns = metric.Metadata{
 		Name:        "sql.pre_serve.new_conns",
-		Help:        "Counter of the number of SQL connections created prior to routine the connection a specific tenant",
+		Help:        "Number of SQL connections created prior to routing the connection to the target SQL server",
 		Measurement: "Connections",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaPreServeBytesIn = metric.Metadata{
 		Name:        "sql.pre_serve.bytesin",
-		Help:        "Number of SQL bytes received prior to routing the connection to a specific tenant",
+		Help:        "Number of SQL bytes received prior to routing the connection to the target SQL server",
 		Measurement: "SQL Bytes",
 		Unit:        metric.Unit_BYTES,
 	}
 	MetaPreServeBytesOut = metric.Metadata{
 		Name:        "sql.pre_serve.bytesout",
-		Help:        "Number of SQL bytes sent prior to routing the connection to a specific tenant",
+		Help:        "Number of SQL bytes sent prior to routing the connection to the target SQL server",
 		Measurement: "SQL Bytes",
 		Unit:        metric.Unit_BYTES,
 	}
 	MetaPreServeConnFailures = metric.Metadata{
 		Name:        "sql.pre_serve.conn.failures",
-		Help:        "Number of SQL connection failures prior to routing the connection to a specific tenant",
+		Help:        "Number of SQL connection failures prior to routing the connection to the target SQL server",
 		Measurement: "Connections",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaPreServeMaxBytes = metric.Metadata{
 		Name:        "sql.pre_serve.mem.max",
-		Help:        "Memory usage for SQL connections prior to routing the connection to a specific tenant",
+		Help:        "Memory usage for SQL connections prior to routing the connection to the target SQL server",
 		Measurement: "Memory",
 		Unit:        metric.Unit_BYTES,
 	}
 	MetaPreServeCurBytes = metric.Metadata{
 		Name:        "sql.pre_serve.mem.cur",
-		Help:        "Current memory usage for SQL connections prior to routing the connection to a specific tenant",
+		Help:        "Current memory usage for SQL connections prior to routing the connection to the target SQL server",
 		Measurement: "Memory",
 		Unit:        metric.Unit_BYTES,
 	}
@@ -80,8 +80,8 @@ var (
 // tenant-independent, and thus cannot rely on tenant-specific connection
 // or state.
 type PreServeConnHandler struct {
-	errWriter                errWriter
 	cfg                      *base.Config
+	st                       *cluster.Settings
 	tenantIndependentMetrics tenantIndependentMetrics
 
 	getTLSConfig func() (*tls.Config, error)
@@ -137,11 +137,8 @@ func NewPreServeConnHandler(
 	ctx := ambientCtx.AnnotateCtx(context.Background())
 	metrics := makeTenantIndependentMetrics(histogramWindow)
 	s := PreServeConnHandler{
-		errWriter: errWriter{
-			sv:         &st.SV,
-			msgBuilder: newWriteBuffer(metrics.PreServeBytesOutCount),
-		},
 		cfg:                      cfg,
+		st:                       st,
 		acceptTenantName:         acceptTenantName,
 		tenantIndependentMetrics: metrics,
 		getTLSConfig:             getTLSConfig,
@@ -195,10 +192,10 @@ func makeTenantIndependentMetrics(histogramWindow time.Duration) tenantIndepende
 		PreServeNewConns:      metric.NewCounter(MetaPreServeNewConns),
 		PreServeConnFailures:  metric.NewCounter(MetaPreServeConnFailures),
 		PreServeMaxBytes: metric.NewHistogram(metric.HistogramOptions{
-			Metadata: MetaPreServeMaxBytes,
-			Duration: histogramWindow,
-			Buckets:  metric.MemoryUsage64MBBuckets,
-			Mode:     metric.HistogramModePrometheus,
+			Metadata:     MetaPreServeMaxBytes,
+			Duration:     histogramWindow,
+			BucketConfig: metric.MemoryUsage64MBBuckets,
+			Mode:         metric.HistogramModePrometheus,
 		}),
 		PreServeCurBytes: metric.NewGauge(MetaPreServeCurBytes),
 	}
@@ -219,20 +216,24 @@ func (s *PreServeConnHandler) SendRoutingError(
 			"service unavailable for target tenant (%v)", tenantName),
 		`Double check your "-ccluster=" connection option or your "cluster:" database name prefix.`)
 
-	_ = s.sendErr(ctx, conn, err)
-	_ = conn.Close()
+	_ = s.sendErr(ctx, s.st, conn, err)
 }
 
 // sendErr sends errors to the client during the connection startup
 // sequence. Later error sends during/after authentication are handled
 // in conn.go.
-func (s *PreServeConnHandler) sendErr(ctx context.Context, conn net.Conn, err error) error {
+func (s *PreServeConnHandler) sendErr(
+	ctx context.Context, st *cluster.Settings, conn net.Conn, err error,
+) error {
+	w := errWriter{
+		sv:         &st.SV,
+		msgBuilder: newWriteBuffer(s.tenantIndependentMetrics.PreServeBytesOutCount),
+	}
 	// We could, but do not, report server-side network errors while
 	// trying to send the client error. This is because clients that
 	// receive error payload are highly correlated with clients
 	// disconnecting abruptly.
-	_ /* err */ = s.errWriter.writeErr(ctx, err, conn)
-	_ = conn.Close()
+	_ /* err */ = w.writeErr(ctx, err, conn)
 	return err
 }
 
@@ -321,7 +322,7 @@ func (s *PreServeConnHandler) PreServe(
 	case versionCancel:
 		// The cancel message is rather peculiar: it is sent without
 		// authentication, always over an unencrypted channel.
-		if ok, key := readCancelKeyAndCloseConn(ctx, conn, &buf); ok {
+		if ok, key := readCancelKey(ctx, &buf); ok {
 			return conn, PreServeStatus{
 				State:     PreServeCancel,
 				CancelKey: key,
@@ -341,7 +342,7 @@ func (s *PreServeConnHandler) PreServe(
 		// telemetry counter to indicate an attempt was made
 		// to use this feature.
 		err = errors.WithTelemetry(err, "#52184")
-		return conn, st, s.sendErr(ctx, conn, err)
+		return conn, st, s.sendErr(ctx, s.st, conn, err)
 	}
 
 	// Compute the initial connType.
@@ -357,7 +358,7 @@ func (s *PreServeConnHandler) PreServe(
 		return conn, st, err
 	}
 	if clientErr != nil {
-		return conn, st, s.sendErr(ctx, conn, clientErr)
+		return conn, st, s.sendErr(ctx, s.st, conn, clientErr)
 	}
 
 	// What does the client want to do?
@@ -371,7 +372,7 @@ func (s *PreServeConnHandler) PreServe(
 		// Yet, we've found clients in the wild that send the cancel
 		// after the TLS handshake, for example at
 		// https://github.com/cockroachlabs/support/issues/600.
-		if ok, key := readCancelKeyAndCloseConn(ctx, conn, &buf); ok {
+		if ok, key := readCancelKey(ctx, &buf); ok {
 			return conn, PreServeStatus{
 				State:     PreServeCancel,
 				CancelKey: key,
@@ -384,7 +385,7 @@ func (s *PreServeConnHandler) PreServe(
 		// We don't know this protocol.
 		err := pgerror.Newf(pgcode.ProtocolViolation, "unknown protocol version %d", version)
 		err = errors.WithTelemetry(err, fmt.Sprintf("protocol-version-%d", version))
-		return conn, st, s.sendErr(ctx, conn, err)
+		return conn, st, s.sendErr(ctx, s.st, conn, err)
 	}
 
 	// Reserve some memory for this connection using the server's monitor. This
@@ -402,8 +403,9 @@ func (s *PreServeConnHandler) PreServe(
 		ctx, &buf, conn.RemoteAddr(), s.trustClientProvidedRemoteAddr.Get(), s.acceptTenantName, s.acceptSystemIdentityOption.Get())
 	if err != nil {
 		st.Reserved.Close(ctx)
-		return conn, st, s.sendErr(ctx, conn, err)
+		return conn, st, s.sendErr(ctx, s.st, conn, err)
 	}
+	st.clientParameters.IsSSL = st.ConnType == hba.ConnHostSSL
 
 	st.State = PreServeReady
 	return conn, st, nil
@@ -498,7 +500,7 @@ func (s *PreServeConnHandler) readVersion(
 ) (version uint32, buf pgwirebase.ReadBuffer, err error) {
 	var n int
 	buf = pgwirebase.MakeReadBuffer(
-		pgwirebase.ReadBufferOptionWithClusterSettings(s.errWriter.sv),
+		pgwirebase.ReadBufferOptionWithClusterSettings(&s.st.SV),
 	)
 	n, err = buf.ReadUntypedMsg(conn)
 	if err != nil {

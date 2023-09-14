@@ -22,55 +22,81 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/require"
 )
 
 func TestVersionGuard(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 
 	type testCase struct {
 		name            string
-		storageVersion  clusterversion.Key
+		storageVersion  *clusterversion.Key
 		settingsVersion clusterversion.Key
 		checkVersions   map[clusterversion.Key]bool
 	}
 
 	initialVersion := clusterversion.V22_2
+	startVersion := clusterversion.V23_1Start
 	maxVersion := clusterversion.V23_1
+
 	tests := []testCase{
 		{
-			name:            "unfinalized",
-			storageVersion:  initialVersion,
+			name:            "bootstrap-old-version",
+			storageVersion:  nil,
 			settingsVersion: initialVersion,
 			checkVersions: map[clusterversion.Key]bool{
-				initialVersion:            true,
-				clusterversion.V23_1Start: false,
-				maxVersion:                false,
+				initialVersion: true,
+				startVersion:   false,
+				maxVersion:     false,
+			},
+		},
+		{
+			name:            "bootstrap-current-version",
+			storageVersion:  nil,
+			settingsVersion: maxVersion,
+			checkVersions: map[clusterversion.Key]bool{
+				initialVersion: true,
+				startVersion:   true,
+				maxVersion:     true,
+			},
+		},
+		{
+			name:            "unfinalized",
+			storageVersion:  &initialVersion,
+			settingsVersion: initialVersion,
+			checkVersions: map[clusterversion.Key]bool{
+				initialVersion: true,
+				startVersion:   false,
+				maxVersion:     false,
 			},
 		},
 		{
 			name:            "mid-finalize",
-			storageVersion:  clusterversion.V23_1Start,
+			storageVersion:  &startVersion,
 			settingsVersion: initialVersion,
 			checkVersions: map[clusterversion.Key]bool{
-				initialVersion:            true,
-				clusterversion.V23_1Start: true,
-				maxVersion:                false,
+				initialVersion: true,
+				startVersion:   true,
+				maxVersion:     false,
 			},
 		},
 		{
 			name:            "finalized",
-			storageVersion:  maxVersion,
+			storageVersion:  &maxVersion,
 			settingsVersion: maxVersion,
 			checkVersions: map[clusterversion.Key]bool{
-				initialVersion:            true,
-				clusterversion.V23_1Start: true,
-				maxVersion:                true,
+				initialVersion: true,
+				startVersion:   true,
+				maxVersion:     true,
 			},
 		},
 		{
@@ -80,7 +106,7 @@ func TestVersionGuard(t *testing.T) {
 			// version behind the settings version should not exist in
 			// production.
 			name:            "verify-optimization",
-			storageVersion:  initialVersion,
+			storageVersion:  &initialVersion,
 			settingsVersion: maxVersion,
 			checkVersions: map[clusterversion.Key]bool{
 				initialVersion:            true,
@@ -101,14 +127,18 @@ func TestVersionGuard(t *testing.T) {
 			settingVersion := clusterversion.ClusterVersion{Version: clusterversion.ByKey(test.settingsVersion)}
 			require.NoError(t, settings.Version.SetActiveVersion(ctx, settingVersion))
 
-			storageVersion := clusterversion.ClusterVersion{Version: clusterversion.ByKey(test.storageVersion)}
-			marshaledVersion, err := protoutil.Marshal(&storageVersion)
+			if test.storageVersion == nil {
+				tDB.Exec(t, `DELETE FROM system.settings WHERE name = 'version'`)
+			} else {
+				storageVersion := clusterversion.ClusterVersion{Version: clusterversion.ByKey(*test.storageVersion)}
+				marshaledVersion, err := protoutil.Marshal(&storageVersion)
+				require.NoError(t, err)
+				tDB.Exec(t, `
+					UPSERT INTO system.settings (name, value, "lastUpdated", "valueType")
+					VALUES ('version', $1, now(), 'm')`,
+					marshaledVersion)
 
-			require.NoError(t, err)
-			tDB.Exec(t, `
-				UPDATE system.settings
-				SET value = $1
-				WHERE name = 'version'`, marshaledVersion)
+			}
 
 			watcher := settingswatcher.New(nil, s.Codec(), settings, nil, nil, nil)
 			require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {

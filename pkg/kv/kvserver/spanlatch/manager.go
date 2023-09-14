@@ -12,7 +12,6 @@ package spanlatch
 
 import (
 	"context"
-	"fmt"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -27,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // A Manager maintains an interval tree of key and key range latches. Latch
@@ -96,13 +96,22 @@ func (la *latch) inReadSet() bool {
 	return la.next != nil
 }
 
+// String implements the fmt.Stringer interface.
+func (la *latch) String() string {
+	return redact.StringWithoutMarkers(la)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (la *latch) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("%s@%s", la.span, la.ts)
+}
+
 //go:generate ../../../util/interval/generic/gen.sh *latch spanlatch
 
 // Methods required by util/interval/generic type contract.
 func (la *latch) ID() uint64         { return la.id }
 func (la *latch) Key() []byte        { return la.span.Key }
 func (la *latch) EndKey() []byte     { return la.span.EndKey }
-func (la *latch) String() string     { return fmt.Sprintf("%s@%s", la.span, la.ts) }
 func (la *latch) New() *latch        { return new(latch) }
 func (la *latch) SetID(v uint64)     { la.id = v }
 func (la *latch) SetKey(v []byte)    { la.span.Key = v }
@@ -427,7 +436,16 @@ func (m *Manager) insertLocked(lg *Guard) {
 }
 
 func (m *Manager) nextIDLocked() uint64 {
-	m.idAlloc++
+	// We allocate IDs from the top of the uint64 space and in reverse order.
+	// This is done to order latches in the tree on a same key in reverse order
+	// of acquisition. Doing so ensures that when we iterate over the tree and
+	// see a key with many conflicting latches, we visit the latches on that key
+	// in the reverse order that they will be released. In doing so, we minimize
+	// the number of open channels that we wait on (calls to waitForSignal) and
+	// minimize the number of goroutine scheduling points. This is important to
+	// avoid spikes in runnable goroutine after each request completes, which
+	// can negatively affect node health.
+	m.idAlloc--
 	return m.idAlloc
 }
 

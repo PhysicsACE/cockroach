@@ -35,7 +35,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
@@ -157,6 +159,25 @@ func (os *optSchema) getDescriptorForPermissionsCheck() catalog.Descriptor {
 	}
 	// Otherwise, just return the database descriptor.
 	return os.database
+}
+
+// LookupDatabaseName implements the cat.Catalog interface.
+func (oc *optCatalog) LookupDatabaseName(
+	ctx context.Context, flags cat.Flags, name string,
+) (tree.Name, error) {
+	if flags.AvoidDescriptorCaches {
+		defer func(prev bool) {
+			oc.planner.skipDescriptorCache = prev
+		}(oc.planner.skipDescriptorCache)
+		oc.planner.skipDescriptorCache = true
+	}
+	if name == "" {
+		name = oc.planner.CurrentDatabase()
+	}
+	if err := oc.planner.LookupDatabase(ctx, name); err != nil {
+		return "", err
+	}
+	return tree.Name(name), nil
 }
 
 // ResolveSchema is part of the cat.Catalog interface.
@@ -344,8 +365,14 @@ func (oc *optCatalog) ResolveFunction(
 
 func (oc *optCatalog) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (*tree.FunctionName, *tree.Overload, error) {
+) (*tree.RoutineName, *tree.Overload, error) {
 	return oc.planner.ResolveFunctionByOID(ctx, oid)
+}
+
+func (oc *optCatalog) ResolveProcedure(
+	ctx context.Context, name *tree.UnresolvedObjectName, path tree.SearchPath,
+) (*tree.Overload, error) {
+	return oc.planner.ResolveProcedure(ctx, name, path)
 }
 
 func getDescFromCatalogObjectForPermissions(o cat.Object) (catalog.Descriptor, error) {
@@ -448,7 +475,7 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 	var scName tree.Name
 	// TODO(richardjcai): Remove this in 22.2.
 	if scID == keys.PublicSchemaID {
-		scName = tree.PublicSchemaName
+		scName = catconstants.PublicSchemaName
 	} else {
 		scDesc, err := oc.planner.Descriptors().ByID(txn).WithoutNonPublic().Get().Schema(ctx, scID)
 		if err != nil {
@@ -467,6 +494,15 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 // RoleExists is part of the cat.Catalog interface.
 func (oc *optCatalog) RoleExists(ctx context.Context, role username.SQLUsername) (bool, error) {
 	return RoleExists(ctx, oc.planner.InternalSQLTxn(), role)
+}
+
+// Optimizer is part of the cat.Catalog interface.
+func (oc *optCatalog) Optimizer() interface{} {
+	if oc.planner == nil {
+		return nil
+	}
+	plannerInterface := eval.Planner(oc.planner)
+	return plannerInterface.Optimizer()
 }
 
 // dataSourceForDesc returns a data source wrapper for the given descriptor.
@@ -1339,6 +1375,11 @@ func (ot *optTable) GetDatabaseID() descpb.ID {
 	return ot.desc.GetParentID()
 }
 
+// IsHypothetical is part of the cat.Table interface.
+func (ot *optTable) IsHypothetical() bool {
+	return false
+}
+
 // lookupColumnOrdinal returns the ordinal of the column with the given ID. A
 // cache makes the lookup O(1).
 func (ot *optTable) lookupColumnOrdinal(colID descpb.ColumnID) (int, error) {
@@ -1550,9 +1591,9 @@ func (oi *optIndex) IsInverted() bool {
 	return oi.idx.GetType() == descpb.IndexDescriptor_INVERTED
 }
 
-// IsNotVisible is part of the cat.Index interface.
-func (oi *optIndex) IsNotVisible() bool {
-	return oi.idx.IsNotVisible()
+// GetInvisibility is part of the cat.Index interface.
+func (oi *optIndex) GetInvisibility() float64 {
+	return oi.idx.GetInvisibility()
 }
 
 // ColumnCount is part of the cat.Index interface.
@@ -2328,6 +2369,11 @@ func (ot *optVirtualTable) GetDatabaseID() descpb.ID {
 	return 0
 }
 
+// IsHypothetical is part of the cat.Table interface.
+func (ot *optVirtualTable) IsHypothetical() bool {
+	return false
+}
+
 // CollectTypes is part of the cat.DataSource interface.
 func (ot *optVirtualTable) CollectTypes(ord int) (descpb.IDs, error) {
 	col := ot.desc.AllColumns()[ord]
@@ -2385,9 +2431,9 @@ func (oi *optVirtualIndex) IsInverted() bool {
 	return false
 }
 
-// IsNotVisible is part of the cat.Index interface.
-func (oi *optVirtualIndex) IsNotVisible() bool {
-	return false
+// GetInvisibility is part of the cat.Index interface.
+func (oi *optVirtualIndex) GetInvisibility() float64 {
+	return 0.0
 }
 
 // ExplicitColumnCount is part of the cat.Index interface.

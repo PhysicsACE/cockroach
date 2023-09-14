@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -151,13 +153,14 @@ type TestServerArgs struct {
 	// config span.
 	DisableSpanConfigs bool
 
-	// TestServer will probabilistically start a single test tenant on each
-	// node for multi-tenant testing, and default all connections through that
-	// tenant. Use this flag to disable that behavior. You might want/need to
-	// disable this behavior if your test case is already leveraging tenants,
-	// or if some of the functionality being tested is not accessible from
-	// within tenants.
-	DisableDefaultTestTenant bool
+	// DefaultTestTenant determines whether a test's application
+	// workload will be redirected to a virtual cluster (secondary
+	// tenant) automatically.
+	//
+	// The default behavior is to do this probabilistically. See
+	// DefaultTestTenantOptions and its various instances defined
+	// below for alternative options that suits your test case.
+	DefaultTestTenant DefaultTestTenantOptions
 
 	// StartDiagnosticsReporting checks cluster.TelemetryOptOut(), and
 	// if not disabled starts the asynchronous goroutine that checks for
@@ -168,6 +171,10 @@ type TestServerArgs struct {
 	// ObsServiceAddr is the address to which events will be exported over OTLP.
 	// If empty, exporting events is inhibited.
 	ObsServiceAddr string
+
+	// AutoConfigProvider provides auto-configuration tasks to apply on
+	// the cluster during server initialization.
+	AutoConfigProvider acprovider.Provider
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -199,12 +206,168 @@ type TestClusterArgs struct {
 	// and potentially adjusted according to ReplicationMode.
 	ServerArgsPerNode map[int]TestServerArgs
 
-	// If reusable listeners is true, then restart should keep listeners untouched
-	// so that servers are kept on the same ports. It is up to the test to set
-	// proxy listeners to TestServerArgs.Listener that would survive
-	// net.Listener.Close() and then allow restarted server to use them again.
-	// See testutils.ListenerRegistry.
-	ReusableListeners bool
+	// If set, listeners will be created from the below registry and they will be
+	// retained across restarts (i.e. servers are kept on the same ports, but
+	// avoiding races where another process grabs the port while the server is
+	// down). It's also possible not to set this field but set a *ReusableListener
+	// directly in TestServerArgs.Listener. If a non-reusable listener is set in
+	// that field, RestartServer will return an error to guide the developer
+	// towards a non-flaky pattern.
+	ReusableListenerReg *listenerutil.ListenerRegistry
+}
+
+// DefaultTestTenantOptions specifies the conditions under which a
+// virtual cluster (secondary tenant) will be automatically started to
+// bear load for a unit test.
+type DefaultTestTenantOptions struct {
+	testBehavior testBehavior
+
+	// Whether the testserver will allow or block attempts to create
+	// additional virtual clusters. (Default is to block.)
+	allowAdditionalTenants bool
+
+	// Whether implicit uses of the ApplicationLayerInterface or
+	// StorageLayerInterface result in warnings/notices.
+	//
+	// We use a "no" boolean, so that the default value results in "do
+	// warn".
+	noWarnImplicitInterfaces bool
+
+	// If test tenant is disabled, issue and label to link in log message.
+	issueNum int
+	label    string
+}
+
+type testBehavior int8
+
+const (
+	ttProb testBehavior = iota
+	ttEnabled
+	ttDisabled
+)
+
+var (
+	// TestTenantProbabilisticOnly starts the test under a virtual
+	// cluster on a probabilistic basis. It will also prevent the
+	// starting of additional virtual clusters by raising an error if it
+	// is attempted. This is the default behavior.
+	TestTenantProbabilisticOnly = DefaultTestTenantOptions{testBehavior: ttProb, allowAdditionalTenants: false}
+
+	// TestTenantProbabilistic starts the test under a virtual
+	// cluster on a probabilistic basis. It allows the starting of
+	// additional virtual clusters.
+	TestTenantProbabilistic = DefaultTestTenantOptions{testBehavior: ttProb, allowAdditionalTenants: true}
+
+	// TestTenantAlwaysEnabled will always redirect the test workload to
+	// a virtual cluster. This is useful for quickly verifying that a
+	// test works under cluster virtualization.
+	//
+	// Note: this value should not be used for checked in test code
+	// unless there is a good reason to do so. We want the common case
+	// to use TestTenantProbabilistic or TestTenantProbabilisticOnly.
+	TestTenantAlwaysEnabled = DefaultTestTenantOptions{testBehavior: ttEnabled, allowAdditionalTenants: true}
+
+	// TODOTestTenantDisabled should not be used anymore. Use the
+	// other values instead.
+	// TODO(#76378): Review existing tests and use the proper value instead.
+	TODOTestTenantDisabled = DefaultTestTenantOptions{testBehavior: ttDisabled, allowAdditionalTenants: true}
+
+	// TestControlsTenantsExplicitly is used when the test wants to
+	// manage its own secondary tenants and tenant servers.
+	TestControlsTenantsExplicitly = DefaultTestTenantOptions{
+		testBehavior:             ttDisabled,
+		allowAdditionalTenants:   true,
+		noWarnImplicitInterfaces: true,
+	}
+
+	// TestIsSpecificToStorageLayerAndNeedsASystemTenant is used when
+	// the test needs to be given access to a SQL conn to a tenant with
+	// sufficient capabilities to access all the storage layer.
+	// (Initially that'd be "the" system tenant.)
+	TestIsSpecificToStorageLayerAndNeedsASystemTenant = DefaultTestTenantOptions{
+		testBehavior:             ttDisabled,
+		allowAdditionalTenants:   true,
+		noWarnImplicitInterfaces: true,
+	}
+
+	// TestNeedsTightIntegrationBetweenAPIsAndTestingKnobs is used when
+	// a test wants to use a single set of testing knobs for both the
+	// storage layer and the SQL layer and for simplicity of the test
+	// code we want to give that test a simplified environment.
+	//
+	// Note: it is debatable whether the gain in test code simplicity is
+	// worth the cost of never running that test with the virtualization
+	// layer active.
+	TestNeedsTightIntegrationBetweenAPIsAndTestingKnobs = TestIsSpecificToStorageLayerAndNeedsASystemTenant
+)
+
+func (do DefaultTestTenantOptions) AllowAdditionalTenants() bool {
+	return do.allowAdditionalTenants
+}
+
+func (do DefaultTestTenantOptions) TestTenantAlwaysEnabled() bool {
+	return do.testBehavior == ttEnabled
+}
+
+func (do DefaultTestTenantOptions) TestTenantAlwaysDisabled() bool {
+	return do.testBehavior == ttDisabled
+}
+
+// WarnImplicitInterfaces indicates whether to warn when the test code
+// uses ApplicationLayerInterface or StorageLayerInterface
+// implicitely.
+func (do DefaultTestTenantOptions) WarnImplicitInterfaces() bool {
+	return !do.noWarnImplicitInterfaces
+}
+
+func (do DefaultTestTenantOptions) IssueRef() (int, string) {
+	return do.issueNum, do.label
+}
+
+// TestDoesNotWorkWithSecondaryTenantsButWeDontKnowWhyYet can be used
+// to disable virtualization because the test doesn't appear to be compatible
+// with it, and we don't understand it yet.
+// It should link to a github issue with label C-test-failure.
+func TestDoesNotWorkWithSecondaryTenantsButWeDontKnowWhyYet(
+	issueNumber int,
+) DefaultTestTenantOptions {
+	return DefaultTestTenantOptions{
+		testBehavior:           ttDisabled,
+		allowAdditionalTenants: true,
+		issueNum:               issueNumber,
+		label:                  "C-test-failure",
+	}
+}
+
+// TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet can be
+// used to disable virtualization because the test exercises a feature
+// known not to work with virtualization enabled yet but we wish it to
+// eventually.
+//
+// It should link to a github issue with label C-bug
+// and the issue should be linked to an epic under INI-213 or INI-214.
+func TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(
+	issueNumber int,
+) DefaultTestTenantOptions {
+	return DefaultTestTenantOptions{
+		testBehavior:           ttDisabled,
+		allowAdditionalTenants: true,
+		issueNum:               issueNumber,
+		label:                  "C-bug",
+	}
+}
+
+// InternalNonDefaultDecision builds a sentinel value used inside a
+// mechanism in serverutils. Should not be used by tests directly.
+func InternalNonDefaultDecision(
+	baseArg DefaultTestTenantOptions, enable bool,
+) DefaultTestTenantOptions {
+	mode := ttDisabled
+	if enable {
+		mode = ttEnabled
+	}
+	baseArg.testBehavior = mode
+	return baseArg
 }
 
 var (
@@ -313,6 +476,10 @@ type TestTenantArgs struct {
 
 	// Skip check for tenant existence when running the test.
 	SkipTenantCheck bool
+
+	// Do not wait for tenant record cache to be populated before
+	// starting a tenant server.
+	SkipWaitForTenantCache bool
 
 	// Locality is used to initialize the same-named field on the server.Config
 	// struct.

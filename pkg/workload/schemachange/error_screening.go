@@ -21,8 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func (og *operationGenerator) tableExists(
@@ -564,9 +564,9 @@ SELECT count(*) > 0
 
 func getValidGenerationErrors() errorCodeSet {
 	return errorCodeSet{
-		pgcode.NumericValueOutOfRange:    true,
-		pgcode.FloatingPointException:    true,
-		pgcode.InvalidTextRepresentation: true,
+		pgcode.NumericValueOutOfRange:    struct{}{},
+		pgcode.FloatingPointException:    struct{}{},
+		pgcode.InvalidTextRepresentation: struct{}{},
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -111,6 +112,23 @@ func validateTenantInfo(
 		}
 	}
 
+	// Sanity check. Note that this interlock is not a guarantee that
+	// the cluster setting will never be set to an invalid tenant. There
+	// is a race condition between changing the cluster setting and the
+	// check here. Generally, other subsystems should always tolerate
+	// when the cluster setting is set to a tenant without service (or
+	// even one that doesn't exist).
+	if multitenant.VerifyTenantService.Get(&settings.SV) &&
+		info.ServiceMode == mtinfopb.ServiceModeNone &&
+		info.Name != "" &&
+		multitenant.DefaultTenantSelect.Get(&settings.SV) == string(info.Name) {
+		return errors.WithHintf(
+			pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+				"cannot stop service while tenant is selected as default"),
+			"Update the cluster setting %q to a different value.",
+			multitenant.DefaultClusterSelectSettingName)
+	}
+
 	return nil
 }
 
@@ -190,10 +208,10 @@ func (p *planner) setTenantService(
 	ctx context.Context, info *mtinfopb.TenantInfo, newMode mtinfopb.TenantServiceMode,
 ) error {
 	if p.EvalContext().TxnReadOnly {
-		return readOnlyError("ALTER TENANT SERVICE")
+		return readOnlyError("ALTER VIRTUAL CLUSTER SERVICE")
 	}
 
-	if err := p.RequireAdminRole(ctx, "set tenant service"); err != nil {
+	if err := CanManageTenant(ctx, p); err != nil {
 		return err
 	}
 	if err := rejectIfCantCoordinateMultiTenancy(p.ExecCfg().Codec, "set tenant service"); err != nil {
@@ -212,7 +230,7 @@ func (p *planner) setTenantService(
 		return errors.WithHint(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 			"cannot change service mode %v to %v directly",
 			info.ServiceMode, newMode),
-			"Use ALTER TENANT STOP SERVICE first.")
+			"Use ALTER VIRTUAL CLUSTER STOP SERVICE first.")
 	}
 
 	info.ServiceMode = newMode
@@ -223,16 +241,15 @@ func (p *planner) renameTenant(
 	ctx context.Context, info *mtinfopb.TenantInfo, newName roachpb.TenantName,
 ) error {
 	if p.EvalContext().TxnReadOnly {
-		return readOnlyError("ALTER TENANT RENAME TO")
-	}
-
-	if err := p.RequireAdminRole(ctx, "rename tenant"); err != nil {
-		return err
+		return readOnlyError("ALTER VIRTUAL CLUSTER RENAME TO")
 	}
 	if err := rejectIfCantCoordinateMultiTenancy(p.ExecCfg().Codec, "rename tenant"); err != nil {
 		return err
 	}
 	if err := rejectIfSystemTenant(info.ID, "rename"); err != nil {
+		return err
+	}
+	if err := CanManageTenant(ctx, p); err != nil {
 		return err
 	}
 
@@ -247,9 +264,13 @@ func (p *planner) renameTenant(
 	}
 
 	if info.ServiceMode != mtinfopb.ServiceModeNone {
+		// No name changes while there is a service mode.
+		//
+		// If this is ever allowed, the logic to update the tenant name in
+		// logging output for tenant servers must be updated as well.
 		return errors.WithHint(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 			"cannot rename tenant in service mode %v", info.ServiceMode),
-			"Use ALTER TENANT STOP SERVICE before renaming a tenant.")
+			"Use ALTER VIRTUAL CLUSTER STOP SERVICE before renaming a tenant.")
 	}
 
 	info.Name = newName

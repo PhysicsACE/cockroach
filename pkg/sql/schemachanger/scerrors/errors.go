@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -130,6 +131,8 @@ type concurrentSchemaChangeError struct {
 	descID descpb.ID
 }
 
+var _ pgerror.ClientVisibleRetryError = (*concurrentSchemaChangeError)(nil)
+
 // ClientVisibleRetryError is detected by the pgwire layer and will convert
 // this error into a serialization error to be retried. See
 // pgcode.ClientVisibleRetryError.
@@ -173,6 +176,15 @@ func SchemaChangerUserError(err error) error {
 // HasSchemaChangerUserError returns true if the error is meant to be surfaced.
 func HasSchemaChangerUserError(err error) bool {
 	return errors.HasType(err, (*schemaChangerUserError)(nil))
+}
+
+// UnwrapSchemaChangerUserError returns the cause of a schemaChangerUserError,
+// or nil if the error is not a schemaChangerUserError.
+func UnwrapSchemaChangerUserError(err error) error {
+	if scUserError := (*schemaChangerUserError)(nil); errors.As(err, &scUserError) {
+		return scUserError.err
+	}
+	return nil
 }
 
 func (e *schemaChangerUserError) Error() string {

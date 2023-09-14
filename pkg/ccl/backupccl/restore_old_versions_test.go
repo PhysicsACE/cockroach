@@ -58,8 +58,12 @@ func TestRestoreOldVersions(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	testdataBase := datapathutils.TestDataPath(t, "restore_old_versions")
 	var (
-		clusterDirs           = testdataBase + "/cluster"
-		systemRoleMembersDirs = testdataBase + "/system-role-members-restore"
+		clusterDirs                    = testdataBase + "/cluster"
+		systemRoleMembersDirs          = testdataBase + "/system-role-members-restore"
+		systemPrivilegesDirs           = testdataBase + "/system-privileges-restore"
+		systemDatabaseRoleSettingsDirs = testdataBase + "/system-database-role-settings-restore"
+		systemExternalConnectionsDirs  = testdataBase + "/system-external-connections-restore"
+		clusterWithTenants             = testdataBase + "/cluster-with-tenants"
 	)
 
 	t.Run("cluster-restore", func(t *testing.T) {
@@ -87,6 +91,49 @@ func TestRestoreOldVersions(t *testing.T) {
 			t.Run(dir.Name(), fullClusterRestoreSystemRoleMembersWithoutIDs(exportDir))
 		}
 	})
+
+	t.Run("full-cluster-restore-system-privileges-without-ids", func(t *testing.T) {
+		dirs, err := os.ReadDir(systemPrivilegesDirs)
+		require.NoError(t, err)
+		for _, dir := range dirs {
+			require.True(t, dir.IsDir())
+			exportDir, err := filepath.Abs(filepath.Join(systemPrivilegesDirs, dir.Name()))
+			require.NoError(t, err)
+			t.Run(dir.Name(), fullClusterRestoreSystemPrivilegesWithoutIDs(exportDir))
+		}
+	})
+
+	t.Run("full-cluster-restore-system-database-role-settings-without-ids", func(t *testing.T) {
+		dirs, err := os.ReadDir(systemDatabaseRoleSettingsDirs)
+		require.NoError(t, err)
+		for _, dir := range dirs {
+			require.True(t, dir.IsDir())
+			exportDir, err := filepath.Abs(filepath.Join(systemDatabaseRoleSettingsDirs, dir.Name()))
+			require.NoError(t, err)
+			t.Run(dir.Name(), fullClusterRestoreSystemDatabaseRoleSettingsWithoutIDs(exportDir))
+		}
+	})
+
+	t.Run("full-cluster-restore-system-external-connections-without-ids", func(t *testing.T) {
+		dirs, err := os.ReadDir(systemExternalConnectionsDirs)
+		require.NoError(t, err)
+		for _, dir := range dirs {
+			require.True(t, dir.IsDir())
+			exportDir, err := filepath.Abs(filepath.Join(systemExternalConnectionsDirs, dir.Name()))
+			require.NoError(t, err)
+			t.Run(dir.Name(), fullClusterRestoreSystemExternalConnectionsWithoutIDs(exportDir))
+		}
+	})
+	t.Run("cluster-with-tenants", func(t *testing.T) {
+		dirs, err := os.ReadDir(clusterWithTenants)
+		require.NoError(t, err)
+		for _, dir := range dirs {
+			require.True(t, dir.IsDir())
+			exportDir, err := filepath.Abs(filepath.Join(clusterWithTenants, dir.Name()))
+			require.NoError(t, err)
+			t.Run(dir.Name(), fullClusterRestoreWithTenants(exportDir))
+		}
+	})
 }
 
 func restoreOldVersionClusterTest(exportDir string) func(t *testing.T) {
@@ -97,8 +144,8 @@ func restoreOldVersionClusterTest(exportDir string) func(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				// Disabling the test tenant due to test failures. More
 				// investigation is required. Tracked with #76378.
-				DisableDefaultTestTenant: true,
-				ExternalIODir:            externalDir,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir:     externalDir,
 			},
 		})
 		sqlDB := sqlutils.MakeSQLRunner(tc.Conns[0])
@@ -110,7 +157,17 @@ func restoreOldVersionClusterTest(exportDir string) func(t *testing.T) {
 		require.NoError(t, err)
 
 		// Ensure that the restore succeeds.
-		sqlDB.Exec(t, `RESTORE FROM LATEST IN $1`, localFoo)
+		//
+		// The restore queries are run with `UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
+		// option to ensure the restore is successful on development branches. This
+		// is because, while the backups were generated on release branches and have
+		// versions such as 22.2 in their manifest, the development branch will have
+		// a BinaryMinSupportedVersion offset by the clusterversion.DevOffset
+		// described in `pkg/clusterversion/cockroach_versions.go`. This will mean
+		// that the manifest version is always less than the
+		// BinaryMinSupportedVersion which will in turn fail the restore unless we
+		// pass in the specified option to elide the compatability check.
+		sqlDB.Exec(t, `RESTORE FROM LATEST IN $1 WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION`, localFoo)
 
 		sqlDB.CheckQueryResults(t, "SHOW DATABASES", [][]string{
 			{"data", "root", "NULL", "NULL", "{}", "NULL"},
@@ -120,10 +177,10 @@ func restoreOldVersionClusterTest(exportDir string) func(t *testing.T) {
 		})
 
 		sqlDB.CheckQueryResults(t, "SHOW SCHEMAS", [][]string{
-			{"crdb_internal", "NULL"},
-			{"information_schema", "NULL"},
-			{"pg_catalog", "NULL"},
-			{"pg_extension", "NULL"},
+			{"crdb_internal", "node"},
+			{"information_schema", "node"},
+			{"pg_catalog", "node"},
+			{"pg_extension", "node"},
 			{"public", "admin"},
 		})
 
@@ -144,9 +201,9 @@ func restoreOldVersionClusterTest(exportDir string) func(t *testing.T) {
 		// Now validate that the namespace table doesn't have more than one entry
 		// for the same ID.
 		sqlDB.CheckQueryResults(t, `
-SELECT 
+SELECT
 CASE WHEN count(distinct id) = count(id)
-THEN 'unique' ELSE 'duplicates' 
+THEN 'unique' ELSE 'duplicates'
 END
 FROM system.namespace;`, [][]string{{"unique"}})
 
@@ -208,7 +265,7 @@ func TestRestoreWithDroppedSchemaCorruption(t *testing.T) {
 		// reference a nil pointer below where we're expecting a database
 		// descriptor to exist. More investigation is required.
 		// Tracked with #76378.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, args)
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
@@ -257,9 +314,8 @@ DROP SCHEMA bar;
 
 func fullClusterRestoreSystemRoleMembersWithoutIDs(exportDir string) func(t *testing.T) {
 	return func(t *testing.T) {
-		const numAccounts = 1000
-		_, _, tmpDir, cleanupFn := backupRestoreTestSetup(t, multiNode, numAccounts, InitManualReplication)
-		defer cleanupFn()
+		tmpDir, tempDirCleanupFn := testutils.TempDir(t)
+		defer tempDirCleanupFn()
 
 		_, sqlDB, cleanup := backupRestoreTestSetupEmpty(t, singleNode, tmpDir,
 			InitManualReplication, base.TestClusterArgs{
@@ -272,12 +328,154 @@ func fullClusterRestoreSystemRoleMembersWithoutIDs(exportDir string) func(t *tes
 		err := os.Symlink(exportDir, filepath.Join(tmpDir, "foo"))
 		require.NoError(t, err)
 
-		sqlDB.Exec(t, fmt.Sprintf("RESTORE FROM '%s'", localFoo))
+		// The restore queries are run with `UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
+		// option to ensure the restore is successful on development branches. This
+		// is because, while the backups were generated on release branches and have
+		// versions such as 22.2 in their manifest, the development branch will have
+		// a BinaryMinSupportedVersion offset by the clusterversion.DevOffset
+		// described in `pkg/clusterversion/cockroach_versions.go`. This will mean
+		// that the manifest version is always less than the
+		// BinaryMinSupportedVersion which will in turn fail the restore unless we
+		// pass in the specified option to elide the compatability check.
+		sqlDB.Exec(t, fmt.Sprintf("RESTORE FROM '%s' WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION", localFoo))
 
 		sqlDB.CheckQueryResults(t, "SELECT * FROM system.role_members", [][]string{
 			{"admin", "root", "true", "2", "1"},
 			{"testrole", "testuser1", "false", "100", "101"},
 			{"testrole", "testuser2", "true", "100", "102"},
+		})
+	}
+}
+
+func fullClusterRestoreSystemPrivilegesWithoutIDs(exportDir string) func(t *testing.T) {
+	return func(t *testing.T) {
+		tmpDir, tempDirCleanupFn := testutils.TempDir(t)
+		defer tempDirCleanupFn()
+
+		_, sqlDB, cleanup := backupRestoreTestSetupEmpty(t, singleNode, tmpDir,
+			InitManualReplication, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{
+					Knobs: base.TestingKnobs{
+						JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+					},
+				}})
+		defer cleanup()
+		err := os.Symlink(exportDir, filepath.Join(tmpDir, "foo"))
+		require.NoError(t, err)
+
+		// The restore queries are run with `UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
+		// option to ensure the restore is successful on development branches. This
+		// is because, while the backups were generated on release branches and have
+		// versions such as 22.2 in their manifest, the development branch will have
+		// a BinaryMinSupportedVersion offset by the clusterversion.DevOffset
+		// described in `pkg/clusterversion/cockroach_versions.go`. This will mean
+		// that the manifest version is always less than the
+		// BinaryMinSupportedVersion which will in turn fail the restore unless we
+		// pass in the specified option to elide the compatability check.
+		sqlDB.Exec(t, fmt.Sprintf("RESTORE FROM '%s' WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION", localFoo))
+
+		sqlDB.CheckQueryResults(t, "SELECT * FROM system.privileges", [][]string{
+			{"public", "/vtable/crdb_internal/tables", "{}", "{}", "4"},
+			{"testuser1", "/global/", "{VIEWACTIVITY}", "{}", "100"},
+			{"testuser2", "/global/", "{MODIFYCLUSTERSETTING}", "{}", "101"},
+		})
+	}
+}
+
+func fullClusterRestoreSystemDatabaseRoleSettingsWithoutIDs(exportDir string) func(t *testing.T) {
+	return func(t *testing.T) {
+		tmpDir, tempDirCleanupFn := testutils.TempDir(t)
+		defer tempDirCleanupFn()
+
+		_, sqlDB, cleanup := backupRestoreTestSetupEmpty(t, singleNode, tmpDir,
+			InitManualReplication, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{
+					Knobs: base.TestingKnobs{
+						JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+					},
+				}})
+		defer cleanup()
+		err := os.Symlink(exportDir, filepath.Join(tmpDir, "foo"))
+		require.NoError(t, err)
+
+		// The restore queries are run with `UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
+		// option to ensure the restore is successful on development branches. This
+		// is because, while the backups were generated on release branches and have
+		// versions such as 22.2 in their manifest, the development branch will have
+		// a BinaryMinSupportedVersion offset by the clusterversion.DevOffset
+		// described in `pkg/clusterversion/cockroach_versions.go`. This will mean
+		// that the manifest version is always less than the
+		// BinaryMinSupportedVersion which will in turn fail the restore unless we
+		// pass in the specified option to elide the compatability check.
+		sqlDB.Exec(t, fmt.Sprintf("RESTORE FROM '%s' WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION", localFoo))
+
+		sqlDB.CheckQueryResults(t, "SELECT * FROM system.database_role_settings", [][]string{
+			{"0", "", "{timezone=America/New_York}", "0"},
+			{"0", "testuser1", "{application_name=roachdb}", "100"},
+			{"0", "testuser2", "{disallow_full_table_scans=on}", "101"},
+		})
+	}
+}
+
+func fullClusterRestoreSystemExternalConnectionsWithoutIDs(exportDir string) func(t *testing.T) {
+	return func(t *testing.T) {
+		tmpDir, tempDirCleanupFn := testutils.TempDir(t)
+		defer tempDirCleanupFn()
+
+		_, sqlDB, cleanup := backupRestoreTestSetupEmpty(t, singleNode, tmpDir,
+			InitManualReplication, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{
+					Knobs: base.TestingKnobs{
+						JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+					},
+				}})
+		defer cleanup()
+		err := os.Symlink(exportDir, filepath.Join(tmpDir, "foo"))
+		require.NoError(t, err)
+
+		// The restore queries are run with `UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
+		// option to ensure the restore is successful on development branches. This
+		// is because, while the backups were generated on release branches and have
+		// versions such as 22.2 in their manifest, the development branch will have
+		// a BinaryMinSupportedVersion offset by the clusterversion.DevOffset
+		// described in `pkg/clusterversion/cockroach_versions.go`. This will mean
+		// that the manifest version is always less than the
+		// BinaryMinSupportedVersion which will in turn fail the restore unless we
+		// pass in the specified option to elide the compatability check.
+		sqlDB.Exec(t, fmt.Sprintf("RESTORE FROM '%s' WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION", localFoo))
+
+		sqlDB.CheckQueryResults(t, "SELECT * FROM system.external_connections", [][]string{
+			{"connection1", "2023-03-20 01:26:50.174781 +0000 +0000", "2023-03-20 01:26:50.174781 +0000 +0000", "STORAGE",
+				"\b\u0005\u0012\u0019\n\u0017userfile:///connection1", "testuser1", "100"},
+			{"connection2", "2023-03-20 01:26:51.223986 +0000 +0000", "2023-03-20 01:26:51.223986 +0000 +0000", "STORAGE",
+				"\b\u0005\u0012\u0019\n\u0017userfile:///connection2", "testuser2", "101"},
+		})
+	}
+}
+
+func fullClusterRestoreWithTenants(exportDir string) func(t *testing.T) {
+	return func(t *testing.T) {
+		tmpDir, tempDirCleanupFn := testutils.TempDir(t)
+		defer tempDirCleanupFn()
+
+		_, sqlDB, cleanup := backupRestoreTestSetupEmpty(t, singleNode, tmpDir,
+			InitManualReplication, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{
+					Knobs: base.TestingKnobs{
+						JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+					},
+				}})
+		defer cleanup()
+		err := os.Symlink(exportDir, filepath.Join(tmpDir, "foo"))
+		require.NoError(t, err)
+		sqlDB.CheckQueryResults(t, fmt.Sprintf("SELECT count(*) FROM [SHOW BACKUP LATEST IN '%s'] WHERE object_type = 'TENANT'", localFoo), [][]string{
+			{"2"},
+		})
+		sqlDB.Exec(t, fmt.Sprintf("RESTORE FROM LATEST IN '%s' WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION, include_all_virtual_clusters", localFoo))
+		sqlDB.CheckQueryResults(t, "SHOW TENANTS", [][]string{
+			{"1", "system", "ready", "shared"},
+			{"5", "tenant-5", "ready", "none"},
+			{"6", "tenant-6", "ready", "none"},
 		})
 	}
 }

@@ -1,8 +1,8 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "zerofields",
+    testonly = 1,
     srcs = ["no_zero_field.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/testutils/zerofields",
     visibility = ["//visibility:public"],
@@ -17,5 +17,3 @@ go_test(
     embed = [":zerofields"],
     deps = ["@com_github_cockroachdb_errors//:errors"],
 )
-
-get_x_data(name = "get_x_data")

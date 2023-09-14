@@ -273,7 +273,17 @@ var ExportColumns = ResultColumns{
 	{Name: "bytes", Typ: types.Int},
 }
 
-// TenantColumns appear in all SHOW TENANT queries.
+// ExportColumnTypes is the type schema of the EXPORT statement.
+var ExportColumnTypes []*types.T
+
+func init() {
+	ExportColumnTypes = make([]*types.T, len(ExportColumns))
+	for i, c := range ExportColumns {
+		ExportColumnTypes[i] = c.Typ
+	}
+}
+
+// TenantColumns appear in all SHOW VIRTUAL CLUSTER queries.
 var TenantColumns = ResultColumns{
 	{Name: "id", Typ: types.Int},
 	{Name: "name", Typ: types.String},
@@ -282,7 +292,7 @@ var TenantColumns = ResultColumns{
 }
 
 // TenantColumnsWithReplication is appended to TenantColumns for
-// SHOW TENANT ... WITH REPLICATION STATUS queries.
+// SHOW VIRTUAL CLUSTER ... WITH REPLICATION STATUS queries.
 var TenantColumnsWithReplication = ResultColumns{
 	{Name: "source_tenant_name", Typ: types.String},
 	{Name: "source_cluster_uri", Typ: types.String},
@@ -296,9 +306,9 @@ var TenantColumnsWithReplication = ResultColumns{
 }
 
 // TenantColumnsWithCapabilities is appended to TenantColumns for
-// SHOW TENANT ... WITH CAPABILITIES queries.
+// SHOW VIRTUAL CLUSTER ... WITH CAPABILITIES queries.
 var TenantColumnsWithCapabilities = ResultColumns{
-	{Name: "capability_id", Typ: types.String},
+	{Name: "capability_name", Typ: types.String},
 	{Name: "capability_value", Typ: types.String},
 }
 
@@ -334,3 +344,11 @@ const RangesExtraRenders = `
 	coalesce((crdb_internal.range_stats(start_key)->>'range_key_bytes')::INT, 0) +
 	coalesce((crdb_internal.range_stats(start_key)->>'range_val_bytes')::INT, 0) AS range_size
 `
+
+// IdentifySystemColumns is the schema for IDENTIFY_SYSTEM.
+var IdentifySystemColumns = ResultColumns{
+	{Name: "systemid", Typ: types.String},
+	{Name: "timeline", Typ: types.Int4},
+	{Name: "xlogpos", Typ: types.String},
+	{Name: "dbname", Typ: types.String},
+}

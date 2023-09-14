@@ -729,7 +729,10 @@ func TestConstraintReport(t *testing.T) {
 	// the cluster. We disable the cluster's own production of reports so that it
 	// doesn't interfere with the test.
 	ReporterInterval.Override(ctx, &st.SV, 0)
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		Settings:          st,
+	})
 	con := s.InternalExecutor().(isql.Executor)
 	defer s.Stopper().Stop(ctx)
 
@@ -985,7 +988,7 @@ func compileTestCase(tc baseReportTestCase) (compiledTestCase, error) {
 		allStores = append(allStores, sds...)
 	}
 
-	keyScanner := keysutils.MakePrettyScannerForNamedTables(tableToID, idxToID)
+	keyScanner := keysutils.MakePrettyScannerForNamedTables(roachpb.SystemTenantID, tableToID, idxToID)
 	ranges, err := processSplits(keyScanner, tc.splits, allStores)
 	if err != nil {
 		return compiledTestCase{}, err

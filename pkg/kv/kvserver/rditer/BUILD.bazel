@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -12,10 +11,13 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
+        "//pkg/kv/kvserver/spanset",
         "//pkg/roachpb",
         "//pkg/storage",
         "//pkg/storage/enginepb",
         "//pkg/util/iterutil",
+        "@com_github_cockroachdb_pebble//:pebble",
+        "@com_github_cockroachdb_pebble//rangekey",
     ],
 )
 
@@ -49,5 +51,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

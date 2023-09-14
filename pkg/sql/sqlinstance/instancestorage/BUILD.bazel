@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,6 +13,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
+        "//pkg/clusterversion",
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvclient/rangefeed",
@@ -21,6 +21,7 @@ go_library(
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/multitenant",
         "//pkg/roachpb",
+        "//pkg/server/settingswatcher",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql",
@@ -44,6 +45,7 @@ go_library(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_logtags//:logtags",
     ],
 )
 
@@ -62,14 +64,17 @@ go_test(
     embed = [":instancestorage"],
     deps = [
         "//pkg/base",
-        "//pkg/ccl/kvccl/kvtenantccl",
+        "//pkg/clusterversion",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvclient/kvtenant",
         "//pkg/kv/kvclient/rangefeed",
         "//pkg/roachpb",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
+        "//pkg/server/settingswatcher",
+        "//pkg/settings/cluster",
         "//pkg/sql/catalog/descs",
         "//pkg/sql/catalog/desctestutils",
         "//pkg/sql/catalog/systemschema",
@@ -79,11 +84,9 @@ go_test(
         "//pkg/sql/sqlliveness/slstorage",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
-        "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/encoding",
-        "//pkg/util/envutil",
         "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
@@ -98,5 +101,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -69,21 +69,27 @@ func registerLOQRecovery(r registry.Registry) {
 	} {
 		testSpec := s
 		r.Add(registry.TestSpec{
-			Name:              s.testName(""),
-			Owner:             registry.OwnerReplication,
-			Tags:              []string{`default`},
-			Cluster:           spec,
-			NonReleaseBlocker: true,
+			Name:                s.testName(""),
+			Owner:               registry.OwnerReplication,
+			Benchmark:           true,
+			Tags:                registry.Tags(`default`),
+			Cluster:             spec,
+			Leases:              registry.MetamorphicLeases,
+			SkipPostValidations: registry.PostValidationInvalidDescriptors | registry.PostValidationNoDeadNodes,
+			NonReleaseBlocker:   true,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runRecoverLossOfQuorum(ctx, t, c, testSpec)
 			},
 		})
 		r.Add(registry.TestSpec{
-			Name:              s.testName("half-online"),
-			Owner:             registry.OwnerReplication,
-			Tags:              []string{`default`},
-			Cluster:           spec,
-			NonReleaseBlocker: true,
+			Name:                s.testName("half-online"),
+			Owner:               registry.OwnerReplication,
+			Benchmark:           true,
+			Tags:                registry.Tags(`default`),
+			Cluster:             spec,
+			Leases:              registry.MetamorphicLeases,
+			SkipPostValidations: registry.PostValidationInvalidDescriptors | registry.PostValidationNoDeadNodes,
+			NonReleaseBlocker:   true,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runHalfOnlineRecoverLossOfQuorum(ctx, t, c, testSpec)
 			},
@@ -165,7 +171,9 @@ func runRecoverLossOfQuorum(ctx context.Context, t test.Test, c cluster.Cluster,
 	workloadHistogramFile := "restored.json"
 
 	c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-	settings := install.MakeClusterSettings()
+	settings := install.MakeClusterSettings(install.EnvOption([]string{
+		"COCKROACH_MIN_RANGE_MAX_BYTES=1",
+	}))
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, nodes)
 
 	// Cleanup stale files generated during recovery. We do this for the case
@@ -257,14 +265,17 @@ func runRecoverLossOfQuorum(ctx context.Context, t test.Test, c cluster.Cluster,
 		c.Start(ctx, t.L(), option.DefaultStartSingleNodeOpts(), settings, c.Nodes(remaining...))
 
 		t.L().Printf("waiting for nodes to restart")
-		if err = contextutil.RunWithTimeout(ctx, "wait-for-restart", time.Minute,
+		if err = timeutil.RunWithTimeout(ctx, "wait-for-restart", time.Minute,
 			func(ctx context.Context) error {
 				var err error
 				for {
 					if ctx.Err() != nil {
 						return &recoveryImpossibleError{testOutcome: restartFailed}
 					}
-					db, err = c.ConnE(ctx, t.L(), 1)
+					// Note that conn doesn't actually connect, it just creates driver
+					// and prepares URL. Actual connection is done when statement is
+					// being executed.
+					db, err = c.ConnE(ctx, t.L(), 1, option.ConnectTimeout(15*time.Second))
 					if err == nil {
 						break
 					}
@@ -288,7 +299,7 @@ func runRecoverLossOfQuorum(ctx context.Context, t test.Test, c cluster.Cluster,
 		}
 
 		t.L().Printf("mark dead nodes as decommissioned")
-		if err := contextutil.RunWithTimeout(ctx, "mark-nodes-decommissioned", 5*time.Minute,
+		if err := timeutil.RunWithTimeout(ctx, "mark-nodes-decommissioned", 5*time.Minute,
 			func(ctx context.Context) error {
 				decommissionCmd := fmt.Sprintf(
 					"./cockroach node decommission --wait none --insecure --url={pgurl:%d} 2 3", 1)
@@ -314,7 +325,7 @@ func runRecoverLossOfQuorum(ctx context.Context, t test.Test, c cluster.Cluster,
 			// cluster is not healthy after recovery and that means restart failed.
 			return &recoveryImpossibleError{testOutcome: restartFailed}
 		}
-		if err := contextutil.RunWithTimeout(ctx, "decommission-removed-nodes", 5*time.Minute,
+		if err := timeutil.RunWithTimeout(ctx, "decommission-removed-nodes", 5*time.Minute,
 			func(ctx context.Context) error {
 				decommissionCmd := fmt.Sprintf(
 					"./cockroach node decommission --wait all --insecure --url={pgurl:%d} 2 3", 1)
@@ -378,7 +389,9 @@ func runHalfOnlineRecoverLossOfQuorum(
 	workloadHistogramFile := "restored.json"
 
 	c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-	settings := install.MakeClusterSettings()
+	settings := install.MakeClusterSettings(install.EnvOption([]string{
+		"COCKROACH_MIN_RANGE_MAX_BYTES=1",
+	}))
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, nodes)
 
 	// Cleanup stale files generated during recovery. We do this for the case
@@ -463,7 +476,7 @@ func runHalfOnlineRecoverLossOfQuorum(
 
 		t.L().Printf("waiting for nodes to process recovery")
 		verifyCommand := "./cockroach debug recover verify --insecure --host " + addr + " " + planName
-		if err = contextutil.RunWithTimeout(ctx, "wait-for-restart", 2*time.Minute,
+		if err = timeutil.RunWithTimeout(ctx, "wait-for-restart", 2*time.Minute,
 			func(ctx context.Context) error {
 				for {
 					res, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(controller), verifyCommand)
@@ -485,7 +498,7 @@ func runHalfOnlineRecoverLossOfQuorum(
 					if ctx.Err() != nil {
 						return &recoveryImpossibleError{testOutcome: restartFailed}
 					}
-					db, err = c.ConnE(ctx, t.L(), remaining[len(remaining)-1])
+					db, err = c.ConnE(ctx, t.L(), remaining[len(remaining)-1], option.ConnectTimeout(15*time.Second))
 					if err == nil {
 						break
 					}
@@ -526,7 +539,7 @@ func runHalfOnlineRecoverLossOfQuorum(
 		// In half online mode, nodes will update dead nodes' status upon
 		// restart. Check that it actually happened. We also need to have retry
 		// since decommission is done in the background with retries.
-		if err = contextutil.RunWithTimeout(ctx, "wait-for-decommission", 5*time.Minute,
+		if err = timeutil.RunWithTimeout(ctx, "wait-for-decommission", 5*time.Minute,
 			func(ctx context.Context) error {
 				// Keep trying to query until either we get no rows (all nodes are
 				// decommissioned or removed) or task times out. In timeout case, test
@@ -595,12 +608,10 @@ func setDBRangeLimits(ctx context.Context, db *gosql.DB, dbName string, size int
 func setSnapshotRate(ctx context.Context, db *gosql.DB, sizeMB int64) error {
 	queries := []string{
 		"RESET CLUSTER SETTING kv.snapshot_rebalance.max_rate",
-		"RESET CLUSTER SETTING kv.snapshot_recovery.max_rate",
 	}
 	if sizeMB > 0 {
 		queries = []string{
 			fmt.Sprintf("SET CLUSTER SETTING kv.snapshot_rebalance.max_rate = '%dMiB'", sizeMB),
-			fmt.Sprintf("SET CLUSTER SETTING kv.snapshot_recovery.max_rate = '%dMiB'", sizeMB),
 		}
 	}
 	for _, query := range queries {

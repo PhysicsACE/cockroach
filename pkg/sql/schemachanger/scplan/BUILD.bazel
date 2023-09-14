@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -19,12 +18,15 @@ go_library(
         "//pkg/sql/schemachanger/scplan/internal/rules",
         "//pkg/sql/schemachanger/scplan/internal/rules/current",
         "//pkg/sql/schemachanger/scplan/internal/rules/release_22_2",
+        "//pkg/sql/schemachanger/scplan/internal/rules/release_23_1",
         "//pkg/sql/schemachanger/scplan/internal/scgraph",
         "//pkg/sql/schemachanger/scplan/internal/scgraphviz",
         "//pkg/sql/schemachanger/scplan/internal/scstage",
         "//pkg/sql/schemachanger/screl",
+        "//pkg/sql/sem/catid",
         "//pkg/util",
         "//pkg/util/log",
+        "//pkg/util/mon",
         "//pkg/util/timeutil",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
@@ -35,12 +37,12 @@ go_library(
 
 go_test(
     name = "scplan_test",
-    size = "medium",
+    size = "large",
     srcs = [
         "main_test.go",
         "plan_test.go",
     ],
-    args = ["-test.timeout=295s"],
+    args = ["-test.timeout=895s"],
     data = glob(["testdata/**"]),
     deps = [
         ":scplan",
@@ -63,9 +65,9 @@ go_test(
         "//pkg/testutils/datapathutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
-        "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
         "//pkg/util/log",
+        "//pkg/util/mon",
         "//pkg/util/randutil",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",
@@ -73,5 +75,3 @@ go_test(
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
-
-get_x_data(name = "get_x_data")

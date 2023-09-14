@@ -14,8 +14,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverctl"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/redact"
 	"github.com/spf13/cobra"
@@ -59,29 +59,10 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 	const serverType redact.SafeString = "SQL server"
 
 	initConfig := func(ctx context.Context) error {
-		if err := serverCfg.InitSQLServer(ctx); err != nil {
-			return err
-		}
-		// This value is injected in order to have something populated during startup.
-		// In the initial 20.2 release of multi-tenant clusters, no version state was
-		// ever populated in the version cluster setting. A value is populated during
-		// the activation of 21.1. See the documentation attached to the TenantCluster
-		// in upgrade/upgradecluster for more details on the tenant upgrade flow.
-		// Note that the value of 21.1 is populated when a tenant cluster is created
-		// during 21.1 in crdb_internal.create_tenant.
-		//
-		// Note that the tenant will read the value in the system.settings table
-		// before accepting SQL connections.
-		//
-		// TODO(knz): Check if this special initialization can be removed.
-		// See: https://github.com/cockroachdb/cockroach/issues/90831
-		st := serverCfg.BaseConfig.Settings
-		return clusterversion.Initialize(
-			ctx, st.Version.BinaryMinSupportedVersion(), &st.SV,
-		)
+		return serverCfg.InitSQLServer(ctx)
 	}
 
-	newServerFn := func(ctx context.Context, serverCfg server.Config, stopper *stop.Stopper) (serverStartupInterface, error) {
+	newServerFn := func(ctx context.Context, serverCfg server.Config, stopper *stop.Stopper) (serverctl.ServerStartupInterface, error) {
 		// Beware of not writing simply 'return server.NewServer()'. This is
 		// because it would cause the serverStartupInterface reference to
 		// always be non-nil, even if NewServer returns a nil pointer (and

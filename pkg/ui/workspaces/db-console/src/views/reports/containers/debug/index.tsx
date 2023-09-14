@@ -260,16 +260,15 @@ export default function Debug() {
   return (
     <div className="section">
       <Helmet title="Debug" />
-      <h3 className="base-heading">Advanced Debugging</h3>
+      <h3 className="base-heading">Advanced Debug</h3>
       {disable_kv_level_advanced_debug && (
         <section className="section">
           <InlineAlert
-            title="Some advanced debug options are not available on secondary tenants."
+            title="Some advanced debug options are not available on virtual clusters."
             intent="warning"
             message={
               <span>
-                To access additional advanced debug options, please login using
-                system tenant credentials.
+                Contact your system operator to gain access to this interface.
               </span>
             }
           />
@@ -446,6 +445,11 @@ export default function Debug() {
             params={{ node: nodeID, seconds: "5", labels: "true" }}
           />
           <DebugTableLink
+            name="Cluster-wide CPU Profile (profiles all nodes; MEMORY OVERHEAD)"
+            url="debug/pprof/ui/cpu/"
+            params={{ node: "all", seconds: "5", labels: "true" }}
+          />
+          <DebugTableLink
             name="Block"
             url="debug/pprof/ui/block/"
             params={{ node: nodeID }}
@@ -555,6 +559,7 @@ export default function Debug() {
         <DebugTableRow title="Metrics">
           <DebugTableLink name="Variables" url="debug/metrics" />
           <DebugTableLink name="Prometheus" url="_status/vars" />
+          <DebugTableLink name="Load" url="_status/load" />
           <DebugTableLink name="Rules" url="api/v2/rules/" />
         </DebugTableRow>
         <DebugTableRow

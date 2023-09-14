@@ -105,12 +105,13 @@ func (zc *debugZipContext) collectClusterData(
 
 	{
 		s := zc.clusterPrinter.start("requesting nodes")
+		var nodesStatus *serverpb.NodesResponse
 		err := zc.runZipFn(ctx, s, func(ctx context.Context) error {
 			nodesList, err = zc.status.NodesList(ctx, &serverpb.NodesListRequest{})
+			nodesStatus, err = zc.status.Nodes(ctx, &serverpb.NodesRequest{})
 			return err
 		})
 
-		nodesStatus, err := zc.status.Nodes(ctx, &serverpb.NodesRequest{})
 		if code := status.Code(errors.Cause(err)); code == codes.Unimplemented {
 			// running on non system tenant, use data from NodesList()
 			if cErr := zc.z.createJSONOrError(s, debugBase+"/nodes.json", nodesList, err); cErr != nil {
@@ -156,7 +157,7 @@ func (zc *debugZipContext) collectClusterData(
 		}
 	}
 
-	{
+	if zipCtx.includeRangeInfo {
 		var tenantRanges *serverpb.TenantRangesResponse
 		s := zc.clusterPrinter.start("requesting tenant ranges")
 		if requestErr := zc.runZipFn(ctx, s, func(ctx context.Context) error {
@@ -165,7 +166,7 @@ func (zc *debugZipContext) collectClusterData(
 			return err
 		}); requestErr != nil {
 			if err := zc.z.createError(s, zc.prefix+tenantRangesName, requestErr); err != nil {
-				return &serverpb.NodesListResponse{}, nil, errors.Wrap(err, "fetching tenant ranges")
+				return &serverpb.NodesListResponse{}, nil, s.fail(err)
 			}
 		} else {
 			s.done()
@@ -176,13 +177,10 @@ func (zc *debugZipContext) collectClusterData(
 					return rangeList.Ranges[i].RangeID > rangeList.Ranges[j].RangeID
 				})
 				sLocality := zc.clusterPrinter.start("writing tenant ranges for locality: %s", locality)
-				prefix := fmt.Sprintf("%s/%s/%s", zc.prefix, tenantRangesName, locality)
-				for _, r := range rangeList.Ranges {
-					sRange := zc.clusterPrinter.start("writing tenant range %d", r.RangeID)
-					name := fmt.Sprintf("%s/%d", prefix, r.RangeID)
-					if err := zc.z.createJSON(sRange, name+".json", r); err != nil {
-						return &serverpb.NodesListResponse{}, nil, errors.Wrapf(err, "writing tenant range %d for locality %s", r.RangeID, locality)
-					}
+				name := fmt.Sprintf("%s/%s/%s", zc.prefix, tenantRangesName, locality)
+				s := zc.clusterPrinter.start("writing tenant ranges for locality %s", locality)
+				if err := zc.z.createJSON(s, name+".json", rangeList.Ranges); err != nil {
+					return &serverpb.NodesListResponse{}, nil, s.fail(err)
 				}
 				sLocality.done()
 			}

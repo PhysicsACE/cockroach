@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -36,6 +35,7 @@ go_test(
     size = "large",
     srcs = [
         "alter_table_bench_test.go",
+        "audit_bench_test.go",
         "bench_test.go",
         "create_alter_role_bench_test.go",
         "discard_bench_test.go",
@@ -47,12 +47,14 @@ go_test(
         "rtt_analysis_test.go",
         "system_bench_test.go",
         "truncate_bench_test.go",
+        "udf_resolution_test.go",
         "validate_benchmark_data_test.go",
         "virtual_table_bench_test.go",
     ],
     args = ["-test.timeout=895s"],
     data = glob(["testdata/**"]),
     embed = [":rttanalysis"],
+    exec_properties = {"Pool": "medium"},
     shard_count = 16,
     deps = [
         "//pkg/base",
@@ -64,5 +66,3 @@ go_test(
         "//pkg/util/randutil",
     ],
 )
-
-get_x_data(name = "get_x_data")

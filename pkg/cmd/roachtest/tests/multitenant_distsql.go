@@ -40,6 +40,7 @@ func registerMultiTenantDistSQL(r registry.Registry) {
 				Name:    fmt.Sprintf("multitenant/distsql/instances=%d/bundle=%s/timeout=%d", numInstances, b, to),
 				Owner:   registry.OwnerSQLQueries,
 				Cluster: r.MakeClusterSpec(4),
+				Leases:  registry.MetamorphicLeases,
 				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 					runMultiTenantDistSQL(ctx, t, c, numInstances, b == "on", to)
 				},
@@ -57,25 +58,34 @@ func runMultiTenantDistSQL(
 	timeoutMillis int,
 ) {
 	c.Put(ctx, t.Cockroach(), "./cockroach")
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(install.SecureOption(true)), c.Node(1))
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(install.SecureOption(true)), c.Node(2))
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(install.SecureOption(true)), c.Node(3))
+	// This test sets a smaller default range size than the default due to
+	// performance and resource limitations. We set the minimum range max bytes to
+	// 1 byte to bypass the guardrails.
+	settings := install.MakeClusterSettings(install.SecureOption(true))
+	settings.Env = append(settings.Env, "COCKROACH_MIN_RANGE_MAX_BYTES=1")
+	tenantEnvOpt := createTenantEnvVar(settings.Env[len(settings.Env)-1])
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Node(1))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Node(2))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Node(3))
 
 	const (
 		tenantID           = 11
 		tenantBaseHTTPPort = 8081
 		tenantBaseSQLPort  = 26259
+		// localPortOffset is used to avoid port conflicts with nodes on a local
+		// cluster.
+		localPortOffset = 1000
 	)
 
 	tenantHTTPPort := func(offset int) int {
 		if c.IsLocal() || numInstances > c.Spec().NodeCount {
-			return tenantBaseHTTPPort + offset
+			return tenantBaseHTTPPort + localPortOffset + offset
 		}
 		return tenantBaseHTTPPort
 	}
 	tenantSQLPort := func(offset int) int {
 		if c.IsLocal() || numInstances > c.Spec().NodeCount {
-			return tenantBaseSQLPort + offset
+			return tenantBaseSQLPort + localPortOffset + offset
 		}
 		return tenantBaseSQLPort
 	}
@@ -85,7 +95,8 @@ func runMultiTenantDistSQL(
 	require.NoError(t, err)
 
 	instances := make([]*tenantNode, 0, numInstances)
-	instance1 := createTenantNode(ctx, t, c, c.Node(1), tenantID, 2 /* node */, tenantHTTPPort(0), tenantSQLPort(0), createTenantCertNodes(c.All()))
+	instance1 := createTenantNode(ctx, t, c, c.Node(1), tenantID, 2 /* node */, tenantHTTPPort(0), tenantSQLPort(0),
+		createTenantCertNodes(c.All()), tenantEnvOpt)
 	instances = append(instances, instance1)
 	defer instance1.stop(ctx, t, c)
 	instance1.start(ctx, t, c, "./cockroach")

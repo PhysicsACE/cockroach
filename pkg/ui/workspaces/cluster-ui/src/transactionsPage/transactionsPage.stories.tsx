@@ -11,61 +11,59 @@
 import React from "react";
 import { storiesOf } from "@storybook/react";
 import { MemoryRouter } from "react-router-dom";
-import { cloneDeep, noop, extend } from "lodash";
+import { cloneDeep, extend, noop } from "lodash";
 import {
-  data,
-  nodeRegions,
   columns,
-  routeProps,
-  timeScale,
-  sortSetting,
+  data,
   filters,
   lastUpdated,
+  nodeRegions,
+  requestTime,
+  routeProps,
+  sortSetting,
+  timeScale,
+  timestamp,
 } from "./transactions.fixture";
 
 import { TransactionsPage } from ".";
 import { RequestError } from "../util";
+import { RequestState, SqlStatsResponse, SqlStatsSortOptions } from "../api";
 
 const getEmptyData = () =>
   extend({}, data, { transactions: [], statements: [] });
+
+const defaultLimitAndSortProps = {
+  limit: 100,
+  reqSortSetting: SqlStatsSortOptions.PCT_RUNTIME,
+  onChangeLimit: noop,
+  onChangeReqSort: noop,
+  onApplySearchCriteria: noop,
+};
 
 storiesOf("Transactions Page", module)
   .addDecorator(storyFn => <MemoryRouter>{storyFn()}</MemoryRouter>)
   .addDecorator(storyFn => (
     <div style={{ backgroundColor: "#F5F7FA" }}>{storyFn()}</div>
   ))
-  .add("with data", () => (
-    <TransactionsPage
-      isDataValid={true}
-      {...routeProps}
-      columns={columns}
-      data={data}
-      timeScale={timeScale}
-      filters={filters}
-      nodeRegions={nodeRegions}
-      hasAdminRole={true}
-      onFilterChange={noop}
-      onSortingChange={noop}
-      refreshData={noop}
-      refreshNodes={noop}
-      refreshUserSQLRoles={noop}
-      resetSQLStats={noop}
-      search={""}
-      sortSetting={sortSetting}
-      lastUpdated={lastUpdated}
-    />
-  ))
-  .add("without data", () => {
+  .add("with data", () => {
+    const resp: RequestState<SqlStatsResponse> = {
+      valid: true,
+      inFlight: false,
+      data,
+      lastUpdated,
+      error: null,
+    };
+
     return (
       <TransactionsPage
         {...routeProps}
-        isDataValid={true}
+        txnsResp={resp}
         columns={columns}
-        data={getEmptyData()}
         timeScale={timeScale}
         filters={filters}
         nodeRegions={nodeRegions}
         hasAdminRole={true}
+        oldestDataAvailable={timestamp}
         onFilterChange={noop}
         onSortingChange={noop}
         refreshData={noop}
@@ -74,7 +72,42 @@ storiesOf("Transactions Page", module)
         resetSQLStats={noop}
         search={""}
         sortSetting={sortSetting}
-        lastUpdated={lastUpdated}
+        requestTime={requestTime}
+        onRequestTimeChange={noop}
+        {...defaultLimitAndSortProps}
+      />
+    );
+  })
+  .add("without data", () => {
+    const resp: RequestState<SqlStatsResponse> = {
+      valid: true,
+      inFlight: false,
+      data: getEmptyData(),
+      lastUpdated,
+      error: null,
+    };
+
+    return (
+      <TransactionsPage
+        {...routeProps}
+        columns={columns}
+        txnsResp={resp}
+        timeScale={timeScale}
+        filters={filters}
+        nodeRegions={nodeRegions}
+        hasAdminRole={true}
+        oldestDataAvailable={timestamp}
+        onFilterChange={noop}
+        onSortingChange={noop}
+        refreshData={noop}
+        refreshNodes={noop}
+        refreshUserSQLRoles={noop}
+        resetSQLStats={noop}
+        search={""}
+        sortSetting={sortSetting}
+        requestTime={requestTime}
+        onRequestTimeChange={noop}
+        {...defaultLimitAndSortProps}
       />
     );
   })
@@ -85,17 +118,25 @@ storiesOf("Transactions Page", module)
     searchParams.set("q", "aaaaaaa");
     history.location.search = searchParams.toString();
 
+    const resp: RequestState<SqlStatsResponse> = {
+      valid: true,
+      inFlight: false,
+      data: getEmptyData(),
+      lastUpdated,
+      error: null,
+    };
+
     return (
       <TransactionsPage
         {...routeProps}
         columns={columns}
-        isDataValid={true}
-        data={getEmptyData()}
+        txnsResp={resp}
         timeScale={timeScale}
         filters={filters}
         history={history}
         nodeRegions={nodeRegions}
         hasAdminRole={true}
+        oldestDataAvailable={timestamp}
         onFilterChange={noop}
         onSortingChange={noop}
         refreshData={noop}
@@ -104,21 +145,31 @@ storiesOf("Transactions Page", module)
         resetSQLStats={noop}
         search={""}
         sortSetting={sortSetting}
-        lastUpdated={lastUpdated}
+        requestTime={requestTime}
+        onRequestTimeChange={noop}
+        {...defaultLimitAndSortProps}
       />
     );
   })
   .add("with loading indicator", () => {
+    const resp: RequestState<SqlStatsResponse> = {
+      valid: true,
+      inFlight: true,
+      data: undefined,
+      lastUpdated,
+      error: null,
+    };
+
     return (
       <TransactionsPage
         {...routeProps}
         columns={columns}
-        isDataValid={true}
-        data={undefined}
+        txnsResp={resp}
         timeScale={timeScale}
         filters={filters}
         nodeRegions={nodeRegions}
         hasAdminRole={true}
+        oldestDataAvailable={timestamp}
         onFilterChange={noop}
         onSortingChange={noop}
         refreshData={noop}
@@ -127,28 +178,35 @@ storiesOf("Transactions Page", module)
         resetSQLStats={noop}
         search={""}
         sortSetting={sortSetting}
-        lastUpdated={lastUpdated}
+        requestTime={requestTime}
+        onRequestTimeChange={noop}
+        {...defaultLimitAndSortProps}
       />
     );
   })
   .add("with error alert", () => {
+    const resp: RequestState<SqlStatsResponse> = {
+      valid: true,
+      inFlight: true,
+      data: undefined,
+      lastUpdated,
+      error: new RequestError(
+        "Forbidden",
+        403,
+        "this operation requires admin privilege",
+      ),
+    };
+
     return (
       <TransactionsPage
         {...routeProps}
         columns={columns}
-        isDataValid={true}
-        data={undefined}
+        txnsResp={resp}
         timeScale={timeScale}
-        error={
-          new RequestError(
-            "Forbidden",
-            403,
-            "this operation requires admin privilege",
-          )
-        }
         filters={filters}
         nodeRegions={nodeRegions}
         hasAdminRole={true}
+        oldestDataAvailable={timestamp}
         onFilterChange={noop}
         onSortingChange={noop}
         refreshData={noop}
@@ -157,7 +215,9 @@ storiesOf("Transactions Page", module)
         resetSQLStats={noop}
         search={""}
         sortSetting={sortSetting}
-        lastUpdated={lastUpdated}
+        requestTime={requestTime}
+        onRequestTimeChange={noop}
+        {...defaultLimitAndSortProps}
       />
     );
   });

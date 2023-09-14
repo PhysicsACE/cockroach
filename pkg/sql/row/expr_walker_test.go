@@ -81,9 +81,9 @@ func TestJobBackedSeqChunkProvider(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	evalCtx := &eval.Context{
 		Codec: s.ExecutorConfig().(sql.ExecutorConfig).Codec,
@@ -201,7 +201,7 @@ func TestJobBackedSeqChunkProvider(t *testing.T) {
 			}
 
 			for id, val := range test.seqIDToExpectedVal {
-				seqDesc := createAndIncrementSeqDescriptor(ctx, t, id, keys.TODOSQLCodec,
+				seqDesc := createAndIncrementSeqDescriptor(ctx, t, id, evalCtx.Codec,
 					test.incrementBy, test.seqIDToOpts[id], kvDB)
 				seqMetadata := &row.SequenceMetadata{
 					SeqDesc:         seqDesc,
@@ -210,7 +210,7 @@ func TestJobBackedSeqChunkProvider(t *testing.T) {
 					CurVal:          0,
 				}
 				require.NoError(t, j.RequestChunk(ctx, evalCtx, annot, seqMetadata))
-				getJobProgressQuery := `SELECT progress FROM system.jobs J WHERE J.id = $1`
+				getJobProgressQuery := `SELECT progress FROM crdb_internal.system_jobs J WHERE J.id = $1`
 
 				var progressBytes []byte
 				require.NoError(t, sqlDB.QueryRow(getJobProgressQuery, job.ID()).Scan(&progressBytes))

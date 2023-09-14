@@ -22,18 +22,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
@@ -119,10 +120,11 @@ func (s Server) ServeLocalReplicas(
 	_ *serverpb.RecoveryCollectLocalReplicaInfoRequest,
 	stream serverpb.Admin_RecoveryCollectLocalReplicaInfoServer,
 ) error {
+	v := s.settings.Version.ActiveVersion(ctx)
 	return s.stores.VisitStores(func(s *kvserver.Store) error {
 		reader := s.TODOEngine().NewSnapshot()
 		defer reader.Close()
-		return visitStoreReplicas(ctx, reader, s.StoreID(), s.NodeID(),
+		return visitStoreReplicas(ctx, reader, s.StoreID(), s.NodeID(), v,
 			func(info loqrecoverypb.ReplicaInfo) error {
 				return stream.Send(&serverpb.RecoveryCollectLocalReplicaInfoResponse{ReplicaInfo: &info})
 			})
@@ -136,6 +138,9 @@ func (s Server) ServeClusterReplicas(
 	kvDB *kv.DB,
 ) (err error) {
 	// Block requests that require fan-out to other nodes until upgrade is finalized.
+	// We can't assume that caller is up-to-date with cluster version and process
+	// regardless of version known by current node as recommended for RPC
+	// requests because caller is a CLI which that only knows its binary version.
 	if !s.settings.Version.IsActive(ctx, clusterversion.V23_1) {
 		return errors.Newf("loss of quorum recovery service requires cluster upgraded to 23.1")
 	}
@@ -150,7 +155,19 @@ func (s Server) ServeClusterReplicas(
 		}
 	}()
 
-	err = contextutil.RunWithTimeout(ctx, "scan range descriptors", s.metadataQueryTimeout,
+	v := s.settings.Version.ActiveVersion(ctx)
+	if err = outStream.Send(&serverpb.RecoveryCollectReplicaInfoResponse{
+		Info: &serverpb.RecoveryCollectReplicaInfoResponse_Metadata{
+			Metadata: &loqrecoverypb.ClusterMetadata{
+				ClusterID: s.clusterIDContainer.String(),
+				Version:   v.Version,
+			},
+		},
+	}); err != nil {
+		return err
+	}
+
+	err = timeutil.RunWithTimeout(ctx, "scan range descriptors", s.metadataQueryTimeout,
 		func(txnCtx context.Context) error {
 			txn := kvDB.NewTxn(txnCtx, "scan-range-descriptors")
 			if err := txn.SetFixedTimestamp(txnCtx, kvDB.Clock().Now()); err != nil {
@@ -245,6 +262,9 @@ func (s Server) StagePlan(
 	ctx context.Context, req *serverpb.RecoveryStagePlanRequest,
 ) (*serverpb.RecoveryStagePlanResponse, error) {
 	// Block requests that require fan-out to other nodes until upgrade is finalized.
+	// We can't assume that caller is up-to-date with cluster version and process
+	// regardless of version known by current node as recommended for RPC
+	// requests because caller is a CLI which that only knows its binary version.
 	if !s.settings.Version.IsActive(ctx, clusterversion.V23_1) {
 		return nil, errors.Newf("loss of quorum recovery service requires cluster upgraded to 23.1")
 	}
@@ -252,10 +272,19 @@ func (s Server) StagePlan(
 	if !req.ForcePlan && req.Plan == nil {
 		return nil, errors.New("stage plan request can't be used with empty plan without force flag")
 	}
-	clusterID := s.clusterIDContainer.Get().String()
-	if req.Plan != nil && req.Plan.ClusterID != clusterID {
-		return nil, errors.Newf("attempting to stage plan from cluster %s on cluster %s",
-			req.Plan.ClusterID, clusterID)
+	if p := req.Plan; p != nil {
+		clusterID := s.clusterIDContainer.Get().String()
+		if p.ClusterID != clusterID {
+			return nil, errors.Newf("attempting to stage plan from cluster %s on cluster %s",
+				p.ClusterID, clusterID)
+		}
+		version := s.settings.Version.ActiveVersion(ctx)
+		if err := checkPlanVersionMatches(p.Version, version.Version, req.ForceLocalInternalVersion); err != nil {
+			return nil, errors.Wrap(err, "incompatible plan")
+		}
+		// It is safe to always update internal to reflect active version since it
+		// is allowed by the check above or is not needed.
+		p.Version.Internal = version.Internal
 	}
 
 	localNodeID := s.nodeIDContainer.Get()
@@ -320,9 +349,10 @@ func (s Server) StagePlan(
 			func(nodeID roachpb.NodeID, client serverpb.AdminClient) error {
 				delete(foundNodes, nodeID)
 				res, err := client.RecoveryStagePlan(ctx, &serverpb.RecoveryStagePlanRequest{
-					Plan:      req.Plan,
-					AllNodes:  false,
-					ForcePlan: req.ForcePlan,
+					Plan:                      req.Plan,
+					AllNodes:                  false,
+					ForcePlan:                 req.ForcePlan,
+					ForceLocalInternalVersion: req.ForceLocalInternalVersion,
 				})
 				if err != nil {
 					nodeErrors = append(nodeErrors,
@@ -439,10 +469,7 @@ func (s Server) NodeStatus(
 }
 
 func (s Server) Verify(
-	ctx context.Context,
-	req *serverpb.RecoveryVerifyRequest,
-	liveNodes livenesspb.IsLiveMap,
-	db *kv.DB,
+	ctx context.Context, req *serverpb.RecoveryVerifyRequest, nl *liveness.NodeLiveness, db *kv.DB,
 ) (*serverpb.RecoveryVerifyResponse, error) {
 	// Block requests that require fan-out to other nodes until upgrade is finalized.
 	if !s.settings.Version.IsActive(ctx, clusterversion.V23_1) {
@@ -453,7 +480,7 @@ func (s Server) Verify(
 	err := s.visitAdminNodes(ctx, fanOutConnectionRetryOptions,
 		notListed(req.DecommissionedNodeIDs),
 		func(nodeID roachpb.NodeID, client serverpb.AdminClient) error {
-			return contextutil.RunWithTimeout(ctx, fmt.Sprintf("retrieve status of n%d", nodeID),
+			return timeutil.RunWithTimeout(ctx, fmt.Sprintf("retrieve status of n%d", nodeID),
 				retrieveNodeStatusTimeout,
 				func(ctx context.Context) error {
 					res, err := client.RecoveryNodeStatus(ctx, &serverpb.RecoveryNodeStatusRequest{})
@@ -468,24 +495,20 @@ func (s Server) Verify(
 	if err != nil {
 		return nil, err
 	}
-
-	decomStatus := make(map[roachpb.NodeID]livenesspb.MembershipStatus)
-	decomNodes := make(map[roachpb.NodeID]interface{})
+	decomNodes := make(map[roachpb.NodeID]bool)
+	decomStatus := make(map[roachpb.NodeID]livenesspb.MembershipStatus, len(req.DecommissionedNodeIDs))
 	for _, plannedID := range req.DecommissionedNodeIDs {
-		decomNodes[plannedID] = struct{}{}
-		if ns, ok := liveNodes[plannedID]; ok {
-			decomStatus[plannedID] = ns.Membership
-		}
+		decomNodes[plannedID] = true
+		decomStatus[plannedID] = nl.GetNodeVitalityFromCache(plannedID).MembershipStatus()
 	}
 
 	isNodeLive := func(rd roachpb.ReplicaDescriptor) bool {
 		// Preemptively remove dead nodes as they would return Forbidden error if
 		// liveness is not stale enough.
-		if _, removed := decomNodes[rd.NodeID]; removed {
+		if decomNodes[rd.NodeID] {
 			return false
 		}
-		l, ok := liveNodes[rd.NodeID]
-		return ok && l.IsLive
+		return nl.GetNodeVitalityFromCache(rd.NodeID).IsLive(livenesspb.LossOfQuorum)
 	}
 
 	getRangeInfo := func(
@@ -518,7 +541,7 @@ func (s Server) Verify(
 		if req.MaxReportedRanges == 0 {
 			return nil, nil
 		}
-		err := contextutil.RunWithTimeout(ctx, "retrieve ranges health", retrieveKeyspaceHealthTimeout,
+		err := timeutil.RunWithTimeout(ctx, "retrieve ranges health", retrieveKeyspaceHealthTimeout,
 			func(ctx context.Context) error {
 				start := keys.Meta2Prefix
 				for {
@@ -614,6 +637,19 @@ func checkRangeHealth(
 	return loqrecoverypb.RangeHealth_LOSS_OF_QUORUM
 }
 
+// makeVisitAvailableNodes creates a function to visit available remote nodes.
+//
+// Returned function would dial all cluster nodes from gossip and executes
+// visitor function with admin client after connection is established. Function
+// will perform retries on dial operation as well on visitor execution.
+//
+// For former, grpcutil.IsConnectionUnavailable check on returned error will
+// abort retry loop because that indicates that node is not available. The
+// expectation here is that we don't know if nodes in gossip are available or
+// not and we don't want to block on dead nodes indefinitely.
+//
+// For latter, errors marked with errMarkRetry marker are retried. It is up
+// to the visitor to mark appropriate errors are retryable.
 func makeVisitAvailableNodes(
 	g *gossip.Gossip, loc roachpb.Locality, rpcCtx *rpc.Context,
 ) visitNodeAdminFn {
@@ -632,6 +668,8 @@ func makeVisitAvailableNodes(
 				// them and let caller handle incomplete info.
 				if err != nil {
 					if grpcutil.IsConnectionUnavailable(err) {
+						log.Infof(ctx, "rejecting node n%d because of suspected un-retryable error: %s",
+							node.NodeID, err)
 						return nil
 					}
 					// This was an initial heartbeat type error, we must retry as node seems
@@ -683,6 +721,18 @@ func makeVisitAvailableNodes(
 	}
 }
 
+// makeVisitNode creates a function to visit a remote node.
+//
+// Returned function would dial a node and executes visitor function with
+// status client after connection is established. Function will perform
+// retries on dial operation as well on visitor execution.
+//
+// For former, closed connection errors will abort retry loop because that
+// indicates that node is not available. The expectation here is that we are
+// trying to talk to available nodes and all other errors are transient.
+//
+// For latter, errors marked with errMarkRetry marker are retried. It is up
+// to the visitor to mark appropriate errors are retryable.
 func makeVisitNode(g *gossip.Gossip, loc roachpb.Locality, rpcCtx *rpc.Context) visitNodeStatusFn {
 	return func(ctx context.Context, nodeID roachpb.NodeID, retryOpts retry.Options,
 		visitor func(client serverpb.StatusClient) error,
@@ -698,6 +748,8 @@ func makeVisitNode(g *gossip.Gossip, loc roachpb.Locality, rpcCtx *rpc.Context) 
 			conn, err = rpcCtx.GRPCDialNode(addr.String(), node.NodeID, rpc.DefaultClass).Connect(ctx)
 			if err != nil {
 				if grpcutil.IsClosedConnection(err) {
+					log.Infof(ctx, "can't dial node n%d because connection is permanently closed: %s",
+						node.NodeID, err)
 					return err
 				}
 				// Retry any other transient connection flakes.

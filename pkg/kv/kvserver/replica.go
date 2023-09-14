@@ -15,7 +15,6 @@ import (
 	"sort"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/docs"
@@ -23,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
@@ -41,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -85,8 +84,6 @@ const (
 	defaultReplicaRaftMuWarnThreshold = 500 * time.Millisecond
 )
 
-var testingDisableQuiescence = envutil.EnvOrDefaultBool("COCKROACH_DISABLE_QUIESCENCE", false)
-
 // StrictGCEnforcement controls whether requests are rejected based on the GC
 // threshold and the current GC TTL (true) or just based on the GC threshold
 // (false).
@@ -97,19 +94,30 @@ var StrictGCEnforcement = settings.RegisterBoolSetting(
 	true,
 )
 
+type atomicDescInfo struct {
+	full           redact.RedactableString
+	fullUnredacted string // `full.StripMarkers()` for use in String() without extra allocs
+	idOnly         string // "<RangeID>/<ReplicaID>" only
+}
+
 type atomicDescString struct {
-	strPtr unsafe.Pointer
+	v atomic.Value // *atomicDescInfo
 }
 
 // store atomically updates d.strPtr with the string representation of desc.
 func (d *atomicDescString) store(replicaID roachpb.ReplicaID, desc *roachpb.RangeDescriptor) {
-	str := redact.Sprintfn(func(w redact.SafePrinter) {
+	printRid := func(w redact.SafePrinter) {
 		w.Printf("%d/", desc.RangeID)
 		if replicaID == 0 {
-			w.SafeString("?:")
+			w.SafeString("?")
 		} else {
-			w.Printf("%d:", replicaID)
+			w.Printf("%d", replicaID)
 		}
+	}
+
+	str := redact.Sprintfn(func(w redact.SafePrinter) {
+		printRid(w)
+		w.SafeString(":")
 
 		if !desc.IsInitialized() {
 			w.SafeString("{-}")
@@ -120,24 +128,37 @@ func (d *atomicDescString) store(replicaID roachpb.ReplicaID, desc *roachpb.Rang
 		}
 	})
 
-	atomic.StorePointer(&d.strPtr, unsafe.Pointer(&str))
+	ridOnly := redact.Sprintfn(func(w redact.SafePrinter) {
+		printRid(w)
+	}).StripMarkers()
+
+	d.v.Store(&atomicDescInfo{
+		full:           str,
+		fullUnredacted: str.StripMarkers(),
+		idOnly:         ridOnly,
+	})
 }
 
 // String returns the string representation of the range; since we are not
 // using a lock, the copy might be inconsistent.
 func (d *atomicDescString) String() string {
-	return d.get().StripMarkers()
+	return d.get().fullUnredacted
+}
+
+// ID returns `rX/Y`, i.e. omits the key range portion.
+func (d *atomicDescString) ID() string {
+	return d.get().idOnly
 }
 
 // SafeFormat renders the string safely.
 func (d *atomicDescString) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Print(d.get())
+	w.Print(d.get().full)
 }
 
 // Get returns the string representation of the range; since we are not
 // using a lock, the copy might be inconsistent.
-func (d *atomicDescString) get() redact.RedactableString {
-	return *(*redact.RedactableString)(atomic.LoadPointer(&d.strPtr))
+func (d *atomicDescString) get() *atomicDescInfo {
+	return d.v.Load().(*atomicDescInfo)
 }
 
 // atomicConnectionClass stores an rpc.ConnectionClass atomically.
@@ -158,6 +179,34 @@ func (c *atomicConnectionClass) set(cc rpc.ConnectionClass) {
 type raftSparseStatus struct {
 	raft.BasicStatus
 	Progress map[uint64]tracker.Progress
+}
+
+// ReplicaMutex is an RWMutex. It has its own type to make it easier to look for
+// usages specific to the replica mutex.
+type ReplicaMutex syncutil.RWMutex
+
+func (mu *ReplicaMutex) Lock() {
+	(*syncutil.RWMutex)(mu).Lock()
+}
+
+func (mu *ReplicaMutex) Unlock() {
+	(*syncutil.RWMutex)(mu).Unlock()
+}
+
+func (mu *ReplicaMutex) RLock() {
+	(*syncutil.RWMutex)(mu).RLock()
+}
+
+func (mu *ReplicaMutex) AssertHeld() {
+	(*syncutil.RWMutex)(mu).AssertHeld()
+}
+
+func (mu *ReplicaMutex) AssertRHeld() {
+	(*syncutil.RWMutex)(mu).AssertRHeld()
+}
+
+func (mu *ReplicaMutex) RUnlock() {
+	(*syncutil.RWMutex)(mu).RUnlock()
 }
 
 // A Replica is a contiguous keyspace with writes managed via an
@@ -365,7 +414,7 @@ type Replica struct {
 
 	mu struct {
 		// Protects all fields in the mu struct.
-		syncutil.RWMutex
+		ReplicaMutex
 		// The destroyed status of a replica indicating if it's alive, corrupt,
 		// scheduled for destruction or has been GCed.
 		// destroyStatus should only be set while also holding the raftMu and
@@ -405,7 +454,8 @@ type Replica struct {
 		// thus invalid) even when lastIndexNotDurable is known, in which case the
 		// term will have to be retrieved from the Raft log entry. Use the
 		// invalidLastTerm constant for this case.
-		lastIndexNotDurable, lastTermNotDurable uint64
+		lastIndexNotDurable kvpb.RaftIndex
+		lastTermNotDurable  kvpb.RaftTerm
 		// A map of raft log index of pending snapshots to deadlines.
 		// Used to prohibit raft log truncations that would leave a gap between
 		// the snapshot and the new first index. The map entry has a zero
@@ -501,7 +551,6 @@ type Replica struct {
 		// Instead, the buffer internally holds a reference to mu and will use
 		// it appropriately.
 		proposalBuf propBuf
-
 		// proposals stores the Raft in-flight commands which originated at this
 		// Replica, i.e. all commands for which propose has been called, but which
 		// have not yet applied. A proposal is "pending" until it is "finalized",
@@ -665,7 +714,10 @@ type Replica struct {
 		// raftMu and the entire handleRaftReady loop. Not needed if raftMu is
 		// already held.
 		applyingEntries bool
-		// The replica's Raft group "node".
+		// The replica's Raft group "node". Can be nil for destroyed replicas
+		// (destroyReasonRemoved) and in some tests, otherwise is never nil.
+		//
+		// TODO(erikgrinaker): make this never be nil.
 		internalRaftGroup *raft.RawNode
 
 		// The ID of the leader replica within the Raft group. NB: this is updated
@@ -681,10 +733,10 @@ type Replica struct {
 
 		// The most recently updated time for each follower of this range. This is updated
 		// every time a Raft message is received from a peer.
+		//
 		// Note that superficially it seems that similar information is contained in the
 		// Progress of a RaftStatus, which has a RecentActive field. However, that field
-		// is always true unless CheckQuorum is active, which at the time of writing in
-		// CockroachDB is not the case.
+		// is always true unless CheckQuorum is active.
 		//
 		// The lastUpdateTimes map is also updated when a leaseholder steps up
 		// (making the assumption that all followers are live at that point),
@@ -706,7 +758,7 @@ type Replica struct {
 		// The base index is the index up to (including) which quota was already
 		// released. That is, the first element in quotaReleaseQueue below is
 		// released as the base index moves up by one, etc.
-		proposalQuotaBaseIndex uint64
+		proposalQuotaBaseIndex kvpb.RaftIndex
 
 		// Once the leader observes a proposal come 'out of Raft', we add the size
 		// of the associated command to a queue of quotas we have yet to release
@@ -719,6 +771,9 @@ type Replica struct {
 
 		// Counts calls to Replica.tick()
 		ticks int
+
+		// lastProposalAtTicks tracks the time of the last proposal, in ticks.
+		lastProposalAtTicks int
 
 		// Counts Raft messages refused due to queue congestion.
 		droppedMessages int
@@ -777,6 +832,16 @@ type Replica struct {
 		pausedFollowers map[roachpb.ReplicaID]struct{}
 
 		slowProposalCount int64 // updated in refreshProposalsLocked
+
+		// replicaFlowControlIntegration is used to interface with replication flow
+		// control. It's backed by the node-level kvflowcontrol.Controller that
+		// manages flow tokens for on a per <tenant,work class> basis, which it
+		// interfaces through a replica-level kvflowcontrol.Handle. It's
+		// actively used on replicas initiating replication traffic, i.e. are
+		// both the leaseholder and raft leader.
+		//
+		// Accessing it requires Replica.mu to be held, exclusively.
+		replicaFlowControlIntegration replicaFlowControlIntegration
 	}
 
 	// The raft log truncations that are pending. Access is protected by its own
@@ -795,7 +860,7 @@ type Replica struct {
 		// Requires Replica.raftMu be held when providing logical ops and
 		//  informing the processor of closed timestamp updates. This properly
 		//  synchronizes updates that are linearized and driven by the Raft log.
-		proc *rangefeed.Processor
+		proc rangefeed.Processor
 		// opFilter is a best-effort filter that informs the raft processing
 		// goroutine of which logical operations the rangefeed processor is
 		// interested in based on the processor's current registrations.
@@ -857,7 +922,7 @@ func (r *Replica) String() string {
 // SafeFormat implements the redact.SafeFormatter interface.
 func (r *Replica) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("[n%d,s%d,r%s]",
-		r.store.Ident.NodeID, r.store.Ident.StoreID, r.rangeStr.get())
+		r.store.Ident.NodeID, r.store.Ident.StoreID, &r.rangeStr)
 }
 
 // ReplicaID returns the ID for the Replica. This value is fixed for the
@@ -894,10 +959,14 @@ func (r *Replica) GetMaxBytes() int64 {
 	return r.mu.conf.RangeMaxBytes
 }
 
-// SetSpanConfig sets the replica's span config.
-func (r *Replica) SetSpanConfig(conf roachpb.SpanConfig) {
+// SetSpanConfig sets the replica's span config. It returns whether the change
+// to the span config was "significant". For significant changes, the caller
+// should queue up the span to all the relevant queues since they may not decide
+// to process this replica.
+func (r *Replica) SetSpanConfig(conf roachpb.SpanConfig) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	oldConf := r.mu.conf
 
 	if r.IsInitialized() && !r.mu.conf.IsEmpty() && !conf.IsEmpty() {
 		total := r.mu.state.Stats.Total()
@@ -919,11 +988,51 @@ func (r *Replica) SetSpanConfig(conf roachpb.SpanConfig) {
 			r.mu.largestPreviousMaxRangeSizeBytes = 0
 		}
 	}
-
 	if knobs := r.store.TestingKnobs(); knobs != nil && knobs.SetSpanConfigInterceptor != nil {
 		conf = knobs.SetSpanConfigInterceptor(r.descRLocked(), conf)
 	}
 	r.mu.conf, r.mu.spanConfigExplicitlySet = conf, true
+	return oldConf.HasConfigurationChange(conf)
+}
+
+// MaybeQueue attempts to check and queue against the subset of that are
+// impacted by changes to the SpanConfig. This should be called after any
+// changes to the span configs.
+func (r *Replica) MaybeQueue(ctx context.Context, now hlc.ClockTimestamp) {
+	r.store.splitQueue.Async(ctx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
+		h.MaybeAdd(ctx, r, now)
+	})
+	r.store.mergeQueue.Async(ctx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
+		h.MaybeAdd(ctx, r, now)
+	})
+	if EnqueueInMvccGCQueueOnSpanConfigUpdateEnabled.Get(&r.store.GetStoreConfig().Settings.SV) {
+		r.store.mvccGCQueue.Async(ctx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
+			h.MaybeAdd(ctx, r, now)
+		})
+	}
+	// The replicate queue has a relatively more expensive queue check
+	// (shouldQueue), because it scales with the number of stores, and
+	// performs more checks.
+	if EnqueueInReplicateQueueOnSpanConfigUpdateEnabled.Get(&r.store.GetStoreConfig().Settings.SV) {
+		r.store.replicateQueue.Async(ctx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
+			h.MaybeAdd(ctx, r, now)
+		})
+	}
+}
+
+// IsScratchRange returns true if this is range is a scratch range (i.e.
+// overlaps with the scratch span and has a start key <= keys.ScratchRangeMin).
+func (r *Replica) IsScratchRange() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isScratchRangeRLocked()
+}
+
+func (r *Replica) isScratchRangeRLocked() bool {
+	rangeKeySpan := r.descRLocked().KeySpan()
+	rangeStartKey := rangeKeySpan.Key
+	return rangeKeySpan.AsRawSpanWithNoLocals().Overlaps(keys.ScratchSpan) &&
+		roachpb.RKey(keys.ScratchRangeMin).Compare(rangeStartKey) <= 0
 }
 
 // IsFirstRange returns true if this is the first range.
@@ -1356,7 +1465,7 @@ func (r *Replica) GetLastReplicaGCTimestamp(ctx context.Context) (hlc.Timestamp,
 func (r *Replica) setLastReplicaGCTimestamp(ctx context.Context, timestamp hlc.Timestamp) error {
 	key := keys.RangeLastReplicaGCTimestampKey(r.RangeID)
 	return storage.MVCCPutProto(
-		ctx, r.store.TODOEngine(), nil, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &timestamp)
+		ctx, r.store.TODOEngine(), key, hlc.Timestamp{}, &timestamp, storage.MVCCWriteOptions{})
 }
 
 // getQueueLastProcessed returns the last processed timestamp for the
@@ -1592,13 +1701,8 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 		return kvserverpb.LeaseStatus{}, err
 	}
 
-	var shouldExtend bool
-	postRUnlock := func() {}
 	r.mu.RLock()
-	defer func() {
-		r.mu.RUnlock()
-		postRUnlock()
-	}()
+	defer r.mu.RUnlock()
 
 	// Has the replica been initialized?
 	// NB: this should have already been checked in Store.Send, so we don't need
@@ -1623,7 +1727,7 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 		return kvserverpb.LeaseStatus{}, err
 	}
 
-	st, shouldExtend, err := r.checkLeaseRLocked(ctx, ba)
+	st, err := r.checkLeaseRLocked(ctx, ba)
 	if err != nil {
 		return kvserverpb.LeaseStatus{}, err
 	}
@@ -1647,13 +1751,6 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 		}
 	}
 
-	if shouldExtend {
-		// If we're asked to extend the lease, trigger (async) lease renewal.
-		// Kicking this off requires an exclusive lock, and we hold a read-only lock
-		// already, so we jump through a hoop to run it in a suitably positioned
-		// defer.
-		postRUnlock = func() { r.maybeExtendLeaseAsync(ctx, st) }
-	}
 	return st, nil
 }
 
@@ -1717,12 +1814,10 @@ func (r *Replica) checkExecutionCanProceedRWOrAdmin(
 // checkLeaseRLocked checks the provided batch against the GC
 // threshold and lease. A nil error indicates to go ahead with the batch, and
 // is accompanied either by a valid or zero lease status, the latter case
-// indicating that the request was permitted to bypass the lease check. The
-// returned bool indicates whether the lease should be extended (only on nil
-// error).
+// indicating that the request was permitted to bypass the lease check.
 func (r *Replica) checkLeaseRLocked(
 	ctx context.Context, ba *kvpb.BatchRequest,
-) (kvserverpb.LeaseStatus, bool, error) {
+) (kvserverpb.LeaseStatus, error) {
 	now := r.Clock().NowAsClockTimestamp()
 	// If the request is a write or a consistent read, it requires the
 	// replica serving it to hold the range lease. We pass the write
@@ -1734,7 +1829,6 @@ func (r *Replica) checkLeaseRLocked(
 	reqTS := ba.WriteTimestamp()
 	st := r.leaseStatusForRequestRLocked(ctx, now, reqTS)
 
-	var shouldExtend bool
 	// Write commands that skip the lease check in practice are exactly
 	// RequestLease and TransferLease. Both use the provided previous lease for
 	// verification below raft. We return a zero lease status from this method and
@@ -1745,26 +1839,24 @@ func (r *Replica) checkLeaseRLocked(
 	// doesn't check the lease.
 	if !ba.IsSingleSkipsLeaseCheckRequest() && ba.ReadConsistency != kvpb.INCONSISTENT {
 		// Check the lease.
-		var err error
-		shouldExtend, err = r.leaseGoodToGoForStatusRLocked(ctx, now, reqTS, st)
+		err := r.leaseGoodToGoForStatusRLocked(ctx, now, reqTS, st)
 		if err != nil {
 			// No valid lease, but if we can serve this request via follower reads,
 			// we may continue.
 			if !r.canServeFollowerReadRLocked(ctx, ba) {
 				// If not, return the error.
-				return kvserverpb.LeaseStatus{}, false, err
+				return kvserverpb.LeaseStatus{}, err
 			}
 			// Otherwise, suppress the error. Also, remember that we're not serving
 			// this under the lease by zeroing out the status. We also intentionally
 			// do not pass the original status to checkTSAboveGCThreshold as
 			// this method assumes that a valid status indicates that this replica
-			// holds the lease (see #73123). `shouldExtend` is already false in this
-			// branch, but for completeness we zero it out as well.
-			st, shouldExtend, err = kvserverpb.LeaseStatus{}, false, nil
+			// holds the lease (see #73123).
+			st, err = kvserverpb.LeaseStatus{}, nil
 		}
 	}
 
-	return st, shouldExtend, nil
+	return st, nil
 }
 
 // checkExecutionCanProceedForRangeFeed returns an error if a rangefeed request
@@ -1781,8 +1873,8 @@ func (r *Replica) checkExecutionCanProceedForRangeFeed(
 	} else if err := r.checkSpanInRangeRLocked(ctx, rSpan); err != nil {
 		return err
 	} else if !r.isRangefeedEnabledRLocked() && !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
-		return errors.Errorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
-			docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
+		return errors.Errorf("[r%d] rangefeeds require the kv.rangefeed.enabled setting. See %s",
+			r.RangeID, docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	} else if err := r.checkTSAboveGCThresholdRLocked(ts, status, false /* isAdmin */); err != nil {
 		return err
 	}
@@ -2033,7 +2125,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 	// orphaned followers would fail to queue themselves for GC.) Unquiesce the
 	// range in case it managed to quiesce between when the Subsume request
 	// arrived and now, which is rare but entirely legal.
-	r.maybeUnquiesceLocked()
+	r.maybeUnquiesceLocked(false /* wakeLeader */, true /* mayCampaign */)
 
 	taskCtx := r.AnnotateCtx(context.Background())
 	err = r.store.stopper.RunAsyncTask(taskCtx, "wait-for-merge", func(ctx context.Context) {
@@ -2172,7 +2264,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 // both the lease holder and the raft leader before being applied by other
 // replicas).
 func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
-	ctx context.Context, now hlc.ClockTimestamp,
+	ctx context.Context, status kvserverpb.LeaseStatus,
 ) {
 	if r.store.TestingKnobs().DisableLeaderFollowsLeaseholder {
 		return
@@ -2180,7 +2272,6 @@ func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
 	if !r.isRaftLeaderRLocked() { // fast path
 		return
 	}
-	status := r.leaseStatusAtRLocked(ctx, now)
 	if !status.IsValid() || status.OwnedBy(r.StoreID()) {
 		return
 	}
@@ -2247,9 +2338,9 @@ func (r *Replica) GetLeaseHistory() []roachpb.Lease {
 	return r.leaseHistory.get()
 }
 
-// EnableLeaseHistory turns on the lease history for testing purposes. Returns
-// a function to return it to its original state that can be deferred.
-func EnableLeaseHistory(maxEntries int) func() {
+// EnableLeaseHistoryForTesting turns on the lease history for testing purposes.
+// Returns a function to return it to its original state that can be deferred.
+func EnableLeaseHistoryForTesting(maxEntries int) func() {
 	originalValue := leaseHistoryMaxEntries
 	leaseHistoryMaxEntries = maxEntries
 	return func() {
@@ -2274,7 +2365,8 @@ func (r *Replica) GetEngineCapacity() (roachpb.StoreCapacity, error) {
 // GetApproximateDiskBytes returns an approximate measure of bytes in the store
 // in the specified key range.
 func (r *Replica) GetApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
-	return r.store.TODOEngine().ApproximateDiskBytes(from, to)
+	bytes, _, _, err := r.store.TODOEngine().ApproximateDiskBytes(from, to)
+	return bytes, err
 }
 
 func init() {
@@ -2297,6 +2389,31 @@ func (r *Replica) MeasureRaftCPUNanos(start time.Duration) {
 	})
 }
 
+// RangeUsageInfo returns the usage information for the replica, assigning it
+// to the range usage information.
+// NB: This is currently just the replicas usage, it assumes that the range's
+// usage information matches. Which is dubious in some cases but often
+// reasonable when we only consider the leaseholder.
+func (r *Replica) RangeUsageInfo() allocator.RangeUsageInfo {
+	loadStats := r.LoadStats()
+	localityInfo := r.loadStats.RequestLocalityInfo()
+	return allocator.RangeUsageInfo{
+		LogicalBytes:             r.GetMVCCStats().Total(),
+		QueriesPerSecond:         loadStats.QueriesPerSecond,
+		WritesPerSecond:          loadStats.WriteKeysPerSecond,
+		ReadsPerSecond:           loadStats.ReadKeysPerSecond,
+		WriteBytesPerSecond:      loadStats.WriteBytesPerSecond,
+		ReadBytesPerSecond:       loadStats.ReadBytesPerSecond,
+		RaftCPUNanosPerSecond:    loadStats.RaftCPUNanosPerSecond,
+		RequestCPUNanosPerSecond: loadStats.RequestCPUNanosPerSecond,
+		RequestsPerSecond:        loadStats.RequestsPerSecond,
+		RequestLocality: &allocator.RangeRequestLocalityInfo{
+			Counts:   localityInfo.LocalityCounts,
+			Duration: localityInfo.Duration,
+		},
+	}
+}
+
 // measureNanosRunning measures the difference in cpu time from when this
 // method is called, to when the returned function is called. This difference
 // is recorded against the replica's cpu time attribution.
@@ -2310,6 +2427,12 @@ func (r *Replica) measureNanosRunning(start time.Duration, f func(float64)) {
 // tracker state.
 func (r *Replica) GetLoadStatsForTesting() *load.ReplicaLoad {
 	return r.loadStats
+}
+
+// HasOutstandingLearnerSnapshotInFlightForTesting is for use only by tests to
+// gather whether there are in-flight snapshots to learner replcas.
+func (r *Replica) HasOutstandingLearnerSnapshotInFlightForTesting() bool {
+	return r.errOnOutstandingLearnerSnapshotInflight() != nil
 }
 
 // ReadProtectedTimestampsForTesting is for use only by tests to read and update

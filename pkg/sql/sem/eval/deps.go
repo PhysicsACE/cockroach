@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -26,9 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/lib/pq/oid"
 )
 
@@ -120,11 +123,17 @@ type CatalogBuiltins interface {
 	// redacts its expressions, and re-encodes it.
 	RedactDescriptor(ctx context.Context, encodedDescriptor []byte) ([]byte, error)
 
-	// DescriptorWithPostDeserializationChanges expects an encoded protobuf
-	// descriptor, decodes it, puts it into a catalog.DescriptorBuilder,
-	// calls RunPostDeserializationChanges, and re-encodes it.
-	DescriptorWithPostDeserializationChanges(
-		ctx context.Context, encodedDescriptor []byte,
+	// RepairedDescriptor expects an encoded protobuf descriptor,
+	// decodes it,
+	// puts it into a catalog.DescriptorBuilder,
+	// calls RunPostDeserializationChanges,
+	// calls StripDanglingBackReferences,
+	// and re-encodes it.
+	RepairedDescriptor(
+		ctx context.Context,
+		encodedDescriptor []byte,
+		descIDMightExist func(id descpb.ID) bool,
+		nonTerminalJobIDMightExist func(id jobspb.JobID) bool,
 	) ([]byte, error)
 }
 
@@ -195,6 +204,10 @@ type Planner interface {
 	tree.FunctionReferenceResolver
 
 	// Mon returns the Planner's monitor.
+	//
+	// TODO(yuzefovich): memory usage against this monitor doesn't count against
+	// sql.mem.distsql.current metric, audit the callers to see whether this is
+	// undesirable in some places.
 	Mon() *mon.BytesMonitor
 
 	// ExecutorConfig returns *ExecutorConfig
@@ -373,12 +386,24 @@ type Planner interface {
 	// DML statement and the enforce_home_region session setting is true.
 	EnforceHomeRegion() bool
 
+	// GetRangeDescIterator gets a rangedesc.Iterator for the specified span.
+	GetRangeDescIterator(context.Context, roachpb.Span) (rangedesc.Iterator, error)
+
 	// GetRangeDescByID gets the RangeDescriptor by the specified RangeID.
 	GetRangeDescByID(context.Context, roachpb.RangeID) (roachpb.RangeDescriptor, error)
 
-	SpanStats(context.Context, roachpb.RKey, roachpb.RKey) (*roachpb.SpanStatsResponse, error)
+	SpanStats(context.Context, roachpb.Spans) (*roachpb.SpanStatsResponse, error)
 
 	GetDetailsForSpanStats(ctx context.Context, dbId int, tableId int) (InternalRows, error)
+
+	// MaybeReallocateAnnotations makes a new annotations slice of size
+	// numAnnotations if one is maintained by this Planner and the current one has
+	// less than numAnnotations entries. If updated, the annotations in the eval
+	// context held in the planner is also updated.
+	MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx)
+
+	// Optimizer returns the optimizer associated with this Planner, if any.
+	Optimizer() interface{}
 }
 
 // InternalRows is an iterator interface that's exposed by the internal
@@ -417,6 +442,19 @@ type CompactEngineSpanFunc func(
 	ctx context.Context, nodeID, storeID int32, startKey, endKey []byte,
 ) error
 
+// GetTableMetrics is used to retrieve sstable metrics on a key span
+// (end-exclusive) at the given (nodeID, storeID).
+type GetTableMetricsFunc func(
+	ctx context.Context, nodeID, storeID int32, startKey, endKey []byte,
+) ([]enginepb.SSTableMetricsInfo, error)
+
+// ScanStorageInternalKeysFunc is used to retrieve pebble metrics on a key span
+// (end-exclusive) at the given (nodeID, storeID).
+// megabytesPerSecond is used to specify the maximmum number of bytes read per second.
+type ScanStorageInternalKeysFunc func(
+	ctx context.Context, nodeID, storeID int32, startKey, endKey []byte, megabytesPerSecond int64,
+) ([]enginepb.StorageInternalKeysMetrics, error)
+
 // SetCompactionConcurrencyFunc is used to change the compaction concurrency of a
 // store.
 type SetCompactionConcurrencyFunc func(
@@ -441,6 +479,9 @@ type SessionAccessor interface {
 	// HasRoleOption returns nil iff the current session user has the specified
 	// role option.
 	HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error)
+
+	// CheckPrivilege verifies that the current user has `privilege` on `descriptor`.
+	CheckPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind) error
 
 	// HasViewActivityOrViewActivityRedactedRole returns true iff the current session user has the
 	// VIEWACTIVITY or VIEWACTIVITYREDACTED permission.
@@ -468,6 +509,19 @@ type ClientNoticeSender interface {
 	// BufferClientNotice buffers the notice to send to the client.
 	// This is flushed before the connection is closed.
 	BufferClientNotice(ctx context.Context, notice pgnotice.Notice)
+	// SendClientNotice immediately flushes the notice to the client. This is used
+	// to implement PLpgSQL RAISE statements; most cases should use
+	// BufferClientNotice.
+	SendClientNotice(ctx context.Context, notice pgnotice.Notice) error
+}
+
+// DeferredRoutineSender allows a nested routine to send the information needed
+// for its own evaluation to a parent routine. This is used to defer execution
+// for tail-call optimization. It can only be used during local execution.
+type DeferredRoutineSender interface {
+	// SendDeferredRoutine sends a local nested routine and its arguments to its
+	// parent routine.
+	SendDeferredRoutine(expr *tree.RoutineExpr, args tree.Datums)
 }
 
 // PrivilegedAccessor gives access to certain queries that would otherwise
@@ -487,6 +541,9 @@ type PrivilegedAccessor interface {
 	// Returns the config byte array, a bool representing whether the namespace exists,
 	// and an error if there is one.
 	LookupZoneConfigByNamespaceID(ctx context.Context, id int64) (tree.DBytes, bool, error)
+
+	// IsSystemTable returns if a given descriptor ID is a system table.s
+	IsSystemTable(ctx context.Context, id int64) (bool, error)
 }
 
 // RegionOperator gives access to the current region, validation for all
@@ -510,14 +567,6 @@ type RegionOperator interface {
 	// ResetMultiRegionZoneConfigsForDatabase resets the given database's zone
 	// configuration to its multi-region default.
 	ResetMultiRegionZoneConfigsForDatabase(ctx context.Context, id int64) error
-
-	// OptimizeSystemDatabase configures some tables in the system data as
-	// global and regional by row. The locality changes reduce how long it
-	// takes a server to start up in a multi-region deployment.
-	//
-	// TODO(jeffswenson): remove OptimizeSystemDatabase after cleaning up the
-	// unsafe_optimize_system_database built in.
-	OptimizeSystemDatabase(ctx context.Context) error
 }
 
 // SequenceOperators is used for various sql related functions that can
@@ -545,6 +594,11 @@ type SequenceOperators interface {
 	// `newVal + seqOpts.Increment`.
 	// Takes in a sequence ID rather than a name, unlike SetSequenceValue.
 	SetSequenceValueByID(ctx context.Context, seqID uint32, newVal int64, isCalled bool) error
+
+	// GetLastSequenceValueByID returns the last value returned by the sequence,
+	// not specific to any session. It also returns a flag to indicate if the
+	// sequence has been called before.
+	GetLastSequenceValueByID(ctx context.Context, seqID uint32) (value int64, wasCalled bool, err error)
 }
 
 // ChangefeedState is used to track progress and checkpointing for sinkless/core changefeeds.
@@ -552,7 +606,7 @@ type SequenceOperators interface {
 // over the SQL connection, this state belongs in the EvalCtx.
 type ChangefeedState interface {
 	// SetHighwater sets the frontier timestamp for the changefeed.
-	SetHighwater(frontier *hlc.Timestamp)
+	SetHighwater(frontier hlc.Timestamp)
 
 	// SetCheckpoint sets the checkpoint for the changefeed.
 	SetCheckpoint(spans []roachpb.Span, timestamp hlc.Timestamp)
@@ -615,6 +669,7 @@ type GossipOperator interface {
 // to avoid circular dependency.
 type SQLStatsController interface {
 	ResetClusterSQLStats(ctx context.Context) error
+	ResetActivityTables(ctx context.Context) error
 	CreateSQLStatsCompactionSchedule(ctx context.Context) error
 }
 
@@ -638,6 +693,8 @@ type IndexUsageStatsController interface {
 type StmtDiagnosticsRequestInsertFunc func(
 	ctx context.Context,
 	stmtFingerprint string,
+	planGist string,
+	antiPlanGist bool,
 	samplingProbability float64,
 	minExecutionLatency time.Duration,
 	expiresAfter time.Duration,

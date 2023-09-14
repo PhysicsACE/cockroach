@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
@@ -58,8 +57,9 @@ func VMDir(clusterName string, nodeIdx int) string {
 // Init initializes the Local provider and registers it into vm.Providers.
 func Init(storage VMStorage) error {
 	vm.Providers[ProviderName] = &Provider{
-		clusters: make(cloud.Clusters),
-		storage:  storage,
+		clusters:    make(cloud.Clusters),
+		storage:     storage,
+		DNSProvider: NewDNSProvider(config.DNSDir, "local-zone"),
 	}
 	return nil
 }
@@ -82,17 +82,22 @@ func DeleteCluster(l *logger.Logger, name string) error {
 	l.Printf("Deleting local cluster %s\n", name)
 
 	for i := range c.VMs {
-		if err := os.RemoveAll(VMDir(c.Name, i+1)); err != nil {
+		path := VMDir(c.Name, i+1)
+		if err := os.RemoveAll(path); err != nil {
 			return err
 		}
 	}
 
-	if err := p.storage.DeleteCluster(name); err != nil {
+	if err := p.storage.DeleteCluster(l, name); err != nil {
 		return err
 	}
 
 	delete(p.clusters, name)
-	return nil
+
+	// Local clusters are expected to specifically use the local DNS provider
+	// implementation, and should clean up any DNS records in the local file
+	// system cache.
+	return p.DeleteRecordsBySubdomain(c.Name)
 }
 
 // Clusters returns a list of all known local clusters.
@@ -106,30 +111,48 @@ type VMStorage interface {
 	// SaveCluster saves the metadata for a local cluster. It is expected that
 	// when the program runs again, this same metadata will be reported via
 	// AddCluster.
-	SaveCluster(cluster *cloud.Cluster) error
+	SaveCluster(l *logger.Logger, cluster *cloud.Cluster) error
 
 	// DeleteCluster deletes the metadata for a local cluster.
-	DeleteCluster(name string) error
+	DeleteCluster(l *logger.Logger, name string) error
 }
 
 // A Provider is used to create stub VM objects.
 type Provider struct {
 	clusters cloud.Clusters
-
-	storage VMStorage
+	storage  VMStorage
+	vm.DNSProvider
 }
 
-func (p *Provider) SnapshotVolume(
-	volume vm.Volume, name, description string, labels map[string]string,
-) (string, error) {
-	return "", nil
+func (p *Provider) CreateVolumeSnapshot(
+	l *logger.Logger, volume vm.Volume, vsco vm.VolumeSnapshotCreateOpts,
+) (vm.VolumeSnapshot, error) {
+	return vm.VolumeSnapshot{}, nil
 }
 
-func (p *Provider) CreateVolume(vm.VolumeCreateOpts) (vm.Volume, error) {
+func (p *Provider) CreateVolume(*logger.Logger, vm.VolumeCreateOpts) (vm.Volume, error) {
 	return vm.Volume{}, nil
 }
 
-func (p *Provider) AttachVolumeToVM(vm.Volume, *vm.VM) (string, error) {
+func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) error {
+	return nil
+}
+
+func (p *Provider) ListVolumes(l *logger.Logger, vm *vm.VM) ([]vm.Volume, error) {
+	return vm.NonBootAttachedVolumes, nil
+}
+
+func (p *Provider) ListVolumeSnapshots(
+	l *logger.Logger, vslo vm.VolumeSnapshotListOpts,
+) ([]vm.VolumeSnapshot, error) {
+	return nil, nil
+}
+
+func (p *Provider) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
+	return nil
+}
+
+func (p *Provider) AttachVolume(*logger.Logger, vm.Volume, *vm.VM) (string, error) {
 	return "", nil
 }
 
@@ -145,12 +168,20 @@ func (o *providerOpts) ConfigureClusterFlags(*pflag.FlagSet, vm.MultipleProjects
 }
 
 // CleanSSH is part of the vm.Provider interface.  This implementation is a no-op.
-func (p *Provider) CleanSSH() error {
+func (p *Provider) CleanSSH(l *logger.Logger) error {
 	return nil
 }
 
 // ConfigSSH is part of the vm.Provider interface.  This implementation is a no-op.
-func (p *Provider) ConfigSSH(zones []string) error {
+func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
+	return nil
+}
+
+func (p *Provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	return nil
+}
+
+func (p *Provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
 	return nil
 }
 
@@ -170,30 +201,6 @@ func (p *Provider) Create(
 		return errors.Errorf("'%s' is not a valid local cluster name", c.Name)
 	}
 
-	// We will need to assign ports to the nodes, and they must not conflict with
-	// any other local clusters.
-	var portsTaken intsets.Fast
-	for _, c := range p.clusters {
-		for i := range c.VMs {
-			portsTaken.Add(c.VMs[i].SQLPort)
-			portsTaken.Add(c.VMs[i].AdminUIPort)
-		}
-	}
-	sqlPort := config.DefaultSQLPort
-	adminUIPort := config.DefaultAdminUIPort
-
-	// getPort returns the first available port (starting at *port), and modifies
-	// (*port) to be the following value.
-	getPort := func(port *int) int {
-		for portsTaken.Contains(*port) {
-			(*port)++
-		}
-		result := *port
-		portsTaken.Add(result)
-		(*port)++
-		return result
-	}
-
 	for i := range names {
 		c.VMs[i] = vm.VM{
 			Name:             "localhost",
@@ -201,23 +208,23 @@ func (p *Provider) Create(
 			Lifetime:         time.Hour,
 			PrivateIP:        "127.0.0.1",
 			Provider:         ProviderName,
+			DNSProvider:      ProviderName,
 			ProviderID:       ProviderName,
 			PublicIP:         "127.0.0.1",
+			PublicDNS:        "localhost",
 			RemoteUser:       config.OSUser.Username,
 			VPC:              ProviderName,
 			MachineType:      ProviderName,
 			Zone:             ProviderName,
-			SQLPort:          getPort(&sqlPort),
-			AdminUIPort:      getPort(&adminUIPort),
 			LocalClusterName: c.Name,
 		}
-
-		err := os.MkdirAll(VMDir(c.Name, i+1), 0755)
+		path := VMDir(c.Name, i+1)
+		err := os.MkdirAll(path, 0755)
 		if err != nil {
 			return err
 		}
 	}
-	if err := p.storage.SaveCluster(c); err != nil {
+	if err := p.storage.SaveCluster(l, c); err != nil {
 		return err
 	}
 	p.clusters[c.Name] = c
@@ -225,22 +232,22 @@ func (p *Provider) Create(
 }
 
 // Delete is part of the vm.Provider interface.
-func (p *Provider) Delete(vms vm.List) error {
+func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 	panic("DeleteCluster should be used")
 }
 
 // Reset is part of the vm.Provider interface. This implementation is a no-op.
-func (p *Provider) Reset(vms vm.List) error {
+func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 	return nil
 }
 
 // Extend is part of the vm.Provider interface.  This implementation returns an error.
-func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
+func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
 	return errors.New("local clusters have unlimited lifetime")
 }
 
 // FindActiveAccount is part of the vm.Provider interface. This implementation is a no-op.
-func (p *Provider) FindActiveAccount() (string, error) {
+func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 	return "", nil
 }
 

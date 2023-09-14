@@ -16,7 +16,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -43,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/knz/bubbline/editline"
 	"github.com/knz/bubbline/history"
 )
@@ -67,9 +67,10 @@ Query Buffer
 
 Connection
   \info             display server details including connection strings.
-  \c, \connect {[DB] [USER] [HOST] [PORT] | [URL]}
+  \c, \connect {[DB] [USER] [HOST] [PORT] [options] | [URL]}
                     connect to a server or print the current connection URL.
-                    (Omitted values reuse previous parameters. Use '-' to skip a field.)
+                    Omitted values reuse previous parameters. Use '-' to skip a field.
+                    The option "autocerts" attempts to auto-discover TLS client certs.
   \password [USERNAME]
                     securely change the password for a user
 
@@ -125,15 +126,14 @@ Commands specific to the demo shell (EXPERIMENTAL):
   \demo ls                     list the demo nodes and their connection URLs.
   \demo shutdown <nodeid>      stop a demo node.
   \demo restart <nodeid>       restart a stopped demo node.
-  \demo decommission <nodeid>  decommission a node.
-  \demo recommission <nodeid>  recommission a node.
+  \demo decommission <nodeid>  decommission a node. This implies a shutdown.
   \demo add <locality>         add a node (locality specified as "region=<region>,zone=<zone>").
 `
 
-	defaultPromptPattern = "%n@%M/%/%x>"
+	defaultPromptPattern = "%n@%M:%>/%C%/%x>"
 
 	// debugPromptPattern avoids substitution patterns that require a db roundtrip.
-	debugPromptPattern = "%n@%M>"
+	debugPromptPattern = "%n@%M:%> %C>"
 )
 
 // cliState defines the current state of the CLI during
@@ -320,7 +320,9 @@ func (c *cliState) addHistory(line string) {
 }
 
 func (c *cliState) invalidSyntax(nextState cliStateEnum) cliStateEnum {
-	return c.invalidSyntaxf(nextState, `%s. Try \? for help.`, c.lastInputLine)
+	return c.cliError(nextState,
+		errors.WithHint(errors.Newf("invalid syntax: %s", c.lastInputLine),
+			`Try \? for help.`))
 }
 
 // inCopy implements the sqlShell interface (to support the editor).
@@ -332,26 +334,23 @@ func (c *cliState) resetCopy() {
 	c.copyFromState = nil
 }
 
-func (c *cliState) invalidSyntaxf(
-	nextState cliStateEnum, format string, args ...interface{},
-) cliStateEnum {
-	fmt.Fprint(c.iCtx.stderr, "invalid syntax: ")
-	fmt.Fprintf(c.iCtx.stderr, format, args...)
-	fmt.Fprintln(c.iCtx.stderr)
-	c.exitErr = errInvalidSyntax
-	return nextState
+func (c *cliState) invalidOptionChange(nextState cliStateEnum, opt string) cliStateEnum {
+	return c.cliError(nextState, errors.Newf("cannot change option during multi-line editing: %s", opt))
 }
 
-func (c *cliState) invalidOptionChange(nextState cliStateEnum, opt string) cliStateEnum {
-	c.exitErr = errors.Newf("cannot change option during multi-line editing: %s\n", opt)
-	fmt.Fprintln(c.iCtx.stderr, c.exitErr)
+func (c *cliState) cliError(nextState cliStateEnum, err error) cliStateEnum {
+	c.exitErr = err
+	if !c.singleStatement {
+		clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+	}
+	if c.iCtx.errExit {
+		return cliStop
+	}
 	return nextState
 }
 
 func (c *cliState) internalServerError(nextState cliStateEnum, err error) cliStateEnum {
-	fmt.Fprintf(c.iCtx.stderr, "internal server error: %v\n", err)
-	c.exitErr = err
-	return nextState
+	return c.cliError(nextState, errors.Wrap(err, "internal server error"))
 }
 
 var options = map[string]struct {
@@ -408,7 +407,7 @@ var options = map[string]struct {
 		display: func(c *cliState) string { return strconv.Itoa(c.sqlExecCtx.TableBorderMode) },
 	},
 	`display_format`: {
-		description:               "the output format for tabular data (table, csv, tsv, html, ndjson, sql, records, raw)",
+		description:               fmt.Sprintf("the output format for tabular data (%s)", clisqlexec.TableFormatHelp),
 		isBoolean:                 false,
 		validDuringMultilineEntry: true,
 		set: func(c *cliState, val string) error {
@@ -530,7 +529,7 @@ var options = map[string]struct {
 		deprecated:                true,
 	},
 	`prompt1`: {
-		description:               "prompt string to use before each command (the following are expanded: %M full host, %m host, %> port number, %n user, %/ database, %x txn status)",
+		description:               "prompt string to use before each command (expansions: %M full host, %m host, %> port number, %n user, %/ database, %x txn status, %C logical cluster)",
 		isBoolean:                 false,
 		validDuringMultilineEntry: true,
 		set: func(c *cliState, val string) error {
@@ -556,32 +555,44 @@ var optionNames = func() []string {
 	return names
 }()
 
-var setArgsRe = regexp.MustCompile(`^\s*` + // zero or more leading space.
-	`(?P<option>(?:[a-zA-Z_.0-9]|-)+)` + // 1 or more non-space option characters.
-	`(?:` +
-	`\s*(?:=\s*|\s+)` + // separator: either some spaces, or an equal sign surrounded by optional spaces.
-	`(?P<value>` +
-	`"(?:[^"]|\\.)*"` + // value is either a double-quoted string, which might be empty; or
-	`|` +
-	`[^\s"]+` + // value may be a string of non-space, non-quote characters.
-	`))?` + // value, as a whole, is optional.
-	`\s*$`, // either a standalone option or the value can be followed by optional spaces.
-)
-
-func getSetArgs(sargs string) (ok bool, option string, hasValue bool, value string) {
-	m := setArgsRe.FindStringSubmatch(sargs)
-	if m == nil {
+func getSetArgs(args []string) (ok bool, option string, hasValue bool, value string) {
+	if len(args) == 0 {
+		// Used in testing only.
 		return false, "", false, ""
 	}
-	option = m[1]
-	if len(m) == 2 || m[2] == "" {
-		return true, option, false, ""
+
+	if strings.Contains(args[0], "=") {
+		// Syntax: a=b, a= b.
+		parts := strings.SplitN(args[0], "=", 2)
+		args[0] = parts[0]
+		if len(args) == 1 {
+			args = append(args, "")
+		}
+		args[1] = parts[1] + args[1]
+	} else if len(args) >= 2 && strings.HasPrefix(args[1], "=") {
+		// Syntax: a =b, a = b.
+		if len(args) == 2 {
+			args = append(args, "")
+		}
+		args[2] = args[1][1:] + args[2]
+		copy(args[1:], args[2:])
+		args = args[:len(args)-1]
 	}
-	return true, option, true, m[2]
+
+	if len(args) == 1 {
+		return true, args[0], false, ""
+	}
+
+	// This is the same behavior as in postgres: multiple arguments
+	// in set are concatenated together to form the value string.
+	// To introduce spaces, use quotes.
+	return true, args[0], true, strings.Join(args[1:], "")
 }
 
 // handleSet supports the \set client-side command.
-func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cliStateEnum {
+func (c *cliState) handleSet(
+	line string, args []string, nextState, errState cliStateEnum,
+) cliStateEnum {
 	if len(args) == 0 {
 		optData := make([][]string, 0, len(options))
 		for _, n := range optionNames {
@@ -600,20 +611,14 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 		return nextState
 	}
 
-	// For \set, we're not trusting the default field separator which
-	// simply splits at spaces, because it doesn't help us handle
-	// "a=b", "a = b", "a b" and "a =b" effectively.
-	// Regular expressions to the rescue.
-	sargs := strings.Join(args, " ")
-
-	ok, optName, hasValue, val := getSetArgs(sargs)
+	ok, optName, hasValue, val := getSetArgs(args)
 	if !ok {
 		return c.invalidSyntax(errState)
 	}
 
 	opt, ok := options[optName]
 	if !ok {
-		return c.invalidSyntax(errState)
+		return c.cliError(errState, errors.Newf("unknown variable name: %q", optName))
 	}
 	if len(c.partialLines) > 0 && !opt.validDuringMultilineEntry {
 		return c.invalidOptionChange(errState, optName)
@@ -643,9 +648,7 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 	}
 
 	if err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "\\set %s: %v\n", sargs, err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, errors.Wrapf(err, "%s", line))
 	}
 
 	return nextState
@@ -658,15 +661,13 @@ func (c *cliState) handleUnset(args []string, nextState, errState cliStateEnum) 
 	}
 	opt, ok := options[args[0]]
 	if !ok {
-		return c.invalidSyntax(errState)
+		return c.cliError(errState, errors.Newf("unknown variable name: %q", args[0]))
 	}
 	if len(c.partialLines) > 0 && !opt.validDuringMultilineEntry {
 		return c.invalidOptionChange(errState, args[0])
 	}
 	if err := opt.reset(c); err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "\\unset %s: %v\n", args[0], err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, errors.Wrapf(err, "\\unset %s", args[0]))
 	}
 	return nextState
 }
@@ -680,14 +681,14 @@ func isEndOfStatement(lastTok int) bool {
 func (c *cliState) handleDemo(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
 	// A demo cluster signifies the presence of `cockroach demo`.
 	if c.sqlCtx.DemoCluster == nil {
-		return c.invalidSyntaxf(errState, `\demo can only be run with cockroach demo`)
+		return c.cliError(errState, errors.New(`\demo can only be run with cockroach demo`))
 	}
 
 	// The \demo command has one of three patterns:
 	//
 	//	- A lone command (currently, only ls)
 	//	- A command followed by a string (add followed by locality string)
-	//	- A command followed by a node number (shutdown, restart, decommission, recommission)
+	//	- A command followed by a node number (shutdown, restart, decommission)
 	//
 	// We parse these commands separately, in the following blocks.
 	if len(cmd) == 1 && cmd[0] == "ls" {
@@ -763,10 +764,8 @@ func (c *cliState) handleDemoNodeCommands(
 ) cliStateEnum {
 	nodeID, err := strconv.ParseInt(cmd[1], 10, 32)
 	if err != nil {
-		return c.invalidSyntaxf(
-			errState,
-			"%s",
-			errors.Wrapf(err, "%q is not a valid node ID", cmd[1]),
+		return c.cliError(errState,
+			errors.Wrapf(err, "invalid syntax: %q is not a valid node ID", cmd[1]),
 		)
 	}
 
@@ -785,12 +784,6 @@ func (c *cliState) handleDemoNodeCommands(
 		}
 		fmt.Fprintf(c.iCtx.stdout, "node %d has been restarted\n", nodeID)
 		return nextState
-	case "recommission":
-		if err := c.sqlCtx.DemoCluster.Recommission(ctx, int32(nodeID)); err != nil {
-			return c.internalServerError(errState, err)
-		}
-		fmt.Fprintf(c.iCtx.stdout, "node %d has been recommissioned\n", nodeID)
-		return nextState
 	case "decommission":
 		if err := c.sqlCtx.DemoCluster.Decommission(ctx, int32(nodeID)); err != nil {
 			return c.internalServerError(errState, err)
@@ -808,10 +801,9 @@ func (c *cliState) handleHelp(cmd []string, nextState, errState cliStateEnum) cl
 	if helpText != "" {
 		fmt.Fprintln(c.iCtx.stdout, helpText)
 	} else {
-		fmt.Fprintf(c.iCtx.stderr,
-			"no help available for %q.\nTry \\h with no argument to see available help.\n", command)
-		c.exitErr = errors.New("no help available")
-		return errState
+		return c.cliError(errState, errors.WithHint(
+			errors.Newf("no help available for %q", command),
+			`Try \h with no argument to see available help.`))
 	}
 	return nextState
 }
@@ -823,10 +815,9 @@ func (c *cliState) handleFunctionHelp(cmd []string, nextState, errState cliState
 	if helpText != "" {
 		fmt.Fprintln(c.iCtx.stdout, helpText)
 	} else {
-		fmt.Fprintf(c.iCtx.stderr,
-			"no help available for %q.\nTry \\hf with no argument to see available help.\n", funcName)
-		c.exitErr = errors.New("no help available")
-		return errState
+		return c.cliError(errState, errors.WithHint(
+			errors.Newf("no help available for %q", funcName),
+			`Try \hf with no argument to see available help.`))
 	}
 	return nextState
 }
@@ -862,9 +853,7 @@ func (c *cliState) runSyscmd(line string, nextState, errState cliStateEnum) cliS
 
 	cmdOut, err := c.execSyscmd(command)
 	if err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "command failed: %s\n", err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, errors.Wrap(err, "command failed"))
 	}
 
 	fmt.Fprint(c.iCtx.stdout, cmdOut)
@@ -882,9 +871,7 @@ func (c *cliState) pipeSyscmd(line string, nextState, errState cliStateEnum) cli
 
 	cmdOut, err := c.execSyscmd(command)
 	if err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "command failed: %s\n", err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, errors.Wrap(err, "command failed"))
 	}
 
 	c.lastInputLine = cmdOut
@@ -934,7 +921,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 	} else {
 		// Configure the editor to use the new prompt.
 
-		parsedURL, err := url.Parse(c.conn.GetURL())
+		parsedURL, err := pgurl.Parse(c.conn.GetURL())
 		if err != nil {
 			// If parsing fails, we'll keep the entire URL. The Open call succeeded, and that
 			// is the important part.
@@ -943,10 +930,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 			return nextState
 		}
 
-		userName := ""
-		if parsedURL.User != nil {
-			userName = parsedURL.User.Username()
-		}
+		userName := parsedURL.GetUsername()
 
 		dbName := unknownDbName
 		c.lastKnownTxnStatus = unknownTxnStatus
@@ -961,27 +945,111 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 			dbName = c.refreshDatabaseName()
 		}
 
+		// Do we have a "cluster" option; either as an options= parameter
+		// or as a prefix to the database name?
+		opts := parsedURL.GetExtraOptions()
+		var logicalCluster string
+		if extOptsS := opts.Get("options"); extOptsS != "" {
+			extOpts, err := pgurl.ParseExtendedOptions(extOptsS)
+			if err == nil {
+				logicalCluster = extOpts.Get("cluster")
+			}
+		}
+		if urlDB := parsedURL.GetDatabase(); strings.HasPrefix(urlDB, "cluster:") {
+			parts := strings.SplitN(urlDB, "/", 2)
+			logicalCluster = parts[0][len("cluster:"):]
+		}
+		if logicalCluster != "" {
+			logicalCluster += "/"
+		}
+
 		c.fullPrompt = rePromptFmt.ReplaceAllStringFunc(c.iCtx.customPromptPattern, func(m string) string {
+			// See:
+			// https://www.postgresql.org/docs/15/app-psql.html#APP-PSQL-PROMPTING
 			switch m {
 			case "%M":
-				return parsedURL.Host // full host name.
+				// "The full host name (with domain name) of the database
+				// server, or [local] if the connection is over a Unix domain
+				// socket, or [local:/dir/name], if the Unix domain socket is
+				// not at the compiled in default location."
+				net, host, _ := parsedURL.GetNetworking()
+				switch net {
+				case pgurl.ProtoTCP:
+					return host
+				case pgurl.ProtoUnix:
+					// We do not have "compiled-in default location" in
+					// CockroachDB so the location is always explicit.
+					return fmt.Sprintf("[local:%s]", host)
+				default:
+					// unreachable
+					return ""
+				}
+
 			case "%m":
-				return parsedURL.Hostname() // host name.
+				// "The host name of the database server, truncated at the
+				// first dot, or [local] if the connection is over a Unix
+				// domain socket."
+				net, host, _ := parsedURL.GetNetworking()
+				switch net {
+				case pgurl.ProtoTCP:
+					return strings.SplitN(host, ".", 2)[0]
+				case pgurl.ProtoUnix:
+					return "[local]"
+				default:
+					// unreachable
+					return ""
+				}
+
 			case "%>":
-				return parsedURL.Port() // port.
-			case "%n": // user name.
+				// "The port number at which the database server is listening."
+				_, _, port := parsedURL.GetNetworking()
+				return port
+
+			case "%n":
+				// "The database session user name."
+				//
+				// TODO(sql): in psql this is updated based on the current user
+				// in the session set via SET SESSION AUTHORIZATION.
+				// See: https://github.com/cockroachdb/cockroach/issues/105136
 				return userName
-			case "%/": // database name.
+
+			case "%/":
+				// "The name of the current database."
 				return dbName
-			case "%x": // txn status.
+
+			case "%x":
+				// "Transaction status:..."
+				// Note: the specific string here is incompatible with psql.
+				// For example we use "OPEN" instead of '*". This was an extremely
+				// early decision in the SQL shell's history.
 				return c.lastKnownTxnStatus
+
 			case "%%":
 				return "%"
+
+			case "%C":
+				// CockroachDB extension: the logical cluster name.
+				return logicalCluster
+
 			default:
+				// Not implemented:
+				// %~: "Like %/, but the output is ~ (tilde) if the database is your default database."
+				//     CockroachDB does not have per-user default databases (yet).
+				// %#: "If the session user is a database superuser, then a #, otherwise a >."
+				//     The shell does not know how to determine this yet. See: #105136
+				// %p: "The process ID of the backend currently connected to."
+				//     CockroachDB does not have "backend process IDs" like PostgreSQL.
+				// %R: continuation character
+				//     The mechanism for continuation is handled internally by the input editor.
+				// %l: "The line number inside the current statement, starting from 1."
+				//     Lines are handled internally by the input editor.
+				// %w: "Whitespace of the same width as the most recent output of PROMPT1."
+				//     The prompt alignment for multi-line edits is handled internally by the input editor.
+				// %digits: "Character with given octal code."
+				//     This can also be done via `\set prompt1 '\NNN'`
 				err = fmt.Errorf("unrecognized format code in prompt: %q", m)
 				return ""
 			}
-
 		})
 		if err != nil {
 			c.fullPrompt = err.Error()
@@ -1147,14 +1215,11 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 				c.partialStmtsLen = 0
 				c.useContinuePrompt = false
 			}()
-			c.exitErr = errors.CombineErrors(
+			if err := errors.CombineErrors(
 				pgerror.Newf(pgcode.QueryCanceled, "COPY canceled by user"),
 				c.copyFromState.Cancel(),
-			)
-			if c.exitErr != nil {
-				if !c.singleStatement {
-					clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-				}
+			); err != nil {
+				_ = c.cliError(cliRefreshPrompt, err)
 			}
 			return cliRefreshPrompt
 		}
@@ -1201,9 +1266,7 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 
 	default:
 		// Other errors terminate the shell.
-		fmt.Fprintf(c.iCtx.stderr, "input error: %s\n", err)
-		c.exitErr = err
-		return cliStop
+		return c.cliError(cliStop, errors.Wrap(err, "input error"))
 	}
 
 	c.lastInputLine = l
@@ -1271,13 +1334,9 @@ func (c *cliState) setupChangefeedOutput() (undo func(), err error) {
 }
 
 func (c *cliState) handleDescribe(cmd []string, loopState, errState cliStateEnum) cliStateEnum {
-	var title, sql string
-	var qargs []interface{}
-	var foreach func([]string) []describeStage
-	title, sql, qargs, foreach, c.exitErr = pgInspect(cmd)
-	if c.exitErr != nil {
-		clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-		return errState
+	title, sql, qargs, foreach, err := pgInspect(cmd)
+	if err != nil {
+		return c.cliError(errState, err)
 	}
 
 	if title != "" {
@@ -1292,7 +1351,7 @@ func (c *cliState) handleDescribe(cmd []string, loopState, errState cliStateEnum
 		// There's N stages, each produced by the foreach function
 		// applied on the result of the original SQL. Used mainly by \d.
 		var rows [][]string
-		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
+		if err := c.runWithInterruptableCtx(func(ctx context.Context) error {
 			q := clisqlclient.MakeQuery(fmt.Sprintf(sql, qargs...))
 			var err error
 			_, rows, err = c.sqlExecCtx.RunQuery(
@@ -1300,12 +1359,8 @@ func (c *cliState) handleDescribe(cmd []string, loopState, errState cliStateEnum
 				true, /* showMoreChars */
 			)
 			return err
-		})
-		if c.exitErr != nil {
-			if !c.singleStatement {
-				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-			}
-			return errState
+		}); err != nil {
+			return c.cliError(errState, err)
 		}
 
 		for _, row := range rows {
@@ -1318,7 +1373,7 @@ func (c *cliState) handleDescribe(cmd []string, loopState, errState cliStateEnum
 		if st.title != "" {
 			fmt.Fprintln(c.iCtx.queryOutput, st.title)
 		}
-		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
+		if err := c.runWithInterruptableCtx(func(ctx context.Context) error {
 			q := clisqlclient.MakeQuery(fmt.Sprintf(st.sql, st.qargs...))
 			return c.sqlExecCtx.RunQueryAndFormatResults(
 				ctx,
@@ -1328,12 +1383,8 @@ func (c *cliState) handleDescribe(cmd []string, loopState, errState cliStateEnum
 				c.iCtx.stderr,
 				q,
 			)
-		})
-		if c.exitErr != nil {
-			if !c.singleStatement {
-				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-			}
-			return errState
+		}); err != nil {
+			return c.cliError(errState, err)
 		}
 	}
 	return loopState
@@ -1359,7 +1410,10 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	// any, in all cases.
 	line := strings.TrimRight(c.lastInputLine, "; ")
 
-	cmd := strings.Fields(line)
+	cmd, err := scanLocalCmdArgs(line)
+	if err != nil {
+		return c.cliError(cliStartLine, err)
+	}
 	if cmd[0] == `\z` {
 		// psql compatibility.
 		cmd[0] = `\dp`
@@ -1386,7 +1440,7 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		c.maybeFlushOutput()
 
 	case `\set`:
-		return c.handleSet(cmd[1:], loopState, errState)
+		return c.handleSet(line, cmd[1:], loopState, errState)
 
 	case `\unset`:
 		return c.handleUnset(cmd[1:], loopState, errState)
@@ -1470,17 +1524,11 @@ ORDER BY 1`
 		return c.handleFunctionHelp(cmd[1:], loopState, errState)
 
 	case `\copy`:
-		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
+		if err := c.runWithInterruptableCtx(func(ctx context.Context) error {
 			// Strip out the starting \ in \copy.
 			return c.beginCopyFrom(ctx, line[1:])
-		})
-		if c.exitErr != nil {
-			if !c.singleStatement {
-				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-			}
-			if c.iCtx.errExit {
-				return cliStop
-			}
+		}); err != nil {
+			return c.cliError(cliStartLine, err)
 		}
 		return cliStartLine
 
@@ -1542,9 +1590,7 @@ func (c *cliState) handlePassword(
 
 	passwordHashMethod, err := c.getPasswordHashMethod()
 	if err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "retrieving hash method from server: %v\n", err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, errors.Wrap(err, "retrieving hash method from server"))
 	}
 
 	var escapedUserName string
@@ -1561,22 +1607,16 @@ func (c *cliState) handlePassword(
 	// to stop the entry. This needs to be cleaned up.
 	password1, err := pprompt.PromptForPassword("" /* prompt */)
 	if err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "reading password: %v\n", err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, errors.Wrap(err, "reading password"))
 	}
 
 	password2, err := pprompt.PromptForPassword("Enter it again: ")
 	if err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "reading password: %v\n", err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, errors.Wrap(err, "reading password"))
 	}
 
 	if password1 != password2 {
-		c.exitErr = errors.New("passwords didn't match")
-		fmt.Fprintln(c.iCtx.stderr, c.exitErr)
-		return errState
+		return c.cliError(errState, errors.New("passwords didn't match"))
 	}
 
 	var hashedPassword []byte
@@ -1589,9 +1629,7 @@ func (c *cliState) handlePassword(
 	)
 
 	if err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "hashing password: %v\n", err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, errors.Wrap(err, "hashing password"))
 	}
 
 	c.concatLines = fmt.Sprintf(
@@ -1610,9 +1648,7 @@ func (c *cliState) handleConnect(
 	cmd []string, loopState, errState cliStateEnum,
 ) (resState cliStateEnum) {
 	if err := c.handleConnectInternal(cmd, false /*omitConnString*/); err != nil {
-		fmt.Fprintln(c.iCtx.stderr, err)
-		c.exitErr = err
-		return errState
+		return c.cliError(errState, err)
 	}
 	return loopState
 }
@@ -1672,10 +1708,22 @@ func (c *cliState) handleConnectInternal(cmd []string, omitConnString bool) erro
 		return err
 	}
 
+	var autoCerts bool
+
 	// Parse the arguments to \connect:
-	// it accepts newdb, user, host, port in that order.
+	// it accepts newdb, user, host, port and options in that order.
 	// Each field can be marked as "-" to reuse the current defaults.
+	dbOverride := false
 	switch len(cmd) {
+	case 5:
+		if cmd[4] != "-" {
+			if cmd[4] == "autocerts" {
+				autoCerts = true
+			} else {
+				return errors.Newf(`unknown syntax: \c %s`, strings.Join(cmd, " "))
+			}
+		}
+		fallthrough
 	case 4:
 		if cmd[3] != "-" {
 			if err := newURL.SetOption("port", cmd[3]); err != nil {
@@ -1699,6 +1747,7 @@ func (c *cliState) handleConnectInternal(cmd []string, omitConnString bool) erro
 		fallthrough
 	case 1:
 		if cmd[0] != "-" {
+			dbOverride = true
 			if err := newURL.SetOption("database", cmd[0]); err != nil {
 				return err
 			}
@@ -1713,6 +1762,41 @@ func (c *cliState) handleConnectInternal(cmd []string, omitConnString bool) erro
 
 	default:
 		return errors.Newf(`unknown syntax: \c %s`, strings.Join(cmd, " "))
+	}
+
+	// If the URL contained -ccluster=XXX to start with, but the user
+	// is overriding the DB name manually with cluster:XXX, we want
+	// to inject the new name into the `-ccluster` option.
+	if newDB := newURL.GetDatabase(); dbOverride && strings.HasPrefix(newDB, "cluster:") {
+		extraOpts := newURL.GetExtraOptions()
+		if extendedOptsS := extraOpts.Get("options"); extendedOptsS != "" {
+			extendedOpts, err := pgurl.ParseExtendedOptions(extendedOptsS)
+			// Note: we ignore the case where there is an error. In that
+			// case, the existing `options` string is preserved unchanged.
+			// We do not block the connection here, because perhaps the user
+			// is trying to use a new syntax (supported in a later version
+			// of the server) that we don't yet support in this version of
+			// the shell.
+			if err == nil {
+				parts := strings.SplitN(newDB, "/", 2)
+				logicalCluster := parts[0][len("cluster:"):]
+
+				// Override the cluster name in the -ccluster option with the
+				// new specified cluster.
+				extendedOpts.Set("cluster", logicalCluster)
+				if err := newURL.SetOption("options", pgurl.EncodeExtendedOptions(extendedOpts)); err != nil {
+					return err
+				}
+				// Set the requested db name to the remainder of the db string.
+				actualNewDB := ""
+				if len(parts) > 1 {
+					actualNewDB = parts[1]
+				}
+				if err := newURL.SetOption("database", actualNewDB); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	// If we are reconnecting to the same server with the same user, reuse
@@ -1736,6 +1820,12 @@ func (c *cliState) handleConnectInternal(cmd []string, omitConnString bool) erro
 			return err
 		}
 		newURL.WithAuthn(prevAuthn)
+	}
+
+	if autoCerts {
+		if err := autoFillClientCerts(newURL, currURL, c.sqlCtx.CertsDir); err != nil {
+			return err
+		}
 	}
 
 	if err := newURL.Validate(); err != nil {
@@ -1770,9 +1860,7 @@ func (c *cliState) runInclude(
 	}
 
 	if c.levels >= maxRecursionLevels {
-		c.exitErr = errors.Newf(`\i: too many recursion levels (max %d)`, maxRecursionLevels)
-		fmt.Fprintf(c.iCtx.stderr, "%v\n", c.exitErr)
-		return errState
+		return c.cliError(errState, errors.Newf(`\i: too many recursion levels (max %d)`, maxRecursionLevels))
 	}
 
 	if len(c.partialLines) > 0 {
@@ -1795,9 +1883,7 @@ func (c *cliState) runInclude(
 	// Close the file at the end.
 	defer func() {
 		if err := f.Close(); err != nil {
-			fmt.Fprintf(c.iCtx.stderr, "error: closing %s: %v\n", filename, err)
-			c.exitErr = errors.CombineErrors(c.exitErr, err)
-			resState = errState
+			resState = c.cliError(errState, errors.Wrapf(err, "closing %s", filename))
 		}
 	}()
 
@@ -1973,10 +2059,7 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 			fmt.Fprintln(c.iCtx.stdout, helpText)
 		}
 
-		_ = c.invalidSyntaxf(
-			cliStart, "statement ignored: %v",
-			clierror.NewFormattedError(err, false /*showSeverity*/, false /*verbose*/),
-		)
+		_ = c.cliError(cliStart, errors.Wrap(err, "statement ignored"))
 
 		// Stop here if exiterr is set.
 		if c.iCtx.errExit {
@@ -2009,19 +2092,16 @@ var copyToRe = regexp.MustCompile(`(?i)COPY.*TO\s+STDOUT`)
 // concatLines.
 func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 	if err := c.iCtx.maybeWrapStatement(context.Background(), c.concatLines, c); err != nil {
-		c.exitErr = err
-		if !c.singleStatement {
-			clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-		}
-		if c.iCtx.errExit {
-			return cliStop
-		}
-		return nextState
+		return c.cliError(nextState, err)
 	}
 	if c.iCtx.afterRun != nil {
 		defer c.iCtx.afterRun()
 		c.iCtx.afterRun = nil
 	}
+
+	// Clear the error state - the new statement will define a new error
+	// status.
+	c.exitErr = nil
 
 	// Once we send something to the server, the txn status may change arbitrarily.
 	// Clear the known state so that further entries do not assume anything.
@@ -2031,22 +2111,15 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 	if c.iCtx.autoTrace != "" {
 		// Clear the trace by disabling tracing, then restart tracing
 		// with the specified options.
-		c.exitErr = c.conn.Exec(
+		if err := c.conn.Exec(
 			context.Background(),
-			"SET tracing = off; SET tracing = "+c.iCtx.autoTrace)
-		if c.exitErr != nil {
-			if !c.singleStatement {
-				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-			}
-			if c.iCtx.errExit {
-				return cliStop
-			}
-			return nextState
+			"SET tracing = off; SET tracing = "+c.iCtx.autoTrace); err != nil {
+			return c.cliError(nextState, err)
 		}
 	}
 
 	// Now run the statement/query.
-	c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
+	if err := c.runWithInterruptableCtx(func(ctx context.Context) error {
 		if scanner.FirstLexicalToken(c.concatLines) == lexbase.COPY {
 			// Ideally this is parsed using the parser, but we've avoided doing so
 			// for clisqlshell to be small.
@@ -2077,11 +2150,10 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 			c.iCtx.stderr,
 			q,
 		)
-	})
-	if c.exitErr != nil {
-		if !c.singleStatement {
-			clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-		}
+	}); err != nil {
+		// Display the error and set c.exitErr, but do not stop the shell
+		// immediately. We still want to display the trace below.
+		_ = c.cliError(nextState, err)
 	}
 
 	// If we are tracing, stop tracing and display the trace. We do
@@ -2630,9 +2702,7 @@ func (c *cliState) runOpen(cmd []string, contState, errState cliStateEnum) (resS
 		outputFile = cmd[0]
 	}
 	if err := c.openOutputFile(outputFile); err != nil {
-		c.exitErr = err
-		fmt.Fprintf(c.iCtx.stderr, "%v\n", c.exitErr)
-		return errState
+		return c.cliError(errState, err)
 	}
 	return contState
 }
@@ -2692,4 +2762,101 @@ func (c *cliState) closeOutputFile() error {
 	c.iCtx.queryOutput = c.iCtx.stdout
 	c.iCtx.queryOutputBuf = nil
 	return err
+}
+
+// autoFillClientCerts tries to discover a TLS client certificate and key
+// for use in newURL. This is used from the \connect command with option
+// "autocerts".
+func autoFillClientCerts(newURL, currURL *pgurl.URL, extraCertsDir string) error {
+	username := newURL.GetUsername()
+	// We could use methods from package "certnames" here but we're
+	// avoiding extra package dependencies for the sake of keeping
+	// the standalone shell binary (cockroach-sql) small.
+	desiredKeyFile := "client." + username + ".key"
+	desiredCertFile := "client." + username + ".crt"
+	// Try to discover a TLS client certificate and key.
+	// First we'll try to find them in the directory specified in the shell config.
+	// This is coming from --certs-dir on the command line (of COCKROACH_CERTS_DIR).
+	//
+	// If not found there, we'll try to find the client cert in the
+	// same directory as the cert in the original URL; and the key in
+	// the same directory as the key in the original URL (cert and key
+	// may be in different places).
+	//
+	// If the original URL doesn't have a cert, we'll try to find a
+	// cert in the directory where the CA cert is stored.
+
+	// If all fails, we'll tell the user where we tried to search.
+	candidateDirs := make(map[string]struct{})
+	var newCert, newKey string
+	if extraCertsDir != "" {
+		candidateDirs[extraCertsDir] = struct{}{}
+		if candidateCert := filepath.Join(extraCertsDir, desiredCertFile); fileExists(candidateCert) {
+			newCert = candidateCert
+		}
+		if candidateKey := filepath.Join(extraCertsDir, desiredKeyFile); fileExists(candidateKey) {
+			newKey = candidateKey
+		}
+	}
+	if newCert == "" || newKey == "" {
+		var caCertDir string
+		if tlsUsed, _, caCertPath := currURL.GetTLSOptions(); tlsUsed {
+			caCertDir = filepath.Dir(caCertPath)
+			candidateDirs[caCertDir] = struct{}{}
+		}
+		var prevCertDir, prevKeyDir string
+		if authnCertEnabled, certPath, keyPath := currURL.GetAuthnCert(); authnCertEnabled {
+			prevCertDir = filepath.Dir(certPath)
+			prevKeyDir = filepath.Dir(keyPath)
+			candidateDirs[prevCertDir] = struct{}{}
+			candidateDirs[prevKeyDir] = struct{}{}
+		}
+		if newKey == "" {
+			if candidateKey := filepath.Join(prevKeyDir, desiredKeyFile); fileExists(candidateKey) {
+				newKey = candidateKey
+			} else if candidateKey := filepath.Join(caCertDir, desiredKeyFile); fileExists(candidateKey) {
+				newKey = candidateKey
+			}
+		}
+		if newCert == "" {
+			if candidateCert := filepath.Join(prevCertDir, desiredCertFile); fileExists(candidateCert) {
+				newCert = candidateCert
+			} else if candidateCert := filepath.Join(caCertDir, desiredCertFile); fileExists(candidateCert) {
+				newCert = candidateCert
+			}
+		}
+	}
+	if newCert == "" || newKey == "" {
+		err := errors.Newf("unable to find TLS client cert and key for user %q", username)
+		if len(candidateDirs) == 0 {
+			err = errors.WithHint(err, "No candidate directories; try specifying --certs-dir on the command line.")
+		} else {
+			sortedDirs := make([]string, 0, len(candidateDirs))
+			for dir := range candidateDirs {
+				sortedDirs = append(sortedDirs, dir)
+			}
+			sort.Strings(sortedDirs)
+			err = errors.WithDetailf(err, "Candidate directories:\n- %s", strings.Join(sortedDirs, "\n- "))
+		}
+		return err
+	}
+
+	newURL.WithAuthn(pgurl.AuthnClientCert(newCert, newKey))
+
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true
+	}
+	if oserror.IsNotExist(err) {
+		return false
+	}
+	// Stat() returned an error that is not "does not exist".
+	// This is unexpected, but we'll treat it as if the file does exist.
+	// The connection will try to use the file, and then fail with a
+	// more specific error.
+	return true
 }

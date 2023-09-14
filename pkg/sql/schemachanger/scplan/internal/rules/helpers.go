@@ -12,7 +12,6 @@ package rules
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -111,6 +110,11 @@ func JoinOnColumnID(a, b NodeVars, relationIDVar, columnIDVar rel.Var) rel.Claus
 	return joinOnColumnIDUntyped(a.El, b.El, relationIDVar, columnIDVar)
 }
 
+// JoinOnColumnFamilyID joins elements on column ID.
+func JoinOnColumnFamilyID(a, b NodeVars, relationIDVar, columnFamilyIDVar rel.Var) rel.Clause {
+	return joinOnColumnFamilyIDUntyped(a.El, b.El, relationIDVar, columnFamilyIDVar)
+}
+
 // JoinOnIndexID joins elements on index ID.
 func JoinOnIndexID(a, b NodeVars, relationIDVar, indexIDVar rel.Var) rel.Clause {
 	return joinOnIndexIDUntyped(a.El, b.El, relationIDVar, indexIDVar)
@@ -206,6 +210,16 @@ var (
 			}
 		},
 	)
+	joinOnColumnFamilyIDUntyped = screl.Schema.Def4(
+		"joinOnColumnFamilyID", "a", "b", "desc-id", "family-id", func(
+			a, b, descID, familyID rel.Var,
+		) rel.Clauses {
+			return rel.Clauses{
+				JoinOnDescIDUntyped(a, b, descID),
+				familyID.Entities(screl.ColumnFamilyID, a, b),
+			}
+		},
+	)
 	joinOnConstraintIDUntyped = screl.Schema.Def4(
 		"joinOnConstraintID", "a", "b", "desc-id", "constraint-id", func(
 			a, b, descID, constraintID rel.Var,
@@ -253,35 +267,19 @@ var (
 		})
 )
 
-// ForEachElement executes a function for each element type.
-func ForEachElement(fn func(element scpb.Element) error) error {
-	var ep scpb.ElementProto
-	vep := reflect.ValueOf(ep)
-	for i := 0; i < vep.NumField(); i++ {
-		e := vep.Field(i).Interface().(scpb.Element)
-		if err := fn(e); err != nil {
-			return iterutil.Map(err)
-		}
-	}
-	return nil
-}
-
 // ForEachElementInActiveVersion executes a function for each element supported within
 // the current active version.
 func ForEachElementInActiveVersion(
 	version clusterversion.ClusterVersion, fn func(element scpb.Element) error,
 ) error {
-	var ep scpb.ElementProto
-	vep := reflect.ValueOf(ep)
-	for i := 0; i < vep.NumField(); i++ {
-		e := vep.Field(i).Interface().(scpb.Element)
+	return scpb.ForEachElementType(func(e scpb.Element) error {
 		if version.IsActive(screl.MinElementVersion(e)) {
 			if err := fn(e); err != nil {
 				return iterutil.Map(err)
 			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 type elementTypePredicate = func(e scpb.Element) bool

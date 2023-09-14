@@ -1,12 +1,14 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "streamclient",
     srcs = [
         "client.go",
+        "client_helpers.go",
         "partitioned_stream_client.go",
+        "pgconn.go",
         "random_stream_client.go",
+        "span_config_stream_client.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient",
     visibility = ["//visibility:public"],
@@ -48,9 +50,14 @@ go_test(
         "client_test.go",
         "main_test.go",
         "partitioned_stream_client_test.go",
+        "span_config_stream_client_test.go",
     ],
     args = ["-test.timeout=55s"],
     embed = [":streamclient"],
+    tags = [
+        "ccl_test",
+        "no-remote-exec",
+    ],
     deps = [
         "//pkg/base",
         "//pkg/ccl",
@@ -60,6 +67,7 @@ go_test(
         "//pkg/ccl/streamingccl/replicationtestutils",
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
+        "//pkg/keys",
         "//pkg/repstream/streampb",
         "//pkg/roachpb",
         "//pkg/security/securityassets",
@@ -84,5 +92,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

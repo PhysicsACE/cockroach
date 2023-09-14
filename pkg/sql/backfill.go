@@ -793,6 +793,12 @@ func (sc *SchemaChanger) validateConstraints(
 				resolver := descs.NewDistSQLTypeResolver(collection, txn.KV())
 				semaCtx := tree.MakeSemaContext()
 				semaCtx.TypeResolver = &resolver
+				semaCtx.NameResolver = NewSkippingCacheSchemaResolver(
+					txn.Descriptors(),
+					sessiondata.NewStack(NewInternalSessionData(ctx, sc.settings, "validate constraint")),
+					txn.KV(),
+					nil, /* authAccessor */
+				)
 				semaCtx.FunctionResolver = descs.NewDistSQLFunctionResolver(collection, txn.KV())
 				// TODO (rohany): When to release this? As of now this is only going to get released
 				//  after the check is validated.
@@ -1049,7 +1055,7 @@ func (sc *SchemaChanger) distIndexBackfill(
 		if err != nil {
 			return err
 		}
-		sd := NewFakeSessionData(sc.execCfg.SV(), "dist-index-backfill")
+		sd := NewInternalSessionData(ctx, sc.execCfg.Settings, "dist-index-backfill")
 		evalCtx = createSchemaChangeEvalCtx(ctx, sc.execCfg, sd, txn.KV().ReadTimestamp(), txn.Descriptors())
 		planCtx = sc.distSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil, /* planner */
 			txn.KV(), DistributionTypeSystemTenantOnly)
@@ -1345,7 +1351,7 @@ func (sc *SchemaChanger) distColumnBackfill(
 				return nil
 			}
 			cbw := MetadataCallbackWriter{rowResultWriter: &errOnlyResultWriter{}, fn: metaFn}
-			sd := NewFakeSessionData(sc.execCfg.SV(), "dist-column-backfill")
+			sd := NewInternalSessionData(ctx, sc.execCfg.Settings, "dist-column-backfill")
 			evalCtx := createSchemaChangeEvalCtx(ctx, sc.execCfg, sd, txn.KV().ReadTimestamp(), txn.Descriptors())
 			recv := MakeDistSQLReceiver(
 				ctx,
@@ -1574,6 +1580,9 @@ func ValidateConstraint(
 			return txn.WithSyntheticDescriptors(
 				[]catalog.Descriptor{tableDesc},
 				func() error {
+					if skip, err := canSkipCheckValidation(tableDesc, ck); err != nil || skip {
+						return err
+					}
 					violatingRow, formattedCkExpr, err := validateCheckExpr(ctx, &semaCtx, txn, sessionData, ck.GetExpr(),
 						tableDesc.(*tabledesc.Mutable), indexIDForValidation)
 					if err != nil {
@@ -1628,6 +1637,29 @@ func ValidateConstraint(
 			return errors.AssertionFailedf("validation of unsupported constraint type")
 		}
 	})
+}
+
+// canSkipCheckValidation returns true if
+//  1. ck is from a hash-sharded column (because the shard column's computed
+//     expression is a modulo operation and thus the check constraint is
+//     valid by construction).
+//  2. ck is a NOT-NULL check and the column is a shard column (because shard
+//     column is a computed column and thus not null by construction).
+func canSkipCheckValidation(
+	tableDesc catalog.TableDescriptor, ck catalog.CheckConstraint,
+) (bool, error) {
+	if ck.IsHashShardingConstraint() {
+		return true, nil
+	}
+	if ck.IsNotNullColumnConstraint() {
+		colID := ck.GetReferencedColumnID(0)
+		col, err := catalog.MustFindColumnByID(tableDesc, colID)
+		if err != nil {
+			return false, err
+		}
+		return tableDesc.IsShardColumn(col), nil
+	}
+	return false, nil
 }
 
 // ValidateInvertedIndexes checks that the indexes have entries for
@@ -2486,7 +2518,7 @@ func runSchemaChangesInTxn(
 				}
 			} else if idx := m.AsIndex(); idx != nil {
 				if err := indexTruncateInTxn(
-					ctx, planner.InternalSQLTxn(), planner.ExecCfg(), planner.Descriptors(), planner.EvalContext(), immutDesc, idx, traceKV,
+					ctx, planner.InternalSQLTxn(), planner.ExecCfg(), planner.EvalContext(), immutDesc, idx, traceKV,
 				); err != nil {
 					return err
 				}
@@ -2899,9 +2931,8 @@ func indexBackfillInTxn(
 // reuse an existing kv.Txn safely.
 func indexTruncateInTxn(
 	ctx context.Context,
-	txn isql.Txn,
+	txn descs.Txn,
 	execCfg *ExecutorConfig,
-	descriptors *descs.Collection,
 	evalCtx *eval.Context,
 	tableDesc catalog.TableDescriptor,
 	idx catalog.Index,
@@ -2928,7 +2959,7 @@ func indexTruncateInTxn(
 		}
 	}
 	// Remove index zone configs.
-	return RemoveIndexZoneConfigs(ctx, txn, execCfg, traceKV, descriptors, tableDesc, []uint32{uint32(idx.GetID())})
+	return RemoveIndexZoneConfigs(ctx, txn, execCfg, traceKV, tableDesc, []uint32{uint32(idx.GetID())})
 }
 
 // We note the time at the start of the merge in order to limit the set of

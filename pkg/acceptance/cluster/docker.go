@@ -25,9 +25,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/docker/distribution/reference"
@@ -280,7 +280,12 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	} else if ci.State.Running {
 		exp = append(exp, eventDie)
 	}
-	if err := c.cluster.client.ContainerRestart(ctx, c.id, timeout); err != nil {
+
+	timeoutSeconds := int(timeout.Seconds())
+	stopOpts := container.StopOptions{
+		Timeout: &timeoutSeconds,
+	}
+	if err := c.cluster.client.ContainerRestart(ctx, c.id, stopOpts); err != nil {
 		return err
 	}
 	c.cluster.expectEvent(c, append(exp, eventRestart)...)
@@ -386,7 +391,7 @@ func (cli resilientDockerClient) ContainerStart(
 	clientCtx context.Context, id string, opts types.ContainerStartOptions,
 ) error {
 	for {
-		err := contextutil.RunWithTimeout(clientCtx, "start container", 20*time.Second, func(ctx context.Context) error {
+		err := timeutil.RunWithTimeout(clientCtx, "start container", 20*time.Second, func(ctx context.Context) error {
 			return cli.APIClient.ContainerStart(ctx, id, opts)
 		})
 
@@ -407,7 +412,7 @@ func (cli resilientDockerClient) ContainerCreate(
 	networkingConfig *network.NetworkingConfig,
 	platformSpec *specs.Platform,
 	containerName string,
-) (container.ContainerCreateCreatedBody, error) {
+) (container.CreateResponse, error) {
 	response, err := cli.APIClient.ContainerCreate(
 		ctx, config, hostConfig, networkingConfig, platformSpec, containerName,
 	)
@@ -419,7 +424,7 @@ func (cli resilientDockerClient) ContainerCreate(
 		})
 		if cerr != nil {
 			log.Infof(ctx, "unable to list containers: %v", cerr)
-			return container.ContainerCreateCreatedBody{}, err
+			return container.CreateResponse{}, err
 		}
 		for _, c := range containers {
 			for _, n := range c.Names {
@@ -435,7 +440,7 @@ func (cli resilientDockerClient) ContainerCreate(
 				}
 				if rerr := cli.ContainerRemove(ctx, c.ID, options); rerr != nil {
 					log.Infof(ctx, "unable to remove container: %v", rerr)
-					return container.ContainerCreateCreatedBody{}, err
+					return container.CreateResponse{}, err
 				}
 				return cli.ContainerCreate(ctx, config, hostConfig, networkingConfig, platformSpec, containerName)
 			}

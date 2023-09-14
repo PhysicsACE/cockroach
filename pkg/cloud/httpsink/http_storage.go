@@ -25,10 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -108,12 +108,6 @@ func (h *httpStorage) Settings() *cluster.Settings {
 	return h.settings
 }
 
-func (h *httpStorage) ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error) {
-	// https://github.com/cockroachdb/cockroach/issues/23859
-	stream, _, err := h.ReadFileAt(ctx, basename, 0)
-	return stream, err
-}
-
 func (h *httpStorage) openStreamAt(
 	ctx context.Context, url string, pos int64,
 ) (*http.Response, error) {
@@ -141,19 +135,19 @@ func (h *httpStorage) openStreamAt(
 	return nil, ctx.Err()
 }
 
-func (h *httpStorage) ReadFileAt(
-	ctx context.Context, basename string, offset int64,
-) (ioctx.ReadCloserCtx, int64, error) {
-	stream, err := h.openStreamAt(ctx, basename, offset)
+func (h *httpStorage) ReadFile(
+	ctx context.Context, basename string, opts cloud.ReadOptions,
+) (_ ioctx.ReadCloserCtx, fileSize int64, _ error) {
+	stream, err := h.openStreamAt(ctx, basename, opts.Offset)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	var size int64
-	if offset == 0 {
+	if opts.Offset == 0 {
 		size = stream.ContentLength
 	} else {
-		size, err = cloud.CheckHTTPContentRangeHeader(stream.Header.Get("Content-Range"), offset)
+		size, err = cloud.CheckHTTPContentRangeHeader(stream.Header.Get("Content-Range"), opts.Offset)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -161,15 +155,15 @@ func (h *httpStorage) ReadFileAt(
 
 	canResume := stream.Header.Get("Accept-Ranges") == "bytes"
 	if canResume {
-		opener := func(ctx context.Context, pos int64) (io.ReadCloser, error) {
+		opener := func(ctx context.Context, pos int64) (io.ReadCloser, int64, error) {
 			s, err := h.openStreamAt(ctx, basename, pos)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
-			return s.Body, err
+			return s.Body, size, err
 		}
-		return cloud.NewResumingReader(ctx, opener, stream.Body, offset,
-			cloud.IsResumableHTTPError, nil), size, nil
+		return cloud.NewResumingReader(ctx, opener, stream.Body, opts.Offset, size, basename,
+			cloud.ResumingReaderRetryOnErrFnForSettings(ctx, h.settings), nil), size, nil
 	}
 	return ioctx.ReadCloserAdapter(stream.Body), size, nil
 }
@@ -186,7 +180,7 @@ func (h *httpStorage) List(_ context.Context, _, _ string, _ cloud.ListingFn) er
 }
 
 func (h *httpStorage) Delete(ctx context.Context, basename string) error {
-	return contextutil.RunWithTimeout(ctx, fmt.Sprintf("DELETE %s", basename),
+	return timeutil.RunWithTimeout(ctx, fmt.Sprintf("DELETE %s", basename),
 		cloud.Timeout.Get(&h.settings.SV), func(ctx context.Context) error {
 			_, err := h.reqNoBody(ctx, "DELETE", basename, nil)
 			return err
@@ -195,7 +189,7 @@ func (h *httpStorage) Delete(ctx context.Context, basename string) error {
 
 func (h *httpStorage) Size(ctx context.Context, basename string) (int64, error) {
 	var resp *http.Response
-	if err := contextutil.RunWithTimeout(ctx, fmt.Sprintf("HEAD %s", basename),
+	if err := timeutil.RunWithTimeout(ctx, fmt.Sprintf("HEAD %s", basename),
 		cloud.Timeout.Get(&h.settings.SV), func(ctx context.Context) error {
 			var err error
 			resp, err = h.reqNoBody(ctx, "HEAD", basename, nil)

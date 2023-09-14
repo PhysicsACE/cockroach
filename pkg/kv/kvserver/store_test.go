@@ -35,9 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
+	aload "github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowdispatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
@@ -46,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -76,7 +78,6 @@ import (
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
 )
 
 var testIdent = roachpb.StoreIdent{
@@ -178,17 +179,16 @@ func createTestStoreWithoutStart(
 	// Setup fake zone config handler.
 	config.TestingSetupZoneConfigHook(stopper)
 
-	rpcContext := rpc.NewContext(ctx,
-		rpc.ContextOptions{
-			TenantID:        roachpb.SystemTenantID,
-			Config:          &base.Config{Insecure: true},
-			Clock:           cfg.Clock.WallClock(),
-			ToleratedOffset: cfg.Clock.ToleratedOffset(),
-			Stopper:         stopper,
-			Settings:        cfg.Settings,
-		})
+	rpcOpts := rpc.DefaultContextOptions()
+	rpcOpts.Insecure = true
+	rpcOpts.Clock = cfg.Clock.WallClock()
+	rpcOpts.ToleratedOffset = cfg.Clock.ToleratedOffset()
+	rpcOpts.Stopper = stopper
+	rpcOpts.Settings = cfg.Settings
+	rpcOpts.TenantRPCAuthorizer = tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer()
+	rpcContext := rpc.NewContext(ctx, rpcOpts)
 	stopper.SetTracer(cfg.AmbientCtx.Tracer)
-	server, err := rpc.NewServer(rpcContext) // never started
+	server, err := rpc.NewServer(ctx, rpcContext) // never started
 	require.NoError(t, err)
 
 	// Some tests inject their own Gossip and StorePool, via
@@ -200,6 +200,9 @@ func createTestStoreWithoutStart(
 	}
 	if cfg.StorePool == nil {
 		cfg.StorePool = NewTestStorePool(*cfg)
+	}
+	if cfg.RPCContext == nil {
+		cfg.RPCContext = rpcContext
 	}
 	// Many tests using this test harness (as opposed to higher-level
 	// ones like multiTestContext or TestServer) want to micro-manage
@@ -228,7 +231,18 @@ func createTestStoreWithoutStart(
 	// and it's important that this doesn't cause crashes. Just set up the
 	// "real thing" since it's straightforward enough.
 	cfg.NodeDialer = nodedialer.New(rpcContext, gossip.AddressResolver(cfg.Gossip))
-	cfg.Transport = NewRaftTransport(cfg.AmbientCtx, cfg.Settings, cfg.Tracer(), cfg.NodeDialer, server, stopper)
+	cfg.Transport = NewRaftTransport(
+		cfg.AmbientCtx,
+		cfg.Settings,
+		cfg.Tracer(),
+		cfg.NodeDialer,
+		server,
+		stopper,
+		kvflowdispatch.NewDummyDispatch(),
+		NoopStoresFlowControlIntegration{},
+		NoopRaftTransportDisconnectListener{},
+		nil, /* knobs */
+	)
 
 	stores := NewStores(cfg.AmbientCtx, cfg.Clock)
 	nodeDesc := &roachpb.NodeDescriptor{NodeID: 1}
@@ -242,7 +256,7 @@ func createTestStoreWithoutStart(
 		NodeDescs:          mockNodeStore{desc: nodeDesc},
 		RPCContext:         rpcContext,
 		RPCRetryOptions:    &retry.Options{},
-		NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(cfg.Gossip)), // TODO
+		NodeDialer:         cfg.NodeDialer,
 		FirstRangeProvider: rangeProv,
 		TestingKnobs: kvcoord.ClientTestingKnobs{
 			TransportFactory: kvcoord.SenderTransportFactory(cfg.AmbientCtx.Tracer, &storeSender),
@@ -365,12 +379,10 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 			if err := storage.MVCCPut(
 				ctx,
 				eng,
-				nil, /* ms */
 				key,
 				hlc.Timestamp{},
-				hlc.ClockTimestamp{},
 				roachpb.MakeValueFromString("fake value for "+key.String()),
-				nil, /* txn */
+				storage.MVCCWriteOptions{},
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -379,7 +391,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 
 	type seenT struct {
 		rangeID   roachpb.RangeID
-		tombstone roachpb.RangeTombstone
+		tombstone kvserverpb.RangeTombstone
 	}
 
 	// Next, write the keys we're planning to see again.
@@ -393,7 +405,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 				continue
 			}
 
-			tombstone := roachpb.RangeTombstone{
+			tombstone := kvserverpb.RangeTombstone{
 				NextReplicaID: roachpb.ReplicaID(rng.Int31n(100)),
 			}
 
@@ -402,7 +414,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 
 			t.Logf("writing tombstone at rangeID=%d", rangeID)
 			if err := storage.MVCCPutProto(
-				ctx, eng, nil /* ms */, keys.RangeTombstoneKey(rangeID), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil /* txn */, &tombstone,
+				ctx, eng, keys.RangeTombstoneKey(rangeID), hlc.Timestamp{}, &tombstone, storage.MVCCWriteOptions{},
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -418,7 +430,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 	})
 
 	var seen []seenT
-	var tombstone roachpb.RangeTombstone
+	var tombstone kvserverpb.RangeTombstone
 
 	handleTombstone := func(rangeID roachpb.RangeID) error {
 		seen = append(seen, seenT{rangeID: rangeID, tombstone: tombstone})
@@ -446,6 +458,40 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 	if diff := pretty.Diff(wanted, seen); len(diff) > 0 {
 		pretty.Ldiff(t, wanted, seen)
 		t.Fatal("diff(wanted, seen) is nonempty")
+	}
+}
+
+// TestStoreConfigSetDefaults checks that StoreConfig.SetDefaults() sets proper
+// defaults based on numStores.
+func TestStoreConfigSetDefaultsNumStores(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testcases := map[string]struct {
+		conc        int
+		defaultConc int
+		numStores   int
+		expectConc  int
+	}{
+		"zero default is retained":         {defaultConc: 0, numStores: 4, expectConc: 0},
+		"negative default is retained":     {defaultConc: -1, numStores: 4, expectConc: -1},
+		"zero stores retains default":      {defaultConc: 4, expectConc: 4},
+		"explicit value not distributed":   {conc: 4, numStores: 2, expectConc: 4},
+		"explicit value overrides default": {conc: 4, defaultConc: 16, numStores: 2, expectConc: 4},
+		"default value is distributed":     {defaultConc: 16, numStores: 4, expectConc: 4},
+		"default value uses ceil division": {defaultConc: 16, numStores: 5, expectConc: 4},
+		"all stores have at least 1":       {defaultConc: 4, numStores: 10, expectConc: 1},
+	}
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			defer func(original int) {
+				defaultRaftSchedulerConcurrency = original // restore global default
+			}(defaultRaftSchedulerConcurrency)
+			defaultRaftSchedulerConcurrency = tc.defaultConc
+			cfg := StoreConfig{RaftSchedulerConcurrency: tc.conc}
+			cfg.SetDefaults(tc.numStores)
+			require.Equal(t, tc.expectConc, cfg.RaftSchedulerConcurrency)
+		})
 	}
 }
 
@@ -690,15 +736,31 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
-		DestroyData: true,
-	}); err != nil {
-		t.Fatal(err)
+
+	// Can't remove Replica with DestroyData false because this requires the destroyStatus
+	// to already have been set by the caller (but we didn't).
+	require.ErrorContains(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		DestroyData: false,
+	}), `replica not marked as destroyed`)
+
+	// Remove the Replica twice, as this should be idempotent.
+	// NB: we rely on this idempotency today (as @tbg found out when he accidentally
+	// removed it).
+	for i := 0; i < 2; i++ {
+		require.NoError(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+			DestroyData: true,
+		}), "%d", i)
 	}
+
+	// However, if we have DestroyData=false, caller is expected to be the unique first "destroyer"
+	// of the Replica.
+	require.ErrorContains(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		DestroyData: false,
+	}), `does not exist`)
 
 	// Verify that removal of a replica marks it as destroyed so that future raft
 	// commands on the Replica will silently be dropped.
-	err = repl1.withRaftGroup(true, func(r *raft.RawNode) (bool, error) {
+	err = repl1.withRaftGroup(func(r *raft.RawNode) (bool, error) {
 		return true, errors.Errorf("unexpectedly created a raft group")
 	})
 	require.Equal(t, errRemoved, err)
@@ -835,7 +897,7 @@ func TestMarkReplicaInitialized(t *testing.T) {
 	require.NoError(t,
 		logstore.NewStateLoader(newRangeID).SetRaftReplicaID(ctx, store.TODOEngine(), replicaID))
 
-	r := newUninitializedReplica(store, newRangeID, replicaID)
+	r, err := newUninitializedReplica(store, newRangeID, replicaID)
 	require.NoError(t, err)
 
 	store.mu.Lock()
@@ -1691,7 +1753,7 @@ func TestStoreResolveWriteIntentNoTxn(t *testing.T) {
 	}
 
 	// Verify that the pushee's timestamp was moved forward on
-	// former read, since we have it available in write intent error.
+	// former read, since we have it available in lock conflict error.
 	minExpTS := getTS
 	minExpTS.Logical++
 	if txn.WriteTimestamp.Less(minExpTS) {
@@ -1716,8 +1778,6 @@ func TestStoreResolveWriteIntentNoTxn(t *testing.T) {
 	}
 }
 
-func setTxnAutoGC(to bool) func() { return batcheval.TestingSetTxnAutoGC(to) }
-
 // TestStoreReadInconsistent verifies that gets and scans with read
 // consistency set to INCONSISTENT or READ_UNCOMMITTED either push or
 // simply ignore extant intents (if they cannot be pushed), depending
@@ -1732,14 +1792,15 @@ func TestStoreReadInconsistent(t *testing.T) {
 		kvpb.INCONSISTENT,
 	} {
 		t.Run(rc.String(), func(t *testing.T) {
-			// The test relies on being able to commit a Txn without specifying the
-			// intent, while preserving the Txn record. Turn off
-			// automatic cleanup for this to work.
-			defer setTxnAutoGC(false)()
 			ctx := context.Background()
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
-			store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
+			cfg := TestStoreConfig(nil)
+			// The test relies on being able to commit a Txn without specifying the
+			// intent, while preserving the Txn record. Turn off
+			// automatic cleanup for this to work.
+			cfg.TestingKnobs.EvalKnobs.DisableTxnAutoGC = true
+			store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 
 			for _, canPush := range []bool{true, false} {
 				keyA := roachpb.Key(fmt.Sprintf("%t-a", canPush))
@@ -2079,7 +2140,7 @@ func TestStoreSkipLockedTSCache(t *testing.T) {
 			t1 := timeutil.Unix(2, 0)
 			manualClock.MustAdvanceTo(t1)
 			lockedKey := roachpb.Key("b")
-			txn := roachpb.MakeTransaction("locker", lockedKey, 0, makeTS(t1.UnixNano(), 0), 0, 0)
+			txn := roachpb.MakeTransaction("locker", lockedKey, 0, 0, makeTS(t1.UnixNano(), 0), 0, 0, 0)
 			txnH := kvpb.Header{Txn: &txn}
 			putArgs := putArgs(lockedKey, []byte("newval"))
 			_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), txnH, &putArgs)
@@ -2245,9 +2306,9 @@ func TestStoreScanIntents(t *testing.T) {
 // limits.
 //
 // The test proceeds as follows: a writer lays down more than
-// `MaxIntentsPerWriteIntentErrorDefault` intents, and a reader is expected to
-// encounter these intents and raise a `WriteIntentError` with exactly
-// `MaxIntentsPerWriteIntentErrorDefault` intents in the error.
+// `MaxIntentsPerLockConflictError` intents, and a reader is expected to
+// encounter these intents and raise a `LockConflictError` with exactly
+// `MaxIntentsPerLockConflictError` intents in the error.
 func TestStoreScanIntentsRespectsLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -2256,27 +2317,27 @@ func TestStoreScanIntentsRespectsLimit(t *testing.T) {
 		t, "this test writes a ton of intents and tries to clean them up, too slow under race",
 	)
 
-	var interceptWriteIntentErrors atomic.Value
+	var interceptLockConflictErrors atomic.Value
 	// `commitCh` is used to block the writer from committing until the reader has
 	// encountered the intents laid down by the writer.
 	commitCh := make(chan struct{})
 	// intentsLaidDownCh is signalled when the writer is done laying down intents.
 	intentsLaidDownCh := make(chan struct{})
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Store: &StoreTestingKnobs{
 					TestingConcurrencyRetryFilter: func(
 						ctx context.Context, ba *kvpb.BatchRequest, pErr *kvpb.Error,
 					) {
-						if errors.HasType(pErr.GoError(), (*kvpb.WriteIntentError)(nil)) {
-							// Assert that the WriteIntentError has MaxIntentsPerWriteIntentErrorIntents.
-							if trap := interceptWriteIntentErrors.Load(); trap != nil && trap.(bool) {
+						if errors.HasType(pErr.GoError(), (*kvpb.LockConflictError)(nil)) {
+							// Assert that the LockConflictError has MaxIntentsPerLockConflictError intents.
+							if trap := interceptLockConflictErrors.Load(); trap != nil && trap.(bool) {
 								require.Equal(
-									t, storage.MaxIntentsPerWriteIntentErrorDefault,
-									len(pErr.GetDetail().(*kvpb.WriteIntentError).Intents),
+									t, storage.MaxIntentsPerLockConflictErrorDefault,
+									len(pErr.GetDetail().(*kvpb.LockConflictError).Locks),
 								)
-								interceptWriteIntentErrors.Store(false)
+								interceptLockConflictErrors.Store(false)
 								// Allow the writer to commit.
 								t.Logf("allowing writer to commit")
 								close(commitCh)
@@ -2295,13 +2356,13 @@ func TestStoreScanIntentsRespectsLimit(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Lay down more than `MaxIntentsPerWriteIntentErrorDefault` intents.
+	// Lay down more than `MaxIntentsPerLockConflictErrorDefault` intents.
 	go func() {
 		defer wg.Done()
 		txn := newTransaction(
 			"test", roachpb.Key("test-key"), roachpb.NormalUserPriority, tc.Server(0).Clock(),
 		)
-		for j := 0; j < storage.MaxIntentsPerWriteIntentErrorDefault+10; j++ {
+		for j := 0; j < storage.MaxIntentsPerLockConflictErrorDefault+10; j++ {
 			var key roachpb.Key
 			key = append(key, keys.ScratchRangeMin...)
 			key = append(key, []byte(fmt.Sprintf("%d", j))...)
@@ -2324,17 +2385,17 @@ func TestStoreScanIntentsRespectsLimit(t *testing.T) {
 	}
 
 	// Now, expect a conflicting reader to encounter the intents and raise a
-	// WriteIntentError with exactly `MaxIntentsPerWriteIntentErrorDefault`
+	// LockConflictError with exactly `MaxIntentsPerLockConflictErrorDefault`
 	// intents. See the TestingConcurrencyRetryFilter above.
 	var ba kv.Batch
-	for i := 0; i < storage.MaxIntentsPerWriteIntentErrorDefault+10; i += 10 {
+	for i := 0; i < storage.MaxIntentsPerLockConflictErrorDefault+10; i += 10 {
 		for _, key := range intentKeys[i : i+10] {
 			args := getArgs(key)
 			ba.AddRawRequest(&args)
 		}
 	}
-	t.Logf("issuing gets while intercepting WriteIntentErrors")
-	interceptWriteIntentErrors.Store(true)
+	t.Logf("issuing gets while intercepting LockConflictErrors")
+	interceptLockConflictErrors.Store(true)
 	go func() {
 		defer wg.Done()
 		err := store.DB().Run(ctx, &ba)
@@ -2579,6 +2640,53 @@ func TestStoreBadRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStore_HottestReplicasByTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
+
+	type testData struct {
+		tenantID uint64
+		qps      float64
+	}
+
+	td := []testData{{1, 2}, {1, 3}, {1, 4}, {1, 5},
+		{2, 1}, {2, 2}, {2, 3}, {2, 4}}
+
+	acc := NewTenantReplicaAccumulator(aload.Queries)
+
+	for i, c := range td {
+		cr := candidateReplica{
+			Replica: &Replica{RangeID: roachpb.RangeID(i)},
+			usage:   allocator.RangeUsageInfo{QueriesPerSecond: c.qps},
+		}
+		cr.mu.tenantID = roachpb.MustMakeTenantID(c.tenantID)
+		acc.AddReplica(cr)
+	}
+
+	store.replRankingsByTenant.Update(acc)
+
+	hotReplicas := store.HottestReplicasByTenant(roachpb.MustMakeTenantID(1))
+	require.NotNil(t, hotReplicas)
+	require.Equal(t, 4, len(hotReplicas))
+
+	// Test requesting hottest replicas asynchronously to detect data race.
+	iterationsNum := 100
+	wg := sync.WaitGroup{}
+	wg.Add(iterationsNum)
+	for i := 0; i < iterationsNum; i++ {
+		go func() {
+			require.NotNil(t, store.HottestReplicasByTenant(roachpb.MustMakeTenantID(1)))
+			require.NotNil(t, store.HottestReplicasByTenant(roachpb.MustMakeTenantID(2)))
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }
 
 // fakeRangeQueue implements the rangeQueue interface and
@@ -2936,13 +3044,14 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	require.NoError(t, s.processRaftSnapshotRequest(ctx, req,
+	_, pErr := s.processRaftSnapshotRequest(ctx, req,
 		IncomingSnapshot{
 			SnapUUID:    uuid.MakeV4(),
 			Desc:        desc,
 			placeholder: placeholder,
 		},
-	).GoError())
+	)
+	require.NoError(t, pErr.GoError())
 
 	testutils.SucceedsSoon(t, func() error {
 		s.mu.Lock()
@@ -3008,14 +3117,14 @@ func TestSendSnapshotThrottling(t *testing.T) {
 			Desc: &roachpb.RangeDescriptor{RangeID: 1},
 		},
 	}
-	newBatch := e.NewBatch
+	newBatch := e.NewWriteBatch
 
 	// Test that a failed Recv() causes a fail throttle
 	{
 		sp := &fakeStorePool{}
 		expectedErr := errors.New("")
 		c := fakeSnapshotStream{nil, expectedErr}
-		err := sendSnapshot(
+		_, err := sendSnapshot(
 			ctx, st, tr, c, sp, header, nil /* snap */, newBatch, nil /* sent */, nil, /* recordBytesSent */
 		)
 		if sp.failedThrottles != 1 {
@@ -3034,7 +3143,7 @@ func TestSendSnapshotThrottling(t *testing.T) {
 			EncodedError: errors.EncodeError(ctx, errors.New("boom")),
 		}
 		c := fakeSnapshotStream{resp, nil}
-		err := sendSnapshot(
+		_, err := sendSnapshot(
 			ctx, st, tr, c, sp, header, nil /* snap */, newBatch, nil /* sent */, nil, /* recordBytesSent */
 		)
 		if sp.failedThrottles != 1 {
@@ -3152,7 +3261,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	s := tc.store
 
 	cleanupNonEmpty1, err := s.reserveReceiveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
-		RangeSize: 1,
+		RangeSize: 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3162,6 +3271,8 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	}
 	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
 		"unexpected snapshot queue length")
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueSize.Value(),
+		"unexpected snapshot queue size")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
 		"unexpected snapshots in progress")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
@@ -3179,6 +3290,8 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	}
 	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
 		"unexpected snapshot queue length")
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueSize.Value(),
+		"unexpected snapshot queue size")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
 		"unexpected snapshots in progress")
 	require.Equal(t, int64(2), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
@@ -3200,6 +3313,10 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 				t.Errorf("unexpected snapshot queue length; expected: %d, got: %d", 1,
 					s.Metrics().RangeSnapshotRecvQueueLength.Value())
 			}
+			if s.Metrics().RangeSnapshotRecvQueueSize.Value() != int64(10) {
+				t.Errorf("unexplected snapshot queue size; expected: %d, got: %d", 1,
+					s.Metrics().RangeSnapshotRecvQueueSize.Value())
+			}
 			if s.Metrics().RangeSnapshotRecvInProgress.Value() != int64(1) {
 				t.Errorf("unexpected snapshots in progress; expected: %d, got: %d", 1,
 					s.Metrics().RangeSnapshotRecvInProgress.Value())
@@ -3211,7 +3328,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	}()
 
 	cleanupNonEmpty3, err := s.reserveReceiveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
-		RangeSize: 1,
+		RangeSize: 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3219,6 +3336,8 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	atomic.StoreInt32(&boom, 1)
 	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
 		"unexpected snapshot queue length")
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueSize.Value(),
+		"unexpected snapshot queue size")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
 		"unexpected snapshots in progress")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
@@ -3379,26 +3498,9 @@ func TestSnapshotRateLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCases := []struct {
-		priority      kvserverpb.SnapshotRequest_Priority
-		expectedLimit rate.Limit
-		expectedErr   string
-	}{
-		{kvserverpb.SnapshotRequest_UNKNOWN, 0, "unknown snapshot priority"},
-		{kvserverpb.SnapshotRequest_RECOVERY, 32 << 20, ""},
-		{kvserverpb.SnapshotRequest_REBALANCE, 32 << 20, ""},
-	}
-	for _, c := range testCases {
-		t.Run(c.priority.String(), func(t *testing.T) {
-			limit, err := snapshotRateLimit(cluster.MakeTestingClusterSettings(), c.priority)
-			if !testutils.IsError(err, c.expectedErr) {
-				t.Fatalf("expected \"%s\", but found %v", c.expectedErr, err)
-			}
-			if c.expectedLimit != limit {
-				t.Fatalf("expected %v, but found %v", c.expectedLimit, limit)
-			}
-		})
-	}
+	st := cluster.MakeTestingClusterSettings()
+	limit := rebalanceSnapshotRate.Get(&st.SV)
+	require.Equal(t, int64(32<<20), limit)
 }
 
 type mockSpanConfigReader struct {
@@ -3406,13 +3508,15 @@ type mockSpanConfigReader struct {
 	overrides map[string]roachpb.SpanConfig
 }
 
-func (m *mockSpanConfigReader) NeedsSplit(ctx context.Context, start, end roachpb.RKey) bool {
+func (m *mockSpanConfigReader) NeedsSplit(
+	ctx context.Context, start, end roachpb.RKey,
+) (bool, error) {
 	panic("unimplemented")
 }
 
 func (m *mockSpanConfigReader) ComputeSplitKey(
 	ctx context.Context, start, end roachpb.RKey,
-) roachpb.RKey {
+) (roachpb.RKey, error) {
 	panic("unimplemented")
 }
 
@@ -3462,7 +3566,7 @@ func TestAllocatorCheckRangeUnconfigured(t *testing.T) {
 		} else {
 			// Expect error looking up spanConfig if we can't use the system config span,
 			// as the spanconfig.KVSubscriber infrastructure is not initialized.
-			require.ErrorIs(t, err, errSysCfgUnavailable)
+			require.ErrorIs(t, err, errSpanConfigsUnavailable)
 			require.Equal(t, allocatorimpl.AllocatorNoop, action)
 		}
 	})
@@ -4001,7 +4105,7 @@ func TestStoreGetOrCreateReplicaWritesRaftReplicaID(t *testing.T) {
 	require.True(t, created)
 	replicaID, err := repl.mu.stateLoader.LoadRaftReplicaID(ctx, tc.store.TODOEngine())
 	require.NoError(t, err)
-	require.Equal(t, &roachpb.RaftReplicaID{ReplicaID: 7}, replicaID)
+	require.Equal(t, &kvserverpb.RaftReplicaID{ReplicaID: 7}, replicaID)
 }
 
 func BenchmarkStoreGetReplica(b *testing.B) {

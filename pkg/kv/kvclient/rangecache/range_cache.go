@@ -26,12 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
@@ -83,6 +83,14 @@ const (
 	ReadFromFollower = kvpb.INCONSISTENT
 	// ReadFromLeaseholder is the RangeLookupConsistency used to read from the
 	// leaseholder.
+	// TODO(baptist): This may be incorrect. An uncommitted read may not see the
+	// updated value. Revisit if this should be a CONSISTENT read against the
+	// leaseholder. READ_UNCOMMITTED does not guarantee a more up-to-date view
+	// than INCONSISTENT, it only guarantees that the read is on the leaseholder,
+	// but may not include writes that have been appended to Raft, but not yet
+	// applied. In the case of certain disk issues, the leaseholders disk may be
+	// significantly behind. An alternative would be to change READ_UNCOMMITTED to
+	// acquire latches. See #98862.
 	ReadFromLeaseholder = kvpb.READ_UNCOMMITTED
 )
 
@@ -915,7 +923,7 @@ func tryLookupImpl(
 	// Since we don't inherit any other cancelation, let's put in a generous
 	// timeout as some protection against unavailable meta ranges.
 	var rs, preRs []roachpb.RangeDescriptor
-	if err := contextutil.RunWithTimeout(ctx, "range lookup", 10*time.Second,
+	if err := timeutil.RunWithTimeout(ctx, "range lookup", 10*time.Second,
 		func(ctx context.Context) error {
 			var err error
 			rs, preRs, err = rc.performRangeLookup(ctx, key, consistency, useReverseScan)

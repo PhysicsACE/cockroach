@@ -24,6 +24,8 @@ import "sql/sessiondatapb/session_data.proto";
 import "util/hlc/timestamp.proto";
 import "clusterversion/cluster_version.proto";
 import "google/protobuf/timestamp.proto";
+import "server/autoconfig/autoconfigpb/autoconfig.proto";
+import "util/tracing/tracingpb/recorded_span.proto";
 
 enum EncryptionMode {
   Passphrase = 0;
@@ -150,6 +152,11 @@ message StreamIngestionProgress {
   // consistent state as of the CutoverTime.
   util.hlc.Timestamp cutover_time = 1 [(gogoproto.nullable) = false];
 
+  // ReplicatedTime is the ingestion frontier. This is the canonical
+  // value of the frontier. The HighWater in the job progress is for
+  // informational purposes only.
+  util.hlc.Timestamp replicated_time = 7 [(gogoproto.nullable) = false];
+
   // ReplicationStatus is the status of the tenant that has a replication
   // (ingestion) job.
   uint32 replication_status = 6 [
@@ -167,11 +174,17 @@ message StreamIngestionProgress {
   repeated string stream_addresses = 5;
 
   reserved 3;
+
+  // RemainingCutoverSpans contains the spans that still need to be cutover once
+  // the cutover time gets set.
+  repeated roachpb.Span remaining_cutover_spans = 8 [(gogoproto.nullable) = false];
+
+  // Next Id: 9
 }
 
 message StreamReplicationDetails {
   // Key spans we are replicating
-  repeated roachpb.Span spans = 1;
+  repeated roachpb.Span spans = 1 [(gogoproto.nullable) = false];
 
   // ID of the protected timestamp record that protects the above spans
   bytes protected_timestamp_record_id = 2 [
@@ -306,7 +319,7 @@ message BackupDetails {
   // invoked.
   string application_name = 23;
 
-  roachpb.Locality coordinator_location = 24 [(gogoproto.nullable) = false];
+  roachpb.Locality execution_locality = 24 [(gogoproto.nullable) = false];
 
   // IncldeAllSecondaryTenants indicates whether a full tenant backup
   // should also include a tenant backup of all existing secondary
@@ -460,7 +473,18 @@ message RestoreDetails {
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
   ];
 
-  // NEXT ID: 29.
+  // Disables loacality checking for zone configs.
+  bool SkipLocalitiesCheck = 29;
+
+  roachpb.Locality execution_locality = 30 [(gogoproto.nullable) = false];
+
+  bool experimental_online = 31;
+
+  // DownloadSpans indicates this job is the download-step of a multi-step
+  // online restore.
+  repeated roachpb.Span download_spans = 32 [(gogoproto.nullable) = false];
+
+  // NEXT ID: 33.
 }
 
 
@@ -469,6 +493,18 @@ message RestoreDetails {
 
 message RestoreProgress {
   bytes high_water = 1;
+
+  message FrontierEntry {
+    roachpb.Span span = 1 [(gogoproto.nullable) = false];
+    util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
+  }
+
+  repeated FrontierEntry checkpoint = 2 [(gogoproto.nullable) = false];
+
+  // TotalDownloadRequired is set in the download job for an online restore, and
+  // reflects the total amount that was initially found to be needing to be
+  // downloaded.
+  uint64 total_download_required = 3;
 }
 
 message ImportDetails {
@@ -851,7 +887,9 @@ message SchemaChangeDetails {
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
   ];
 
-  // Next id 13.
+  sessiondatapb.SessionData session_data = 13;
+
+  // Next id 14.
 }
 
 message SchemaChangeProgress {
@@ -1164,6 +1202,33 @@ message PollJobsStatsDetails {
 message PollJobsStatsProgress {
 }
 
+message AutoConfigRunnerDetails {
+}
+
+message AutoConfigRunnerProgress {
+}
+
+message AutoConfigEnvRunnerDetails {
+  string env_id = 1 [(gogoproto.customname) = "EnvID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/server/autoconfig/autoconfigpb.EnvironmentID"];
+}
+
+message AutoConfigEnvRunnerProgress {
+}
+
+message AutoConfigTaskDetails {
+  string env_id = 1 [(gogoproto.customname) = "EnvID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/server/autoconfig/autoconfigpb.EnvironmentID"];
+  cockroach.server.autoconfig.autoconfigpb.Task task = 2 [(gogoproto.nullable) = false];
+}
+
+message AutoConfigTaskProgress {
+}
+
+message AutoUpdateSQLActivityDetails {
+}
+
+message AutoUpdateSQLActivityProgress {
+}
+
 message Payload {
   string description = 1;
   // If empty, the description is assumed to be the statement.
@@ -1221,6 +1286,11 @@ message Payload {
     // PollJobsStats jobs poll the jobs table for statistics metrics as the number of
     // paused jobs.
     PollJobsStatsDetails poll_jobs_stats = 39;
+
+    AutoConfigRunnerDetails auto_config_runner = 41;
+    AutoConfigEnvRunnerDetails auto_config_env_runner = 42;
+    AutoConfigTaskDetails auto_config_task = 43;
+    AutoUpdateSQLActivityDetails auto_update_sql_activities = 44;
   }
   reserved 26;
   // PauseReason is used to describe the reason that the job is currently paused
@@ -1248,7 +1318,7 @@ message Payload {
   // specifies how old such record could get before this job is canceled.
   int64 maximum_pts_age = 40 [(gogoproto.casttype) = "time.Duration",  (gogoproto.customname) = "MaximumPTSAge"];
 
-  // NEXT ID: 41
+  // NEXT ID: 45
 }
 
 message Progress {
@@ -1290,6 +1360,10 @@ message Progress {
     SchemaTelemetryProgress schema_telemetry = 26;
     KeyVisualizerProgress keyVisualizerProgress = 27;
     PollJobsStatsProgress pollJobsStats = 28;
+    AutoConfigRunnerProgress auto_config_runner = 29;
+    AutoConfigEnvRunnerProgress auto_config_env_runner = 30;
+    AutoConfigTaskProgress auto_config_task = 31;
+    AutoUpdateSQLActivityProgress update_sql_activity = 32;
   }
 
   uint64 trace_id = 21 [(gogoproto.nullable) = false, (gogoproto.customname) = "TraceID", (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb.TraceID"];
@@ -1311,16 +1385,20 @@ enum Type {
   // We can't name this TYPE_SCHEMA_CHANGE due to how proto generates actual
   // names for this enum, which cause a conflict with the SCHEMA_CHANGE entry.
   TYPEDESC_SCHEMA_CHANGE = 9 [(gogoproto.enumvalue_customname) = "TypeTypeSchemaChange"];
-  STREAM_INGESTION = 10 [(gogoproto.enumvalue_customname) = "TypeStreamIngestion"];
+  REPLICATION_STREAM_INGESTION = 10 [(gogoproto.enumvalue_customname) = "TypeReplicationStreamIngestion"];
   NEW_SCHEMA_CHANGE = 11 [(gogoproto.enumvalue_customname) = "TypeNewSchemaChange"];
   MIGRATION = 12 [(gogoproto.enumvalue_customname) = "TypeMigration"];
   AUTO_SPAN_CONFIG_RECONCILIATION = 13 [(gogoproto.enumvalue_customname) = "TypeAutoSpanConfigReconciliation"];
   AUTO_SQL_STATS_COMPACTION = 14 [(gogoproto.enumvalue_customname) = "TypeAutoSQLStatsCompaction"];
-  STREAM_REPLICATION = 15 [(gogoproto.enumvalue_customname) = "TypeStreamReplication"];
+  REPLICATION_STREAM_PRODUCER = 15 [(gogoproto.enumvalue_customname) = "TypeReplicationStreamProducer"];
   ROW_LEVEL_TTL = 16 [(gogoproto.enumvalue_customname) = "TypeRowLevelTTL"];
   AUTO_SCHEMA_TELEMETRY = 17 [(gogoproto.enumvalue_customname) = "TypeAutoSchemaTelemetry"];
   KEY_VISUALIZER = 18 [(gogoproto.enumvalue_customname) = "TypeKeyVisualizer"];
   POLL_JOBS_STATS = 19 [(gogoproto.enumvalue_customname) = "TypePollJobsStats"];
+  AUTO_CONFIG_RUNNER = 20 [(gogoproto.enumvalue_customname) = "TypeAutoConfigRunner"];
+  AUTO_CONFIG_ENV_RUNNER = 21 [(gogoproto.enumvalue_customname) = "TypeAutoConfigEnvRunner"];
+  AUTO_CONFIG_TASK = 22 [(gogoproto.enumvalue_customname) = "TypeAutoConfigTask"];
+  AUTO_UPDATE_SQL_ACTIVITY = 23 [(gogoproto.enumvalue_customname) = "TypeAutoUpdateSQLActivity"];
 }
 
 message Job {
@@ -1349,4 +1427,10 @@ message RetriableExecutionFailure {
   // that the error was too large. While the structure may be lost, at least
   // some information will be preserved.
   string truncated_error = 6;
+}
+
+// TraceData is used to capture the traces of a job when the resumer completes
+// its execution.
+message TraceData {
+  repeated util.tracing.tracingpb.RecordedSpan collected_spans = 1 [(gogoproto.nullable) = false];
 }

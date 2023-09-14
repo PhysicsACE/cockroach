@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -34,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/errors"
 )
 
@@ -115,6 +115,18 @@ type txnDeps struct {
 	settings            *cluster.Settings
 }
 
+type nameEntry struct {
+	descpb.NameInfo
+	id descpb.ID
+}
+
+var _ catalog.NameEntry = &nameEntry{}
+
+// GetID is part of the catalog.NameEntry interface.
+func (t nameEntry) GetID() descpb.ID {
+	return t.id
+}
+
 func (d *txnDeps) UpdateSchemaChangeJob(
 	ctx context.Context, id jobspb.JobID, callback scexec.JobUpdateCallback,
 ) error {
@@ -191,6 +203,11 @@ func (d *txnDeps) DeleteName(ctx context.Context, nameInfo descpb.NameInfo, id d
 	return d.descsCollection.DeleteNamespaceEntryToBatch(ctx, d.kvTrace, &nameInfo, d.getOrCreateBatch())
 }
 
+// AddName implements the scexec.Catalog interface.
+func (d *txnDeps) AddName(ctx context.Context, nameInfo descpb.NameInfo, id descpb.ID) error {
+	return d.descsCollection.InsertNamespaceEntryToBatch(ctx, d.kvTrace, &nameEntry{nameInfo, id}, d.getOrCreateBatch())
+}
+
 // DeleteDescriptor implements the scexec.Catalog interface.
 func (d *txnDeps) DeleteDescriptor(ctx context.Context, id descpb.ID) error {
 	return d.descsCollection.DeleteDescToBatch(ctx, d.kvTrace, id, d.getOrCreateBatch())
@@ -203,7 +220,10 @@ func (d *txnDeps) DeleteZoneConfig(ctx context.Context, id descpb.ID) error {
 
 // Validate implements the scexec.Catalog interface.
 func (d *txnDeps) Validate(ctx context.Context) error {
-	return d.descsCollection.ValidateUncommittedDescriptors(ctx, d.txn.KV())
+	return d.descsCollection.ValidateUncommittedDescriptors(ctx,
+		d.txn.KV(),
+		false, /*validateZoneConfigs*/
+		nil /*zoneConfigValidator*/)
 }
 
 // Run implements the scexec.Catalog interface.
@@ -216,6 +236,13 @@ func (d *txnDeps) Run(ctx context.Context) error {
 	}
 	d.batch = nil
 	return nil
+}
+
+// InitializeSequence implements the scexec.Caatalog interface.
+func (d *txnDeps) InitializeSequence(id descpb.ID, startVal int64) {
+	batch := d.getOrCreateBatch()
+	sequenceKey := d.codec.SequenceKey(uint32(id))
+	batch.Inc(sequenceKey, startVal)
 }
 
 // Reset implements the scexec.Catalog interface.
@@ -253,7 +280,7 @@ func (d *txnDeps) CheckPausepoint(name string) error {
 }
 
 func (d *txnDeps) UseLegacyGCJob(ctx context.Context) bool {
-	return !d.settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob)
+	return !storage.CanUseMVCCRangeTombstones(ctx, d.settings)
 }
 
 func (d *txnDeps) SchemaChangerJobID() jobspb.JobID {

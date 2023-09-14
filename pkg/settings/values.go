@@ -61,6 +61,8 @@ type valuesContainer struct {
 	// current context (i.e. it is a SystemOnly setting and the container is for a
 	// tenant). Reading or writing such a setting causes panics in test builds.
 	forbidden [numSlots]bool
+
+	hasValue [numSlots]uint32
 }
 
 func (c *valuesContainer) setGenericVal(slot slotIdx, newVal interface{}) {
@@ -93,7 +95,7 @@ func (c *valuesContainer) getGeneric(slot slotIdx) interface{} {
 func (c *valuesContainer) checkForbidden(slot slotIdx) bool {
 	if c.forbidden[slot] {
 		if buildutil.CrdbTestBuild {
-			panic(errors.AssertionFailedf("attempted to set forbidden setting %s", slotTable[slot].Key()))
+			panic(errors.AssertionFailedf("attempted to set forbidden setting %s", slotTable[slot].Name()))
 		}
 		return false
 	}
@@ -152,6 +154,14 @@ func (sv *Values) setInt64(ctx context.Context, slot slotIdx, newVal int64) {
 	if sv.container.setInt64Val(slot, newVal) {
 		sv.settingChanged(ctx, slot)
 	}
+}
+
+func (sv *Values) setValueOrigin(ctx context.Context, slot slotIdx, origin ValueOrigin) {
+	atomic.StoreUint32(&sv.container.hasValue[slot], uint32(origin))
+}
+
+func (sv *Values) getValueOrigin(ctx context.Context, slot slotIdx) ValueOrigin {
+	return ValueOrigin(atomic.LoadUint32(&sv.container.hasValue[slot]))
 }
 
 // setDefaultOverride overrides the default value for the respective setting to

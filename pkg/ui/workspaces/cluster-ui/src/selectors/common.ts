@@ -24,14 +24,14 @@ import {
 // between db-console and cluster-ui.
 
 export const selectExecutionID = (
-  _state: any,
+  _state: unknown,
   props: RouteComponentProps,
 ): string | null => {
   return getMatchParamByName(props.match, executionIdAttr);
 };
 
 export const selectID = (
-  _state: any,
+  _state: unknown,
   props: RouteComponentProps,
 ): string | null => {
   return getMatchParamByName(props.match, idAttr);

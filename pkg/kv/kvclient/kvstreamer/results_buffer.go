@@ -64,6 +64,8 @@ type resultsBuffer interface {
 	clearOverhead(context.Context)
 
 	// close releases all of the resources associated with the buffer.
+	// NB: close can only be called when all other goroutines (the worker
+	// coordinator as well as any async request evaluators) have exited.
 	close(context.Context)
 
 	///////////////////////////////////////////////////////////////////////////
@@ -94,7 +96,10 @@ type resultsBuffer interface {
 	// goroutine blocked in wait(), the goroutine is woken up.
 	//
 	// It is assumed that the budget's mutex is already being held.
-	doneAddingLocked(context.Context)
+	//
+	// doneAddingLocked returns the naumber of results that have been added but
+	// not yet returned to the client, and whether the client goroutine was woken.
+	doneAddingLocked(context.Context) (int, bool)
 
 	///////////////////////////////////////////////////////////////////////////
 	//                                                                       //
@@ -217,11 +222,13 @@ func (b *resultsBufferBase) accountForOverheadLocked(ctx context.Context, overhe
 	b.overheadAccountedFor = overheadMemUsage
 }
 
-// signal non-blockingly sends on hasResults channel.
-func (b *resultsBufferBase) signal() {
+// signal non-blockingly sends on hasResults channel and returns whether sent.
+func (b *resultsBufferBase) signal() bool {
 	select {
 	case b.hasResults <- struct{}{}:
+		return true
 	default:
+		return false
 	}
 }
 
@@ -298,9 +305,9 @@ func (b *outOfOrderResultsBuffer) addLocked(r Result) {
 
 const resultSize = int64(unsafe.Sizeof(Result{}))
 
-func (b *outOfOrderResultsBuffer) doneAddingLocked(ctx context.Context) {
+func (b *outOfOrderResultsBuffer) doneAddingLocked(ctx context.Context) (int, bool) {
 	b.accountForOverheadLocked(ctx, int64(cap(b.results))*resultSize)
-	b.signal()
+	return len(b.results), b.signal()
 }
 
 func (b *outOfOrderResultsBuffer) clearOverhead(ctx context.Context) {
@@ -336,12 +343,7 @@ func (b *outOfOrderResultsBuffer) numSpilledResults() int {
 	return 0
 }
 
-func (b *outOfOrderResultsBuffer) close(context.Context) {
-	// Note that only the client's goroutine can be blocked waiting for the
-	// results, and close() is called only by the same goroutine, so signaling
-	// isn't necessary. However, we choose to be safe and do it anyway.
-	b.signal()
-}
+func (b *outOfOrderResultsBuffer) close(context.Context) {}
 
 // ResultDiskBuffer encapsulates the logic for spilling Results to temporary
 // disk storage.
@@ -357,7 +359,8 @@ type ResultDiskBuffer interface {
 	Deserialize(_ context.Context, _ *Result, resultID int) error
 	// Reset reset the buffer for reuse.
 	Reset(context.Context) error
-	// Close closes the buffer and releases all of its resources.
+	// Close closes the buffer and releases all of its resources. Cannot be
+	// called concurrently with Serialize / Deserialize.
 	Close(context.Context)
 }
 
@@ -508,13 +511,14 @@ func (b *inOrderResultsBuffer) addLocked(r Result) {
 
 const inOrderBufferedResultSize = int64(unsafe.Sizeof(inOrderBufferedResult{}))
 
-func (b *inOrderResultsBuffer) doneAddingLocked(ctx context.Context) {
+func (b *inOrderResultsBuffer) doneAddingLocked(ctx context.Context) (int, bool) {
 	overhead := int64(cap(b.buffered))*inOrderBufferedResultSize + // b.buffered
 		int64(cap(b.resultScratch))*resultSize // b.resultsScratch
 	b.accountForOverheadLocked(ctx, overhead)
 	if len(b.buffered) > 0 && b.buffered[0].Position == b.headOfLinePosition && b.buffered[0].subRequestIdx == b.headOfLineSubRequestIdx {
-		b.signal()
+		return len(b.buffered), b.signal()
 	}
+	return len(b.buffered), false
 }
 
 func (b *inOrderResultsBuffer) clearOverhead(ctx context.Context) {
@@ -663,13 +667,7 @@ func (b *inOrderResultsBuffer) numSpilledResults() int {
 }
 
 func (b *inOrderResultsBuffer) close(ctx context.Context) {
-	b.Lock()
-	defer b.Unlock()
 	b.diskBuffer.Close(ctx)
-	// Note that only the client's goroutine can be blocked waiting for the
-	// results, and close() is called only by the same goroutine, so signaling
-	// isn't necessary. However, we choose to be safe and do it anyway.
-	b.signal()
 }
 
 // inOrderBufferedResult describes a single Result for InOrder mode, regardless
@@ -704,19 +702,18 @@ type inOrderBufferedResult struct {
 // spill updates r to represent a result that has been spilled to disk and is
 // identified by the provided ordinal in the disk buffer.
 func (r *inOrderBufferedResult) spill(diskResultID int) {
-	isScanComplete := r.scanComplete
 	*r = inOrderBufferedResult{
 		Result: Result{
 			memoryTok:      r.memoryTok,
 			Position:       r.Position,
 			subRequestIdx:  r.subRequestIdx,
 			subRequestDone: r.subRequestDone,
+			scanComplete:   r.scanComplete,
 		},
 		addEpoch:     r.addEpoch,
 		onDisk:       true,
 		diskResultID: diskResultID,
 	}
-	r.scanComplete = isScanComplete
 }
 
 // get returns the Result, deserializing it from disk if necessary. toConsume

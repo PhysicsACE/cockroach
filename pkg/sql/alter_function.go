@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
@@ -22,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -63,6 +65,8 @@ func (p *planner) AlterFunctionOptions(
 }
 
 func (n *alterFunctionOptionsNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounter("function"))
+
 	fnDesc, err := params.p.mustGetMutableFunctionForAlter(params.ctx, &n.n.Function)
 	if err != nil {
 		return err
@@ -71,7 +75,7 @@ func (n *alterFunctionOptionsNode) startExec(params runParams) error {
 	// referenced by other objects. This is needed when want to allow function
 	// references. Need to think about in what condition a function can be altered
 	// or not.
-	if err := tree.ValidateFuncOptions(n.n.Options); err != nil {
+	if err := tree.ValidateRoutineOptions(n.n.Options); err != nil {
 		return err
 	}
 
@@ -85,9 +89,10 @@ func (n *alterFunctionOptionsNode) startExec(params runParams) error {
 		if err := maybeValidateNewFuncVolatility(params, fnDesc, option); err != nil {
 			return err
 		}
-		if err := setFuncOption(params, fnDesc, option); err != nil {
-			return err
-		}
+	}
+
+	if err := setFuncOptions(params, fnDesc, n.n.Options); err != nil {
+		return err
 	}
 
 	if err := params.p.writeFuncSchemaChange(params.ctx, fnDesc); err != nil {
@@ -105,17 +110,17 @@ func (n *alterFunctionOptionsNode) startExec(params runParams) error {
 }
 
 func maybeValidateNewFuncVolatility(
-	params runParams, fnDesc catalog.FunctionDescriptor, option tree.FunctionOption,
+	params runParams, fnDesc catalog.FunctionDescriptor, option tree.RoutineOption,
 ) error {
 	switch t := option.(type) {
-	case tree.FunctionVolatility:
+	case tree.RoutineVolatility:
 		f := NewReferenceProviderFactory(params.p)
 		ast, err := fnDesc.ToCreateExpr()
 		if err != nil {
 			return err
 		}
 		for i, o := range ast.Options {
-			if _, ok := o.(tree.FunctionVolatility); ok {
+			if _, ok := o.(tree.RoutineVolatility); ok {
 				ast.Options[i] = t
 			}
 		}
@@ -147,6 +152,7 @@ func (p *planner) AlterFunctionRename(
 }
 
 func (n *alterFunctionRenameNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounter("function"))
 	// TODO(chengxiong): add validation that a function can not be altered if it's
 	// referenced by other objects. This is needed when want to allow function
 	// references.
@@ -220,6 +226,7 @@ func (p *planner) AlterFunctionSetOwner(
 }
 
 func (n *alterFunctionSetOwnerNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounter("function"))
 	fnDesc, err := params.p.mustGetMutableFunctionForAlter(params.ctx, &n.n.Function)
 	if err != nil {
 		return err
@@ -280,6 +287,7 @@ func (p *planner) AlterFunctionSetSchema(
 }
 
 func (n *alterFunctionSetSchemaNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounter("function"))
 	// TODO(chengxiong): add validation that a function can not be altered if it's
 	// referenced by other objects. This is needed when want to allow function
 	// references.
@@ -408,10 +416,11 @@ func (p *planner) mustGetMutableFunctionForAlter(
 
 func toSchemaOverloadSignature(fnDesc *funcdesc.Mutable) descpb.SchemaDescriptor_FunctionSignature {
 	ret := descpb.SchemaDescriptor_FunctionSignature{
-		ID:         fnDesc.GetID(),
-		ArgTypes:   make([]*types.T, len(fnDesc.GetParams())),
-		ReturnType: fnDesc.ReturnType.Type,
-		ReturnSet:  fnDesc.ReturnType.ReturnSet,
+		ID:          fnDesc.GetID(),
+		ArgTypes:    make([]*types.T, len(fnDesc.GetParams())),
+		ReturnType:  fnDesc.ReturnType.Type,
+		ReturnSet:   fnDesc.ReturnType.ReturnSet,
+		IsProcedure: fnDesc.IsProcedure,
 	}
 	for i := range fnDesc.Params {
 		ret.ArgTypes[i] = fnDesc.Params[i].Type

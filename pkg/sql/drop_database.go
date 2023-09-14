@@ -13,7 +13,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
@@ -141,7 +140,7 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		schemaToDelete := schemaWithDbDesc.schema
 		switch schemaToDelete.SchemaKind() {
 		case catalog.SchemaPublic:
-			b := &kv.Batch{}
+			b := p.Txn().NewBatch()
 			if err := p.Descriptors().DeleteDescriptorlessPublicSchemaToBatch(
 				ctx, p.ExtendedEvalContext().Tracing.KVTracingEnabled(), n.dbDesc, b,
 			); err != nil {
@@ -151,7 +150,7 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 				return err
 			}
 		case catalog.SchemaTemporary:
-			b := &kv.Batch{}
+			b := p.Txn().NewBatch()
 			if err := p.Descriptors().DeleteTempSchemaToBatch(
 				ctx, p.ExtendedEvalContext().Tracing.KVTracingEnabled(), n.dbDesc, schemaToDelete.GetName(), b,
 			); err != nil {
@@ -173,7 +172,7 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		}
 	}
 
-	p.createDropDatabaseJob(
+	if err := p.createDropDatabaseJob(
 		ctx,
 		n.dbDesc.GetID(),
 		schemasIDsToDelete,
@@ -181,7 +180,9 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		n.d.typesToDelete,
 		n.d.functionsToDelete,
 		tree.AsStringWithFQNames(n.n, params.Ann()),
-	)
+	); err != nil {
+		return err
+	}
 
 	n.dbDesc.SetDropped()
 	b := p.txn.NewBatch()
@@ -213,6 +214,11 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	if err := p.deleteComment(
 		ctx, n.dbDesc.GetID(), 0 /* subID */, catalogkeys.DatabaseCommentType,
 	); err != nil {
+		return err
+	}
+
+	// TODO(jeffswenson): delete once region_livess is implemented (#107966)
+	if err := p.maybeUpdateSystemDBSurvivalGoal(ctx); err != nil {
 		return err
 	}
 
@@ -253,8 +259,9 @@ func (p *planner) accumulateAllObjectsToDelete(
 	ctx context.Context, objects []toDelete,
 ) ([]*tabledesc.Mutable, map[descpb.ID]*tabledesc.Mutable, error) {
 	implicitDeleteObjects := make(map[descpb.ID]*tabledesc.Mutable)
+	visited := make(map[descpb.ID]struct{})
 	for _, toDel := range objects {
-		err := p.accumulateCascadingViews(ctx, implicitDeleteObjects, toDel.desc)
+		err := p.accumulateCascadingViews(ctx, implicitDeleteObjects, visited, toDel.desc)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -311,8 +318,12 @@ func (p *planner) accumulateOwnedSequences(
 // references, which means this list can't be constructed by simply scanning
 // the namespace table.
 func (p *planner) accumulateCascadingViews(
-	ctx context.Context, dependentObjects map[descpb.ID]*tabledesc.Mutable, desc *tabledesc.Mutable,
+	ctx context.Context,
+	dependentObjects map[descpb.ID]*tabledesc.Mutable,
+	visited map[descpb.ID]struct{},
+	desc *tabledesc.Mutable,
 ) error {
+	visited[desc.ID] = struct{}{}
 	for _, ref := range desc.DependedOnBy {
 		desc, err := p.Descriptors().MutableByID(p.txn).Desc(ctx, ref.ID)
 		if err != nil {
@@ -327,8 +338,15 @@ func (p *planner) accumulateCascadingViews(
 		if !dependentDesc.IsView() {
 			continue
 		}
+
+		_, seen := visited[ref.ID]
+		if dependentObjects[ref.ID] == dependentDesc || seen {
+			// This view's dependencies are already added.
+			continue
+		}
 		dependentObjects[ref.ID] = dependentDesc
-		if err := p.accumulateCascadingViews(ctx, dependentObjects, dependentDesc); err != nil {
+
+		if err := p.accumulateCascadingViews(ctx, dependentObjects, visited, dependentDesc); err != nil {
 			return err
 		}
 	}

@@ -12,22 +12,17 @@ import (
 	"context"
 	"fmt"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationtestutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamproducer"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -35,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -43,145 +37,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
-
-// TestTenantStreaming tests that tenants can stream changes end-to-end.
-func TestTenantStreaming(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	skip.UnderRace(t, "slow under race")
-
-	ctx := context.Background()
-
-	args := base.TestServerArgs{
-		// Disabling the test tenant because the test below assumes that
-		// when it's monitoring the streaming job, it's doing so from the system
-		// tenant and not from within a secondary tenant. When inside
-		// a secondary tenant, it won't be able to see the streaming job.
-		// This may also be impacted by the fact that we don't currently support
-		// tenant->tenant streaming. Tracked with #76378.
-		DisableDefaultTestTenant: true,
-		Knobs: base.TestingKnobs{
-			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
-	}
-
-	// Start the source server.
-	source, sourceDB, _ := serverutils.StartServer(t, args)
-	defer source.Stopper().Stop(ctx)
-
-	// Start tenant server in the source cluster.
-	sourceTenantID := serverutils.TestTenantID()
-	sourceTenantName := roachpb.TenantName("source-tenant")
-	_, tenantConn := serverutils.StartTenant(t, source, base.TestTenantArgs{
-		TenantID:   sourceTenantID,
-		TenantName: sourceTenantName,
-	})
-	defer func() {
-		require.NoError(t, tenantConn.Close())
-	}()
-	// sourceSQL refers to the tenant generating the data.
-	sourceSQL := sqlutils.MakeSQLRunner(tenantConn)
-
-	// Make changefeeds run faster.
-	resetFreq := changefeedbase.TestingSetDefaultMinCheckpointFrequency(50 * time.Millisecond)
-	defer resetFreq()
-	// Set required cluster settings.
-	sourceDBRunner := sqlutils.MakeSQLRunner(sourceDB)
-	sourceDBRunner.ExecMultiple(t, strings.Split(`
-SET CLUSTER SETTING kv.rangefeed.enabled = true;
-SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s';
-SET CLUSTER SETTING changefeed.experimental_poll_interval = '10ms';
-SET CLUSTER SETTING stream_replication.min_checkpoint_frequency = '1s';
-SET CLUSTER SETTING stream_replication.stream_liveness_track_frequency = '500ms';
-`,
-		";")...)
-
-	// Start the destination server.
-	hDest, cleanupDest := replicationtestutils.NewReplicationHelper(t,
-		// Test fails when run from within the test tenant. More investigation
-		// is required. Tracked with #76378.
-		// TODO(ajstorm): This may be the right course of action here as the
-		//  replication is now being run inside a tenant.
-		base.TestServerArgs{DisableDefaultTestTenant: true})
-	defer cleanupDest()
-	// destSQL refers to the system tenant as that's the one that's running the
-	// job.
-	destSQL := hDest.SysSQL
-	destSQL.ExecMultiple(t, strings.Split(`
-SET CLUSTER SETTING stream_replication.consumer_heartbeat_frequency = '100ms';
-SET CLUSTER SETTING bulkio.stream_ingestion.minimum_flush_interval = '500ms';
-SET CLUSTER SETTING bulkio.stream_ingestion.cutover_signal_poll_interval = '100ms';
-SET CLUSTER SETTING stream_replication.job_checkpoint_frequency = '100ms';
-SET CLUSTER SETTING cross_cluster_replication.enabled = true;
-`,
-		";")...)
-
-	// Sink to read data from.
-	pgURL, cleanupSink := sqlutils.PGUrl(t, source.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
-	defer cleanupSink()
-
-	var startTime string
-	sourceSQL.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&startTime)
-
-	destSQL.Exec(t,
-		fmt.Sprintf(`CREATE EXTERNAL CONNECTION "replication-source-addr" AS "%s"`,
-			pgURL.String()),
-	)
-
-	destSQL.Exec(t,
-		`CREATE TENANT "destination-tenant" FROM REPLICATION OF "source-tenant" ON $1`,
-		"external://replication-source-addr",
-	)
-	streamProducerJobID, ingestionJobID := replicationtestutils.GetStreamJobIds(t, ctx, destSQL, "destination-tenant")
-
-	sourceSQL.Exec(t, `
-CREATE DATABASE d;
-CREATE TABLE d.t1(i int primary key, a string, b string);
-CREATE TABLE d.t2(i int primary key);
-INSERT INTO d.t1 (i) VALUES (42);
-INSERT INTO d.t2 VALUES (2);
-`)
-
-	replicationtestutils.WaitUntilStartTimeReached(t, destSQL, jobspb.JobID(ingestionJobID))
-	var cutoverStr string
-	cutoverTime := timeutil.Now().Round(time.Microsecond)
-	destSQL.QueryRow(t, `ALTER TENANT "destination-tenant" COMPLETE REPLICATION TO SYSTEM TIME $1::string`,
-		hlc.Timestamp{WallTime: cutoverTime.UnixNano()}.AsOfSystemTime()).Scan(&cutoverStr)
-	cutoverOutput := replicationtestutils.DecimalTimeToHLC(t, cutoverStr)
-	require.Equal(t, cutoverTime, cutoverOutput.GoTime())
-	jobutils.WaitForJobToSucceed(t, destSQL, jobspb.JobID(ingestionJobID))
-	jobutils.WaitForJobToSucceed(t, sourceDBRunner, jobspb.JobID(streamProducerJobID))
-
-	stats := replicationutils.TestingGetStreamIngestionStatsFromReplicationJob(t, ctx, destSQL, ingestionJobID)
-	require.Equal(t, cutoverTime, stats.IngestionProgress.CutoverTime.GoTime())
-	require.Equal(t, streampb.StreamReplicationStatus_STREAM_INACTIVE, stats.ProducerStatus.StreamStatus)
-
-	_, destTenantConn := serverutils.StartTenant(t, hDest.SysServer, base.TestTenantArgs{
-		TenantID:            roachpb.MustMakeTenantID(2),
-		TenantName:          "destination-tenant",
-		DisableCreateTenant: true,
-	})
-	defer func() {
-		require.NoError(t, destTenantConn.Close())
-	}()
-	DestTenantSQL := sqlutils.MakeSQLRunner(destTenantConn)
-
-	query := "SELECT * FROM d.t1"
-	sourceData := sourceSQL.QueryStr(t, query)
-	destData := DestTenantSQL.QueryStr(t, query)
-	require.Equal(t, sourceData, destData)
-}
 
 func TestTenantStreamingCreationErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	srcServer, srcDB, _ := serverutils.StartServer(t, base.TestServerArgs{DisableDefaultTestTenant: true})
+	srcServer, srcDB, _ := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TODOTestTenantDisabled})
 	defer srcServer.Stopper().Stop(ctx)
-	destServer, destDB, _ := serverutils.StartServer(t, base.TestServerArgs{DisableDefaultTestTenant: true})
+	destServer, destDB, _ := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TODOTestTenantDisabled})
 	defer destServer.Stopper().Stop(ctx)
 
 	srcTenantID := serverutils.TestTenantID()
@@ -200,7 +67,7 @@ func TestTenantStreamingCreationErrors(t *testing.T) {
 	DestSysSQL.Exec(t, `SET CLUSTER SETTING cross_cluster_replication.enabled = true;`)
 
 	// Sink to read data from.
-	srcPgURL, cleanupSink := sqlutils.PGUrl(t, srcServer.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+	srcPgURL, cleanupSink := sqlutils.PGUrl(t, srcServer.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanupSink()
 
 	DestSysSQL.ExpectErr(t, "pq: neither the source tenant \"source\" nor the destination tenant \"system\" \\(0\\) can be the system tenant",
@@ -226,7 +93,7 @@ func TestCutoverBuiltin(t *testing.T) {
 			// Disable the test tenant as the test below looks for a
 			// streaming job assuming that it's within the system tenant.
 			// Tracked with #76378.
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			},
@@ -262,11 +129,23 @@ func TestCutoverBuiltin(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, sp.StreamIngest.CutoverTime.IsEmpty())
 
-	var highWater time.Time
+	var replicatedTime time.Time
 	err = job.NoTxn().Update(ctx, func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-		highWater = timeutil.Now().Round(time.Microsecond)
-		hlcHighWater := hlc.Timestamp{WallTime: highWater.UnixNano()}
-		return jobs.UpdateHighwaterProgressed(hlcHighWater, md, ju)
+		if err := md.CheckRunningOrReverting(); err != nil {
+			return err
+		}
+		replicatedTime = timeutil.Now().Round(time.Microsecond)
+		hlcReplicatedTime := hlc.Timestamp{WallTime: replicatedTime.UnixNano()}
+
+		progress := md.Progress
+		streamProgress := progress.Details.(*jobspb.Progress_StreamIngest).StreamIngest
+		streamProgress.ReplicatedTime = hlcReplicatedTime
+		progress.Progress = &jobspb.Progress_HighWater{
+			HighWater: &hlcReplicatedTime,
+		}
+
+		ju.UpdateProgress(progress)
+		return nil
 	})
 	require.NoError(t, err)
 
@@ -274,7 +153,7 @@ func TestCutoverBuiltin(t *testing.T) {
 	var explain string
 	err = db.QueryRowContext(ctx,
 		`EXPLAIN SELECT crdb_internal.complete_stream_ingestion_job($1, $2)`, job.ID(),
-		highWater).Scan(&explain)
+		replicatedTime).Scan(&explain)
 	require.NoError(t, err)
 	require.Equal(t, "distribution: local", explain)
 
@@ -282,7 +161,7 @@ func TestCutoverBuiltin(t *testing.T) {
 	err = db.QueryRowContext(
 		ctx,
 		`SELECT crdb_internal.complete_stream_ingestion_job($1, $2)`,
-		job.ID(), highWater).Scan(&jobID)
+		job.ID(), replicatedTime).Scan(&jobID)
 	require.NoError(t, err)
 	require.Equal(t, job.ID(), jobspb.JobID(jobID))
 
@@ -292,7 +171,7 @@ func TestCutoverBuiltin(t *testing.T) {
 	progress = sj.Progress()
 	sp, ok = progress.GetDetails().(*jobspb.Progress_StreamIngest)
 	require.True(t, ok)
-	require.Equal(t, hlc.Timestamp{WallTime: highWater.UnixNano()}, sp.StreamIngest.CutoverTime)
+	require.Equal(t, hlc.Timestamp{WallTime: replicatedTime.UnixNano()}, sp.StreamIngest.CutoverTime)
 }
 
 // TestReplicationJobResumptionStartTime tests that a replication job picks the
@@ -306,10 +185,10 @@ func TestReplicationJobResumptionStartTime(t *testing.T) {
 	canContinue := make(chan struct{})
 	args := replicationtestutils.DefaultTenantStreamingClustersArgs
 
-	replicationSpecs := make([]*execinfrapb.StreamIngestionDataSpec, 0)
+	replicationSpecs := make(map[base.SQLInstanceID]*execinfrapb.StreamIngestionDataSpec, 0)
 	frontier := &execinfrapb.StreamIngestionFrontierSpec{}
 	args.TestingKnobs = &sql.StreamingTestingKnobs{
-		AfterReplicationFlowPlan: func(ingestionSpecs []*execinfrapb.StreamIngestionDataSpec,
+		AfterReplicationFlowPlan: func(ingestionSpecs map[base.SQLInstanceID]*execinfrapb.StreamIngestionDataSpec,
 			frontierSpec *execinfrapb.StreamIngestionFrontierSpec) {
 			replicationSpecs = ingestionSpecs
 			frontier = frontierSpec
@@ -347,14 +226,14 @@ func TestReplicationJobResumptionStartTime(t *testing.T) {
 
 	for _, r := range replicationSpecs {
 		require.Equal(t, startTime, r.InitialScanTimestamp)
-		require.Empty(t, r.PreviousHighWaterTimestamp)
+		require.Empty(t, r.PreviousReplicatedTimestamp)
 	}
-	require.Empty(t, frontier.HighWaterAtStart)
+	require.Empty(t, frontier.ReplicatedTimeAtStart)
 
 	// Allow the job to make some progress.
 	canContinue <- struct{}{}
 	srcTime := c.SrcCluster.Server(0).Clock().Now()
-	c.WaitUntilHighWatermark(srcTime, jobspb.JobID(replicationJobID))
+	c.WaitUntilReplicatedTime(srcTime, jobspb.JobID(replicationJobID))
 
 	// Pause the job.
 	c.DestSysSQL.Exec(t, `PAUSE JOB $1`, replicationJobID)
@@ -374,21 +253,21 @@ func TestReplicationJobResumptionStartTime(t *testing.T) {
 
 	// Assert that the previous highwater mark is greater than the replication
 	// start time.
-	var previousHighWaterTimestamp hlc.Timestamp
+	var previousReplicatedTimestamp hlc.Timestamp
 	for _, r := range replicationSpecs {
 		require.Equal(t, startTime, r.InitialScanTimestamp)
-		require.True(t, r.InitialScanTimestamp.Less(r.PreviousHighWaterTimestamp))
-		if previousHighWaterTimestamp.IsEmpty() {
-			previousHighWaterTimestamp = r.PreviousHighWaterTimestamp
+		require.True(t, r.InitialScanTimestamp.Less(r.PreviousReplicatedTimestamp))
+		if previousReplicatedTimestamp.IsEmpty() {
+			previousReplicatedTimestamp = r.PreviousReplicatedTimestamp
 		} else {
-			require.Equal(t, r.PreviousHighWaterTimestamp, previousHighWaterTimestamp)
+			require.Equal(t, r.PreviousReplicatedTimestamp, previousReplicatedTimestamp)
 		}
 	}
-	require.Equal(t, frontier.HighWaterAtStart, previousHighWaterTimestamp)
+	require.Equal(t, frontier.ReplicatedTimeAtStart, previousReplicatedTimestamp)
 	canContinue <- struct{}{}
 	srcTime = c.SrcCluster.Server(0).Clock().Now()
-	c.WaitUntilHighWatermark(srcTime, jobspb.JobID(replicationJobID))
-	c.Cutover(producerJobID, replicationJobID, srcTime.GoTime())
+	c.WaitUntilReplicatedTime(srcTime, jobspb.JobID(replicationJobID))
+	c.Cutover(producerJobID, replicationJobID, srcTime.GoTime(), false)
 	jobutils.WaitForJobToSucceed(t, c.DestSysSQL, jobspb.JobID(replicationJobID))
 }
 
@@ -403,28 +282,22 @@ func TestCutoverFractionProgressed(t *testing.T) {
 
 	ctx := context.Background()
 
-	respRecvd := make(chan struct{})
-	continueRevert := make(chan struct{})
-	defer close(continueRevert)
+	progressUpdated := make(chan struct{})
+	progressRead := make(chan struct{})
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
-			Store: &kvserver.StoreTestingKnobs{
-				TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
-					for _, ru := range br.Responses {
-						switch ru.GetInner().(type) {
-						case *kvpb.RevertRangeResponse:
-							respRecvd <- struct{}{}
-							<-continueRevert
-						}
-					}
-					return nil
-				},
-			},
 			Streaming: &sql.StreamingTestingKnobs{
 				OverrideRevertRangeBatchSize: 1,
+				CutoverProgressShouldUpdate:  func() bool { return true },
+				OnCutoverProgressUpdate: func(_ roachpb.Spans) {
+					progressUpdated <- struct{}{}
+
+					// Only begin next progress update once the test has read the latest progress update.
+					<-progressRead
+				},
 			},
 		},
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -454,14 +327,17 @@ func TestCutoverFractionProgressed(t *testing.T) {
 	// Create a mock replication job with the `foo` table span so that on cut over
 	// we can revert the table's ranges.
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
-	jobExecCtx := &sql.FakeJobExecContext{ExecutorConfig: &execCfg}
+	jobExecCtx, ctxClose := sql.MakeJobExecContext(ctx, "test-cutover-fraction-progressed", username.RootUserName(), &sql.MemoryMetrics{}, &execCfg)
+	defer ctxClose()
+
 	mockReplicationJobDetails := jobspb.StreamIngestionDetails{
 		Span: makeTableSpan(execCfg.Codec, uint32(id)),
 	}
 	mockReplicationJobRecord := jobs.Record{
 		Details: mockReplicationJobDetails,
 		Progress: jobspb.StreamIngestionProgress{
-			CutoverTime: cutover,
+			CutoverTime:           cutover,
+			RemainingCutoverSpans: roachpb.Spans{mockReplicationJobDetails.Span},
 		},
 		Username: username.TestUserName(),
 	}
@@ -470,72 +346,147 @@ func TestCutoverFractionProgressed(t *testing.T) {
 	replicationJob, err := registry.CreateJobWithTxn(ctx, mockReplicationJobRecord, jobID, nil)
 	require.NoError(t, err)
 	require.NoError(t, replicationJob.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-		return jobs.UpdateHighwaterProgressed(cutover, md, ju)
+		if err := md.CheckRunningOrReverting(); err != nil {
+			return err
+		}
+		progress := md.Progress
+		streamProgress := progress.Details.(*jobspb.Progress_StreamIngest).StreamIngest
+		streamProgress.ReplicatedTime = cutover
+		progress.Progress = &jobspb.Progress_HighWater{
+			HighWater: &cutover,
+		}
+		ju.UpdateProgress(progress)
+		return nil
 	}))
 
 	metrics := registry.MetricsStruct().StreamIngest.(*Metrics)
 	require.Equal(t, int64(0), metrics.ReplicationCutoverProgress.Value())
-
-	g := ctxgroup.WithContext(ctx)
-	g.GoCtx(func(ctx context.Context) error {
-		defer close(respRecvd)
-		revert, err := maybeRevertToCutoverTimestamp(ctx, jobExecCtx, jobID)
-		require.NoError(t, err)
-		require.True(t, revert)
-		return nil
-	})
 
 	loadProgress := func() jobspb.Progress {
 		j, err := execCfg.JobRegistry.LoadJob(ctx, jobID)
 		require.NoError(t, err)
 		return j.Progress()
 	}
-	progressMap := map[string]bool{
-		"0.00": false,
-		"0.17": false,
-		"0.33": false,
-		"0.50": false,
-		"0.67": false,
-		"0.83": false,
-	}
-	var expectedRanges int64 = 6
-	g.GoCtx(func(ctx context.Context) error {
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case _, ok := <-respRecvd:
-				if !ok {
-					return nil
-				}
-				sip := loadProgress()
-				curProgress := sip.GetFractionCompleted()
-				s := fmt.Sprintf("%.2f", curProgress)
-				if _, ok := progressMap[s]; !ok {
-					t.Fatalf("unexpected progress fraction %s", s)
-				}
-				// We sometimes see the same progress, which is valid, no need to update
-				// the expected range count.
-				if expectedRanges != metrics.ReplicationCutoverProgress.Value() {
-					// There is progress, which means that another range was reverted,
-					// updated the expected range count.
-					expectedRanges--
-				}
-				require.Equal(t, expectedRanges, metrics.ReplicationCutoverProgress.Value())
-				progressMap[s] = true
-				continueRevert <- struct{}{}
-			}
-		}
-	})
-	require.NoError(t, g.Wait())
-	sip := loadProgress()
-	require.Equal(t, sip.GetFractionCompleted(), float32(1))
-	require.Equal(t, int64(0), metrics.ReplicationCutoverProgress.Value())
 
-	// Ensure we have hit all our expected progress fractions.
-	for k, v := range progressMap {
-		if !v {
-			t.Fatalf("failed to see progress fraction %s", k)
+	var lastRangesLeft int64 = 6
+	var lastFraction float32 = 0
+	var progressUpdates = 0
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		for range progressUpdated {
+			sip := loadProgress()
+			curProgress := sip.GetFractionCompleted()
+			progressRead <- struct{}{}
+			progressUpdates++
+			if lastFraction >= curProgress {
+				return errors.Newf("unexpected progress fraction: %f (previous) >= %f (current)",
+					lastFraction,
+					curProgress)
+			}
+			rangesLeft := metrics.ReplicationCutoverProgress.Value()
+			if lastRangesLeft < rangesLeft {
+				return errors.Newf("unexpected range count from metric: %d (current) > %d (previous)",
+					rangesLeft, lastRangesLeft)
+			}
+			lastRangesLeft = rangesLeft
+			lastFraction = curProgress
 		}
+		return nil
+	})
+
+	revert, err := maybeRevertToCutoverTimestamp(ctx, jobExecCtx, replicationJob)
+	require.NoError(t, err)
+	require.True(t, revert)
+
+	close(progressUpdated)
+	require.NoError(t, g.Wait())
+
+	sip := loadProgress()
+	require.Equal(t, float32(1), sip.GetFractionCompleted())
+	require.Equal(t, int64(0), metrics.ReplicationCutoverProgress.Value())
+	require.True(t, progressUpdates > 1)
+}
+
+// TestCutoverCheckpointing asserts that cutover progress persists to the job
+// record and ensures the cutover job does not duplicate persisted work after
+// the job is paused after a few updates.
+func TestCutoverCheckpointing(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	progressUpdated := make(chan struct{})
+	pauseRequested := make(chan struct{})
+	var updateCount int
+	remainingSpanUpdates := make(map[string]struct{})
+	args := replicationtestutils.DefaultTenantStreamingClustersArgs
+	args.TestingKnobs = &sql.StreamingTestingKnobs{
+		CutoverProgressShouldUpdate:  func() bool { return true },
+		OverrideRevertRangeBatchSize: 1,
+		OnCutoverProgressUpdate: func(remainingSpansUpdate roachpb.Spans) {
+
+			// If checkpointing works properly, we expect no repeating remaining span updates.
+			_, ok := remainingSpanUpdates[remainingSpansUpdate.String()]
+			require.False(t, ok, fmt.Sprintf("repeated remaining span update %s", remainingSpansUpdate.String()))
+			remainingSpanUpdates[remainingSpansUpdate.String()] = struct{}{}
+
+			updateCount++
+			if updateCount == 3 {
+				close(progressUpdated)
+				// Wait until the job is in a pause-requested state, which causes subsequent
+				// updates to the job record (like cutover progress updates) to
+				// error with a pause-requested tag, causing the whole job to pause.
+				<-pauseRequested
+			}
+		},
 	}
+
+	ctx := context.Background()
+	c, cleanup := replicationtestutils.CreateTenantStreamingClusters(ctx, t, args)
+	defer cleanup()
+
+	producerJobIDInt, replicationJobIDInt := c.StartStreamReplication(ctx)
+	replicationJobID := jobspb.JobID(replicationJobIDInt)
+
+	jobutils.WaitForJobToRun(c.T, c.SrcSysSQL, jobspb.JobID(producerJobIDInt))
+	jobutils.WaitForJobToRun(c.T, c.DestSysSQL, replicationJobID)
+	c.WaitUntilStartTimeReached(replicationJobID)
+
+	c.SrcTenantSQL.Exec(t, `CREATE TABLE foo(id) AS SELECT generate_series(1, 10)`)
+
+	cutoverTime := c.SrcCluster.Server(0).Clock().Now()
+
+	// Insert some revisions which we can revert to a timestamp before the update.
+	c.SrcTenantSQL.Exec(t, `UPDATE foo SET id = id + 1`)
+
+	c.WaitUntilReplicatedTime(c.SrcCluster.Server(0).Clock().Now(), replicationJobID)
+
+	getCutoverRemainingSpans := func() roachpb.Spans {
+		progress := jobutils.GetJobProgress(t, c.DestSysSQL, replicationJobID).GetStreamIngest()
+		return progress.RemainingCutoverSpans
+	}
+
+	// Ensure there are no remaining cutover spans before cutover begins.
+	require.Equal(t, len(getCutoverRemainingSpans()), 0)
+
+	c.Cutover(producerJobIDInt, replicationJobIDInt, cutoverTime.GoTime(), true)
+	<-progressUpdated
+
+	c.DestSysSQL.Exec(t, `PAUSE JOB $1`, &replicationJobID)
+	close(pauseRequested)
+	jobutils.WaitForJobToPause(t, c.DestSysSQL, replicationJobID)
+
+	details := jobutils.GetJobPayload(t, c.DestSysSQL, replicationJobID).GetStreamIngestion()
+
+	// Assert that some progress has been persisted.
+	remainingSpans := getCutoverRemainingSpans()
+	require.Greater(t, len(remainingSpans), 0)
+	require.NotEqual(t, remainingSpans, roachpb.Spans{details.Span})
+
+	c.DestSysSQL.Exec(t, `RESUME JOB $1`, &replicationJobID)
+	jobutils.WaitForJobToSucceed(t, c.DestSysSQL, replicationJobID)
+
+	// Ensure no spans are left to cutover. Stringify during comparison because
+	// the empty remainingSpans are encoded as
+	// roachpb.Spans{roachpb.Span{Key:/Min, EndKey:/Min}.
+	require.Equal(t, getCutoverRemainingSpans().String(), roachpb.Spans{}.String())
 }

@@ -1,12 +1,17 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "scanner",
-    srcs = ["scan.go"],
+    srcs = [
+        "plpgsql_scan.go",
+        "scan.go",
+    ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/scanner",
     visibility = ["//visibility:public"],
-    deps = ["//pkg/sql/lexbase"],
+    deps = [
+        "//pkg/sql/lexbase",
+        "//pkg/sql/plpgsql/parser/lexbase",
+    ],
 )
 
 go_test(
@@ -47,5 +52,3 @@ genrule(
         "//pkg/gen:__pkg__",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -336,7 +336,8 @@ func (mb *mutationBuilder) buildInputForUpdate(
 	// SELECT + ORDER BY (which may add projected expressions)
 	projectionsScope := mb.outScope.replace()
 	projectionsScope.appendColumnsFromScope(mb.outScope)
-	orderByScope := mb.b.analyzeOrderBy(orderBy, mb.outScope, projectionsScope, tree.RejectGenerators)
+	orderByScope := mb.b.analyzeOrderBy(orderBy, mb.outScope, projectionsScope,
+		exprKindOrderByUpdate, tree.RejectGenerators|tree.RejectAggregates)
 	mb.b.buildOrderBy(mb.outScope, projectionsScope, orderByScope)
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 
@@ -417,7 +418,7 @@ func (mb *mutationBuilder) buildInputForDelete(
 	if usingClausePresent {
 		usingScope := mb.b.buildFromTables(using, noRowLocking, inScope)
 
-		// Check that the same table name is not used multiple times
+		// Check that the same table name is not used multiple times.
 		mb.b.validateJoinTableNames(mb.fetchScope, usingScope)
 
 		// The USING table columns can be accessed by the RETURNING clause of the
@@ -448,7 +449,8 @@ func (mb *mutationBuilder) buildInputForDelete(
 	// SELECT + ORDER BY (which may add projected expressions)
 	projectionsScope := mb.outScope.replace()
 	projectionsScope.appendColumnsFromScope(mb.outScope)
-	orderByScope := mb.b.analyzeOrderBy(orderBy, mb.outScope, projectionsScope, tree.RejectGenerators)
+	orderByScope := mb.b.analyzeOrderBy(orderBy, mb.outScope, projectionsScope,
+		exprKindOrderByDelete, tree.RejectGenerators|tree.RejectAggregates)
 	mb.b.buildOrderBy(mb.outScope, projectionsScope, orderByScope)
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 
@@ -460,7 +462,7 @@ func (mb *mutationBuilder) buildInputForDelete(
 	mb.outScope = projectionsScope
 
 	// Build a distinct on to ensure there is at most one row in the joined output
-	// for every row in the table
+	// for every row in the table.
 	if usingClausePresent {
 		var pkCols opt.ColSet
 
@@ -562,7 +564,7 @@ func (mb *mutationBuilder) extractValuesInput(inputRows *tree.Select) *tree.Valu
 // or just the unchanged input expression if there are no DEFAULT values.
 func (mb *mutationBuilder) replaceDefaultExprs(inRows *tree.Select) (outRows *tree.Select) {
 	values := mb.extractValuesInput(inRows)
-	if values == nil {
+	if values == nil || len(values.Rows) == 0 {
 		return inRows
 	}
 
@@ -723,6 +725,16 @@ func (mb *mutationBuilder) addSynthesizedComputedCols(colIDs opt.OptionalColList
 		// Skip columns that are already specified (this is possible for upserts).
 		if colIDs[i] != 0 {
 			continue
+		}
+
+		// Create a new scope for resolving column references in computed column
+		// expressions. We cannot use mb.outScope because columns in that scope
+		// may be ambiguous, by design. We build a scope that contains a single
+		// column for each column in the target table, representing either an
+		// existing value (a column from mb.fetchColIDs) or a new value (a
+		// column from mb.upsertColIDs, mb.updateColIDs, or mb.insertColIDs).
+		if !pb.HasResolveScope() {
+			pb.SetResolveScope(mb.computedColumnScope())
 		}
 
 		tabColID := mb.tabID.ColumnID(i)
@@ -909,6 +921,39 @@ func (mb *mutationBuilder) projectPartialIndexColsImpl(putScope, delScope *scope
 		mb.b.constructProjectForScope(mb.outScope, projectionScope)
 		mb.outScope = projectionScope
 	}
+}
+
+// computedColumnScope returns a new scope that can be used to build computed
+// column expressions. Columns will never be ambiguous because each column in
+// the returned scope maps to a single column in the target table.
+//
+// The columns included in the scope depend on the state of mb.upsertColIDs,
+// mb.updateColIDs, mb.fetchColIDs, and mb.insertColIDs, using the same order of
+// preference as disambiguateColumns (see mapToReturnColID). Therefore, this
+// function will return different scopes at different stages of building a
+// mutation statement. For example, when building the scan portion of an UPDATE,
+// the scope will include columns from mb.fetchColIDs, while it will include
+// columns from mb.updateColIDs or mb.fetchColIDs when building the SET portion
+// of an UPDATE.
+func (mb *mutationBuilder) computedColumnScope() *scope {
+	s := mb.b.allocScope()
+	for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
+		colID := mb.mapToReturnColID(i)
+		if colID == 0 {
+			continue
+		}
+		col := mb.outScope.getColumn(colID)
+		if col == nil {
+			panic(errors.AssertionFailedf("expected to find column %d in scope", colID))
+		}
+		targetCol := mb.tab.Column(i)
+		s.cols = append(s.cols, scopeColumn{
+			name: scopeColName(targetCol.ColName()),
+			typ:  col.typ,
+			id:   col.id,
+		})
+	}
+	return s
 }
 
 // disambiguateColumns ranges over the scope and ensures that at most one column

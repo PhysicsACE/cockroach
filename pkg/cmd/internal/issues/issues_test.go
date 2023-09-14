@@ -13,6 +13,7 @@ package issues
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,7 +21,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/datadriven"
@@ -57,6 +57,7 @@ func TestPost(t *testing.T) {
 		message              string
 		artifacts            string
 		reproCmd             string
+		skipTestFailure      bool
 		reproTitle, reproURL string
 	}
 
@@ -151,6 +152,13 @@ test logs left over in: /go/src/github.com/cockroachdb/cockroach/artifacts/logTe
 			reproURL:    "https://github.com/cockroachdb/cockroach",
 			reproTitle:  "FooBar README",
 		},
+		{
+			name:            "infrastructure-flake",
+			packageName:     "roachtest",
+			testName:        "TestCDC",
+			message:         "Something went wrong",
+			skipTestFailure: true,
+		},
 	}
 
 	testByName := func(t *testing.T, name string) testCase {
@@ -185,7 +193,7 @@ test logs left over in: /go/src/github.com/cockroachdb/cockroach/artifacts/logTe
 						issueNum = *base.Number
 					}
 					return github.Issue{
-						Title:  github.String(fmt.Sprintf("%s: %s%s failed", packageName, testName, suffix)),
+						Title:  github.String(fmt.Sprintf("%s: %s%s failed [failure reason]", packageName, testName, suffix)),
 						Number: &issueNum,
 						Labels: base.Labels,
 					}
@@ -213,7 +221,7 @@ test logs left over in: /go/src/github.com/cockroachdb/cockroach/artifacts/logTe
 	relatedIssue := github.Issue{
 		// Title is generated during the test using the test case's
 		// package and test names
-		Number: github.Int(issueNumber + 1),
+		Number: github.Int(issueNumber + 10),
 		Labels: []github.Label{{
 			Name: github.String("C-test-failure"),
 			URL:  github.String("fake"),
@@ -267,17 +275,15 @@ test logs left over in: /go/src/github.com/cockroachdb/cockroach/artifacts/logTe
 
 			var buf strings.Builder
 			opts := opts // play it safe since we're mutating it below
-			opts.getLatestTag = func() (string, error) {
-				const tag = "v3.3.0"
-				_, _ = fmt.Fprintf(&buf, "getLatestTag: result %s\n", tag)
-				return tag, nil
+			opts.getBinaryVersion = func() string {
+				const v = "v3.3.0"
+				_, _ = fmt.Fprintf(&buf, "getBinaryVersion: result %s\n", v)
+				return v
 			}
 
-			l, err := logger.RootLogger("", false)
-			require.NoError(t, err)
 			p := &poster{
 				Options: &opts,
-				l:       l,
+				l:       log.Default(),
 			}
 
 			createdIssue := false
@@ -355,14 +361,15 @@ test logs left over in: /go/src/github.com/cockroachdb/cockroach/artifacts/logTe
 				repro = HelpCommandAsLink(c.reproTitle, c.reproURL)
 			}
 			req := PostRequest{
-				PackageName:     c.packageName,
-				TestName:        c.testName,
-				Message:         c.message,
-				Artifacts:       c.artifacts,
-				MentionOnCreate: []string{"@cockroachdb/idonotexistbecausethisisatest"},
-				HelpCommand:     repro,
-				ExtraLabels:     []string{"release-blocker"},
-				ExtraParams:     map[string]string{"ROACHTEST_cloud": "gce"},
+				PackageName:          c.packageName,
+				TestName:             c.testName,
+				Message:              c.message,
+				SkipLabelTestFailure: c.skipTestFailure,
+				Artifacts:            c.artifacts,
+				MentionOnCreate:      []string{"@cockroachdb/idonotexistbecausethisisatest"},
+				HelpCommand:          repro,
+				ExtraLabels:          []string{"release-blocker"},
+				ExtraParams:          map[string]string{"ROACHTEST_cloud": "gce"},
 			}
 			require.NoError(t, p.post(context.Background(), UnitTestFormatter, req))
 
@@ -419,10 +426,7 @@ func TestPostEndToEnd(t *testing.T) {
 		HelpCommand: UnitTestHelpCommand(""),
 	}
 
-	l, err := logger.RootLogger("", false)
-	require.NoError(t, err)
-
-	require.NoError(t, Post(context.Background(), l, UnitTestFormatter, req))
+	require.NoError(t, Post(context.Background(), log.Default(), UnitTestFormatter, req))
 }
 
 // setEnv overrides the env variables corresponding to the input map. The

@@ -8,9 +8,11 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
+import moment from "moment-timezone";
+import { Duration } from "src/util/format";
 import {
   executeInternalSql,
+  LARGE_RESULT_SIZE,
   SqlExecutionRequest,
   sqlResultsAreEmpty,
 } from "src/api";
@@ -46,6 +48,7 @@ export function getStatementDiagnosticsReports(): Promise<StatementDiagnosticsRe
       },
     ],
     execute: true,
+    max_result_size: LARGE_RESULT_SIZE,
   };
 
   return executeInternalSql<StatementDiagnosticsReport>(req).then(res => {
@@ -74,7 +77,7 @@ export type InsertStmtDiagnosticRequest = {
 };
 
 export type InsertStmtDiagnosticResponse = {
-  stmt_diag_req_id: string;
+  req_resp: boolean;
 };
 
 export function createStatementDiagnosticsReport({
@@ -83,32 +86,26 @@ export function createStatementDiagnosticsReport({
   minExecutionLatencySeconds,
   expiresAfterSeconds,
 }: InsertStmtDiagnosticRequest): Promise<InsertStmtDiagnosticResponse> {
-  const requestedAt = moment.now(); // milliseconds
-  const args: any = [stmtFingerprint, moment.utc(requestedAt).toISOString()];
-  const cols = ["statement_fingerprint", "requested_at"];
+  const args: any = [stmtFingerprint];
 
-  if (samplingProbability && samplingProbability !== 0) {
+  if (samplingProbability) {
     args.push(samplingProbability);
-    cols.push("sampling_probability");
+  } else {
+    args.push(0);
   }
-  if (minExecutionLatencySeconds && minExecutionLatencySeconds !== 0) {
-    args.push(minExecutionLatencySeconds.toString());
-    cols.push("min_execution_latency");
+  if (minExecutionLatencySeconds) {
+    args.push(Duration(minExecutionLatencySeconds * 1e9));
+  } else {
+    args.push("0");
   }
   if (expiresAfterSeconds && expiresAfterSeconds !== 0) {
-    const expiresAt = requestedAt + expiresAfterSeconds * 1000;
-    args.push(moment.utc(expiresAt).toISOString());
-    cols.push("expires_at");
+    args.push(Duration(expiresAfterSeconds * 1e9));
+  } else {
+    args.push("0");
   }
 
-  const queryCols = cols.join(", ");
-  const placeHolders = args.map((elem: any, idx: number) => `$${idx + 1}`);
-
   const createStmtDiag = {
-    sql: `
-        INSERT INTO system.statement_diagnostics_requests 
-            (${queryCols}) 
-             VALUES (${placeHolders}) RETURNING id as stmt_diag_req_id;`,
+    sql: `SELECT crdb_internal.request_statement_bundle($1, $2, $3::INTERVAL, $4::INTERVAL) as req_resp`,
     arguments: args,
   };
 
@@ -124,7 +121,10 @@ export function createStatementDiagnosticsReport({
         throw res.error;
       }
 
-      if (res.execution?.txn_results[0]?.rows?.length === 0) {
+      if (
+        res.execution?.txn_results[0]?.rows?.length === 0 ||
+        res.execution?.txn_results[0]?.rows[0]["req_resp"] === false
+      ) {
         throw new Error("Failed to insert statement diagnostics request");
       }
 
@@ -178,7 +178,11 @@ export type CancelStmtDiagnosticResponse = {
 export function cancelStatementDiagnosticsReport({
   requestId,
 }: CancelStmtDiagnosticRequest): Promise<CancelStmtDiagnosticResponse> {
-  const query = `UPDATE system.statement_diagnostics_requests SET expires_at = '1970-01-01' WHERE completed = false AND id = $1::INT8 AND (expires_at IS NULL OR expires_at > now()) RETURNING id as stmt_diag_req_id`;
+  const query = `UPDATE system.statement_diagnostics_requests 
+SET expires_at = '1970-01-01' 
+WHERE completed = false 
+AND id = $1::INT8 
+AND (expires_at IS NULL OR expires_at > now()) RETURNING id as stmt_diag_req_id`;
   const req: SqlExecutionRequest = {
     execute: true,
     statements: [

@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/poison"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/redact"
 )
 
 func nextUUID(counter *uint32) uuid.UUID {
@@ -63,10 +65,11 @@ func scanTxnPriority(t *testing.T, d *datadriven.TestData) enginepb.TxnPriority 
 
 func scanUserPriority(t *testing.T, d *datadriven.TestData) roachpb.UserPriority {
 	const key = "priority"
-	priS := "normal"
-	if d.HasArg(key) {
-		d.ScanArgs(t, key, &priS)
+	if !d.HasArg(key) {
+		return roachpb.NormalUserPriority
 	}
+	var priS string
+	d.ScanArgs(t, key, &priS)
 	switch priS {
 	case "low":
 		return roachpb.MinUserPriority
@@ -167,12 +170,20 @@ func scanSingleRequest(
 		}
 		return enginepb.TxnSeq(n)
 	}
+	maybeGetStr := func() lock.Strength {
+		s, ok := fields["str"]
+		if !ok {
+			return lock.None
+		}
+		return concurrency.GetStrength(t, d, s)
+	}
 
 	switch cmd {
 	case "get":
 		var r kvpb.GetRequest
 		r.Sequence = maybeGetSeq()
 		r.Key = roachpb.Key(mustGetField("key"))
+		r.KeyLockingStrength = maybeGetStr()
 		return &r
 
 	case "scan":
@@ -182,6 +193,7 @@ func scanSingleRequest(
 		if v, ok := fields["endkey"]; ok {
 			r.EndKey = roachpb.Key(v)
 		}
+		r.KeyLockingStrength = maybeGetStr()
 		return &r
 
 	case "put":
@@ -210,17 +222,24 @@ func scanSingleRequest(
 		}
 		return &r
 
+	case "refresh":
+		var r kvpb.RefreshRequest
+		r.Key = roachpb.Key(mustGetField("key"))
+		return &r
+
 	default:
 		d.Fatalf(t, "unknown request type: %s", cmd)
 		return nil
 	}
 }
 
-func scanTxnStatus(t *testing.T, d *datadriven.TestData) (roachpb.TransactionStatus, string) {
+func scanTxnStatus(
+	t *testing.T, d *datadriven.TestData,
+) (roachpb.TransactionStatus, redact.SafeString) {
 	var statusStr string
 	d.ScanArgs(t, "status", &statusStr)
 	status := parseTxnStatus(t, d, statusStr)
-	var verb string
+	var verb redact.SafeString
 	switch status {
 	case roachpb.COMMITTED:
 		verb = "committing"

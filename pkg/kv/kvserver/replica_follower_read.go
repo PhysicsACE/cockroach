@@ -15,7 +15,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -28,11 +27,12 @@ import (
 // information is collected and passed around, regardless of the value of this
 // setting.
 var FollowerReadsEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.closed_timestamp.follower_reads_enabled",
 	"allow (all) replicas to serve consistent historical reads based on closed timestamp information",
 	true,
-).WithPublic()
+	settings.WithName("kv.closed_timestamp.follower_reads.enabled"),
+	settings.WithPublic)
 
 // BatchCanBeEvaluatedOnFollower determines if a batch consists exclusively of
 // requests that can be evaluated on a follower replica, given a sufficiently
@@ -138,7 +138,7 @@ func (r *Replica) canServeFollowerReadRLocked(ctx context.Context, ba *kvpb.Batc
 func (r *Replica) getCurrentClosedTimestampLocked(
 	ctx context.Context, sufficient hlc.Timestamp,
 ) hlc.Timestamp {
-	appliedLAI := ctpb.LAI(r.mu.state.LeaseAppliedIndex)
+	appliedLAI := r.mu.state.LeaseAppliedIndex
 	leaseholder := r.mu.state.Lease.Replica.NodeID
 	raftClosed := r.mu.state.RaftClosedTimestamp
 	sideTransportClosed := r.sideTransportClosedTimestamp.get(ctx, leaseholder, appliedLAI, sufficient)

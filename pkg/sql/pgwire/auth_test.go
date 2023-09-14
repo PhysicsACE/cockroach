@@ -30,7 +30,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/identmap"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -48,6 +47,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/stdstrings"
 	"github.com/cockroachdb/redact"
+	pgx "github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
@@ -217,17 +217,21 @@ func hbaRunTest(t *testing.T, insecure bool) {
 		defer cleanup()
 
 		s, conn, _ := serverutils.StartServer(t,
-			base.TestServerArgs{Insecure: insecure, SocketFile: maybeSocketFile})
+			base.TestServerArgs{
+				DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(107310),
+				Insecure:          insecure,
+				SocketFile:        maybeSocketFile,
+			})
 		defer s.Stopper().Stop(context.Background())
 
 		// Enable conn/auth logging.
 		// We can't use the cluster settings to do this, because
 		// cluster settings propagate asynchronously.
-		testServer := s.(*server.TestServer)
+		testServer := s.ApplicationLayer()
 		pgServer := testServer.PGServer().(*pgwire.Server)
 		pgServer.TestingEnableConnLogging()
 		pgServer.TestingEnableAuthLogging()
-		testServer.PGPreServer().TestingAcceptSystemIdentityOption(true)
+		testServer.PGPreServer().(*pgwire.PreServeConnHandler).TestingAcceptSystemIdentityOption(true)
 
 		httpClient, err := s.GetAdminHTTPClient()
 		if err != nil {
@@ -266,7 +270,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 					}
 
 				case "accept_sql_without_tls":
-					testServer.Cfg.AcceptSQLWithoutTLS = true
+					testServer.SetAcceptSQLWithoutTLS(true)
 
 				case "set_hba":
 					_, err := conn.ExecContext(context.Background(),
@@ -409,6 +413,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 								// Erase non-deterministic fields.
 								info["Timestamp"] = "XXX"
 								info["RemoteAddress"] = "XXX"
+								info["SessionID"] = "XXX"
 								if _, ok := info["Duration"]; ok {
 									info["Duration"] = "NNN"
 								}
@@ -482,7 +487,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 					// We want the certs to be present in the filesystem for this test.
 					// However, certs are only generated for users "root" and "testuser" specifically.
 					sqlURL, cleanupFn := sqlutils.PGUrlWithOptionalClientCerts(
-						t, s.ServingSQLAddr(), t.Name(), url.User(systemIdentity),
+						t, s.AdvSQLAddr(), t.Name(), url.User(systemIdentity),
 						forceCerts ||
 							systemIdentity == username.RootUser ||
 							systemIdentity == username.TestUser /* withClientCerts */)
@@ -490,7 +495,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 
 					var host, port string
 					if td.Cmd == "connect" {
-						host, port, err = net.SplitHostPort(s.ServingSQLAddr())
+						host, port, err = net.SplitHostPort(s.AdvSQLAddr())
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -600,6 +605,13 @@ func fmtErr(err error) string {
 			}
 			if pqErr.Hint != "" {
 				hint := strings.Replace(pqErr.Hint, stdstrings.IssueReferral, "<STANDARD REFERRAL>", 1)
+				if strings.Contains(hint, "Supported methods:") {
+					// Depending on whether the test is running on linux or not
+					// (or, more specifically, whether gss build tag is set),
+					// "gss" method might not be included, so we remove it here
+					// and not include into the expected output.
+					hint = strings.Replace(hint, "gss, ", "", 1)
+				}
 				errStr += "\nHINT: " + hint
 			}
 			if pqErr.Detail != "" {
@@ -621,12 +633,14 @@ func TestClientAddrOverride(t *testing.T) {
 	defer sc.Close(t)
 
 	// Start a server.
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
 
 	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "testClientAddrOverride" /* prefix */, url.User(username.TestUser),
+		t, s.AdvSQLAddr(), "testClientAddrOverride" /* prefix */, url.User(username.TestUser),
 	)
 	defer cleanupFunc()
 
@@ -638,10 +652,9 @@ func TestClientAddrOverride(t *testing.T) {
 	// Enable conn/auth logging.
 	// We can't use the cluster settings to do this, because
 	// cluster settings for booleans propagate asynchronously.
-	testServer := s.(*server.TestServer)
-	pgServer := testServer.PGServer().(*pgwire.Server)
+	pgServer := s.PGServer().(*pgwire.Server)
 	pgServer.TestingEnableAuthLogging()
-	pgPreServer := testServer.PGPreServer()
+	pgPreServer := s.PGPreServer().(*pgwire.PreServeConnHandler)
 
 	testCases := []struct {
 		specialAddr string
@@ -733,7 +746,7 @@ func TestClientAddrOverride(t *testing.T) {
 			t.Run("check-server-log-uses-override", func(t *testing.T) {
 				// Wait for the disconnection event in logs.
 				testutils.SucceedsSoon(t, func() error {
-					log.Flush()
+					log.FlushFiles()
 					entries, err := log.FetchEntriesFromFiles(testStartTime.UnixNano(), math.MaxInt64, 10000, sessionTerminatedRe,
 						log.WithMarkedSensitiveData)
 					if err != nil {
@@ -746,7 +759,7 @@ func TestClientAddrOverride(t *testing.T) {
 				})
 
 				// Now we want to check that the logging tags are also updated.
-				log.Flush()
+				log.FlushFiles()
 				entries, err := log.FetchEntriesFromFiles(testStartTime.UnixNano(), math.MaxInt64, 10000, authLogFileRe,
 					log.WithMarkedSensitiveData)
 				if err != nil {
@@ -771,6 +784,56 @@ func TestClientAddrOverride(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestSSLSessionVar checks that the read-only SSL session variable correctly
+// reflects the state of the connection.
+func TestSSLSessionVar(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	sc := log.ScopeWithoutShowLogs(t)
+	defer sc.Close(t)
+
+	ctx := context.Background()
+	// Start a server.
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+
+	// Ensure the test user exists.
+	if _, err := db.Exec(fmt.Sprintf(`CREATE USER %s WITH PASSWORD 'abc'`, username.TestUser)); err != nil {
+		t.Fatal(err)
+	}
+
+	s.SetAcceptSQLWithoutTLS(true)
+
+	pgURLWithCerts, cleanupFuncCerts := sqlutils.PGUrlWithOptionalClientCerts(
+		t, s.AdvSQLAddr(), "TestSSLSessionVarCerts" /* prefix */, url.User(username.TestUser), true,
+	)
+	defer cleanupFuncCerts()
+
+	pgURLWithoutCerts, cleanupFuncWithoutCerts := sqlutils.PGUrlWithOptionalClientCerts(
+		t, s.AdvSQLAddr(), "TestSSLSessionVarNoCerts" /* prefix */, url.UserPassword(username.TestUser, "abc"), false,
+	)
+	defer cleanupFuncWithoutCerts()
+	q := pgURLWithoutCerts.Query()
+	q.Set("sslmode", "disable")
+	pgURLWithoutCerts.RawQuery = q.Encode()
+
+	// Connect with certs.
+	connWithCerts, err := pgx.Connect(ctx, pgURLWithCerts.String())
+	require.NoError(t, err)
+	var result string
+	err = connWithCerts.QueryRow(ctx, "SHOW ssl").Scan(&result)
+	require.NoError(t, err)
+	require.Equal(t, "on", result)
+
+	// Connect without certs.
+	connWithoutCerts, err := pgx.Connect(ctx, pgURLWithoutCerts.String())
+	require.NoError(t, err)
+	err = connWithoutCerts.QueryRow(ctx, "SHOW ssl").Scan(&result)
+	require.NoError(t, err)
+	require.Equal(t, "off", result)
 }
 
 var sessionTerminatedRe = regexp.MustCompile("client_session_end")

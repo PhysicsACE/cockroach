@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/petermattis/goid"
@@ -37,8 +38,7 @@ import (
 // interestingGoroutines returns all goroutines we care about for the purpose
 // of leak checking. It excludes testing or runtime ones.
 func interestingGoroutines() map[int64]string {
-	buf := make([]byte, 2<<20)
-	buf = buf[:runtime.Stack(buf, true)]
+	buf := allstacks.Get()
 	gs := make(map[int64]string)
 	for _, g := range strings.Split(string(buf), "\n\n") {
 		sl := strings.SplitN(g, "\n", 2)
@@ -56,6 +56,14 @@ func interestingGoroutines() map[int64]string {
 			strings.Contains(stack, ").writeLoop(") ||
 			// Ignore the Sentry client, which is created lazily on first use.
 			strings.Contains(stack, "sentry-go.(*HTTPTransport).worker") ||
+			// Ignore the opensensus worker, which is created by the event exporter.
+			strings.Contains(stack, "go.opencensus.io/stats/view.(*worker).start") ||
+			// Ignore pgconn which creates a goroutine to do an async cleanup.
+			strings.Contains(stack, "github.com/jackc/pgconn.(*PgConn).asyncClose.func1") ||
+			// Ignore pgconn which creates a goroutine to watch context cancellation.
+			strings.Contains(stack, "github.com/jackc/pgconn/internal/ctxwatch.(*ContextWatcher).Watch.func1") ||
+			// Ignore pq goroutine that watches for context cancellation.
+			strings.Contains(stack, "github.com/lib/pq.(*conn).watchCancel") ||
 			// Seems to be gccgo specific.
 			(runtime.Compiler == "gccgo" && strings.Contains(stack, "testing.T.Parallel")) ||
 			// Ignore intentionally long-running logging goroutines that live for the
@@ -93,17 +101,26 @@ var leakDetectorDisabled uint32
 // cycle.
 var PrintLeakedStoppers = func(t testing.TB) {}
 
+// T allows failing tests.
+type T interface {
+	Errorf(fmt string, args ...interface{})
+}
+
 // AfterTest snapshots the currently-running goroutines and returns a
 // function to be run at the end of tests to see whether any
 // goroutines leaked.
-func AfterTest(t testing.TB) func() {
+func AfterTest(t T) func() {
 	if atomic.LoadUint32(&leakDetectorDisabled) != 0 {
 		return func() {}
 	}
 
 	orig := interestingGoroutines()
 	return func() {
-		t.Helper()
+		if h, ok := t.(interface {
+			Helper()
+		}); ok {
+			h.Helper()
+		}
 		// If there was a panic, "leaked" goroutines are expected.
 		if r := recover(); r != nil {
 			// Inhibit the leak detector for future tests, in case someone (insanely?)
@@ -112,20 +129,24 @@ func AfterTest(t testing.TB) func() {
 			// the middle of another test's execution and trip the leak detector for
 			// that innocent test.
 			atomic.StoreUint32(&leakDetectorDisabled, 1)
-			t.Logf("panic: %s", r)
+			t.Errorf("panic: %s", r)
 			panic(r)
 		}
 
 		// If the test already failed, we don't pile on any more errors but we check
 		// to see if the leak detector should be disabled for future tests.
-		if t.Failed() {
+		if f, ok := t.(interface {
+			Failed() bool
+		}); ok && f.Failed() {
 			if err := diffGoroutines(orig); err != nil {
 				atomic.StoreUint32(&leakDetectorDisabled, 1)
 			}
 			return
 		}
 
-		PrintLeakedStoppers(t)
+		if tb, ok := t.(testing.TB); ok {
+			PrintLeakedStoppers(tb)
+		}
 
 		// Loop, waiting for goroutines to shut down.
 		// Wait up to 5 seconds, but finish as quickly as possible.
@@ -137,7 +158,7 @@ func AfterTest(t testing.TB) func() {
 					continue
 				}
 				atomic.StoreUint32(&leakDetectorDisabled, 1)
-				t.Error(err)
+				t.Errorf("%v", err)
 			}
 			break
 		}

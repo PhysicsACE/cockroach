@@ -113,6 +113,9 @@ func checkStorage(
 	}
 
 	buf := make([]byte, chunkSize)
+	// https://github.com/cockroachdb/cockroach/issues/110599 tracks this
+	// deprecated usage.
+	//lint:ignore SA1019 deprecated
 	_, _ = rand.Read(buf)
 
 	var res result
@@ -139,7 +142,7 @@ func checkStorage(
 
 	// Now read the file back and time it.
 	beforeRead := timeutil.Now()
-	r, err := store.ReadFile(ctx, filename)
+	r, _, err := store.ReadFile(ctx, filename, cloud.ReadOptions{NoFileSize: true})
 	if err != nil {
 		return res, errors.Wrap(err, "opening reader")
 	}
@@ -179,10 +182,9 @@ func newCloudCheckProcessor(
 	processorID int32,
 	spec execinfrapb.CloudStorageTestSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	p := &proc{spec: spec}
-	if err := p.Init(ctx, p, post, flowTypes, flowCtx, processorID, output, nil /* memMonitor */, execinfra.ProcStateOpts{}); err != nil {
+	if err := p.Init(ctx, p, post, flowTypes, flowCtx, processorID, nil /* memMonitor */, execinfra.ProcStateOpts{}); err != nil {
 		return nil, err
 	}
 	return p, nil

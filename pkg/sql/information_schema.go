@@ -22,13 +22,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
@@ -40,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
 	"github.com/cockroachdb/cockroach/pkg/util/collatedstring"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -404,29 +408,29 @@ var informationSchemaColumnsTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 	schema: vtable.InformationSchemaColumns,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		// Get the collations for all comments of current database.
-		comments, err := getComments(ctx, p)
+		allComments, err := p.Descriptors().GetAllComments(ctx, p.Txn())
 		if err != nil {
 			return err
 		}
-		// Push all comments of columns into map.
-		commentMap := make(map[tree.DInt]map[tree.DInt]string)
-		for _, comment := range comments {
-			objID := tree.MustBeDInt(comment[0])
-			objSubID := tree.MustBeDInt(comment[1])
-			description := comment[2].String()
-			commentType := tree.MustBeDInt(comment[3])
-			if commentType == 2 {
-				if commentMap[objID] == nil {
-					commentMap[objID] = make(map[tree.DInt]string)
-				}
-				commentMap[objID][objSubID] = description
-			}
-		}
-
+		// Get the collations for all comments of current database.
 		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(
 			db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor,
 		) error {
+			// Push all comments of columns into map.
+			commentMap := make(map[descpb.PGAttributeNum]string)
+			if err := allComments.ForEachCommentOnDescriptor(
+				table.GetID(),
+				func(key catalogkeys.CommentKey, cmt string) error {
+					if key.CommentType != catalogkeys.ColumnCommentType {
+						return nil
+					}
+					commentMap[descpb.PGAttributeNum(key.SubID)] = cmt
+					return nil
+				},
+			); err != nil {
+				return err
+			}
+
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(sc.GetName())
 			for _, column := range table.AccessibleColumns() {
@@ -472,10 +476,10 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 					}
 				}
 
-				// Match the comment belonging to current column from map,using table id and column id
-				tableID := tree.DInt(table.GetID())
-				columnID := tree.DInt(column.GetID())
-				description := commentMap[tableID][columnID]
+				description := tree.DNull
+				if cmt, ok := commentMap[column.GetPGAttributeNum()]; ok {
+					description = tree.NewDString(cmt)
+				}
 
 				// udt_schema is set to pg_catalog for builtin types. If, however, the
 				// type is a user defined type, then we should fill this value based on
@@ -507,7 +511,7 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 					scNameStr,                         // table_schema
 					tree.NewDString(table.GetName()),  // table_name
 					tree.NewDString(column.GetName()), // column_name
-					tree.NewDString(description),      // column_comment
+					description,                       // column_comment
 					tree.NewDInt(tree.DInt(column.GetPGAttributeNum())), // ordinal_position
 					colDefault,                        // column_default
 					yesOrNoDatum(column.IsNullable()), // is_nullable
@@ -853,14 +857,44 @@ https://www.postgresql.org/docs/9.5/infoschema-key-column-usage.html`,
 
 // Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-parameters.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/parameters-table.html
-var informationSchemaParametersTable = virtualSchemaTable{
-	comment: `built-in function parameters (empty - introspection not yet supported)
+var informationSchemaParametersTable = virtualSchemaView{
+	comment: `function parameters
 https://www.postgresql.org/docs/9.5/infoschema-parameters.html`,
 	schema: vtable.InformationSchemaParameters,
-	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
+	resultColumns: colinfo.ResultColumns{
+		{Name: "specific_catalog", Typ: types.String},
+		{Name: "specific_schema", Typ: types.String},
+		{Name: "specific_name", Typ: types.String},
+		{Name: "ordinal_position", Typ: types.Int},
+		{Name: "parameter_mode", Typ: types.String},
+		{Name: "is_result", Typ: types.String},
+		{Name: "as_locator", Typ: types.String},
+		{Name: "parameter_name", Typ: types.String},
+		{Name: "data_type", Typ: types.String},
+		{Name: "character_maximum_length", Typ: types.Int},
+		{Name: "character_octet_length", Typ: types.Int},
+		{Name: "character_set_catalog", Typ: types.String},
+		{Name: "character_set_schema", Typ: types.String},
+		{Name: "character_set_name", Typ: types.String},
+		{Name: "collation_catalog", Typ: types.String},
+		{Name: "collation_schema", Typ: types.String},
+		{Name: "collation_name", Typ: types.String},
+		{Name: "numeric_precision", Typ: types.Int},
+		{Name: "numeric_precision_radix", Typ: types.Int},
+		{Name: "numeric_scale", Typ: types.Int},
+		{Name: "datetime_precision", Typ: types.Int},
+		{Name: "interval_type", Typ: types.String},
+		{Name: "interval_precision", Typ: types.Int},
+		{Name: "udt_catalog", Typ: types.String},
+		{Name: "udt_schema", Typ: types.String},
+		{Name: "udt_name", Typ: types.String},
+		{Name: "scope_catalog", Typ: types.String},
+		{Name: "scope_schema", Typ: types.String},
+		{Name: "scope_name", Typ: types.String},
+		{Name: "maximum_cardinality", Typ: types.Int},
+		{Name: "dtd_identifier", Typ: types.String},
+		{Name: "parameter_default", Typ: types.String},
 	},
-	unimplemented: true,
 }
 
 var (
@@ -961,14 +995,94 @@ https://www.postgresql.org/docs/9.5/infoschema-role-table-grants.html`,
 }
 
 // MySQL:    https://dev.mysql.com/doc/mysql-infoschema-excerpt/5.7/en/routines-table.html
-var informationSchemaRoutineTable = virtualSchemaTable{
-	comment: `built-in functions (empty - introspection not yet supported)
-https://www.postgresql.org/docs/9.5/infoschema-routines.html`,
+var informationSchemaRoutineTable = virtualSchemaView{
+	comment: `built-in functions and user-defined functions
+https://www.postgresql.org/docs/15/infoschema-routines.html`,
 	schema: vtable.InformationSchemaRoutines,
-	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
+	resultColumns: colinfo.ResultColumns{
+		{Name: "specific_catalog", Typ: types.String},
+		{Name: "specific_schema", Typ: types.String},
+		{Name: "specific_name", Typ: types.String},
+		{Name: "routine_catalog", Typ: types.String},
+		{Name: "routine_schema", Typ: types.String},
+		{Name: "routine_name", Typ: types.String},
+		{Name: "routine_type", Typ: types.String},
+		{Name: "module_catalog", Typ: types.String},
+		{Name: "module_schema", Typ: types.String},
+		{Name: "module_name", Typ: types.String},
+		{Name: "udt_catalog", Typ: types.String},
+		{Name: "udt_schema", Typ: types.String},
+		{Name: "udt_name", Typ: types.String},
+		{Name: "data_type", Typ: types.String},
+		{Name: "character_maximum_length", Typ: types.Int},
+		{Name: "character_octet_length", Typ: types.Int},
+		{Name: "character_set_catalog", Typ: types.String},
+		{Name: "character_set_schema", Typ: types.String},
+		{Name: "character_set_name", Typ: types.String},
+		{Name: "collation_catalog", Typ: types.String},
+		{Name: "collation_schema", Typ: types.String},
+		{Name: "collation_name", Typ: types.String},
+		{Name: "numeric_precision", Typ: types.Int},
+		{Name: "numeric_precision_radix", Typ: types.Int},
+		{Name: "numeric_scale", Typ: types.Int},
+		{Name: "datetime_precision", Typ: types.Int},
+		{Name: "interval_type", Typ: types.String},
+		{Name: "interval_precision", Typ: types.Int},
+		{Name: "type_udt_catalog", Typ: types.String},
+		{Name: "type_udt_schema", Typ: types.String},
+		{Name: "type_udt_name", Typ: types.String},
+		{Name: "scope_catalog", Typ: types.String},
+		{Name: "scope_schema", Typ: types.String},
+		{Name: "scope_name", Typ: types.String},
+		{Name: "maximum_cardinality", Typ: types.Int},
+		{Name: "dtd_identifier", Typ: types.String},
+		{Name: "routine_body", Typ: types.String},
+		{Name: "routine_definition", Typ: types.String},
+		{Name: "external_name", Typ: types.String},
+		{Name: "external_language", Typ: types.String},
+		{Name: "parameter_style", Typ: types.String},
+		{Name: "is_deterministic", Typ: types.String},
+		{Name: "sql_data_access", Typ: types.String},
+		{Name: "is_null_call", Typ: types.String},
+		{Name: "sql_path", Typ: types.String},
+		{Name: "schema_level_routine", Typ: types.String},
+		{Name: "max_dynamic_result_sets", Typ: types.Int},
+		{Name: "is_user_defined_cast", Typ: types.String},
+		{Name: "is_implicitly_invocable", Typ: types.String},
+		{Name: "security_type", Typ: types.String},
+		{Name: "to_sql_specific_catalog", Typ: types.String},
+		{Name: "to_sql_specific_schema", Typ: types.String},
+		{Name: "to_sql_specific_name", Typ: types.String},
+		{Name: "as_locator", Typ: types.String},
+		{Name: "created", Typ: types.TimestampTZ},
+		{Name: "last_altered", Typ: types.TimestampTZ},
+		{Name: "new_savepoint_level", Typ: types.String},
+		{Name: "is_udt_dependent", Typ: types.String},
+		{Name: "result_cast_from_data_type", Typ: types.String},
+		{Name: "result_cast_as_locator", Typ: types.String},
+		{Name: "result_cast_char_max_length", Typ: types.Int},
+		{Name: "result_cast_char_octet_length", Typ: types.Int},
+		{Name: "result_cast_char_set_catalog", Typ: types.String},
+		{Name: "result_cast_char_set_schema", Typ: types.String},
+		{Name: "result_cast_char_set_name", Typ: types.String},
+		{Name: "result_cast_collation_catalog", Typ: types.String},
+		{Name: "result_cast_collation_schema", Typ: types.String},
+		{Name: "result_cast_collation_name", Typ: types.String},
+		{Name: "result_cast_numeric_precision", Typ: types.Int},
+		{Name: "result_cast_numeric_precision_radix", Typ: types.Int},
+		{Name: "result_cast_numeric_scale", Typ: types.Int},
+		{Name: "result_cast_datetime_precision", Typ: types.Int},
+		{Name: "result_cast_interval_type", Typ: types.String},
+		{Name: "result_cast_interval_precision", Typ: types.Int},
+		{Name: "result_cast_type_udt_catalog", Typ: types.String},
+		{Name: "result_cast_type_udt_schema", Typ: types.String},
+		{Name: "result_cast_type_udt_name", Typ: types.String},
+		{Name: "result_cast_scope_catalog", Typ: types.String},
+		{Name: "result_cast_scope_schema", Typ: types.String},
+		{Name: "result_cast_scope_name", Typ: types.String},
+		{Name: "result_cast_maximum_cardinality", Typ: types.Int},
+		{Name: "result_cast_dtd_identifier", Typ: types.String},
 	},
-	unimplemented: true,
 }
 
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/schemata-table.html
@@ -1037,7 +1151,10 @@ var informationSchemaTypePrivilegesTable = virtualSchemaTable{
 					typeNameStr := tree.NewDString(typeDesc.GetName())
 					// TODO(knz): This should filter for the current user, see
 					// https://github.com/cockroachdb/cockroach/issues/35572
-					privs := typeDesc.GetPrivileges().Show(privilege.Type, true /* showImplicitOwnerPrivs */)
+					privs, err := typeDesc.GetPrivileges().Show(privilege.Type, true /* showImplicitOwnerPrivs */)
+					if err != nil {
+						return err
+					}
 					for _, u := range privs {
 						userNameStr := tree.NewDString(u.User.Normalized())
 						for _, priv := range u.Privileges {
@@ -1076,7 +1193,10 @@ var informationSchemaSchemataTablePrivileges = virtualSchemaTable{
 		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
 			func(db catalog.DatabaseDescriptor) error {
 				return forEachSchema(ctx, p, db, true /* requiresPrivileges */, func(sc catalog.SchemaDescriptor) error {
-					privs := sc.GetPrivileges().Show(privilege.Schema, true /* showImplicitOwnerPrivs */)
+					privs, err := sc.GetPrivileges().Show(privilege.Schema, true /* showImplicitOwnerPrivs */)
+					if err != nil {
+						return err
+					}
 					dbNameStr := tree.NewDString(db.GetName())
 					scNameStr := tree.NewDString(sc.GetName())
 					// TODO(knz): This should filter for the current user, see
@@ -1136,14 +1256,24 @@ https://www.postgresql.org/docs/9.5/infoschema-sequences.html`,
 				if !table.IsSequence() {
 					return nil
 				}
+				typ := "INT8"
+				precision := 64
+				switch table.GetSequenceOpts().AsIntegerType {
+				case "INT2":
+					precision = 16
+					typ = "INT2"
+				case "INT4":
+					precision = 32
+					typ = "INT4"
+				}
 				return addRow(
-					tree.NewDString(db.GetName()),    // catalog
-					tree.NewDString(sc.GetName()),    // schema
-					tree.NewDString(table.GetName()), // name
-					tree.NewDString("bigint"),        // type
-					tree.NewDInt(64),                 // numeric precision
-					tree.NewDInt(2),                  // numeric precision radix
-					tree.NewDInt(0),                  // numeric scale
+					tree.NewDString(db.GetName()),      // catalog
+					tree.NewDString(sc.GetName()),      // schema
+					tree.NewDString(table.GetName()),   // name
+					tree.NewDString(typ),               // integer type, one of ["INT2", "INT4", "INT8"]
+					tree.NewDInt(tree.DInt(precision)), // numeric precision
+					tree.NewDInt(2),                    // numeric precision radix
+					tree.NewDInt(0),                    // numeric scale
 					tree.NewDString(strconv.FormatInt(table.GetSequenceOpts().Start, 10)),     // start value
 					tree.NewDString(strconv.FormatInt(table.GetSequenceOpts().MinValue, 10)),  // min value
 					tree.NewDString(strconv.FormatInt(table.GetSequenceOpts().MaxValue, 10)),  // max value
@@ -1170,21 +1300,23 @@ var informationSchemaStatisticsTable = virtualSchemaTable{
 				appendRow := func(index catalog.Index, colName string, sequence int,
 					direction tree.Datum, isStored, isImplicit bool,
 				) error {
+					idxInvisibility := index.GetInvisibility()
 					return addRow(
-						dbNameStr,                           // table_catalog
-						scNameStr,                           // table_schema
-						tbNameStr,                           // table_name
-						yesOrNoDatum(!index.IsUnique()),     // non_unique
-						scNameStr,                           // index_schema
-						tree.NewDString(index.GetName()),    // index_name
-						tree.NewDInt(tree.DInt(sequence)),   // seq_in_index
-						tree.NewDString(colName),            // column_name
-						tree.DNull,                          // collation
-						tree.DNull,                          // cardinality
-						direction,                           // direction
-						yesOrNoDatum(isStored),              // storing
-						yesOrNoDatum(isImplicit),            // implicit
-						yesOrNoDatum(!index.IsNotVisible()), // is_visible
+						dbNameStr,                            // table_catalog
+						scNameStr,                            // table_schema
+						tbNameStr,                            // table_name
+						yesOrNoDatum(!index.IsUnique()),      // non_unique
+						scNameStr,                            // index_schema
+						tree.NewDString(index.GetName()),     // index_name
+						tree.NewDInt(tree.DInt(sequence)),    // seq_in_index
+						tree.NewDString(colName),             // column_name
+						tree.DNull,                           // collation
+						tree.DNull,                           // cardinality
+						direction,                            // direction
+						yesOrNoDatum(isStored),               // storing
+						yesOrNoDatum(isImplicit),             // implicit
+						yesOrNoDatum(idxInvisibility == 0.0), // is_visible
+						tree.NewDFloat(tree.DFloat(1-idxInvisibility)), // visibility
 					)
 				}
 
@@ -1348,7 +1480,11 @@ var informationSchemaUserPrivileges = virtualSchemaTable{
 				dbNameStr := tree.NewDString(dbDesc.GetName())
 				for _, u := range []string{username.RootUser, username.AdminRole} {
 					grantee := tree.NewDString(u)
-					for _, p := range privilege.GetValidPrivilegesForObject(privilege.Table).SortedNames() {
+					validPrivs, err := privilege.GetValidPrivilegesForObject(privilege.Table)
+					if err != nil {
+						return err
+					}
+					for _, p := range validPrivs.SortedNames() {
 						if err := addRow(
 							grantee,            // grantee
 							dbNameStr,          // table_catalog
@@ -1392,7 +1528,11 @@ func populateTablePrivileges(
 			if err != nil {
 				return err
 			}
-			for _, u := range desc.Show(tableType, true /* showImplicitOwnerPrivs */) {
+			showPrivs, err := desc.Show(tableType, true /* showImplicitOwnerPrivs */)
+			if err != nil {
+				return err
+			}
+			for _, u := range showPrivs {
 				granteeNameStr := tree.NewDString(u.User.Normalized())
 				for _, priv := range u.Privileges {
 					// We use this function to check for the grant option so that the
@@ -1576,6 +1716,9 @@ var informationSchemaSessionVariables = virtualSchemaTable{
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		for _, vName := range varNames {
 			gen := varGen[vName]
+			if gen.Hidden {
+				continue
+			}
 			value, err := gen.Get(&p.extendedEvalCtx, p.Txn())
 			if err != nil {
 				return err
@@ -1618,6 +1761,7 @@ var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
 			dbNameStr := tree.NewDString(db.GetName())
 			exPriv := tree.NewDString(privilege.EXECUTE.String())
 			roleNameForBuiltins := []*tree.DString{
+				tree.NewDString(username.AdminRole),
 				tree.NewDString(username.RootUser),
 				tree.NewDString(username.PublicRole),
 			}
@@ -1643,7 +1787,7 @@ var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
 
 				_, overloads := builtinsregistry.GetBuiltinProperties(name)
 				for _, o := range overloads {
-					fnSpecificName := tree.NewDString(fmt.Sprintf("%s_%d", fnNameStr, o.Oid))
+					fnSpecificName := tree.NewDString(nameConcatOid(fnNameStr, o.Oid))
 					for _, grantee := range roleNameForBuiltins {
 						if err := addRow(
 							tree.DNull, // grantor
@@ -1664,7 +1808,7 @@ var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
 			}
 
 			err := db.ForEachSchema(func(id descpb.ID, name string) error {
-				sc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, id)
+				sc, err := p.Descriptors().ByIDWithLeased(p.txn).Get().Schema(ctx, id)
 				if err != nil {
 					return err
 				}
@@ -1673,42 +1817,46 @@ var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
 					if err != nil {
 						return err
 					}
-					privs := fn.GetPrivileges()
-					scNameStr := tree.NewDString(sc.GetName())
-					fnSpecificName := tree.NewDString(fmt.Sprintf("%s_%d", fn.GetName(), catid.FuncIDToOID(fn.GetID())))
-					fnName := tree.NewDString(fn.GetName())
-					// EXECUTE is the only privilege kind relevant to functions.
-					if err := addRow(
-						tree.DNull, // grantor
-						tree.NewDString(privs.Owner().Normalized()), // grantee
-						dbNameStr,      // specific_catalog
-						scNameStr,      // specific_schema
-						fnSpecificName, // specific_name
-						dbNameStr,      // routine_catalog
-						scNameStr,      // routine_schema
-						fnName,         // routine_name
-						exPriv,         // privilege_type
-						yesString,      // is_grantable
-					); err != nil {
+					canSeeDescriptor, err := userCanSeeDescriptor(ctx, p, fn, db, false /* allowAdding */)
+					if err != nil {
 						return err
 					}
-					for _, user := range privs.Users {
-						if !privilege.EXECUTE.IsSetIn(user.Privileges) {
-							continue
-						}
-						if err := addRow(
-							tree.DNull, // grantor
-							tree.NewDString(user.User().Normalized()), // grantee
-							dbNameStr,      // specific_catalog
-							scNameStr,      // specific_schema
-							fnSpecificName, // specific_name
-							dbNameStr,      // routine_catalog
-							scNameStr,      // routine_schema
-							fnName,         // routine_name
-							exPriv,         // privilege_type
-							yesOrNoDatum(privilege.EXECUTE.IsSetIn(user.WithGrantOption)), // is_grantable
-						); err != nil {
-							return err
+					if !canSeeDescriptor {
+						return nil
+					}
+					privs, err := fn.GetPrivileges().Show(privilege.Function, true /* showImplicitOwnerPrivs */)
+					if err != nil {
+						return err
+					}
+					scNameStr := tree.NewDString(sc.GetName())
+
+					fnSpecificName := tree.NewDString(nameConcatOid(fn.GetName(), catid.FuncIDToOID(fn.GetID())))
+					fnName := tree.NewDString(fn.GetName())
+					for _, u := range privs {
+						userNameStr := tree.NewDString(u.User.Normalized())
+						for _, priv := range u.Privileges {
+							// We use this function to check for the grant option so that the
+							// object owner also gets is_grantable=true.
+							isGrantable, err := p.CheckGrantOptionsForUser(
+								ctx, fn.GetPrivileges(), sc, []privilege.Kind{priv.Kind}, u.User,
+							)
+							if err != nil {
+								return err
+							}
+							if err := addRow(
+								tree.DNull,                          // grantor
+								userNameStr,                         // grantee
+								dbNameStr,                           // specific_catalog
+								scNameStr,                           // specific_schema
+								fnSpecificName,                      // specific_name
+								dbNameStr,                           // routine_catalog
+								scNameStr,                           // routine_schema
+								fnName,                              // routine_name
+								tree.NewDString(priv.Kind.String()), // privilege_type
+								yesOrNoDatum(isGrantable),           // is_grantable
+							); err != nil {
+								return err
+							}
 						}
 					}
 					return nil
@@ -2742,6 +2890,18 @@ func forEachRole(
 		}
 	}
 
+	// Add a row for the internal `node` user. It does not exist in system.users
+	// since you can't log in as it, but it does own objects like the system
+	// database, so it should be viewable in introspection.
+	nodeOptionsJSON, err := json.MakeJSON(map[string]interface{}{roleoption.NOLOGIN.String(): true})
+	if err != nil {
+		return err
+	}
+	nodeOptions := roleOptions{tree.NewDJSON(nodeOptionsJSON)}
+	if err := fn(username.NodeUserName(), false /* isRole */, nodeOptions, tree.DNull /* settings */); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -2784,28 +2944,43 @@ func userCanSeeDescriptor(
 		return false, nil
 	}
 
+	// Users can see objects in the database if they have connect privilege.
+	if parentDBDesc != nil {
+		if ok, err := p.HasPrivilege(ctx, parentDBDesc, privilege.CONNECT, p.User()); err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
+		}
+	}
+	// Also check if the user has any privilege on the descriptor. This check is
+	// done second, so that the check above can short-circuit, allowing us to
+	// avoid fetching the synthetic privileges for virtual tables in a thundering
+	// herd while populating a table like pg_class, which has a row for every
+	// table, including virtual tables.
 	// TODO(richardjcai): We may possibly want to remove the ability to view
 	// the descriptor if they have any privilege on the descriptor and only
 	// allow the descriptor to be viewed if they have CONNECT on the DB. #59827.
-	canSeeDescriptor := false
 	if ok, err := p.HasAnyPrivilege(ctx, desc); err != nil {
 		return false, err
-	} else {
-		canSeeDescriptor = ok
+	} else if ok {
+		return true, nil
 	}
-	// Users can see objects in the database if they have connect privilege.
-	if parentDBDesc != nil {
-		if !canSeeDescriptor {
-			if ok, err := p.HasPrivilege(ctx, parentDBDesc, privilege.CONNECT, p.User()); err != nil {
-				return false, err
-			} else {
-				canSeeDescriptor = ok
-			}
-		}
-	}
-	return canSeeDescriptor, nil
+	return false, nil
 }
 
 func descriptorIsVisible(desc catalog.Descriptor, allowAdding bool) bool {
 	return desc.Public() || (allowAdding && desc.Adding())
+}
+
+// nameConcatOid is a Go version of the nameconcatoid builtin function. The
+// result is the same as fmt.Sprintf("%s_%d", s, o) except that, if it would not
+// fit in 63 characters, we make it do so by truncating the name input (not the
+// oid).
+func nameConcatOid(s string, o oid.Oid) string {
+	const maxLen = 63
+	oidStr := strconv.Itoa(int(o))
+	if len(s)+1+len(oidStr) <= maxLen {
+		return s + "_" + oidStr
+	}
+	return s[:maxLen-1-len(oidStr)] + "_" + oidStr
 }

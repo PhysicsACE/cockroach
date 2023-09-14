@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/build/util"
 	"github.com/cockroachdb/errors"
 )
@@ -30,13 +31,25 @@ import (
 type BuildOptions struct {
 	// True iff this is a release build.
 	Release bool
-	// BuildTag must be set if Release is set, and vice-versea.
+	// BuildTag overrides the build tag for a "Release" build.
+	// This can only be set for a Release build.
 	BuildTag string
 
 	// ExecFn.Run() is called to execute commands for this build.
 	// The zero value is appropriate in "real" scenarios but for
 	// tests you can update ExecFn.MockExecFn.
 	ExecFn ExecFn
+
+	// Channel represents the telemetry channel
+	Channel string
+}
+
+// ChannelFromPlatform retrurns the telemetry channel used for a particular platform.
+func ChannelFromPlatform(platform Platform) string {
+	if platform == PlatformLinuxFIPS {
+		return build.FIPSTelemetryChannel
+	}
+	return build.DefaultTelemetryChannel
 }
 
 // SuffixFromPlatform returns the suffix that will be appended to the
@@ -118,14 +131,14 @@ func SharedLibraryExtensionFromPlatform(platform Platform) string {
 }
 
 // MakeWorkload makes the bin/workload binary. It is only ever built in the
-// crosslinux configuration.
-func MakeWorkload(opts BuildOptions, pkgDir string) error {
+// crosslinux and crosslinuxarm configurations.
+func MakeWorkload(platform Platform, opts BuildOptions, pkgDir string) error {
 	if opts.Release {
 		return errors.Newf("cannot build workload in Release mode")
 	}
-	// NB: workload doesn't need anything stamped so we can use `crosslinux`
-	// rather than `crosslinuxbase`.
-	cmd := exec.Command("bazel", "build", "//pkg/cmd/workload", "-c", "opt", "--config=crosslinux", "--config=ci")
+	crossConfig := CrossConfigFromPlatform(platform)
+	configArg := fmt.Sprintf("--config=%s", crossConfig)
+	cmd := exec.Command("bazel", "build", "//pkg/cmd/workload", "-c", "opt", configArg, "--config=ci")
 	cmd.Dir = pkgDir
 	cmd.Stderr = os.Stderr
 	log.Printf("%s", cmd.Args)
@@ -134,32 +147,41 @@ func MakeWorkload(opts BuildOptions, pkgDir string) error {
 		return errors.Wrapf(err, "failed to run %s: %s", cmd.Args, string(stdoutBytes))
 	}
 
-	bazelBin, err := getPathToBazelBin(opts.ExecFn, pkgDir, []string{"-c", "opt", "--config=crosslinux", "--config=ci"})
+	bazelBin, err := getPathToBazelBin(opts.ExecFn, pkgDir, []string{"-c", "opt", configArg, "--config=ci"})
 	if err != nil {
 		return err
 	}
-	return stageBinary("//pkg/cmd/workload", PlatformLinux, bazelBin, filepath.Join(pkgDir, "bin"), false)
+	return stageBinary("//pkg/cmd/workload", platform, bazelBin, filepath.Join(pkgDir, "bin"), platform == PlatformLinuxArm)
 }
 
 // MakeRelease makes the release binary and associated files.
 func MakeRelease(platform Platform, opts BuildOptions, pkgDir string) error {
+	if !(opts.Channel == build.DefaultTelemetryChannel || opts.Channel == build.FIPSTelemetryChannel) {
+		return errors.Newf("cannot set the telemetry channel to %s, supported channels: %s and %s", opts.Channel, build.DefaultTelemetryChannel, build.FIPSTelemetryChannel)
+	}
 	buildArgs := []string{"build", "//pkg/cmd/cockroach", "//pkg/cmd/cockroach-sql"}
-	if platform != PlatformMacOSArm {
+	if platform != PlatformMacOSArm && platform != PlatformWindows {
 		buildArgs = append(buildArgs, "//c-deps:libgeos")
 	}
 	targetTriple := TargetTripleFromPlatform(platform)
+	var stampCommand string
+	if platform == PlatformWindows {
+		buildArgs = append(buildArgs, "--enable_runfiles")
+	}
 	if opts.Release {
 		if opts.BuildTag == "" {
-			return errors.Newf("must set BuildTag if Release is set")
+			stampCommand = fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s %s release", targetTriple, opts.Channel)
+		} else {
+			stampCommand = fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s %s release %s", targetTriple, opts.Channel, opts.BuildTag)
 		}
-		buildArgs = append(buildArgs, fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s official-binary release", targetTriple))
 	} else {
 		if opts.BuildTag != "" {
-			return errors.Newf("cannot set BuildTag if Release is not set")
+			return errors.Newf("BuildTag cannot be set for non-Release builds")
 		}
-		buildArgs = append(buildArgs, fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s official-binary", targetTriple))
+		stampCommand = fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s %s", targetTriple, opts.Channel)
 	}
-	configs := []string{"-c", "opt", "--config=ci", "--config=force_build_cdeps", "--config=with_ui", fmt.Sprintf("--config=%s", CrossConfigFromPlatform(platform))}
+	buildArgs = append(buildArgs, stampCommand)
+	configs := []string{"-c", "opt", "--config=ci", "--config=force_build_cdeps", fmt.Sprintf("--config=%s", CrossConfigFromPlatform(platform))}
 	buildArgs = append(buildArgs, configs...)
 	cmd := exec.Command("bazel", buildArgs...)
 	cmd.Dir = pkgDir
@@ -318,7 +340,7 @@ func stageBinary(
 }
 
 func stageLibraries(platform Platform, bazelBin string, dir string) error {
-	if platform == PlatformMacOSArm {
+	if platform == PlatformMacOSArm || platform == PlatformWindows {
 		return nil
 	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -326,12 +348,7 @@ func stageLibraries(platform Platform, bazelBin string, dir string) error {
 	}
 	ext := SharedLibraryExtensionFromPlatform(platform)
 	for _, lib := range CRDBSharedLibraries {
-		libDir := "lib"
-		if platform == PlatformWindows {
-			// NB: On Windows these libs end up in the `bin` subdir.
-			libDir = "bin"
-		}
-		src := filepath.Join(bazelBin, "c-deps", "libgeos_foreign", libDir, lib+ext)
+		src := filepath.Join(bazelBin, "c-deps", "libgeos_foreign", "lib", lib+ext)
 		srcF, err := os.Open(src)
 		if err != nil {
 			return err

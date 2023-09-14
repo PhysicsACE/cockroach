@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -45,13 +44,21 @@ func registerDiskStalledDetection(r registry.Registry) {
 			return &cgroupDiskStaller{t: t, c: c, readOrWrite: []string{"write"}, logsToo: true}
 		},
 	}
+	makeSpec := func() spec.ClusterSpec {
+		s := r.MakeClusterSpec(4, spec.ReuseNone())
+		// Use PDs in an attempt to work around flakes encountered when using SSDs.
+		// See #97968.
+		s.PreferLocalSSD = false
+		return s
+	}
 	for name, makeStaller := range stallers {
 		name, makeStaller := name, makeStaller
 		r.Add(registry.TestSpec{
-			Name:    fmt.Sprintf("disk-stalled/%s", name),
-			Owner:   registry.OwnerStorage,
-			Cluster: r.MakeClusterSpec(4, spec.ReuseNone()),
-			Timeout: 20 * time.Minute,
+			Name:                fmt.Sprintf("disk-stalled/%s", name),
+			Owner:               registry.OwnerStorage,
+			Cluster:             makeSpec(),
+			Timeout:             30 * time.Minute,
+			SkipPostValidations: registry.PostValidationNoDeadNodes,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runDiskStalledDetection(ctx, t, c, makeStaller(t, c), true /* doStall */)
 			},
@@ -61,33 +68,8 @@ func registerDiskStalledDetection(r registry.Registry) {
 			// the encryption-at-rest implementation that could indefinitely
 			// stall the process during a disk stall.
 			EncryptionSupport: registry.EncryptionMetamorphic,
+			Leases:            registry.MetamorphicLeases,
 		})
-	}
-
-	for _, stallLogDir := range []bool{false, true} {
-		for _, stallDataDir := range []bool{false, true} {
-			// Grab copies of the args because we'll pass them into a closure.
-			// Everyone's favorite bug to write in Go.
-			stallLogDir := stallLogDir
-			stallDataDir := stallDataDir
-			r.Add(registry.TestSpec{
-				Name: fmt.Sprintf(
-					"disk-stalled/fuse/log=%t,data=%t",
-					stallLogDir, stallDataDir,
-				),
-				Owner:   registry.OwnerStorage,
-				Cluster: r.MakeClusterSpec(4, spec.ReuseNone()),
-				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					runDiskStalledDetection(ctx, t, c, &fuseDiskStaller{
-						t:         t,
-						c:         c,
-						stallLogs: stallLogDir,
-						stallData: stallDataDir,
-					}, stallLogDir || stallDataDir /* doStall */)
-				},
-				EncryptionSupport: registry.EncryptionMetamorphic,
-			})
-		}
 	}
 }
 
@@ -128,7 +110,6 @@ func runDiskStalledDetection(
 	require.NoError(t, err)
 	adminURL := adminUIAddrs[0]
 
-	c.Run(ctx, c.Node(4), `./cockroach workload init kv --splits 1000 {pgurl:1}`)
 	// Open SQL connections—one to n1, the node that will be stalled, and one to
 	// n2 that should remain open and active for the remainder.
 	n1Conn := c.Conn(ctx, t.L(), 1)
@@ -136,11 +117,14 @@ func runDiskStalledDetection(
 	n2conn := c.Conn(ctx, t.L(), 2)
 	defer n2conn.Close()
 	require.NoError(t, n1Conn.PingContext(ctx))
-	_, err = n2conn.ExecContext(ctx, `USE kv;`)
-	require.NoError(t, err)
 
 	// Wait for upreplication.
 	require.NoError(t, WaitFor3XReplication(ctx, t, n2conn))
+
+	c.Run(ctx, c.Node(4), `./cockroach workload init kv --splits 1000 {pgurl:1}`)
+
+	_, err = n2conn.ExecContext(ctx, `USE kv;`)
+	require.NoError(t, err)
 
 	t.Status("starting workload")
 	workloadStartAt := timeutil.Now()
@@ -152,6 +136,7 @@ func runDiskStalledDetection(
 			`{pgurl:1-3}`)
 		return nil
 	})
+	defer m.Wait()
 
 	// Wait between [3m,6m) before stalling the disk.
 	pauseDur := 3*time.Minute + time.Duration(rand.Intn(3))*time.Minute
@@ -176,7 +161,15 @@ func runDiskStalledDetection(
 		m.ExpectDeath()
 	}
 	s.Stall(ctx, c.Node(1))
-	defer s.Unstall(ctx, c.Node(1))
+	// NB: We use a background context in the defer'ed unstall command,
+	// otherwise on test failure our c.Run calls will be ignored. Leaving
+	// the disk stalled will prevent artifact collection, making debugging
+	// difficult.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		s.Unstall(ctx, c.Node(1))
+	}()
 
 	// Wait twice the maximum sync duration and check if our SQL connection to
 	// node 1 is still alive. It should've been terminated.
@@ -198,14 +191,12 @@ func runDiskStalledDetection(
 	}
 
 	// Let the workload continue after the stall.
-	{
-		workloadPauseDur := 10*time.Minute - timeutil.Since(workloadStartAt)
-		t.Status("letting workload continue for ", workloadPauseDur, " with n1 stalled")
-		select {
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
-		case <-time.After(workloadPauseDur):
-		}
+	workloadAfterDur := 10*time.Minute - timeutil.Since(workloadStartAt)
+	t.Status("letting workload continue for ", workloadAfterDur, " with n1 stalled")
+	select {
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	case <-time.After(workloadAfterDur):
 	}
 
 	{
@@ -216,7 +207,7 @@ func runDiskStalledDetection(
 		cum := response.Results[0].Datapoints
 		totalTxnsPostStall := cum[len(cum)-1].Value - totalTxnsPreStall
 		preStallTPS := totalTxnsPreStall / stallAt.Sub(workloadStartAt).Seconds()
-		postStallTPS := totalTxnsPostStall / now.Sub(stallAt).Seconds()
+		postStallTPS := totalTxnsPostStall / workloadAfterDur.Seconds()
 		t.L().PrintfCtx(ctx, "%.2f total transactions committed after stall\n", totalTxnsPostStall)
 		t.L().PrintfCtx(ctx, "pre-stall tps: %.2f, post-stall tps: %.2f\n", preStallTPS, postStallTPS)
 		if postStallTPS < preStallTPS/2 {
@@ -313,6 +304,7 @@ func (s *dmsetupDiskStaller) Setup(ctx context.Context) {
 }
 
 func (s *dmsetupDiskStaller) Cleanup(ctx context.Context) {
+	s.c.Run(ctx, s.c.All(), `sudo dmsetup resume data1`)
 	s.c.Run(ctx, s.c.All(), `sudo umount /mnt/data1`)
 	s.c.Run(ctx, s.c.All(), `sudo dmsetup remove_all`)
 	s.c.Run(ctx, s.c.All(), `sudo mount /mnt/data1`)
@@ -373,9 +365,9 @@ func (s *cgroupDiskStaller) device() (major, minor int) {
 	//    `cat /proc/partitions` and find `deviceName`
 	switch s.c.Spec().Cloud {
 	case spec.GCE:
-		// ls -l /dev/nvme0n1
-		// brw-rw---- 1 root disk 259, 0 Jan 26 20:05 /dev/nvme0n1
-		return 259, 0
+		// ls -l /dev/sdb
+		// brw-rw---- 1 root disk 8, 16 Mar 27 22:08 /dev/sdb
+		return 8, 16
 	default:
 		s.t.Fatalf("unsupported cloud %q", s.c.Spec().Cloud)
 		return 0, 0
@@ -395,64 +387,10 @@ func (s *cgroupDiskStaller) setThroughput(
 	))
 }
 
-// fuseDiskStaller uses a FUSE filesystem (charybdefs) to insert an artificial
-// delay on all I/O.
-type fuseDiskStaller struct {
-	t         test.Test
-	c         cluster.Cluster
-	stallLogs bool
-	stallData bool
-}
-
-var _ diskStaller = (*fuseDiskStaller)(nil)
-
-func (s *fuseDiskStaller) DataDir() string {
-	if s.stallData {
-		return "{store-dir}/faulty"
-	}
-	return "{store-dir}/real"
-}
-
-func (s *fuseDiskStaller) LogDir() string {
-	if s.stallLogs {
-		return "{store-dir}/faulty/logs"
-	}
-	return "{store-dir}/real/logs"
-}
-
-func (s *fuseDiskStaller) Setup(ctx context.Context) {
-	if s.c.IsLocal() && runtime.GOOS != "linux" {
-		s.t.Fatalf("must run on linux os, found %s", runtime.GOOS)
-	}
-	s.t.Status("setting up charybdefs")
-	require.NoError(s.t, s.c.Install(ctx, s.t.L(), s.c.All(), "charybdefs"))
-	s.c.Run(ctx, s.c.All(), "sudo umount -f {store-dir}/faulty || true")
-	s.c.Run(ctx, s.c.All(), "mkdir -p {store-dir}/{real,faulty} || true")
-	s.c.Run(ctx, s.c.All(), "rm -f logs && ln -s {store-dir}/real/logs logs || true")
-	s.c.Run(ctx, s.c.All(), "sudo charybdefs {store-dir}/faulty -oallow_other,modules=subdir,subdir={store-dir}/real")
-	s.c.Run(ctx, s.c.All(), "sudo mkdir -p {store-dir}/real/logs")
-	s.c.Run(ctx, s.c.All(), "sudo chmod -R 777 {store-dir}/{real,faulty}")
-}
-
-func (s *fuseDiskStaller) Cleanup(ctx context.Context) {
-	s.c.Run(ctx, s.c.All(), "sudo umount -f {store-dir}/faulty || true")
-}
-
-func (s *fuseDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) {
-	// Stall for 2x the max sync duration. The tool expects an integer
-	// representing the delay time, in microseconds.
-	stallMicros := (2 * maxSyncDur).Microseconds()
-	s.c.Run(ctx, nodes, "charybdefs-nemesis", "--delay", strconv.FormatInt(stallMicros, 10))
-}
-
-func (s *fuseDiskStaller) Unstall(ctx context.Context, nodes option.NodeListOption) {
-	s.c.Run(ctx, nodes, "charybdefs-nemesis --clear")
-}
-
 func getDevice(t test.Test, s spec.ClusterSpec) string {
 	switch s.Cloud {
 	case spec.GCE:
-		return "/dev/nvme0n1"
+		return "/dev/sdb"
 	case spec.AWS:
 		return "/dev/nvme1n1"
 	default:

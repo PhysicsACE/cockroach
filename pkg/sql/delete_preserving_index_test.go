@@ -44,7 +44,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
@@ -64,7 +63,7 @@ import (
 func TestDeletePreservingIndexEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	mergeFinished := make(chan struct{})
 	completeSchemaChange := make(chan struct{})
 	errorChan := make(chan error, 1)
@@ -254,7 +253,7 @@ func TestDeletePreservingIndexEncodingUsesNormalDeletesInDeleteOnly(t *testing.T
 	// so disable leases on tables.
 	defer lease.TestingDisableTableLeases()()
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer server.Stopper().Stop(context.Background())
 
@@ -318,7 +317,7 @@ func TestDeletePreservingIndexEncodingWithEmptyValues(t *testing.T) {
 	// so disable leases on tables.
 	defer lease.TestingDisableTableLeases()()
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer server.Stopper().Stop(context.Background())
 	setupSQL := `
@@ -519,7 +518,7 @@ func TestMergeProcessor(t *testing.T) {
 
 	defer lease.TestingDisableTableLeases()()
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 
 	type TestCase struct {
 		name                   string
@@ -704,19 +703,19 @@ func TestMergeProcessor(t *testing.T) {
 		sp := tableDesc.IndexSpan(codec, srcIndex.GetID())
 
 		output := fakeReceiver{}
-		im, err := backfill.NewIndexBackfillMerger(ctx, &flowCtx, execinfrapb.IndexBackfillMergerSpec{
+		im, err := backfill.NewIndexBackfillMerger(ctx, &flowCtx, 0 /* processorID */, execinfrapb.IndexBackfillMergerSpec{
 			Table:            tableDesc.TableDescriptor,
 			TemporaryIndexes: []descpb.IndexID{srcIndex.GetID()},
 			AddedIndexes:     []descpb.IndexID{dstIndex.GetID()},
 			Spans:            []roachpb.Span{sp},
 			SpanIdx:          []int32{0},
 			MergeTimestamp:   kvDB.Clock().Now(),
-		}, &output)
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		im.Run(ctx)
+		im.Run(ctx, &output)
 		if output.err != nil {
 			t.Fatal(output.err)
 		}

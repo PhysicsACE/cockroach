@@ -12,13 +12,19 @@ package tenantcapabilitiestestutils
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigbounds"
+	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,27 +50,78 @@ func ParseBatchRequests(t *testing.T, d *datadriven.TestData) (ba kvpb.BatchRequ
 	return ba
 }
 
+// ParseTenantInfo collects the name, service mode and data state from the test input.
+func ParseTenantInfo(
+	t *testing.T, d *datadriven.TestData,
+) (
+	name *roachpb.TenantName,
+	dataState mtinfopb.TenantDataState,
+	serviceMode mtinfopb.TenantServiceMode,
+	err error,
+) {
+	if d.HasArg("name") {
+		var tenantName string
+		d.ScanArgs(t, "name", &tenantName)
+		tname := roachpb.TenantName(tenantName)
+		name = &tname
+	}
+	if d.HasArg("service") {
+		var mode string
+		d.ScanArgs(t, "service", &mode)
+		var ok bool
+		serviceMode, ok = mtinfopb.TenantServiceModeValues[mode]
+		if !ok {
+			return nil, 0, 0, errors.Newf("unknown service mode %s", mode)
+		}
+	}
+	if d.HasArg("data") {
+		var data string
+		d.ScanArgs(t, "data", &data)
+		var ok bool
+		dataState, ok = mtinfopb.TenantDataStateValues[data]
+		if !ok {
+			return nil, 0, 0, errors.Newf("unknown data state %s", data)
+		}
+	}
+	return name, dataState, serviceMode, nil
+}
+
+// ParseTenantCapabilityUpsert parses all args which have a key that is a
+// capability key and sets it on top of the default tenant capabilities.
 func ParseTenantCapabilityUpsert(
 	t *testing.T, d *datadriven.TestData,
-) (roachpb.TenantID, tenantcapabilitiespb.TenantCapabilities, error) {
+) (roachpb.TenantID, *tenantcapabilitiespb.TenantCapabilities, error) {
 	tID := GetTenantID(t, d)
 	caps := tenantcapabilitiespb.TenantCapabilities{}
 	for _, arg := range d.CmdArgs {
-		if capID, ok := tenantcapabilities.CapabilityIDFromString(arg.Key); ok {
-			capType := capID.CapabilityType()
-			switch capType {
-			case tenantcapabilities.Bool:
-				b, err := strconv.ParseBool(arg.Vals[0])
-				if err != nil {
-					return roachpb.TenantID{}, tenantcapabilitiespb.TenantCapabilities{}, err
-				}
-				caps.Cap(capID).Set(b)
-			default:
-				t.Fatalf("unknown type %q", capType)
+		capability, ok := tenantcapabilities.FromName(arg.Key)
+		if !ok {
+			continue
+		}
+		switch c := capability.(type) {
+		case tenantcapabilities.BoolCapability:
+			b, err := strconv.ParseBool(arg.Vals[0])
+			if err != nil {
+				return roachpb.TenantID{}, nil, err
 			}
+			c.Value(&caps).Set(b)
+
+		case tenantcapabilities.SpanConfigBoundsCapability:
+			jsonD, err := json.ParseJSON(arg.Vals[0])
+			if err != nil {
+				return roachpb.TenantID{}, nil, err
+			}
+			var v tenantcapabilitiespb.SpanConfigBounds
+			if _, err := protoreflect.JSONBMarshalToMessage(jsonD, &v); err != nil {
+				return roachpb.TenantID{}, nil, err
+			}
+			c.Value(&caps).Set(spanconfigbounds.New(&v))
+
+		default:
+			t.Fatalf("unknown capability type %T for capability %s", c, arg.Key)
 		}
 	}
-	return tID, caps, nil
+	return tID, &caps, nil
 }
 
 func ParseTenantCapabilityDelete(t *testing.T, d *datadriven.TestData) *tenantcapabilities.Update {
@@ -89,4 +146,30 @@ func GetTenantID(t *testing.T, d *datadriven.TestData) roachpb.TenantID {
 	tID, err := roachpb.TenantIDFromString(tenantID)
 	require.NoError(t, err)
 	return tID
+}
+
+// AlteredCapabilitiesString pretty-prints all altered capability
+// values that no longer match an empty protobuf.
+func AlteredCapabilitiesString(capabilities *tenantcapabilitiespb.TenantCapabilities) string {
+	defaultCapabilities := &tenantcapabilitiespb.TenantCapabilities{}
+	var builder strings.Builder
+	builder.WriteByte('{')
+	space := ""
+	for _, capID := range tenantcapabilities.IDs {
+		value := tenantcapabilities.MustGetValueByID(capabilities, capID)
+		defaultValue := tenantcapabilities.MustGetValueByID(defaultCapabilities, capID)
+		if value.String() != defaultValue.String() {
+			builder.WriteString(space)
+			builder.WriteString(capID.String())
+			builder.WriteByte(':')
+			builder.WriteString(value.String())
+			space = " "
+		}
+	}
+	// All capabilities have default values.
+	if space == "" {
+		builder.WriteString("default")
+	}
+	builder.WriteByte('}')
+	return builder.String()
 }

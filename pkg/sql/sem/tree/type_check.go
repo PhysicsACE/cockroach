@@ -82,17 +82,21 @@ type SemaContext struct {
 // Restore() method, see below.
 type SemaProperties struct {
 	// required constraints type checking to only accept certain kinds
-	// of expressions. See SetConstraint
+	// of expressions. See Require.
 	required semaRequirements
 
 	// Derived is populated during semantic analysis with properties
 	// from the expression being analyzed.  The caller is responsible
 	// for re-initializing this when needed.
 	Derived ScalarProperties
+
+	// Ancestors is mutated during semantic analysis to provide contextual
+	// information for each descendent during traversal of sub-expressions.
+	Ancestors ScalarAncestors
 }
 
 type semaRequirements struct {
-	// context is the name of the semantic anlysis context, for use in
+	// context is the name of the semantic analysis context, for use in
 	// error messages.
 	context string
 
@@ -102,11 +106,14 @@ type semaRequirements struct {
 	rejectFlags SemaRejectFlags
 }
 
-// Require resets the derived properties and sets required constraints.
+// Require resets the derived properties and the scalar ancestors, and sets
+// required constraints. It must only be called before starting semantic
+// analysis and during traversal by semantic analysis itself.
 func (s *SemaProperties) Require(context string, rejectFlags SemaRejectFlags) {
 	s.required.context = context
 	s.required.rejectFlags = rejectFlags
 	s.Derived.Clear()
+	s.Ancestors.clear()
 }
 
 // IsSet checks if the given rejectFlag is set as a required property.
@@ -180,21 +187,55 @@ type ScalarProperties struct {
 	// SeenGenerator is set to true if the expression originally
 	// contained a SRF.
 	SeenGenerator bool
-
-	// inFuncExpr is temporarily set to true while type checking the
-	// parameters of a function. Used to process RejectNestedGenerators
-	// properly.
-	inFuncExpr bool
-
-	// InWindowFunc is temporarily set to true while type checking the
-	// parameters of a window function in order to reject nested window
-	// functions.
-	InWindowFunc bool
 }
 
 // Clear resets the scalar properties to defaults.
 func (sp *ScalarProperties) Clear() {
 	*sp = ScalarProperties{}
+}
+
+// ScalarAncestors provides context for the current scalar expression during
+// semantic analysis. Ancestors are temporarily modified by expressions so that
+// their descendent expressions can be analyzed with respect to their ancestors.
+type ScalarAncestors byte
+
+const (
+	// FuncExprAncestor is temporarily added to ScalarAncestors while type
+	// checking the parameters of a function. Used to process
+	// RejectNestedGenerators properly.
+	FuncExprAncestor ScalarAncestors = 1 << iota
+
+	// WindowFuncAncestor is temporarily added to ScalarAncestors while type
+	// checking the parameters of a window function in order to reject nested
+	// window functions.
+	WindowFuncAncestor
+
+	// ConditionalAncestor is temporarily added to ScalarAncestors while type
+	// checking condition expressions CASE, COALESCE, and IF. Used to reject
+	// set-returning functions within conditional expressions.
+	ConditionalAncestor
+)
+
+// Push adds the given ancestor to s.
+func (s *ScalarAncestors) Push(other ScalarAncestors) {
+	*s = *s | other
+}
+
+// Has returns true if s has the given ancestor.
+func (s ScalarAncestors) Has(other ScalarAncestors) bool {
+	return s&other != 0
+}
+
+// PopTo returns s to the given set of ancestors. Use with:
+//
+//	defer semaCtx.Properties.Ancestors.PopTo(semaCtx.Properties.Ancestors)
+func (s *ScalarAncestors) PopTo(orig ScalarAncestors) {
+	*s = orig
+}
+
+// clear resets s to the default set of ancestors.
+func (s *ScalarAncestors) clear() {
+	*s = 0
 }
 
 // MakeSemaContext initializes a simple SemaContext suitable
@@ -246,8 +287,14 @@ func unexpectedTypeError(expr Expr, want, got *types.T) error {
 }
 
 func decorateTypeCheckError(err error, format string, a ...interface{}) error {
-	if !errors.HasType(err, (*placeholderTypeAmbiguityErr)(nil)) {
-		return pgerror.Wrapf(err, pgcode.InvalidParameterValue, format, a...)
+	switch pgerror.GetPGCode(err) {
+	case pgcode.Grouping, pgcode.Windowing, pgcode.FeatureNotSupported:
+	// Error due to syntax, e.g. using generator function in a Case expr.
+	// Fall through.
+	default:
+		if !errors.HasType(err, (*placeholderTypeAmbiguityErr)(nil)) {
+			return pgerror.Wrapf(err, pgcode.InvalidParameterValue, format, a...)
+		}
 	}
 	return errors.WithStack(err)
 }
@@ -381,6 +428,10 @@ func (expr *BinaryExpr) TypeCheck(
 func (expr *CaseExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
+	if semaCtx != nil {
+		defer semaCtx.Properties.Ancestors.PopTo(semaCtx.Properties.Ancestors)
+		semaCtx.Properties.Ancestors.Push(ConditionalAncestor)
+	}
 	var err error
 	tmpExprs := make([]Expr, 0, len(expr.Whens)+1)
 	if expr.Expr != nil {
@@ -410,19 +461,22 @@ func (expr *CaseExpr) TypeCheck(
 	}
 
 	tmpExprs = tmpExprs[:0]
-	for _, when := range expr.Whens {
-		tmpExprs = append(tmpExprs, when.Val)
-	}
+	// As described in the Postgres docs, CASE treats its ELSE clause (if any) as
+	// the "first" input.
+	// See https://www.postgresql.org/docs/15/typeconv-union-case.html#ftn.id-1.5.9.10.9.6.1.1.
 	if expr.Else != nil {
 		tmpExprs = append(tmpExprs, expr.Else)
+	}
+	for _, when := range expr.Whens {
+		tmpExprs = append(tmpExprs, when.Val)
 	}
 	typedSubExprs, retType, err := typeCheckSameTypedExprs(ctx, semaCtx, desired, tmpExprs...)
 	if err != nil {
 		return nil, decorateTypeCheckError(err, "incompatible value type")
 	}
 	if expr.Else != nil {
-		expr.Else = typedSubExprs[len(typedSubExprs)-1]
-		typedSubExprs = typedSubExprs[:len(typedSubExprs)-1]
+		expr.Else = typedSubExprs[0]
+		typedSubExprs = typedSubExprs[1:]
 	}
 	for i, whenVal := range typedSubExprs {
 		expr.Whens[i].Val = whenVal
@@ -593,7 +647,7 @@ func (expr *CastExpr) TypeCheck(
 	castFrom := typedSubExpr.ResolvedType()
 	allowStable := true
 	context := ""
-	if semaCtx != nil && semaCtx.Properties.required.rejectFlags&RejectStableOperators != 0 {
+	if semaCtx != nil && semaCtx.Properties.IsSet(RejectStableOperators) {
 		allowStable = false
 		context = semaCtx.Properties.required.context
 	}
@@ -848,6 +902,10 @@ func (expr *SerializedExpr) TypeCheck(
 func (expr *CoalesceExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
+	if semaCtx != nil {
+		defer semaCtx.Properties.Ancestors.PopTo(semaCtx.Properties.Ancestors)
+		semaCtx.Properties.Ancestors.Push(ConditionalAncestor)
+	}
 	typedSubExprs, retType, err := typeCheckSameTypedExprs(ctx, semaCtx, desired, expr.Exprs...)
 	if err != nil {
 		return nil, decorateTypeCheckError(err, "incompatible %s expressions", redact.Safe(expr.Name))
@@ -940,7 +998,7 @@ func NewInvalidFunctionUsageError(class FunctionClass, context string) error {
 		cat = "window"
 		code = pgcode.Windowing
 	case GeneratorClass:
-		cat = "generator"
+		cat = "set-returning"
 		code = pgcode.FeatureNotSupported
 	}
 	return pgerror.Newf(code, "%s functions are not allowed in %s", cat, context)
@@ -963,12 +1021,12 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *ResolvedFunctionD
 		return err
 	}
 	if expr.IsWindowFunctionApplication() {
-		if sc.Properties.required.rejectFlags&RejectWindowApplications != 0 {
+		if sc.Properties.IsSet(RejectWindowApplications) {
 			return NewInvalidFunctionUsageError(WindowClass, sc.Properties.required.context)
 		}
 
-		if sc.Properties.Derived.InWindowFunc &&
-			sc.Properties.required.rejectFlags&RejectNestedWindowFunctions != 0 {
+		if sc.Properties.Ancestors.Has(WindowFuncAncestor) &&
+			sc.Properties.IsSet(RejectNestedWindowFunctions) {
 			return pgerror.Newf(pgcode.Windowing, "window function calls cannot be nested")
 		}
 		sc.Properties.Derived.SeenWindowApplication = true
@@ -976,23 +1034,26 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *ResolvedFunctionD
 		// If it is an aggregate function *not used OVER a window*, then
 		// we have an aggregation.
 		if fnCls == AggregateClass {
-			if sc.Properties.Derived.inFuncExpr &&
-				sc.Properties.required.rejectFlags&RejectNestedAggregates != 0 {
+			if sc.Properties.Ancestors.Has(FuncExprAncestor) &&
+				sc.Properties.IsSet(RejectNestedAggregates) {
 				return NewAggInAggError()
 			}
-			if sc.Properties.required.rejectFlags&RejectAggregates != 0 {
+			if sc.Properties.IsSet(RejectAggregates) {
 				return NewInvalidFunctionUsageError(AggregateClass, sc.Properties.required.context)
 			}
 			sc.Properties.Derived.SeenAggregate = true
 		}
 	}
 	if fnCls == GeneratorClass {
-		if sc.Properties.Derived.inFuncExpr &&
-			sc.Properties.required.rejectFlags&RejectNestedGenerators != 0 {
+		if sc.Properties.Ancestors.Has(FuncExprAncestor) &&
+			sc.Properties.IsSet(RejectNestedGenerators) {
 			return NewInvalidNestedSRFError(sc.Properties.required.context)
 		}
-		if sc.Properties.required.rejectFlags&RejectGenerators != 0 {
+		if sc.Properties.IsSet(RejectGenerators) {
 			return NewInvalidFunctionUsageError(GeneratorClass, sc.Properties.required.context)
+		}
+		if sc.Properties.Ancestors.Has(ConditionalAncestor) {
+			return NewInvalidFunctionUsageError(GeneratorClass, "conditional expressions")
 		}
 		sc.Properties.Derived.SeenGenerator = true
 	}
@@ -1010,6 +1071,12 @@ func NewContextDependentOpsNotAllowedError(context string) error {
 	)
 }
 
+// TypeCheckContext returns the semantic analysis context, for use in creating
+// error messages.
+func (sc *SemaContext) TypeCheckContext() string {
+	return sc.Properties.required.context
+}
+
 // checkVolatility checks whether an operator with the given Volatility is
 // allowed in the current context.
 func (sc *SemaContext) checkVolatility(v volatility.V) error {
@@ -1018,7 +1085,7 @@ func (sc *SemaContext) checkVolatility(v volatility.V) error {
 	}
 	switch v {
 	case volatility.Volatile:
-		if sc.Properties.required.rejectFlags&RejectVolatileFunctions != 0 {
+		if sc.Properties.IsSet(RejectVolatileFunctions) {
 			// The code FeatureNotSupported is a bit misleading here,
 			// because we probably can't support the feature at all. However
 			// this error code matches PostgreSQL's in the same conditions.
@@ -1026,7 +1093,7 @@ func (sc *SemaContext) checkVolatility(v volatility.V) error {
 				"volatile functions are not allowed in %s", sc.Properties.required.context)
 		}
 	case volatility.Stable:
-		if sc.Properties.required.rejectFlags&RejectStableOperators != 0 {
+		if sc.Properties.IsSet(RejectStableOperators) {
 			return NewContextDependentOpsNotAllowedError(sc.Properties.required.context)
 		}
 	}
@@ -1075,23 +1142,15 @@ func (expr *FuncExpr) TypeCheck(
 	}
 
 	if semaCtx != nil {
-		// We'll need to remember we are in a function application to
-		// generate suitable errors in checkFunctionUsage().  We cannot
-		// set ctx.inFuncExpr earlier (in particular not before the call
-		// to checkFunctionUsage() above) because the top-level FuncExpr
-		// must be acceptable even if it is a SRF and
-		// RejectNestedGenerators is set.
-		defer func(semaCtx *SemaContext, prevFunc bool, prevWindow bool) {
-			semaCtx.Properties.Derived.inFuncExpr = prevFunc
-			semaCtx.Properties.Derived.InWindowFunc = prevWindow
-		}(
-			semaCtx,
-			semaCtx.Properties.Derived.inFuncExpr,
-			semaCtx.Properties.Derived.InWindowFunc,
-		)
-		semaCtx.Properties.Derived.inFuncExpr = true
+		// We'll need to remember we are in a function application to generate
+		// suitable errors in checkFunctionUsage(). We cannot enter
+		// FuncExprAncestor earlier (in particular not before the call to
+		// checkFunctionUsage() above) because the top-level FuncExpr must be
+		// acceptable even if it is a SRF and RejectNestedGenerators is set.
+		defer semaCtx.Properties.Ancestors.PopTo(semaCtx.Properties.Ancestors)
+		semaCtx.Properties.Ancestors.Push(FuncExprAncestor)
 		if expr.WindowDef != nil {
-			semaCtx.Properties.Derived.InWindowFunc = true
+			semaCtx.Properties.Ancestors.Push(WindowFuncAncestor)
 		}
 	}
 
@@ -1106,12 +1165,17 @@ func (expr *FuncExpr) TypeCheck(
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s()", def.Name)
 	}
 
+	var hasUDFOverload bool
 	var calledOnNullInputFns, notCalledOnNullInputFns intsets.Fast
 	for _, idx := range s.overloadIdxs {
 		if def.Overloads[idx].CalledOnNullInput {
 			calledOnNullInputFns.Add(int(idx))
 		} else {
 			notCalledOnNullInputFns.Add(int(idx))
+		}
+		// TODO(harding): Check if this is a record-returning UDF instead.
+		if def.Overloads[idx].IsUDF {
+			hasUDFOverload = true
 		}
 	}
 
@@ -1159,7 +1223,7 @@ func (expr *FuncExpr) TypeCheck(
 	// NULL arguments, the function isn't a generator or aggregate builtin, and
 	// NULL is given as an argument.
 	if len(s.overloadIdxs) > 0 && calledOnNullInputFns.Len() == 0 && funcCls != GeneratorClass &&
-		funcCls != AggregateClass {
+		funcCls != AggregateClass && !hasUDFOverload {
 		for _, expr := range s.typedExprs {
 			if expr.ResolvedType().Family() == types.UnknownFamily {
 				return DNull, nil
@@ -1415,6 +1479,10 @@ func (expr *IfErrExpr) TypeCheck(
 func (expr *IfExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
+	if semaCtx != nil {
+		defer semaCtx.Properties.Ancestors.PopTo(semaCtx.Properties.Ancestors)
+		semaCtx.Properties.Ancestors.Push(ConditionalAncestor)
+	}
 	typedCond, err := typeCheckAndRequireBoolean(ctx, semaCtx, expr.Cond, "IF condition")
 	if err != nil {
 		return nil, err
@@ -1611,7 +1679,7 @@ func (expr *RangeCond) TypeCheck(
 
 // TypeCheck implements the Expr interface.
 func (expr *Subquery) TypeCheck(_ context.Context, sc *SemaContext, _ *types.T) (TypedExpr, error) {
-	if sc != nil && sc.Properties.required.rejectFlags&RejectSubqueries != 0 {
+	if sc != nil && sc.Properties.IsSet(RejectSubqueries) {
 		return nil, pgerror.Newf(pgcode.FeatureNotSupported,
 			"subqueries are not allowed in %s", sc.Properties.required.context)
 	}
@@ -1981,6 +2049,12 @@ func (d *DBox2D) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (Typed
 
 // TypeCheck implements the Expr interface. It is implemented as an idempotent
 // identity function for Datum.
+func (d *DPGLSN) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
+	return d, nil
+}
+
+// TypeCheck implements the Expr interface. It is implemented as an idempotent
+// identity function for Datum.
 func (d *DGeography) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
 	return d, nil
 }
@@ -2324,6 +2398,38 @@ func typeCheckComparisonOp(
 	_, leftIsTuple := foldedLeft.(*Tuple)
 	_, rightIsTuple := foldedRight.(*Tuple)
 	_, rightIsSubquery := foldedRight.(SubqueryExpr)
+	var tsMatchesWithText bool
+	var typedLeft, typedRight TypedExpr
+	var leftFamily, rightFamily types.Family
+	var err error
+
+	// Do an initial check for TEXT @@ XXX special cases which might need to
+	// inject a to_tsvector or plainto_tsquery function call.
+	if op.Symbol == treecmp.TSMatches {
+		if switched {
+			// The order of operators matters as to which function call to apply.
+			foldedLeft, foldedRight = foldedRight, foldedLeft
+			switched = false
+		}
+		disallowSwitch = true
+		typedLeft, err = foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
+			return nil, nil, nil, false,
+				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sigWithErr)
+		}
+		typedRight, err = foldedRight.TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
+			return nil, nil, nil, false,
+				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sigWithErr)
+		}
+		leftFamily = typedLeft.ResolvedType().Family()
+		rightFamily = typedRight.ResolvedType().Family()
+		if leftFamily == types.StringFamily || rightFamily == types.StringFamily {
+			tsMatchesWithText = true
+		}
+	}
 
 	handleTupleTypeMismatch := false
 	switch {
@@ -2347,7 +2453,7 @@ func typeCheckComparisonOp(
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 		}
 
-		typedLeft := typedSubExprs[0]
+		typedLeft = typedSubExprs[0]
 		typedSubExprs = typedSubExprs[1:]
 
 		rightTuple.typ = types.MakeTuple(make([]*types.T, len(typedSubExprs)))
@@ -2361,7 +2467,7 @@ func typeCheckComparisonOp(
 		return typedLeft, rightTuple, fn, false, nil
 
 	case foldedOp.Symbol == treecmp.In && rightIsSubquery:
-		typedLeft, err := foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
+		typedLeft, err = foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
 		if err != nil {
 			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
 			return nil, nil, nil, false,
@@ -2376,15 +2482,19 @@ func typeCheckComparisonOp(
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 		}
 
-		desired := types.MakeTuple([]*types.T{typ})
-		typedRight, err := foldedRight.TypeCheck(ctx, semaCtx, desired)
+		desired := typ
+		if desired.Family() != types.TupleFamily {
+			desired = types.MakeTuple([]*types.T{typ})
+		}
+
+		typedRight, err = foldedRight.TypeCheck(ctx, semaCtx, desired)
 		if err != nil {
 			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
 			return nil, nil, nil, false,
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sigWithErr)
 		}
 
-		if err := typeCheckSubqueryWithIn(
+		if err = typeCheckSubqueryWithIn(
 			typedLeft.ResolvedType(), typedRight.ResolvedType(),
 		); err != nil {
 			return nil, nil, nil, false, err
@@ -2399,22 +2509,51 @@ func typeCheckComparisonOp(
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 		}
 		// Using non-folded left and right to avoid having to swap later.
-		typedLeft, typedRight, err := typeCheckTupleComparison(ctx, semaCtx, op, left.(*Tuple), right.(*Tuple))
+		typedLeft, typedRight, err = typeCheckTupleComparison(ctx, semaCtx, op, left.(*Tuple), right.(*Tuple))
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 		return typedLeft, typedRight, fn, false, nil
 
 	case leftIsTuple || rightIsTuple:
+		var errLeft, errRight error
 		// Tuple must compare with a tuple type, as handled above.
-		typedLeft, errLeft := foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
-		typedRight, errRight := foldedRight.TypeCheck(ctx, semaCtx, types.Any)
+		typedLeft, errLeft = foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
+		typedRight, errRight = foldedRight.TypeCheck(ctx, semaCtx, types.Any)
 		if errLeft == nil && errRight == nil &&
 			((typedLeft.ResolvedType().Family() == types.TupleFamily &&
 				typedRight.ResolvedType().Family() != types.TupleFamily) ||
 				(typedRight.ResolvedType().Family() == types.TupleFamily &&
 					typedLeft.ResolvedType().Family() != types.TupleFamily)) {
 			handleTupleTypeMismatch = true
+		}
+	case tsMatchesWithText:
+		// Apply rules from:
+		// https://www.postgresql.org/docs/current/textsearch-intro.html#TEXTSEARCH-MATCHING
+		// Perform the following type conversions:
+		//            initial             |              result
+		// -------------------------------------------------------------------------
+		// a::TEXT @@ b::TEXT             |  to_tsvector(a) @@ plainto_tsquery(b)
+		// a::TEXT @@ b::TSQUERY          |  to_tsvector(a) @@ b
+		// a::TSQUERY @@ b::TEXT          |  a @@ to_tsvector(b)
+		if leftFamily == types.StringFamily {
+			if rightFamily == types.StringFamily || rightFamily == types.TSQueryFamily {
+				leftExprs := make(Exprs, 1)
+				leftExprs[0] = typedLeft
+				foldedLeft = &FuncExpr{Func: WrapFunction("to_tsvector"), Exprs: leftExprs, AggType: GeneralAgg}
+			}
+		}
+
+		funcName := "plainto_tsquery"
+		if rightFamily == types.StringFamily {
+			if leftFamily == types.StringFamily || leftFamily == types.TSQueryFamily {
+				if leftFamily == types.TSQueryFamily {
+					funcName = "to_tsvector"
+				}
+				rightExprs := make(Exprs, 1)
+				rightExprs[0] = typedRight
+				foldedRight = &FuncExpr{Func: WrapFunction(funcName), Exprs: rightExprs, AggType: GeneralAgg}
+			}
 		}
 	}
 
@@ -2476,8 +2615,8 @@ func typeCheckComparisonOp(
 	}
 	leftReturn := leftExpr.ResolvedType()
 	rightReturn := rightExpr.ResolvedType()
-	leftFamily := leftReturn.Family()
-	rightFamily := rightReturn.Family()
+	leftFamily = leftReturn.Family()
+	rightFamily = rightReturn.Family()
 
 	// Return early if at least one overload is possible, NULL is an argument,
 	// and none of the overloads accept NULL.
@@ -2600,7 +2739,7 @@ func typeCheckSameTypedExprs(
 		return typeCheckConstsAndPlaceholdersWithDesired(s, desired)
 	default:
 		firstValidIdx := -1
-		firstValidType := types.Unknown
+		candidateType := types.Unknown
 		for i, ok := s.resolvableIdxs.Next(0); ok; i, ok = s.resolvableIdxs.Next(i + 1) {
 			typedExpr, err := exprs[i].TypeCheck(ctx, semaCtx, desired)
 			if err != nil {
@@ -2608,13 +2747,13 @@ func typeCheckSameTypedExprs(
 			}
 			typedExprs[i] = typedExpr
 			if returnType := typedExpr.ResolvedType(); returnType.Family() != types.UnknownFamily {
-				firstValidType = returnType
+				candidateType = returnType
 				firstValidIdx = i
 				break
 			}
 		}
 
-		if firstValidType.Family() == types.UnknownFamily {
+		if candidateType.Family() == types.UnknownFamily {
 			// We got to the end without finding a non-null expression.
 			switch {
 			case !constIdxs.Empty():
@@ -2634,28 +2773,56 @@ func typeCheckSameTypedExprs(
 		}
 
 		for i, ok := s.resolvableIdxs.Next(firstValidIdx + 1); ok; i, ok = s.resolvableIdxs.Next(i + 1) {
-			typedExpr, err := exprs[i].TypeCheck(ctx, semaCtx, firstValidType)
+			typedExpr, err := exprs[i].TypeCheck(ctx, semaCtx, candidateType)
 			if err != nil {
 				return nil, nil, err
 			}
-			// TODO(#75103): For UNION, CASE, and related expressions we should
-			// only allow types that can be implicitly cast to firstValidType.
-			if typ := typedExpr.ResolvedType(); !(typ.Equivalent(firstValidType) || typ.Family() == types.UnknownFamily) {
-				return nil, nil, unexpectedTypeError(exprs[i], firstValidType, typ)
+			// From the Postgres docs
+			// https://www.postgresql.org/docs/15/typeconv-union-case.html:
+			// If the candidate type can be implicitly converted to the other
+			// type, but not vice-versa, select the other type as the new
+			// candidate type.
+			if typ := typedExpr.ResolvedType(); cast.ValidCast(candidateType, typ, cast.ContextImplicit) {
+				if !cast.ValidCast(typ, candidateType, cast.ContextImplicit) {
+					candidateType = typ
+				}
+			}
+			// TODO(mgartner): Remove this check now that we check the types
+			// below.
+			if typ := typedExpr.ResolvedType(); !(typ.Equivalent(candidateType) || typ.Family() == types.UnknownFamily) {
+				return nil, nil, unexpectedTypeError(exprs[i], candidateType, typ)
 			}
 			typedExprs[i] = typedExpr
 		}
 		if !constIdxs.Empty() {
-			if _, err := typeCheckSameTypedConsts(s, firstValidType, true); err != nil {
+			if _, err := typeCheckSameTypedConsts(s, candidateType, true); err != nil {
 				return nil, nil, err
 			}
 		}
 		if !placeholderIdxs.Empty() {
-			if _, err := typeCheckSameTypedPlaceholders(s, firstValidType); err != nil {
+			if _, err := typeCheckSameTypedPlaceholders(s, candidateType); err != nil {
 				return nil, nil, err
 			}
 		}
-		return typedExprs, firstValidType, nil
+		// Now we check that each expression can be implicit cast to the
+		// candidate type, and add the cast if necessary. If any expressions
+		// cannot be cast, type-checking fails. This is described in Step 6 of
+		// Postgres's "UNION, CASE, and Related Constructs" type conversion
+		// documentation:
+		// https://www.postgresql.org/docs/15/typeconv-union-case.html
+		for i, e := range typedExprs {
+			typ := e.ResolvedType()
+			// TODO(mgartner): There should probably be a cast if the types are
+			// not identical, not just if the types are not equivalent.
+			if typ.Equivalent(candidateType) || typ.Family() == types.UnknownFamily {
+				continue
+			}
+			if !cast.ValidCast(typ, candidateType, cast.ContextImplicit) {
+				return nil, nil, unexpectedTypeError(exprs[i], candidateType, typ)
+			}
+			typedExprs[i] = NewTypedCastExpr(e, candidateType)
+		}
+		return typedExprs, candidateType, nil
 	}
 }
 
@@ -2852,6 +3019,16 @@ func typeCheckSameTypedTupleExprs(
 	firstLen := len(first.Exprs)
 	if err := checkAllTuplesHaveLength(exprs[1:], firstLen); err != nil {
 		return nil, nil, err
+	}
+
+	// All labeled tuples must have the same number of expressions as labels.
+	for i := range exprs {
+		if e, ok := exprs[i].(*Tuple); ok && len(e.Labels) > 0 && len(e.Labels) != len(e.Exprs) {
+			return nil, nil, pgerror.Newf(pgcode.Syntax,
+				"mismatch in tuple definition: %d expressions, %d labels",
+				len(e.Exprs), len(e.Labels),
+			)
+		}
 	}
 
 	// All expressions within tuples at the same indexes must be the same type.
@@ -3340,6 +3517,9 @@ func getMostSignificantOverload(
 	for _, idx := range filter {
 		o := qualifiedOverloads[idx]
 		if o.IsUDF {
+			// This check is only concerned with user-defined functions, not with
+			// builtin functions defined with a SQL string body. For this reason we
+			// check o.IsUDF instead of o.HasSQLBody().
 			udfFound = true
 		}
 		if seenSchema != "" && o.Schema != seenSchema {

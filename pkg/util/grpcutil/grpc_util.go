@@ -143,25 +143,21 @@ func IsAuthError(err error) bool {
 	return false
 }
 
-// RequestDidNotStart returns true if the given error from gRPC
-// means that the request definitely could not have started on the
-// remote server.
+// IsWaitingForInit checks whether the provided error is because the node is
+// still waiting for initialization.
+func IsWaitingForInit(err error) bool {
+	s, ok := status.FromError(errors.UnwrapAll(err))
+	return ok && s.Code() == codes.Unavailable && strings.Contains(err.Error(), "node waiting for init")
+}
+
+// RequestDidNotStart returns true if the given RPC error means that the request
+// definitely could not have started on the remote server.
 func RequestDidNotStart(err error) bool {
-	if errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) ||
+	// NB: gRPC doesn't provide a way to distinguish unambiguous failures, but
+	// InitialHeartbeatFailedError serves mostly the same purpose. See also
+	// https://github.com/grpc/grpc-go/issues/1443.
+	return errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) ||
 		errors.Is(err, circuit.ErrBreakerOpen) ||
-		IsConnectionRejected(err) {
-		return true
-	}
-	_, ok := status.FromError(errors.Cause(err))
-	if !ok {
-		// This is a non-gRPC error; assume nothing.
-		return false
-	}
-	// This is where you'd hope to treat some gRPC errors as unambiguous.
-	// Unfortunately, gRPC provides no good way to distinguish ambiguous from
-	// unambiguous failures.
-	//
-	// https://github.com/grpc/grpc-go/issues/1443
-	// https://github.com/cockroachave hdb/cockroach/issues/19708#issuecomment-343891640
-	return false
+		IsConnectionRejected(err) ||
+		IsWaitingForInit(err)
 }

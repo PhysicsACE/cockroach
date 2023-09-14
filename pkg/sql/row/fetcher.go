@@ -100,17 +100,31 @@ type KVBatchFetcherResponse struct {
 	ColBatch coldata.Batch
 	// spanID is the ID associated with the span that generated this response.
 	spanID int
+	// kvPairsRead tracks the number of key-values pairs that were just fetched
+	// (meaning that we needed to issue a BatchRequest to produce this
+	// response). Notably, if we already had some buffered responses from the
+	// previous BatchResponse, this number will remain zero.
+	kvPairsRead int64
 }
 
 // KVBatchFetcher abstracts the logic of fetching KVs in batches.
 type KVBatchFetcher interface {
 	// SetupNextFetch prepares the fetch of the next set of spans.
+	//
+	// spansCanOverlap indicates whether spans might be unordered and
+	// overlapping. If true, then spanIDs must be non-nil.
+	//
+	// NOTE: if spansCanOverlap is true and a single span can touch multiple
+	// ranges, then fetched rows from different spans can be interspersed with
+	// one another. See the comment on txnKVFetcher.SetupNextFetch for more
+	// details.
 	SetupNextFetch(
 		ctx context.Context,
 		spans roachpb.Spans,
 		spanIDs []int,
 		batchBytesLimit rowinfra.BytesLimit,
 		firstBatchKeyLimit rowinfra.KeyLimit,
+		spansCanOverlap bool,
 	) error
 
 	// NextBatch returns the next batch of rows. See KVBatchFetcherResponse for
@@ -121,13 +135,19 @@ type KVBatchFetcher interface {
 	// for concurrent use and is able to handle a case of uninitialized fetcher.
 	GetBytesRead() int64
 
+	// GetKVPairsRead returns the number of key-value pairs read by this
+	// fetcher throughout its lifetime. It is safe for concurrent use and is
+	// able to handle a case of uninitialized fetcher.
+	GetKVPairsRead() int64
+
 	// GetBatchRequestsIssued returns the number of BatchRequests issued by this
 	// fetcher throughout its lifetime. It is safe for concurrent use and is
 	// able to handle a case of uninitialized fetcher.
 	GetBatchRequestsIssued() int64
 
 	// Close releases the resources of this KVBatchFetcher. Must be called once
-	// the fetcher is no longer in use.
+	// the fetcher is no longer in use. Note that observability-related methods
+	// can still be safely called after Close.
 	Close(ctx context.Context)
 }
 
@@ -414,6 +434,7 @@ func (rf *Fetcher) Init(ctx context.Context, args FetcherInitArgs) error {
 		}
 		rf.kvFetcher = args.StreamingKVFetcher
 	} else if !args.WillUseKVProvider {
+		var kvPairsRead int64
 		var batchRequestsIssued int64
 		fetcherArgs := newTxnKVFetcherArgs{
 			reverse:                    args.Reverse,
@@ -422,12 +443,15 @@ func (rf *Fetcher) Init(ctx context.Context, args FetcherInitArgs) error {
 			lockTimeout:                args.LockTimeout,
 			acc:                        rf.kvFetcherMemAcc,
 			forceProductionKVBatchSize: args.ForceProductionKVBatchSize,
+			kvPairsRead:                &kvPairsRead,
 			batchRequestsIssued:        &batchRequestsIssued,
 		}
 		if args.Txn != nil {
 			fetcherArgs.sendFn = makeTxnKVFetcherDefaultSendFunc(args.Txn, &batchRequestsIssued)
-			fetcherArgs.requestAdmissionHeader = args.Txn.AdmissionHeader()
-			fetcherArgs.responseAdmissionQ = args.Txn.DB().SQLKVResponseAdmissionQ
+			fetcherArgs.admission.requestHeader = args.Txn.AdmissionHeader()
+			fetcherArgs.admission.responseQ = args.Txn.DB().SQLKVResponseAdmissionQ
+			fetcherArgs.admission.pacerFactory = args.Txn.DB().AdmissionPacerFactory
+			fetcherArgs.admission.settingsValues = args.Txn.DB().SettingsValues
 		}
 		rf.kvFetcher = newKVFetcher(newTxnKVFetcherInternal(fetcherArgs))
 	}
@@ -518,7 +542,7 @@ func (rf *Fetcher) StartScan(
 	}
 
 	if err := rf.kvFetcher.SetupNextFetch(
-		ctx, spans, spanIDs, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint),
+		ctx, spans, spanIDs, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint), rf.args.SpansCanOverlap,
 	); err != nil {
 		return err
 	}
@@ -618,7 +642,8 @@ func (rf *Fetcher) StartInconsistentScan(
 	}
 
 	if err := rf.kvFetcher.SetupNextFetch(
-		ctx, spans, nil /* spanIDs */, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint),
+		ctx, spans, nil, batchBytesLimit,
+		rf.rowLimitToKeyLimit(rowLimitHint), false, /* spansCanOverlap */
 	); err != nil {
 		return err
 	}
@@ -648,10 +673,13 @@ func (rf *Fetcher) ConsumeKVProvider(ctx context.Context, f *KVProvider) error {
 	if !rf.args.WillUseKVProvider {
 		return errors.AssertionFailedf("ConsumeKVProvider is called instead of StartScan")
 	}
-	if rf.kvFetcher != nil {
+	if rf.kvFetcher == nil {
+		rf.kvFetcher = newKVFetcher(f)
+	} else {
 		rf.kvFetcher.Close(ctx)
+		rf.kvFetcher.reset(f)
 	}
-	rf.kvFetcher = newKVFetcher(f)
+
 	return rf.startScan(ctx)
 }
 
@@ -1271,6 +1299,15 @@ func (rf *Fetcher) finalizeRow() error {
 // Key returns nil when there are no more rows.
 func (rf *Fetcher) Key() roachpb.Key {
 	return rf.kv.Key
+}
+
+// GetKVPairsRead returns total number of key-value pairs read by the underlying
+// KVFetcher.
+func (rf *Fetcher) GetKVPairsRead() int64 {
+	if rf == nil || rf.kvFetcher == nil || rf.args.WillUseKVProvider {
+		return 0
+	}
+	return rf.kvFetcher.GetKVPairsRead()
 }
 
 // GetBytesRead returns total number of bytes read by the underlying KVFetcher.

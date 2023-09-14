@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -350,6 +351,18 @@ type zipContext struct {
 	// attempts to access multiple nodes concurrently by default.
 	concurrency int
 
+	// includeRangeInfo includes information about each individual range in
+	// individual nodes/*/ranges/*.json files. For large clusters, this can
+	// dramatically increase debug zip size/file count.
+	includeRangeInfo bool
+
+	// includeStacks fetches all goroutines running on each targeted node in
+	// nodes/*/stacks.txt and nodes/*/stacks_with_labels.txt files. Note that
+	// fetching stack traces for all goroutines is a temporary "stop the world"
+	// operation, which can momentarily have negative impacts on SQL service
+	// latency.
+	includeStacks bool
+
 	// The log/heap/etc files to include.
 	files fileSelection
 }
@@ -362,6 +375,12 @@ func setZipContextDefaults() {
 	zipCtx.files = fileSelection{}
 	zipCtx.redactLogs = false
 	zipCtx.redact = false
+	// Even though it makes debug.zip heavyweight, range infos are often the best source
+	// of information for range-level issues and so they are opt-out, not opt-in.
+	zipCtx.includeRangeInfo = true
+	// Goroutine stack dumps require a "stop the world" operation on the server side,
+	// which impacts performance and SQL service latency.
+	zipCtx.includeStacks = true
 	zipCtx.cpuProfDuration = 5 * time.Second
 	zipCtx.concurrency = 15
 
@@ -622,8 +641,8 @@ var demoCtx = struct {
 // test that exercises command-line parsing.
 func setDemoContextDefaults() {
 	demoCtx.NumNodes = 1
-	demoCtx.SQLPoolMemorySize = 128 << 20 // 128MB, chosen to fit 9 nodes on 2GB machine.
-	demoCtx.CacheSize = 64 << 20          // 64MB, chosen to fit 9 nodes on 2GB machine.
+	demoCtx.SQLPoolMemorySize = 256 << 20 // 256MiB, chosen to fit 9 nodes on 4GB machine.
+	demoCtx.CacheSize = 64 << 20          // 64MiB, chosen to fit 9 nodes on 4GB machine.
 	demoCtx.UseEmptyDatabase = false
 	demoCtx.SimulateLatency = false
 	demoCtx.RunWorkload = false
@@ -639,6 +658,7 @@ func setDemoContextDefaults() {
 	demoCtx.Multitenant = true
 	demoCtx.DisableServerController = false
 	demoCtx.DefaultEnableRangefeeds = true
+	demoCtx.AutoConfigProvider = acprovider.NoTaskProvider{}
 
 	demoCtx.pidFile = ""
 	demoCtx.disableEnterpriseFeatures = false

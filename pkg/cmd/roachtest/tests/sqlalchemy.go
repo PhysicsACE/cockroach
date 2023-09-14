@@ -30,16 +30,17 @@ import (
 var sqlAlchemyResultRegex = regexp.MustCompile(`^(?P<test>test.*::.*::[^ \[\]]*(?:\[.*])?) (?P<result>\w+)\s+\[.+]$`)
 var sqlAlchemyReleaseTagRegex = regexp.MustCompile(`^rel_(?P<major>\d+)_(?P<minor>\d+)_(?P<point>\d+)$`)
 
-var supportedSQLAlchemyTag = "2.0.2"
+var supportedSQLAlchemyTag = "2.0.20"
 
 // This test runs the SQLAlchemy dialect test suite against a single Cockroach
 // node.
 func registerSQLAlchemy(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    "sqlalchemy",
-		Owner:   registry.OwnerSQLSessions,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `orm`},
+		Leases:  registry.MetamorphicLeases,
+		Tags:    registry.Tags(`default`, `orm`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runSQLAlchemy(ctx, t, c)
 		},

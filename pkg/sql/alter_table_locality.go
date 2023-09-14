@@ -84,6 +84,11 @@ func (p *planner) AlterTableLocality(
 		)
 	}
 
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
+		return nil, err
+	}
+
 	return &alterTableSetLocalityNode{
 		n:         *n,
 		tableDesc: tableDesc,
@@ -579,10 +584,9 @@ func (n *alterTableSetLocalityNode) writeNewTableLocalityAndZoneConfig(
 	// Update the zone configuration.
 	if err := ApplyZoneConfigForMultiRegionTable(
 		params.ctx,
-		params.p.Txn(),
+		params.p.InternalSQLTxn(),
 		params.p.ExecCfg(),
 		params.p.extendedEvalCtx.Tracing.KVTracingEnabled(),
-		params.p.Descriptors(),
 		regionConfig,
 		n.tableDesc,
 		ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,

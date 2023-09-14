@@ -14,77 +14,52 @@ import {
 } from "@cockroachlabs/cluster-ui";
 import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
-import { createSelector } from "reselect";
-import { KeyedCachedDataReducerState, refreshJob } from "src/redux/apiReducers";
-import { AdminUIState } from "src/redux/state";
-import { JobResponseMessage } from "src/util/api";
+import {
+  createSelectorForKeyedCachedDataField,
+  refreshListExecutionDetailFiles,
+  refreshJob,
+  refreshUserSQLRoles,
+} from "src/redux/apiReducers";
+import { AdminUIState, AppDispatch } from "src/redux/state";
+import { ListJobProfilerExecutionDetailsResponseMessage } from "src/util/api";
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
+import { collectExecutionDetailsAction } from "oss/src/redux/jobs/jobsActions";
+import long from "long";
+import { selectHasAdminRole } from "src/redux/user";
 
-const selectJobState = createSelector(
-  [(state: AdminUIState) => state.cachedData?.job],
-  (jobState): KeyedCachedDataReducerState<JobResponseMessage> => {
-    if (!jobState) {
-      return null;
-    }
-    return jobState;
-  },
-);
-
-export const selectJob = createSelector(
-  [(state: AdminUIState) => state.cachedData?.jobs, selectJobState, selectID],
-  (jobsState, jobState, jobID) => {
-    const jobsCache = jobsState.data;
-    let job: JobResponseMessage;
-    if (!jobID || (!jobsCache && !jobState)) {
-      return null;
-    } else if (jobsCache) {
-      job = Object(
-        jobsCache.data.jobs.find(job => job.id.toString() === jobID),
-      );
-    } else if (jobState) {
-      job = jobState[jobID]?.data;
-    }
-    return job;
-  },
-);
-
-export const selectJobError = createSelector(
-  selectJobState,
-  selectID,
-  (state: KeyedCachedDataReducerState<JobResponseMessage>, jobID) => {
-    if (!state || !jobID) {
-      return null;
-    }
-    return state[jobID]?.lastError;
-  },
-);
-
-export const selectJobLoading = createSelector(
-  selectJobState,
-  selectID,
-  (state: KeyedCachedDataReducerState<JobResponseMessage>, jobID) => {
-    if (!state || !jobID) {
-      return null;
-    }
-    return state[jobID]?.inFlight;
-  },
-);
-
+const selectJob = createSelectorForKeyedCachedDataField("job", selectID);
+const selectExecutionDetailFiles =
+  createSelectorForKeyedCachedDataField<ListJobProfilerExecutionDetailsResponseMessage>(
+    "jobProfiler",
+    selectID,
+  );
 const mapStateToProps = (
   state: AdminUIState,
   props: RouteComponentProps,
 ): JobDetailsStateProps => {
-  const job = selectJob(state, props);
-  const jobLoading = selectJobLoading(state, props);
-  const jobError = selectJobError(state, props);
+  const jobID = selectID(state, props);
   return {
-    job,
-    jobLoading,
-    jobError,
+    jobRequest: selectJob(state, props),
+    jobProfilerExecutionDetailFilesResponse: selectExecutionDetailFiles(
+      state,
+      props,
+    ),
+    jobProfilerLastUpdated: state.cachedData.jobProfiler[jobID]?.setAt,
+    jobProfilerDataIsValid: state.cachedData.jobProfiler[jobID]?.valid,
+    onDownloadExecutionFileClicked: clusterUiApi.getExecutionDetailFile,
+    hasAdminRole: selectHasAdminRole(state),
   };
 };
 
 const mapDispatchToProps = {
   refreshJob,
+  refreshExecutionDetailFiles: refreshListExecutionDetailFiles,
+  onRequestExecutionDetails: (jobID: long) => {
+    return (dispatch: AppDispatch) => {
+      dispatch(collectExecutionDetailsAction({ job_id: jobID }));
+    };
+  },
+  refreshUserSQLRoles: refreshUserSQLRoles,
 };
 
 export default withRouter(

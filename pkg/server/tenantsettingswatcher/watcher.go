@@ -21,9 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 )
@@ -82,8 +84,8 @@ func New(
 // canceled or the stopper is stopped prior to the initial data being retrieved.
 func (w *Watcher) Start(ctx context.Context, sysTableResolver catalog.SystemTableIDResolver) error {
 	w.startCh = make(chan struct{})
+	defer close(w.startCh)
 	w.startErr = w.startRangeFeed(ctx, sysTableResolver)
-	close(w.startCh)
 	return w.startErr
 }
 
@@ -94,7 +96,14 @@ func (w *Watcher) Start(ctx context.Context, sysTableResolver catalog.SystemTabl
 func (w *Watcher) startRangeFeed(
 	ctx context.Context, sysTableResolver catalog.SystemTableIDResolver,
 ) error {
-	tableID, err := sysTableResolver.LookupSystemTableID(ctx, systemschema.TenantSettingsTable.GetName())
+	// We need to retry unavailable replicas here. This is only meant to be called
+	// at server startup.
+	tableID, err := startup.RunIdempotentWithRetryEx(ctx,
+		w.stopper.ShouldQuiesce(),
+		"tenant start setting rangefeed",
+		func(ctx context.Context) (descpb.ID, error) {
+			return sysTableResolver.LookupSystemTableID(ctx, systemschema.TenantSettingsTable.GetName())
+		})
 	if err != nil {
 		return err
 	}
@@ -195,12 +204,6 @@ func (w *Watcher) startRangeFeed(
 // WaitForStart waits until the rangefeed is set up. Returns an error if the
 // rangefeed setup failed.
 func (w *Watcher) WaitForStart(ctx context.Context) error {
-	// Fast path check.
-	select {
-	case <-w.startCh:
-		return w.startErr
-	default:
-	}
 	if w.startCh == nil {
 		return errors.AssertionFailedf("Start() was not yet called")
 	}

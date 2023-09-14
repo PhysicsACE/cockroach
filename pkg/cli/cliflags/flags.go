@@ -1345,7 +1345,7 @@ Maximum memory capacity available for each node to store temporary data for SQL
 clients, including prepared queries and intermediate data rows during query
 execution. Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB and
 1GiB) or a percentage of physical memory (e.g. .25). If left unspecified,
-defaults to 128MiB.
+defaults to 256MiB.
 `,
 	}
 	DemoNodeCacheSize = FlagInfo{
@@ -1447,6 +1447,12 @@ If set to false, overrides the default demo behavior of enabling rangefeeds.`,
 		Description: `
 Disable the creation of a default dataset in the demo shell.
 This makes 'cockroach demo' faster to start.`,
+	}
+
+	ConfigProfile = FlagInfo{
+		Name:        "config-profile",
+		EnvVar:      "COCKROACH_CONFIG_PROFILE",
+		Description: `Select a configuration profile to apply.`,
 	}
 
 	GeoLibsDir = FlagInfo{
@@ -1635,6 +1641,26 @@ Setting this flag will be interpreted in the same way as setting the
 Redact anything that may contain confidential data or PII from retrieved
 debug data. An exception is made for range key data, as this data is
 necessary to support CockroachDB.
+`,
+	}
+
+	ZipIncludeRangeInfo = FlagInfo{
+		Name: "include-range-info",
+		Description: `
+Include information about each individual range in nodes/*/ranges/*.json files.
+For large clusters, this can dramatically increase debug zip size/file count.
+`,
+	}
+
+	ZipIncludeGoroutineStacks = FlagInfo{
+		Name: "include-goroutine-stacks",
+		Description: `
+Fetch stack traces for all goroutines running on each targeted node in nodes/*/stacks.txt
+and nodes/*/stacks_with_labels.txt files. Note that fetching stack traces for all goroutines is
+a "stop-the-world" operation, which can momentarily have negative impacts on SQL service 
+latency. Note that any periodic goroutine dumps previously taken on the node will still be 
+included in nodes/*/goroutines/*.txt.gz, as these would have already been generated and don't 
+require any additional stop-the-world operations to be collected.
 `,
 	}
 
@@ -1910,6 +1936,16 @@ y - assume yes to all prompts
 n - assume no/abort to all prompts
 p - prompt interactively for a confirmation
 </PRE>
+`,
+	}
+
+	RecoverIgnoreInternalVersion = FlagInfo{
+		Name: "ignore-internal-version",
+		Description: `
+When set, staging and local store plan application commands will ignore internal
+cluster version. This option must only be used to bypass version check if
+cluster is stuck in the middle of upgrade and locally stored versions differ
+from node to node and previous application or staging attempt failed.
 `,
 	}
 

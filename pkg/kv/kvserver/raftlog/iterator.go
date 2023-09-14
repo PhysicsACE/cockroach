@@ -12,6 +12,7 @@ package raftlog
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -31,7 +32,7 @@ type storageIter interface {
 // The raft log is a contiguous sequence of indexes (i.e. no holes) which may be
 // empty.
 type Reader interface {
-	NewMVCCIterator(storage.MVCCIterKind, storage.IterOptions) storage.MVCCIterator
+	NewMVCCIterator(storage.MVCCIterKind, storage.IterOptions) (storage.MVCCIterator, error)
 }
 
 // An Iterator inspects the raft log. After creation, SeekGE should be invoked,
@@ -60,14 +61,14 @@ type Iterator struct {
 type IterOptions struct {
 	// Hi ensures the Iterator never seeks to any entry with index >= Hi. This is
 	// useful when the caller is interested in a slice [Lo, Hi) of the raft log.
-	Hi uint64
+	Hi kvpb.RaftIndex
 }
 
 // NewIterator initializes an Iterator that reads the raft log for the given
 // RangeID from the provided Reader.
 //
 // Callers that can afford allocating a closure may prefer using Visit.
-func NewIterator(rangeID roachpb.RangeID, eng Reader, opts IterOptions) *Iterator {
+func NewIterator(rangeID roachpb.RangeID, eng Reader, opts IterOptions) (*Iterator, error) {
 	// TODO(tbg): can pool these most of the things below, incl. the *Iterator.
 	prefixBuf := keys.MakeRangeIDPrefixBuf(rangeID)
 	var upperBound roachpb.Key
@@ -76,13 +77,17 @@ func NewIterator(rangeID roachpb.RangeID, eng Reader, opts IterOptions) *Iterato
 	} else {
 		upperBound = prefixBuf.RaftLogKey(opts.Hi)
 	}
+	iter, err := eng.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+		UpperBound: upperBound,
+	})
+	if err != nil {
+		return nil, err
+	}
 	return &Iterator{
 		eng:       eng,
 		prefixBuf: prefixBuf,
-		iter: eng.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
-			UpperBound: upperBound,
-		}),
-	}
+		iter:      iter,
+	}, nil
 }
 
 // Close releases the resources associated with this Iterator.
@@ -107,7 +112,7 @@ func (it *Iterator) load() (bool, error) {
 // SeekGE positions the Iterator at the first raft log with index greater than
 // or equal to idx. Returns (true, nil) on success, (false, nil) if no such
 // entry exists.
-func (it *Iterator) SeekGE(idx uint64) (bool, error) {
+func (it *Iterator) SeekGE(idx kvpb.RaftIndex) (bool, error) {
 	it.iter.SeekGE(storage.MakeMVCCMetadataKey(it.prefixBuf.RaftLogKey(idx)))
 	return it.load()
 }
@@ -134,8 +139,13 @@ func (it *Iterator) Entry() raftpb.Entry {
 //
 // The closure may return iterutil.StopIteration(), which will stop iteration
 // without returning an error.
-func Visit(eng Reader, rangeID roachpb.RangeID, lo, hi uint64, fn func(raftpb.Entry) error) error {
-	it := NewIterator(rangeID, eng, IterOptions{Hi: hi})
+func Visit(
+	eng Reader, rangeID roachpb.RangeID, lo, hi kvpb.RaftIndex, fn func(raftpb.Entry) error,
+) error {
+	it, err := NewIterator(rangeID, eng, IterOptions{Hi: hi})
+	if err != nil {
+		return err
+	}
 	defer it.Close()
 	ok, err := it.SeekGE(lo)
 	if err != nil {

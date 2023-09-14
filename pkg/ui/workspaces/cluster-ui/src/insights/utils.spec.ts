@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import moment from "moment";
+import moment from "moment-timezone";
 import {
   filterStatementInsights,
   filterTransactionInsights,
@@ -26,8 +26,10 @@ import {
   InsightNameEnum,
   planRegressionInsight,
   slowExecutionInsight,
+  StatementStatus,
   StmtInsightEvent,
   suboptimalPlanInsight,
+  TransactionStatus,
   TxnInsightDetails,
   TxnInsightEvent,
 } from "./types";
@@ -76,6 +78,8 @@ const statementInsightMock: StmtInsightEvent = {
   indexRecommendations: [],
   planGist: "gist",
   cpuSQLNanos: 50,
+  errorCode: "",
+  status: StatementStatus.COMPLETED,
 };
 
 function mockStmtInsightEvent(
@@ -116,6 +120,8 @@ const txnInsightEventMock: TxnInsightEvent = {
   elapsedTimeMillis: 1,
   stmtExecutionIDs: [statementInsightMock.statementExecutionID],
   cpuSQLNanos: 50,
+  errorCode: "",
+  status: TransactionStatus.COMPLETED,
 };
 
 function mockTxnInsightEvent(
@@ -208,6 +214,26 @@ describe("test workload insights utils", () => {
         "no results",
       );
       expect(filtered.length).toEqual(0);
+
+      filtered = filterTransactionInsights(
+        [
+          ...txnsWithQueries,
+          mockTxnInsightEvent({ sessionID: "my-uniq-session-id-11223344" }),
+          mockTxnInsightEvent({
+            stmtExecutionIDs: ["statement-exec-id-11223344"],
+          }),
+          mockTxnInsightEvent({
+            transactionExecutionID: "txn-exec-id-11223344",
+          }),
+          mockTxnInsightEvent({
+            transactionFingerprintID: "txn-fingerprint-id-11223344",
+          }),
+        ],
+        { app: "" },
+        INTERNAL_APP_PREFIX,
+        "11223344",
+      );
+      expect(filtered.length).toEqual(4);
     });
 
     it("should filter txns given a mix of requirements", () => {
@@ -338,6 +364,29 @@ describe("test workload insights utils", () => {
         "no results",
       );
       expect(filtered.length).toEqual(0);
+
+      filtered = filterStatementInsights(
+        [
+          ...stmtsWithQueries,
+          mockStmtInsightEvent({
+            transactionFingerprintID: "txn-fingerprint-id-11223344",
+          }),
+          mockStmtInsightEvent({
+            transactionExecutionID: "txn-exec-id-11223344",
+          }),
+          mockStmtInsightEvent({ sessionID: "session-id-11223344" }),
+          mockStmtInsightEvent({
+            statementFingerprintID: "stmt-fingerprint-id-11223344",
+          }),
+          mockStmtInsightEvent({
+            statementExecutionID: "stmt-exec-id-11223344",
+          }),
+        ],
+        { app: "" },
+        INTERNAL_APP_PREFIX,
+        "11223344",
+      );
+      expect(filtered.length).toEqual(5);
     });
 
     it("should filter txns given a mix of requirements", () => {

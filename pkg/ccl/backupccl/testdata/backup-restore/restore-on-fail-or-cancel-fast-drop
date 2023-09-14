@@ -19,10 +19,6 @@ BACKUP INTO 'nodelocal://1/cluster_backup';
 new-cluster name=s2 nodes=1 share-io-dir=s1 disable-tenant
 ----
 
-exec-sql
-SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true;
-----
-
 # Restore's OnFailOrCancel deletes descriptors which requires us to wait for no
 # versions of that descriptor to be leased before proceeding. Since our test fails
 # the job after the descriptors have been published, it's possible for them to be leased
@@ -50,7 +46,7 @@ SET CLUSTER SETTING jobs.debug.pausepoints = 'restore.after_publishing_descripto
 ----
 
 restore expect-pausepoint tag=a
-RESTORE FROM LATEST IN 'nodelocal://0/cluster_backup';
+RESTORE FROM LATEST IN 'nodelocal://1/cluster_backup';
 ----
 job paused at pausepoint
 
@@ -82,7 +78,7 @@ SHOW JOBS WHEN COMPLETE (SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'SCHEMA
 ----
 
 restore
-RESTORE FROM LATEST IN 'nodelocal://0/cluster_backup';
+RESTORE FROM LATEST IN 'nodelocal://1/cluster_backup';
 ----
 
 subtest end

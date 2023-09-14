@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -186,7 +188,7 @@ func decodeTableStatisticsKV(
 	types := []*types.T{types.Int, types.Int}
 	dirs := []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC}
 	keyVals := make([]rowenc.EncDatum, 2)
-	if _, _, err := rowenc.DecodeIndexKey(codec, types, keyVals, dirs, kv.Key); err != nil {
+	if _, err := rowenc.DecodeIndexKey(codec, keyVals, dirs, kv.Key); err != nil {
 		return 0, err
 	}
 
@@ -794,8 +796,8 @@ ORDER BY "createdAt" DESC, "columnIDs" DESC, "statisticID" DESC
 	// TODO(michae2): Add an index on system.table_statistics (tableID, createdAt,
 	// columnIDs, statisticID).
 
-	it, err := sc.db.Executor().QueryIterator(
-		ctx, "get-table-statistics", nil /* txn */, getTableStatisticsStmt, tableID,
+	it, err := sc.db.Executor().QueryIteratorEx(
+		ctx, "get-table-statistics", nil /* txn */, sessiondata.NodeUserSessionDataOverride, getTableStatisticsStmt, tableID,
 	)
 	if err != nil {
 		return nil, err
@@ -821,8 +823,13 @@ ORDER BY "createdAt" DESC, "columnIDs" DESC, "statisticID" DESC
 	statsList = append(merged, statsList...)
 
 	if forecast {
-		forecasts := ForecastTableStatistics(ctx, statsList)
-		statsList = append(forecasts, statsList...)
+		forecasts := ForecastTableStatistics(ctx, &sc.settings.SV, statsList)
+		statsList = append(statsList, forecasts...)
+		// Some forecasts could have a CreatedAt time before or after some collected
+		// stats, so make sure the list is sorted in descending CreatedAt order.
+		sort.SliceStable(statsList, func(i, j int) bool {
+			return statsList[i].CreatedAt.After(statsList[j].CreatedAt)
+		})
 	}
 
 	return statsList, nil

@@ -6,6 +6,8 @@
 //
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
+// Package schemafeed provides SchemaFeed, which can be used to track schema
+// updates.
 package schemafeed
 
 import (
@@ -30,9 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -126,6 +128,7 @@ type schemaFeed struct {
 	mu struct {
 		syncutil.Mutex
 
+		// started is used to prevent running a schema feed more than once.
 		started bool
 
 		// the highest known valid timestamp
@@ -153,6 +156,17 @@ type schemaFeed struct {
 		// typeDeps tracks dependencies from target tables to user defined types
 		// that they use.
 		typeDeps typeDependencyTracker
+
+		// pollingPaused, if set, pauses the polling background work.
+		// Polling can be paused if all tables are locked from schema changes because
+		// we know no table events will occur.
+		pollingPaused bool
+
+		// The following two maps are memoization to help avoid map allocation
+		// on a hot path. It is by nature implementation details and should only
+		// be concerned by implementer of method pauseOrResumePolling.
+		allTableVersions1 map[descpb.ID]descpb.DescriptorVersion
+		allTableVersions2 map[descpb.ID]descpb.DescriptorVersion
 	}
 }
 
@@ -217,7 +231,15 @@ type tableHistoryWaiter struct {
 	errCh chan error
 }
 
-func (tf *schemaFeed) markStarted() error {
+func (tf *schemaFeed) pollingPaused() bool {
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	return tf.mu.pollingPaused
+}
+
+// init does all necessary initialization work.
+// It should be called only once when running the feed.
+func (tf *schemaFeed) init() error {
 	tf.mu.Lock()
 	defer tf.mu.Unlock()
 	if tf.mu.started {
@@ -229,7 +251,7 @@ func (tf *schemaFeed) markStarted() error {
 
 // Run will run the SchemaFeed. It is an error to run a feed more than once.
 func (tf *schemaFeed) Run(ctx context.Context) error {
-	if err := tf.markStarted(); err != nil {
+	if err := tf.init(); err != nil {
 		return err
 	}
 
@@ -252,14 +274,13 @@ func (tf *schemaFeed) Run(ctx context.Context) error {
 	//
 	// After we add some sort of locking to prevent schema changes we should also
 	// only poll if we don't have a lease.
-	return tf.pollTableHistory(ctx)
+	return tf.periodicallyMaybePollTableHistory(ctx)
 }
 
 func (tf *schemaFeed) primeInitialTableDescs(ctx context.Context) error {
-	tf.mu.Lock()
-	initialTableDescTs := tf.mu.highWater
-	tf.mu.Unlock()
+	initialTableDescTs := tf.highWater()
 	var initialDescs []catalog.Descriptor
+
 	initialTableDescsFn := func(
 		ctx context.Context, txn descs.Txn,
 	) error {
@@ -283,21 +304,41 @@ func (tf *schemaFeed) primeInitialTableDescs(ctx context.Context) error {
 		return err
 	}
 
-	tf.mu.Lock()
-	// Register all types used by the initial set of tables.
-	for _, desc := range initialDescs {
-		tbl := desc.(catalog.TableDescriptor)
-		tf.mu.typeDeps.ingestTable(tbl)
-	}
-	tf.mu.Unlock()
+	func() {
+		tf.mu.Lock()
+		defer tf.mu.Unlock()
+		// Register all types used by the initial set of tables.
+		for _, desc := range initialDescs {
+			tbl := desc.(catalog.TableDescriptor)
+			tf.mu.typeDeps.ingestTable(tbl)
+		}
+	}()
 
 	return tf.ingestDescriptors(ctx, hlc.Timestamp{}, initialTableDescTs, initialDescs, tf.validateDescriptor)
 }
 
-func (tf *schemaFeed) pollTableHistory(ctx context.Context) error {
+// periodicallyMaybePollTableHistory periodically polls all versions of watched
+// tables from `system.descriptor` table between `tf.highWater` and now, if it
+// is not paused. This is the general mechanism schemaFeed use to know all watched
+// table versions at or before a particular timestamp, internally tracked by
+// `tf.highWater`, so it can answer Peek/Pop(atOrBefore).
+//
+// Note: such a spinning loop incurs a lot of read traffic in the cluster (think:
+// many nodes and many changefeeds) but for the vast, vast majority of the time,
+// the polling answer is "no table has changed during this interval" because
+// schema changes are rare. To mitigate that and still be able to answer
+// Peek/Pop(atOrBefore), we can "lock" the table to prevent schema changes, so
+// the periodic polling can be paused and Peek/Pop will always just return nil.
+// Read commentary in peekOrPop for more explanations.
+func (tf *schemaFeed) periodicallyMaybePollTableHistory(ctx context.Context) error {
 	for {
-		if err := tf.updateTableHistory(ctx, tf.clock.Now()); err != nil {
-			return err
+		if !tf.pollingPaused() {
+			if err := tf.updateTableHistory(ctx, tf.clock.Now()); err != nil {
+				return err
+			}
+			if tf.metrics != nil {
+				tf.metrics.TableHistoryScans.Inc(1)
+			}
 		}
 
 		select {
@@ -308,6 +349,8 @@ func (tf *schemaFeed) pollTableHistory(ctx context.Context) error {
 	}
 }
 
+// updateTableHistory attempts to advance `high_water` to `endTS` by fetching
+// descriptor versions from `high_water` to `endTS`.
 func (tf *schemaFeed) updateTableHistory(ctx context.Context, endTS hlc.Timestamp) error {
 	startTS := tf.highWater()
 	if endTS.LessEq(startTS) {
@@ -325,7 +368,6 @@ func (tf *schemaFeed) updateTableHistory(ctx context.Context, endTS hlc.Timestam
 func (tf *schemaFeed) Peek(
 	ctx context.Context, atOrBefore hlc.Timestamp,
 ) (events []TableEvent, err error) {
-
 	return tf.peekOrPop(ctx, atOrBefore, false /* pop */)
 }
 
@@ -339,6 +381,12 @@ func (tf *schemaFeed) Pop(
 func (tf *schemaFeed) peekOrPop(
 	ctx context.Context, atOrBefore hlc.Timestamp, pop bool,
 ) (events []TableEvent, err error) {
+	// Routinely check to pause or resume polling. If it decides to pause polling,
+	// then `atOrBefore` will be updated to one that requires no waiting.
+	atOrBefore, err = tf.pauseOrResumePolling(ctx, atOrBefore)
+	if err != nil {
+		return nil, err
+	}
 	if err = tf.waitForTS(ctx, atOrBefore); err != nil {
 		return nil, err
 	}
@@ -357,11 +405,112 @@ func (tf *schemaFeed) peekOrPop(
 	return events, nil
 }
 
+// pauseOrResumePolling pauses or resumes the periodic table history scan
+// performed by the schema feed, based on whether all tables are "locked"
+// from schema changes.
+// Either way, it returns a timestamp `ts` that is ready to be called with
+// peekOrPop(ts).
+//
+// Namely, if it decides to pause the polling (meaning it has confirmed that
+// all tables are locked), then it returns `tf.highWater` because
+// there is no table events in (tf.highWater, atOrBefore], and we just need to
+// peekOrPop at `tf.highWater`, which requires no waiting.
+// If it decides to resume the polling (meaning it has confirmed that not all
+// tables are locked), then it returns the same `atOrBefore` so we can fall back
+// and rely on peekOkPop(atOrBefore) to give us the answer.
+//
+// Technical details:
+// The way it confirms that there is no table events in (tf.highWater, atOrBefore]
+// is to acquire a lease of the table at `tf.highWater` (call it `ld1`) and
+// at `atOrBefore` (call it `ld2`).
+// The lease manager guarantees the following invariant:
+//
+//	leaseManager.Acquire(t, ts) returns a descriptor of `t` whose version is valid
+//	for SQL activities at timestamp `ts`. This version is either the "canonical"
+//	version of `t` at `ts`, or its predecessor version.
+//
+// Now, if both `ld1` and `ld2` are of the same version and are both "schema_locked",
+// then it's safe to report "there's no table events in (tf.highWater, atOrBefore]",
+// because
+//   - ld1 canonical, ld2 canonical: no table events bc `t` remains the same
+//     from `tf.highWater` to `atOrBefore`
+//   - ld1 canonical, ld2 predecessor: a schema change happened in (tf.highWater, atOrBefore].
+//     But the only schema change allowed on a locked table is to unlock
+//     it so `ld2` will be exactly the same as the canonical version except
+//     for the locked-bit. We can ignore/omit such an "uninteresting" table event
+//     as it will be filtered by the schema feed anyway.
+//   - ld1 predecessor, ld2 predecessor: no schema change bc `t` remains the same
+//     from `tf.highWater` to `atOrBefore`.
+//   - ld1 predecessor, ld2 canonical: impossible (how can it be that `t` is
+//     unlocked at tf.highWater but locked at atOrBefore with the same version?).
+func (tf *schemaFeed) pauseOrResumePolling(
+	ctx context.Context, atOrBefore hlc.Timestamp,
+) (hlc.Timestamp, error) {
+	// areAllLeasedTablesSchemaLockedAt returns true if all leased tables are
+	// schema locked at timestamp `ts`.
+	// It also updates input `versions` to record those table versions at `ts`.
+	areAllLeasedTablesSchemaLockedAt := func(
+		ts hlc.Timestamp, versions map[descpb.ID]descpb.DescriptorVersion,
+	) (bool, error) {
+		allWatchedTableSchemaLocked := true
+		err := tf.targets.EachTableID(func(id descpb.ID) error {
+			ld, err := tf.leaseMgr.Acquire(ctx, ts, id)
+			if err != nil {
+				return err
+			}
+			defer ld.Release(ctx)
+			if !ld.Underlying().(catalog.TableDescriptor).IsSchemaLocked() {
+				allWatchedTableSchemaLocked = false
+				return iterutil.StopIteration()
+			}
+			versions[id] = ld.Underlying().(catalog.TableDescriptor).GetVersion()
+			return nil
+		})
+		if errors.Is(err, catalog.ErrDescriptorDropped) {
+			// If a table is dropped and cause Acquire to fail, we mark it as terminal
+			// error, so we don't retry and let the changefeed job handle this error.
+			err = changefeedbase.WithTerminalError(err)
+		}
+		return allWatchedTableSchemaLocked, err
+	}
+
+	tf.mu.Lock()
+	defer tf.mu.Unlock()
+	if atOrBefore.LessEq(tf.mu.highWater) {
+		// `atOrBefore` warrants a fast path already, with polling paused or not.
+		return atOrBefore, nil
+	}
+
+	if tf.mu.allTableVersions1 == nil {
+		tf.mu.allTableVersions1 = make(map[descpb.ID]descpb.DescriptorVersion)
+		tf.mu.allTableVersions2 = make(map[descpb.ID]descpb.DescriptorVersion)
+	}
+
+	// Always start with a stance to resume polling until we've proved otherwise.
+	tf.mu.pollingPaused = false
+	if ok, err := areAllLeasedTablesSchemaLockedAt(tf.mu.highWater, tf.mu.allTableVersions1); err != nil || !ok {
+		return atOrBefore, err
+	}
+	if ok, err := areAllLeasedTablesSchemaLockedAt(atOrBefore, tf.mu.allTableVersions2); err != nil || !ok {
+		return atOrBefore, err
+	}
+	if len(tf.mu.allTableVersions1) != len(tf.mu.allTableVersions2) {
+		return atOrBefore, nil
+	}
+	for id, version := range tf.mu.allTableVersions1 {
+		if version != tf.mu.allTableVersions2[id] {
+			return atOrBefore, nil
+		}
+	}
+	tf.mu.pollingPaused = true
+	return tf.mu.highWater, nil
+}
+
 // highWater returns the current high-water timestamp.
 func (tf *schemaFeed) highWater() hlc.Timestamp {
 	tf.mu.Lock()
+	defer tf.mu.Unlock()
 	highWater := tf.mu.highWater
-	tf.mu.Unlock()
 	return highWater
 }
 
@@ -376,18 +525,22 @@ func (tf *schemaFeed) highWater() hlc.Timestamp {
 func (tf *schemaFeed) waitForTS(ctx context.Context, ts hlc.Timestamp) error {
 	var errCh chan error
 
-	tf.mu.Lock()
-	highWater := tf.mu.highWater
+	highWater := tf.highWater()
 	var err error
-	if !tf.mu.errTS.IsEmpty() && tf.mu.errTS.LessEq(ts) {
-		err = tf.mu.err
-	}
-	fastPath := err != nil || ts.LessEq(highWater)
-	if !fastPath {
-		errCh = make(chan error, 1)
-		tf.mu.waiters = append(tf.mu.waiters, tableHistoryWaiter{ts: ts, errCh: errCh})
-	}
-	tf.mu.Unlock()
+	var fastPath bool
+	func() {
+		tf.mu.Lock()
+		defer tf.mu.Unlock()
+		if !tf.mu.errTS.IsEmpty() && tf.mu.errTS.LessEq(ts) {
+			err = tf.mu.err
+		}
+		fastPath = err != nil || ts.LessEq(highWater)
+		if !fastPath {
+			// non-fastPath is when we need to prove the invariant holds from [`high_water`, `ts].
+			errCh = make(chan error, 1)
+			tf.mu.waiters = append(tf.mu.waiters, tableHistoryWaiter{ts: ts, errCh: errCh})
+		}
+	}()
 	if fastPath {
 		if log.V(1) {
 			log.Infof(ctx, "fastpath for %s: %v", ts, err)
@@ -404,7 +557,7 @@ func (tf *schemaFeed) waitForTS(ctx context.Context, ts hlc.Timestamp) error {
 		return ctx.Err()
 	case err := <-errCh:
 		if log.V(1) {
-			log.Infof(ctx, "waited %s for %s highwater: %v", timeutil.Since(start), ts, err)
+			log.Infof(ctx, "waited %s for %s highwater: err=%v", timeutil.Since(start), ts, err)
 		}
 		if tf.metrics != nil {
 			tf.metrics.TableMetadataNanos.Inc(timeutil.Since(start).Nanoseconds())
@@ -413,6 +566,7 @@ func (tf *schemaFeed) waitForTS(ctx context.Context, ts hlc.Timestamp) error {
 	}
 }
 
+// descLess orders descriptors by (modificationTime, id).
 func descLess(a, b catalog.Descriptor) bool {
 	aTime, bTime := a.GetModificationTime(), b.GetModificationTime()
 	if aTime.Equal(bTime) {
@@ -507,7 +661,14 @@ func (tf *schemaFeed) validateDescriptor(
 		}
 		// If a interesting type changed, then we just want to force the lease
 		// manager to acquire the freshest version of the type.
-		return tf.leaseMgr.AcquireFreshestFromStore(ctx, desc.GetID())
+		if err := tf.leaseMgr.AcquireFreshestFromStore(ctx, desc.GetID()); err != nil {
+			err = errors.Wrapf(err, "could not acquire type descriptor %d lease", desc.GetID())
+			if errors.Is(err, catalog.ErrDescriptorDropped) { // That's pretty fatal.
+				err = changefeedbase.WithTerminalError(err)
+			}
+			return err
+		}
+		return nil
 	case catalog.TableDescriptor:
 		if err := changefeedvalidators.ValidateTable(tf.targets, desc, tf.tolerances); err != nil {
 			return err
@@ -570,8 +731,13 @@ var highPriorityAfter = settings.RegisterDurationSetting(
 	"changefeed.schema_feed.read_with_priority_after",
 	"retry with high priority if we were not able to read descriptors for too long; 0 disables",
 	time.Minute,
-).WithPublic()
+	settings.WithPublic)
 
+// sendExportRequestWithPriorityOverride uses KV API Export() to dump all kv pairs
+// whose key falls under `span` and whose mvcc timestamp falls within [startTs, endTS].
+//
+// If this KV call didn't succeed after `changefeed.schema_feed.read_with_priority_after`,
+// we cancel the call and retry the call with high priority.
 func sendExportRequestWithPriorityOverride(
 	ctx context.Context,
 	st *cluster.Settings,
@@ -604,7 +770,7 @@ func sendExportRequestWithPriorityOverride(
 	}
 
 	var resp kvpb.Response
-	err := contextutil.RunWithTimeout(
+	err := timeutil.RunWithTimeout(
 		ctx, "schema-feed", priorityAfter,
 		func(ctx context.Context) error {
 			var err error
@@ -615,13 +781,15 @@ func sendExportRequestWithPriorityOverride(
 	if err == nil {
 		return resp, nil
 	}
-	if errors.HasType(err, (*contextutil.TimeoutError)(nil)) {
+	if errors.HasType(err, (*timeutil.TimeoutError)(nil)) {
 		header.UserPriority = roachpb.MaxUserPriority
 		return sendRequest(ctx)
 	}
 	return nil, err
 }
 
+// fetchDescriptorVersions makes a KV API call to fetch all watched descriptors
+// versions with mvcc timestamp in (startTS, endTS].
 func (tf *schemaFeed) fetchDescriptorVersions(
 	ctx context.Context, startTS, endTS hlc.Timestamp,
 ) ([]catalog.Descriptor, error) {
@@ -692,12 +860,19 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 					if err != nil {
 						return err
 					}
-					if unsafeValue == nil {
+
+					if len(unsafeValue) == 0 {
+						if isType {
+							return changefeedbase.WithTerminalError(
+								errors.Wrapf(catalog.ErrDescriptorDropped, "type descriptor %d dropped", id))
+						}
+
 						name := origName
 						if name == "" {
 							name = changefeedbase.StatementTimeName(fmt.Sprintf("desc(%d)", id))
 						}
-						return errors.Errorf(`"%v" was dropped or truncated`, name)
+						return changefeedbase.WithTerminalError(
+							errors.Wrapf(catalog.ErrDescriptorDropped, `table "%v"[%d] was dropped or truncated`, name, id))
 					}
 
 					// Unmarshal the descriptor.

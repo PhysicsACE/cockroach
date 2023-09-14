@@ -76,7 +76,6 @@ export const StatementInsightDetails: React.FC<
   isTenant,
   timeScale,
   hasAdminRole,
-  setTimeScale,
   refreshUserSQLRoles,
 }) => {
   const [explainPlanState, setExplainPlanState] = useState<ExplainPlanState>({
@@ -159,7 +158,11 @@ export const StatementInsightDetails: React.FC<
           <section className={cx("section")}>
             <Row>
               <Col span={24}>
-                <SqlBox size={SqlBoxSize.custom} value={details?.query} />
+                <SqlBox
+                  size={SqlBoxSize.custom}
+                  value={details?.query}
+                  format={true}
+                />
               </Col>
             </Row>
           </section>

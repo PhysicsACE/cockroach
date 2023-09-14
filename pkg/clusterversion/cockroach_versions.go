@@ -184,8 +184,6 @@ const (
 	// TODODelete_V22_2Start demarcates work towards CockroachDB v22.2.
 	TODODelete_V22_2Start
 
-	// TODODelete_V22_2LocalTimestamps enables the use of local timestamps in MVCC values.
-	TODODelete_V22_2LocalTimestamps
 	// TODODelete_V22_2PebbleFormatSplitUserKeysMarkedCompacted updates the Pebble format
 	// version that recombines all user keys that may be split across multiple
 	// files into a single table.
@@ -203,15 +201,6 @@ const (
 	TODODelete_V22_2RemoveGrantPrivilege
 	// TODODelete_V22_2MVCCRangeTombstones enables the use of MVCC range tombstones.
 	TODODelete_V22_2MVCCRangeTombstones
-	// TODODelete_V22_2UpgradeSequenceToBeReferencedByID ensures that sequences are referenced
-	// by IDs rather than by their names. For example, a column's DEFAULT (or
-	// ON UPDATE) expression can be defined to be 'nextval('s')'; we want to be
-	// able to refer to sequence 's' by its ID, since 's' might be later renamed.
-	TODODelete_V22_2UpgradeSequenceToBeReferencedByID
-	// TODODelete_V22_2SampledStmtDiagReqs enables installing statement diagnostic requests that
-	// probabilistically collects stmt bundles, controlled by the user provided
-	// sampling rate.
-	TODODelete_V22_2SampledStmtDiagReqs
 	// TODODelete_V22_2SystemPrivilegesTable adds system.privileges table.
 	TODODelete_V22_2SystemPrivilegesTable
 	// TODODelete_V22_2EnablePredicateProjectionChangefeed indicates that changefeeds support
@@ -229,9 +218,11 @@ const (
 	TODODelete_V22_2SystemUsersIDColumnIsBackfilled
 	// TODODelete_V22_2SetSystemUsersUserIDColumnNotNull sets the user_id column in system.users to not null.
 	TODODelete_V22_2SetSystemUsersUserIDColumnNotNull
-	// TODODelete_V22_2SQLSchemaTelemetryScheduledJobs adds an automatic schedule for SQL schema
+	// Permanent_V22_2SQLSchemaTelemetryScheduledJobs adds an automatic schedule for SQL schema
 	// telemetry logging jobs.
-	TODODelete_V22_2SQLSchemaTelemetryScheduledJobs
+	//
+	// This is a permanent migration which should exist forever.
+	Permanent_V22_2SQLSchemaTelemetryScheduledJobs
 	// TODODelete_V22_2SchemaChangeSupportsCreateFunction adds support of CREATE FUNCTION
 	// statement.
 	TODODelete_V22_2SchemaChangeSupportsCreateFunction
@@ -257,26 +248,8 @@ const (
 	// options table id column cannot be null. This is the final step
 	// of the system.role_options table migration.
 	TODODelete_V22_2SetRoleOptionsUserIDColumnNotNull
-	// TODODelete_V22_2UseDelRangeInGCJob enables the use of the DelRange operation in the
-	// GC job. Before it is enabled, the GC job uses ClearRange operations
-	// after the job waits out the GC TTL. After it has been enabled, the
-	// job instead issues DelRange operations at the beginning of the job
-	// and then waits for the data to be removed automatically before removing
-	// the descriptor and zone configurations.
-	TODODelete_V22_2UseDelRangeInGCJob
-	// TODODelete_V22_2WaitedForDelRangeInGCJob corresponds to the migration which waits for
-	// the GC jobs to adopt the use of DelRange with tombstones.
-	TODODelete_V22_2WaitedForDelRangeInGCJob
 	// TODODelete_V22_2RangefeedUseOneStreamPerNode changes rangefeed implementation to use 1 RPC stream per node.
 	TODODelete_V22_2RangefeedUseOneStreamPerNode
-	// TODODelete_V22_2NoNonMVCCAddSSTable adds a migration which waits for all
-	// schema changes to complete. After this point, no non-MVCC
-	// AddSSTable calls will be used outside of tenant streaming.
-	TODODelete_V22_2NoNonMVCCAddSSTable
-	// TODODelete_V22_2UpdateInvalidColumnIDsInSequenceBackReferences looks for invalid column
-	// ids in sequences' back references and attempts a best-effort-based matching
-	// to update those column IDs.
-	TODODelete_V22_2UpdateInvalidColumnIDsInSequenceBackReferences
 	// TODODelete_V22_2TTLDistSQL uses DistSQL to distribute TTL SELECT/DELETE statements to
 	// leaseholder nodes.
 	TODODelete_V22_2TTLDistSQL
@@ -297,10 +270,6 @@ const (
 	// TODODelete_V22_2SupportAssumeRoleAuth is the version where assume role authorization is
 	// supported in cloud storage and KMS.
 	TODODelete_V22_2SupportAssumeRoleAuth
-	// TODODelete_V22_2FixUserfileRelatedDescriptorCorruption adds a migration which uses
-	// heuristics to identify invalid table descriptors for userfile-related
-	// descriptors.
-	TODODelete_V22_2FixUserfileRelatedDescriptorCorruption
 
 	// V22_2 is CockroachDB v22.2. It's used for all v22.2.x patch releases.
 	V22_2
@@ -482,8 +451,123 @@ const (
 	// has been backfilled.
 	V23_1ExternalConnectionsTableOwnerIDColumnBackfilled
 
+	// V23_1AllowNewSystemPrivileges is the version at which we allow the new
+	// MODIFYSQLCLUSTERSETTING abd VIEWJOB system privileges to be used.
+	// Note: After v23.1 is released, we won't need to version gate these anymore,
+	// since we've made mixed-version clusters tolerate new privileges.
+	V23_1AllowNewSystemPrivileges
+
+	// V23_1JobInfoTableIsBackfilled is a version gate after which the
+	// system.job_info table has been backfilled with rows for the payload and
+	// progress of each job in the system.jobs table.
+	V23_1JobInfoTableIsBackfilled
+
+	// V23_1EnableFlushableIngest upgrades the Pebble format major version to
+	// FormatFlushableIngest, which enables use of flushable ingestion.
+	V23_1EnableFlushableIngest
+
+	// V23_1_UseDelRangeInGCJob enables the use of the DelRange operation in the
+	// GC job. Before it is enabled, the GC job uses ClearRange operations
+	// after the job waits out the GC TTL. After it has been enabled, the
+	// job instead issues DelRange operations at the beginning of the job
+	// and then waits for the data to be removed automatically before removing
+	// the descriptor and zone configurations.
+	V23_1_UseDelRangeInGCJob
+
+	// V23_1WaitedForDelRangeInGCJob corresponds to the migration which waits for
+	// the GC jobs to adopt the use of DelRange with tombstones.
+	V23_1WaitedForDelRangeInGCJob
+
+	// V23_1_TaskSystemTables is the version where the system tables
+	// task_payloads and tenant_tasks have been created.
+	V23_1_TaskSystemTables
+
+	// V23_1_CreateAutoConfigRunnerJob is the version where the auto
+	// config runner persistent job has been created.
+	V23_1_CreateAutoConfigRunnerJob
+
+	// V23_1AddSQLStatsComputedIndexes is the version at which Cockroach adds new
+	// computed columns and indexes to the statement_statistics and
+	// transaction_statistics system tables. These columns optimize persisted SQL
+	// statistics queries for observability.
+	V23_1AddSQLStatsComputedIndexes
+
+	// V23_1AddSystemActivityTables is the version at which Cockroach adds system
+	// tables statement_activity and transaction_activity. These tables will
+	// contain a subset of data from statement_statistics and transaction_statistics
+	// that are optimized for the console.
+	V23_1AddSystemActivityTables
+
+	// V23_1StopWritingPayloadAndProgressToSystemJobs is the version where the
+	// payload and progress columns are no longer written to system.jobs.
+	V23_1StopWritingPayloadAndProgressToSystemJobs
+
+	// V23_1ChangeSQLStatsTTL is the version where the gc TTL was updated to all
+	// SQL Stats tables.
+	V23_1ChangeSQLStatsTTL
+
+	// V23_1_TenantIDSequence is the version where system.tenant_id_seq
+	// was introduced.
+	V23_1_TenantIDSequence
+
+	// V23_1CreateSystemActivityUpdateJob is the version at which Cockroach adds a
+	// job that periodically updates the statement_activity and transaction_activity.
+	// tables.
+	V23_1CreateSystemActivityUpdateJob
+
+	// V23_1 is CockroachDB v23.1. It's used for all v23.1.x patch releases.
+	V23_1
+
+	// V23_2Start demarcates the start of cluster versions stepped through during
+	// the process of upgrading from previous supported releases to 23.2.
+	V23_2Start
+
+	// V23_2TTLAllowDescPK is the version where TTL tables can have descending
+	// primary keys.
+	V23_2TTLAllowDescPK
+
+	// V23_2_PartiallyVisibleIndexes is the version where partially visible
+	// indexes are enabled.
+	V23_2_PartiallyVisibleIndexes
+
+	// V23_2_EnableRangeCoalescingForSystemTenant enables range coalescing for
+	// the system tenant.
+	V23_2_EnableRangeCoalescingForSystemTenant
+
+	// V23_2_UseACRaftEntryEntryEncodings gates the use of raft entry encodings
+	// that (optionally) embed below-raft admission data.
+	V23_2_UseACRaftEntryEntryEncodings
+
+	// V23_2_PebbleFormatDeleteSizedAndObsolete upgrades Pebble's format major
+	// version to FormatDeleteSizedAndObsolete, allowing use of a new sstable
+	// format version Pebblev4. This version has two improvements:
+	//   a) It allows the use of DELSIZED point tombstones.
+	//   b) It encodes the obsolence of keys in a key-kind bit.
+	V23_2_PebbleFormatDeleteSizedAndObsolete
+
+	// V23_2_UseSizedPebblePointTombstones enables the use of Pebble's new
+	// DeleteSized operations.
+	V23_2_UseSizedPebblePointTombstones
+
+	// V23_2_PebbleFormatVirtualSSTables upgrades Pebble's format major version to
+	// FormatVirtualSSTables, allowing use of virtual sstables in Pebble.
+	V23_2_PebbleFormatVirtualSSTables
+
+	// V23_2_StmtDiagForPlanGist enables statement diagnostic feature to collect
+	// the bundle for particular plan gist.
+	V23_2_StmtDiagForPlanGist
+
+	// V23_2_RegionaLivenessTable guarantees the regional liveness table exists
+	// and its ready for use.
+	V23_2_RegionaLivenessTable
+
+	// V23_2_RemoveLockTableWaiterTouchPush simplifies the push logic in
+	// lock_table_waiter by passing the wait policy of the pusher as part of the
+	// push request and leaving the push outcome to the server-side logic.
+	V23_2_RemoveLockTableWaiterTouchPush
+
 	// *************************************************
-	// Step (1): Add new versions here.
+	// Step (1) Add new versions here.
 	// Do not add new versions to a patch release.
 	// *************************************************
 )
@@ -556,10 +640,6 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 2},
 	},
 	{
-		Key:     TODODelete_V22_2LocalTimestamps,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 4},
-	},
-	{
 		Key:     TODODelete_V22_2PebbleFormatSplitUserKeysMarkedCompacted,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 6},
 	},
@@ -578,14 +658,6 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     TODODelete_V22_2MVCCRangeTombstones,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 16},
-	},
-	{
-		Key:     TODODelete_V22_2UpgradeSequenceToBeReferencedByID,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 18},
-	},
-	{
-		Key:     TODODelete_V22_2SampledStmtDiagReqs,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 20},
 	},
 	{
 		Key:     TODODelete_V22_2SystemPrivilegesTable,
@@ -616,7 +688,7 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 40},
 	},
 	{
-		Key:     TODODelete_V22_2SQLSchemaTelemetryScheduledJobs,
+		Key:     Permanent_V22_2SQLSchemaTelemetryScheduledJobs,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 42},
 	},
 	{
@@ -640,24 +712,8 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 54},
 	},
 	{
-		Key:     TODODelete_V22_2UseDelRangeInGCJob,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 56},
-	},
-	{
-		Key:     TODODelete_V22_2WaitedForDelRangeInGCJob,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 58},
-	},
-	{
 		Key:     TODODelete_V22_2RangefeedUseOneStreamPerNode,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 60},
-	},
-	{
-		Key:     TODODelete_V22_2NoNonMVCCAddSSTable,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 62},
-	},
-	{
-		Key:     TODODelete_V22_2UpdateInvalidColumnIDsInSequenceBackReferences,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 66},
 	},
 	{
 		Key:     TODODelete_V22_2TTLDistSQL,
@@ -674,10 +730,6 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     TODODelete_V22_2SupportAssumeRoleAuth,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 74},
-	},
-	{
-		Key:     TODODelete_V22_2FixUserfileRelatedDescriptorCorruption,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 76},
 	},
 	{
 		Key:     V22_2,
@@ -835,6 +887,106 @@ var rawVersionsSingleton = keyedVersions{
 		Key:     V23_1ExternalConnectionsTableOwnerIDColumnBackfilled,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 76},
 	},
+	{
+		Key:     V23_1AllowNewSystemPrivileges,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 78},
+	},
+	{
+		Key:     V23_1JobInfoTableIsBackfilled,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 80},
+	},
+	{
+		Key:     V23_1EnableFlushableIngest,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 82},
+	},
+	{
+		Key:     V23_1_UseDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 84},
+	},
+	{
+		Key:     V23_1WaitedForDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 86},
+	},
+	{
+		Key:     V23_1_TaskSystemTables,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 88},
+	},
+	{
+		Key:     V23_1_CreateAutoConfigRunnerJob,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 90},
+	},
+	{
+		Key:     V23_1AddSQLStatsComputedIndexes,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 92},
+	},
+	{
+		Key:     V23_1AddSystemActivityTables,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 94},
+	},
+	{
+		Key:     V23_1StopWritingPayloadAndProgressToSystemJobs,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 96},
+	},
+	{
+		Key:     V23_1ChangeSQLStatsTTL,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 98},
+	},
+	{
+		Key:     V23_1_TenantIDSequence,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 100},
+	},
+	{
+		Key:     V23_1CreateSystemActivityUpdateJob,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 102},
+	},
+	{
+		Key:     V23_1,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 0},
+	},
+	{
+		Key:     V23_2Start,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 2},
+	},
+	{
+		Key:     V23_2TTLAllowDescPK,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 4},
+	},
+	{
+		Key:     V23_2_PartiallyVisibleIndexes,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 6},
+	},
+	{
+		Key:     V23_2_EnableRangeCoalescingForSystemTenant,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 8},
+	},
+	{
+		Key:     V23_2_UseACRaftEntryEntryEncodings,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 10},
+	},
+	{
+		Key:     V23_2_PebbleFormatDeleteSizedAndObsolete,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 12},
+	},
+	{
+		Key:     V23_2_UseSizedPebblePointTombstones,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 14},
+	},
+	{
+		Key:     V23_2_PebbleFormatVirtualSSTables,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 16},
+	},
+	{
+		Key:     V23_2_StmtDiagForPlanGist,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 18},
+	},
+	{
+		Key:     V23_2_RegionaLivenessTable,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 20},
+	},
+	{
+		Key:     V23_2_RemoveLockTableWaiterTouchPush,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 22},
+	},
 
 	// *************************************************
 	// Step (2): Add new versions here.
@@ -904,13 +1056,13 @@ var versionsSingleton = func() keyedVersions {
 	return rawVersionsSingleton
 }()
 
-// V23_1 is a placeholder that will eventually be replaced by the actual 23.1
+// V23_2 is a placeholder that will eventually be replaced by the actual 23.2
 // version Key, but in the meantime it points to the latest Key. The placeholder
 // is defined so that it can be referenced in code that simply wants to check if
-// a cluster is running 23.1 and has completed all associated migrations; most
+// a cluster is running 23.2 and has completed all associated migrations; most
 // version gates can use this instead of defining their own version key if all
-// simply need to check is that the cluster has upgraded to 23.1.
-var V23_1 = versionsSingleton[len(versionsSingleton)-1].Key
+// simply need to check is that the cluster has upgraded to 23.2.
+var V23_2 = versionsSingleton[len(versionsSingleton)-1].Key
 
 const (
 	BinaryMinSupportedVersionKey = V22_2
@@ -927,7 +1079,7 @@ var (
 	// comment).
 	binaryMinSupportedVersion = ByKey(BinaryMinSupportedVersionKey)
 
-	BinaryVersionKey = V23_1
+	BinaryVersionKey = V23_2
 	// binaryVersion is the version of this binary.
 	//
 	// This is the version that a new cluster will use when created.

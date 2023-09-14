@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -32,7 +33,8 @@ func declareKeysHeartbeatTransaction(
 	rs ImmutableRangeState,
 	header *kvpb.Header,
 	req kvpb.Request,
-	latchSpans, _ *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
 ) {
 	declareKeysWriteTransaction(rs, header, req, latchSpans)
@@ -91,7 +93,7 @@ func HeartbeatTxn(
 		// is up for debate.
 		txn.LastHeartbeat.Forward(args.Now)
 		txnRecord := txn.AsRecord()
-		if err := storage.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &txnRecord); err != nil {
+		if err := storage.MVCCPutProto(ctx, readWriter, key, hlc.Timestamp{}, &txnRecord, storage.MVCCWriteOptions{Stats: cArgs.Stats}); err != nil {
 			return result.Result{}, err
 		}
 	}

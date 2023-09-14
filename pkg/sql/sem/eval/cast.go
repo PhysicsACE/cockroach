@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
@@ -65,11 +66,7 @@ func ReType(expr tree.TypedExpr, wantedType *types.T) (_ tree.TypedExpr, ok bool
 func PerformCast(
 	ctx context.Context, evalCtx *Context, d tree.Datum, t *types.T,
 ) (tree.Datum, error) {
-	ret, err := performCastWithoutPrecisionTruncation(ctx, evalCtx, d, t, true /* truncateWidth */)
-	if err != nil {
-		return nil, err
-	}
-	return tree.AdjustValueToType(t, ret)
+	return performCast(ctx, evalCtx, d, t, true /* truncateWidth */)
 }
 
 // PerformAssignmentCast performs an assignment cast from the provided Datum to
@@ -89,7 +86,13 @@ func PerformAssignmentCast(
 			"invalid assignment cast: %s -> %s", d.ResolvedType(), t,
 		)
 	}
-	d, err := performCastWithoutPrecisionTruncation(ctx, evalCtx, d, t, false /* truncateWidth */)
+	return performCast(ctx, evalCtx, d, t, false /* truncateWidth */)
+}
+
+func performCast(
+	ctx context.Context, evalCtx *Context, d tree.Datum, t *types.T, truncateWidth bool,
+) (tree.Datum, error) {
+	d, err := performCastWithoutPrecisionTruncation(ctx, evalCtx, d, t, truncateWidth)
 	if err != nil {
 		return nil, err
 	}
@@ -429,7 +432,7 @@ func performCastWithoutPrecisionTruncation(
 			}
 		case *tree.DBool, *tree.DDecimal:
 			s = d.String()
-		case *tree.DTimestamp, *tree.DDate, *tree.DTime, *tree.DTimeTZ, *tree.DGeography, *tree.DGeometry, *tree.DBox2D:
+		case *tree.DTimestamp, *tree.DDate, *tree.DTime, *tree.DTimeTZ, *tree.DGeography, *tree.DGeometry, *tree.DBox2D, *tree.DPGLSN:
 			s = tree.AsStringWithFlags(d, tree.FmtBareStrings)
 		case *tree.DTimestampTZ:
 			// Convert to context timezone for correct display.
@@ -579,6 +582,21 @@ func performCastWithoutPrecisionTruncation(
 			return tree.NewDBox2D(*bbox), nil
 		}
 
+	case types.PGLSNFamily:
+		if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.V23_2) {
+			return nil, pgerror.Newf(pgcode.FeatureNotSupported,
+				"version %v must be finalized to use pg_lsn",
+				clusterversion.ByKey(clusterversion.V23_2))
+		}
+		switch d := d.(type) {
+		case *tree.DString:
+			return tree.ParseDPGLSN(string(*d))
+		case *tree.DCollatedString:
+			return tree.ParseDPGLSN(d.Contents)
+		case *tree.DPGLSN:
+			return d, nil
+		}
+
 	case types.GeographyFamily:
 		switch d := d.(type) {
 		case *tree.DString:
@@ -615,7 +633,7 @@ func performCastWithoutPrecisionTruncation(
 			if t == nil {
 				return tree.DNull, nil
 			}
-			g, err := geo.ParseGeographyFromGeoJSON([]byte(*t))
+			g, err := geo.ParseGeographyFromGeoJSON(encoding.UnsafeConvertStringToBytes(*t))
 			if err != nil {
 				return nil, err
 			}
@@ -663,7 +681,7 @@ func performCastWithoutPrecisionTruncation(
 			if t == nil {
 				return tree.DNull, nil
 			}
-			g, err := geo.ParseGeometryFromGeoJSON([]byte(*t))
+			g, err := geo.ParseGeometryFromGeoJSON(encoding.UnsafeConvertStringToBytes(*t))
 			if err != nil {
 				return nil, err
 			}
@@ -900,7 +918,7 @@ func performCastWithoutPrecisionTruncation(
 				ecast := tree.DNull
 				if e != tree.DNull {
 					var err error
-					ecast, err = PerformCast(ctx, evalCtx, e, t.ArrayContents())
+					ecast, err = performCast(ctx, evalCtx, e, t.ArrayContents(), truncateWidth)
 					if err != nil {
 						return nil, err
 					}

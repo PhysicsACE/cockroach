@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/obsservice/obslib"
 	"github.com/cockroachdb/cockroach/pkg/obsservice/obspb"
 	otel_collector_pb "github.com/cockroachdb/cockroach/pkg/obsservice/obspb/opentelemetry-proto/collector/logs/v1"
 	otel_pb "github.com/cockroachdb/cockroach/pkg/obsservice/obspb/opentelemetry-proto/common/v1"
@@ -94,6 +95,10 @@ type EventExporterTestingKnobs struct {
 	// FlushTriggerByteSize, if set, overrides the default trigger value for the
 	// EventExporter.
 	FlushTriggerByteSize uint64
+	// TestConsumer, if set, sets the consumer to be used by the embedded ingest
+	// component used. This allows us to capture consumed events when running
+	// in embedded mode, so we can make assertions against them in tests.
+	TestConsumer obslib.EventConsumer
 }
 
 var _ base.ModuleTestingKnobs = &EventExporterTestingKnobs{}
@@ -312,27 +317,31 @@ func (s *EventsExporter) Start(ctx context.Context, stopper *stop.Stopper) error
 					{Resource: &s.resource},
 				},
 			}
-			s.buf.mu.Lock()
-			// Iterate through the different types of events.
-			req.ResourceLogs[0].ScopeLogs = make([]otel_logs_pb.ScopeLogs, 0, len(s.buf.mu.events))
-			for _, buf := range s.buf.mu.events {
-				events, sizeBytes := buf.moveContents()
-				if len(events) == 0 {
-					continue
+			func() {
+				s.buf.mu.Lock()
+				defer s.buf.mu.Unlock()
+				// Iterate through the different types of events.
+				req.ResourceLogs[0].ScopeLogs = make([]otel_logs_pb.ScopeLogs, 0, len(s.buf.mu.events))
+				for _, buf := range s.buf.mu.events {
+					events, sizeBytes := buf.moveContents()
+					if len(events) == 0 {
+						continue
+					}
+					totalEvents += len(events)
+					s.buf.mu.sizeBytes -= sizeBytes
+					msgSize += sizeBytes
+					req.ResourceLogs[0].ScopeLogs = append(req.ResourceLogs[0].ScopeLogs,
+						otel_logs_pb.ScopeLogs{Scope: &buf.instrumentationScope, LogRecords: events})
 				}
-				totalEvents += len(events)
-				s.buf.mu.sizeBytes -= sizeBytes
-				msgSize += sizeBytes
-				req.ResourceLogs[0].ScopeLogs = append(req.ResourceLogs[0].ScopeLogs,
-					otel_logs_pb.ScopeLogs{Scope: &buf.instrumentationScope, LogRecords: events})
-			}
-			s.buf.mu.Unlock()
+			}()
 
 			if len(req.ResourceLogs[0].ScopeLogs) > 0 {
 				_, err := s.otelClient.Export(ctx, req, grpc.WaitForReady(true))
-				s.buf.mu.Lock()
-				s.buf.mu.memAccount.Shrink(ctx, int64(msgSize))
-				s.buf.mu.Unlock()
+				func() {
+					s.buf.mu.Lock()
+					defer s.buf.mu.Unlock()
+					s.buf.mu.memAccount.Shrink(ctx, int64(msgSize))
+				}()
 				if err != nil {
 					log.Warningf(ctx, "failed to export events: %s", err)
 				} else {

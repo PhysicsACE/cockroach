@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -7,6 +6,7 @@ go_library(
         "column.go",
         "comment.go",
         "constraint.go",
+        "create.go",
         "dependencies.go",
         "drop.go",
         "function.go",
@@ -14,8 +14,10 @@ go_library(
         "index.go",
         "privileges.go",
         "references.go",
+        "schema.go",
         "schema_change_job.go",
         "scmutationexec.go",
+        "sequence.go",
         "stats.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/scmutationexec",
@@ -49,5 +51,3 @@ go_library(
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -40,7 +39,10 @@ import (
 // the version setting. The caller is responsible for decoding the
 // value to transform it to a user-facing string.
 func (p *planner) getCurrentEncodedVersionSettingValue(
-	ctx context.Context, s *settings.VersionSetting, name string,
+	ctx context.Context,
+	s *settings.VersionSetting,
+	key settings.InternalKey,
+	name settings.SettingName,
 ) (string, error) {
 	st := p.ExecCfg().Settings
 	var res string
@@ -51,7 +53,7 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 	// the same time guaranteeing that a node reporting a certain version has
 	// also processed the corresponding version bump (which is important as only
 	// then does the node update its persisted state; see #22796).
-	if err := contextutil.RunWithTimeout(ctx, fmt.Sprintf("show cluster setting %s", name), 2*time.Minute,
+	if err := timeutil.RunWithTimeout(ctx, fmt.Sprintf("show cluster setting %s", name), 2*time.Minute,
 		func(ctx context.Context) error {
 			tBegin := timeutil.Now()
 
@@ -62,7 +64,7 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 						ctx, "read-setting",
 						txn.KV(),
 						sessiondata.RootUserSessionDataOverride,
-						"SELECT value FROM system.settings WHERE name = $1", name,
+						"SELECT value FROM system.settings WHERE name = $1", key,
 					)
 					if err != nil {
 						return err
@@ -94,14 +96,14 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 					}
 
 					localRawVal := []byte(s.Get(&st.SV))
-					if !bytes.Equal(localRawVal, kvRawVal) {
+					if err := checkClusterSettingValuesAreEquivalent(
+						localRawVal, kvRawVal,
+					); err != nil {
 						// NB: errors.Wrapf(nil, ...) returns nil.
 						// nolint:errwrap
-						return errors.Errorf(
-							"value differs between local setting (%v) and KV (%v); try again later (%v after %s)",
-							localRawVal, kvRawVal, ctx.Err(), timeutil.Since(tBegin))
+						return errors.WithHintf(err, "try again later (%v after %v)",
+							ctx.Err(), timeutil.Since(tBegin))
 					}
-
 					res = string(kvRawVal)
 					return nil
 				})
@@ -113,24 +115,69 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 	return res, nil
 }
 
+// checkClusterSettingValuesAreEquivalent returns an error if the cluster
+// setting values are not equivalent. Equivalent cluster setting values
+// are either the byte-for-byte identical, or the local value is the successor
+// to the kv value and the local value is a fence version.
+//
+// The in-memory version gets pushed to the fence but the fence is not persisted,
+// so, while migrations are ongoing, we won't see these values match. In practice
+// this is a problem these days because the migrations take a long time.
+func checkClusterSettingValuesAreEquivalent(localRawVal, kvRawVal []byte) error {
+	if bytes.Equal(localRawVal, kvRawVal) {
+		return nil
+	}
+	type cv = clusterversion.ClusterVersion
+	maybeDecodeVersion := func(data []byte) (cv, any, bool) {
+		if len(data) == 0 {
+			return cv{}, data, false
+		}
+		var v cv
+		if err := protoutil.Unmarshal(data, &v); err != nil {
+			return cv{}, data, false
+		}
+		return v, v, true
+	}
+	decodedLocal, localVal, localOk := maybeDecodeVersion(localRawVal)
+	decodedKV, kvVal, kvOk := maybeDecodeVersion(kvRawVal)
+	if localOk && kvOk && decodedLocal.Internal%2 == 1 /* isFence */ {
+		predecessor := decodedLocal
+		predecessor.Internal--
+		if predecessor.Equal(decodedKV) {
+			return nil
+		}
+	}
+	return errors.Errorf(
+		"value differs between local setting (%v) and KV (%v)",
+		localVal, kvVal)
+}
+
+func settingNameDeprecationNotice(oldName, newName settings.SettingName) pgnotice.Notice {
+	return pgnotice.Newf("the name %q is deprecated; use %q instead", oldName, newName)
+}
+
 func (p *planner) ShowClusterSetting(
 	ctx context.Context, n *tree.ShowClusterSetting,
 ) (planNode, error) {
-	name := strings.ToLower(n.Name)
-	setting, ok := settings.LookupForLocalAccess(name, p.ExecCfg().Codec.ForSystemTenant())
+	name := settings.SettingName(strings.ToLower(n.Name))
+	setting, ok, nameStatus := settings.LookupForLocalAccess(name, p.ExecCfg().Codec.ForSystemTenant())
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
+	}
+	if nameStatus != settings.NameActive {
+		p.BufferClientNotice(ctx, settingNameDeprecationNotice(name, setting.Name()))
+		name = setting.Name()
 	}
 
 	if err := checkPrivilegesForSetting(ctx, p, name, "show"); err != nil {
 		return nil, err
 	}
 
-	if strings.HasPrefix(n.Name, "sql.defaults") {
+	if strings.HasPrefix(string(name), "sql.defaults") {
 		p.BufferClientNotice(
 			ctx,
 			errors.WithHintf(
-				pgnotice.Newf("using global default %s is not recommended", n.Name),
+				pgnotice.Newf("using global default %s is not recommended", name),
 				"use the `ALTER ROLE ... SET` syntax to control session variable defaults at a finer-grained level. See: %s",
 				docs.URL("alter-role.html#set-default-session-variable-values-for-a-role"),
 			),
@@ -145,7 +192,7 @@ func (p *planner) ShowClusterSetting(
 	return planShowClusterSetting(setting, name, columns,
 		func(ctx context.Context, p *planner) (bool, string, error) {
 			if verSetting, ok := setting.(*settings.VersionSetting); ok {
-				encoded, err := p.getCurrentEncodedVersionSettingValue(ctx, verSetting, name)
+				encoded, err := p.getCurrentEncodedVersionSettingValue(ctx, verSetting, setting.InternalKey(), name)
 				return true, encoded, err
 			}
 			return true, setting.Encoded(&p.ExecCfg().Settings.SV), nil
@@ -154,7 +201,7 @@ func (p *planner) ShowClusterSetting(
 }
 
 func getShowClusterSettingPlanColumns(
-	val settings.NonMaskedSetting, name string,
+	val settings.NonMaskedSetting, name settings.SettingName,
 ) (colinfo.ResultColumns, error) {
 	var dType *types.T
 	switch val.(type) {
@@ -173,17 +220,17 @@ func getShowClusterSettingPlanColumns(
 	default:
 		return nil, errors.Errorf("unknown setting type for %s: %s", name, val.Typ())
 	}
-	return colinfo.ResultColumns{{Name: name, Typ: dType}}, nil
+	return colinfo.ResultColumns{{Name: string(name), Typ: dType}}, nil
 }
 
 func planShowClusterSetting(
 	val settings.NonMaskedSetting,
-	name string,
+	name settings.SettingName,
 	columns colinfo.ResultColumns,
 	getEncodedValue func(ctx context.Context, p *planner) (bool, string, error),
 ) (planNode, error) {
 	return &delayedNode{
-		name:    "SHOW CLUSTER SETTING " + name,
+		name:    "SHOW CLUSTER SETTING " + string(name),
 		columns: columns,
 		constructor: func(ctx context.Context, p *planner) (planNode, error) {
 			isNotNull, encoded, err := getEncodedValue(ctx, p)

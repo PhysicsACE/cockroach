@@ -14,9 +14,7 @@ import (
 	"context"
 	"math/rand"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -257,9 +256,7 @@ func (p *planner) truncateTable(ctx context.Context, id descpb.ID, jobDesc strin
 	}
 	record := CreateGCJobRecord(
 		jobDesc, p.User(), details,
-		!p.execCfg.Settings.Version.IsActive(
-			ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob,
-		),
+		!storage.CanUseMVCCRangeTombstones(ctx, p.execCfg.Settings),
 	)
 	if _, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
 		ctx, record, p.ExecCfg().JobRegistry.MakeJobID(), p.InternalSQLTxn(),
@@ -293,7 +290,7 @@ func (p *planner) truncateTable(ctx context.Context, id descpb.ID, jobDesc strin
 		NewIndexes:        newIndexIDs[1:],
 	}
 	if err := maybeUpdateZoneConfigsForPKChange(
-		ctx, p.InternalSQLTxn(), p.ExecCfg(), p.ExtendedEvalContext().Tracing.KVTracingEnabled(), p.Descriptors(), tableDesc, swapInfo,
+		ctx, p.InternalSQLTxn(), p.ExecCfg(), p.ExtendedEvalContext().Tracing.KVTracingEnabled(), tableDesc, swapInfo,
 	); err != nil {
 		return err
 	}
@@ -383,6 +380,11 @@ func checkTableForDisallowedMutationsWithTruncate(desc *tabledesc.Mutable) error
 				"TRUNCATE concurrent with ongoing schema change",
 				"cannot perform TRUNCATE on %q which has an ongoing column type "+
 					"change", desc.GetName())
+		} else if m.AsModifyRowLevelTTL() != nil {
+			return unimplemented.Newf(
+				"TRUNCATE concurrent with ongoing schema change",
+				"cannot perform TRUNCATE on %q which has an ongoing row level TTL "+
+					"change", desc.GetName())
 		} else {
 			return errors.AssertionFailedf("cannot perform TRUNCATE due to "+
 				"concurrent unknown mutation of type %T for mutation %d in %v", m, i, desc)
@@ -414,7 +416,7 @@ func (p *planner) copySplitPointsToNewIndexes(
 
 	// Re-split the new set of indexes along the same split points as the old
 	// indexes.
-	var b kv.Batch
+	b := p.Txn().NewBatch()
 	tablePrefix := execCfg.Codec.TablePrefix(uint32(tableID))
 
 	// Fetch all of the range descriptors for this index.
@@ -509,12 +511,12 @@ func (p *planner) copySplitPointsToNewIndexes(
 		})
 	}
 
-	if err = p.txn.DB().Run(ctx, &b); err != nil {
+	if err = p.txn.DB().Run(ctx, b); err != nil {
 		return err
 	}
 
 	// Now scatter the ranges, after we've finished splitting them.
-	b = kv.Batch{}
+	b = p.Txn().NewBatch()
 	b.AddRawRequest(&kvpb.AdminScatterRequest{
 		// Scatter all of the data between the start key of the first new index, and
 		// the PrefixEnd of the last new index.
@@ -525,7 +527,7 @@ func (p *planner) copySplitPointsToNewIndexes(
 		RandomizeLeases: true,
 	})
 
-	return p.txn.DB().Run(ctx, &b)
+	return p.txn.DB().Run(ctx, b)
 }
 
 func (p *planner) reassignIndexComments(

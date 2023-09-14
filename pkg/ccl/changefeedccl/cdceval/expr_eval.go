@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -40,7 +40,7 @@ type Evaluator struct {
 	// Execution context.
 	execCfg     *sql.ExecutorConfig
 	user        username.SQLUsername
-	sessionData sessiondatapb.SessionData
+	sessionData *sessiondata.SessionData
 	withDiff    bool
 	familyEval  map[descpb.FamilyID]*familyEvaluator
 }
@@ -64,7 +64,7 @@ type familyEvaluator struct {
 	// Execution context.
 	execCfg     *sql.ExecutorConfig
 	user        username.SQLUsername
-	sessionData sessiondatapb.SessionData
+	sessionData *sessiondata.SessionData
 
 	// rowCh receives projection datums.
 	rowCh      chan tree.Datums
@@ -80,7 +80,7 @@ func NewEvaluator(
 	sc *tree.SelectClause,
 	execCfg *sql.ExecutorConfig,
 	user username.SQLUsername,
-	sd sessiondatapb.SessionData,
+	sd *sessiondata.SessionData,
 	statementTS hlc.Timestamp,
 	withDiff bool,
 ) *Evaluator {
@@ -101,7 +101,7 @@ func newFamilyEvaluator(
 	targetFamilyID descpb.FamilyID,
 	execCfg *sql.ExecutorConfig,
 	user username.SQLUsername,
-	sd sessiondatapb.SessionData,
+	sd *sessiondata.SessionData,
 	statementTS hlc.Timestamp,
 	withDiff bool,
 ) *familyEvaluator {
@@ -196,10 +196,14 @@ func (e *familyEvaluator) eval(
 
 	encDatums := updatedRow.EncDatums()
 	if havePrev {
-		if err := e.copyPrevRow(prevRow); err != nil {
-			return cdcevent.Row{}, err
+		if prevRow.IsDeleted() {
+			encDatums = append(encDatums, rowenc.EncDatum{Datum: tree.DNull})
+		} else {
+			if err := e.copyPrevRow(prevRow); err != nil {
+				return cdcevent.Row{}, err
+			}
+			encDatums = append(encDatums, rowenc.EncDatum{Datum: e.prevRowTuple})
 		}
-		encDatums = append(encDatums, rowenc.EncDatum{Datum: e.prevRowTuple})
 	}
 
 	// Push data into DistSQL.
@@ -465,10 +469,10 @@ func (e *familyEvaluator) setupContextForRow(
 	} else {
 		// Insert or update.
 		if e.rowEvalCtx.withDiff {
-			if prevRow.IsInitialized() {
-				e.rowEvalCtx.op = eventTypeUpdate
-			} else {
+			if prevRow.IsDeleted() || !prevRow.IsInitialized() {
 				e.rowEvalCtx.op = eventTypeInsert
+			} else {
+				e.rowEvalCtx.op = eventTypeUpdate
 			}
 		} else {
 			// Without diff option we can't tell insert from update; so, use upsert.

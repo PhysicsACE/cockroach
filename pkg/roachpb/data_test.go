@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
@@ -437,12 +438,47 @@ func TestSetGetChecked(t *testing.T) {
 
 func TestTransactionBumpEpoch(t *testing.T) {
 	origNow := makeTS(10, 1)
-	txn := MakeTransaction("test", Key("a"), 1, origNow, 0, 99)
+	txn := MakeTransaction("test", Key("a"), isolation.Serializable, 1, origNow, 0, 99, 0)
 	// Advance the txn timestamp.
 	txn.WriteTimestamp = txn.WriteTimestamp.Add(10, 2)
 	txn.BumpEpoch()
 	if a, e := txn.Epoch, enginepb.TxnEpoch(1); a != e {
 		t.Errorf("expected epoch %d; got %d", e, a)
+	}
+}
+
+func TestTransactionBumpReadTimestamp(t *testing.T) {
+	ts9 := makeTS(9, 1)
+	ts10 := makeTS(10, 1)
+	ts11 := makeTS(11, 1)
+	ts12 := makeTS(12, 1)
+	ts13 := makeTS(13, 1)
+	origReadTs := ts10
+	origWriteTs := ts12
+
+	testCases := []struct {
+		bumpTs     hlc.Timestamp
+		expReadTs  hlc.Timestamp
+		expWriteTs hlc.Timestamp
+	}{
+		{ts9, origReadTs, origWriteTs},
+		{ts10, origReadTs, origWriteTs},
+		{ts11, ts11, origWriteTs},
+		{ts12, ts12, origWriteTs},
+		{ts13, ts13, ts13},
+	}
+	for _, c := range testCases {
+		t.Run(c.bumpTs.String(), func(t *testing.T) {
+			var txn Transaction
+			txn.ReadTimestamp = origReadTs
+			txn.WriteTimestamp = origWriteTs
+			txn.WriteTooOld = true
+
+			txn.BumpReadTimestamp(c.bumpTs)
+			require.Equal(t, c.expReadTs, txn.ReadTimestamp)
+			require.Equal(t, c.expWriteTs, txn.WriteTimestamp)
+			require.False(t, txn.WriteTooOld)
+		})
 	}
 }
 
@@ -504,8 +540,9 @@ func TestFastPathObservedTimestamp(t *testing.T) {
 
 var nonZeroTxn = Transaction{
 	TxnMeta: enginepb.TxnMeta{
-		Key:               Key("foo"),
 		ID:                uuid.MakeV4(),
+		Key:               Key("foo"),
+		IsoLevel:          isolation.Snapshot,
 		Epoch:             2,
 		WriteTimestamp:    makeSynTS(20, 21),
 		MinTimestamp:      makeSynTS(10, 11),
@@ -526,11 +563,12 @@ var nonZeroTxn = Transaction{
 			Synthetic: true, // normally not set, but needed for zerofields.NoZeroField
 		},
 	}},
-	WriteTooOld:          true,
-	LockSpans:            []Span{{Key: []byte("a"), EndKey: []byte("b")}},
-	InFlightWrites:       []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
-	CommitTimestampFixed: true,
-	IgnoredSeqNums:       []enginepb.IgnoredSeqNumRange{{Start: 888, End: 999}},
+	WriteTooOld:        true,
+	LockSpans:          []Span{{Key: []byte("a"), EndKey: []byte("b")}},
+	InFlightWrites:     []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
+	ReadTimestampFixed: true,
+	IgnoredSeqNums:     []enginepb.IgnoredSeqNumRange{{Start: 888, End: 999}},
+	AdmissionPriority:  1,
 }
 
 func TestTransactionUpdate(t *testing.T) {
@@ -620,7 +658,7 @@ func TestTransactionUpdate(t *testing.T) {
 	expTxn5.InFlightWrites = nil
 	expTxn5.IgnoredSeqNums = nil
 	expTxn5.WriteTooOld = false
-	expTxn5.CommitTimestampFixed = false
+	expTxn5.ReadTimestampFixed = false
 	require.Equal(t, expTxn5, txn5)
 
 	// Updating a different transaction fatals.
@@ -696,21 +734,35 @@ func TestTransactionUpdateStaging(t *testing.T) {
 
 // TestTransactionUpdateAbortedOldEpoch tests that Transaction.Update propagates
 // an ABORTED status even when that status comes from a proto with an old epoch.
-// Once a transaction is ABORTED, it will stay aborted, even if its coordinator
-// doesn't know this at the time that it increments its epoch and retries.
+// It also tests that Transaction.Update retains an ABORTED status even when it
+// is updated with a new epoch with a PENDING status. Either way, once a
+// transaction is ABORTED, it will stay aborted, even if its coordinator doesn't
+// know this at the time that it increments its epoch and retries.
 func TestTransactionUpdateAbortedOldEpoch(t *testing.T) {
-	txn := nonZeroTxn
-	txn.Status = ABORTED
+	txnAbort := nonZeroTxn
+	txnAbort.Status = ABORTED
 
-	txnRestart := txn
+	txnRestart := nonZeroTxn
 	txnRestart.Epoch++
 	txnRestart.Status = PENDING
-	txnRestart.Update(&txn)
 
-	expTxn := txn
-	expTxn.Epoch++
-	expTxn.Status = ABORTED
-	require.Equal(t, expTxn, txnRestart)
+	testCases := []struct {
+		name      string
+		recv, arg Transaction
+	}{
+		{name: "aborted receiver", recv: txnAbort, arg: txnRestart},
+		{name: "aborted argument", recv: txnRestart, arg: txnAbort},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.recv.Update(&tc.arg)
+
+			expTxn := nonZeroTxn
+			expTxn.Epoch++
+			expTxn.Status = ABORTED
+			require.Equal(t, expTxn, tc.recv)
+		})
+	}
 }
 
 func TestTransactionClone(t *testing.T) {
@@ -751,7 +803,7 @@ func TestTransactionRestart(t *testing.T) {
 	expTxn.WriteTimestamp = makeTS(25, 1)
 	expTxn.ReadTimestamp = makeTS(25, 1)
 	expTxn.WriteTooOld = false
-	expTxn.CommitTimestampFixed = false
+	expTxn.ReadTimestampFixed = false
 	expTxn.LockSpans = nil
 	expTxn.InFlightWrites = nil
 	expTxn.IgnoredSeqNums = nil
@@ -760,7 +812,7 @@ func TestTransactionRestart(t *testing.T) {
 
 func TestTransactionRefresh(t *testing.T) {
 	txn := nonZeroTxn
-	txn.Refresh(makeTS(25, 1))
+	txn.BumpReadTimestamp(makeTS(25, 1))
 
 	expTxn := nonZeroTxn
 	expTxn.WriteTimestamp = makeTS(25, 1)
@@ -878,7 +930,7 @@ func TestMakePriority(t *testing.T) {
 	}
 
 	// Generate values for all priorities.
-	const trials = 100000
+	const trials = 750000
 	values := make([][trials]enginepb.TxnPriority, len(userPs))
 	for i, userPri := range userPs {
 		for tr := 0; tr < trials; tr++ {
@@ -2077,7 +2129,7 @@ func TestTxnLocksAsLockUpdates(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ts := hlc.Timestamp{WallTime: 1}
-	txn := MakeTransaction("hello", Key("k"), 0, ts, 0, 99)
+	txn := MakeTransaction("hello", Key("k"), isolation.Serializable, 0, ts, 0, 99, 0)
 
 	txn.Status = COMMITTED
 	txn.IgnoredSeqNums = []enginepb.IgnoredSeqNumRange{{Start: 0, End: 0}}

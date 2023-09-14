@@ -56,16 +56,16 @@ type Reader interface {
 	// as ordering, through IteratorOptions argument. StatementVisitor can return
 	// error, if an error is returned after the execution of the visitor, the
 	// iteration is aborted.
-	IterateStatementStats(context.Context, *IteratorOptions, StatementVisitor) error
+	IterateStatementStats(context.Context, IteratorOptions, StatementVisitor) error
 
 	// IterateTransactionStats iterates through all the collected transaction
 	// statistics by using TransactionVisitor. It behaves similarly to
 	// IterateStatementStats.
-	IterateTransactionStats(context.Context, *IteratorOptions, TransactionVisitor) error
+	IterateTransactionStats(context.Context, IteratorOptions, TransactionVisitor) error
 
 	// IterateAggregatedTransactionStats iterates through all the collected app-level
 	// transactions statistics. It behaves similarly to IterateStatementStats.
-	IterateAggregatedTransactionStats(context.Context, *IteratorOptions, AggregatedTransactionVisitor) error
+	IterateAggregatedTransactionStats(context.Context, IteratorOptions, AggregatedTransactionVisitor) error
 }
 
 // ApplicationStats is an interface to read from or write to the statistics
@@ -199,17 +199,16 @@ type RecordedStmtStats struct {
 	AutoRetryCount       int
 	AutoRetryReason      error
 	RowsAffected         int
-	IdleLatency          float64
-	ParseLatency         float64
-	PlanLatency          float64
-	RunLatency           float64
-	ServiceLatency       float64
-	OverheadLatency      float64
+	IdleLatencySec       float64
+	ParseLatencySec      float64
+	PlanLatencySec       float64
+	RunLatencySec        float64
+	ServiceLatencySec    float64
+	OverheadLatencySec   float64
 	BytesRead            int64
 	RowsRead             int64
 	RowsWritten          int64
 	Nodes                []int64
-	Regions              []string
 	StatementType        tree.StatementType
 	Plan                 *appstatspb.ExplainTreePlanNode
 	PlanGist             string

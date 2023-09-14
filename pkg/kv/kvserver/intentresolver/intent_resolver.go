@@ -13,6 +13,8 @@ package intentresolver
 import (
 	"bytes"
 	"context"
+	"math"
+	"runtime/debug"
 	"sort"
 	"time"
 
@@ -25,13 +27,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
@@ -121,6 +125,7 @@ type Config struct {
 	Clock                *hlc.Clock
 	DB                   *kv.DB
 	Stopper              *stop.Stopper
+	Settings             *cluster.Settings
 	AmbientCtx           log.AmbientContext
 	TestingKnobs         kvserverbase.IntentResolverTestingKnobs
 	RangeDescriptorCache RangeCache
@@ -147,6 +152,7 @@ type IntentResolver struct {
 	db           *kv.DB
 	stopper      *stop.Stopper
 	testingKnobs kvserverbase.IntentResolverTestingKnobs
+	settings     *cluster.Settings
 	ambientCtx   log.AmbientContext
 	sem          *quotapool.IntPool // semaphore to limit async goroutines
 
@@ -166,7 +172,8 @@ type IntentResolver struct {
 		// called directly after EndTxn evaluation or during GC of txn spans.
 		inFlightTxnCleanups map[uuid.UUID]struct{}
 	}
-	every log.EveryN
+	every                       log.EveryN
+	everyAdmissionHeaderMissing log.EveryN
 }
 
 func setConfigDefaults(c *Config) {
@@ -205,14 +212,16 @@ func (nrdc nopRangeDescriptorCache) Lookup(
 func New(c Config) *IntentResolver {
 	setConfigDefaults(&c)
 	ir := &IntentResolver{
-		clock:        c.Clock,
-		db:           c.DB,
-		stopper:      c.Stopper,
-		sem:          quotapool.NewIntPool("intent resolver", uint64(c.TaskLimit)),
-		every:        log.Every(time.Minute),
-		Metrics:      makeMetrics(),
-		rdc:          c.RangeDescriptorCache,
-		testingKnobs: c.TestingKnobs,
+		clock:                       c.Clock,
+		db:                          c.DB,
+		stopper:                     c.Stopper,
+		sem:                         quotapool.NewIntPool("intent resolver", uint64(c.TaskLimit)),
+		every:                       log.Every(time.Minute),
+		Metrics:                     makeMetrics(),
+		rdc:                         c.RangeDescriptorCache,
+		testingKnobs:                c.TestingKnobs,
+		settings:                    c.Settings,
+		everyAdmissionHeaderMissing: log.Every(5 * time.Minute),
 	}
 	c.Stopper.AddCloser(ir.sem.Closer("stopper"))
 	ir.mu.inFlightPushes = map[uuid.UUID]int{}
@@ -221,22 +230,24 @@ func New(c Config) *IntentResolver {
 	if c.TestingKnobs.MaxIntentResolutionSendBatchTimeout != 0 {
 		intentResolutionSendBatchTimeout = c.TestingKnobs.MaxIntentResolutionSendBatchTimeout
 	}
-	inFlightBackpressureLimit := requestbatcher.DefaultInFlightBackpressureLimit
+	inFlightGCBackpressureLimit := requestbatcher.DefaultInFlightBackpressureLimit
 	if c.TestingKnobs.InFlightBackpressureLimit != 0 {
-		inFlightBackpressureLimit = c.TestingKnobs.InFlightBackpressureLimit
+		inFlightGCBackpressureLimit = c.TestingKnobs.InFlightBackpressureLimit
 	}
 	gcBatchSize := gcBatchSize
 	if c.TestingKnobs.MaxIntentResolutionBatchSize > 0 {
 		gcBatchSize = c.TestingKnobs.MaxGCBatchSize
 	}
 	ir.gcBatcher = requestbatcher.New(requestbatcher.Config{
-		AmbientCtx:                c.AmbientCtx,
-		Name:                      "intent_resolver_gc_batcher",
-		MaxMsgsPerBatch:           gcBatchSize,
-		MaxWait:                   c.MaxGCBatchWait,
-		MaxIdle:                   c.MaxGCBatchIdle,
-		MaxTimeout:                intentResolutionSendBatchTimeout,
-		InFlightBackpressureLimit: inFlightBackpressureLimit,
+		AmbientCtx:      c.AmbientCtx,
+		Name:            "intent_resolver_gc_batcher",
+		MaxMsgsPerBatch: gcBatchSize,
+		MaxWait:         c.MaxGCBatchWait,
+		MaxIdle:         c.MaxGCBatchIdle,
+		MaxTimeout:      intentResolutionSendBatchTimeout,
+		// NB: async GC work is not limited by ir.sem, so we do need an in-flight
+		// backpressure limit.
+		InFlightBackpressureLimit: func() int { return inFlightGCBackpressureLimit },
 		Stopper:                   c.Stopper,
 		Sender:                    c.DB.NonTransactionalSender(),
 	})
@@ -246,6 +257,10 @@ func New(c Config) *IntentResolver {
 		intentResolutionBatchSize = c.TestingKnobs.MaxIntentResolutionBatchSize
 		intentResolutionRangeBatchSize = c.TestingKnobs.MaxIntentResolutionBatchSize
 	}
+	inFlightLimit := inFlightLimitProvider{
+		settings:                         c.Settings,
+		testingInFlightBackpressureLimit: c.TestingKnobs.InFlightBackpressureLimit,
+	}
 	ir.irBatcher = requestbatcher.New(requestbatcher.Config{
 		AmbientCtx:                c.AmbientCtx,
 		Name:                      "intent_resolver_ir_batcher",
@@ -254,7 +269,7 @@ func New(c Config) *IntentResolver {
 		MaxWait:                   c.MaxIntentResolutionBatchWait,
 		MaxIdle:                   c.MaxIntentResolutionBatchIdle,
 		MaxTimeout:                intentResolutionSendBatchTimeout,
-		InFlightBackpressureLimit: inFlightBackpressureLimit,
+		InFlightBackpressureLimit: inFlightLimit.limit,
 		Stopper:                   c.Stopper,
 		Sender:                    c.DB.NonTransactionalSender(),
 	})
@@ -267,7 +282,7 @@ func New(c Config) *IntentResolver {
 		MaxWait:                   c.MaxIntentResolutionBatchWait,
 		MaxIdle:                   c.MaxIntentResolutionBatchIdle,
 		MaxTimeout:                intentResolutionSendBatchTimeout,
-		InFlightBackpressureLimit: inFlightBackpressureLimit,
+		InFlightBackpressureLimit: inFlightLimit.limit,
 		Stopper:                   c.Stopper,
 		Sender:                    c.DB.NonTransactionalSender(),
 	})
@@ -408,6 +423,7 @@ func (ir *IntentResolver) MaybePushTransactions(
 	b := &kv.Batch{}
 	b.Header.Timestamp = ir.clock.Now()
 	b.Header.Timestamp.Forward(pushTo)
+	b.Header.WaitPolicy = h.WaitPolicy
 	for _, pushTxn := range pushTxns {
 		b.AddRawRequest(&kvpb.PushTxnRequest{
 			RequestHeader: kvpb.RequestHeader{
@@ -486,16 +502,19 @@ func (ir *IntentResolver) runAsyncTask(
 // expired yet (i.e. they are not at least 5s old)? Should we filter
 // those out? If we don't, will this be too expensive for SKIP LOCKED?
 func (ir *IntentResolver) CleanupIntentsAsync(
-	ctx context.Context, intents []roachpb.Intent, allowSyncProcessing bool,
+	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
+	intents []roachpb.Intent,
+	allowSyncProcessing bool,
 ) error {
 	if len(intents) == 0 {
 		return nil
 	}
 	now := ir.clock.Now()
 	return ir.runAsyncTask(ctx, allowSyncProcessing, func(ctx context.Context) {
-		err := contextutil.RunWithTimeout(ctx, "async intent resolution",
+		err := timeutil.RunWithTimeout(ctx, "async intent resolution",
 			asyncIntentResolutionTimeout, func(ctx context.Context) error {
-				_, err := ir.CleanupIntents(ctx, intents, now, kvpb.PUSH_TOUCH)
+				_, err := ir.CleanupIntents(ctx, admissionHeader, intents, now, kvpb.PUSH_TOUCH)
 				return err
 			})
 		if err != nil && ir.every.ShouldLog() {
@@ -511,7 +530,11 @@ func (ir *IntentResolver) CleanupIntentsAsync(
 // subset of the intents may have been resolved, but zero will be
 // returned.
 func (ir *IntentResolver) CleanupIntents(
-	ctx context.Context, intents []roachpb.Intent, now hlc.Timestamp, pushType kvpb.PushTxnType,
+	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
+	intents []roachpb.Intent,
+	now hlc.Timestamp,
+	pushType kvpb.PushTxnType,
 ) (int, error) {
 	h := kvpb.Header{Timestamp: now}
 
@@ -568,7 +591,7 @@ func (ir *IntentResolver) CleanupIntents(
 		//   same situation as above.
 		//
 		// Thus, we must poison.
-		opts := ResolveOptions{Poison: true}
+		opts := ResolveOptions{Poison: true, AdmissionHeader: admissionHeader}
 		if pErr := ir.ResolveIntents(ctx, resolveIntents, opts); pErr != nil {
 			return 0, errors.Wrapf(pErr.GoError(), "failed to resolve intents")
 		}
@@ -608,7 +631,9 @@ func (ir *IntentResolver) CleanupTxnIntentsAsync(
 			}
 			defer release()
 			if err := ir.cleanupFinishedTxnIntents(
-				ctx, rangeID, et.Txn, et.Poison, onComplete,
+				// The admission header is constructed using the completed
+				// transaction.
+				ctx, kv.AdmissionHeaderForLockUpdateForTxn(et.Txn), rangeID, et.Txn, et.Poison, onComplete,
 			); err != nil {
 				if ir.every.ShouldLog() {
 					log.Warningf(ctx, "failed to cleanup transaction intents: %v", err)
@@ -652,6 +677,7 @@ func (ir *IntentResolver) lockInFlightTxnCleanup(
 // It will not be called if an error is returned.
 func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
 	rangeID roachpb.RangeID,
 	txn *roachpb.Transaction,
 	now hlc.Timestamp,
@@ -723,7 +749,8 @@ func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 			// Set onComplete to nil to disable the deferred call as the call has now
 			// been delegated to the callback passed to cleanupFinishedTxnIntents.
 			onComplete = nil
-			err := ir.cleanupFinishedTxnIntents(ctx, rangeID, txn, false /* poison */, onCleanupComplete)
+			err := ir.cleanupFinishedTxnIntents(
+				ctx, admissionHeader, rangeID, txn, false /* poison */, onCleanupComplete)
 			if err != nil {
 				if ir.every.ShouldLog() {
 					log.Warningf(ctx, "failed to cleanup transaction intents: %+v", err)
@@ -787,6 +814,7 @@ func (ir *IntentResolver) gcTxnRecord(
 // which is likely to be after this call returns in the case of success.
 func (ir *IntentResolver) cleanupFinishedTxnIntents(
 	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
 	rangeID roachpb.RangeID,
 	txn *roachpb.Transaction,
 	poison bool,
@@ -800,7 +828,8 @@ func (ir *IntentResolver) cleanupFinishedTxnIntents(
 		}
 	}()
 	// Resolve intents.
-	opts := ResolveOptions{Poison: poison, MinTimestamp: txn.MinTimestamp}
+	opts := ResolveOptions{
+		Poison: poison, MinTimestamp: txn.MinTimestamp, AdmissionHeader: admissionHeader}
 	if pErr := ir.resolveIntents(ctx, (*txnLockUpdates)(txn), opts); pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "failed to resolve intents")
 	}
@@ -814,7 +843,7 @@ func (ir *IntentResolver) cleanupFinishedTxnIntents(
 		ir.ambientCtx.AnnotateCtx(context.Background()),
 		"storage.IntentResolver: cleanup txn records",
 		func(ctx context.Context) {
-			err := contextutil.RunWithTimeout(ctx, "cleanup txn record",
+			err := timeutil.RunWithTimeout(ctx, "cleanup txn record",
 				gcTxnRecordTimeout, func(ctx context.Context) error {
 					return ir.gcTxnRecord(ctx, rangeID, txn)
 				})
@@ -845,6 +874,25 @@ type ResolveOptions struct {
 	// The original transaction timestamp from the earliest txn epoch; if
 	// supplied, resolution of intent ranges can be optimized in some cases.
 	MinTimestamp hlc.Timestamp
+	// AdmissionHeader of the caller.
+	AdmissionHeader kvpb.AdmissionHeader
+	// If set, instructs the IntentResolver to send the intent resolution requests
+	// immediately, instead of adding them to a batch and waiting for that batch
+	// to fill up with other intent resolution requests. This can be used to avoid
+	// any batching-induced latency, and should be used only by foreground traffic
+	// that is willing to trade off some throughput for lower latency.
+	//
+	// In addition to disabling batching, the option will also disable key count
+	// and byte size pagination. All requests will be sent in the same batch
+	// (subject to splitting on range boundaries) and no MaxSpanRequestKeys or
+	// TargetBytes limits will be assigned to limit the number or size of intents
+	// resolved by multi-point or ranged intent resolution. Users of the flag
+	// should be conscious of this.
+	//
+	// Because of these limitations, the flag is kept internal to this package. If
+	// we want to expose the flag and use it in more cases, we will first need to
+	// support key count and byte size pagination when bypassing the batcher.
+	sendImmediately bool
 }
 
 // lookupRangeID maps a key to a RangeID for best effort batching of intent
@@ -873,45 +921,79 @@ type lockUpdates interface {
 	Index(i int) roachpb.LockUpdate
 }
 
+var _ lockUpdates = (*txnLockUpdates)(nil)
+var _ lockUpdates = (*singleLockUpdate)(nil)
+var _ lockUpdates = (*sliceLockUpdates)(nil)
+
 type txnLockUpdates roachpb.Transaction
 
-// Len returns the number of LockSpans in a txnLockUpdates,
-// as part of the lockUpdates interface implementation.
+// Len implements the lockUpdates interface.
 func (t *txnLockUpdates) Len() int {
 	return len(t.LockSpans)
 }
 
-// Index produces a LockUpdate from the respective LockSpan, when called on
-// txnLockUpdates. txnLockUpdates implements the lockUpdates interface.
+// Index implements the lockUpdates interface.
 func (t *txnLockUpdates) Index(i int) roachpb.LockUpdate {
 	return roachpb.MakeLockUpdate((*roachpb.Transaction)(t), t.LockSpans[i])
 }
 
+type singleLockUpdate roachpb.LockUpdate
+
+// Len implements the lockUpdates interface.
+func (s *singleLockUpdate) Len() int {
+	return 1
+}
+
+// Index implements the lockUpdates interface.
+func (s *singleLockUpdate) Index(i int) roachpb.LockUpdate {
+	if i != 0 {
+		panic("index out of bounds")
+	}
+	return roachpb.LockUpdate(*s)
+}
+
 type sliceLockUpdates []roachpb.LockUpdate
 
-// Len returns the number of LockUpdates in sliceLockUpdates,
-// as part of the lockUpdates interface implementation.
+// Len implements the lockUpdates interface.
 func (s *sliceLockUpdates) Len() int {
 	return len(*s)
 }
 
-// Index trivially produces a LockUpdate when called on sliceLockUpdates.
-// sliceLockUpdates implements the lockUpdates interface.
+// Index implements the lockUpdates interface.
 func (s *sliceLockUpdates) Index(i int) roachpb.LockUpdate {
 	return (*s)[i]
 }
 
-// ResolveIntent synchronously resolves an intent according to opts.
+// ResolveIntent synchronously resolves an intent according to opts. The method
+// is expected to be run on behalf of a user request, as opposed to a background
+// task.
 func (ir *IntentResolver) ResolveIntent(
 	ctx context.Context, intent roachpb.LockUpdate, opts ResolveOptions,
 ) *kvpb.Error {
-	return ir.ResolveIntents(ctx, []roachpb.LockUpdate{intent}, opts)
+	if len(intent.EndKey) == 0 {
+		// If the caller wants to resolve a single point intent, let it send the
+		// request immediately. This is a performance optimization to resolve
+		// conflicting intents immediately for latency-sensitive requests.
+		//
+		// We don't set this flag when resolving a range of keys or when resolving
+		// multiple point intents (in ResolveIntents) due to the limitations around
+		// pagination described in the comment on ResolveOptions.sendImmediately.
+		opts.sendImmediately = true
+	}
+	return ir.resolveIntents(ctx, (*singleLockUpdate)(&intent), opts)
 }
 
-// ResolveIntents synchronously resolves intents according to opts.
+// ResolveIntents synchronously resolves intents according to opts. The method
+// is expected to be run on behalf of a user request, as opposed to a background
+// task.
 func (ir *IntentResolver) ResolveIntents(
 	ctx context.Context, intents []roachpb.LockUpdate, opts ResolveOptions,
 ) (pErr *kvpb.Error) {
+	// TODO(nvanbenschoten): unlike IntentResolver.ResolveIntent, we don't set
+	// sendImmediately on the ResolveOptions here. This is because we don't
+	// support pagination when sending intent resolution immediately and not
+	// through the batcher. If this becomes important, we'll need to lift this
+	// limitation.
 	return ir.resolveIntents(ctx, (*sliceLockUpdates)(&intents), opts)
 }
 
@@ -935,43 +1017,55 @@ func (ir *IntentResolver) resolveIntents(
 	if err := ctx.Err(); err != nil {
 		return kvpb.NewError(err)
 	}
-	log.Eventf(ctx, "resolving intents")
+	log.Eventf(ctx, "resolving %d intents", intents.Len())
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	respChan := make(chan requestbatcher.Response, intents.Len())
-	for i := 0; i < intents.Len(); i++ {
-		intent := intents.Index(i)
-		rangeID := ir.lookupRangeID(ctx, intent.Key)
-		var req kvpb.Request
-		var batcher *requestbatcher.RequestBatcher
-		if len(intent.EndKey) == 0 {
-			req = &kvpb.ResolveIntentRequest{
-				RequestHeader:     kvpb.RequestHeaderFromSpan(intent.Span),
-				IntentTxn:         intent.Txn,
-				Status:            intent.Status,
-				Poison:            opts.Poison,
-				IgnoredSeqNums:    intent.IgnoredSeqNums,
-				ClockWhilePending: intent.ClockWhilePending,
-			}
-			batcher = ir.irBatcher
-		} else {
-			req = &kvpb.ResolveIntentRangeRequest{
-				RequestHeader:     kvpb.RequestHeaderFromSpan(intent.Span),
-				IntentTxn:         intent.Txn,
-				Status:            intent.Status,
-				Poison:            opts.Poison,
-				MinTimestamp:      opts.MinTimestamp,
-				IgnoredSeqNums:    intent.IgnoredSeqNums,
-				ClockWhilePending: intent.ClockWhilePending,
-			}
-			batcher = ir.irRangeBatcher
+	// Construct a slice of requests to send.
+	var singleReq [1]kvpb.Request //gcassert:noescape
+	reqs := resolveIntentReqs(intents, opts, singleReq[:])
+	h := opts.AdmissionHeader
+	if h == (kvpb.AdmissionHeader{}) && ir.everyAdmissionHeaderMissing.ShouldLog() {
+		log.Warningf(ctx, "empty admission header provided by %s", string(debug.Stack()))
+	}
+	// Send the requests ...
+	if opts.sendImmediately {
+		bypassAdmission := sendImmediatelyBypassAdmissionControl.Get(&ir.settings.SV)
+		if bypassAdmission {
+			h = kv.AdmissionHeaderForBypass(h)
 		}
-		if err := batcher.SendWithChan(ctx, respChan, rangeID, req); err != nil {
+		// ... using a single batch.
+		b := &kv.Batch{}
+		b.AdmissionHeader = h
+		b.AddRawRequest(reqs...)
+		if err := ir.db.Run(ctx, b); err != nil {
+			return b.MustPErr()
+		}
+		return nil
+	}
+	// ... using their corresponding request batcher.
+	respChan := make(chan requestbatcher.Response, len(reqs))
+	batcherBypassAdmission := batchBypassAdmissionControl.Get(&ir.settings.SV)
+	if batcherBypassAdmission {
+		h = kv.AdmissionHeaderForBypass(h)
+	}
+	for _, req := range reqs {
+		var batcher *requestbatcher.RequestBatcher
+		switch req.Method() {
+		case kvpb.ResolveIntent:
+			batcher = ir.irBatcher
+		case kvpb.ResolveIntentRange:
+			batcher = ir.irRangeBatcher
+		default:
+			panic("unexpected")
+		}
+		rangeID := ir.lookupRangeID(ctx, req.Header().Key)
+		if err := batcher.SendWithChan(ctx, respChan, rangeID, req, h); err != nil {
 			return kvpb.NewError(err)
 		}
 	}
-	for seen := 0; seen < intents.Len(); seen++ {
+	// Collect responses.
+	for range reqs {
 		select {
 		case resp := <-respChan:
 			if resp.Err != nil {
@@ -987,6 +1081,49 @@ func (ir *IntentResolver) resolveIntents(
 	return nil
 }
 
+func resolveIntentReqs(
+	intents lockUpdates, opts ResolveOptions, alloc []kvpb.Request,
+) []kvpb.Request {
+	var pointReqs []kvpb.ResolveIntentRequest
+	var rangeReqs []kvpb.ResolveIntentRangeRequest
+	for i := 0; i < intents.Len(); i++ {
+		intent := intents.Index(i)
+		if len(intent.EndKey) == 0 {
+			pointReqs = append(pointReqs, kvpb.ResolveIntentRequest{
+				RequestHeader:     kvpb.RequestHeaderFromSpan(intent.Span),
+				IntentTxn:         intent.Txn,
+				Status:            intent.Status,
+				Poison:            opts.Poison,
+				IgnoredSeqNums:    intent.IgnoredSeqNums,
+				ClockWhilePending: intent.ClockWhilePending,
+			})
+		} else {
+			rangeReqs = append(rangeReqs, kvpb.ResolveIntentRangeRequest{
+				RequestHeader:     kvpb.RequestHeaderFromSpan(intent.Span),
+				IntentTxn:         intent.Txn,
+				Status:            intent.Status,
+				Poison:            opts.Poison,
+				MinTimestamp:      opts.MinTimestamp,
+				IgnoredSeqNums:    intent.IgnoredSeqNums,
+				ClockWhilePending: intent.ClockWhilePending,
+			})
+		}
+	}
+	var reqs []kvpb.Request
+	if cap(alloc) >= intents.Len() {
+		reqs = alloc[:0]
+	} else {
+		reqs = make([]kvpb.Request, 0, intents.Len())
+	}
+	for i := range pointReqs {
+		reqs = append(reqs, &pointReqs[i])
+	}
+	for i := range rangeReqs {
+		reqs = append(reqs, &rangeReqs[i])
+	}
+	return reqs
+}
+
 // intentsByTxn implements sort.Interface to sort intents based on txnID.
 type intentsByTxn []roachpb.Intent
 
@@ -996,4 +1133,40 @@ func (s intentsByTxn) Len() int      { return len(s) }
 func (s intentsByTxn) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s intentsByTxn) Less(i, j int) bool {
 	return bytes.Compare(s[i].Txn.ID[:], s[j].Txn.ID[:]) < 0
+}
+
+// inFlightBackpressureLimitEnabled controls whether the intent resolving
+// requestbatcher.RequestBatchers created by the IntentResolver use an
+// in-flight backpressure limit of DefaultInFlightBackpressureLimit. The
+// default is false, i.e., there is no limit on in-flight requests. A limit on
+// in-flight requests is considered superfluous since we have two limits on
+// the number of active goroutines waiting to get their intent resolution
+// requests processed: the async goroutines, limited to 1000
+// (defaultTaskLimit), and the workload goroutines. Each waiter produces work
+// for a single range, and that work can typically be batched into a single
+// RPC (since requestbatcher.Config.MaxMsgsPerBatch is quite generous). In
+// the rare case where a single waiter produces numerous concurrent RPCs,
+// because of a large number of kvpb.Requests (note that wide
+// ResolveIntentRange cause pagination, and not concurrent RPCs), we have
+// already paid the memory cost of buffering these numerous kvpb.Requests, so
+// we may as well send them out.
+var inFlightBackpressureLimitEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.intent_resolver.batcher.in_flight_backpressure_limit.enabled",
+	"set to true to enable the use of DefaultInFlightBackpressureLimit",
+	false)
+
+type inFlightLimitProvider struct {
+	settings                         *cluster.Settings
+	testingInFlightBackpressureLimit int
+}
+
+func (p inFlightLimitProvider) limit() int {
+	if p.testingInFlightBackpressureLimit != 0 {
+		return p.testingInFlightBackpressureLimit
+	}
+	if p.settings == nil || inFlightBackpressureLimitEnabled.Get(&p.settings.SV) {
+		return requestbatcher.DefaultInFlightBackpressureLimit
+	}
+	return math.MaxInt32
 }

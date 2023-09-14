@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package catalogkeys describes keys used by the SQL catalog.
 package catalogkeys
 
 import (
@@ -45,6 +46,8 @@ type CommentType int
 //go:generate stringer --type CommentType
 
 // Note: please add the new comment types to AllCommentTypes as well.
+// Note: do not change the numeric values of this enum -- they correspond
+// to stored values in system.comments.
 const (
 	// DatabaseCommentType comment on a database.
 	DatabaseCommentType CommentType = 0
@@ -58,10 +61,12 @@ const (
 	SchemaCommentType CommentType = 4
 	// ConstraintCommentType comment on a constraint.
 	ConstraintCommentType CommentType = 5
+	// FunctionCommentType comment on a function.
+	FunctionCommentType CommentType = 6
 
 	// MaxCommentTypeValue is the max possible integer of CommentType type.
 	// Update this whenever a new comment type is added.
-	MaxCommentTypeValue = ConstraintCommentType
+	MaxCommentTypeValue = FunctionCommentType
 )
 
 // AllCommentTypes is a slice of all valid schema comment types.
@@ -72,6 +77,13 @@ var AllCommentTypes = []CommentType{
 	IndexCommentType,
 	SchemaCommentType,
 	ConstraintCommentType,
+	FunctionCommentType,
+}
+
+// IsValidCommentType checks if a given comment type is in the valid value
+// range.
+func IsValidCommentType(t CommentType) bool {
+	return t >= 0 && t <= MaxCommentTypeValue
 }
 
 func init() {

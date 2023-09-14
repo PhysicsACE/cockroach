@@ -74,7 +74,7 @@ func (s *Container) RecordStatement(
 	// recorded we don't need to create an entry in the stmts map for it. We do
 	// still need stmtFingerprintID for transaction level metrics tracking.
 	t := sqlstats.StatsCollectionLatencyThreshold.Get(&s.st.SV)
-	if !sqlstats.StmtStatsEnable.Get(&s.st.SV) || (t > 0 && t.Seconds() >= value.ServiceLatency) {
+	if !sqlstats.StmtStatsEnable.Get(&s.st.SV) || (t > 0 && t.Seconds() >= value.ServiceLatencySec) {
 		createIfNonExistent = false
 	}
 
@@ -126,28 +126,32 @@ func (s *Container) RecordStatement(
 
 	stats.mu.data.SQLType = value.StatementType.String()
 	stats.mu.data.NumRows.Record(stats.mu.data.Count, float64(value.RowsAffected))
-	stats.mu.data.IdleLat.Record(stats.mu.data.Count, value.IdleLatency)
-	stats.mu.data.ParseLat.Record(stats.mu.data.Count, value.ParseLatency)
-	stats.mu.data.PlanLat.Record(stats.mu.data.Count, value.PlanLatency)
-	stats.mu.data.RunLat.Record(stats.mu.data.Count, value.RunLatency)
-	stats.mu.data.ServiceLat.Record(stats.mu.data.Count, value.ServiceLatency)
-	stats.mu.data.OverheadLat.Record(stats.mu.data.Count, value.OverheadLatency)
+	stats.mu.data.IdleLat.Record(stats.mu.data.Count, value.IdleLatencySec)
+	stats.mu.data.ParseLat.Record(stats.mu.data.Count, value.ParseLatencySec)
+	stats.mu.data.PlanLat.Record(stats.mu.data.Count, value.PlanLatencySec)
+	stats.mu.data.RunLat.Record(stats.mu.data.Count, value.RunLatencySec)
+	stats.mu.data.ServiceLat.Record(stats.mu.data.Count, value.ServiceLatencySec)
+	stats.mu.data.OverheadLat.Record(stats.mu.data.Count, value.OverheadLatencySec)
 	stats.mu.data.BytesRead.Record(stats.mu.data.Count, float64(value.BytesRead))
 	stats.mu.data.RowsRead.Record(stats.mu.data.Count, float64(value.RowsRead))
 	stats.mu.data.RowsWritten.Record(stats.mu.data.Count, float64(value.RowsWritten))
 	stats.mu.data.LastExecTimestamp = s.getTimeNow()
-	stats.mu.data.Nodes = util.CombineUniqueInt64(stats.mu.data.Nodes, value.Nodes)
-	stats.mu.data.Regions = util.CombineUniqueString(stats.mu.data.Regions, value.Regions)
-	stats.mu.data.PlanGists = util.CombineUniqueString(stats.mu.data.PlanGists, []string{value.PlanGist})
+	stats.mu.data.Nodes = util.CombineUnique(stats.mu.data.Nodes, value.Nodes)
+	if value.ExecStats != nil {
+		stats.mu.data.Regions = util.CombineUnique(stats.mu.data.Regions, value.ExecStats.Regions)
+	}
+	stats.mu.data.PlanGists = util.CombineUnique(stats.mu.data.PlanGists, []string{value.PlanGist})
 	stats.mu.data.IndexRecommendations = value.IndexRecommendations
-	stats.mu.data.Indexes = util.CombineUniqueString(stats.mu.data.Indexes, value.Indexes)
+	stats.mu.data.Indexes = util.CombineUnique(stats.mu.data.Indexes, value.Indexes)
 
 	// Percentile latencies are only being sampled if the latency was above the
 	// AnomalyDetectionLatencyThreshold.
-	latencies := s.latencyInformation.GetPercentileValues(stmtFingerprintID)
+	// The Insights detector already does a flush when detecting for anomaly latency,
+	// so there is no need to force a flush when retrieving the data during this step.
+	latencies := s.latencyInformation.GetPercentileValues(stmtFingerprintID, false)
 	latencyInfo := appstatspb.LatencyInfo{
-		Min: value.ServiceLatency,
-		Max: value.ServiceLatency,
+		Min: value.ServiceLatencySec,
+		Max: value.ServiceLatencySec,
 		P50: latencies.P50,
 		P90: latencies.P90,
 		P99: latencies.P99,
@@ -208,7 +212,7 @@ func (s *Container) RecordStatement(
 	s.insights.ObserveStatement(value.SessionID, &insights.Statement{
 		ID:                   value.StatementID,
 		FingerprintID:        stmtFingerprintID,
-		LatencyInSeconds:     value.ServiceLatency,
+		LatencyInSeconds:     value.ServiceLatencySec,
 		Query:                value.Query,
 		Status:               getStatus(value.StatementError),
 		StartTime:            value.StartTime,
@@ -301,17 +305,21 @@ func (s *Container) RecordTransaction(
 	if created {
 		estimatedMemAllocBytes :=
 			stats.sizeUnsafe() + key.Size() + 8 /* hash of transaction key */
-		s.mu.Lock()
+		if err := func() error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
 
-		// If the monitor is nil, we do not track memory usage.
-		if s.mu.acc.Monitor() != nil {
-			if err := s.mu.acc.Grow(ctx, estimatedMemAllocBytes); err != nil {
-				delete(s.mu.txns, key)
-				s.mu.Unlock()
-				return ErrMemoryPressure
+			// If the monitor is nil, we do not track memory usage.
+			if s.mu.acc.Monitor() != nil {
+				if err := s.mu.acc.Grow(ctx, estimatedMemAllocBytes); err != nil {
+					delete(s.mu.txns, key)
+					return ErrMemoryPressure
+				}
 			}
+			return nil
+		}(); err != nil {
+			return err
 		}
-		s.mu.Unlock()
 	}
 
 	stats.mu.data.Count++

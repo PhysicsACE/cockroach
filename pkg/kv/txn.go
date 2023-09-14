@@ -17,17 +17,18 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -72,13 +73,6 @@ type Txn struct {
 		ID           uuid.UUID
 		debugName    string
 		userPriority roachpb.UserPriority
-
-		// previousIDs holds the set of all previous IDs that the Txn's Proto has
-		// had across transaction aborts. This allows us to determine if a given
-		// response was meant for any incarnation of this transaction. This is
-		// useful for catching retriable errors that have escaped inner
-		// transactions, so that they don't cause a retry of an outer transaction.
-		previousIDs map[uuid.UUID]struct{}
 
 		// sender is a stateful sender for use with transactions (usually a
 		// TxnCoordSender). A new sender is created on transaction restarts (not
@@ -140,10 +134,12 @@ func NewTxnWithAdmissionControl(
 	kvTxn := roachpb.MakeTransaction(
 		"unnamed",
 		nil, // baseKey
+		isolation.Serializable,
 		roachpb.NormalUserPriority,
 		now.ToTimestamp(),
 		db.clock.MaxOffset().Nanoseconds(),
 		int32(db.ctx.NodeID.SQLInstanceID()),
+		priority,
 	)
 	txn := NewTxnFromProto(ctx, db, gatewayNodeID, now, RootTxn, &kvTxn)
 	txn.admissionHeader = kvpb.AdmissionHeader{
@@ -278,6 +274,33 @@ func (txn *Txn) IsOpen() bool {
 	return txn.statusLocked() == roachpb.PENDING
 }
 
+// isClientFinalized returns true if the client has issued an EndTxn request in
+// an attempt to finalize the transaction.
+func (txn *Txn) isClientFinalized() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.ClientFinalized()
+}
+
+// SetIsoLevel sets the transaction's isolation level. Transactions default to
+// Serializable isolation. The isolation must be set before any operations are
+// performed on the transaction.
+func (txn *Txn) SetIsoLevel(isoLevel isolation.Level) error {
+	if txn.typ != RootTxn {
+		return errors.AssertionFailedf("SetIsoLevel() called on leaf txn")
+	}
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.SetIsoLevel(isoLevel)
+}
+
+// IsoLevel returns the transaction's isolation level.
+func (txn *Txn) IsoLevel() isolation.Level {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.IsoLevel()
+}
+
 // SetUserPriority sets the transaction's user priority. Transactions default to
 // normal user priority. The user priority must be set before any operations are
 // performed on the transaction.
@@ -367,22 +390,36 @@ func (txn *Txn) readTimestampLocked() hlc.Timestamp {
 	return txn.mu.sender.ReadTimestamp()
 }
 
-// CommitTimestamp returns the transaction's start timestamp.
-// The start timestamp can get pushed but the use of this
-// method will guarantee that if a timestamp push is needed
-// the commit will fail with a retryable error.
-func (txn *Txn) CommitTimestamp() hlc.Timestamp {
+// ReadTimestampFixed returns true if the read timestamp has been fixed
+// and cannot be pushed forward.
+func (txn *Txn) ReadTimestampFixed() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.ReadTimestampFixed()
+}
+
+// CommitTimestamp returns the transaction's commit timestamp.
+//
+// If the transaction is committed, the method returns the timestamp at
+// which the transaction performed all of its writes.
+//
+// If the transaction is aborted, the method returns an error.
+//
+// If the transaction is pending and running under serializable isolation,
+// the method returns the transaction's current provisional commit
+// timestamp. It also fixes the transaction's read timestamp to ensure
+// that the transaction cannot be pushed to a later timestamp and still
+// commit. It does so by disabling read refreshes. As a result, using this
+// method just once increases the likelihood that a retry error will
+// bubble up to a client.
+//
+// If the transaction is pending and running under a weak isolation level,
+// the method returns an error. Fixing the commit timestamp prematurely is
+// not supported for transactions running under weak isolation levels.
+func (txn *Txn) CommitTimestamp() (hlc.Timestamp, error) {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	return txn.mu.sender.CommitTimestamp()
-}
-
-// CommitTimestampFixed returns true if the commit timestamp has
-// been fixed to the start timestamp and cannot be pushed forward.
-func (txn *Txn) CommitTimestampFixed() bool {
-	txn.mu.Lock()
-	defer txn.mu.Unlock()
-	return txn.mu.sender.CommitTimestampFixed()
 }
 
 // ProvisionalCommitTimestamp returns the transaction's provisional
@@ -446,6 +483,20 @@ func (txn *Txn) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 func (txn *Txn) GetForUpdate(ctx context.Context, key interface{}) (KeyValue, error) {
 	b := txn.NewBatch()
 	b.GetForUpdate(key)
+	return getOneRow(txn.Run(ctx, b), b)
+}
+
+// GetForShare retrieves the value for a key, returning the retrieved key/value
+// or an error. An unreplicated, shared lock is acquired on the key, if it
+// exists. It is not considered an error for the key to not exist.
+//
+//	r, err := txn.GetForShare("a")
+//	// string(r.Key) == "a"
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) GetForShare(ctx context.Context, key interface{}) (KeyValue, error) {
+	b := txn.NewBatch()
+	b.GetForShare(key)
 	return getOneRow(txn.Run(ctx, b), b)
 }
 
@@ -539,13 +590,17 @@ func (txn *Txn) Inc(ctx context.Context, key interface{}, value int64) (KeyValue
 }
 
 func (txn *Txn) scan(
-	ctx context.Context, begin, end interface{}, maxRows int64, isReverse, forUpdate bool,
+	ctx context.Context,
+	begin, end interface{},
+	maxRows int64,
+	isReverse bool,
+	str kvpb.KeyLockingStrengthType,
 ) ([]KeyValue, error) {
 	b := txn.NewBatch()
 	if maxRows > 0 {
 		b.Header.MaxSpanRequestKeys = maxRows
 	}
-	b.scan(begin, end, isReverse, forUpdate)
+	b.scan(begin, end, isReverse, str)
 	r, err := getOneResult(txn.Run(ctx, b), b)
 	return r.Rows, err
 }
@@ -560,7 +615,7 @@ func (txn *Txn) scan(
 func (txn *Txn) Scan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, false /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.NonLocking)
 }
 
 // ScanForUpdate retrieves the rows between begin (inclusive) and end
@@ -574,7 +629,21 @@ func (txn *Txn) Scan(
 func (txn *Txn) ScanForUpdate(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, true /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForUpdate)
+}
+
+// ScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in ascending order. Unreplicated, shared locks are acquired on
+// each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements (or all results
+// when zero is supplied).
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) ScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64,
+) ([]KeyValue, error) {
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForShare)
 }
 
 // ReverseScan retrieves the rows between begin (inclusive) and end (exclusive)
@@ -587,7 +656,7 @@ func (txn *Txn) ScanForUpdate(
 func (txn *Txn) ReverseScan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, false /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.NonLocking)
 }
 
 // ReverseScanForUpdate retrieves the rows between begin (inclusive) and end
@@ -601,7 +670,21 @@ func (txn *Txn) ReverseScan(
 func (txn *Txn) ReverseScanForUpdate(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, true /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForUpdate)
+}
+
+// ReverseScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in descending order. Unreplicated, shared locks are acquired
+// on each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements (or all results
+// when zero is supplied).
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) ReverseScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64,
+) ([]KeyValue, error) {
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForShare)
 }
 
 // Iterate performs a paginated scan and applying the function f to every page.
@@ -683,11 +766,6 @@ func (txn *Txn) commit(ctx context.Context) error {
 	et := endTxnReq(true, txn.deadline())
 	ba := &kvpb.BatchRequest{Requests: et.unionArr[:]}
 	_, pErr := txn.Send(ctx, ba)
-	if pErr == nil {
-		for _, t := range txn.commitTriggers {
-			t(ctx)
-		}
-	}
 	return pErr.GoError()
 }
 
@@ -847,7 +925,7 @@ func (txn *Txn) rollback(ctx context.Context) *kvpb.Error {
 		// CreateTime will give it preference within the tenant.
 		et := endTxnReq(false, hlc.Timestamp{} /* deadline */)
 		ba := &kvpb.BatchRequest{Requests: et.unionArr[:]}
-		_ = contextutil.RunWithTimeout(ctx, "async txn rollback", asyncRollbackTimeout,
+		_ = timeutil.RunWithTimeout(ctx, "async txn rollback", asyncRollbackTimeout,
 			func(ctx context.Context) error {
 				if _, pErr := txn.Send(ctx, ba); pErr != nil {
 					if statusErr, ok := pErr.GetDetail().(*kvpb.TransactionStatusError); ok &&
@@ -927,12 +1005,18 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 		}
 		err = fn(ctx, txn)
 
-		// Commit on success, unless the txn has already been committed by the
-		// closure. We allow that, as closure might want to run 1PC transactions.
+		// Optionally inject retryable errors for testing.
+		if err == nil && txn.TestingShouldRetry() {
+			err = txn.GenerateForcedRetryableErr(ctx, "injected retriable error")
+		}
+
+		// Commit on success, unless the txn has already been committed or rolled
+		// back by the closure. We allow that, as the closure might want to run 1PC
+		// transactions or might want to rollback on certain conditions.
 		if err == nil {
-			if !txn.IsCommitted() {
+			if !txn.isClientFinalized() {
 				err = txn.Commit(ctx)
-				log.Eventf(ctx, "client.Txn did AutoCommit. err: %v", err)
+				log.Eventf(ctx, "kv.Txn did AutoCommit. err: %v", err)
 				if err != nil {
 					if !errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil)) {
 						// We can't retry, so let the caller know we tried to
@@ -953,12 +1037,20 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 					log.Fatalf(ctx, "unexpected UnhandledRetryableError at the txn.exec() level: %s", err)
 				}
 			} else if t := (*kvpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(err, &t) {
-				if !txn.IsRetryableErrMeantForTxn(*t) {
-					// Make sure the txn record that err carries is for this txn.
-					// If it's not, we terminate the "retryable" character of the error. We
-					// might get a TransactionRetryWithProtoRefreshError if the closure ran another
-					// transaction internally and let the error propagate upwards.
+				if txn.ID() != t.PrevTxnID {
+					// Make sure the retryable error is meant for this level by checking
+					// the transaction the error was generated for. If it's not, we
+					// terminate the "retryable" character of the error. We might get a
+					// TransactionRetryWithProtoRefreshError if the closure ran another
+					// transaction internally and let the error propagate upwards instead
+					// of handling it.
 					return errors.Wrapf(err, "retryable error from another txn")
+				}
+				if txn.isClientFinalized() {
+					// We've already committed or rolled back, so we can't retry. The
+					// closure should not have returned a retryable error in this case.
+					return errors.NewAssertionErrorWithWrappedErrf(err,
+						"client already committed or rolled back")
 				}
 				retryable = true
 			}
@@ -968,7 +1060,9 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 			break
 		}
 
-		txn.PrepareForRetry(ctx)
+		if err := txn.PrepareForRetry(ctx); err != nil {
+			return err
+		}
 	}
 
 	return err
@@ -976,48 +1070,107 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 
 // PrepareForRetry needs to be called before a retry to perform some
 // book-keeping and clear errors when possible.
-func (txn *Txn) PrepareForRetry(ctx context.Context) {
-	// TODO(andrei): I think commit triggers are reset in the wrong place. See #18170.
+func (txn *Txn) PrepareForRetry(ctx context.Context) error {
+	// Reset commit triggers. These must be reconfigured by the client during the
+	// next retry.
 	txn.commitTriggers = nil
 
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
-	retryErr := txn.mu.sender.GetTxnRetryableErr(ctx)
+	retryErr := txn.mu.sender.GetRetryableErr(ctx)
 	if retryErr == nil {
-		return
+		return nil
 	}
 	if txn.typ != RootTxn {
-		panic(errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
-			retryErr, "PrepareForRetry() called on leaf txn"), ctx))
+		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+			retryErr, "PrepareForRetry() called on leaf txn"), ctx)
 	}
+	if err := txn.checkRetryErrorTxnIDLocked(ctx, retryErr); err != nil {
+		return err
+	}
+
 	log.VEventf(ctx, 2, "retrying transaction: %s because of a retryable error: %s",
 		txn.debugNameLocked(), retryErr)
-	txn.handleRetryableErrLocked(ctx, retryErr)
-}
+	txn.resetDeadlineLocked()
 
-// IsRetryableErrMeantForTxn returns true if err is a retryable
-// error meant to restart this client transaction.
-func (txn *Txn) IsRetryableErrMeantForTxn(
-	retryErr kvpb.TransactionRetryWithProtoRefreshError,
-) bool {
-	if txn.typ != RootTxn {
-		panic(errors.AssertionFailedf("IsRetryableErrMeantForTxn() called on leaf txn"))
+	if !retryErr.TxnMustRestartFromBeginning() {
+		// If the retry error does not require the transaction to restart from
+		// beginning, it will have also not caused the transaction to advance its
+		// epoch. The caller has decided that it does want to restart from the
+		// beginning, se we "promote" the partial retry error to a full retry by
+		// manually restarting the transaction.
+		const msg = "promoting partial retryable error to full transaction retry"
+		log.VEventf(ctx, 2, msg)
+		manualErr := txn.mu.sender.GenerateForcedRetryableErr(
+			ctx, retryErr.NextTransaction.WriteTimestamp, true /* mustRestart */, msg)
+		// Now replace retryErr with the error returned by ManualRestart.
+		if !errors.As(manualErr, &retryErr) {
+			return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+				manualErr, "unexpected non-retry error during manual restart"), ctx)
+		}
 	}
 
+	if !retryErr.PrevTxnAborted() {
+		// If the retryable error doesn't correspond to an aborted transaction,
+		// there's no need to switch out the transaction. We simply clear the
+		// retryable error and proceed.
+		return txn.mu.sender.ClearRetryableErr(ctx)
+	}
+
+	return txn.handleTransactionAbortedErrorLocked(ctx, retryErr)
+}
+
+// PrepareForPartialRetry is like PrepareForRetry, except that it expects the
+// retryable error to not require the transaction to restart from the beginning
+// (see TransactionRetryWithProtoRefreshError.TxnMustRestartFromBeginning). It
+// is called once a partial retryable error has been handled and the caller is
+// ready to continue using the transaction.
+func (txn *Txn) PrepareForPartialRetry(ctx context.Context) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
-	errTxnID := retryErr.TxnID
-
-	// Make sure the txn record that err carries is for this txn.
-	// First check if the error was meant for a previous incarnation
-	// of the transaction.
-	if _, ok := txn.mu.previousIDs[errTxnID]; ok {
-		return true
+	retryErr := txn.mu.sender.GetRetryableErr(ctx)
+	if retryErr == nil {
+		return nil
 	}
-	// If not, make sure it was meant for this transaction.
-	return errTxnID == txn.mu.ID
+	if txn.typ != RootTxn {
+		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+			retryErr, "PrepareForPartialRetry() called on leaf txn"), ctx)
+	}
+	if err := txn.checkRetryErrorTxnIDLocked(ctx, retryErr); err != nil {
+		return err
+	}
+	if retryErr.TxnMustRestartFromBeginning() {
+		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+			retryErr, "unexpected retryable error that must restart from beginning"), ctx)
+	}
+
+	log.VEventf(ctx, 2, "partially retrying transaction: %s because of a retryable error: %s",
+		txn.debugNameLocked(), retryErr)
+
+	return txn.mu.sender.ClearRetryableErr(ctx)
+}
+
+func (txn *Txn) checkRetryErrorTxnIDLocked(
+	ctx context.Context, retryErr *kvpb.TransactionRetryWithProtoRefreshError,
+) error {
+	if txn.mu.ID == retryErr.PrevTxnID {
+		return nil
+	}
+	// Sanity check that the retry error we're dealing with is for the current
+	// incarnation of the transaction. Aborted transactions may be retried
+	// transparently in certain cases and such incarnations come with new
+	// txn IDs. However, at no point can both the old and new incarnation of a
+	// transaction be active at the same time -- this would constitute a
+	// programming error.
+	return errors.WithContextTags(
+		errors.NewAssertionErrorWithWrappedErrf(
+			retryErr,
+			"unexpected retryable error for old incarnation of the transaction %s; current incarnation %s",
+			retryErr.PrevTxnID,
+			txn.mu.ID,
+		), ctx)
 }
 
 // Send runs the specified calls synchronously in a single batch and
@@ -1057,27 +1210,28 @@ func (txn *Txn) Send(
 	sender := txn.mu.sender
 	txn.mu.Unlock()
 	br, pErr := txn.db.sendUsingSender(ctx, ba, sender)
+
 	if pErr == nil {
+		// Invoking the commit triggers here ensures they run even in the case when a
+		// commit request is issued manually (not via Commit).
+		if et, ok := ba.GetArg(kvpb.EndTxn); ok && et.(*kvpb.EndTxnRequest).Commit {
+			for _, t := range txn.commitTriggers {
+				t(ctx)
+			}
+		}
 		return br, nil
 	}
 
 	if retryErr, ok := pErr.GetDetail().(*kvpb.TransactionRetryWithProtoRefreshError); ok {
-		if requestTxnID != retryErr.TxnID {
+		if requestTxnID != retryErr.PrevTxnID {
 			// KV should not return errors for transactions other than the one that sent
 			// the request.
 			log.Fatalf(ctx, "retryable error for the wrong txn. "+
-				"requestTxnID: %s, retryErr.TxnID: %s. retryErr: %s",
-				requestTxnID, retryErr.TxnID, retryErr)
+				"requestTxnID: %s, retryErr.PrevTxnID: %s. retryErr: %s",
+				requestTxnID, retryErr.PrevTxnID, retryErr)
 		}
 	}
 	return br, pErr
-}
-
-func (txn *Txn) handleRetryableErrLocked(
-	ctx context.Context, retryErr *kvpb.TransactionRetryWithProtoRefreshError,
-) {
-	txn.resetDeadlineLocked()
-	txn.replaceRootSenderIfTxnAbortedLocked(ctx, retryErr, retryErr.TxnID)
 }
 
 // NegotiateAndSend is a specialized version of Send that is capable of
@@ -1205,7 +1359,7 @@ func (txn *Txn) checkNegotiateAndSendPreconditions(
 	assert(ba.IsReadOnly(), "batch must be read-only")
 	assert(!ba.IsLocking(), "batch must not be locking")
 	assert(txn.typ == RootTxn, "txn must be root")
-	assert(!txn.CommitTimestampFixed(), "txn commit timestamp must not be fixed")
+	assert(!txn.ReadTimestampFixed(), "txn read timestamp must not be fixed")
 	return err
 }
 
@@ -1232,48 +1386,23 @@ func (txn *Txn) applyDeadlineToBoundedStaleness(
 }
 
 // GetLeafTxnInputState returns the LeafTxnInputState information for this
-// transaction for use with InitializeLeafTxn(), when distributing
-// the state of the current transaction to multiple distributed
-// transaction coordinators.
-func (txn *Txn) GetLeafTxnInputState(ctx context.Context) *roachpb.LeafTxnInputState {
-	if txn.typ != RootTxn {
-		panic(errors.WithContextTags(errors.AssertionFailedf("GetLeafTxnInputState() called on leaf txn"), ctx))
-	}
-
-	txn.mu.Lock()
-	defer txn.mu.Unlock()
-	ts, err := txn.mu.sender.GetLeafTxnInputState(ctx, AnyTxnStatus)
-	if err != nil {
-		log.Fatalf(ctx, "unexpected error from GetLeafTxnInputState(AnyTxnStatus): %s", err)
-	}
-	return ts
-}
-
-// GetLeafTxnInputStateOrRejectClient is like GetLeafTxnInputState
-// except, if the transaction is already aborted or otherwise in state
-// that cannot make progress, it returns an error. If the transaction
-// is aborted, the error will be a retryable one, and the transaction
-// will have been prepared for another transaction attempt (so, on
-// retryable errors, it acts like Send()).
-func (txn *Txn) GetLeafTxnInputStateOrRejectClient(
-	ctx context.Context,
-) (*roachpb.LeafTxnInputState, error) {
+// transaction for use with NewLeafTxn(), when distributing the state of the
+// current transaction to multiple distributed transaction coordinators.
+//
+// If the transaction is already aborted or otherwise in a state that cannot
+// make progress, it returns an error. If the transaction is aborted, the error
+// returned will be a retryable one. In such cases, the caller is responsible
+// for handling the error before another attempt by calling PrepareForRetry. Use
+// of the transaction before doing so will continue to be rejected.
+func (txn *Txn) GetLeafTxnInputState(ctx context.Context) (*roachpb.LeafTxnInputState, error) {
 	if txn.typ != RootTxn {
 		return nil, errors.WithContextTags(
-			errors.AssertionFailedf("GetLeafTxnInputStateOrRejectClient() called on leaf txn"), ctx)
+			errors.AssertionFailedf("GetLeafTxnInputState() called on leaf txn"), ctx)
 	}
 
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
-	tfs, err := txn.mu.sender.GetLeafTxnInputState(ctx, OnlyPending)
-	if err != nil {
-		var retryErr *kvpb.TransactionRetryWithProtoRefreshError
-		if errors.As(err, &retryErr) {
-			txn.handleRetryableErrLocked(ctx, retryErr)
-		}
-		return nil, err
-	}
-	return tfs, nil
+	return txn.mu.sender.GetLeafTxnInputState(ctx)
 }
 
 // GetLeafTxnFinalState returns the LeafTxnFinalState information for this
@@ -1288,11 +1417,11 @@ func (txn *Txn) GetLeafTxnFinalState(ctx context.Context) (*roachpb.LeafTxnFinal
 
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
-	tfs, err := txn.mu.sender.GetLeafTxnFinalState(ctx, AnyTxnStatus)
+	tfs, err := txn.mu.sender.GetLeafTxnFinalState(ctx)
 	if err != nil {
 		return nil, errors.WithContextTags(
 			errors.NewAssertionErrorWithWrappedErrf(err,
-				"unexpected error from GetLeafTxnFinalState(AnyTxnStatus)"), ctx)
+				"unexpected error from GetLeafTxnFinalState()"), ctx)
 	}
 	return tfs, nil
 }
@@ -1309,8 +1438,7 @@ func (txn *Txn) UpdateRootWithLeafFinalState(
 
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
-	txn.mu.sender.UpdateRootWithLeafFinalState(ctx, tfs)
-	return nil
+	return txn.mu.sender.UpdateRootWithLeafFinalState(ctx, tfs)
 }
 
 // UpdateStateOnRemoteRetryableErr updates the txn in response to an error
@@ -1339,55 +1467,34 @@ func (txn *Txn) UpdateStateOnRemoteRetryableErr(ctx context.Context, pErr *kvpb.
 	}
 
 	pErr = txn.mu.sender.UpdateStateOnRemoteRetryableErr(ctx, pErr)
-	txn.replaceRootSenderIfTxnAbortedLocked(ctx, pErr.GetDetail().(*kvpb.TransactionRetryWithProtoRefreshError), origTxnID)
-
 	return pErr.GoError()
 }
 
-// replaceRootSenderIfTxnAbortedLocked handles
-// TransactionAbortedErrors, on which a new sender is created to
-// replace the current one.
+// handleTransactionAbortedErrorLocked handles performs bookkeeping to handle
+// TransactionAbortedErrors before the transaction can be retried.
 //
-// origTxnID is the id of the txn that generated retryErr. Note that this can be
-// different from retryErr.Transaction - the latter might be a new transaction.
-func (txn *Txn) replaceRootSenderIfTxnAbortedLocked(
-	ctx context.Context, retryErr *kvpb.TransactionRetryWithProtoRefreshError, origTxnID uuid.UUID,
-) {
-	// The proto inside the error has been prepared for use by the next
-	// transaction attempt.
-	newTxn := &retryErr.Transaction
-
-	if txn.mu.ID != origTxnID {
-		// The transaction has changed since the request that generated the error
-		// was sent. Nothing more to do.
-		log.VEventf(ctx, 2, "retriable error for old incarnation of the transaction")
-		return
-	}
+// For aborted transactions, the supplied error proto contains a new transaction
+// that should be used on the next transaction attempt. The main thing to do
+// here is to create a new sender associated with this transaction, and replace
+// the current one with it.
+func (txn *Txn) handleTransactionAbortedErrorLocked(
+	ctx context.Context, retryErr *kvpb.TransactionRetryWithProtoRefreshError,
+) error {
 	if !retryErr.PrevTxnAborted() {
-		// We don't need a new transaction as a result of this error, but we may
-		// have a retryable error that should be cleared.
-		txn.mu.sender.ClearTxnRetryableErr(ctx)
-		return
+		// Sanity check we're dealing with a TransactionAbortedError.
+		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+			retryErr, "cannot replace root sender if txn not aborted"), ctx)
 	}
 
-	// The ID changed, which means that the cause was a TransactionAbortedError;
-	// we've created a new Transaction that we're about to start using, so we save
-	// the old transaction ID so that concurrent requests or delayed responses
-	// that that throw errors know that these errors were sent to the correct
-	// transaction, even once the proto is reset.
-	txn.recordPreviousTxnIDLocked(txn.mu.ID)
+	// The transaction we had been using thus far has been aborted. The proto
+	// inside the error has been prepared for use by the next transaction attempt.
+	newTxn := &retryErr.NextTransaction
 	txn.mu.ID = newTxn.ID
 	// Create a new txn sender. We need to preserve the stepping mode, if any.
 	prevSteppingMode := txn.mu.sender.GetSteppingMode(ctx)
 	txn.mu.sender = txn.db.factory.RootTransactionalSender(newTxn, txn.mu.userPriority)
 	txn.mu.sender.ConfigureStepping(ctx, prevSteppingMode)
-}
-
-func (txn *Txn) recordPreviousTxnIDLocked(prevTxnID uuid.UUID) {
-	if txn.mu.previousIDs == nil {
-		txn.mu.previousIDs = make(map[uuid.UUID]struct{})
-	}
-	txn.mu.previousIDs[txn.mu.ID] = struct{}{}
+	return nil
 }
 
 // SetFixedTimestamp makes the transaction run in an unusual way, at a "fixed
@@ -1413,23 +1520,36 @@ func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) error {
 	return txn.mu.sender.SetFixedTimestamp(ctx, ts)
 }
 
-// GenerateForcedRetryableError returns a TransactionRetryWithProtoRefreshError that will
-// cause the txn to be retried.
+// GenerateForcedRetryableErr returns a TransactionRetryWithProtoRefreshError
+// that will cause the txn to be retried.
 //
 // The transaction's epoch is bumped, simulating to an extent what the
 // TxnCoordSender does on retriable errors. The transaction's timestamp is only
-// bumped to the extent that txn.ReadTimestamp is racheted up to txn.WriteTimestamp.
+// bumped to the extent that txn.ReadTimestamp is ratcheted up to txn.WriteTimestamp.
 // TODO(andrei): This method should take in an up-to-date timestamp, but
 // unfortunately its callers don't currently have that handy.
-func (txn *Txn) GenerateForcedRetryableError(
-	ctx context.Context, msg redact.RedactableString,
-) error {
+//
+// As with other transaction retry errors, the caller must call PrepareForRetry
+// before continuing to use the transaction.
+func (txn *Txn) GenerateForcedRetryableErr(ctx context.Context, msg redact.RedactableString) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	now := txn.db.clock.NowAsClockTimestamp()
-	txn.mu.sender.ManualRestart(ctx, txn.mu.userPriority, now.ToTimestamp())
-	txn.resetDeadlineLocked()
-	return txn.mu.sender.PrepareRetryableError(ctx, msg)
+	return txn.mu.sender.GenerateForcedRetryableErr(ctx, now.ToTimestamp(), false /* mustRestart */, msg)
+}
+
+// RandomTxnRetryProbability is the probability that a transaction will inject a
+// retryable error when either the RandomTransactionRetryFilter testing filter
+// is installed or the COCKROACH_FORCE_RANDOM_TXN_RETRIES environment variable
+// is set.
+const RandomTxnRetryProbability = 0.1
+
+// TestingShouldRetry returns true if we should generate a random, retryable
+// error for this transaction.
+func (txn *Txn) TestingShouldRetry() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.TestingShouldRetry()
 }
 
 // IsSerializablePushAndRefreshNotPossible returns true if the transaction is
@@ -1492,6 +1612,13 @@ func (txn *Txn) Step(ctx context.Context) error {
 	return txn.mu.sender.Step(ctx)
 }
 
+// GetReadSeqNum gets the read sequence number for this transaction.
+func (txn *Txn) GetReadSeqNum() enginepb.TxnSeq {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.GetReadSeqNum()
+}
+
 // SetReadSeqNum sets the read sequence number for this transaction.
 func (txn *Txn) SetReadSeqNum(seq enginepb.TxnSeq) error {
 	txn.mu.Lock()
@@ -1539,21 +1666,6 @@ func (txn *Txn) ReleaseSavepoint(ctx context.Context, s SavepointToken) error {
 	return txn.mu.sender.ReleaseSavepoint(ctx, s)
 }
 
-// ManualRefresh forces a refresh of the read timestamp of a transaction to
-// match that of its write timestamp. It is only recommended for transactions
-// that need extremely precise control over the request ordering, like the
-// transaction that merges ranges together. When combined with
-// DisablePipelining, this feature allows the range merge transaction to
-// prove that it will not be pushed between sending its SubsumeRequest and
-// committing. This enables that request to be pushed at earlier points in
-// its lifecycle.
-func (txn *Txn) ManualRefresh(ctx context.Context) error {
-	txn.mu.Lock()
-	sender := txn.mu.sender
-	txn.mu.Unlock()
-	return sender.ManualRefresh(ctx)
-}
-
 // DeferCommitWait defers the transaction's commit-wait operation, passing
 // responsibility of commit-waiting from the Txn to the caller of this
 // method. The method returns a function which the caller must eventually
@@ -1574,18 +1686,8 @@ func (txn *Txn) DeferCommitWait(ctx context.Context) func(context.Context) error
 func (txn *Txn) AdmissionHeader() kvpb.AdmissionHeader {
 	h := txn.admissionHeader
 	if txn.mu.sender.IsLocking() {
-		// Assign higher priority to requests by txns that are locking, so that
-		// they release locks earlier. Note that this is a crude approach, and is
-		// worse than priority inheritance used for locks in realtime systems. We
-		// do this because admission control does not have visibility into the
-		// exact locks held by waiters in the admission queue, and cannot compare
-		// that with priorities of waiting requests in the various lock table
-		// queues. This crude approach has shown some benefit in tpcc with 3000
-		// warehouses, where it halved the number of lock waiters, and increased
-		// the transaction throughput by 10+%. In that experiment 40% of the
-		// BatchRequests evaluated by KV had been assigned high priority due to
-		// locking.
-		h.Priority = int32(admissionpb.LockingPri)
+		h.Priority = int32(admissionpb.AdjustedPriorityWhenHoldingLocks(
+			admissionpb.WorkPriority(h.Priority)))
 	}
 	return h
 }

@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -376,6 +377,8 @@ func generateSplitCACerts(certsDir string) error {
 // We construct SSL server and clients and use the generated certs.
 func TestUseCerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// Do not mock cert access for this test.
 	securityassets.ResetLoader()
 	defer ResetTest()
@@ -393,24 +396,26 @@ func TestUseCerts(t *testing.T) {
 	params := base.TestServerArgs{
 		SSLCertsDir:       certsDir,
 		InsecureWebAccess: true,
+
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(109498),
 	}
-	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, _, db := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	// Insecure mode.
-	clientContext := testutils.NewNodeTestBaseContext()
-	clientContext.Insecure = true
+	clientContext := rpc.SecurityContextOptions{Insecure: true}
 	sCtx := rpc.NewSecurityContext(
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+	req, err := http.NewRequest("GET", s.AdminURL().WithPath("/_status/metrics/local").String(), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %v", err)
 	}
@@ -422,21 +427,20 @@ func TestUseCerts(t *testing.T) {
 	}
 
 	// New client. With certs this time.
-	clientContext = testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
+	clientContext = rpc.SecurityContextOptions{SSLCertsDir: certsDir}
 	{
 		secondSCtx := rpc.NewSecurityContext(
 			clientContext,
 			security.CommandTLSSettings{},
 			roachpb.SystemTenantID,
-			tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+			tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 		)
 		httpClient, err = secondSCtx.GetHTTPClient()
 	}
 	if err != nil {
 		t.Fatalf("Expected success, got %v", err)
 	}
-	req, err = http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+	req, err = http.NewRequest("GET", s.AdminURL().WithPath("/_status/metrics/local").String(), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %v", err)
 	}
@@ -451,7 +455,8 @@ func TestUseCerts(t *testing.T) {
 	}
 
 	// Check KV connection.
-	if err := db.Put(context.Background(), "foo", "bar"); err != nil {
+	scratchKey := append(s.Codec().TenantPrefix(), roachpb.Key("foo")...)
+	if err := db.Put(context.Background(), scratchKey, "bar"); err != nil {
 		t.Error(err)
 	}
 }
@@ -468,6 +473,8 @@ func makeSecurePGUrl(addr, user, certsDir, caName, certName, keyName string) str
 // We construct SSL server and clients and use the generated certs.
 func TestUseSplitCACerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// Do not mock cert access for this test.
 	securityassets.ResetLoader()
 	defer ResetTest()
@@ -485,24 +492,26 @@ func TestUseSplitCACerts(t *testing.T) {
 	params := base.TestServerArgs{
 		SSLCertsDir:       certsDir,
 		InsecureWebAccess: true,
+
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(109498),
 	}
-	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, _, db := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	// Insecure mode.
-	clientContext := testutils.NewNodeTestBaseContext()
-	clientContext.Insecure = true
+	clientContext := rpc.SecurityContextOptions{Insecure: true}
 	sCtx := rpc.NewSecurityContext(
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+	req, err := http.NewRequest("GET", s.AdminURL().WithPath("/_status/metrics/local").String(), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %v", err)
 	}
@@ -514,21 +523,20 @@ func TestUseSplitCACerts(t *testing.T) {
 	}
 
 	// New client. With certs this time.
-	clientContext = testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
+	clientContext = rpc.SecurityContextOptions{SSLCertsDir: certsDir}
 	{
 		secondSCtx := rpc.NewSecurityContext(
 			clientContext,
 			security.CommandTLSSettings{},
 			roachpb.SystemTenantID,
-			tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+			tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 		)
 		httpClient, err = secondSCtx.GetHTTPClient()
 	}
 	if err != nil {
 		t.Fatalf("Expected success, got %v", err)
 	}
-	req, err = http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+	req, err = http.NewRequest("GET", s.AdminURL().WithPath("/_status/metrics/local").String(), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %v", err)
 	}
@@ -543,7 +551,8 @@ func TestUseSplitCACerts(t *testing.T) {
 	}
 
 	// Check KV connection.
-	if err := db.Put(context.Background(), "foo", "bar"); err != nil {
+	scratchKey := append(s.Codec().TenantPrefix(), roachpb.Key("foo")...)
+	if err := db.Put(context.Background(), scratchKey, "bar"); err != nil {
 		t.Error(err)
 	}
 
@@ -568,7 +577,7 @@ func TestUseSplitCACerts(t *testing.T) {
 
 	for i, tc := range testCases {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			pgUrl := makeSecurePGUrl(s.ServingSQLAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
+			pgUrl := makeSecurePGUrl(s.AdvSQLAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
 			goDB, err := gosql.Open("postgres", pgUrl)
 			if err != nil {
 				t.Fatal(err)
@@ -587,6 +596,8 @@ func TestUseSplitCACerts(t *testing.T) {
 // We construct SSL server and clients and use the generated certs.
 func TestUseWrongSplitCACerts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	// Do not mock cert access for this test.
 	securityassets.ResetLoader()
 	defer ResetTest()
@@ -613,24 +624,26 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	params := base.TestServerArgs{
 		SSLCertsDir:       certsDir,
 		InsecureWebAccess: true,
+
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(109498),
 	}
-	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, _, db := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	// Insecure mode.
-	clientContext := testutils.NewNodeTestBaseContext()
-	clientContext.Insecure = true
+	clientContext := rpc.SecurityContextOptions{Insecure: true}
 	sCtx := rpc.NewSecurityContext(
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	httpClient, err := sCtx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+	req, err := http.NewRequest("GET", s.AdminURL().WithPath("/_status/metrics/local").String(), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %v", err)
 	}
@@ -642,21 +655,20 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	}
 
 	// New client with certs, but the UI CA is gone, we have no way to verify the Admin UI cert.
-	clientContext = testutils.NewNodeTestBaseContext()
-	clientContext.SSLCertsDir = certsDir
+	clientContext = rpc.SecurityContextOptions{SSLCertsDir: certsDir}
 	{
 		secondCtx := rpc.NewSecurityContext(
 			clientContext,
 			security.CommandTLSSettings{},
 			roachpb.SystemTenantID,
-			tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+			tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 		)
 		httpClient, err = secondCtx.GetHTTPClient()
 	}
 	if err != nil {
 		t.Fatalf("Expected success, got %v", err)
 	}
-	req, err = http.NewRequest("GET", s.AdminURL()+"/_status/metrics/local", nil)
+	req, err = http.NewRequest("GET", s.AdminURL().WithPath("/_status/metrics/local").String(), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %v", err)
 	}
@@ -670,7 +682,8 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	}
 
 	// Check KV connection.
-	if err := db.Put(context.Background(), "foo", "bar"); err != nil {
+	scratchKey := append(s.Codec().TenantPrefix(), roachpb.Key("foo")...)
+	if err := db.Put(context.Background(), scratchKey, "bar"); err != nil {
 		t.Error(err)
 	}
 
@@ -686,7 +699,7 @@ func TestUseWrongSplitCACerts(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		pgUrl := makeSecurePGUrl(s.ServingSQLAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
+		pgUrl := makeSecurePGUrl(s.AdvSQLAddr(), tc.user, certsDir, tc.caName, tc.certPrefix+".crt", tc.certPrefix+".key")
 		goDB, err := gosql.Open("postgres", pgUrl)
 		if err != nil {
 			t.Fatal(err)

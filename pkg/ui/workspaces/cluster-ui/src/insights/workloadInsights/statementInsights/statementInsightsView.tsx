@@ -23,6 +23,7 @@ import {
   defaultFilters,
   Filter,
   getFullFiltersAsStringRecord,
+  SelectedFilters,
 } from "src/queryFilter/filter";
 import { getWorkloadInsightEventFiltersFromURL } from "src/queryFilter/utils";
 import { Pagination } from "src/pagination";
@@ -50,12 +51,12 @@ import {
   timeScaleRangeToObj,
 } from "../../../timeScaleDropdown";
 import { StmtInsightsReq } from "src/api/stmtInsightsApi";
-import moment from "moment";
+import moment from "moment-timezone";
 
 import styles from "src/statementsPage/statementsPage.module.scss";
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
 import { commonStyles } from "../../../common";
-import { useFetchDataWithPolling } from "src/util/hooks";
+import { useScheduleFunction } from "src/util/hooks";
 import { InlineAlert } from "@cockroachlabs/ui-components";
 import { insights } from "src/util";
 import { Anchor } from "src/anchor";
@@ -111,7 +112,6 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = ({
   selectedColumnNames,
   dropDownSelect,
   maxSizeApiReached,
-  isTenant,
 }: StatementInsightsViewProps) => {
   const [pagination, setPagination] = useState<ISortedTablePagination>({
     current: 1,
@@ -128,13 +128,16 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = ({
   }, [refreshStatementInsights, timeScale]);
 
   const shouldPoll = timeScale.key !== "Custom";
-  const clearPolling = useFetchDataWithPolling(
+  const [refetch, clearPolling] = useScheduleFunction(
     refresh,
-    isDataValid,
-    lastUpdated,
-    shouldPoll,
+    shouldPoll, // Don't reschedule refresh if we have a custom time interval.
     10 * 1000, // 10s polling interval
+    lastUpdated,
   );
+
+  useEffect(() => {
+    if (!isDataValid) refetch();
+  }, [isDataValid, refetch]);
 
   useEffect(() => {
     // We use this effect to sync settings defined on the URL (sort, filters),
@@ -252,7 +255,7 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = ({
   return (
     <div className={cx("root")}>
       <PageConfig>
-        {!isTenant && <PageConfigItem>{dropDownSelect}</PageConfigItem>}
+        <PageConfigItem>{dropDownSelect}</PageConfigItem>
         <PageConfigItem>
           <Search
             placeholder="Search Statements"
@@ -279,6 +282,12 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = ({
           />
         </PageConfigItem>
       </PageConfig>
+      <SelectedFilters
+        filters={filters}
+        onRemoveFilter={onSubmitFilters}
+        onClearFilters={clearFilters}
+        className={cx("margin-adjusted")}
+      />
       <div className={cx("table-area")}>
         <Loading
           loading={isLoading}
@@ -292,6 +301,7 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = ({
                 <ColumnsSelector
                   options={tableColumns}
                   onSubmitColumns={onColumnsChange}
+                  size={"small"}
                 />
                 <TableStatistics
                   pagination={pagination}
@@ -299,7 +309,6 @@ export const StatementInsightsView: React.FC<StatementInsightsViewProps> = ({
                   totalCount={filteredStatements?.length}
                   arrayItemName="statement insights"
                   activeFilters={countActiveFilters}
-                  onClearFilters={clearFilters}
                 />
               </div>
               <StatementInsightsTable

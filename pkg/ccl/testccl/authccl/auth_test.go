@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/jwtauthccl"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -181,17 +180,15 @@ func jwtRunTest(t *testing.T, insecure bool) {
 		}
 		defer cleanup()
 
-		s, conn, _ := serverutils.StartServer(t,
+		srv, conn, _ := serverutils.StartServer(t,
 			base.TestServerArgs{
 				Insecure:   insecure,
 				SocketFile: maybeSocketFile,
 			})
-		defer s.Stopper().Stop(context.Background())
+		defer srv.Stopper().Stop(context.Background())
+		s := srv.ApplicationLayer()
 
 		sv := &s.ClusterSettings().SV
-		if len(s.TestTenants()) > 0 {
-			sv = &s.TestTenants()[0].ClusterSettings().SV
-		}
 
 		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf(`CREATE USER %s`, username.TestUser)); err != nil {
 			t.Fatal(err)
@@ -227,6 +224,11 @@ func jwtRunTest(t *testing.T, insecure bool) {
 								t.Fatalf("wrong number of argumenets to jwt_cluster_setting jwks: %d", len(a.Vals))
 							}
 							jwtauthccl.JWTAuthJWKS.Override(context.Background(), sv, a.Vals[0])
+						case "claim":
+							if len(a.Vals) != 1 {
+								t.Fatalf("wrong number of argumenets to jwt_cluster_setting claim: %d", len(a.Vals))
+							}
+							jwtauthccl.JWTAuthClaim.Override(context.Background(), sv, a.Vals[0])
 						case "ident_map":
 							if len(a.Vals) != 1 {
 								t.Fatalf("wrong number of argumenets to jwt_cluster_setting ident_map: %d", len(a.Vals))
@@ -283,13 +285,13 @@ func jwtRunTest(t *testing.T, insecure bool) {
 					// We want the certs to be present in the filesystem for this test.
 					// However, certs are only generated for users "root" and "testuser" specifically.
 					sqlURL, cleanupFn := sqlutils.PGUrlWithOptionalClientCerts(
-						t, s.ServingSQLAddr(), t.Name(), url.User(user),
+						t, s.AdvSQLAddr(), t.Name(), url.User(user),
 						forceCerts || user == username.RootUser || user == username.TestUser /* withClientCerts */)
 					defer cleanupFn()
 
 					var host, port string
 					if td.Cmd == "connect" {
-						host, port, err = net.SplitHostPort(s.ServingSQLAddr())
+						host, port, err = net.SplitHostPort(s.AdvSQLAddr())
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -413,9 +415,10 @@ func TestClientAddrOverride(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
+	ts := s.ApplicationLayer()
 
 	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "testClientAddrOverride" /* prefix */, url.User(username.TestUser),
+		t, ts.AdvSQLAddr(), "testClientAddrOverride" /* prefix */, url.User(username.TestUser),
 	)
 	defer cleanupFunc()
 
@@ -427,15 +430,8 @@ func TestClientAddrOverride(t *testing.T) {
 	// Enable conn/auth logging.
 	// We can't use the cluster settings to do this, because
 	// cluster settings for booleans propagate asynchronously.
-	var pgServer *pgwire.Server
-	var pgPreServer *pgwire.PreServeConnHandler
-	if len(s.TestTenants()) > 0 {
-		pgServer = s.TestTenants()[0].PGServer().(*pgwire.Server)
-		pgPreServer = s.TestTenants()[0].(*server.TestTenant).PGPreServer()
-	} else {
-		pgServer = s.PGServer().(*pgwire.Server)
-		pgPreServer = s.(*server.TestServer).PGPreServer()
-	}
+	pgServer := ts.PGServer().(*pgwire.Server)
+	pgPreServer := ts.PGPreServer().(*pgwire.PreServeConnHandler)
 	pgServer.TestingEnableAuthLogging()
 
 	testCases := []struct {
@@ -528,7 +524,7 @@ func TestClientAddrOverride(t *testing.T) {
 			t.Run("check-server-log-uses-override", func(t *testing.T) {
 				// Wait for the disconnection event in logs.
 				testutils.SucceedsSoon(t, func() error {
-					log.Flush()
+					log.FlushFiles()
 					entries, err := log.FetchEntriesFromFiles(testStartTime.UnixNano(), math.MaxInt64, 10000, sessionTerminatedRe,
 						log.WithMarkedSensitiveData)
 					if err != nil {
@@ -541,7 +537,7 @@ func TestClientAddrOverride(t *testing.T) {
 				})
 
 				// Now we want to check that the logging tags are also updated.
-				log.Flush()
+				log.FlushFiles()
 				entries, err := log.FetchEntriesFromFiles(testStartTime.UnixNano(), math.MaxInt64, 10000, authLogFileRe,
 					log.WithMarkedSensitiveData)
 				if err != nil {

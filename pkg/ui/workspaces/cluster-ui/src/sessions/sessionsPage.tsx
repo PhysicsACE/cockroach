@@ -21,7 +21,7 @@ import {
 import { RouteComponentProps } from "react-router-dom";
 import classNames from "classnames/bind";
 
-import LoadingError from "../sqlActivity/errorComponent";
+import LoadingError, { mergeErrors } from "../sqlActivity/errorComponent";
 import { Pagination } from "src/pagination";
 import {
   SortSetting,
@@ -37,6 +37,7 @@ import {
   Filters,
   getTimeValueInSeconds,
   handleFiltersFromQueryString,
+  SelectedFilters,
 } from "../queryFilter";
 
 import TerminateQueryModal, {
@@ -57,7 +58,7 @@ import ColumnsSelector, {
   SelectOption,
 } from "../columnsSelector/columnsSelector";
 import { TimestampToMoment, unset } from "src/util";
-import moment from "moment";
+import moment from "moment-timezone";
 import {
   getLabel,
   StatisticTableColumnKeys,
@@ -234,7 +235,9 @@ export class SessionsPage extends React.Component<
   onChangePage = (current: number): void => {
     const { pagination } = this.state;
     this.setState({ pagination: { ...pagination, current } });
-    this.props.onPageChanged(current);
+    if (this.props.onPageChanged) {
+      this.props.onPageChanged(current);
+    }
   };
 
   onSubmitFilters = (filters: Filters): void => {
@@ -318,7 +321,7 @@ export class SessionsPage extends React.Component<
           TimestampToMoment(s.session.start),
           "seconds",
         );
-        return sessionTime >= timeValue || timeValue === "empty";
+        return timeValue === "empty" || sessionTime >= Number(timeValue);
       })
       .filter((s: SessionInfo) => {
         if (filters.username && filters.username != "All") {
@@ -396,6 +399,11 @@ export class SessionsPage extends React.Component<
             filters={filters}
             timeLabel={"Session duration"}
           />
+          <SelectedFilters
+            filters={filters}
+            onRemoveFilter={this.onSubmitFilters}
+            onClearFilters={this.onClearFilters}
+          />
         </div>
         <section className={sessionsPageCx("sessions-table-area")}>
           <div className={statementsPageCx("cl-table-statistic")}>
@@ -403,13 +411,13 @@ export class SessionsPage extends React.Component<
               <ColumnsSelector
                 options={tableColumns}
                 onSubmitColumns={onColumnsChange}
+                size={"small"}
               />
               <TableStatistics
                 pagination={pagination}
                 totalCount={sessionsToDisplay.length}
                 arrayItemName="sessions"
                 activeFilters={activeFilters}
-                onClearFilters={this.onClearFilters}
               />
             </div>
           </div>
@@ -451,6 +459,7 @@ export class SessionsPage extends React.Component<
           renderError={() =>
             LoadingError({
               statsType: "sessions",
+              error: mergeErrors(this.props.sessionsError),
             })
           }
         />

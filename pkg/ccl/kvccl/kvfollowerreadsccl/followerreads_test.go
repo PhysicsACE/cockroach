@@ -13,7 +13,8 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math"
-	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan/replicaoracle"
@@ -98,7 +98,7 @@ func TestCanSendToFollower(t *testing.T) {
 	future := clock.Now().Add(2*clock.MaxOffset().Nanoseconds(), 0)
 
 	txn := func(ts hlc.Timestamp) *roachpb.Transaction {
-		txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0, 1)
+		txn := roachpb.MakeTransaction("txn", nil, 0, 0, ts, 0, 1, 0)
 		return &txn
 	}
 	withWriteTimestamp := func(txn *roachpb.Transaction, ts hlc.Timestamp) *roachpb.Transaction {
@@ -208,7 +208,7 @@ func TestCanSendToFollower(t *testing.T) {
 		},
 		{
 			name: "stale locking read",
-			ba:   batch(txn(stale), &kvpb.GetRequest{KeyLocking: lock.Exclusive}),
+			ba:   batch(txn(stale), &kvpb.GetRequest{KeyLockingStrength: lock.Exclusive}),
 			exp:  false,
 		},
 		{
@@ -345,7 +345,7 @@ func TestCanSendToFollower(t *testing.T) {
 		},
 		{
 			name:     "stale locking read, global reads policy",
-			ba:       batch(txn(stale), &kvpb.GetRequest{KeyLocking: lock.Exclusive}),
+			ba:       batch(txn(stale), &kvpb.GetRequest{KeyLockingStrength: lock.Exclusive}),
 			ctPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
 			exp:      false,
 		},
@@ -679,7 +679,7 @@ func TestOracle(t *testing.T) {
 				Clock:      clock,
 			})
 
-			res, err := o.ChoosePreferredReplica(ctx, c.txn, desc, c.lh, c.ctPolicy, replicaoracle.QueryState{})
+			res, _, err := o.ChoosePreferredReplica(ctx, c.txn, desc, c.lh, c.ctPolicy, replicaoracle.QueryState{})
 			require.NoError(t, err)
 			require.Equal(t, c.exp, res)
 		})
@@ -692,28 +692,29 @@ func TestOracle(t *testing.T) {
 // encountering this situation, and then follower reads work.
 func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	// The test uses follower_read_timestamp().
 	defer utilccl.TestingEnableEnterprise()()
 
-	historicalQuery := `SELECT * FROM test AS OF SYSTEM TIME follower_read_timestamp() WHERE k=2`
+	var historicalQuery atomic.Value
+	historicalQuery.Store(`SELECT * FROM test AS OF SYSTEM TIME follower_read_timestamp() WHERE k=2`)
 	recCh := make(chan tracingpb.Recording, 1)
 
 	tc := testcluster.StartTestCluster(t, 4,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
-				UseDatabase:              "t",
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+				UseDatabase:       "t",
 			},
 			// n4 pretends to have low latency to n2 and n3, so that it tries to use
 			// them for follower reads.
 			// Also, we're going to collect a trace of the test's final query.
 			ServerArgsPerNode: map[int]base.TestServerArgs{
 				3: {
-					DisableDefaultTestTenant: true,
-					UseDatabase:              "t",
+					UseDatabase: "t",
 					Knobs: base.TestingKnobs{
 						KVClient: &kvcoord.ClientTestingKnobs{
 							// Inhibit the checking of connection health done by the
@@ -732,7 +733,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 						},
 						SQLExecutor: &sql.ExecutorTestingKnobs{
 							WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
-								if stmt == historicalQuery {
+								if stmt == historicalQuery.Load().(string) {
 									recCh <- trace
 								}
 							},
@@ -786,7 +787,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// not be executed as a follower read since it attempts to use n2 which
 	// doesn't have a replica any more and then it tries n1 which returns an
 	// updated descriptor.
-	n4.Exec(t, historicalQuery)
+	n4.Exec(t, historicalQuery.Load().(string))
 	// As a sanity check, verify that this was not a follower read.
 	rec := <-recCh
 	require.False(t, kv.OnlyFollowerReads(rec), "query was served through follower reads: %s", rec)
@@ -803,7 +804,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// Make a note of the follower reads metric on n3. We'll check that it was
 	// incremented.
 	var followerReadsCountBefore int64
-	err := tc.Servers[2].Stores().VisitStores(func(s *kvserver.Store) error {
+	err := tc.Servers[2].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 		followerReadsCountBefore = s.Metrics().FollowerReadsCount.Count()
 		return nil
 	})
@@ -812,7 +813,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// Run a historical query and assert that it's served from the follower (n3).
 	// n4 should attempt to route to n3 because we pretend n3 has a lower latency
 	// (see testing knob).
-	n4.Exec(t, historicalQuery)
+	n4.Exec(t, historicalQuery.Load().(string))
 	rec = <-recCh
 
 	// Look at the trace and check that we've served a follower read.
@@ -820,12 +821,55 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 
 	// Check that the follower read metric was incremented.
 	var followerReadsCountAfter int64
-	err = tc.Servers[2].Stores().VisitStores(func(s *kvserver.Store) error {
+	err = tc.Servers[2].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 		followerReadsCountAfter = s.Metrics().FollowerReadsCount.Count()
 		return nil
 	})
 	require.NoError(t, err)
 	require.Greater(t, followerReadsCountAfter, followerReadsCountBefore)
+
+	// Now verify that follower reads aren't mistakenly counted as "misplanned
+	// ranges" (#61313).
+
+	// First, run a query on n3 to populate its cache.
+	n3 := sqlutils.MakeSQLRunner(tc.Conns[2])
+	n3.Exec(t, "SELECT * from test WHERE k=1")
+	n3Cache := tc.Server(2).DistSenderI().(*kvcoord.DistSender).RangeDescriptorCache()
+	entry = n3Cache.GetCached(ctx, tablePrefix, false /* inverted */)
+	require.NotNil(t, entry)
+	require.False(t, entry.Lease().Empty())
+	require.Equal(t, roachpb.StoreID(1), entry.Lease().Replica.StoreID)
+	require.Equal(t, []roachpb.ReplicaDescriptor{
+		{NodeID: 1, StoreID: 1, ReplicaID: 1},
+		{NodeID: 3, StoreID: 3, ReplicaID: 3, Type: roachpb.NON_VOTER},
+	}, entry.Desc().Replicas().Descriptors())
+
+	// Enable DistSQL so that we have a distributed plan with a single flow on
+	// n3 (local plans ignore the misplanned ranges).
+	n4.Exec(t, "SET distsql=on")
+
+	// Run a historical query and assert that it's served from the follower (n3).
+	// n4 should choose n3 to plan the TableReader on because we pretend n3 has
+	// a lower latency (see testing knob).
+
+	// Note that this query is such that the physical planning needs to fetch
+	// the ReplicaInfo twice for the same range. This allows us to verify that
+	// the cached - in the spanResolverIterator - information is correctly
+	// preserved.
+	historicalQuery.Store(`SELECT * FROM [SELECT * FROM test WHERE k=2 UNION ALL SELECT * FROM test WHERE k=3] AS OF SYSTEM TIME follower_read_timestamp()`)
+	n4.Exec(t, historicalQuery.Load().(string))
+	rec = <-recCh
+
+	// Sanity check that the plan was distributed.
+	require.True(t, strings.Contains(rec.String(), "creating DistSQL plan with isLocal=false"))
+	// Look at the trace and check that we've served a follower read.
+	require.True(t, kv.OnlyFollowerReads(rec), "query was not served through follower reads: %s", rec)
+	// Verify that we didn't produce the "misplanned ranges" metadata that would
+	// purge the non-stale entries from the range cache on n4.
+	require.False(t, strings.Contains(rec.String(), "clearing entries overlapping"))
+	// Also confirm that we didn't even check for the "misplanned ranges"
+	// metadata on n3.
+	require.False(t, strings.Contains(rec.String(), "checking range cache to see if range info updates should be communicated to the gateway"))
 }
 
 // TestSecondaryTenantFollowerReadsRouting ensures that secondary tenants route
@@ -834,7 +878,6 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 // where it needs to be estimated using node localities.
 func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 95338, "flaky test")
 	defer utilccl.TestingEnableEnterprise()()
 
 	skip.UnderStressRace(t, "times out")
@@ -857,13 +900,15 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 			}
 			localities[i] = locality
 			serverArgs[i] = base.TestServerArgs{
-				Locality:                 localities[i],
-				DisableDefaultTestTenant: true, // we'll create one ourselves below.
+				Locality: localities[i],
 			}
 		}
 		tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
 			ReplicationMode:   base.ReplicationManual,
 			ServerArgsPerNode: serverArgs,
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TODOTestTenantDisabled, // we'll create one ourselves below.
+			},
 		})
 		ctx := context.Background()
 		defer tc.Stopper().Stop(ctx)
@@ -871,7 +916,7 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 		historicalQuery := `SELECT * FROM t.test AS OF SYSTEM TIME follower_read_timestamp() WHERE k=2`
 		recCh := make(chan tracingpb.Recording, 1)
 
-		var tenants [numNodes]serverutils.TestTenantInterface
+		var tenants [numNodes]serverutils.ApplicationLayerInterface
 		for i := 0; i < numNodes; i++ {
 			knobs := base.TestingKnobs{}
 			if i == 3 { // n4
@@ -925,7 +970,12 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 		systemSQL.Exec(t, `ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.1s'`)
 		// We're making assertions on traces collected by the tenant using log lines
 		// in KV so we must ensure they're not redacted.
-		systemSQL.Exec(t, `SET CLUSTER SETTING server.secondary_tenants.redact_trace.enabled = 'false'`)
+		systemSQL.Exec(t, `SET CLUSTER SETTING trace.redact_at_virtual_cluster_boundary.enabled = 'false'`)
+
+		dbs := make([]*gosql.DB, numNodes)
+		for i := 0; i < numNodes; i++ {
+			dbs[i] = tenants[i].SQLConn(t, "")
+		}
 
 		// Wait until all tenant servers are aware of the setting override.
 		testutils.SucceedsSoon(t, func() error {
@@ -934,16 +984,10 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 			}
 			for _, settingName := range settingNames {
 				for i := 0; i < numNodes; i++ {
-					pgURL, cleanup := sqlutils.PGUrl(t, tenants[i].SQLAddr(), "Tenant", url.User(username.RootUser))
-					defer cleanup()
-					db, err := gosql.Open("postgres", pgURL.String())
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer db.Close()
+					db := dbs[i]
 
 					var val string
-					err = db.QueryRow(
+					err := db.QueryRow(
 						fmt.Sprintf("SHOW CLUSTER SETTING %s", settingName),
 					).Scan(&val)
 					require.NoError(t, err)
@@ -959,13 +1003,7 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 			return nil
 		})
 
-		pgURL, cleanupPGUrl := sqlutils.PGUrl(
-			t, tenants[3].SQLAddr(), "Tenant", url.User(username.RootUser),
-		)
-		defer cleanupPGUrl()
-		tenantSQLDB, err := gosql.Open("postgres", pgURL.String())
-		require.NoError(t, err)
-		defer tenantSQLDB.Close()
+		tenantSQLDB := dbs[3]
 		tenantSQL := sqlutils.MakeSQLRunner(tenantSQLDB)
 
 		tenantSQL.Exec(t, `CREATE DATABASE t`)
@@ -973,6 +1011,7 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 
 		startKey := keys.MakeSQLCodec(serverutils.TestTenantID()).TenantPrefix()
 		tc.AddVotersOrFatal(t, startKey, tc.Target(1), tc.Target(2))
+		tc.WaitForVotersOrFatal(t, startKey, tc.Target(1), tc.Target(2))
 		desc := tc.LookupRangeOrFatal(t, startKey)
 		require.Equal(t, []roachpb.ReplicaDescriptor{
 			{NodeID: 1, StoreID: 1, ReplicaID: 1},
@@ -989,7 +1028,7 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 		getFollowerReadCounts := func() [numNodes]int64 {
 			var counts [numNodes]int64
 			for i := range tc.Servers {
-				err := tc.Servers[i].Stores().VisitStores(func(s *kvserver.Store) error {
+				err := tc.Servers[i].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 					counts[i] = s.Metrics().FollowerReadsCount.Count()
 					return nil
 				})

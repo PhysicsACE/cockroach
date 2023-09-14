@@ -9,7 +9,7 @@
 // licenses/APL.txt.
 
 import React from "react";
-import { Link, RouteComponentProps } from "react-router-dom";
+import { RouteComponentProps } from "react-router-dom";
 import { Tooltip } from "antd";
 import "antd/lib/tooltip/style";
 import classNames from "classnames/bind";
@@ -27,15 +27,11 @@ import {
   SortedTable,
   SortSetting,
 } from "src/sortedtable";
-import * as format from "src/util/format";
-import { EncodeDatabaseUri } from "src/util/format";
-
 import styles from "./databasesPage.module.scss";
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
 import { baseHeadingClasses } from "src/transactionsPage/transactionsPageClasses";
 import { syncHistory, tableStatsClusterSetting, unique } from "src/util";
 import booleanSettingStyles from "../settings/booleanSetting.module.scss";
-import { CircleFilled } from "../icon";
 import LoadingError from "../sqlActivity/errorComponent";
 import { Loading } from "../loading";
 import { Search } from "../search";
@@ -49,6 +45,20 @@ import {
 import { merge } from "lodash";
 import { UIConfigState } from "src/store";
 import { TableStatistics } from "../tableStatistics";
+import {
+  DatabaseNameCell,
+  IndexRecCell,
+  DiskSizeCell,
+} from "./databaseTableCells";
+import {
+  DatabaseSpanStatsRow,
+  DatabaseTablesResponse,
+  isMaxSizeError,
+  SqlApiQueryResponse,
+  SqlExecutionErrorMessage,
+} from "../api";
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import { checkInfoAvailable } from "../databases";
 
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
@@ -81,16 +91,15 @@ const booleanSettingCx = classnames.bind(booleanSettingStyles);
 //       rangeCount: number;
 //       nodes: number[];
 //       nodesByRegionString: string;
-//       missingTables: { // DatabasesPageDataMissingTable[]
-//         loading: boolean;
-//         name: string;
-//       }[];
 //     }[];
 //   }
 export interface DatabasesPageData {
   loading: boolean;
   loaded: boolean;
-  lastError: Error;
+  // Request error when getting database names.
+  requestError: Error;
+  // Query error when getting database names.
+  queryError: SqlExecutionErrorMessage;
   databases: DatabasesPageDataDatabase[];
   sortSetting: SortSetting;
   search: string;
@@ -98,18 +107,21 @@ export interface DatabasesPageData {
   nodeRegions: { [nodeId: string]: string };
   isTenant?: UIConfigState["isTenant"];
   automaticStatsCollectionEnabled?: boolean;
+  indexRecommendationsEnabled: boolean;
   showNodeRegionsColumn?: boolean;
+  csIndexUnusedDuration: string;
 }
 
 export interface DatabasesPageDataDatabase {
   loading: boolean;
   loaded: boolean;
-  lastError: Error;
+  // Request error when getting database details.
+  requestError: Error;
+  // Query error when getting database details.
+  queryError: SqlExecutionErrorMessage;
   name: string;
-  sizeInBytes: number;
-  tableCount: number;
-  rangeCount: number;
-  missingTables: DatabasesPageDataMissingTable[];
+  spanStats?: SqlApiQueryResponse<DatabaseSpanStatsRow>;
+  tables?: SqlApiQueryResponse<DatabaseTablesResponse>;
   // Array of node IDs used to unambiguously filter by node and region.
   nodes?: number[];
   // String of nodes grouped by region in alphabetical order, e.g.
@@ -119,22 +131,12 @@ export interface DatabasesPageDataDatabase {
   numIndexRecommendations: number;
 }
 
-// A "missing" table is one for which we were unable to gather size and range
-// count information during the backend call to fetch DatabaseDetails. We
-// expose it here so that the component has the opportunity to try to refresh
-// those properties for the table directly.
-export interface DatabasesPageDataMissingTable {
-  // Note that we don't need a "loaded" property here because we expect
-  // the reducers supplying our properties to remove a missing table from
-  // the list once we've loaded its data.
-  loading: boolean;
-  name: string;
-}
-
 export interface DatabasesPageActions {
   refreshDatabases: () => void;
-  refreshDatabaseDetails: (database: string) => void;
-  refreshTableStats: (database: string, table: string) => void;
+  refreshDatabaseDetails: (
+    database: string,
+    csIndexUnusedDuration: string,
+  ) => void;
   refreshSettings: () => void;
   refreshNodes?: () => void;
   onFilterChange?: (value: Filters) => void;
@@ -154,7 +156,7 @@ interface DatabasesPageState {
   pagination: ISortedTablePagination;
   filters?: Filters;
   activeFilters?: number;
-  lastDetailsError: Error;
+  columns: ColumnDescriptor<DatabasesPageDataDatabase>[];
 }
 
 class DatabasesSortedTable extends SortedTable<DatabasesPageDataDatabase> {}
@@ -194,7 +196,7 @@ export class DatabasesPage extends React.Component<
         current: 1,
         pageSize: tablePageSize,
       },
-      lastDetailsError: null,
+      columns: this.columns(),
     };
 
     const stateFromHistory = this.getStateFromHistory();
@@ -254,7 +256,26 @@ export class DatabasesPage extends React.Component<
   };
 
   componentDidMount(): void {
-    this.refresh();
+    if (this.props.refreshNodes != null) {
+      this.props.refreshNodes();
+    }
+
+    if (this.props.refreshSettings != null) {
+      this.props.refreshSettings();
+    }
+
+    if (
+      !this.props.loaded &&
+      !this.props.loading &&
+      this.props.requestError === undefined
+    ) {
+      return this.props.refreshDatabases();
+    } else {
+      // If the props are already loaded then componentDidUpdate
+      // will not get called so call refresh to make sure details
+      // are loaded
+      this.refresh();
+    }
   }
 
   updateQueryParams(): void {
@@ -273,32 +294,26 @@ export class DatabasesPage extends React.Component<
     }
   }
 
-  componentDidUpdate(): void {
-    this.updateQueryParams();
-    this.refresh();
+  componentDidUpdate(
+    prevProps: Readonly<DatabasesPageProps>,
+    prevState: Readonly<DatabasesPageState>,
+  ): void {
+    if (this.shouldRefreshDatabaseInformation(prevState, prevProps)) {
+      this.updateQueryParams();
+      this.refresh();
+    }
+    if (
+      prevProps.indexRecommendationsEnabled !==
+        this.props.indexRecommendationsEnabled ||
+      prevProps.showNodeRegionsColumn !== this.props.showNodeRegionsColumn
+    ) {
+      this.setState({ columns: this.columns() });
+    }
   }
 
   private refresh(): void {
-    if (this.props.refreshNodes != null) {
-      this.props.refreshNodes();
-    }
-
-    if (this.props.refreshSettings != null) {
-      this.props.refreshSettings();
-    }
-
-    if (
-      !this.props.loaded &&
-      !this.props.loading &&
-      this.props.lastError === undefined
-    ) {
-      return this.props.refreshDatabases();
-    }
-
-    let lastDetailsError: Error;
-
     // load everything by default
-    let filteredDbs = this.props.databases;
+    let filteredDbs: DatabasesPageDataDatabase[] = this.props.databases;
 
     // Loading only the first page if there are more than
     // 40 dbs. If there is more than 40 dbs sort will be disabled.
@@ -322,32 +337,16 @@ export class DatabasesPage extends React.Component<
     }
 
     filteredDbs.forEach(database => {
-      if (database.lastError !== undefined) {
-        lastDetailsError = database.lastError;
-      }
-
-      if (
-        lastDetailsError &&
-        this.state.lastDetailsError?.name != lastDetailsError?.name
-      ) {
-        this.setState({ lastDetailsError: lastDetailsError });
-      }
-
       if (
         !database.loaded &&
         !database.loading &&
-        (database.lastError === undefined ||
-          database.lastError?.name === "GetDatabaseInfoError")
+        database.requestError === undefined
       ) {
-        this.props.refreshDatabaseDetails(database.name);
-        return;
+        this.props.refreshDatabaseDetails(
+          database.name,
+          this.props.csIndexUnusedDuration,
+        );
       }
-
-      database.missingTables.forEach(table => {
-        if (!table.loading) {
-          return this.props.refreshTableStats(database.name, table.name);
-        }
-      });
     });
   }
 
@@ -446,16 +445,16 @@ export class DatabasesPage extends React.Component<
     );
   };
 
-  // Returns a list of databses to the display based on input from the search
+  // Returns a list of databases to the display based on input from the search
   // box and the applied filters.
   filteredDatabasesData = (): DatabasesPageDataDatabase[] => {
     const { search, databases, filters, nodeRegions } = this.props;
 
     // The regions and nodes selected from the filter dropdown.
     const regionsSelected =
-      filters.regions.length > 0 ? filters.regions.split(",") : [];
+      filters.regions?.length > 0 ? filters.regions.split(",") : [];
     const nodesSelected =
-      filters.nodes.length > 0 ? filters.nodes.split(",") : [];
+      filters.nodes?.length > 0 ? filters.nodes.split(",") : [];
 
     return databases
       .filter(db => (search ? filterBySearchQuery(db, search) : true))
@@ -467,13 +466,11 @@ export class DatabasesPage extends React.Component<
         let foundNode = nodesSelected.length == 0;
 
         db.nodes?.forEach(node => {
-          if (
-            foundRegion ||
-            regionsSelected.includes(nodeRegions[node.toString()])
-          ) {
+          const n = node?.toString() || "";
+          if (foundRegion || regionsSelected.includes(nodeRegions[n])) {
             foundRegion = true;
           }
-          if (foundNode || nodesSelected.includes("n" + node.toString())) {
+          if (foundNode || nodesSelected.includes("n" + n)) {
             foundNode = true;
           }
           if (foundNode && foundRegion) return true;
@@ -483,144 +480,153 @@ export class DatabasesPage extends React.Component<
       });
   };
 
-  private renderIndexRecommendations = (
-    database: DatabasesPageDataDatabase,
-  ): React.ReactNode => {
-    const text =
-      database.numIndexRecommendations > 0
-        ? `${database.numIndexRecommendations} index ${
-            database.numIndexRecommendations > 1
-              ? "recommendations"
-              : "recommendation"
-          }`
-        : "None";
-    const classname =
-      database.numIndexRecommendations > 0
-        ? "index-recommendations-icon__exist"
-        : "index-recommendations-icon__none";
-    return (
-      <div>
-        <CircleFilled className={cx(classname)} />
-        <span>{text}</span>
-      </div>
-    );
-  };
-
-  checkInfoAvailable = (
-    database: DatabasesPageDataDatabase,
-    cell: React.ReactNode,
-  ): React.ReactNode => {
+  private shouldRefreshDatabaseInformation(
+    prevState: Readonly<DatabasesPageState>,
+    prevProps: Readonly<DatabasesPageProps>,
+  ): boolean {
+    // No new dbs to update
     if (
-      database.lastError &&
-      database.lastError.name !== "GetDatabaseInfoError"
+      !this.props.databases ||
+      this.props.databases.length == 0 ||
+      this.props.databases.every(x => x.loaded || x.loading)
     ) {
-      return "(unavailable)";
+      return false;
     }
-    return cell;
-  };
 
-  private columns: ColumnDescriptor<DatabasesPageDataDatabase>[] = [
-    {
-      title: (
-        <Tooltip placement="bottom" title="The name of the database.">
-          Databases
-        </Tooltip>
-      ),
-      cell: database => (
-        <Link
-          to={EncodeDatabaseUri(database.name)}
-          className={cx("icon__container")}
-        >
-          <StackIcon className={cx("icon--s", "icon--primary")} />
-          {database.name}
-        </Link>
-      ),
-      sort: database => database.name,
-      className: cx("databases-table__col-name"),
-      name: "name",
-    },
-    {
-      title: (
-        <Tooltip
-          placement="bottom"
-          title="The approximate total disk size across all table replicas in the database."
-        >
-          Size
-        </Tooltip>
-      ),
-      cell: database =>
-        this.checkInfoAvailable(database, format.Bytes(database.sizeInBytes)),
-      sort: database => database.sizeInBytes,
-      className: cx("databases-table__col-size"),
-      name: "size",
-    },
-    {
-      title: (
-        <Tooltip
-          placement="bottom"
-          title="The total number of tables in the database."
-        >
-          Tables
-        </Tooltip>
-      ),
-      cell: database => this.checkInfoAvailable(database, database.tableCount),
-      sort: database => database.tableCount,
-      className: cx("databases-table__col-table-count"),
-      name: "tableCount",
-    },
-    {
-      title: (
-        <Tooltip
-          placement="bottom"
-          title="The total number of ranges across all tables in the database."
-        >
-          Range Count
-        </Tooltip>
-      ),
-      cell: database => this.checkInfoAvailable(database, database.rangeCount),
-      sort: database => database.rangeCount,
-      className: cx("databases-table__col-range-count"),
-      name: "rangeCount",
-    },
-    {
-      title: (
-        <Tooltip
-          placement="bottom"
-          title="Regions/Nodes on which the database tables are located."
-        >
-          {this.props.isTenant ? "Regions" : "Regions/Nodes"}
-        </Tooltip>
-      ),
-      cell: database =>
-        this.checkInfoAvailable(
-          database,
-          database.nodesByRegionString || "None",
+    if (this.state.pagination.current != prevState.pagination.current) {
+      return true;
+    }
+
+    if (prevProps && this.props.search != prevProps.search) {
+      return true;
+    }
+
+    const filteredDatabases = this.filteredDatabasesData();
+    for (
+      let i = 0;
+      i < filteredDatabases.length && i < disableTableSortSize;
+      i++
+    ) {
+      const db = filteredDatabases[i];
+      if (db.loaded || db.loading || db.requestError != undefined) {
+        continue;
+      }
+      // Info is not loaded for a visible database.
+      return true;
+    }
+
+    return false;
+  }
+
+  private columns(): ColumnDescriptor<DatabasesPageDataDatabase>[] {
+    const columns: ColumnDescriptor<DatabasesPageDataDatabase>[] = [
+      {
+        title: (
+          <Tooltip placement="bottom" title="The name of the database.">
+            Databases
+          </Tooltip>
         ),
-      sort: database => database.nodesByRegionString,
-      className: cx("databases-table__col-node-regions"),
-      name: "nodeRegions",
-      hideIfTenant: true,
-    },
-    {
-      title: (
-        <Tooltip
-          placement="bottom"
-          title="Index recommendations will appear if the system detects improper index usage, such as the occurrence of unused indexes. Following index recommendations may help improve query performance."
-        >
-          Index Recommendations
-        </Tooltip>
-      ),
-      cell: this.renderIndexRecommendations,
-      sort: database => database.numIndexRecommendations,
-      className: cx("databases-table__col-node-regions"),
-      name: "numIndexRecommendations",
-    },
-  ];
+        cell: database => <DatabaseNameCell database={database} />,
+        sort: database => database.name,
+        className: cx("databases-table__col-name"),
+        name: "name",
+      },
+      {
+        title: (
+          <Tooltip
+            placement="bottom"
+            title="The approximate total disk size across all table replicas in the database."
+          >
+            Size
+          </Tooltip>
+        ),
+        cell: database => <DiskSizeCell database={database} />,
+        sort: database => database.spanStats?.approximate_disk_bytes,
+        className: cx("databases-table__col-size"),
+        name: "size",
+      },
+      {
+        title: (
+          <Tooltip
+            placement="bottom"
+            title="The total number of tables in the database."
+          >
+            Tables
+          </Tooltip>
+        ),
+        cell: database =>
+          checkInfoAvailable(
+            database.requestError,
+            database.tables?.error,
+            database.tables?.tables?.length,
+          ),
+        sort: database => database.tables?.tables.length ?? 0,
+        className: cx("databases-table__col-table-count"),
+        name: "tableCount",
+      },
+      {
+        title: (
+          <Tooltip
+            placement="bottom"
+            title="The total number of ranges across all tables in the database."
+          >
+            Range Count
+          </Tooltip>
+        ),
+        cell: database =>
+          checkInfoAvailable(
+            database.requestError,
+            database.spanStats?.error,
+            database.spanStats?.range_count,
+          ),
+        sort: database => database.spanStats?.range_count,
+        className: cx("databases-table__col-range-count"),
+        name: "rangeCount",
+      },
+      {
+        title: (
+          <Tooltip
+            placement="bottom"
+            title="Regions/Nodes on which the database tables are located."
+          >
+            {this.props.isTenant ? "Regions" : "Regions/Nodes"}
+          </Tooltip>
+        ),
+        cell: database =>
+          checkInfoAvailable(
+            database.requestError,
+            null,
+            database.nodesByRegionString ? database.nodesByRegionString : null,
+          ),
+        sort: database => database.nodesByRegionString,
+        className: cx("databases-table__col-node-regions"),
+        name: "nodeRegions",
+        hideIfTenant: true,
+        showByDefault: this.props.showNodeRegionsColumn,
+      },
+    ];
+    if (this.props.indexRecommendationsEnabled) {
+      columns.push({
+        title: (
+          <Tooltip
+            placement="bottom"
+            title="Index recommendations will appear if the system detects improper index usage, such as the
+        occurrence of unused indexes. Following index recommendations may help improve query performance."
+          >
+            Index Recommendations
+          </Tooltip>
+        ),
+        cell: database => <IndexRecCell database={database} />,
+        sort: database => database.numIndexRecommendations,
+        className: cx("databases-table__col-idx-rec"),
+        name: "numIndexRecommendations",
+      });
+    }
+    return columns;
+  }
 
   render(): React.ReactElement {
-    this.columns.find(c => c.name === "nodeRegions").showByDefault =
-      this.props.showNodeRegionsColumn;
-    const displayColumns = this.columns.filter(
+    const displayColumns = this.state.columns.filter(
       col => col.showByDefault !== false,
     );
 
@@ -646,7 +652,7 @@ export class DatabasesPage extends React.Component<
             hideAppNames={true}
             regions={regions}
             hideTimeLabel={true}
-            nodes={nodes.map(n => "n" + n.toString())}
+            nodes={nodes.map(n => "n" + n?.toString())}
             activeFilters={activeFilters}
             filters={defaultFilters}
             onSubmitFilters={this.onSubmitFilters}
@@ -706,62 +712,60 @@ export class DatabasesPage extends React.Component<
           <Loading
             loading={this.props.loading}
             page={"databases"}
-            error={this.props.lastError}
-            render={() => (
-              <DatabasesSortedTable
-                className={cx("databases-table")}
-                data={databasesToDisplay}
-                columns={displayColumns}
-                sortSetting={this.props.sortSetting}
-                onChangeSortSetting={this.changeSortSetting}
-                pagination={this.state.pagination}
-                loading={this.props.loading}
-                disableSortSizeLimit={disableTableSortSize}
-                renderNoResult={
-                  <div
-                    className={cx(
-                      "databases-table__no-result",
-                      "icon__container",
-                    )}
-                  >
-                    <StackIcon className={cx("icon--s")} />
-                    This cluster has no databases.
-                  </div>
-                }
-              />
-            )}
+            error={
+              isMaxSizeError(this.props.queryError?.message)
+                ? new Error(this.props.queryError?.message)
+                : this.props.requestError
+            }
             renderError={() =>
               LoadingError({
                 statsType: "databases",
-                timeout: this.props.lastError?.name
-                  ?.toLowerCase()
-                  .includes("timeout"),
+                error: isMaxSizeError(this.props.queryError?.message)
+                  ? new Error(this.props.queryError?.message)
+                  : this.props.requestError,
               })
             }
-          />
-          {!this.props.loading && (
-            <Loading
+          >
+            {isMaxSizeError(this.props.queryError?.message) && (
+              <InlineAlert
+                intent="info"
+                title={
+                  <>
+                    Not all databases are displayed because the maximum number
+                    of databases was reached in the console.&nbsp;
+                  </>
+                }
+              />
+            )}
+            <DatabasesSortedTable
+              className={cx("databases-table")}
+              tableWrapperClassName={cx("sorted-table")}
+              data={databasesToDisplay}
+              columns={displayColumns}
+              sortSetting={this.props.sortSetting}
+              onChangeSortSetting={this.changeSortSetting}
+              pagination={this.state.pagination}
               loading={this.props.loading}
-              page={"databases"}
-              error={this.state.lastDetailsError}
-              render={() => <></>}
-              renderError={() =>
-                LoadingError({
-                  statsType: "part of the information",
-                  timeout: this.state.lastDetailsError?.name
-                    ?.toLowerCase()
-                    .includes("timeout"),
-                  error: this.state.lastDetailsError,
-                })
+              disableSortSizeLimit={disableTableSortSize}
+              renderNoResult={
+                <div
+                  className={cx(
+                    "databases-table__no-result",
+                    "icon__container",
+                  )}
+                >
+                  <StackIcon className={cx("icon--s")} />
+                  This cluster has no databases.
+                </div>
               }
             />
-          )}
+          </Loading>
         </section>
 
         <Pagination
           pageSize={this.state.pagination.pageSize}
           current={this.state.pagination.current}
-          total={this.props.databases.length}
+          total={databasesToDisplay.length}
           onChange={this.changePage}
         />
       </div>

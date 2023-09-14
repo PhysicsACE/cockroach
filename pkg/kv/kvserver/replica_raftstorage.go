@@ -21,10 +21,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -32,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/redact"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
@@ -79,18 +82,28 @@ func (r *replicaRaftStorage) InitialState() (raftpb.HardState, raftpb.ConfState,
 // access to r.mu.stateLoader.
 //
 // Entries can return log entries that are not yet stable in durable storage.
-func (r *replicaRaftStorage) Entries(lo, hi, maxBytes uint64) ([]raftpb.Entry, error) {
+func (r *replicaRaftStorage) Entries(lo, hi uint64, maxBytes uint64) ([]raftpb.Entry, error) {
+	return r.TypedEntries(kvpb.RaftIndex(lo), kvpb.RaftIndex(hi), maxBytes)
+}
+
+func (r *replicaRaftStorage) TypedEntries(
+	lo, hi kvpb.RaftIndex, maxBytes uint64,
+) ([]raftpb.Entry, error) {
 	ctx := r.AnnotateCtx(context.TODO())
 	if r.raftMu.sideloaded == nil {
 		return nil, errors.New("sideloaded storage is uninitialized")
 	}
-	return logstore.LoadEntries(ctx, r.mu.stateLoader.StateLoader, r.store.TODOEngine(), r.RangeID,
+	ents, _, loadedSize, err := logstore.LoadEntries(ctx, r.mu.stateLoader.StateLoader, r.store.TODOEngine(), r.RangeID,
 		r.store.raftEntryCache, r.raftMu.sideloaded, lo, hi, maxBytes)
+	r.store.metrics.RaftStorageReadBytes.Inc(int64(loadedSize))
+	return ents, err
 }
 
 // raftEntriesLocked requires that r.mu is held for writing.
-func (r *Replica) raftEntriesLocked(lo, hi, maxBytes uint64) ([]raftpb.Entry, error) {
-	return (*replicaRaftStorage)(r).Entries(lo, hi, maxBytes)
+func (r *Replica) raftEntriesLocked(
+	lo, hi kvpb.RaftIndex, maxBytes uint64,
+) ([]raftpb.Entry, error) {
+	return (*replicaRaftStorage)(r).TypedEntries(lo, hi, maxBytes)
 }
 
 // invalidLastTerm is an out-of-band value for r.mu.lastTermNotDurable that
@@ -99,9 +112,14 @@ func (r *Replica) raftEntriesLocked(lo, hi, maxBytes uint64) ([]raftpb.Entry, er
 const invalidLastTerm = 0
 
 // Term implements the raft.Storage interface.
-// Term requires that r.mu is held for writing because it requires exclusive
-// access to r.mu.stateLoader.
 func (r *replicaRaftStorage) Term(i uint64) (uint64, error) {
+	term, err := r.TypedTerm(kvpb.RaftIndex(i))
+	return uint64(term), err
+}
+
+// TypedTerm requires that r.mu is held for writing because it requires exclusive
+// access to r.mu.stateLoader.
+func (r *replicaRaftStorage) TypedTerm(i kvpb.RaftIndex) (kvpb.RaftTerm, error) {
 	// TODO(nvanbenschoten): should we set r.mu.lastTermNotDurable when
 	//   r.mu.lastIndexNotDurable == i && r.mu.lastTermNotDurable == invalidLastTerm?
 	if r.mu.lastIndexNotDurable == i && r.mu.lastTermNotDurable != invalidLastTerm {
@@ -113,38 +131,43 @@ func (r *replicaRaftStorage) Term(i uint64) (uint64, error) {
 }
 
 // raftTermLocked requires that r.mu is locked for writing.
-func (r *Replica) raftTermLocked(i uint64) (uint64, error) {
-	return (*replicaRaftStorage)(r).Term(i)
+func (r *Replica) raftTermLocked(i kvpb.RaftIndex) (kvpb.RaftTerm, error) {
+	return (*replicaRaftStorage)(r).TypedTerm(i)
 }
 
 // GetTerm returns the term of the given index in the raft log. It requires that
 // r.mu is not held.
-func (r *Replica) GetTerm(i uint64) (uint64, error) {
+func (r *Replica) GetTerm(i kvpb.RaftIndex) (kvpb.RaftTerm, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.raftTermLocked(i)
 }
 
 // raftLastIndexRLocked requires that r.mu is held for reading.
-func (r *Replica) raftLastIndexRLocked() uint64 {
+func (r *Replica) raftLastIndexRLocked() kvpb.RaftIndex {
 	return r.mu.lastIndexNotDurable
 }
 
 // LastIndex implements the raft.Storage interface.
 // LastIndex requires that r.mu is held for reading.
 func (r *replicaRaftStorage) LastIndex() (uint64, error) {
+	index, err := r.TypedLastIndex()
+	return uint64(index), err
+}
+
+func (r *replicaRaftStorage) TypedLastIndex() (kvpb.RaftIndex, error) {
 	return (*Replica)(r).raftLastIndexRLocked(), nil
 }
 
 // GetLastIndex returns the index of the last entry in the replica's Raft log.
-func (r *Replica) GetLastIndex() uint64 {
+func (r *Replica) GetLastIndex() kvpb.RaftIndex {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.raftLastIndexRLocked()
 }
 
 // raftFirstIndexRLocked requires that r.mu is held for reading.
-func (r *Replica) raftFirstIndexRLocked() uint64 {
+func (r *Replica) raftFirstIndexRLocked() kvpb.RaftIndex {
 	// TruncatedState is guaranteed to be non-nil.
 	return r.mu.state.TruncatedState.Index + 1
 }
@@ -152,18 +175,23 @@ func (r *Replica) raftFirstIndexRLocked() uint64 {
 // FirstIndex implements the raft.Storage interface.
 // FirstIndex requires that r.mu is held for reading.
 func (r *replicaRaftStorage) FirstIndex() (uint64, error) {
+	index, err := r.TypedFirstIndex()
+	return uint64(index), err
+}
+
+func (r *replicaRaftStorage) TypedFirstIndex() (kvpb.RaftIndex, error) {
 	return (*Replica)(r).raftFirstIndexRLocked(), nil
 }
 
 // GetFirstIndex returns the index of the first entry in the replica's Raft log.
-func (r *Replica) GetFirstIndex() uint64 {
+func (r *Replica) GetFirstIndex() kvpb.RaftIndex {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.raftFirstIndexRLocked()
 }
 
 // GetLeaseAppliedIndex returns the lease index of the last applied command.
-func (r *Replica) GetLeaseAppliedIndex() uint64 {
+func (r *Replica) GetLeaseAppliedIndex() kvpb.LeaseAppliedIndex {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.mu.state.LeaseAppliedIndex
@@ -189,8 +217,8 @@ func (r *replicaRaftStorage) Snapshot() (raftpb.Snapshot, error) {
 	r.mu.AssertHeld()
 	return raftpb.Snapshot{
 		Metadata: raftpb.SnapshotMetadata{
-			Index: r.mu.state.RaftAppliedIndex,
-			Term:  r.mu.state.RaftAppliedIndexTerm,
+			Index: uint64(r.mu.state.RaftAppliedIndex),
+			Term:  uint64(r.mu.state.RaftAppliedIndexTerm),
 		},
 	}, nil
 }
@@ -209,8 +237,28 @@ func (r *Replica) GetSnapshot(
 	// Get a snapshot while holding raftMu to make sure we're not seeing "half
 	// an AddSSTable" (i.e. a state in which an SSTable has been linked in, but
 	// the corresponding Raft command not applied yet).
+	var snap storage.Reader
+	var startKey roachpb.RKey
 	r.raftMu.Lock()
-	snap := r.store.TODOEngine().NewSnapshot()
+	if r.store.cfg.SharedStorageEnabled || storage.UseEFOS.Get(&r.ClusterSettings().SV) {
+		var ss *spanset.SpanSet
+		r.mu.RLock()
+		spans := rditer.MakeAllKeySpans(r.mu.state.Desc) // needs unreplicated to access Raft state
+		startKey = r.mu.state.Desc.StartKey
+		if util.RaceEnabled {
+			ss = rditer.MakeAllKeySpanSet(r.mu.state.Desc)
+			defer ss.Release()
+		}
+		r.mu.RUnlock()
+		efos := r.store.TODOEngine().NewEventuallyFileOnlySnapshot(spans)
+		if util.RaceEnabled {
+			snap = spanset.NewEventuallyFileOnlySnapshot(efos, ss)
+		} else {
+			snap = efos
+		}
+	} else {
+		snap = r.store.TODOEngine().NewSnapshot()
+	}
 	r.raftMu.Unlock()
 
 	defer func() {
@@ -222,8 +270,10 @@ func (r *Replica) GetSnapshot(
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rangeID := r.RangeID
+	if startKey == nil {
+		startKey = r.mu.state.Desc.StartKey
+	}
 
-	startKey := r.mu.state.Desc.StartKey
 	ctx, sp := r.AnnotateCtxWithSpan(ctx, "snapshot")
 	defer sp.Finish()
 
@@ -254,9 +304,10 @@ type OutgoingSnapshot struct {
 	// The Pebble snapshot that will be streamed from.
 	EngineSnap storage.Reader
 	// The replica state within the snapshot.
-	State    kvserverpb.ReplicaState
-	snapType kvserverpb.SnapshotRequest_Type
-	onClose  func()
+	State          kvserverpb.ReplicaState
+	snapType       kvserverpb.SnapshotRequest_Type
+	sharedBackings []objstorage.RemoteObjectBackingHandle
+	onClose        func()
 }
 
 func (s OutgoingSnapshot) String() string {
@@ -272,6 +323,9 @@ func (s OutgoingSnapshot) SafeFormat(w redact.SafePrinter, _ rune) {
 // Close releases the resources associated with the snapshot.
 func (s *OutgoingSnapshot) Close() {
 	s.EngineSnap.Close()
+	for i := range s.sharedBackings {
+		s.sharedBackings[i].Close()
+	}
 	if s.onClose != nil {
 		s.onClose()
 	}
@@ -286,9 +340,13 @@ type IncomingSnapshot struct {
 	// The descriptor in the snapshot, never nil.
 	Desc             *roachpb.RangeDescriptor
 	DataSize         int64
+	SharedSize       int64
 	snapType         kvserverpb.SnapshotRequest_Type
 	placeholder      *ReplicaPlaceholder
-	raftAppliedIndex uint64 // logging only
+	raftAppliedIndex kvpb.RaftIndex      // logging only
+	msgAppRespCh     chan raftpb.Message // receives MsgAppResp if/when snap is applied
+	sharedSSTs       []pebble.SharedSSTMeta
+	doExcise         bool
 }
 
 func (s IncomingSnapshot) String() string {
@@ -336,8 +394,8 @@ func snapshot(
 		RaftSnap: raftpb.Snapshot{
 			Data: snapUUID.GetBytes(),
 			Metadata: raftpb.SnapshotMetadata{
-				Index: state.RaftAppliedIndex,
-				Term:  state.RaftAppliedIndexTerm,
+				Index: uint64(state.RaftAppliedIndex),
+				Term:  uint64(state.RaftAppliedIndexTerm),
 				// Synthesize our raftpb.ConfState from desc.
 				ConfState: desc.Replicas().ConfState(),
 			},
@@ -358,9 +416,9 @@ func (r *Replica) updateRangeInfo(ctx context.Context, desc *roachpb.RangeDescri
 	// to different zones.
 	// Load the system config.
 	confReader, err := r.store.GetConfReader(ctx)
-	if errors.Is(err, errSysCfgUnavailable) {
-		// This could be before the system config was ever gossiped, or it
-		// expired. Let the gossip callback set the info.
+	if errors.Is(err, errSpanConfigsUnavailable) {
+		// This could be before the span config subscription was ever
+		// established.
 		log.Warningf(ctx, "unable to retrieve conf reader, cannot determine range MaxBytes")
 		return nil
 	}
@@ -374,7 +432,11 @@ func (r *Replica) updateRangeInfo(ctx context.Context, desc *roachpb.RangeDescri
 		return errors.Wrapf(err, "%s: failed to lookup span config", r)
 	}
 
-	r.SetSpanConfig(conf)
+	changed := r.SetSpanConfig(conf)
+	if changed {
+		r.MaybeQueue(ctx, r.store.cfg.Clock.NowAsClockTimestamp())
+	}
+
 	return nil
 }
 
@@ -484,6 +546,12 @@ func (r *Replica) applySnapshot(
 			logDetails.Printf(" subsumedReplicas=%d@%0.0fms",
 				len(subsumedRepls), stats.subsumedReplicas.Sub(start).Seconds()*1000)
 		}
+		if len(inSnap.sharedSSTs) > 0 {
+			logDetails.Printf(" shared=%d sharedSize=%s", len(inSnap.sharedSSTs), humanizeutil.IBytes(inSnap.SharedSize))
+		}
+		if inSnap.doExcise {
+			logDetails.Printf(" excise=true")
+		}
 		logDetails.Printf(" ingestion=%d@%0.0fms", len(inSnap.SSTStorageScratch.SSTs()),
 			stats.ingestion.Sub(stats.subsumedReplicas).Seconds()*1000)
 		log.Infof(ctx, "applied %s (%s)", inSnap, logDetails)
@@ -548,12 +616,20 @@ func (r *Replica) applySnapshot(
 		}
 	}
 	var ingestStats pebble.IngestOperationStats
-	if ingestStats, err =
-		// TODO: separate ingestions for log and statemachine engine. See:
-		//
-		// https://github.com/cockroachdb/cockroach/issues/93251
-		r.store.TODOEngine().IngestExternalFilesWithStats(ctx, inSnap.SSTStorageScratch.SSTs()); err != nil {
-		return errors.Wrapf(err, "while ingesting %s", inSnap.SSTStorageScratch.SSTs())
+	// TODO: separate ingestions for log and statemachine engine. See:
+	//
+	// https://github.com/cockroachdb/cockroach/issues/93251
+	if inSnap.doExcise {
+		exciseSpan := desc.KeySpan().AsRawSpanWithNoLocals()
+		if ingestStats, err =
+			r.store.TODOEngine().IngestAndExciseFiles(ctx, inSnap.SSTStorageScratch.SSTs(), inSnap.sharedSSTs, exciseSpan); err != nil {
+			return errors.Wrapf(err, "while ingesting %s and excising %s-%s", inSnap.SSTStorageScratch.SSTs(), exciseSpan.Key, exciseSpan.EndKey)
+		}
+	} else {
+		if ingestStats, err =
+			r.store.TODOEngine().IngestLocalFilesWithStats(ctx, inSnap.SSTStorageScratch.SSTs()); err != nil {
+			return errors.Wrapf(err, "while ingesting %s", inSnap.SSTStorageScratch.SSTs())
+		}
 	}
 	if r.store.cfg.KVAdmissionController != nil {
 		r.store.cfg.KVAdmissionController.SnapshotIngested(r.store.StoreID(), ingestStats)
@@ -569,11 +645,11 @@ func (r *Replica) applySnapshot(
 		log.Fatalf(ctx, "unable to load replica state: %s", err)
 	}
 
-	if state.RaftAppliedIndex != nonemptySnap.Metadata.Index {
+	if uint64(state.RaftAppliedIndex) != nonemptySnap.Metadata.Index {
 		log.Fatalf(ctx, "snapshot RaftAppliedIndex %d doesn't match its metadata index %d",
 			state.RaftAppliedIndex, nonemptySnap.Metadata.Index)
 	}
-	if state.RaftAppliedIndexTerm != nonemptySnap.Metadata.Term {
+	if uint64(state.RaftAppliedIndexTerm) != nonemptySnap.Metadata.Term {
 		log.Fatalf(ctx, "snapshot RaftAppliedIndexTerm %d doesn't match its metadata term %d",
 			state.RaftAppliedIndexTerm, nonemptySnap.Metadata.Term)
 	}
@@ -617,8 +693,10 @@ func (r *Replica) applySnapshot(
 	if isInitialSnap {
 		// NB: this will also call setDescLockedRaftMuLocked.
 		if err := r.initFromSnapshotLockedRaftMuLocked(ctx, desc); err != nil {
+			r.mu.Unlock()
 			log.Fatalf(ctx, "unable to initialize replica while applying snapshot: %+v", err)
 		} else if err := r.store.markReplicaInitializedLockedReplLocked(ctx, r); err != nil {
+			r.mu.Unlock()
 			log.Fatalf(ctx, "unable to mark replica initialized while applying snapshot: %+v", err)
 		}
 	} else {
@@ -748,9 +826,9 @@ func writeUnreplicatedSST(
 
 	if err := sl.SetRaftTruncatedState(
 		ctx, &unreplicatedSST,
-		&roachpb.RaftTruncatedState{
-			Index: meta.Index,
-			Term:  meta.Term,
+		&kvserverpb.RaftTruncatedState{
+			Index: kvpb.RaftIndex(meta.Index),
+			Term:  kvpb.RaftTerm(meta.Term),
 		},
 	); err != nil {
 		return nil, false, errors.Wrapf(err, "unable to write TruncatedState to unreplicated SST writer")

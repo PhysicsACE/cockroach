@@ -46,6 +46,9 @@ type planNodeToRowSource struct {
 
 	// run time state machine values
 	row rowenc.EncDatumRow
+
+	contentionEventsListener  execstats.ContentionEventsListener
+	tenantConsumptionListener execstats.TenantConsumptionListener
 }
 
 var _ execinfra.LocalProcessor = &planNodeToRowSource{}
@@ -103,12 +106,12 @@ func (p *planNodeToRowSource) MustBeStreaming() bool {
 	}
 }
 
-// InitWithOutput implements the LocalProcessor interface.
-func (p *planNodeToRowSource) InitWithOutput(
+// Init implements the execinfra.LocalProcessor interface.
+func (p *planNodeToRowSource) Init(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) error {
 	if err := p.InitWithEvalCtx(
 		ctx,
@@ -121,8 +124,7 @@ func (p *planNodeToRowSource) InitWithOutput(
 		// newPlanNodeToRowSource, so we can just use the eval context from the
 		// params.
 		p.params.EvalContext(),
-		0, /* processorID */
-		output,
+		processorID,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// Input to drain is added in SetInput.
@@ -167,7 +169,7 @@ func (p *planNodeToRowSource) SetInput(ctx context.Context, input execinfra.RowS
 }
 
 func (p *planNodeToRowSource) Start(ctx context.Context) {
-	ctx = p.StartInternal(ctx, nodeName(p.node))
+	ctx = p.StartInternal(ctx, nodeName(p.node), &p.contentionEventsListener, &p.tenantConsumptionListener)
 	p.params.ctx = ctx
 	// This starts all of the nodes below this node.
 	if err := startExec(p.params, p.node); err != nil {
@@ -259,16 +261,16 @@ func (p *planNodeToRowSource) trailingMetaCallback() []execinfrapb.ProducerMetad
 
 // execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
 func (p *planNodeToRowSource) execStatsForTrace() *execinfrapb.ComponentStats {
-	// Propagate RUs from IO requests.
-	// TODO(drewk): we should consider propagating other stats for planNode
-	// operators.
-	scanStats := execstats.GetScanStats(p.Ctx(), p.ExecStatsTrace)
-	if scanStats.ConsumedRU == 0 {
+	// Propagate contention time and RUs from IO requests.
+	if p.contentionEventsListener.CumulativeContentionTime == 0 && p.tenantConsumptionListener.ConsumedRU == 0 {
 		return nil
 	}
 	return &execinfrapb.ComponentStats{
+		KV: execinfrapb.KVStats{
+			ContentionTime: optional.MakeTimeValue(p.contentionEventsListener.CumulativeContentionTime),
+		},
 		Exec: execinfrapb.ExecStats{
-			ConsumedRU: optional.MakeUint(scanStats.ConsumedRU),
+			ConsumedRU: optional.MakeUint(p.tenantConsumptionListener.ConsumedRU),
 		},
 	}
 }

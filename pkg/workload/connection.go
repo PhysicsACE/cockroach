@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/pflag"
 )
@@ -24,8 +25,15 @@ type ConnFlags struct {
 	*pflag.FlagSet
 	DBOverride  string
 	Concurrency int
-	// Method for issuing queries; see SQLRunner.
-	Method string
+	Method      string // Method for issuing queries; see SQLRunner.
+
+	ConnHealthCheckPeriod time.Duration
+	DNSRefreshInterval    time.Duration
+	MaxConnIdleTime       time.Duration
+	MaxConnLifetime       time.Duration
+	MaxConnLifetimeJitter time.Duration
+	MinConns              int
+	WarmupConns           int
 }
 
 // NewConnFlags returns an initialized ConnFlags.
@@ -36,14 +44,37 @@ func NewConnFlags(genFlags *Flags) *ConnFlags {
 		`Override for the SQL database to use. If empty, defaults to the generator name`)
 	c.IntVar(&c.Concurrency, `concurrency`, 2*runtime.GOMAXPROCS(0),
 		`Number of concurrent workers`)
-	c.StringVar(&c.Method, `method`, `prepare`, `SQL issue method (prepare, noprepare, simple)`)
+	c.StringVar(&c.Method, `method`, `cache_statement`, `SQL issue method (cache_statement, cache_describe, describe_exec, exec, simple_protocol)`)
+	c.DurationVar(&c.DNSRefreshInterval, `dns-refresh`, defaultDNSCacheRefresh, `Interval used to refresh cached DNS entries (<0 disables)`)
+	c.DurationVar(&c.ConnHealthCheckPeriod, `conn-healthcheck-period`, 30*time.Second, `Interval that health checks are run on connections`)
+	c.IntVar(&c.MinConns, `min-conns`, 0, `Minimum number of connections to attempt to keep in the pool`)
+	c.DurationVar(&c.MaxConnIdleTime, `max-conn-idle-time`, 150*time.Second, `Max time an idle connection will be kept around`)
+	c.DurationVar(&c.MaxConnLifetime, `max-conn-lifetime`, 300*time.Second, `Max connection lifetime`)
+	c.DurationVar(&c.MaxConnLifetimeJitter, `max-conn-lifetime-jitter`, 150*time.Second, `Jitter max connection lifetime by this amount`)
+	c.IntVar(&c.WarmupConns, `warmup-conns`, 0, `Number of connections to warmup in each connection pool`)
 	genFlags.AddFlagSet(c.FlagSet)
 	if genFlags.Meta == nil {
 		genFlags.Meta = make(map[string]FlagMeta)
 	}
-	genFlags.Meta[`db`] = FlagMeta{RuntimeOnly: true}
-	genFlags.Meta[`concurrency`] = FlagMeta{RuntimeOnly: true}
-	genFlags.Meta[`method`] = FlagMeta{RuntimeOnly: true}
+	for _, k := range []string{
+		`concurrency`,
+		`conn-healthcheck-period`,
+		`db`,
+		`dns-refresh`,
+		`max-conn-idle-time`,
+		`max-conn-lifetime-jitter`,
+		`max-conn-lifetime`,
+		`method`,
+		`min-conns`,
+		`warmup-conns`,
+	} {
+		v, ok := genFlags.Meta[k]
+		if !ok {
+			v = FlagMeta{}
+		}
+		v.RuntimeOnly = true
+		genFlags.Meta[k] = v
+	}
 	return c
 }
 
@@ -78,4 +109,34 @@ func SanitizeUrls(gen Generator, dbOverride string, urls []string) (string, erro
 		}
 	}
 	return dbName, nil
+}
+
+// SetDefaultIsolationLevel configures the provided URLs with the specified
+// default transaction isolation level, if any.
+func SetDefaultIsolationLevel(urls []string, isoLevel string) error {
+	if isoLevel == "" {
+		return nil
+	}
+	// As a convenience, replace underscores with spaces. This allows users of the
+	// workload tool to pass --isolation-level=read_committed instead of needing
+	// to pass --isolation-level="read committed".
+	isoLevel = strings.ReplaceAll(isoLevel, "_", " ")
+	// NOTE: validation of the isolation level value is done by the server during
+	// connection establishment.
+	return setUrlParam(urls, "default_transaction_isolation", isoLevel)
+}
+
+// setUrlParam sets the given parameter to the given value in the provided URLs.
+func setUrlParam(urls []string, param, value string) error {
+	for i := range urls {
+		parsed, err := url.Parse(urls[i])
+		if err != nil {
+			return err
+		}
+		q := parsed.Query()
+		q.Set(param, value)
+		parsed.RawQuery = q.Encode()
+		urls[i] = parsed.String()
+	}
+	return nil
 }

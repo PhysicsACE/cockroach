@@ -118,6 +118,11 @@ type paramStatusUpdate struct {
 
 var _ sql.CommandResult = &commandResult{}
 
+// RevokePortalPausability is part of the sql.RestrictedCommandResult interface.
+func (r *commandResult) RevokePortalPausability() error {
+	return errors.AssertionFailedf("RevokePortalPausability is only implemented by limitedCommandResult only")
+}
+
 // Close is part of the sql.RestrictedCommandResult interface.
 func (r *commandResult) Close(ctx context.Context, t sql.TransactionStatusIndicator) {
 	r.assertNotReleased()
@@ -197,6 +202,11 @@ func (r *commandResult) Err() error {
 	return r.err
 }
 
+// ErrAllowReleased is part of the sql.RestrictedCommandResult interface.
+func (r *commandResult) ErrAllowReleased() error {
+	return r.err
+}
+
 // SetError is part of the sql.RestrictedCommandResult interface.
 //
 // We're not going to write any bytes to the buffer in order to support future
@@ -254,6 +264,27 @@ func (r *commandResult) AddBatch(ctx context.Context, batch coldata.Batch) error
 	return r.conn.bufferBatch(ctx, batch, r)
 }
 
+// BufferedResultsLen is part of the sql.RestrictedCommandResult interface.
+func (r *commandResult) BufferedResultsLen() int {
+	return r.conn.writerState.buf.Len()
+}
+
+// TruncateBufferedResults is part of the sql.RestrictedCommandResult interface.
+func (r *commandResult) TruncateBufferedResults(idx int) bool {
+	r.assertNotReleased()
+	if r.conn.writerState.fi.lastFlushed >= r.pos {
+		return false
+	}
+	if idx < 0 {
+		return false
+	}
+	if idx > r.conn.writerState.buf.Len() {
+		return true
+	}
+	r.conn.writerState.buf.Truncate(idx)
+	return true
+}
+
 // SupportsAddBatch is part of the sql.RestrictedCommandResult interface.
 func (r *commandResult) SupportsAddBatch() bool {
 	return true
@@ -276,6 +307,14 @@ func (r *commandResult) BufferParamStatusUpdate(param string, val string) {
 // BufferNotice is part of the sql.RestrictedCommandResult interface.
 func (r *commandResult) BufferNotice(notice pgnotice.Notice) {
 	r.buffer.notices = append(r.buffer.notices, notice)
+}
+
+// SendNotice is part of the sql.RestrictedCommandResult interface.
+func (r *commandResult) SendNotice(ctx context.Context, notice pgnotice.Notice) error {
+	if err := r.conn.bufferNotice(ctx, notice); err != nil {
+		return err
+	}
+	return r.conn.Flush(r.pos)
 }
 
 // SetColumns is part of the sql.RestrictedCommandResult interface.
@@ -321,10 +360,40 @@ func (r *commandResult) SetPortalOutput(
 	_ /* err */ = r.conn.writeRowDescription(ctx, cols, formatCodes, &r.conn.writerState.buf)
 }
 
-// IncrementRowsAffected is part of the sql.RestrictedCommandResult interface.
-func (r *commandResult) IncrementRowsAffected(ctx context.Context, n int) {
+// SendCopyOut is part of the sql.CopyOutResult interface.
+func (r *commandResult) SendCopyOut(
+	ctx context.Context, cols colinfo.ResultColumns, format pgwirebase.FormatCode,
+) error {
 	r.assertNotReleased()
-	r.rowsAffected += n
+	r.conn.writerState.fi.registerCmd(r.pos)
+	return r.conn.bufferCopyOut(cols, format)
+}
+
+// SendCopyData is part of the sql.CopyOutResult interface.
+func (r *commandResult) SendCopyData(ctx context.Context, copyData []byte, isHeader bool) error {
+	if err := r.beforeAdd(); err != nil {
+		return err
+	}
+	if err := r.conn.bufferCopyData(copyData, r); err != nil {
+		return err
+	}
+	if !isHeader {
+		r.rowsAffected++
+	}
+	return nil
+}
+
+// SendCopyDone is part of the pgwirebase.Conn interface.
+func (r *commandResult) SendCopyDone(ctx context.Context) error {
+	r.assertNotReleased()
+	r.conn.writerState.fi.registerCmd(r.pos)
+	return r.conn.bufferCopyDone()
+}
+
+// SetRowsAffected is part of the sql.RestrictedCommandResult interface.
+func (r *commandResult) SetRowsAffected(ctx context.Context, n int) {
+	r.assertNotReleased()
+	r.rowsAffected = n
 }
 
 // RowsAffected is part of the sql.RestrictedCommandResult interface.
@@ -340,7 +409,7 @@ func (r *commandResult) ResetStmtType(stmt tree.Statement) {
 	r.cmdCompleteTag = stmt.StatementTag()
 }
 
-// GetEntryFromExtraInfo is part of the sql.RestrictedCommandResult interface.
+// GetBulkJobId is part of the sql.RestrictedCommandResult interface.
 func (r *commandResult) GetBulkJobId() uint64 {
 	return r.bulkJobId
 }
@@ -383,6 +452,7 @@ func (c *conn) newCommandResult(
 	limit int,
 	portalName string,
 	implicitTxn bool,
+	portalPausability sql.PortalPausablity,
 ) sql.CommandResult {
 	r := c.allocCommandResult()
 	*r = commandResult{
@@ -401,10 +471,11 @@ func (c *conn) newCommandResult(
 	}
 	telemetry.Inc(sqltelemetry.PortalWithLimitRequestCounter)
 	return &limitedCommandResult{
-		limit:         limit,
-		portalName:    portalName,
-		implicitTxn:   implicitTxn,
-		commandResult: r,
+		limit:            limit,
+		portalName:       portalName,
+		implicitTxn:      implicitTxn,
+		commandResult:    r,
+		portalPausablity: portalPausability,
 	}
 }
 
@@ -422,21 +493,6 @@ func (c *conn) newMiscResult(pos sql.CmdPos, typ completionMsgType) *commandResu
 // to AddRow will block until the associated client connection asks for more
 // rows. It essentially implements the "execute portal with limit" part of the
 // Postgres protocol.
-//
-// This design is known to be flawed. It only supports a specific subset of the
-// protocol. We only allow a portal suspension in an explicit transaction where
-// the suspended portal is completely exhausted before any other pgwire command
-// is executed, otherwise an error is produced. You cannot, for example,
-// interleave portal executions (a portal must be executed to completion before
-// another can be executed). It also breaks the software layering by adding an
-// additional state machine here, instead of teaching the state machine in the
-// sql package about portals.
-//
-// This has been done because refactoring the executor to be able to correctly
-// suspend a portal will require a lot of work, and we wanted to move
-// forward. The work included is things like auditing all of the defers and
-// post-execution stuff (like stats collection) to have it only execute once
-// per statement instead of once per portal.
 type limitedCommandResult struct {
 	*commandResult
 	portalName  string
@@ -445,8 +501,12 @@ type limitedCommandResult struct {
 	seenTuples int
 	// If set, an error will be sent to the client if more rows are produced than
 	// this limit.
-	limit int
+	limit            int
+	reachedLimit     bool
+	portalPausablity sql.PortalPausablity
 }
+
+var _ sql.RestrictedCommandResult = &limitedCommandResult{}
 
 // AddRow is part of the sql.RestrictedCommandResult interface.
 func (r *limitedCommandResult) AddRow(ctx context.Context, row tree.Datums) error {
@@ -462,10 +522,24 @@ func (r *limitedCommandResult) AddRow(ctx context.Context, row tree.Datums) erro
 		if err := r.conn.Flush(r.pos); err != nil {
 			return err
 		}
-		r.seenTuples = 0
-
-		return r.moreResultsNeeded(ctx)
+		if r.portalPausablity == sql.PausablePortal {
+			r.reachedLimit = true
+			return sql.ErrPortalLimitHasBeenReached
+		} else {
+			// TODO(janexing): we keep using the logic from before we added
+			// multiple-active-portals support to avoid bring too many bugs. Eventually
+			// we should remove them and use the "return the control to connExecutor"
+			// logic for all portals.
+			r.seenTuples = 0
+			return r.moreResultsNeeded(ctx)
+		}
 	}
+	return nil
+}
+
+// RevokePortalPausability is part of the sql.RestrictedCommandResult interface.
+func (r *limitedCommandResult) RevokePortalPausability() error {
+	r.portalPausablity = sql.NotPausablePortalForUnsupportedStmt
 	return nil
 }
 
@@ -479,6 +553,17 @@ func (r *limitedCommandResult) SupportsAddBatch() bool {
 // requests for rows from the active portal, during the "execute portal" flow
 // when a limit has been specified.
 func (r *limitedCommandResult) moreResultsNeeded(ctx context.Context) error {
+	errBasedOnPausability := func(pausablity sql.PortalPausablity) error {
+		switch pausablity {
+		case sql.PortalPausabilityDisabled:
+			return sql.ErrLimitedResultNotSupported
+		case sql.NotPausablePortalForUnsupportedStmt:
+			return sql.ErrStmtNotSupportedForPausablePortal
+		default:
+			return errors.AssertionFailedf("unsupported pausability type for a portal")
+		}
+	}
+
 	// Keep track of the previous CmdPos so we can rewind if needed.
 	prevPos := r.conn.stmtBuf.AdvanceOne()
 	for {
@@ -493,7 +578,7 @@ func (r *limitedCommandResult) moreResultsNeeded(ctx context.Context) error {
 			// next message is a delete portal.
 			if c.Type != pgwirebase.PreparePortal || c.Name != r.portalName {
 				telemetry.Inc(sqltelemetry.InterleavedPortalRequestCounter)
-				return errors.WithDetail(sql.ErrLimitedResultNotSupported,
+				return errors.WithDetail(errBasedOnPausability(r.portalPausablity),
 					"cannot close a portal while a different one is open")
 			}
 			return r.rewindAndClosePortal(ctx, prevPos)
@@ -501,7 +586,7 @@ func (r *limitedCommandResult) moreResultsNeeded(ctx context.Context) error {
 			// The happy case: the client wants more rows from the portal.
 			if c.Name != r.portalName {
 				telemetry.Inc(sqltelemetry.InterleavedPortalRequestCounter)
-				return errors.WithDetail(sql.ErrLimitedResultNotSupported,
+				return errors.WithDetail(errBasedOnPausability(r.portalPausablity),
 					"cannot execute a portal while a different one is open")
 			}
 			r.limit = c.Limit
@@ -544,7 +629,7 @@ func (r *limitedCommandResult) moreResultsNeeded(ctx context.Context) error {
 			}
 			// We got some other message, but we only support executing to completion.
 			telemetry.Inc(sqltelemetry.InterleavedPortalRequestCounter)
-			return errors.WithDetail(sql.ErrLimitedResultNotSupported,
+			return errors.WithDetail(errBasedOnPausability(r.portalPausablity),
 				fmt.Sprintf("cannot perform operation %T while a different portal is open", c))
 		}
 		prevPos = curPos
@@ -623,6 +708,13 @@ func (r *limitedCommandResult) rewindAndClosePortal(
 	// up back on it.
 	r.conn.stmtBuf.Rewind(ctx, rewindTo)
 	return sql.ErrLimitedResultClosed
+}
+
+func (r *limitedCommandResult) Close(ctx context.Context, t sql.TransactionStatusIndicator) {
+	if r.reachedLimit {
+		r.commandResult.typ = noCompletionMsg
+	}
+	r.commandResult.Close(ctx, t)
 }
 
 // Get the column index for job id based on the result header defined in

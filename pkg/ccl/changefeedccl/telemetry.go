@@ -69,8 +69,8 @@ func (ptl *periodicTelemetryLogger) recordEmittedBytes(numBytes int) {
 	ptl.sinkTelemetryData.emittedBytes.Add(int64(numBytes))
 }
 
-func (ptl *periodicTelemetryLogger) resetEmittedBytes() int {
-	return int(ptl.sinkTelemetryData.emittedBytes.Swap(0))
+func (ptl *periodicTelemetryLogger) resetEmittedBytes() int64 {
+	return ptl.sinkTelemetryData.emittedBytes.Swap(0)
 }
 
 // recordEmittedBytes implements the telemetryLogger interface.
@@ -96,7 +96,7 @@ func (ptl *periodicTelemetryLogger) maybeFlushLogs() {
 	continuousTelemetryEvent := &eventpb.ChangefeedEmittedBytes{
 		CommonChangefeedEventDetails: ptl.changefeedDetails,
 		JobId:                        int64(ptl.job.ID()),
-		EmittedBytes:                 int32(ptl.resetEmittedBytes()),
+		EmittedBytes:                 ptl.resetEmittedBytes(),
 		LoggingInterval:              loggingInterval,
 	}
 	log.StructuredEvent(ptl.ctx, continuousTelemetryEvent)
@@ -111,7 +111,7 @@ func (ptl *periodicTelemetryLogger) close() {
 	continuousTelemetryEvent := &eventpb.ChangefeedEmittedBytes{
 		CommonChangefeedEventDetails: ptl.changefeedDetails,
 		JobId:                        int64(ptl.job.ID()),
-		EmittedBytes:                 int32(ptl.resetEmittedBytes()),
+		EmittedBytes:                 ptl.resetEmittedBytes(),
 		LoggingInterval:              loggingInterval,
 		Closing:                      true,
 	}
@@ -135,6 +135,8 @@ type telemetryMetricsRecorder struct {
 	telemetryLogger *periodicTelemetryLogger
 	inner           metricsRecorder
 }
+
+var _ metricsRecorder = (*telemetryMetricsRecorder)(nil)
 
 func (r *telemetryMetricsRecorder) close() {
 	r.telemetryLogger.close()
@@ -182,6 +184,14 @@ func (r *telemetryMetricsRecorder) getBackfillRangeCallback() func(int64) (func(
 
 func (r *telemetryMetricsRecorder) recordSizeBasedFlush() {
 	r.inner.recordSizeBasedFlush()
+}
+
+func (r *telemetryMetricsRecorder) recordParallelIOQueueLatency(latency time.Duration) {
+	r.inner.recordParallelIOQueueLatency(latency)
+}
+
+func (r *telemetryMetricsRecorder) recordSinkIOInflightChange(delta int64) {
+	r.inner.recordSinkIOInflightChange(delta)
 }
 
 // ContinuousTelemetryInterval determines the interval at which each node emits telemetry events

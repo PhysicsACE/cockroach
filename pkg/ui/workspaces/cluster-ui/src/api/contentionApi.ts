@@ -18,7 +18,8 @@ import {
   formatApiResult,
 } from "./sqlApi";
 import { ContentionDetails } from "src/insights";
-import moment from "moment";
+import moment from "moment-timezone";
+import { getLogger } from "../util";
 
 export type ContentionFilters = {
   waitingTxnID?: string;
@@ -60,15 +61,22 @@ export async function getContentionDetailsApi(
   const result = await executeInternalSql<ContentionResponseColumns>(request);
 
   if (sqlResultsAreEmpty(result)) {
-    return formatApiResult(
+    if (result?.error) {
+      // We don't return an error if it failed to retrieve the contention information.
+      getLogger().error(
+        "Insights encounter an error while retrieving contention information.",
+        { resultError: result.error },
+      );
+    }
+    return formatApiResult<ContentionDetails[]>(
       [],
-      result.error,
+      null,
       "retrieving contention information",
     );
   }
 
   const contentionDetails: ContentionDetails[] = [];
-  result.execution.txn_results.forEach(x => {
+  result.execution?.txn_results.forEach(x => {
     x.rows.forEach(row => {
       contentionDetails.push({
         blockingExecutionID: row.blocking_txn_id,
@@ -94,7 +102,7 @@ export async function getContentionDetailsApi(
     });
   });
 
-  return formatApiResult(
+  return formatApiResult<ContentionDetails[]>(
     contentionDetails,
     result.error,
     "retrieving insights information",

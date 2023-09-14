@@ -59,7 +59,7 @@ func startGossipAtAddr(
 	rpcContext := rpc.NewInsecureTestingContextWithClusterID(ctx, clock, stopper, clusterID)
 	rpcContext.NodeID.Set(ctx, nodeID)
 
-	server, err := rpc.NewServer(rpcContext)
+	server, err := rpc.NewServer(ctx, rpcContext)
 	require.NoError(t, err)
 	g := NewTest(nodeID, stopper, registry, zonepb.DefaultZoneConfigRef())
 	RegisterGossipServer(server, g)
@@ -119,7 +119,7 @@ func startFakeServerGossips(
 	clock := hlc.NewClockForTesting(nil)
 	lRPCContext := rpc.NewInsecureTestingContextWithClusterID(ctx, clock, stopper, clusterID)
 
-	lserver, err := rpc.NewServer(lRPCContext)
+	lserver, err := rpc.NewServer(ctx, lRPCContext)
 	require.NoError(t, err)
 	local := NewTest(localNodeID, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	RegisterGossipServer(lserver, local)
@@ -128,7 +128,7 @@ func startFakeServerGossips(
 	local.start(lln.Addr())
 
 	rRPCContext := rpc.NewInsecureTestingContextWithClusterID(ctx, clock, stopper, clusterID)
-	rserver, err := rpc.NewServer(rRPCContext)
+	rserver, err := rpc.NewServer(ctx, rRPCContext)
 	require.NoError(t, err)
 	remote := newFakeGossipServer(rserver, stopper)
 	rln, err := netutil.ListenAndServeGRPC(stopper, rserver, util.IsolatedTestAddr)
@@ -162,7 +162,7 @@ func gossipSucceedsSoon(
 			// If the client wasn't able to connect, restart it.
 			g := gossip[client]
 			g.mu.Lock()
-			client.startLocked(g, disconnected, rpcContext, stopper, rpcContext.NewBreaker(""))
+			client.startLocked(g, disconnected, rpcContext, stopper)
 			g.mu.Unlock()
 		default:
 		}
@@ -319,7 +319,7 @@ func TestClientNodeID(t *testing.T) {
 		case <-disconnected:
 			// The client hasn't been started or failed to start, loop and try again.
 			local.mu.Lock()
-			c.startLocked(local, disconnected, rpcContext, stopper, rpcContext.NewBreaker(""))
+			c.startLocked(local, disconnected, rpcContext, stopper)
 			local.mu.Unlock()
 		}
 	}
@@ -476,7 +476,7 @@ func TestClientRegisterWithInitNodeID(t *testing.T) {
 		nodeID := roachpb.NodeID(i + 1)
 
 		rpcContext := rpc.NewInsecureTestingContextWithClusterID(ctx, clock, stopper, clusterID)
-		server, err := rpc.NewServer(rpcContext)
+		server, err := rpc.NewServer(ctx, rpcContext)
 		require.NoError(t, err)
 		// node ID must be non-zero
 		gnode := NewTest(nodeID, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())

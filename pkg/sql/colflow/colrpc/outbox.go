@@ -48,6 +48,8 @@ type flowStreamClient interface {
 // given remote endpoint.
 type Outbox struct {
 	colexecop.OneInputNode
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
 	// inputMetaInfo contains all of the meta components that the outbox is
 	// responsible for. OneInputNode.Input is the deselector operator with Root
 	// field as its input. Notably StatsCollectors are not accessed directly -
@@ -85,6 +87,8 @@ type Outbox struct {
 //   - getStats, when non-nil, returns all of the execution statistics of the
 //     operators that are in the same tree as this Outbox.
 func NewOutbox(
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	unlimitedAllocator *colmem.Allocator,
 	converterMemAcc *mon.BoundAccount,
 	input colexecargs.OpWithMetaInfo,
@@ -103,6 +107,8 @@ func NewOutbox(
 		// Add a deselector as selection vectors are not serialized (nor should they
 		// be).
 		OneInputNode:       colexecop.NewOneInputNode(colexecutils.NewDeselectorOp(unlimitedAllocator, input.Root, typs)),
+		flowCtx:            flowCtx,
+		processorID:        processorID,
 		inputMetaInfo:      input,
 		typs:               typs,
 		unlimitedAllocator: unlimitedAllocator,
@@ -151,7 +157,6 @@ func (o *Outbox) Run(
 	ctx context.Context,
 	dialer execinfra.Dialer,
 	sqlInstanceID base.SQLInstanceID,
-	flowID execinfrapb.FlowID,
 	streamID execinfrapb.StreamID,
 	flowCtxCancel context.CancelFunc,
 	connectionTimeout time.Duration,
@@ -165,11 +170,12 @@ func (o *Outbox) Run(
 	// be safe.
 	defer outboxCtxCancel()
 
-	ctx, o.span = execinfra.ProcessorSpan(ctx, "outbox")
+	ctx, o.span = execinfra.ProcessorSpan(ctx, o.flowCtx, "outbox", o.processorID)
 	if o.span != nil {
 		defer o.span.Finish()
-		o.span.SetTag(execinfrapb.FlowIDTagKey, attribute.StringValue(flowID.String()))
-		o.span.SetTag(execinfrapb.StreamIDTagKey, attribute.IntValue(int(streamID)))
+		if o.span.IsVerbose() {
+			o.span.SetTag(execinfrapb.StreamIDTagKey, attribute.IntValue(int(streamID)))
+		}
 	}
 
 	o.runnerCtx = ctx
@@ -204,10 +210,12 @@ func (o *Outbox) Run(
 			return err
 		}
 
+		// TODO(yuzefovich): the row-based outbox sends the header as part of
+		// the first message with data, consider doing that here too.
 		log.VEvent(ctx, 2, "Outbox sending header")
 		// Send header message to establish the remote server (consumer).
 		if err := stream.Send(
-			&execinfrapb.ProducerMessage{Header: &execinfrapb.ProducerHeader{FlowID: flowID, StreamID: streamID}},
+			&execinfrapb.ProducerMessage{Header: &execinfrapb.ProducerHeader{FlowID: o.flowCtx.ID, StreamID: streamID}},
 		); err != nil {
 			log.Warningf(
 				ctx,
@@ -218,7 +226,9 @@ func (o *Outbox) Run(
 		}
 		return nil
 	}(); err != nil {
-		// error during stream set up.
+		// An error during stream setup - the whole query will fail, so we might
+		// as well proactively cancel the flow on this node.
+		flowCtxCancel()
 		o.close(ctx)
 		return
 	}
@@ -304,6 +314,7 @@ func (o *Outbox) sendBatches(
 			// o.scratch.msg can be reused as soon as Send returns since it returns as
 			// soon as the message is written to the control buffer. The message is
 			// marshaled (bytes are copied) before writing.
+			log.VEvent(ctx, 2, "Outbox sending batch")
 			if err := stream.Send(o.scratch.msg); err != nil {
 				flowinfra.HandleStreamErr(ctx, "Send (batches)", err, flowCtxCancel, outboxCtxCancel)
 				return
@@ -336,18 +347,21 @@ func (o *Outbox) sendMetadata(ctx context.Context, stream flowStreamClient, errT
 			msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.LocalMetaToRemoteProducerMeta(ctx, meta))
 		}
 	}
-	if trace := tracing.SpanFromContext(ctx).GetConfiguredRecording(); trace != nil {
-		msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.RemoteProducerMetadata{
-			Value: &execinfrapb.RemoteProducerMetadata_TraceData_{
-				TraceData: &execinfrapb.RemoteProducerMetadata_TraceData{
-					CollectedSpans: trace,
+	if !o.flowCtx.Gateway {
+		if trace := tracing.SpanFromContext(ctx).GetConfiguredRecording(); trace != nil {
+			msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.RemoteProducerMetadata{
+				Value: &execinfrapb.RemoteProducerMetadata_TraceData_{
+					TraceData: &execinfrapb.RemoteProducerMetadata_TraceData{
+						CollectedSpans: trace,
+					},
 				},
-			},
-		})
+			})
+		}
 	}
 	if len(msg.Data.Metadata) == 0 {
 		return nil
 	}
+	log.VEvent(ctx, 2, "Outbox sending metadata")
 	return stream.Send(msg)
 }
 

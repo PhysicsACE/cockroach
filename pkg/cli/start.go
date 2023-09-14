@@ -35,9 +35,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverctl"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -47,7 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
@@ -313,45 +314,7 @@ func initTempStorageConfig(
 	return tempStorageConfig, nil
 }
 
-type newServerFn func(ctx context.Context, serverCfg server.Config, stopper *stop.Stopper) (serverStartupInterface, error)
-
-type serverStartupInterface interface {
-	serverShutdownInterface
-
-	// ClusterSettings retrieves this server's settings.
-	ClusterSettings() *cluster.Settings
-
-	// LogicalClusterID retrieves this server's logical cluster ID.
-	LogicalClusterID() uuid.UUID
-
-	// PreStart starts the server on the specified port(s) and
-	// initializes subsystems.
-	// It does not activate the pgwire listener over the network / unix
-	// socket, which is done by the AcceptClients() method. The separation
-	// between the two exists so that SQL initialization can take place
-	// before the first client is accepted.
-	PreStart(ctx context.Context) error
-
-	// AcceptClients starts listening for incoming SQL clients over the network.
-	AcceptClients(ctx context.Context) error
-	// AcceptInternalClients starts listening for incoming internal SQL clients over the
-	// loopback interface.
-	AcceptInternalClients(ctx context.Context) error
-
-	// InitialStart returns whether this node is starting for the first time.
-	// This is (currently) used when displaying the server status report
-	// on the terminal & in logs. We know that some folk have automation
-	// that depend on certain strings displayed from this when orchestrating
-	// KV-only nodes.
-	InitialStart() bool
-
-	// RunInitialSQL runs the SQL initialization for brand new clusters,
-	// if the cluster is being started for the first time.
-	// The arguments are:
-	// - startSingleNode is used by 'demo' and 'start-single-node'.
-	// - adminUser/adminPassword is used for 'demo'.
-	RunInitialSQL(ctx context.Context, startSingleNode bool, adminUser, adminPassword string) error
-}
+type newServerFn func(ctx context.Context, serverCfg server.Config, stopper *stop.Stopper) (serverctl.ServerStartupInterface, error)
 
 var errCannotUseJoin = errors.New("cannot use --join with 'cockroach start-single-node' -- use 'cockroach start' instead")
 
@@ -399,9 +362,9 @@ func runStartJoin(cmd *cobra.Command, args []string) error {
 func runStart(cmd *cobra.Command, args []string, startSingleNode bool) error {
 	const serverType redact.SafeString = "node"
 
-	newServerFn := func(_ context.Context, serverCfg server.Config, stopper *stop.Stopper) (serverStartupInterface, error) {
+	newServerFn := func(_ context.Context, serverCfg server.Config, stopper *stop.Stopper) (serverctl.ServerStartupInterface, error) {
 		// Beware of not writing simply 'return server.NewServer()'. This is
-		// because it would cause the serverStartupInterface reference to
+		// because it would cause the serverctl.ServerStartupInterface reference to
 		// always be non-nil, even if NewServer returns a nil pointer (and
 		// an error). The code below is dependent on the interface
 		// reference remaining nil in case of error.
@@ -515,10 +478,6 @@ func runStartInternal(
 	}
 	stopper.SetTracer(serverCfg.BaseConfig.AmbientCtx.Tracer)
 
-	// We don't care about GRPCs fairly verbose logs in most client commands,
-	// but when actually starting a server, we enable them.
-	grpcutil.LowerSeverity(severity.WARNING)
-
 	// Tweak GOMAXPROCS if we're in a cgroup / container that has cpu limits set.
 	// The GO default for GOMAXPROCS is NumCPU(), however this is less
 	// than ideal if the cgroup is limited to a number lower than that.
@@ -533,6 +492,14 @@ func runStartInternal(
 			errors.New("no --join flags provided to 'cockroach start'"),
 			"Consider using 'cockroach init' or 'cockroach start-single-node' instead")
 		return err
+	}
+
+	// Check the --tenant-id-file flag.
+	if fl := cliflagcfg.FlagSetForCmd(cmd).Lookup(cliflags.TenantIDFile.Name); fl != nil && fl.Changed {
+		fileName := fl.Value.String()
+		serverCfg.DelayedSetTenantID = func() (roachpb.TenantID, error) {
+			return tenantIDFromFile(fileName, nil, nil)
+		}
 	}
 
 	// Now perform additional configuration tweaks specific to the start
@@ -551,10 +518,15 @@ func runStartInternal(
 				)
 			}
 		} else {
-			if _, envVarSet := os.LookupEnv("GOMEMLIMIT"); envVarSet {
+			if envVarLimitString, envVarSet := envutil.ExternalEnvString("GOMEMLIMIT", 1); envVarSet {
 				// When --max-go-memory is not specified, but the env var is
-				// set, we don't change it.
-				if envVarLimit := envutil.EnvOrDefaultInt64("GOMEMLIMIT", -1); envVarLimit < defaultGoMemLimitMinValue {
+				// set, we don't change it, so we just log a warning if the
+				// value is too small.
+				envVarLimit, err := humanizeutil.ParseBytes(envVarLimitString)
+				if err != nil {
+					return errors.Wrapf(err, "couldn't parse GOMEMLIMIT value %s", envVarLimitString)
+				}
+				if envVarLimit < defaultGoMemLimitMinValue {
 					log.Ops.Shoutf(
 						ctx, severity.WARNING, "GOMEMLIMIT (%s) is smaller "+
 							"than the recommended minimum (%s), consider increasing it",
@@ -757,16 +729,16 @@ func createAndStartServerAsync(
 	newServerFn newServerFn,
 	startSingleNode bool,
 	serverType redact.SafeString,
-) (srvStatus *serverStatus, serverShutdownReqC <-chan server.ShutdownRequest) {
+) (srvStatus *serverStatus, serverShutdownReqC <-chan serverctl.ShutdownRequest) {
 	var serverStatusMu serverStatus
-	var s serverStartupInterface
-	shutdownReqC := make(chan server.ShutdownRequest, 1)
+	var s serverctl.ServerStartupInterface
+	shutdownReqC := make(chan serverctl.ShutdownRequest, 1)
 
 	log.Ops.Infof(ctx, "starting cockroach %s", serverType)
 
 	go func() {
 		// Ensure that the log files see the startup messages immediately.
-		defer log.Flush()
+		defer log.FlushAllSync()
 		// If anything goes dramatically wrong, use Go's panic/recover
 		// mechanism to intercept the panic and log the panic details to
 		// the error reporting server.
@@ -851,14 +823,16 @@ func createAndStartServerAsync(
 			return reportServerInfo(ctx, tBegin, serverCfg, s.ClusterSettings(),
 				serverType, s.InitialStart(), s.LogicalClusterID())
 		}(); err != nil {
-			shutdownReqC <- server.MakeShutdownRequest(
-				server.ShutdownReasonServerStartupError, errors.Wrapf(err, "server startup failed"))
+			shutdownReqC <- serverctl.MakeShutdownRequest(
+				serverctl.ShutdownReasonServerStartupError, errors.Wrapf(err, "server startup failed"))
 		} else {
 			// Start a goroutine that watches for shutdown requests and notifies
 			// errChan.
 			go func() {
 				select {
 				case req := <-s.ShutdownRequested():
+					shutdownCtx := s.AnnotateCtx(context.Background())
+					log.Infof(shutdownCtx, "server requesting spontaneous shutdown: %v", req.ShutdownCause())
 					shutdownReqC <- req
 				case <-stopper.ShouldQuiesce():
 				}
@@ -883,7 +857,7 @@ type serverStatus struct {
 	// s is a reference to the server, to be used by the shutdown process. This
 	// starts as nil, and is set by setStarted(). Once set, a graceful shutdown
 	// should use a soft drain.
-	s serverShutdownInterface
+	s serverctl.ServerShutdownInterface
 	// stopper is the server's stopper. This is set in setStarted(), together with
 	// `s`. The stopper is handed out to callers of startShutdown(), who will
 	// Stop() it.
@@ -902,7 +876,9 @@ type serverStatus struct {
 // setStarted returns whether shutdown has been requested already. If it has,
 // then the serverStatus does not take ownership of the stopper; the caller is
 // responsible for calling stopper.Stop().
-func (s *serverStatus) setStarted(server serverShutdownInterface, stopper *stop.Stopper) bool {
+func (s *serverStatus) setStarted(
+	server serverctl.ServerShutdownInterface, stopper *stop.Stopper,
+) bool {
 	s.Lock()
 	defer s.Unlock()
 	if s.shutdownRequested {
@@ -925,19 +901,11 @@ func (s *serverStatus) shutdownInProgress() bool {
 // was started already. If the server started, a reference to the server is also
 // returned, and a reference to the stopper that the caller needs to eventually
 // Stop().
-func (s *serverStatus) startShutdown() (bool, serverShutdownInterface, *stop.Stopper) {
+func (s *serverStatus) startShutdown() (bool, serverctl.ServerShutdownInterface, *stop.Stopper) {
 	s.Lock()
 	defer s.Unlock()
 	s.shutdownRequested = true
 	return s.s != nil, s.s, s.stopper
-}
-
-// serverShutdownInterface is the subset of the APIs on a server
-// object that's sufficient to run a server shutdown.
-type serverShutdownInterface interface {
-	AnnotateCtx(context.Context) context.Context
-	Drain(ctx context.Context, verbose bool) (uint64, redact.RedactableString, error)
-	ShutdownRequested() <-chan server.ShutdownRequest
 }
 
 // waitForShutdown blocks until interrupted by a shutdown signal, which can come
@@ -951,7 +919,7 @@ type serverShutdownInterface interface {
 // before shutting down.
 func waitForShutdown(
 	stopper *stop.Stopper,
-	shutdownC <-chan server.ShutdownRequest,
+	shutdownC <-chan serverctl.ShutdownRequest,
 	signalCh <-chan os.Signal,
 	serverStatusMu *serverStatus,
 ) (returnErr error) {
@@ -959,12 +927,15 @@ func waitForShutdown(
 	defer shutdownSpan.Finish()
 
 	stopWithoutDrain := make(chan struct{}) // closed if interrupted very early
+	msgDrain := redact.SafeString("initiating graceful shutdown of server")
 
 	select {
 	case shutdownRequest := <-shutdownC:
 		returnErr = shutdownRequest.ShutdownCause()
-		// There's no point in draining if the server didn't even fully start.
-		drain := shutdownRequest.Reason != server.ShutdownReasonServerStartupError
+		drain := shutdownRequest.TerminateUsingGracefulDrain()
+		if !drain {
+			msgDrain = "initiating hard shutdown of server"
+		}
 		startShutdownAsync(serverStatusMu, stopWithoutDrain, drain)
 
 	case sig := <-signalCh:
@@ -1016,8 +987,7 @@ func waitForShutdown(
 	// stop. From this point on, we just have to wait until the server
 	// indicates it has stopped.
 
-	const msgDrain = "initiating graceful shutdown of server"
-	log.Ops.Info(shutdownCtx, msgDrain)
+	log.Ops.Infof(shutdownCtx, "%s", msgDrain)
 	if !startCtx.inBackground {
 		fmt.Fprintln(os.Stdout, msgDrain)
 	}
@@ -1068,6 +1038,23 @@ func waitForShutdown(
 				redact.Safe(sig), redact.Safe(hardShutdownHint))
 			handleSignalDuringShutdown(sig)
 			panic("unreachable")
+
+		case shutdownRequest := <-shutdownC:
+			if shutdownRequest.TerminateUsingGracefulDrain() {
+				// Internal graceful drain request during graceful shutdown:
+				// continue the graceful shutdown.
+				log.Ops.Infof(shutdownCtx, "received additional shutdown request '%s'; continuing graceful shutdown", shutdownRequest.ShutdownCause())
+				continue
+			} else {
+				// A non-graceful shutdown request: we're done.
+				const msgDone = "internal error during drain; used hard shutdown instead"
+				returnErr = shutdownRequest.ShutdownCause()
+				log.Ops.Infof(shutdownCtx, "received additional shutdown request '%s'; initiating hard shutdown%s",
+					shutdownRequest.ShutdownCause(), redact.Safe(hardShutdownHint))
+				if !startCtx.inBackground {
+					fmt.Fprintln(os.Stdout, msgDone)
+				}
+			}
 
 		case <-stopper.IsStopped():
 			const msgDone = "server drained and shutdown completed"
@@ -1121,40 +1108,13 @@ func startShutdownAsync(
 		drainCtx := logtags.AddTag(s.AnnotateCtx(context.Background()), "server drain process", nil)
 
 		if shouldDrain {
-			// Perform a graceful drain. We keep retrying forever, in
-			// case there are many range leases or some unavailability
-			// preventing progress. If the operator wants to expedite
-			// the shutdown, they will need to make it ungraceful
-			// via a 2nd signal.
-			var (
-				remaining     = uint64(math.MaxUint64)
-				prevRemaining = uint64(math.MaxUint64)
-				verbose       = false
-			)
-
-			for ; ; prevRemaining = remaining {
-				var err error
-				remaining, _, err = s.Drain(drainCtx, verbose)
-				if err != nil {
-					log.Ops.Errorf(drainCtx, "graceful drain failed: %v", err)
-					break
-				}
-				if remaining == 0 {
-					// No more work to do.
-					break
-				}
-
-				// If range lease transfer stalls or the number of
-				// remaining leases somehow increases, verbosity is set
-				// to help with troubleshooting.
-				if remaining >= prevRemaining {
-					verbose = true
-				}
-
-				// Avoid a busy wait with high CPU usage if the server replies
-				// with an incomplete drain too quickly.
-				time.Sleep(200 * time.Millisecond)
-			}
+			// Perform a graceful drain. This function keeps retrying and
+			// the call might never complete (e.g. due to some
+			// unavailability preventing progress). This is intentional. If
+			// the operator wants to expedite the shutdown, they will need
+			// to make it ungraceful by sending a second signal to the
+			// process, which will tickle the shortcut in waitForShutdown().
+			server.CallDrainServerSide(drainCtx, s.Drain)
 		}
 
 		stopper.Stop(drainCtx)
@@ -1287,11 +1247,11 @@ func hintServerCmdFlags(ctx context.Context, cmd *cobra.Command) {
 	if !sqlAddrSpecified {
 		log.Ops.Shoutf(ctx, severity.WARNING,
 			"Running a server without --sql-addr, with a combined RPC/SQL listener, is deprecated.\n"+
-				"This feature will be removed in the next version of CockroachDB.")
+				"This feature will be removed in a later version of CockroachDB.")
 	}
 
 	changed := func(flagName string) bool {
-		fl := pf.Lookup(cliflags.ListenAddr.Name)
+		fl := pf.Lookup(flagName)
 		return fl != nil && fl.Changed
 	}
 
@@ -1546,7 +1506,7 @@ func reportReadinessExternally(ctx context.Context, cmd *cobra.Command, waitForI
 	// Ensure the configuration logging is written to disk in case a
 	// process is waiting for the sdnotify readiness to read important
 	// information from there.
-	log.Flush()
+	log.FlushAllSync()
 
 	// Signal readiness. This unblocks the process when running with
 	// --background or under systemd.

@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -50,8 +51,7 @@ func (d *RowDecoder) DecodeRow(
 	// First we need to decode the setting name field from the index key.
 	keyTypes := []*types.T{d.columns[0].GetType(), d.columns[1].GetType()}
 	keyVals := make([]rowenc.EncDatum, 2)
-	_, _, err := rowenc.DecodeIndexKey(keys.SystemSQLCodec, keyTypes, keyVals, nil, kv.Key)
-	if err != nil {
+	if _, err := rowenc.DecodeIndexKey(keys.SystemSQLCodec, keyVals, nil, kv.Key); err != nil {
 		return roachpb.TenantID{}, kvpb.TenantSetting{}, false, errors.Wrap(err, "failed to decode key")
 	}
 	for i := range keyVals {
@@ -62,7 +62,7 @@ func (d *RowDecoder) DecodeRow(
 	// We do not use MustMakeTenantID because we want to tolerate the 0 value.
 	tenantID := roachpb.TenantID{InternalValue: uint64(tree.MustBeDInt(keyVals[0].Datum))}
 	var setting kvpb.TenantSetting
-	setting.Name = string(tree.MustBeDString(keyVals[1].Datum))
+	setting.InternalKey = settings.InternalKey(tree.MustBeDString(keyVals[1].Datum))
 	if !kv.Value.IsPresent() {
 		return tenantID, setting, true, nil
 	}

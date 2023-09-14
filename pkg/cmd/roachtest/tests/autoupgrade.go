@@ -13,7 +13,6 @@ package tests
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -22,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/errors"
 )
 
@@ -46,7 +45,7 @@ func registerAutoUpgrade(r registry.Registry) {
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, nodes))
 
 		const stageDuration = 30 * time.Second
-		const timeUntilStoreDead = 90 * time.Second
+		const timeUntilNodeDead = 90 * time.Second
 		const buff = 10 * time.Second
 
 		sleep := func(ts time.Duration) error {
@@ -63,7 +62,7 @@ func registerAutoUpgrade(r registry.Registry) {
 		defer db.Close()
 
 		if _, err := db.ExecContext(ctx,
-			"SET CLUSTER SETTING server.time_until_store_dead = $1", timeUntilStoreDead.String(),
+			"SET CLUSTER SETTING server.time_until_store_dead = $1", timeUntilNodeDead.String(),
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -169,7 +168,7 @@ func registerAutoUpgrade(r registry.Registry) {
 		if err := decommissionAndStop(nodeDecommissioned); err != nil {
 			t.Fatal(err)
 		}
-		if err := sleep(timeUntilStoreDead + buff); err != nil {
+		if err := sleep(timeUntilNodeDead + buff); err != nil {
 			t.Fatal(err)
 		}
 
@@ -249,18 +248,15 @@ func registerAutoUpgrade(r registry.Registry) {
 
 		// Wipe n3 to exclude it from the dead node check the roachtest harness
 		// will perform after the test.
-		c.Wipe(ctx, c.Node(nodeDecommissioned))
+		c.Wipe(ctx, false /* preserveCerts */, c.Node(nodeDecommissioned))
 	}
 
 	r.Add(registry.TestSpec{
 		Name:    `autoupgrade`,
-		Owner:   registry.OwnerKV,
+		Owner:   registry.OwnerTestEng,
 		Cluster: r.MakeClusterSpec(5),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			if c.IsLocal() && runtime.GOARCH == "arm64" {
-				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
-			}
-			pred, err := version.PredecessorVersion(*t.BuildVersion())
+			pred, err := release.LatestPredecessor(t.BuildVersion())
 			if err != nil {
 				t.Fatal(err)
 			}

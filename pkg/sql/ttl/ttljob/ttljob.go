@@ -25,10 +25,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -46,28 +47,28 @@ var (
 		"default amount of rows to select in a single query during a TTL job",
 		500,
 		settings.PositiveInt,
-	).WithPublic()
+		settings.WithPublic)
 	defaultDeleteBatchSize = settings.RegisterIntSetting(
 		settings.TenantWritable,
 		"sql.ttl.default_delete_batch_size",
 		"default amount of rows to delete in a single query during a TTL job",
 		100,
 		settings.PositiveInt,
-	).WithPublic()
+		settings.WithPublic)
 	defaultDeleteRateLimit = settings.RegisterIntSetting(
 		settings.TenantWritable,
 		"sql.ttl.default_delete_rate_limit",
 		"default delete rate limit for all TTL jobs. Use 0 to signify no rate limit.",
 		0,
 		settings.NonNegativeInt,
-	).WithPublic()
+		settings.WithPublic)
 
 	jobEnabled = settings.RegisterBoolSetting(
 		settings.TenantWritable,
 		"sql.ttl.job.enabled",
 		"whether the TTL job is enabled",
 		true,
-	).WithPublic()
+		settings.WithPublic)
 )
 
 type rowLevelTTLResumer struct {
@@ -122,7 +123,8 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		// early as the delete will not work.
 		modificationTime := desc.GetModificationTime().GoTime()
 		if modificationTime.After(aost) {
-			return errors.Newf(
+			return pgerror.Newf(
+				pgcode.ObjectNotInPrerequisiteState,
 				"found a recent schema change on the table at %s, aborting",
 				modificationTime.Format(time.RFC3339),
 			)
@@ -135,7 +137,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		rowLevelTTL = *desc.GetRowLevelTTL()
 
 		if rowLevelTTL.Pause {
-			return errors.Newf("ttl jobs on table %s are currently paused", tree.Name(desc.GetName()))
+			return pgerror.Newf(pgcode.OperatorIntervention, "ttl jobs on table %s are currently paused", tree.Name(desc.GetName()))
 		}
 
 		tn, err := descs.GetObjectName(ctx, txn, descsCol, desc)
@@ -150,10 +152,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		return err
 	}
 
-	ttlExpr := colinfo.DefaultTTLExpirationExpr
-	if rowLevelTTL.HasExpirationExpr() {
-		ttlExpr = "(" + rowLevelTTL.ExpirationExpr + ")"
-	}
+	ttlExpr := rowLevelTTL.GetTTLExpr()
 
 	labelMetrics := rowLevelTTL.LabelMetrics
 	group := ctxgroup.WithContext(ctx)
@@ -331,7 +330,7 @@ func checkEnabled(settingsValues *settings.Values) error {
 	if enabled := jobEnabled.Get(settingsValues); !enabled {
 		return errors.Newf(
 			"ttl jobs are currently disabled by CLUSTER SETTING %s",
-			jobEnabled.Key(),
+			jobEnabled.Name(),
 		)
 	}
 	return nil

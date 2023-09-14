@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/stretchr/testify/require"
@@ -58,8 +59,9 @@ func encInt(i int) rowenc.EncDatum {
 
 func TestZigzagJoiner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
+	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
@@ -707,12 +709,12 @@ func TestZigzagJoiner(t *testing.T) {
 
 			out := &distsqlutils.RowBuffer{}
 			post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: c.outCols}
-			z, err := newZigzagJoiner(ctx, &flowCtx, 0 /* processorID */, &c.spec, c.fixedValues, &post, out)
+			z, err := newZigzagJoiner(ctx, &flowCtx, 0 /* processorID */, &c.spec, c.fixedValues, &post)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			z.Run(ctx)
+			z.Run(ctx, out)
 
 			if !out.ProducerClosed() {
 				t.Fatalf("output RowReceiver not closed")
@@ -741,8 +743,9 @@ func TestZigzagJoiner(t *testing.T) {
 // is closed.
 func TestZigzagJoinerDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
+	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
@@ -771,16 +774,18 @@ func TestZigzagJoinerDrain(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 
 	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
-	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 		Txn:     leafTxn,
+		Gateway: false,
 	}
 
-	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
+	testReaderProcessorDrain(ctx, t, func() (execinfra.Processor, error) {
 		return newZigzagJoiner(
 			ctx,
 			&flowCtx,
@@ -800,7 +805,6 @@ func TestZigzagJoinerDrain(t *testing.T) {
 			},
 			[]rowenc.EncDatumRow{{encThree}, {encSeven}},
 			&execinfrapb.PostProcessSpec{Projection: true, OutputColumns: []uint32{0, 1}},
-			out,
 		)
 	})
 }

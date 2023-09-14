@@ -98,7 +98,8 @@ type Optimizer struct {
 	// JoinOrderBuilder adds new join orderings to the memo.
 	jb JoinOrderBuilder
 
-	// rng is used to deterministically perturb costs and/or disable rules.
+	// rng is used to deterministically perturb costs and/or disable rules and/or
+	// determine the visibility (for this query) of a partially visible index.
 	rng *rand.Rand
 
 	// scratchSort is used to avoid repeated allocations during sort enforcement.
@@ -497,7 +498,7 @@ func (o *Optimizer) optimizeGroup(grp memo.RelExpr, required *physical.Required)
 		// times, there is likely a cycle in the memo. To avoid a stack
 		// overflow, throw an internal error. The formatted memo is included as
 		// an error detail to aid in debugging the cycle.
-		mf := makeMemoFormatter(o, FmtCycle)
+		mf := makeMemoFormatter(o, FmtCycle, false /* redactableValues */)
 		panic(errors.WithDetail(
 			errors.AssertionFailedf(
 				"memo group optimization passes surpassed limit of %v; "+
@@ -702,7 +703,7 @@ func (o *Optimizer) enforceProps(
 }
 
 // optimizeEnforcer optimizes and costs the enforcer. getEnforcer is used to
-// reset the enforcer after recusing in optimizeGroup, since the current group
+// reset the enforcer after recursing in optimizeGroup, since the current group
 // and its children may use the same SortExpr to avoid allocations.
 func (o *Optimizer) optimizeEnforcer(
 	state *groupState,
@@ -1108,13 +1109,13 @@ func (o *Optimizer) disableRulesRandom(probability float64) {
 }
 
 func (o *Optimizer) String() string {
-	return o.FormatMemo(FmtPretty)
+	return o.FormatMemo(FmtPretty, false /* redactableValues */)
 }
 
 // FormatMemo returns a string representation of the memo for testing
 // and debugging. The given flags control which properties are shown.
-func (o *Optimizer) FormatMemo(flags FmtFlags) string {
-	mf := makeMemoFormatter(o, flags)
+func (o *Optimizer) FormatMemo(flags FmtFlags, redactableValues bool) string {
+	mf := makeMemoFormatter(o, flags, redactableValues)
 	return mf.format()
 }
 
@@ -1155,8 +1156,8 @@ func (o *Optimizer) recomputeCostImpl(
 }
 
 // FormatExpr is a convenience wrapper for memo.FormatExpr.
-func (o *Optimizer) FormatExpr(e opt.Expr, flags memo.ExprFmtFlags) string {
-	return memo.FormatExpr(o.ctx, e, flags, o.mem, o.catalog)
+func (o *Optimizer) FormatExpr(e opt.Expr, flags memo.ExprFmtFlags, redactableValues bool) string {
+	return memo.FormatExpr(o.ctx, e, flags, redactableValues, o.mem, o.catalog)
 }
 
 // CustomFuncs exports the xform.CustomFuncs for testing purposes.

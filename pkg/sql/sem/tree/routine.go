@@ -13,6 +13,7 @@ package tree
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -98,10 +99,33 @@ type RoutineExpr struct {
 	// its inputs are NULL. If false, the function will not be evaluated in the
 	// presence of null inputs, and will instead evaluate directly to NULL.
 	//
-	// NOTE: This boolean only affects evaluation of set-returning Routines.
+	// NOTE: This boolean only affects evaluation of Routines within project-set
+	// operators. This can apply to scalar routines if they are used as data
+	// source (e.g. SELECT * FROM scalar_udf()), and always applies to
+	// set-returning routines.
 	// Strict non-set-returning routines are not invoked when their arguments
 	// are NULL because optbuilder wraps them in a CASE expressions.
 	CalledOnNullInput bool
+
+	// MultiColOutput is true if the function may return multiple columns.
+	MultiColOutput bool
+
+	// Generator is true if the function may output a set of rows.
+	Generator bool
+
+	// TailCall is true if the routine is in a tail-call position in a parent
+	// routine. This means that once execution reaches this routine, the parent
+	// routine will return the result of evaluating this routine with no further
+	// changes. For routines in a tail-call position we implement an optimization
+	// to avoid nesting execution. This is necessary for performant PLpgSQL loops.
+	TailCall bool
+
+	// Procedure is true if the routine is a procedure being invoked by CALL.
+	Procedure bool
+
+	// ExceptionHandler holds the information needed to handle errors if an
+	// exception block was defined.
+	ExceptionHandler *RoutineExceptionHandler
 }
 
 // NewTypedRoutineExpr returns a new RoutineExpr that is well-typed.
@@ -112,6 +136,11 @@ func NewTypedRoutineExpr(
 	typ *types.T,
 	enableStepping bool,
 	calledOnNullInput bool,
+	multiColOutput bool,
+	generator bool,
+	tailCall bool,
+	procedure bool,
+	exceptionHandler *RoutineExceptionHandler,
 ) *RoutineExpr {
 	return &RoutineExpr{
 		Args:              args,
@@ -120,6 +149,11 @@ func NewTypedRoutineExpr(
 		EnableStepping:    enableStepping,
 		Name:              name,
 		CalledOnNullInput: calledOnNullInput,
+		MultiColOutput:    multiColOutput,
+		Generator:         generator,
+		TailCall:          tailCall,
+		Procedure:         procedure,
+		ExceptionHandler:  exceptionHandler,
 	}
 }
 
@@ -146,4 +180,14 @@ func (node *RoutineExpr) Format(ctx *FmtCtx) {
 func (node *RoutineExpr) Walk(v Visitor) Expr {
 	// Cannot walk into a routine, so this is a no-op.
 	return node
+}
+
+// RoutineExceptionHandler encapsulates the information needed to match and
+// handle errors for the exception block of a routine defined with PLpgSQL.
+type RoutineExceptionHandler struct {
+	// Codes is a list of pgcode strings used to match exceptions.
+	Codes []pgcode.Code
+
+	// Actions contains a routine to handle each error code.
+	Actions []*RoutineExpr
 }

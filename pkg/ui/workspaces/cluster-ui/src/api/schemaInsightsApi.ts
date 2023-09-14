@@ -23,7 +23,8 @@ import {
   InsightType,
   recommendDropUnusedIndex,
 } from "../insights";
-import { HexStringToInt64String } from "../util";
+import { HexStringToInt64String, indexUnusedDuration } from "../util";
+import { QuoteIdentifier } from "./safesql";
 
 // Export for db-console import from clusterUiApi.
 export type { InsightRecommendation } from "../insights";
@@ -50,12 +51,16 @@ type CreateIndexRecommendationsResponse = {
   index_recommendations: string[];
 };
 
+export type SchemaInsightReqParams = {
+  csIndexUnusedDuration: string;
+};
+
 type SchemaInsightResponse =
   | ClusterIndexUsageStatistic
   | CreateIndexRecommendationsResponse;
 type SchemaInsightQuery<RowType> = {
   name: InsightType;
-  query: string;
+  query: string | ((csIndexUnusedDuration: string) => string);
   toSchemaInsight: (response: SqlTxnResult<RowType>) => InsightRecommendation[];
 };
 
@@ -72,7 +77,11 @@ function clusterIndexUsageStatsToSchemaInsight(
         results[key] = {
           type: "DropIndex",
           database: row.database_name,
-          query: `DROP INDEX ${row.schema_name}.${row.table_name}@${row.index_name};`,
+          query: `DROP INDEX ${QuoteIdentifier(
+            row.schema_name,
+          )}.${QuoteIdentifier(row.table_name)}@${QuoteIdentifier(
+            row.index_name,
+          )};`,
           indexDetails: {
             table: row.table_name,
             indexID: row.index_id,
@@ -95,6 +104,9 @@ function createIndexRecommendationsToSchemaInsight(
 
   txn_result.rows.forEach(row => {
     row.index_recommendations.forEach(rec => {
+      if (!rec.includes(" : ")) {
+        return;
+      }
       const recSplit = rec.split(" : ");
       const recType = recSplit[0];
       const recQuery = recSplit[1];
@@ -134,12 +146,9 @@ function createIndexRecommendationsToSchemaInsight(
 // and want to return the most used ones as a priority.
 const dropUnusedIndexQuery: SchemaInsightQuery<ClusterIndexUsageStatistic> = {
   name: "DropIndex",
-  query: `WITH cs AS (
-    SELECT value 
-        FROM crdb_internal.cluster_settings 
-    WHERE variable = 'sql.index_recommendation.drop_unused_duration'
-    )
-    SELECT * FROM (SELECT us.table_id,
+  query: (csIndexUnusedDuration: string) => {
+    csIndexUnusedDuration = csIndexUnusedDuration ?? indexUnusedDuration;
+    return `SELECT * FROM (SELECT us.table_id,
                           us.index_id,
                           us.last_read,
                           us.total_reads,
@@ -149,44 +158,52 @@ const dropUnusedIndexQuery: SchemaInsightQuery<ClusterIndexUsageStatistic> = {
                           t.parent_id as database_id,
                           t.database_name,
                           t.schema_name,
-                          cs.value as unused_threshold,
-                          cs.value::interval as interval_threshold, 
+                          '${csIndexUnusedDuration}' as unused_threshold,
+                          '${csIndexUnusedDuration}'::interval as interval_threshold, 
                           now() - COALESCE(us.last_read AT TIME ZONE 'UTC', COALESCE(ti.created_at, '0001-01-01')) as unused_interval
                    FROM "".crdb_internal.index_usage_statistics AS us
                             JOIN "".crdb_internal.table_indexes as ti
                                  ON us.index_id = ti.index_id AND us.table_id = ti.descriptor_id
                             JOIN "".crdb_internal.tables as t
                                  ON t.table_id = ti.descriptor_id and t.name = ti.descriptor_name
-                            CROSS JOIN cs
-                   WHERE t.database_name != 'system' AND ti.index_type != 'primary')
+                   WHERE t.database_name != 'system' AND ti.is_unique IS false)
           WHERE unused_interval > interval_threshold
-          ORDER BY total_reads DESC;`,
+          ORDER BY total_reads DESC;`;
+  },
   toSchemaInsight: clusterIndexUsageStatsToSchemaInsight,
 };
 
 const createIndexRecommendationsQuery: SchemaInsightQuery<CreateIndexRecommendationsResponse> =
   {
     name: "CreateIndex",
-    query: `SELECT
-       encode(fingerprint_id, 'hex') AS fingerprint_id,  
-       metadata ->> 'db' AS db, 
-       metadata ->> 'query' AS query, 
-       metadata ->> 'querySummary' as querySummary, 
-       metadata ->> 'implicitTxn' AS implicitTxn, 
-       index_recommendations 
-    FROM (
-      SELECT 
-        fingerprint_id, 
-        statistics -> 'statistics' ->> 'lastExecAt' as lastExecAt, 
-        metadata, 
-        index_recommendations, 
-        row_number() over(
-          PARTITION BY 
-            fingerprint_id 
-          ORDER BY statistics -> 'statistics' ->> 'lastExecAt' DESC
-        ) AS rank 
-      FROM crdb_internal.statement_statistics WHERE aggregated_ts >= now() - INTERVAL '1 week')
-      WHERE rank=1 AND array_length(index_recommendations,1) > 0;`,
+    query: `
+SELECT
+  encode(fingerprint_id, 'hex') AS fingerprint_id, 
+  metadata ->> 'db' AS db, 
+  metadata ->> 'query' AS query, 
+  metadata ->> 'querySummary' as querySummary, 
+  metadata ->> 'implicitTxn' AS implicitTxn, 
+  index_recommendations 
+FROM 
+  (
+    SELECT 
+      fingerprint_id, 
+      statistics -> 'statistics' ->> 'lastExecAt' as lastExecAt, 
+      metadata, 
+      index_recommendations, 
+      row_number() over(
+        PARTITION BY fingerprint_id 
+        ORDER BY 
+          statistics -> 'statistics' ->> 'lastExecAt' DESC
+      ) AS rank 
+    FROM 
+      crdb_internal.statement_statistics_persisted 
+    WHERE 
+      aggregated_ts >= now() - INTERVAL '1 week'
+  ) 
+WHERE 
+  rank = 1 AND array_length(index_recommendations, 1) > 0;
+`,
     toSchemaInsight: createIndexRecommendationsToSchemaInsight,
   };
 
@@ -195,14 +212,24 @@ const schemaInsightQueries: SchemaInsightQuery<SchemaInsightResponse>[] = [
   createIndexRecommendationsQuery,
 ];
 
+function getQuery(
+  csIndexUnusedDuration: string,
+  query: string | ((csIndexUnusedDuration: string) => string),
+): string {
+  if (typeof query == "string") {
+    return query;
+  }
+  return query(csIndexUnusedDuration);
+}
+
 // getSchemaInsights makes requests over the SQL API and transforms the corresponding
 // SQL responses into schema insights.
-export async function getSchemaInsights(): Promise<
-  SqlApiResponse<InsightRecommendation[]>
-> {
+export async function getSchemaInsights(
+  params: SchemaInsightReqParams,
+): Promise<SqlApiResponse<InsightRecommendation[]>> {
   const request: SqlExecutionRequest = {
     statements: schemaInsightQueries.map(insightQuery => ({
-      sql: insightQuery.query,
+      sql: getQuery(params.csIndexUnusedDuration, insightQuery.query),
     })),
     execute: true,
     max_result_size: LARGE_RESULT_SIZE,
@@ -212,7 +239,11 @@ export async function getSchemaInsights(): Promise<
 
   const results: InsightRecommendation[] = [];
   if (sqlResultsAreEmpty(result)) {
-    return formatApiResult([], result.error, "retrieving insights information");
+    return formatApiResult<InsightRecommendation[]>(
+      [],
+      result.error,
+      "retrieving insights information",
+    );
   }
   result.execution.txn_results.map(txn_result => {
     // Note: txn_result.statement values begin at 1, not 0.
@@ -222,7 +253,7 @@ export async function getSchemaInsights(): Promise<
       results.push(...insightQuery.toSchemaInsight(txn_result));
     }
   });
-  return formatApiResult(
+  return formatApiResult<InsightRecommendation[]>(
     results,
     result.error,
     "retrieving insights information",

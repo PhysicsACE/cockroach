@@ -50,11 +50,12 @@ type joinReaderState int
 
 const (
 	jrStateUnknown joinReaderState = iota
-	// jrReadingInput means that a batch of rows is being read from the input.
+	// jrReadingInput means that a batch of rows is being read from the input and
+	// matching KVs from the lookup index are being scanned.
 	jrReadingInput
-	// jrPerformingLookup means we are performing an index lookup for the current
-	// input row batch.
-	jrPerformingLookup
+	// jrFetchingLookupRows means we are fetching an index lookup row from the
+	// buffered batch of lookup rows that were previously read from the KV layer.
+	jrFetchingLookupRows
 	// jrEmittingRows means we are emitting the results of the index lookup.
 	jrEmittingRows
 	// jrReadyToDrain means we are done but have not yet started draining.
@@ -191,6 +192,10 @@ type joinReader struct {
 	// disk.
 	rowsRead int64
 
+	contentionEventsListener  execstats.ContentionEventsListener
+	scanStatsListener         execstats.ScanStatsListener
+	tenantConsumptionListener execstats.TenantConsumptionListener
+
 	// curBatchRowsRead is the number of rows that this fetcher read from disk for
 	// the current batch.
 	curBatchRowsRead int64
@@ -240,10 +245,6 @@ type joinReader struct {
 	// of hard and soft limits.
 	limitHintHelper execinfra.LimitHintHelper
 
-	// scanStats is collected from the trace after we finish doing work for this
-	// join.
-	scanStats execstats.ScanStats
-
 	// Set errorOnLookup to true to cause the join to error out just prior to
 	// performing a lookup. This is currently only set when the join contains
 	// only lookups to rows in remote regions and remote accesses are set to
@@ -281,7 +282,6 @@ func newJoinReader(
 	spec *execinfrapb.JoinReaderSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 	readerType joinReaderType,
 ) (execinfra.RowSourcedProcessor, error) {
 	if spec.OutputGroupContinuationForLeftRow && !spec.MaintainOrdering {
@@ -409,7 +409,6 @@ func newJoinReader(
 		spec.OnExpr,
 		spec.OutputGroupContinuationForLeftRow,
 		post,
-		output,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{jr.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -453,16 +452,11 @@ func newJoinReader(
 	if jr.usesStreamer {
 		minMemoryLimit = 100 << 10
 	}
-	memoryLimit := execinfra.GetWorkMemLimit(flowCtx)
-	if memoryLimit < minMemoryLimit {
-		memoryLimit = minMemoryLimit
-	}
 
 	// Initialize memory monitors and bound account for data structures in the joinReader.
-	jr.MemMonitor = mon.NewMonitorInheritWithLimit(
-		"joinreader-mem" /* name */, memoryLimit, flowCtx.Mon,
+	jr.MemMonitor = execinfra.NewLimitedMonitorWithLowerBound(
+		ctx, flowCtx, "joinreader-mem" /* name */, minMemoryLimit,
 	)
-	jr.MemMonitor.StartNoReserved(ctx, flowCtx.Mon)
 	jr.memAcc = jr.MemMonitor.MakeBoundAccount()
 
 	if err := jr.initJoinReaderStrategy(ctx, flowCtx, rightTypes, readerType); err != nil {
@@ -470,6 +464,10 @@ func newJoinReader(
 	}
 	jr.batchSizeBytes = jr.strategy.getLookupRowsBatchSizeHint(flowCtx.EvalCtx.SessionData())
 
+	memoryLimit := execinfra.GetWorkMemLimit(flowCtx)
+	if memoryLimit < minMemoryLimit {
+		memoryLimit = minMemoryLimit
+	}
 	var streamingKVFetcher *row.KVFetcher
 	if jr.usesStreamer {
 		// NOTE: this comment should only be considered in a case of low workmem
@@ -750,8 +748,8 @@ func (jr *joinReader) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata)
 		switch jr.runningState {
 		case jrReadingInput:
 			jr.runningState, row, meta = jr.readInput()
-		case jrPerformingLookup:
-			jr.runningState, meta = jr.performLookup()
+		case jrFetchingLookupRows:
+			jr.runningState, meta = jr.fetchLookupRow()
 		case jrEmittingRows:
 			jr.runningState, row, meta = jr.emitRow()
 		case jrReadyToDrain:
@@ -821,7 +819,26 @@ func sortSpans(spans roachpb.Spans, spanIDs []int) {
 	}
 }
 
-// readInput reads the next batch of input rows and starts an index scan.
+func (jr *joinReader) getBatchBytesLimit() rowinfra.BytesLimit {
+	if jr.usesStreamer {
+		// The streamer itself sets the correct TargetBytes parameter on the
+		// BatchRequests.
+		return rowinfra.NoBytesLimit
+	}
+	if !jr.shouldLimitBatches {
+		// We deem it safe to not limit the batches in order to get the
+		// DistSender-level parallelism.
+		return rowinfra.NoBytesLimit
+	}
+	bytesLimit := jr.lookupBatchBytesLimit
+	if bytesLimit == 0 {
+		bytesLimit = rowinfra.GetDefaultBatchBytesLimit(jr.EvalCtx.TestingKnobs.ForceProductionValues)
+	}
+	return bytesLimit
+}
+
+// readInput reads the next batch of input rows and starts an index scan, which
+// for lookup join is the lookup of matching KVs for a batch of input rows.
 // It can sometimes emit a single row on behalf of the previous batch.
 func (jr *joinReader) readInput() (
 	joinReaderState,
@@ -969,6 +986,17 @@ func (jr *joinReader) readInput() (
 		// All of the input rows were filtered out. Skip the index lookup.
 		return jrEmittingRows, outRow, nil
 	}
+	if jr.errorOnLookup {
+		// If spans has a non-zero length, the call to StartScan below will
+		// perform a batch lookup of kvs, so error out before that happens if
+		// we were instructed to do so via the errorOnLookup flag.
+		err = noHomeRegionError
+		if jr.allowEnforceHomeRegionFollowerReads {
+			err = execinfra.NewDynamicQueryHasNoHomeRegionError(err)
+		}
+		jr.MoveToDraining(err)
+		return jrStateUnknown, nil, jr.DrainHelper()
+	}
 
 	// Sort the spans by key order, except for a special case: an index-join with
 	// maintainOrdering. That case can be executed efficiently if we don't sort:
@@ -1006,41 +1034,25 @@ func (jr *joinReader) readInput() (
 	// modification here, but we want to be conscious about the memory
 	// accounting - we don't double count for any memory of spans because the
 	// joinReaderStrategy doesn't account for any memory used by the spans.
-	var bytesLimit rowinfra.BytesLimit
-	if !jr.usesStreamer {
-		if !jr.shouldLimitBatches {
-			bytesLimit = rowinfra.NoBytesLimit
-		} else {
-			bytesLimit = jr.lookupBatchBytesLimit
-			if jr.lookupBatchBytesLimit == 0 {
-				bytesLimit = rowinfra.GetDefaultBatchBytesLimit(jr.EvalCtx.TestingKnobs.ForceProductionValues)
-			}
-		}
-	}
 	if err = jr.fetcher.StartScan(
-		jr.Ctx(), spans, spanIDs, bytesLimit, rowinfra.NoRowLimit,
+		jr.Ctx(), spans, spanIDs, jr.getBatchBytesLimit(), rowinfra.NoRowLimit,
 	); err != nil {
 		jr.MoveToDraining(err)
 		return jrStateUnknown, nil, jr.DrainHelper()
 	}
 
-	return jrPerformingLookup, outRow, nil
+	return jrFetchingLookupRows, outRow, nil
 }
 
 var noHomeRegionError = pgerror.Newf(pgcode.QueryHasNoHomeRegion,
 	"Query has no home region. Try using a lower LIMIT value or running the query from a different region. %s",
 	sqlerrors.EnforceHomeRegionFurtherInfo)
 
-// performLookup reads the next batch of index rows.
-func (jr *joinReader) performLookup() (joinReaderState, *execinfrapb.ProducerMetadata) {
-	if jr.errorOnLookup {
-		err := noHomeRegionError
-		if jr.allowEnforceHomeRegionFollowerReads {
-			err = execinfra.NewDynamicQueryHasNoHomeRegionError(err)
-		}
-		jr.MoveToDraining(err)
-		return jrStateUnknown, jr.DrainHelper()
-	}
+// fetchLookupRow fetches the next lookup row from the fetcher's batchResponse
+// buffer, which was filled via a call to StartScan in joinReader.readInput.
+// It also starts the KV lookups for the remote branch of locality-optimized
+// join, if those have not yet started.
+func (jr *joinReader) fetchLookupRow() (joinReaderState, *execinfrapb.ProducerMetadata) {
 	for {
 		// Fetch the next row and tell the strategy to process it.
 		lookedUpRow, spanID, err := jr.fetcher.NextRow(jr.Ctx())
@@ -1058,7 +1070,7 @@ func (jr *joinReader) performLookup() (joinReaderState, *execinfrapb.ProducerMet
 		if nextState, err := jr.strategy.processLookedUpRow(jr.Ctx(), lookedUpRow, spanID); err != nil {
 			jr.MoveToDraining(err)
 			return jrStateUnknown, jr.DrainHelper()
-		} else if nextState != jrPerformingLookup {
+		} else if nextState != jrFetchingLookupRows {
 			return nextState, nil
 		}
 	}
@@ -1089,17 +1101,13 @@ func (jr *joinReader) performLookup() (joinReaderState, *execinfrapb.ProducerMet
 			}
 
 			log.VEventf(jr.Ctx(), 1, "scanning %d remote spans", len(spans))
-			bytesLimit := rowinfra.GetDefaultBatchBytesLimit(jr.EvalCtx.TestingKnobs.ForceProductionValues)
-			if !jr.shouldLimitBatches {
-				bytesLimit = rowinfra.NoBytesLimit
-			}
 			if err := jr.fetcher.StartScan(
-				jr.Ctx(), spans, spanIDs, bytesLimit, rowinfra.NoRowLimit,
+				jr.Ctx(), spans, spanIDs, jr.getBatchBytesLimit(), rowinfra.NoRowLimit,
 			); err != nil {
 				jr.MoveToDraining(err)
 				return jrStateUnknown, jr.DrainHelper()
 			}
-			return jrPerformingLookup, nil
+			return jrFetchingLookupRows, nil
 		}
 	}
 
@@ -1153,7 +1161,10 @@ func (jr *joinReader) performMemoryAccounting() error {
 
 // Start is part of the RowSource interface.
 func (jr *joinReader) Start(ctx context.Context) {
-	ctx = jr.StartInternal(ctx, joinReaderProcName)
+	ctx = jr.StartInternal(
+		ctx, joinReaderProcName, &jr.contentionEventsListener,
+		&jr.scanStatsListener, &jr.tenantConsumptionListener,
+	)
 	jr.input.Start(ctx)
 	jr.runningState = jrReadingInput
 }
@@ -1202,18 +1213,17 @@ func (jr *joinReader) execStatsForTrace() *execinfrapb.ComponentStats {
 		return nil
 	}
 
-	jr.scanStats = execstats.GetScanStats(jr.Ctx(), jr.ExecStatsTrace)
-	contentionTime, contentionEvents := execstats.GetCumulativeContentionTime(jr.Ctx(), jr.ExecStatsTrace)
 	ret := &execinfrapb.ComponentStats{
 		Inputs: []execinfrapb.InputStats{is},
 		KV: execinfrapb.KVStats{
 			BytesRead:           optional.MakeUint(uint64(jr.fetcher.GetBytesRead())),
+			KVPairsRead:         optional.MakeUint(uint64(jr.fetcher.GetKVPairsRead())),
 			TuplesRead:          fis.NumTuples,
 			KVTime:              fis.WaitTime,
-			ContentionTime:      optional.MakeTimeValue(contentionTime),
-			ContentionEvents:    contentionEvents,
+			ContentionTime:      optional.MakeTimeValue(jr.contentionEventsListener.CumulativeContentionTime),
 			BatchRequestsIssued: optional.MakeUint(uint64(jr.fetcher.GetBatchRequestsIssued())),
 			KVCPUTime:           optional.MakeTimeValue(fis.kvCPUTime),
+			UsedStreamer:        jr.usesStreamer,
 		},
 		Output: jr.OutputHelper.Stats(),
 	}
@@ -1229,8 +1239,8 @@ func (jr *joinReader) execStatsForTrace() *execinfrapb.ComponentStats {
 			ret.Exec.MaxAllocatedDisk.Add(jr.streamerInfo.diskMonitor.MaximumBytes())
 		}
 	}
-	ret.Exec.ConsumedRU = optional.MakeUint(jr.scanStats.ConsumedRU)
-	execstats.PopulateKVMVCCStats(&ret.KV, &jr.scanStats)
+	ret.Exec.ConsumedRU = optional.MakeUint(jr.tenantConsumptionListener.ConsumedRU)
+	execstats.PopulateKVMVCCStats(&ret.KV, &jr.scanStatsListener.ScanStats)
 	return ret
 }
 

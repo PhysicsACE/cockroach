@@ -21,7 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -37,20 +40,22 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 func TestCloser(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+
 	st := cluster.MakeTestingClusterSettings()
 	start := timeutil.Now()
 	timeSource := timeutil.NewManualTime(start)
 	factory := tenantrate.NewLimiterFactory(&st.SV, &tenantrate.TestingKnobs{
 		TimeSource: timeSource,
-	})
+	}, fakeAuthorizer{})
 	tenant := roachpb.MustMakeTenantID(2)
 	closer := make(chan struct{})
-	ctx := context.Background()
 	limiter := factory.GetTenant(ctx, tenant, closer)
 	// First Wait call will not block.
 	require.NoError(t, limiter.Wait(ctx, tenantcostmodel.TestingRequestInfo(1, 1, 1, 1)))
@@ -72,7 +77,7 @@ func TestUseAfterRelease(t *testing.T) {
 	defer cancel()
 	cs := cluster.MakeTestingClusterSettings()
 
-	factory := tenantrate.NewLimiterFactory(&cs.SV, nil)
+	factory := tenantrate.NewLimiterFactory(&cs.SV, nil /* knobs */, fakeAuthorizer{})
 	s := stop.NewStopper()
 	defer s.Stop(ctx)
 	ctx, cancel2 := s.WithCancelOnQuiesce(ctx)
@@ -137,14 +142,15 @@ func TestDataDriven(t *testing.T) {
 }
 
 type testState struct {
-	initialized bool
-	tenants     map[roachpb.TenantID][]tenantrate.Limiter
-	running     map[string]*launchState
-	rl          *tenantrate.LimiterFactory
-	m           *metric.Registry
-	clock       *timeutil.ManualTime
-	settings    *cluster.Settings
-	config      tenantrate.Config
+	initialized  bool
+	tenants      map[roachpb.TenantID][]tenantrate.Limiter
+	running      map[string]*launchState
+	rl           *tenantrate.LimiterFactory
+	m            *metric.Registry
+	clock        *timeutil.ManualTime
+	settings     *cluster.Settings
+	config       tenantrate.Config
+	capabilities map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities
 }
 
 type launchState struct {
@@ -212,12 +218,12 @@ func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
 	ts.clock = timeutil.NewManualTime(t0)
 	ts.settings = cluster.MakeTestingClusterSettings()
 	ts.config = tenantrate.DefaultConfig()
+	ts.capabilities = make(map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities)
 
-	parseSettings(t, d, &ts.config)
-
+	parseSettings(t, d, &ts.config, ts.capabilities)
 	ts.rl = tenantrate.NewLimiterFactory(&ts.settings.SV, &tenantrate.TestingKnobs{
 		TimeSource: ts.clock,
-	})
+	}, ts)
 	ts.rl.UpdateConfig(ts.config)
 	ts.m = metric.NewRegistry()
 	ts.m.AddMetricStruct(ts.rl.Metrics())
@@ -228,7 +234,7 @@ func (ts *testState) init(t *testing.T, d *datadriven.TestData) string {
 // yaml object representing the limits and updates accordingly. It returns
 // the current time. See init for more details as the semantics are the same.
 func (ts *testState) updateSettings(t *testing.T, d *datadriven.TestData) string {
-	parseSettings(t, d, &ts.config)
+	parseSettings(t, d, &ts.config, ts.capabilities)
 	ts.rl.UpdateConfig(ts.config)
 	return ts.formatTime()
 }
@@ -653,6 +659,54 @@ func (ts *testState) formatTime() string {
 	return ts.clock.Now().Format(timeFormat)
 }
 
+func (ts *testState) HasCapabilityForBatch(
+	context.Context, roachpb.TenantID, *kvpb.BatchRequest,
+) error {
+	panic("unimplemented")
+}
+
+func (ts *testState) BindReader(tenantcapabilities.Reader) {}
+
+var _ tenantcapabilities.Authorizer = &testState{}
+
+func (ts *testState) HasProcessDebugCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanDebugProcess {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasNodeStatusCapability(_ context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanViewNodeInfo {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasTSDBQueryCapability(_ context.Context, tenID roachpb.TenantID) error {
+	if ts.capabilities[tenID].CanViewTSDBMetrics {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) HasNodelocalStorageCapability(
+	_ context.Context, tenID roachpb.TenantID,
+) error {
+	if ts.capabilities[tenID].CanUseNodelocalStorage {
+		return nil
+	} else {
+		return errors.New("unauthorized")
+	}
+}
+
+func (ts *testState) IsExemptFromRateLimiting(_ context.Context, tenID roachpb.TenantID) bool {
+	return ts.capabilities[tenID].ExemptFromRateLimiting
+}
+
 func parseTenantIDs(t *testing.T, d *datadriven.TestData) []uint64 {
 	var tenantIDs []uint64
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &tenantIDs); err != nil {
@@ -668,6 +722,8 @@ type SettingValues struct {
 
 	Read  Factors
 	Write Factors
+
+	Capabilities map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities
 }
 
 // Factors for reads and writes.
@@ -679,7 +735,12 @@ type Factors struct {
 
 // parseSettings parses a SettingValues yaml and updates the given config.
 // Missing (zero) values are ignored.
-func parseSettings(t *testing.T, d *datadriven.TestData, config *tenantrate.Config) {
+func parseSettings(
+	t *testing.T,
+	d *datadriven.TestData,
+	config *tenantrate.Config,
+	capabilties map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities,
+) {
 	var vals SettingValues
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &vals); err != nil {
 		d.Fatalf(t, "failed to unmarshal limits: %v", err)
@@ -698,6 +759,9 @@ func parseSettings(t *testing.T, d *datadriven.TestData, config *tenantrate.Conf
 	override(&config.WriteBatchUnits, vals.Write.PerBatch)
 	override(&config.WriteRequestUnits, vals.Write.PerRequest)
 	override(&config.WriteUnitsPerByte, vals.Write.PerByte)
+	for tenantID, caps := range vals.Capabilities {
+		capabilties[tenantID] = caps
+	}
 }
 
 func parseStrings(t *testing.T, d *datadriven.TestData) []string {
@@ -706,4 +770,36 @@ func parseStrings(t *testing.T, d *datadriven.TestData) []string {
 		d.Fatalf(t, "failed to parse strings: %v", err)
 	}
 	return ids
+}
+
+// fakeAuthorizer implements the tenantauthorizer.Authorizer
+// interface, but does not perform cap checks yet pretents the caller
+// is subject to rate limit checks. (For testing in this package.)
+type fakeAuthorizer struct{}
+
+var _ tenantcapabilities.Authorizer = &fakeAuthorizer{}
+
+func (fakeAuthorizer) HasNodeStatusCapability(_ context.Context, tenID roachpb.TenantID) error {
+	return nil
+}
+func (fakeAuthorizer) HasTSDBQueryCapability(_ context.Context, tenID roachpb.TenantID) error {
+	return nil
+}
+func (fakeAuthorizer) HasNodelocalStorageCapability(
+	_ context.Context, tenID roachpb.TenantID,
+) error {
+	return nil
+}
+func (fakeAuthorizer) IsExemptFromRateLimiting(_ context.Context, tenID roachpb.TenantID) bool {
+	return false
+}
+func (fakeAuthorizer) HasCapabilityForBatch(
+	_ context.Context, tenID roachpb.TenantID, _ *kvpb.BatchRequest,
+) error {
+	return nil
+}
+func (fakeAuthorizer) BindReader(tenantcapabilities.Reader) {}
+
+func (fakeAuthorizer) HasProcessDebugCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	return nil
 }

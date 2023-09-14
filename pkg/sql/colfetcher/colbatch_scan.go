@@ -41,14 +41,19 @@ type colBatchScanBase struct {
 	colexecop.InitHelper
 	execinfra.SpansWithCopy
 
-	flowCtx         *execinfra.FlowCtx
-	limitHint       rowinfra.RowLimit
-	batchBytesLimit rowinfra.BytesLimit
-	parallelize     bool
+	flowCtx                *execinfra.FlowCtx
+	processorID            int32
+	limitHint              rowinfra.RowLimit
+	batchBytesLimit        rowinfra.BytesLimit
+	parallelize            bool
+	ignoreMisplannedRanges bool
 	// tracingSpan is created when the stats should be collected for the query
 	// execution, and it will be finished when closing the operator.
-	tracingSpan *tracing.Span
-	mu          struct {
+	tracingSpan               *tracing.Span
+	contentionEventsListener  execstats.ContentionEventsListener
+	scanStatsListener         execstats.ScanStatsListener
+	tenantConsumptionListener execstats.TenantConsumptionListener
+	mu                        struct {
 		syncutil.Mutex
 		// rowsRead contains the number of total rows this ColBatchScan has
 		// returned so far.
@@ -58,7 +63,7 @@ type colBatchScanBase struct {
 
 func (s *colBatchScanBase) drainMeta() []execinfrapb.ProducerMetadata {
 	var trailingMeta []execinfrapb.ProducerMetadata
-	if !s.flowCtx.Local {
+	if !s.ignoreMisplannedRanges {
 		nodeID, ok := s.flowCtx.NodeID.OptionalNodeID()
 		if ok {
 			ranges := execinfra.MisplannedRanges(s.Ctx, s.SpansCopy, nodeID, s.flowCtx.Cfg.RangeCache)
@@ -70,8 +75,10 @@ func (s *colBatchScanBase) drainMeta() []execinfrapb.ProducerMetadata {
 	if tfs := execinfra.GetLeafTxnFinalState(s.Ctx, s.flowCtx.Txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
-	if trace := tracing.SpanFromContext(s.Ctx).GetConfiguredRecording(); trace != nil {
-		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
+	if !s.flowCtx.Gateway {
+		if trace := tracing.SpanFromContext(s.Ctx).GetConfiguredRecording(); trace != nil {
+			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
+		}
 	}
 	return trailingMeta
 }
@@ -83,14 +90,26 @@ func (s *colBatchScanBase) GetRowsRead() int64 {
 	return s.mu.rowsRead
 }
 
-// GetContentionInfo is part of the colexecop.KVReader interface.
-func (s *colBatchScanBase) GetContentionInfo() (time.Duration, []kvpb.ContentionEvent) {
-	return execstats.GetCumulativeContentionTime(s.Ctx, nil /* recording */)
+// GetContentionTime is part of the colexecop.KVReader interface.
+func (s *colBatchScanBase) GetContentionTime() time.Duration {
+	return s.contentionEventsListener.CumulativeContentionTime
 }
 
 // GetScanStats is part of the colexecop.KVReader interface.
 func (s *colBatchScanBase) GetScanStats() execstats.ScanStats {
-	return execstats.GetScanStats(s.Ctx, nil /* recording */)
+	return s.scanStatsListener.ScanStats
+}
+
+// GetConsumedRU is part of the colexecop.KVReader interface.
+func (s *colBatchScanBase) GetConsumedRU() uint64 {
+	return s.tenantConsumptionListener.ConsumedRU
+}
+
+// UsedStreamer is part of the colexecop.KVReader interface.
+func (s *colBatchScanBase) UsedStreamer() bool {
+	// TODO(yuzefovich): update this when the streamer is used to power the
+	// ColBatchScans (#82164).
+	return false
 }
 
 // Release implements the execreleasable.Releasable interface.
@@ -122,6 +141,7 @@ func newColBatchScanBase(
 	ctx context.Context,
 	kvFetcherMemAcc *mon.BoundAccount,
 	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
 	typeResolver *descs.DistSQLTypeResolver,
@@ -183,11 +203,13 @@ func newColBatchScanBase(
 	}
 
 	*s = colBatchScanBase{
-		SpansWithCopy:   s.SpansWithCopy,
-		flowCtx:         flowCtx,
-		limitHint:       limitHint,
-		batchBytesLimit: batchBytesLimit,
-		parallelize:     spec.Parallelize,
+		SpansWithCopy:          s.SpansWithCopy,
+		flowCtx:                flowCtx,
+		processorID:            processorID,
+		limitHint:              limitHint,
+		batchBytesLimit:        batchBytesLimit,
+		parallelize:            spec.Parallelize,
+		ignoreMisplannedRanges: flowCtx.Local || spec.IgnoreMisplannedRanges,
 	}
 	return s, bsHeader, tableArgs, nil
 }
@@ -215,11 +237,10 @@ func (s *ColBatchScan) Init(ctx context.Context) {
 	if !s.InitHelper.Init(ctx) {
 		return
 	}
-	// If tracing is enabled, we need to start a child span so that the only
-	// contention events present in the recording would be because of this
-	// cFetcher. Note that ProcessorSpan method itself will check whether
-	// tracing is enabled.
-	s.Ctx, s.tracingSpan = execinfra.ProcessorSpan(s.Ctx, "colbatchscan")
+	s.Ctx, s.tracingSpan = execinfra.ProcessorSpan(
+		s.Ctx, s.flowCtx, "colbatchscan", s.processorID,
+		&s.contentionEventsListener, &s.scanStatsListener, &s.tenantConsumptionListener,
+	)
 	limitBatches := !s.parallelize
 	if err := s.cf.StartScan(
 		s.Ctx,
@@ -265,6 +286,13 @@ func (s *ColBatchScan) GetBytesRead() int64 {
 	return s.cf.getBytesRead()
 }
 
+// GetKVPairsRead is part of the colexecop.KVReader interface.
+func (s *ColBatchScan) GetKVPairsRead() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cf.getKVPairsRead()
+}
+
 // GetBatchRequestsIssued is part of the colexecop.KVReader interface.
 func (s *ColBatchScan) GetBatchRequestsIssued() int64 {
 	s.mu.Lock()
@@ -274,9 +302,7 @@ func (s *ColBatchScan) GetBatchRequestsIssued() int64 {
 
 // GetKVCPUTime is part of the colexecop.KVReader interface.
 func (s *ColBatchScan) GetKVCPUTime() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.cf.getKVCPUTime()
+	return s.cf.cpuStopWatch.Elapsed()
 }
 
 // Release implements the execreleasable.Releasable interface.
@@ -306,13 +332,14 @@ func NewColBatchScan(
 	fetcherAllocator *colmem.Allocator,
 	kvFetcherMemAcc *mon.BoundAccount,
 	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	spec *execinfrapb.TableReaderSpec,
 	post *execinfrapb.PostProcessSpec,
 	estimatedRowCount uint64,
 	typeResolver *descs.DistSQLTypeResolver,
 ) (*ColBatchScan, []*types.T, error) {
 	base, bsHeader, tableArgs, err := newColBatchScanBase(
-		ctx, kvFetcherMemAcc, flowCtx, spec, post, typeResolver,
+		ctx, kvFetcherMemAcc, flowCtx, processorID, spec, post, typeResolver,
 	)
 	if err != nil {
 		return nil, nil, err

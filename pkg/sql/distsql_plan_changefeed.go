@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
@@ -82,7 +82,7 @@ func PlanCDCExpression(
 		opt.apply(&cfg)
 	}
 
-	p.stmt = makeStatement(parser.Statement{
+	p.stmt = makeStatement(statements.Statement[tree.Statement]{
 		AST: cdcExpr,
 		SQL: tree.AsString(cdcExpr),
 	}, clusterunique.ID{} /* queryID */)
@@ -198,15 +198,12 @@ func RunCDCEvaluation(
 		return err
 	}
 
-	// Execute the flow.  Force the use of planner descriptor cache when setting
-	// up this local flow.  This is necessary so that as soon as the local flow
-	// setup completes, and all descriptors have been resolved (including leases
-	// for user defined types), we can release those descriptors. If we don't,
-	// then the descriptor leases acquired will be held for the
-	// DefaultDescriptorLeaseDuration (5 minutes), blocking potential schema
-	// changes.
-	cdcPlan.PlanCtx.usePlannerDescriptorsForLocalFlow = true
 	p := cdcPlan.PlanCtx.planner
+	// Make sure that as soon as the local flow setup completes, and all
+	// descriptors have been resolved (including leases for user defined types),
+	// we can release those descriptors. If we don't, then the descriptor leases
+	// acquired will be held for the DefaultDescriptorLeaseDuration (5 minutes),
+	// blocking potential schema changes.
 	finishedSetupFn := func(flowinfra.Flow) {
 		p.Descriptors().ReleaseAll(ctx)
 	}

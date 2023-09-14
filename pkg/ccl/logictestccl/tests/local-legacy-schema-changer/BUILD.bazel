@@ -1,18 +1,27 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_test")
 
 go_test(
     name = "local-legacy-schema-changer_test",
     size = "enormous",
     srcs = ["generated_test.go"],
-    args = ["-test.timeout=3595s"],
+    args = select({
+        "//build/toolchains:use_ci_timeouts": ["-test.timeout=895s"],
+        "//conditions:default": ["-test.timeout=3595s"],
+    }),
     data = [
         "//c-deps:libgeos",  # keep
         "//pkg/ccl/logictestccl:testdata",  # keep
     ],
-    shard_count = 5,
-    tags = ["cpu:1"],
+    exec_properties = {
+        "Pool": "large",
+    },
+    shard_count = 6,
+    tags = [
+        "ccl_test",
+        "cpu:1",
+    ],
     deps = [
+        "//pkg/base",
         "//pkg/build/bazel",
         "//pkg/ccl",
         "//pkg/security/securityassets",
@@ -26,5 +35,3 @@ go_test(
         "//pkg/util/randutil",
     ],
 )
-
-get_x_data(name = "get_x_data")

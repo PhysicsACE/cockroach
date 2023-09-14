@@ -12,6 +12,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"math"
 	"sync"
 
@@ -46,6 +47,9 @@ type pebbleIterator struct {
 	// Buffer used to store MVCCRangeKeyVersions returned by RangeKeys(). Lazily
 	// initialized the first time an iterator's RangeKeys() method is called.
 	mvccRangeKeyVersions []MVCCRangeKeyVersion
+
+	// parent is a pointer to the Engine from which the iterator was constructed.
+	parent *Pebble
 
 	// Set to true to govern whether to call SeekPrefixGE or SeekGE. Skips
 	// SSTables based on MVCC/Engine key when true.
@@ -82,25 +86,29 @@ var pebbleIterPool = sync.Pool{
 
 // newPebbleIterator creates a new Pebble iterator for the given Pebble reader.
 func newPebbleIterator(
-	handle pebble.Reader, opts IterOptions, durability DurabilityRequirement,
-) *pebbleIterator {
+	handle pebble.Reader, opts IterOptions, durability DurabilityRequirement, parent *Pebble,
+) (*pebbleIterator, error) {
 	p := pebbleIterPool.Get().(*pebbleIterator)
 	p.reusable = false // defensive
-	p.init(nil, opts, durability)
-	p.iter = pebbleiter.MaybeWrap(handle.NewIter(&p.options))
-	return p
+	p.init(nil, opts, durability, parent)
+	iter, err := handle.NewIter(&p.options)
+	if err != nil {
+		return nil, err
+	}
+	p.iter = pebbleiter.MaybeWrap(iter)
+	return p, nil
 }
 
 // newPebbleIteratorByCloning creates a new Pebble iterator by cloning the given
 // iterator and reconfiguring it.
 func newPebbleIteratorByCloning(
-	iter pebbleiter.Iterator, opts IterOptions, durability DurabilityRequirement,
+	cloneCtx CloneContext, opts IterOptions, durability DurabilityRequirement,
 ) *pebbleIterator {
 	var err error
 	p := pebbleIterPool.Get().(*pebbleIterator)
 	p.reusable = false // defensive
-	p.init(nil, opts, durability)
-	p.iter, err = iter.Clone(pebble.CloneOptions{
+	p.init(nil, opts, durability, cloneCtx.engine)
+	p.iter, err = cloneCtx.rawIter.Clone(pebble.CloneOptions{
 		IterOptions:      &p.options,
 		RefreshBatchView: true,
 	})
@@ -117,7 +125,7 @@ func newPebbleSSTIterator(
 ) (*pebbleIterator, error) {
 	p := pebbleIterPool.Get().(*pebbleIterator)
 	p.reusable = false // defensive
-	p.init(nil, opts, StandardDurability)
+	p.init(nil, opts, StandardDurability, nil)
 
 	var externalIterOpts []pebble.ExternalIterOption
 	if forwardOnly {
@@ -138,7 +146,10 @@ func newPebbleSSTIterator(
 // reconfiguring the given iter. It is valid to pass a nil iter and then create
 // p.iter using p.options, to avoid redundant reconfiguration via SetOptions().
 func (p *pebbleIterator) init(
-	iter pebbleiter.Iterator, opts IterOptions, durability DurabilityRequirement,
+	iter pebbleiter.Iterator,
+	opts IterOptions,
+	durability DurabilityRequirement,
+	statsReporter *Pebble,
 ) {
 	*p = pebbleIterator{
 		iter:               iter,
@@ -146,6 +157,7 @@ func (p *pebbleIterator) init(
 		lowerBoundBuf:      p.lowerBoundBuf,
 		upperBoundBuf:      p.upperBoundBuf,
 		rangeKeyMaskingBuf: p.rangeKeyMaskingBuf,
+		parent:             statsReporter,
 		reusable:           p.reusable,
 	}
 	p.setOptions(opts, durability)
@@ -164,15 +176,20 @@ func (p *pebbleIterator) initReuseOrCreate(
 	clone bool,
 	opts IterOptions,
 	durability DurabilityRequirement,
-) {
+	statsReporter *Pebble,
+) error {
 	if iter != nil && !clone {
-		p.init(iter, opts, durability)
-		return
+		p.init(iter, opts, durability, statsReporter)
+		return nil
 	}
 
-	p.init(nil, opts, durability)
+	p.init(nil, opts, durability, statsReporter)
 	if iter == nil {
-		p.iter = pebbleiter.MaybeWrap(handle.NewIter(&p.options))
+		innerIter, err := handle.NewIter(&p.options)
+		if err != nil {
+			return err
+		}
+		p.iter = pebbleiter.MaybeWrap(innerIter)
 	} else if clone {
 		var err error
 		p.iter, err = iter.Clone(pebble.CloneOptions{
@@ -181,9 +198,10 @@ func (p *pebbleIterator) initReuseOrCreate(
 		})
 		if err != nil {
 			p.Close()
-			panic(err)
+			return err
 		}
 	}
+	return nil
 }
 
 // setOptions updates the options for a pebbleIterator. If p.iter is non-nil, it
@@ -255,11 +273,16 @@ func (p *pebbleIterator) setOptions(opts IterOptions, durability DurabilityRequi
 		// We are given an inclusive [MinTimestampHint, MaxTimestampHint]. The
 		// MVCCWAllTimeIntervalCollector has collected the WallTimes and we need
 		// [min, max), i.e., exclusive on the upper bound.
-		p.options.PointKeyFilters = []pebble.BlockPropertyFilter{
+		//
+		// NB: PointKeyFilters documents that when set to non-empty, the capacity
+		// of the slice should be at least one more than the length, for a
+		// Pebble-internal performance optimization.
+		pkf := [2]pebble.BlockPropertyFilter{
 			sstable.NewBlockIntervalFilter(mvccWallTimeIntervalCollector,
 				uint64(opts.MinTimestampHint.WallTime),
 				uint64(opts.MaxTimestampHint.WallTime)+1),
 		}
+		p.options.PointKeyFilters = pkf[:1:2]
 		// NB: We disable range key block filtering because of complications in
 		// MVCCIncrementalIterator.maybeSkipKeys: the TBI may see different range
 		// key fragmentation than the main iterator due to the filtering. This would
@@ -285,6 +308,12 @@ func (p *pebbleIterator) Close() {
 		panic("closing idle iterator")
 	}
 	p.inuse = false
+
+	// Report the iterator's stats so they can be accumulated and exposed
+	// through time-series metrics.
+	if p.iter != nil && p.parent != nil {
+		p.parent.aggregateIterStats(p.Stats())
+	}
 
 	if p.reusable {
 		p.iter.ResetStats()
@@ -368,12 +397,11 @@ func (p *pebbleIterator) Valid() (bool, error) {
 		return false, p.iter.Error()
 	}
 
-	// The MVCCIterator interface is broken in that it silently discards
-	// the error when UnsafeKey(), Key() are unable to parse the key as
-	// an MVCCKey. This is especially problematic if the caller is
-	// accidentally iterating into the lock table key space, since that
-	// parsing will fail. We do a cheap check here to make sure we are
-	// not in the lock table key space.
+	// The MVCCIterator interface is broken in that it silently discards the
+	// error when UnsafeKey() is unable to parse the key as an MVCCKey. This is
+	// especially problematic if the caller is accidentally iterating into the
+	// lock table key space, since that parsing will fail. We do a cheap check
+	// here to make sure we are not in the lock table key space.
 	//
 	// TODO(sumeer): fix this properly by changing those method signatures.
 	k := p.iter.Key()
@@ -494,7 +522,7 @@ func (p *pebbleIterator) UnsafeValue() ([]byte, error) {
 	return p.iter.ValueAndErr()
 }
 
-// UnsafeLazyValue implements the MVCCIterator interface.
+// UnsafeLazyValue implements the MVCCIterator and EngineIterator interfaces.
 func (p *pebbleIterator) UnsafeLazyValue() pebble.LazyValue {
 	if ok := p.iter.Valid(); !ok {
 		panic(errors.AssertionFailedf("UnsafeLazyValue called on !Valid iterator"))
@@ -603,15 +631,6 @@ func (p *pebbleIterator) PrevEngineKeyWithLimit(
 		return state, p.iter.Error()
 	}
 	return state, nil
-}
-
-// Key implements the MVCCIterator interface.
-func (p *pebbleIterator) Key() MVCCKey {
-	key := p.UnsafeKey()
-	keyCopy := make([]byte, len(key.Key))
-	copy(keyCopy, key.Key)
-	key.Key = keyCopy
-	return key
 }
 
 // EngineKey implements the EngineIterator interface.
@@ -897,9 +916,9 @@ func (p *pebbleIterator) IsPrefix() bool {
 	return p.prefix
 }
 
-// GetRawIter is part of the EngineIterator interface.
-func (p *pebbleIterator) GetRawIter() pebbleiter.Iterator {
-	return p.iter
+// CloneContext is part of the EngineIterator interface.
+func (p *pebbleIterator) CloneContext() CloneContext {
+	return CloneContext{rawIter: p.iter, engine: p.parent}
 }
 
 func (p *pebbleIterator) getBlockPropertyFilterMask() pebble.BlockPropertyFilterMask {
@@ -932,7 +951,11 @@ func (p *pebbleIterator) destroy() {
 		//
 		// NB: The panic is omitted if the error is encountered on an external
 		// iterator which is iterating over uncommitted sstables.
+
 		if err := p.iter.Close(); !p.external && errors.Is(err, pebble.ErrCorruption) {
+			if p.parent != nil {
+				p.parent.writePreventStartupFile(context.Background(), err)
+			}
 			panic(err)
 		}
 		p.iter = nil

@@ -112,29 +112,26 @@ func runImport(
 	var summary *kvpb.BulkOpSummary
 	group.GoCtx(func(ctx context.Context) error {
 		summary, err = ingestKvs(ctx, flowCtx, spec, progCh, kvCh)
-		if err != nil {
-			return err
-		}
-		var prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
-		prog.ResumePos = make(map[int32]int64)
-		prog.CompletedFraction = make(map[int32]float32)
-		for i := range spec.Uri {
-			prog.CompletedFraction[i] = 1.0
-			prog.ResumePos[i] = math.MaxInt64
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case progCh <- prog:
-			return nil
-		}
+		return err
 	})
 
 	if err = group.Wait(); err != nil {
 		return nil, err
 	}
 
-	return summary, nil
+	var prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
+	prog.ResumePos = make(map[int32]int64)
+	prog.CompletedFraction = make(map[int32]float32)
+	for i := range spec.Uri {
+		prog.CompletedFraction[i] = 1.0
+		prog.ResumePos[i] = math.MaxInt64
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case progCh <- prog:
+		return summary, nil
+	}
 }
 
 type readFileFunc func(context.Context, *fileReader, int32, int64, chan string) error
@@ -191,7 +188,7 @@ func readInputFiles(
 				// readability (e.g. permissions).
 				// If there's only one file, skip that check because it provides no
 				// advantage.
-				raw, err := es.ReadFile(ctx, "")
+				raw, _, err := es.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
 				if err != nil {
 					return err
 				}
@@ -230,7 +227,7 @@ func readInputFiles(
 				return err
 			}
 			defer es.Close()
-			raw, err := es.ReadFile(ctx, "")
+			raw, _, err := es.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
 			if err != nil {
 				return err
 			}

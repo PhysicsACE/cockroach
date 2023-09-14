@@ -11,7 +11,7 @@
 import classNames from "classnames";
 import _ from "lodash";
 import Long from "long";
-import moment from "moment";
+import moment from "moment-timezone";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
@@ -40,6 +40,7 @@ import {
   PageConfigItem,
 } from "src/views/shared/components/pageconfig";
 import Dropdown, { DropdownOption } from "src/views/shared/components/dropdown";
+import { BackToAdvanceDebug } from "../util";
 
 interface NodesOwnProps {
   nodeIds: ReturnType<typeof nodeIDsStringifiedSelector.resultFunc>;
@@ -444,6 +445,7 @@ export class Nodes extends React.Component<NodesProps, LocalNodeState> {
     return (
       <section className="section">
         <Helmet title="Node Diagnostics | Debug" />
+        <BackToAdvanceDebug history={this.props.history} />
         <h1 className="base-heading">Node Diagnostics</h1>
         <NodeFilterList
           nodeIDs={filters.nodeIDs}

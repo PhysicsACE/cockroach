@@ -103,15 +103,20 @@ const fullLoadTruncate = `{
   }`
 
 func awsdmsVerString(v *version.Version) string {
-	if ciBranch := os.Getenv("TC_BUILD_BRANCH"); ciBranch != "" {
-		ciBranch = strings.ReplaceAll(ciBranch, ".", "-")
-		return fmt.Sprintf("ci-%s", ciBranch)
+	if ciBuildID := os.Getenv("TC_BUILD_ID"); ciBuildID != "" {
+		ciBuildID = strings.ReplaceAll(ciBuildID, ".", "-")
+		return fmt.Sprintf("ci-build-%s", ciBuildID)
 	}
 	ret := fmt.Sprintf("local-%d-%d-%d", v.Major(), v.Minor(), v.Patch())
 	if v.PreRelease() != "" {
 		ret += "-" + v.PreRelease()
 	}
-	return strings.ReplaceAll(ret, ".", "-")
+	ret = strings.ReplaceAll(ret, ".", "-")
+	const maxSize = 24
+	if len(ret) > maxSize {
+		ret = ret[:maxSize]
+	}
+	return ret
 }
 
 func awsdmsRoachtestRDSClusterName(v *version.Version) string {
@@ -184,9 +189,10 @@ func dmsDescribeTasksInput(
 func registerAWSDMS(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    "awsdms",
-		Owner:   registry.OwnerSQLSessions, // TODO(otan): add a migrations OWNERS team
+		Owner:   registry.OwnerMigrations,
 		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `awsdms`},
+		Leases:  registry.MetamorphicLeases,
+		Tags:    registry.Tags(`weekly`, `aws-weekly`),
 		Run:     runAWSDMS,
 	})
 }
@@ -203,7 +209,7 @@ func runAWSDMS(ctx context.Context, t test.Test, c cluster.Cluster) {
 	}
 	// We may not have the requisite certificates to start DMS/RDS on non-AWS invocations.
 	if cloud := c.Spec().Cloud; cloud != spec.AWS {
-		t.Skip("skipping test on cloud %s", cloud)
+		t.Skipf("skipping test on cloud %s", cloud)
 		return
 	}
 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithDefaultRegion("us-east-1"))
@@ -647,6 +653,7 @@ func setupRDSCluster(
 			&rds.CreateDBClusterInput{
 				DBClusterIdentifier:         proto.String(awsdmsRoachtestRDSClusterName(t.BuildVersion())),
 				Engine:                      proto.String("aurora-postgresql"),
+				EngineVersion:               proto.String("13"),
 				DBClusterParameterGroupName: proto.String(awsdmsRoachtestDMSParameterGroup(t.BuildVersion())),
 				MasterUsername:              proto.String(awsdmsUser),
 				MasterUserPassword:          proto.String(awsdmsPassword),
@@ -834,6 +841,7 @@ func setupDMSEndpointsAndTask(
 				)
 				return retErr
 			}(); lastErr == nil {
+				t.L().Printf("test for %s successful", *ep.in.EndpointIdentifier)
 				break
 			} else {
 				t.L().Printf("replication endpoint test failed, retrying: %s", lastErr)
@@ -863,26 +871,70 @@ func setupDMSEndpointsAndTask(
 			return err
 		}
 		t.L().Printf("waiting for replication task to be ready")
-		if err := dms.NewReplicationTaskReadyWaiter(dmsCli).Wait(ctx, dmsDescribeTasksInput(t.BuildVersion(), task.tableName), awsdmsWaitTimeLimit); err != nil {
+		input := dmsDescribeTasksInput(t.BuildVersion(), task.tableName)
+		if err = dmsTaskStatusChecker(ctx, dmsCli, input, "ready"); err != nil {
 			return err
 		}
+
 		t.L().Printf("starting replication task")
-		if _, err := dmsCli.StartReplicationTask(
-			ctx,
-			&dms.StartReplicationTaskInput{
-				ReplicationTaskArn:       replTaskOut.ReplicationTask.ReplicationTaskArn,
-				StartReplicationTaskType: dmstypes.StartReplicationTaskTypeValueReloadTarget,
-			},
-		); err != nil {
+		r := retry.StartWithCtx(ctx, retry.Options{
+			InitialBackoff: 10 * time.Second,
+			MaxBackoff:     20 * time.Second,
+			MaxRetries:     10,
+		})
+		var lastErr error
+		for r.Next() {
+			if _, lastErr = dmsCli.StartReplicationTask(
+				ctx,
+				&dms.StartReplicationTaskInput{
+					ReplicationTaskArn:       replTaskOut.ReplicationTask.ReplicationTaskArn,
+					StartReplicationTaskType: dmstypes.StartReplicationTaskTypeValueReloadTarget,
+				},
+			); lastErr == nil {
+				break
+			}
+			t.L().Printf("got error starting DMS task; retrying: %+v", err)
+		}
+		if lastErr != nil {
+			return lastErr
+		}
+
+		t.L().Printf("waiting for replication task to be running")
+		if err = dmsTaskStatusChecker(ctx, dmsCli, input, "running"); err != nil {
 			return err
 		}
-		t.L().Printf("waiting for replication task to be running")
-		if err := dms.NewReplicationTaskRunningWaiter(dmsCli).Wait(
-			ctx,
-			dmsDescribeTasksInput(t.BuildVersion(), task.tableName),
-			awsdmsWaitTimeLimit,
-		); err != nil {
-			return err
+	}
+	return nil
+}
+
+func dmsTaskStatusChecker(
+	ctx context.Context, dmsCli *dms.Client, input *dms.DescribeReplicationTasksInput, status string,
+) error {
+	closer := make(chan struct{})
+	r := retry.StartWithCtx(ctx, retry.Options{
+		InitialBackoff: 10 * time.Second,
+		MaxBackoff:     30 * time.Second,
+		Closer:         closer,
+	})
+	timeout := time.After(awsdmsWaitTimeLimit)
+	for r.Next() {
+		select {
+		case <-timeout:
+			close(closer)
+			// Since we only ever have a unique task returned per filter,
+			// it should be safe to direct index for the task name.
+			return errors.Newf("exceeded time limit waiting for %s to transition to %s", input.Filters[0].Values[0], status)
+		default:
+			dmsTasks, err := dmsCli.DescribeReplicationTasks(ctx, input)
+			if err != nil {
+				return err
+			}
+			for _, task := range dmsTasks.ReplicationTasks {
+				// If we match the status we want, close the retry and exit.
+				if *task.Status == status {
+					close(closer)
+				}
+			}
 		}
 	}
 	return nil

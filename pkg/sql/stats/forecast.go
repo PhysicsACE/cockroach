@@ -12,15 +12,22 @@ package stats
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/json"
+	"fmt"
 	"math"
+	"strconv"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -32,7 +39,7 @@ var UseStatisticsForecasts = settings.RegisterBoolSetting(
 	"sql.stats.forecasts.enabled",
 	"when true, enables generation of statistics forecasts by default for all tables",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // minObservationsForForecast is the minimum number of observed statistics
 // required to produce a statistics forecast. Forecasts based on 1 or 2
@@ -53,20 +60,20 @@ const minGoodnessOfFit = 0.95
 // Whether a forecast is produced for a set of columns depends on how well the
 // observed statistics for that set of columns fit a linear regression model.
 // This means a forecast will not necessarily be produced for every set of
-// columns in the table. Any forecasts produced will have the same CreatedAt
-// time, which will be after the latest observed statistics (and could be in the
-// past, present, or future relative to the current time). Any forecasts
-// produced will not necessarily have the same RowCount or be consistent with
-// the other forecasts produced. (For example, DistinctCount in the forecast for
-// columns {a, b} could very well end up less than DistinctCount in the forecast
-// for column {a}.)
+// columns in the table. Any forecasts produced will not necessarily have the
+// same CreatedAt time (and could be in the past, present, or future relative to
+// the current time). Any forecasts produced will not necessarily have the same
+// RowCount or be consistent with the other forecasts produced. (For example,
+// DistinctCount in the forecast for columns {a, b} could very well end up less
+// than DistinctCount in the forecast for column {a}.)
 //
 // ForecastTableStatistics is deterministic: given the same observations it will
 // return the same forecasts.
-func ForecastTableStatistics(ctx context.Context, observed []*TableStatistic) []*TableStatistic {
+func ForecastTableStatistics(
+	ctx context.Context, sv *settings.Values, observed []*TableStatistic,
+) []*TableStatistic {
 	// Group observed statistics by column set, skipping over partial statistics
 	// and statistics with inverted histograms.
-	var latest time.Time
 	var forecastCols []string
 	observedByCols := make(map[string][]*TableStatistic)
 	for _, stat := range observed {
@@ -81,9 +88,6 @@ func ForecastTableStatistics(ctx context.Context, observed []*TableStatistic) []
 			stat.HistogramData.ColumnType.Family() == types.BytesFamily {
 			continue
 		}
-		if latest.IsZero() {
-			latest = stat.CreatedAt
-		}
 		colKey := MakeSortedColStatKey(stat.ColumnIDs)
 		obs, ok := observedByCols[colKey]
 		if !ok {
@@ -92,19 +96,24 @@ func ForecastTableStatistics(ctx context.Context, observed []*TableStatistic) []
 		observedByCols[colKey] = append(obs, stat)
 	}
 
-	// To make forecasts deterministic, we must choose a time to forecast at based
-	// on only the observed statistics. We choose the time of the latest full
-	// statistics + the average time between automatic stats collections, which
-	// should be roughly when the next automatic stats collection will occur.
-	if latest.IsZero() {
+	if len(observedByCols) == 0 {
 		// No suitable stats.
 		return nil
 	}
-	at := latest.Add(avgFullRefreshTime(observed))
+	avgRefresh := avgFullRefreshTime(observed)
 
 	forecasts := make([]*TableStatistic, 0, len(forecastCols))
 	for _, colKey := range forecastCols {
-		forecast, err := forecastColumnStatistics(ctx, observedByCols[colKey], at, minGoodnessOfFit)
+		// To make forecasts deterministic, we must choose a time to forecast at
+		// based on only the observed statistics. We choose the time of the latest
+		// statistics + the average time between automatic stats collections, which
+		// should be roughly when the next automatic stats collection will
+		// occur. This will be the same time for all columns that had the same
+		// latest collection time.
+		latest := observedByCols[colKey][0].CreatedAt
+		at := latest.Add(avgRefresh)
+
+		forecast, err := forecastColumnStatistics(ctx, sv, observedByCols[colKey], at, minGoodnessOfFit)
 		if err != nil {
 			log.VEventf(
 				ctx, 2, "could not forecast statistics for table %v columns %s: %v",
@@ -136,7 +145,11 @@ func ForecastTableStatistics(ctx context.Context, observed []*TableStatistic) []
 // forecastColumnStatistics is deterministic: given the same observations and
 // forecast time, it will return the same forecast.
 func forecastColumnStatistics(
-	ctx context.Context, observed []*TableStatistic, at time.Time, minRequiredFit float64,
+	ctx context.Context,
+	sv *settings.Values,
+	observed []*TableStatistic,
+	at time.Time,
+	minRequiredFit float64,
 ) (forecast *TableStatistic, err error) {
 	if len(observed) < minObservationsForForecast {
 		return nil, errors.New("not enough observations to forecast statistics")
@@ -260,7 +273,7 @@ func forecastColumnStatistics(
 	// histogram. NOTE: If any of the observed histograms were for inverted
 	// indexes this will produce an incorrect histogram.
 	if observed[0].HistogramData != nil && observed[0].HistogramData.ColumnType != nil {
-		hist, err := predictHistogram(ctx, observed, forecastAt, minRequiredFit, nonNullRowCount)
+		hist, err := predictHistogram(ctx, sv, observed, forecastAt, minRequiredFit, nonNullRowCount)
 		if err != nil {
 			// If we did not successfully predict a histogram then copy the latest
 			// histogram so we can adjust it.
@@ -283,6 +296,61 @@ func forecastColumnStatistics(
 		}
 		forecast.HistogramData = &histData
 		forecast.setHistogramBuckets(hist)
+
+		// Verify that the first two buckets (the initial NULL bucket and the first
+		// non-NULL bucket) both have NumRange=0 and DistinctRange=0. (We must check
+		// this after calling setHistogramBuckets to account for rounding.) See
+		// #93892.
+		for _, bucket := range forecast.Histogram {
+			if bucket.NumRange != 0 || bucket.DistinctRange != 0 {
+				// Build a JSON representation of the first several buckets in each
+				// observed histogram so that we can figure out what happened.
+				const debugBucketCount = 5
+				jsonStats := make([]*JSONStatistic, 0, len(observed))
+
+				addStat := func(stat *TableStatistic) {
+					jsonStat := &JSONStatistic{
+						Name:          stat.Name,
+						CreatedAt:     stat.CreatedAt.String(),
+						Columns:       []string{strconv.FormatInt(int64(stat.ColumnIDs[0]), 10)},
+						RowCount:      stat.RowCount,
+						DistinctCount: stat.DistinctCount,
+						NullCount:     stat.NullCount,
+						AvgSize:       stat.AvgSize,
+					}
+					if err := jsonStat.SetHistogram(stat.HistogramData); err == nil &&
+						len(jsonStat.HistogramBuckets) > debugBucketCount {
+						// Limit the histogram to the first several buckets.
+						jsonStat.HistogramBuckets = jsonStat.HistogramBuckets[0:debugBucketCount]
+					}
+					// Replace UpperBounds with a hash.
+					for i := range jsonStat.HistogramBuckets {
+						hash := md5.Sum([]byte(jsonStat.HistogramBuckets[i].UpperBound))
+						jsonStat.HistogramBuckets[i].UpperBound = fmt.Sprintf("_%x", hash)
+					}
+					jsonStats = append(jsonStats, jsonStat)
+				}
+				addStat(forecast)
+				for i := range observed {
+					addStat(observed[i])
+				}
+				var debugging redact.SafeString
+				if j, err := json.Marshal(jsonStats); err == nil {
+					debugging = redact.SafeString(j)
+				}
+				err := errorutil.UnexpectedWithIssueErrorf(
+					93892,
+					"forecasted histogram had first bucket with non-zero NumRange or DistinctRange: %s",
+					debugging,
+				)
+				errorutil.SendReport(ctx, sv, err)
+				return nil, err
+			}
+			if bucket.UpperBound != tree.DNull {
+				// Stop checking after the first non-NULL bucket.
+				break
+			}
+		}
 	}
 
 	return forecast, nil
@@ -291,6 +359,7 @@ func forecastColumnStatistics(
 // predictHistogram tries to predict the histogram at forecast time.
 func predictHistogram(
 	ctx context.Context,
+	sv *settings.Values,
 	observed []*TableStatistic,
 	forecastAt float64,
 	minRequiredFit float64,
@@ -343,7 +412,12 @@ func predictHistogram(
 	// Construct a linear regression model of quantile functions over time, and
 	// use it to predict a quantile function at the given time.
 	yₙ, r2 := quantileSimpleLinearRegression(createdAts, quantiles, forecastAt)
-	yₙ = yₙ.fixMalformed()
+	var err error
+	yₙ, err = yₙ.fixMalformed()
+	if err != nil {
+		logcrash.ReportOrPanic(ctx, sv, "unable to fix malformed stats quantile: %v", yₙ)
+		return histogram{}, err
+	}
 	log.VEventf(
 		ctx, 3, "forecast for table %v columns %v predicted quantile %v R² %v",
 		tableID, columnIDs, yₙ, r2,

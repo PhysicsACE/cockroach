@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -13,16 +12,21 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/clusterversion",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/multitenant",
         "//pkg/roachpb",
+        "//pkg/server/settingswatcher",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog",
         "//pkg/sql/catalog/systemschema",
-        "//pkg/sql/sem/catid",
+        "//pkg/sql/enum",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sqlliveness",
+        "//pkg/util/admission/admissionpb",
         "//pkg/util/cache",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
@@ -46,12 +50,14 @@ go_test(
         "key_encoder_test.go",
         "main_test.go",
         "sessionid_test.go",
+        "slstorage_internal_test.go",
         "slstorage_test.go",
     ],
     args = ["-test.timeout=55s"],
     embed = [":slstorage"],
     deps = [
         "//pkg/base",
+        "//pkg/clusterversion",
         "//pkg/keys",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
@@ -59,8 +65,10 @@ go_test(
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
+        "//pkg/server/settingswatcher",
         "//pkg/settings/cluster",
-        "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog",
+        "//pkg/sql/catalog/desctestutils",
         "//pkg/sql/catalog/systemschema",
         "//pkg/sql/enum",
         "//pkg/sql/sqlliveness",
@@ -68,7 +76,6 @@ go_test(
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
-        "//pkg/util/envutil",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
@@ -84,5 +91,3 @@ go_test(
         "@org_golang_x_sync//errgroup",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -55,16 +55,18 @@ type TestClusterConfig struct {
 	SkipShort bool
 	// If not empty, bootstrapVersion controls what version the cluster will be
 	// bootstrapped at.
-	BootstrapVersion roachpb.Version
-	// If not empty, binaryVersion is used to set what the Server will consider
-	// to be the binary version.
-	BinaryVersion  roachpb.Version
+	BootstrapVersion clusterversion.Key
+	// DisableUpgrade prevents the cluster from automatically upgrading to the
+	// latest version.
 	DisableUpgrade bool
-	// If true, a sql tenant server will be started and pointed at a node in the
-	// cluster. Connections on behalf of the logic test will go to that tenant.
-	UseTenant bool
-	// Disable the default test tenant.
-	DisableDefaultTestTenant bool
+
+	// If a config profile sets this to "Always", a SQL tenant server will
+	// always be started and pointed at a node in the cluster.
+	// Connections on behalf of the logic test will go to that tenant.
+	// If set to "Never", the tenant server will never be started.
+	// If set to "Random", the default randomization logic will be used.
+	UseSecondaryTenant TenantMode
+
 	// IsCCLConfig should be true for any config that can only be run with a CCL
 	// binary.
 	IsCCLConfig bool
@@ -90,6 +92,18 @@ type TestClusterConfig struct {
 	// of the current commit, and upgrades to the current commit.
 	UseCockroachGoTestserver bool
 }
+
+// TenantMode is the type of the UseSecondaryTenant field in TestClusterConfig.
+type TenantMode int8
+
+const (
+	// Random is the default behavior.
+	Random TenantMode = iota
+	// Always will always start a tenant server.
+	Always
+	// Never will never start a tenant server.
+	Never
+)
 
 const threeNodeTenantConfigName = "3node-tenant"
 
@@ -263,7 +277,11 @@ var LogicTestConfigs = []TestClusterConfig{
 		OverrideDistSQLMode: "off",
 		// local is the configuration where we run all tests which have bad
 		// interactions with the default test tenant.
-		DisableDefaultTestTenant:    true,
+		//
+		// TODO(#76378): We should review this choice. Why can't we use "Random"
+		// here? If there are specific tests that are incompatible, we can
+		// flag them to run only in a separate config.
+		UseSecondaryTenant:          Never,
 		DeclarativeCorpusCollection: true,
 	},
 	{
@@ -277,14 +295,6 @@ var LogicTestConfigs = []TestClusterConfig{
 		NumNodes:            1,
 		OverrideDistSQLMode: "off",
 		OverrideVectorize:   "off",
-	},
-	{
-		Name:                "local-v1.1-at-v1.0-noupgrade",
-		NumNodes:            1,
-		OverrideDistSQLMode: "off",
-		BootstrapVersion:    roachpb.Version{Major: 1},
-		BinaryVersion:       roachpb.Version{Major: 1, Minor: 1},
-		DisableUpgrade:      true,
 	},
 	{
 		Name:                "fakedist",
@@ -315,7 +325,11 @@ var LogicTestConfigs = []TestClusterConfig{
 		// this mode which try to modify zone configurations and we're more
 		// restrictive in the way we allow zone configs to be modified by
 		// secondary tenants. See #75569 for more info.
-		DisableDefaultTestTenant: true,
+		//
+		// TODO(#76378): We should review this choice. Zone configs have
+		// been supported for secondary tenants since v22.2.
+		// Should this config use "Random" instead?
+		UseSecondaryTenant: Never,
 	},
 	{
 		Name:                "5node-disk",
@@ -332,7 +346,7 @@ var LogicTestConfigs = []TestClusterConfig{
 		// dev testlogic ccl --files 3node-tenant --subtest $SUBTEST
 		Name:                        threeNodeTenantConfigName,
 		NumNodes:                    3,
-		UseTenant:                   true,
+		UseSecondaryTenant:          Always,
 		IsCCLConfig:                 true,
 		OverrideDistSQLMode:         "on",
 		DeclarativeCorpusCollection: true,
@@ -346,7 +360,7 @@ var LogicTestConfigs = []TestClusterConfig{
 		// dev testlogic ccl --files 3node-tenant-multiregion --subtests $SUBTESTS
 		Name:                        "3node-tenant-multiregion",
 		NumNodes:                    3,
-		UseTenant:                   true,
+		UseSecondaryTenant:          Always,
 		IsCCLConfig:                 true,
 		OverrideDistSQLMode:         "on",
 		DeclarativeCorpusCollection: true,
@@ -423,14 +437,18 @@ var LogicTestConfigs = []TestClusterConfig{
 		// Need to disable the default test tenant here until we have the
 		// locality optimized search working in multi-tenant configurations.
 		// Tracked with #80678.
-		DisableDefaultTestTenant:    true,
+		//
+		// TODO(#76378): We've fixed that issue. Review this choice. Can
+		// it be "Random" instead? Then we can merge it with the next
+		// config below.
+		UseSecondaryTenant:          Never,
 		DeclarativeCorpusCollection: true,
 	},
 	{
 		Name:                        "multiregion-9node-3region-3azs-tenant",
 		NumNodes:                    9,
 		Localities:                  multiregion9node3region3azsLocalities,
-		UseTenant:                   true,
+		UseSecondaryTenant:          Always,
 		DeclarativeCorpusCollection: true,
 	},
 	{
@@ -454,8 +472,7 @@ var LogicTestConfigs = []TestClusterConfig{
 		Name:                        "local-mixed-22.2-23.1",
 		NumNodes:                    1,
 		OverrideDistSQLMode:         "off",
-		BootstrapVersion:            clusterversion.ByKey(clusterversion.V22_2),
-		BinaryVersion:               clusterversion.ByKey(clusterversion.V23_1),
+		BootstrapVersion:            clusterversion.V22_2,
 		DisableUpgrade:              true,
 		DeclarativeCorpusCollection: true,
 	},
@@ -531,6 +548,7 @@ var (
 		"fakedist",
 		"fakedist-vec-off",
 		"fakedist-disk",
+		"local-mixed-22.2-23.1",
 	}
 	// FiveNodeDefaultConfigName is a special alias for all 5 node configs.
 	FiveNodeDefaultConfigName = "5node-default-configs"

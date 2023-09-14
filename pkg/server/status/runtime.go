@@ -13,12 +13,14 @@ package status
 import (
 	"context"
 	"os"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/goschedstats"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -142,6 +144,12 @@ var (
 		Measurement: "RSS",
 		Unit:        metric.Unit_BYTES,
 	}
+	metaTotalMemBytes = metric.Metadata{
+		Name:        "sys.totalmem",
+		Help:        "Total memory (both free and used)",
+		Measurement: "Memory",
+		Unit:        metric.Unit_BYTES,
+	}
 	metaFDOpen = metric.Metadata{
 		Name:        "sys.fd.open",
 		Help:        "Process open file descriptors",
@@ -245,6 +253,13 @@ var (
 	}
 )
 
+// diskMetricsIgnoredDevices is a regex that matches any block devices that must be
+// ignored for disk metrics (eg. sys.host.disk.write.bytes), as those devices
+// have likely been counted elsewhere. This prevents us from double-counting,
+// for instance, RAID volumes under both the logical volume and under the
+// physical volume(s).
+var diskMetricsIgnoredDevices = envutil.EnvOrDefaultString("COCKROACH_DISK_METRICS_IGNORED_DEVICES", getDefaultIgnoredDevices())
+
 // getCgoMemStats is a function that fetches stats for the C++ portion of the code.
 // We will not necessarily have implementations for all builds, so check for nil first.
 // Returns the following:
@@ -309,7 +324,8 @@ type RuntimeStatSampler struct {
 	// CPU stats for the CRDB process usage.
 	HostCPUCombinedPercentNorm *metric.GaugeFloat64
 	// Memory stats.
-	RSSBytes *metric.Gauge
+	RSSBytes      *metric.Gauge
+	TotalMemBytes *metric.Gauge
 	// File descriptor stats.
 	FDOpen      *metric.Gauge
 	FDSoftLimit *metric.Gauge
@@ -391,6 +407,7 @@ func NewRuntimeStatSampler(ctx context.Context, clock hlc.WallClock) *RuntimeSta
 		HostCPUCombinedPercentNorm: metric.NewGaugeFloat64(metaHostCPUCombinedPercentNorm),
 
 		RSSBytes:               metric.NewGauge(metaRSSBytes),
+		TotalMemBytes:          metric.NewGauge(metaTotalMemBytes),
 		HostDiskReadBytes:      metric.NewGauge(metaHostDiskReadBytes),
 		HostDiskReadCount:      metric.NewGauge(metaHostDiskReadCount),
 		HostDiskReadTime:       metric.NewGauge(metaHostDiskReadTime),
@@ -479,8 +496,10 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	if err != nil {
 		log.Ops.Errorf(ctx, "unable to get process CPU usage: %v", err)
 	}
-	cgroupCPU, _ := cgroups.GetCgroupCPU()
-	cpuShare := cgroupCPU.CPUShares()
+	cpuCapacity, err := getCPUCapacity()
+	if err != nil {
+		log.Ops.Errorf(ctx, "unable to get CPU capacity: %v", err)
+	}
 	cpuUsageStats, err := cpu.Times(false /* percpu */)
 	if err != nil {
 		log.Ops.Errorf(ctx, "unable to get system CPU usage: %v", err)
@@ -560,7 +579,7 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 		hostSrate = float64(hostStime-rsr.last.hostStime) / dur
 	}
 
-	combinedNormalizedProcPerc := (procSrate + procUrate) / cpuShare
+	combinedNormalizedProcPerc := (procSrate + procUrate) / cpuCapacity
 	combinedNormalizedHostPerc := (hostSrate + hostUrate) / float64(numHostCPUs)
 	gcPauseRatio := float64(uint64(gc.PauseTotal)-rsr.last.gcPauseTime) / dur
 	runnableSum := goschedstats.CumulativeNormalizedRunnableGoroutines()
@@ -629,6 +648,8 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(
 	rsr.FDOpen.Update(int64(fds.Open))
 	rsr.FDSoftLimit.Update(int64(fds.SoftLimit))
 	rsr.RSSBytes.Update(int64(mem.Resident))
+	totalMem, _, _ := GetTotalMemoryWithoutLogging()
+	rsr.TotalMemBytes.Update(totalMem)
 	rsr.Uptime.Update((now - rsr.startTimeNanos) / 1e9)
 }
 
@@ -680,7 +701,7 @@ func getSummedDiskCounters(ctx context.Context) (DiskStats, error) {
 		return DiskStats{}, err
 	}
 
-	return sumDiskCounters(diskCounters), nil
+	return sumAndFilterDiskCounters(diskCounters)
 }
 
 func getSummedNetStats(ctx context.Context) (net.IOCountersStat, error) {
@@ -692,11 +713,26 @@ func getSummedNetStats(ctx context.Context) (net.IOCountersStat, error) {
 	return sumNetworkCounters(netCounters), nil
 }
 
-// sumDiskCounters returns a new disk.IOCountersStat whose values are the sum of the
-// values in the slice of disk.IOCountersStats passed in.
-func sumDiskCounters(disksStats []DiskStats) DiskStats {
+// sumAndFilterDiskCounters returns a new disk.IOCountersStat whose values are
+// the sum of the values in the slice of disk.IOCountersStats passed in. It
+// filters out any disk counters that are likely reflecting values already
+// counted elsewhere, eg. md* logical volumes that are created out of RAIDing
+// underlying drives. The filtering regex defaults to a platform-dependent one.
+func sumAndFilterDiskCounters(disksStats []DiskStats) (DiskStats, error) {
 	output := DiskStats{}
+	var ignored *regexp.Regexp
+	if diskMetricsIgnoredDevices != "" {
+		var err error
+		ignored, err = regexp.Compile(diskMetricsIgnoredDevices)
+		if err != nil {
+			return output, err
+		}
+	}
+
 	for _, stats := range disksStats {
+		if ignored != nil && ignored.MatchString(stats.Name) {
+			continue
+		}
 		output.ReadBytes += stats.ReadBytes
 		output.readCount += stats.readCount
 		output.readTime += stats.readTime
@@ -710,7 +746,7 @@ func sumDiskCounters(disksStats []DiskStats) DiskStats {
 
 		output.iopsInProgress += stats.iopsInProgress
 	}
-	return output
+	return output, nil
 }
 
 // subtractDiskCounters subtracts the counters in `sub` from the counters in `from`,
@@ -758,4 +794,24 @@ func GetProcCPUTime(ctx context.Context) (userTimeMillis, sysTimeMillis int64, e
 		return 0, 0, err
 	}
 	return int64(cpuTime.User), int64(cpuTime.Sys), nil
+}
+
+// getCPUCapacity returns the number of logical CPU processors available for
+// use by the process. The capacity accounts for cgroup constraints, GOMAXPROCS
+// and the number of host processors.
+func getCPUCapacity() (float64, error) {
+	numProcs := float64(runtime.GOMAXPROCS(0 /* read only */))
+	cgroupCPU, err := cgroups.GetCgroupCPU()
+	if err != nil {
+		// Return the GOMAXPROCS value if unable to read the cgroup settings, in
+		// practice this is not likely to occur.
+		return numProcs, err
+	}
+	cpuShare := cgroupCPU.CPUShares()
+	// Take the minimum of the CPU shares and the GOMAXPROCS value. The most CPU
+	// the process could use is the lesser of the two.
+	if cpuShare > numProcs {
+		return numProcs, nil
+	}
+	return cpuShare, nil
 }

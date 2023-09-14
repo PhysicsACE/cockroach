@@ -24,7 +24,7 @@ import (
 )
 
 // startAttemptUpgrade attempts to upgrade cluster version.
-func (s *Server) startAttemptUpgrade(ctx context.Context) error {
+func (s *topLevelServer) startAttemptUpgrade(ctx context.Context) error {
 	return s.stopper.RunAsyncTask(ctx, "auto-upgrade", func(ctx context.Context) {
 		ctx, cancel := s.stopper.WithCancelOnQuiesce(ctx)
 		defer cancel()
@@ -120,15 +120,14 @@ const (
 
 // upgradeStatus lets the main checking loop know if we should do upgrade,
 // keep checking upgrade status, or stop attempting upgrade.
-func (s *Server) upgradeStatus(
+func (s *topLevelServer) upgradeStatus(
 	ctx context.Context, clusterVersion string,
 ) (st upgradeStatus, err error) {
 	nodes, err := s.status.ListNodesInternal(ctx, nil)
 	if err != nil {
 		return upgradeBlockedDueToError, err
 	}
-	clock := s.admin.server.clock
-	statusMap, err := getLivenessStatusMap(ctx, s.nodeLiveness, clock.Now().GoTime(), s.st)
+	vitalities, err := s.nodeLiveness.ScanNodeVitalityFromKV(ctx)
 	if err != nil {
 		return upgradeBlockedDueToError, err
 	}
@@ -137,20 +136,22 @@ func (s *Server) upgradeStatus(
 	var notRunningErr error
 	for _, node := range nodes.Nodes {
 		nodeID := node.Desc.NodeID
-		st := statusMap[nodeID]
+		v := vitalities[nodeID]
 
 		// Skip over removed nodes.
-		if st == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
+		if v.IsDecommissioned() {
 			continue
 		}
 
-		if st != livenesspb.NodeLivenessStatus_LIVE &&
-			st != livenesspb.NodeLivenessStatus_DECOMMISSIONING {
+		// TODO(baptist): This does not allow upgrades if any nodes are draining.
+		// This may be an overly strict check as the operator may want to leave the
+		// node in a draining state until post upgrade.
+		if !v.IsLive(livenesspb.Upgrade) {
 			// We definitely won't be able to upgrade, but defer this error as
 			// we may find out that we are already at the latest version (the
 			// cluster may be up-to-date, but a node is down).
 			if notRunningErr == nil {
-				notRunningErr = errors.Errorf("node %d not running (%s), cannot determine version", nodeID, st)
+				notRunningErr = errors.Errorf("node %d not running (%d), cannot determine version", nodeID, st)
 			}
 			continue
 		}
@@ -204,7 +205,7 @@ func (s *Server) upgradeStatus(
 // clusterVersion returns the current cluster version from the SQL subsystem
 // (which returns the version from the KV store as opposed to the possibly
 // lagging settings subsystem).
-func (s *Server) clusterVersion(ctx context.Context) (string, error) {
+func (s *topLevelServer) clusterVersion(ctx context.Context) (string, error) {
 	row, err := s.sqlServer.internalExecutor.QueryRowEx(
 		ctx, "show-version", nil, /* txn */
 		sessiondata.RootUserSessionDataOverride,

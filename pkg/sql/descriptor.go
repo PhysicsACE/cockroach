@@ -12,8 +12,10 @@ package sql
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -29,6 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
@@ -54,6 +58,17 @@ var (
 	errNoFunction        = pgerror.New(pgcode.InvalidName, "no function specified")
 	errNoMatch           = pgerror.New(pgcode.UndefinedObject, "no object matched")
 )
+
+// PublicSchemaCreatePrivilegeEnabled is the cluster setting that determines
+// whether the CREATE privilege is given to the `public` role on the `public`
+// schema at the time the schema is created.
+var PublicSchemaCreatePrivilegeEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.auth.public_schema_create_privilege.enabled",
+	"determines whether to grant all users the CREATE privileges on the public "+
+		"schema when it is created",
+	true,
+	settings.WithPublic)
 
 // createDatabase takes Database descriptor and creates it if needed,
 // incrementing the descriptor counter. Returns true if the descriptor
@@ -141,11 +156,12 @@ func (p *planner) createDatabase(
 		dbdesc.MaybeWithDatabaseRegionConfig(regionConfig),
 		dbdesc.WithPublicSchemaID(publicSchemaID),
 	)
+	includeCreatePriv := PublicSchemaCreatePrivilegeEnabled.Get(&p.execCfg.Settings.SV)
 	publicSchema := schemadesc.NewBuilder(&descpb.SchemaDescriptor{
 		ParentID:   id,
-		Name:       tree.PublicSchema,
+		Name:       catconstants.PublicSchemaName,
 		ID:         publicSchemaID,
-		Privileges: catpb.NewPublicSchemaPrivilegeDescriptor(),
+		Privileges: catpb.NewPublicSchemaPrivilegeDescriptor(includeCreatePriv),
 		Version:    1,
 	}).BuildCreatedMutableSchema()
 
@@ -199,6 +215,11 @@ func (p *planner) createDatabase(
 
 	}
 
+	// TODO(jeffswenson): delete once region_livess is implemented (#107966)
+	if err := p.maybeUpdateSystemDBSurvivalGoal(ctx); err != nil {
+		return nil, false, err
+	}
+
 	return db, true, nil
 }
 
@@ -210,7 +231,7 @@ func (p *planner) createDescriptor(
 			"expected new descriptor, not a modification of version %d",
 			descriptor.OriginalVersion())
 	}
-	b := &kv.Batch{}
+	b := p.Txn().NewBatch()
 	kvTrace := p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 	if err := p.Descriptors().WriteDescToBatch(ctx, kvTrace, descriptor, b); err != nil {
 		return err
@@ -249,6 +270,19 @@ func TranslateSurvivalGoal(g tree.SurvivalGoal) (descpb.SurvivalGoal, error) {
 	}
 }
 
+// TranslateProtoSurvivalGoal translate a descpb.SurvivalGoal into a
+// tree.SurvivalGoal.
+func TranslateProtoSurvivalGoal(g descpb.SurvivalGoal) (tree.SurvivalGoal, error) {
+	switch g {
+	case descpb.SurvivalGoal_ZONE_FAILURE:
+		return tree.SurvivalGoalZoneFailure, nil
+	case descpb.SurvivalGoal_REGION_FAILURE:
+		return tree.SurvivalGoalRegionFailure, nil
+	default:
+		return 0, errors.Newf("unknown survival goal: %d", g)
+	}
+}
+
 // TranslateDataPlacement translates a tree.DataPlacement into a
 // descpb.DataPlacement.
 func TranslateDataPlacement(g tree.DataPlacement) (descpb.DataPlacement, error) {
@@ -264,10 +298,25 @@ func TranslateDataPlacement(g tree.DataPlacement) (descpb.DataPlacement, error) 
 	}
 }
 
-func (p *planner) checkRegionIsCurrentlyActive(ctx context.Context, region catpb.RegionName) error {
-	liveRegions, err := p.getLiveClusterRegions(ctx)
-	if err != nil {
-		return err
+// checkRegionIsCurrentlyActive looks up the set of active regions and
+// checks whether the region argument is in that set. If this is a secondary
+// tenant, and this check is for the system database, we augment the behavior
+// to only look up the host regions.
+func (p *planner) checkRegionIsCurrentlyActive(
+	ctx context.Context, region catpb.RegionName, isSystemDatabase bool,
+) error {
+	var liveRegions LiveClusterRegions
+	if !p.execCfg.Codec.ForSystemTenant() && isSystemDatabase {
+		systemRegions, err := p.regionsProvider().GetSystemRegions(ctx)
+		if err != nil {
+			return err
+		}
+		liveRegions = regionsResponseToLiveClusterRegions(systemRegions)
+	} else {
+		var err error
+		if liveRegions, err = p.getLiveClusterRegions(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Ensure that the region we're adding is currently active.
@@ -303,11 +352,11 @@ var DefaultPrimaryRegion = settings.RegisterStringSetting(
 	`if not empty, all databases created without a PRIMARY REGION will `+
 		`implicitly have the given PRIMARY REGION`,
 	"",
-).WithPublic()
+	settings.WithPublic)
 
 // SecondaryTenantsMultiRegionAbstractionsEnabledSettingName is the name of the
 // cluster setting that governs secondary tenant multi-region abstraction usage.
-const SecondaryTenantsMultiRegionAbstractionsEnabledSettingName = "sql.multi_region.allow_abstractions_for_secondary_tenants.enabled"
+const SecondaryTenantsMultiRegionAbstractionsEnabledSettingName = "sql.virtual_cluster.feature_access.multiregion.enabled"
 
 // SecondaryTenantsMultiRegionAbstractionsEnabled controls if secondary tenants
 // are allowed to use multi-region abstractions. In particular, it controls if
@@ -319,9 +368,10 @@ const SecondaryTenantsMultiRegionAbstractionsEnabledSettingName = "sql.multi_reg
 // databases.
 var SecondaryTenantsMultiRegionAbstractionsEnabled = settings.RegisterBoolSetting(
 	settings.TenantReadOnly,
-	SecondaryTenantsMultiRegionAbstractionsEnabledSettingName,
-	"allow secondary tenants to use multi-region abstractions",
+	"sql.multi_region.allow_abstractions_for_secondary_tenants.enabled", // internal key, name defined above
+	"allow the use of multi-region abstractions and syntax in virtual clusters",
 	false,
+	settings.WithName(SecondaryTenantsMultiRegionAbstractionsEnabledSettingName),
 )
 
 // maybeInitializeMultiRegionMetadata initializes multi-region metadata if a
@@ -352,16 +402,15 @@ func (p *planner) maybeInitializeMultiRegionMetadata(
 	}
 
 	if primaryRegion == "" && len(regions) == 0 {
-		defaultPrimaryRegion := DefaultPrimaryRegion.Get(&p.execCfg.Settings.SV)
-		if defaultPrimaryRegion == "" {
+		var err error
+		primaryRegion, regions, err = p.getDefaultDatabaseRegions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if primaryRegion == "" {
 			return nil, nil
 		}
-		primaryRegion = tree.Name(defaultPrimaryRegion)
-		// TODO(#67156): send notice immediately, so it pops up even on error.
-		p.BufferClientNotice(
-			ctx,
-			pgnotice.Newf("setting %s as the PRIMARY REGION as no PRIMARY REGION was specified", primaryRegion),
-		)
+		p.BufferClientNotice(ctx, formatDefaultRegionNotice(primaryRegion, regions))
 	}
 
 	liveRegions, err := p.getLiveClusterRegions(ctx)
@@ -386,6 +435,72 @@ func (p *planner) maybeInitializeMultiRegionMetadata(
 	}
 
 	return regionConfig, nil
+}
+
+// formatDefaultRegionNotice formats an error that looks like:
+//
+// defaulting to 'WITH PRIMARY REGION "us-east1" REGIONS "us-west2",
+// "us-central3"' as no primary region was specified
+//
+// The error message is intended to echo sql that is equivalent to the default
+// behavior.
+func formatDefaultRegionNotice(primary tree.Name, regions []tree.Name) pgnotice.Notice {
+	var message strings.Builder
+	fmt.Fprintf(&message, `defaulting to 'WITH PRIMARY REGION "%s"`, primary)
+
+	// Add non-primary regions to the message if present.
+	if 0 < len(regions) {
+		fmt.Fprintf(&message, ` REGIONS`)
+		for i := range regions {
+			fmt.Fprintf(&message, ` "%s"`, regions[i])
+			if i < len(regions)-1 {
+				fmt.Fprint(&message, `,`)
+			}
+		}
+	}
+
+	fmt.Fprint(&message, `' as no primary region was specified`)
+	return pgnotice.Newf("%s", message.String())
+}
+
+// getDefaultDatabaseRegions returns the default primary and nonPrimary regions
+// for a database if the user did not specify a primary region via sql.
+func (p *planner) getDefaultDatabaseRegions(
+	ctx context.Context,
+) (primary tree.Name, nonPrimary []tree.Name, err error) {
+	// If 'sql.defaults.primary_region' is set, use the setting value.
+	defaultPrimaryRegion := DefaultPrimaryRegion.Get(&p.execCfg.Settings.SV)
+	if defaultPrimaryRegion != "" {
+		return tree.Name(defaultPrimaryRegion), nil, nil
+	}
+
+	// Otherwise, retrieve the primary region from the system database's
+	// descriptor and the set of all regions from the system database's region
+	// enum.
+	systemDatabase, err := p.Descriptors().ByIDWithLeased(p.txn).Get().Database(ctx, keys.SystemDatabaseID)
+	if err != nil {
+		return "", nil, errors.NewAssertionErrorWithWrappedErrf(
+			err, "failed to resolve system database for regions",
+		)
+	}
+
+	enumRegions, err := regions.GetDatabaseRegions(ctx, p.txn, systemDatabase, p.Descriptors())
+	if err != nil {
+		return "", nil, err
+	}
+	if len(enumRegions) == 0 {
+		return "", nil, nil
+	}
+
+	primaryRegion := tree.Name(systemDatabase.GetRegionConfig().PrimaryRegion)
+	for region := range enumRegions {
+		nextRegion := tree.Name(region)
+		if nextRegion != primaryRegion {
+			nonPrimary = append(nonPrimary, nextRegion)
+		}
+	}
+
+	return primaryRegion, nonPrimary, nil
 }
 
 // GetImmutableTableInterfaceByID is part of the EvalPlanner interface.

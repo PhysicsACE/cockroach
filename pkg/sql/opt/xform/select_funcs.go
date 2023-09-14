@@ -106,7 +106,7 @@ func (c *CustomFuncs) GeneratePartialIndexScans(
 	// Iterate over all partial indexes.
 	var pkCols opt.ColSet
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, filters, rejectNonPartialIndexes|rejectInvertedIndexes)
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, scanPrivate, filters, rejectNonPartialIndexes|rejectInvertedIndexes)
 	iter.ForEach(func(index cat.Index, remainingFilters memo.FiltersExpr, indexCols opt.ColSet, isCovering bool, constProj memo.ProjectionsExpr) {
 		var sb indexScanBuilder
 		sb.Init(c, scanPrivate.Table)
@@ -344,7 +344,7 @@ func (c *CustomFuncs) GetOptionalFiltersAndFilterColumns(
 ) (optionalFilters memo.FiltersExpr, filterColumns opt.ColSet) {
 
 	optionalFilters = c.checkConstraintFilters(scanPrivate.Table)
-	computedColFilters := c.computedColFilters(scanPrivate, explicitFilters, optionalFilters)
+	computedColFilters := c.ComputedColFilters(scanPrivate, explicitFilters, optionalFilters)
 	optionalFilters = append(optionalFilters, computedColFilters...)
 
 	filterColumns = c.FilterOuterCols(explicitFilters)
@@ -437,7 +437,7 @@ func (c *CustomFuncs) GenerateConstrainedScans(
 
 	// Iterate over all non-inverted indexes.
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, explicitFilters, rejectInvertedIndexes)
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, scanPrivate, explicitFilters, rejectInvertedIndexes)
 	iter.ForEach(func(index cat.Index, filters memo.FiltersExpr, indexCols opt.ColSet, isCovering bool, constProj memo.ProjectionsExpr) {
 
 		// Create a prefix sorter that describes which index partitions are
@@ -504,58 +504,6 @@ func (c *CustomFuncs) GenerateConstrainedScans(
 
 		sb.Build(grp)
 	})
-}
-
-// tryFoldComputedCol tries to reduce the computed column with the given column
-// ID into a constant value, by evaluating it with respect to a set of other
-// columns that are constant. If the computed column is constant, enter it into
-// the constCols map and return true. Otherwise, return false.
-func (c *CustomFuncs) tryFoldComputedCol(
-	tabMeta *opt.TableMeta, computedColID opt.ColumnID, constCols constColsMap,
-) bool {
-	// Check whether computed column has already been folded.
-	if _, ok := constCols[computedColID]; ok {
-		return true
-	}
-
-	var replace func(e opt.Expr) opt.Expr
-	replace = func(e opt.Expr) opt.Expr {
-		if variable, ok := e.(*memo.VariableExpr); ok {
-			// Can variable be folded?
-			if constVal, ok := constCols[variable.Col]; ok {
-				// Yes, so replace it with its constant value.
-				return constVal
-			}
-
-			// No, but that may be because the variable refers to a dependent
-			// computed column. In that case, try to recursively fold that
-			// computed column. There are no infinite loops possible because the
-			// dependency graph is guaranteed to be acyclic.
-			if _, ok := tabMeta.ComputedCols[variable.Col]; ok {
-				if c.tryFoldComputedCol(tabMeta, variable.Col, constCols) {
-					return constCols[variable.Col]
-				}
-			}
-
-			return e
-		}
-		return c.e.f.Replace(e, replace)
-	}
-
-	computedCol := tabMeta.ComputedCols[computedColID]
-	if memo.CanBeCompositeSensitive(c.e.mem.Metadata(), computedCol) {
-		// The computed column expression can return different values for logically
-		// equal outer columns (e.g. d::STRING where d is a DECIMAL).
-		return false
-	}
-	replaced := replace(computedCol).(opt.ScalarExpr)
-
-	// If the computed column is constant, enter it into the constCols map.
-	if opt.IsConstValueOp(replaced) {
-		constCols[computedColID] = replaced
-		return true
-	}
-	return false
 }
 
 // inBetweenFilters returns a set of filters that are required to cover all the
@@ -876,16 +824,17 @@ func (c *CustomFuncs) GenerateInvertedIndexScans(
 	// Generate implicit filters from constraints and computed columns as
 	// optional filters to help constrain an index scan.
 	optionalFilters := c.checkConstraintFilters(scanPrivate.Table)
-	computedColFilters := c.computedColFilters(scanPrivate, filters, optionalFilters)
+	computedColFilters := c.ComputedColFilters(scanPrivate, filters, optionalFilters)
 	optionalFilters = append(optionalFilters, computedColFilters...)
 
 	// Iterate over all inverted indexes.
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, filters, rejectNonInvertedIndexes)
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, scanPrivate, filters, rejectNonInvertedIndexes)
 	iter.ForEach(func(index cat.Index, filters memo.FiltersExpr, indexCols opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
 		// Check whether the filter can constrain the index.
 		spanExpr, constraint, remainingFilters, pfState, ok := invertedidx.TryFilterInvertedIndex(
 			c.e.ctx, c.e.evalCtx, c.e.f, filters, optionalFilters, scanPrivate.Table, index, tabMeta.ComputedCols,
+			c.checkCancellation,
 		)
 		if !ok {
 			// A span expression to constrain the inverted index could not be
@@ -1011,6 +960,11 @@ func (c *CustomFuncs) canMaybeConstrainNonInvertedIndex(
 ) bool {
 	md := c.e.mem.Metadata()
 	index := md.Table(tabID).Index(indexOrd)
+	tabMeta := md.TableMeta(tabID)
+	var computedCols opt.ColSet
+	for colID := range tabMeta.ComputedCols {
+		computedCols.Add(colID)
+	}
 
 	for i := range filters {
 		filterProps := filters[i].ScalarProps()
@@ -1020,6 +974,15 @@ func (c *CustomFuncs) canMaybeConstrainNonInvertedIndex(
 		firstIndexCol := tabID.IndexColumnID(index, 0)
 		if filterProps.OuterCols.Contains(firstIndexCol) {
 			return true
+		}
+
+		// If the first index column is a computed column and the filter involves
+		// columns in the computed column expression, then the index can possibly be
+		// constrained.
+		if computedCols.Contains(firstIndexCol) {
+			if tabMeta.ColsInComputedColsExpressions.Intersects(filterProps.OuterCols) {
+				return true
+			}
 		}
 
 		// If the constraints are not tight, then the index can possibly be
@@ -1112,7 +1075,7 @@ func (c *CustomFuncs) GenerateZigzagJoins(
 	// TODO(mgartner): We should consider primary indexes when it has multiple
 	// columns and only the first is being constrained.
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, filters, rejectPrimaryIndex|rejectInvertedIndexes)
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, scanPrivate, filters, rejectPrimaryIndex|rejectInvertedIndexes)
 	iter.ForEach(func(leftIndex cat.Index, outerFilters memo.FiltersExpr, leftCols opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
 		leftFixed := c.indexConstrainedCols(leftIndex, scanPrivate.Table, fixedCols)
 		// Short-circuit quickly if the first column in the index is not a fixed
@@ -1122,7 +1085,7 @@ func (c *CustomFuncs) GenerateZigzagJoins(
 		}
 
 		var iter2 scanIndexIter
-		iter2.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, outerFilters, rejectPrimaryIndex|rejectInvertedIndexes)
+		iter2.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, scanPrivate, outerFilters, rejectPrimaryIndex|rejectInvertedIndexes)
 		iter2.SetOriginalFilters(filters)
 		iter2.ForEachStartingAfter(leftIndex.Ordinal(), func(rightIndex cat.Index, innerFilters memo.FiltersExpr, rightCols opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
 			// Check if we have zigzag hints.
@@ -1451,7 +1414,7 @@ func (c *CustomFuncs) GenerateInvertedIndexZigzagJoins(
 
 	// Iterate over all inverted indexes.
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e.f, c.e.mem, &c.im, scanPrivate, filters, rejectNonInvertedIndexes)
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, scanPrivate, filters, rejectNonInvertedIndexes)
 	iter.ForEach(func(index cat.Index, filters memo.FiltersExpr, indexCols opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
 		// Check if we have zigzag hints.
 		if !scanPrivate.Flags.ZigzagIndexes.Empty() && !scanPrivate.Flags.ZigzagIndexes.Contains(index.Ordinal()) {
@@ -1477,6 +1440,7 @@ func (c *CustomFuncs) GenerateInvertedIndexZigzagJoins(
 			scanPrivate.Table,
 			index,
 			nil, /* computedColumns */
+			c.checkCancellation,
 		)
 		if !ok {
 			return
@@ -1882,4 +1846,14 @@ func (c *CustomFuncs) AddPrimaryKeyColsToScanPrivate(sp *memo.ScanPrivate) *memo
 // TableIDFromScanPrivate returns the table ID of the scan private.
 func (c *CustomFuncs) TableIDFromScanPrivate(sp *memo.ScanPrivate) opt.TableID {
 	return sp.Table
+}
+
+func (c *CustomFuncs) checkCancellation() {
+	// Check whether the optimization has been canceled (most likely due to a
+	// statement timeout). Internally, only every 1024th Check() call will poll
+	// on the Done channel, so this should only have negligible performance
+	// overhead.
+	if err := c.e.o.cancelChecker.Check(); err != nil {
+		panic(err)
+	}
 }

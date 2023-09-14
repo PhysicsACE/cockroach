@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -91,6 +92,13 @@ func (so *DummySequenceOperators) GetLatestValueInSessionForSequenceByID(
 	return 0, errors.WithStack(errSequenceOperators)
 }
 
+// GetLastSequenceValueByID implements the eval.SequenceOperators interface.
+func (so *DummySequenceOperators) GetLastSequenceValueByID(
+	ctx context.Context, seqID uint32,
+) (int64, bool, error) {
+	return 0, false, errors.WithStack(errSequenceOperators)
+}
+
 // SetSequenceValueByID implements the eval.SequenceOperators interface.
 func (so *DummySequenceOperators) SetSequenceValueByID(
 	ctx context.Context, seqID uint32, newVal int64, isCalled bool,
@@ -134,12 +142,6 @@ func (so *DummyRegionOperator) ResetMultiRegionZoneConfigsForTable(
 func (so *DummyRegionOperator) ResetMultiRegionZoneConfigsForDatabase(
 	_ context.Context, id int64,
 ) error {
-	return errors.WithStack(errRegionOperator)
-}
-
-// OptimizeSystemDatabase is part of the eval.RegionOperator
-// interface.
-func (so *DummyRegionOperator) OptimizeSystemDatabase(_ context.Context) error {
 	return errors.WithStack(errRegionOperator)
 }
 
@@ -325,6 +327,11 @@ func (*DummyEvalPlanner) ExecutorConfig() interface{} {
 	return nil
 }
 
+// Optimizer is part of the cat.Catalog interface.
+func (*DummyEvalPlanner) Optimizer() interface{} {
+	return nil
+}
+
 var _ eval.Planner = &DummyEvalPlanner{}
 
 var errEvalPlanner = pgerror.New(pgcode.ScalarOperationCannotRunWithoutFullSessionContext,
@@ -453,7 +460,7 @@ func (ep *DummyEvalPlanner) ResolveFunction(
 // ResolveFunctionByOID implements FunctionReferenceResolver interface.
 func (ep *DummyEvalPlanner) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (*tree.FunctionName, *tree.Overload, error) {
+) (*tree.RoutineName, *tree.Overload, error) {
 	return nil, nil, errors.AssertionFailedf("ResolveFunctionByOID unimplemented")
 }
 
@@ -474,6 +481,13 @@ func (ep *DummyEvalPlanner) EnforceHomeRegion() bool {
 	return false
 }
 
+// GetRangeDescIterator is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) GetRangeDescIterator(
+	context.Context, roachpb.Span,
+) (_ rangedesc.Iterator, _ error) {
+	return
+}
+
 // GetRangeDescByID is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) GetRangeDescByID(
 	context.Context, roachpb.RangeID,
@@ -483,7 +497,7 @@ func (ep *DummyEvalPlanner) GetRangeDescByID(
 
 // SpanStats is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) SpanStats(
-	context.Context, roachpb.RKey, roachpb.RKey,
+	context.Context, roachpb.Spans,
 ) (stats *roachpb.SpanStatsResponse, err error) {
 	return
 }
@@ -493,6 +507,10 @@ func (ep *DummyEvalPlanner) GetDetailsForSpanStats(
 	context.Context, int, int,
 ) (it eval.InternalRows, err error) {
 	return
+}
+
+// MaybeReallocateAnnotations is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) {
 }
 
 // DummyPrivilegedAccessor implements the tree.PrivilegedAccessor interface by returning errors.
@@ -515,6 +533,11 @@ func (ep *DummyPrivilegedAccessor) LookupZoneConfigByNamespaceID(
 	ctx context.Context, id int64,
 ) (tree.DBytes, bool, error) {
 	return "", false, errors.WithStack(errEvalPrivileged)
+}
+
+// IsSystemTable is part of the tree.PrivilegedAccessor interface.
+func (ep *DummyPrivilegedAccessor) IsSystemTable(ctx context.Context, id int64) (bool, error) {
+	return false, errors.WithStack(errEvalPrivileged)
 }
 
 // DummySessionAccessor implements the eval.SessionAccessor interface by returning errors.
@@ -544,6 +567,13 @@ func (ep *DummySessionAccessor) HasAdminRole(_ context.Context) (bool, error) {
 	return false, errors.WithStack(errEvalSessionVar)
 }
 
+// CheckPrivilege is part of the eval.SessionAccessor interface.
+func (ep *DummySessionAccessor) CheckPrivilege(
+	_ context.Context, _ privilege.Object, _ privilege.Kind,
+) error {
+	return errors.WithStack(errEvalSessionVar)
+}
+
 // HasRoleOption is part of the eval.SessionAccessor interface.
 func (ep *DummySessionAccessor) HasRoleOption(
 	ctx context.Context, roleOption roleoption.Option,
@@ -565,6 +595,11 @@ var _ eval.ClientNoticeSender = &DummyClientNoticeSender{}
 
 // BufferClientNotice is part of the eval.ClientNoticeSender interface.
 func (c *DummyClientNoticeSender) BufferClientNotice(context.Context, pgnotice.Notice) {}
+
+// SendClientNotice is part of the eval.ClientNoticeSender interface.
+func (c *DummyClientNoticeSender) SendClientNotice(context.Context, pgnotice.Notice) error {
+	return nil
+}
 
 // DummyTenantOperator implements the tree.TenantOperator interface.
 type DummyTenantOperator struct{}

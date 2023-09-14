@@ -73,7 +73,7 @@ func registerNodeJSPostgres(r registry.Registry) {
 			c,
 			node,
 			"add nodesource repository",
-			`sudo apt install ca-certificates && curl -sL https://deb.nodesource.com/setup_16.x | sudo -E bash -`,
+			`sudo apt install ca-certificates && curl -sL https://deb.nodesource.com/setup_18.x | sudo -E bash -`,
 		)
 		require.NoError(t, err)
 
@@ -168,9 +168,10 @@ PGSSLCERT=$HOME/certs/client.%s.crt PGSSLKEY=$HOME/certs/client.%s.key PGSSLROOT
 
 	r.Add(registry.TestSpec{
 		Name:    "node-postgres",
-		Owner:   registry.OwnerSQLSessions,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `driver`},
+		Leases:  registry.MetamorphicLeases,
+		Tags:    registry.Tags(`default`, `driver`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runNodeJSPostgres(ctx, t, c)
 		},

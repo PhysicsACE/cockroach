@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Package schemachange implements the schemachange workload.
 package schemachange
 
 import (
@@ -17,21 +18,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"regexp"
-	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/spf13/pflag"
 )
 
@@ -54,32 +56,37 @@ import (
 //For example, an attempt to do something we don't support should be swallowed (though if we can detect that maybe we should just not do it, e.g). It will be hard to use this test for anything more than liveness detection until we go through the tedious process of classifying errors.:
 
 const (
-	defaultMaxOpsPerWorker    = 5
-	defaultErrorRate          = 10
-	defaultEnumPct            = 10
-	defaultMaxSourceTables    = 3
-	defaultSequenceOwnedByPct = 25
-	defaultFkParentInvalidPct = 5
-	defaultFkChildInvalidPct  = 5
+	defaultMaxOpsPerWorker                 = 5
+	defaultErrorRate                       = 10
+	defaultEnumPct                         = 10
+	defaultMaxSourceTables                 = 3
+	defaultSequenceOwnedByPct              = 25
+	defaultFkParentInvalidPct              = 5
+	defaultFkChildInvalidPct               = 5
+	defaultDeclarativeSchemaChangerPct     = 25
+	defaultDeclarativeSchemaMaxStmtsPerTxn = 1
 )
 
 type schemaChange struct {
-	flags              workload.Flags
-	dbOverride         string
-	concurrency        int
-	maxOpsPerWorker    int
-	errorRate          int
-	enumPct            int
-	verbose            int
-	dryRun             bool
-	maxSourceTables    int
-	sequenceOwnedByPct int
-	logFilePath        string
-	logFile            *os.File
-	dumpLogsOnce       *sync.Once
-	workers            []*schemaChangeWorker
-	fkParentInvalidPct int
-	fkChildInvalidPct  int
+	flags                           workload.Flags
+	connFlags                       *workload.ConnFlags
+	dbOverride                      string
+	maxOpsPerWorker                 int
+	errorRate                       int
+	enumPct                         int
+	verbose                         int
+	dryRun                          bool
+	maxSourceTables                 int
+	sequenceOwnedByPct              int
+	logFilePath                     string
+	logFile                         *os.File
+	dumpLogsOnce                    *sync.Once
+	declarativeStatementsEnabled    atomic.Bool
+	workers                         []*schemaChangeWorker
+	fkParentInvalidPct              int
+	fkChildInvalidPct               int
+	declarativeSchemaChangerPct     int
+	declarativeSchemaMaxStmtsPerTxn int
 }
 
 var schemaChangeMeta = workload.Meta{
@@ -91,8 +98,6 @@ var schemaChangeMeta = workload.Meta{
 		s.flags.FlagSet = pflag.NewFlagSet(`schemachange`, pflag.ContinueOnError)
 		s.flags.StringVar(&s.dbOverride, `db`, ``,
 			`Override for the SQL database to use. If empty, defaults to the generator name`)
-		s.flags.IntVar(&s.concurrency, `concurrency`, 2*runtime.GOMAXPROCS(0), /* TODO(spaskob): sensible default? */
-			`Number of concurrent workers`)
 		s.flags.IntVar(&s.maxOpsPerWorker, `max-ops-per-worker`, defaultMaxOpsPerWorker,
 			`Number of operations to execute in a single transaction`)
 		s.flags.IntVar(&s.errorRate, `error-rate`, defaultErrorRate,
@@ -111,6 +116,14 @@ var schemaChangeMeta = workload.Meta{
 			`Percentage of times to choose an invalid parent column in a fk constraint.`)
 		s.flags.IntVar(&s.fkChildInvalidPct, `fk-child-invalid-pct`, defaultFkChildInvalidPct,
 			`Percentage of times to choose an invalid child column in a fk constraint.`)
+		s.flags.IntVar(&s.declarativeSchemaChangerPct, `declarative-schema-changer-pct`,
+			defaultDeclarativeSchemaChangerPct,
+			`Percentage of the declarative schema changer is used.`)
+		s.flags.IntVar(&s.declarativeSchemaMaxStmtsPerTxn, `declarative-schema-changer-stmt-per-txn`,
+			defaultDeclarativeSchemaMaxStmtsPerTxn,
+			`Number of statements per-txn used by the declarative schema changer.`)
+
+		s.connFlags = workload.NewConnFlags(&s.flags)
 		return s
 	},
 }
@@ -151,9 +164,18 @@ func (s *schemaChange) Ops(
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
-	cfg := workload.MultiConnPoolCfg{
-		MaxTotalConnections: s.concurrency * 2, //TODO(spaskob): pick a sensible default.
-	}
+	cfg := workload.NewMultiConnPoolCfgFromFlags(s.connFlags)
+	// We will need double the concurrency, since we need watch
+	// dog connections. There is a danger of the pool emptying on
+	// termination (since we will cancel schema changes).
+	cfg.MaxConnsPerPool *= 2
+	cfg.MaxTotalConnections *= 2
+	// Disallow connection lifetime jittering and allow long
+	// life times for this test. Schema changes can drag for
+	// a long time on this workload and we have our own health
+	// checks for progress.
+	cfg.MaxConnLifetime = time.Hour
+	cfg.MaxConnIdleTime = time.Hour
 	pool, err := workload.NewMultiConnPool(ctx, cfg, urls...)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -162,15 +184,23 @@ func (s *schemaChange) Ops(
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
-
-	err = adjustOpWeightsForCockroachVersion(ctx, pool, opWeights)
-	if err != nil {
-		return workload.QueryLoad{}, err
+	stdoutLog := makeAtomicLog(os.Stdout)
+	rng, seed := randutil.NewTestRand()
+	stdoutLog.printLn(fmt.Sprintf("using random seed: %d", seed))
+	ops := newDeck(rng, opWeights...)
+	// A separate deck is constructed of only schema changes supported
+	// by the declarative schema changer. This deck has equal weights,
+	// only for supported schema changes.
+	declarativeOpWeights := make([]int, len(opWeights))
+	for idx, weight := range opWeights {
+		if opDeclarative[idx] {
+			declarativeOpWeights[idx] = weight
+		}
 	}
-	ops := newDeck(rand.New(rand.NewSource(timeutil.Now().UnixNano())), opWeights...)
+	declarativeOps := newDeck(rng, declarativeOpWeights...)
+
 	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
 
-	stdoutLog := makeAtomicLog(os.Stdout)
 	var artifactsLog *atomicLog
 	if s.logFilePath != "" {
 		err := s.initJSONLogFile(s.logFilePath)
@@ -179,17 +209,17 @@ func (s *schemaChange) Ops(
 		}
 		artifactsLog = makeAtomicLog(s.logFile)
 	}
-
 	s.dumpLogsOnce = &sync.Once{}
 
-	for i := 0; i < s.concurrency; i++ {
+	for i := 0; i < s.connFlags.Concurrency; i++ {
 
 		opGeneratorParams := operationGeneratorParams{
 			seqNum:             seqNum,
 			errorRate:          s.errorRate,
 			enumPct:            s.enumPct,
-			rng:                rand.New(rand.NewSource(timeutil.Now().UnixNano())),
+			rng:                rng,
 			ops:                ops,
+			declarativeOps:     declarativeOps,
 			maxSourceTables:    s.maxSourceTables,
 			sequenceOwnedByPct: s.sequenceOwnedByPct,
 			fkParentInvalidPct: s.fkParentInvalidPct,
@@ -236,8 +266,8 @@ func (s *schemaChange) Ops(
 // cluster.
 func (s *schemaChange) initSeqNum(
 	ctx context.Context, pool *workload.MultiConnPool,
-) (*int64, error) {
-	seqNum := new(int64)
+) (*atomic.Int64, error) {
+	var seqNum atomic.Int64
 
 	const q = `
 SELECT max(regexp_extract(name, '[0-9]+$')::INT8)
@@ -260,10 +290,10 @@ SELECT max(regexp_extract(name, '[0-9]+$')::INT8)
 		return nil, err
 	}
 	if max.Valid {
-		*seqNum = max.Int64 + 1
+		seqNum.Store(max.Int64 + 1)
 	}
 
-	return seqNum, nil
+	return &seqNum, nil
 }
 
 type schemaChangeWorker struct {
@@ -326,10 +356,15 @@ func (w *schemaChangeWorker) WrapWithErrorState(err error) error {
 	}
 }
 
-func (w *schemaChangeWorker) runInTxn(ctx context.Context, tx pgx.Tx) error {
+func (w *schemaChangeWorker) runInTxn(
+	ctx context.Context, tx pgx.Tx, useDeclarativeSchemaChanger bool,
+) error {
 	w.logger.startLog(w.id)
 	w.logger.writeLog("BEGIN")
 	opsNum := 1 + w.opGen.randIntn(w.maxOpsPerWorker)
+	if useDeclarativeSchemaChanger && opsNum > w.workload.declarativeSchemaMaxStmtsPerTxn {
+		opsNum = w.workload.declarativeSchemaMaxStmtsPerTxn
+	}
 
 	for i := 0; i < opsNum; i++ {
 		// Terminating this loop early if there are expected commit errors prevents unexpected commit behavior from being
@@ -343,7 +378,7 @@ func (w *schemaChangeWorker) runInTxn(ctx context.Context, tx pgx.Tx) error {
 			break
 		}
 
-		op, err := w.opGen.randOp(ctx, tx)
+		op, err := w.opGen.randOp(ctx, tx, useDeclarativeSchemaChanger)
 		if pgErr := new(pgconn.PgError); errors.As(err, &pgErr) &&
 			pgcode.MakeCode(pgErr.Code) == pgcode.SerializationFailure {
 			return errors.Mark(err, errRunInTxnRbkSentinel)
@@ -391,9 +426,39 @@ func (w *schemaChangeWorker) runInTxn(ctx context.Context, tx pgx.Tx) error {
 }
 
 func (w *schemaChangeWorker) run(ctx context.Context) error {
-	tx, err := w.pool.Get().Begin(ctx)
+	conn, err := w.pool.Get().Acquire(ctx)
+	defer conn.Release()
+	if err != nil {
+		return errors.Wrap(err, "cannot get a connection")
+	}
+	useDeclarativeSchemaChanger := w.opGen.randIntn(100) > w.workload.declarativeSchemaChangerPct
+	if useDeclarativeSchemaChanger {
+		if _, err := conn.Exec(ctx, "SET use_declarative_schema_changer='unsafe_always';"); err != nil {
+			return err
+		}
+	} else {
+		if _, err := conn.Exec(ctx, "SET use_declarative_schema_changer='off';"); err != nil {
+			return err
+		}
+	}
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return errors.Wrap(err, "cannot get a connection and begin a txn")
+	}
+
+	// Enable extra schema changes, if they are available this moment.
+	if !w.workload.declarativeStatementsEnabled.Load() {
+		cannotEnableSchemaChanges, err := isClusterVersionLessThan(ctx, tx, clusterversion.ByKey(clusterversion.V23_2))
+		if err != nil {
+			return errors.Wrap(err, "cannot to get active")
+		}
+		if !cannotEnableSchemaChanges {
+			_, err = w.pool.Get().Exec(ctx, `SET CLUSTER SETTING sql.schema.force_declarative_statements="+CREATE SCHEMA, +CREATE SEQUENCE"`)
+			if err != nil {
+				return errors.Wrap(err, "cannot to enable extra schema changes")
+			}
+			w.workload.declarativeStatementsEnabled.Store(true)
+		}
 	}
 
 	// Release log entry locks if holding all.
@@ -407,16 +472,19 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 	defer watchDog.Stop()
 	start := timeutil.Now()
 	w.opGen.resetTxnState()
-	err = w.runInTxn(ctx, tx)
+	err = w.runInTxn(ctx, tx, useDeclarativeSchemaChanger)
 
 	if err != nil {
 		// Rollback in all cases to release the txn object and its conn pool. Wrap the original
 		// error with a rollback error if necessary.
-		if rbkErr := tx.Rollback(ctx); rbkErr != nil {
-			err = errors.Mark(
-				errors.Wrap(rbkErr, "***UNEXPECTED ERROR DURING ROLLBACK;"),
-				errRunInTxnFatalSentinel,
-			)
+		if !conn.Conn().IsClosed() {
+			if rbkErr := tx.Rollback(ctx); rbkErr != nil {
+				err = errors.Mark(
+					errors.Wrap(errors.WithSecondaryError(err,
+						rbkErr), "***UNEXPECTED ERROR DURING ROLLBACK;"),
+					errRunInTxnFatalSentinel,
+				)
+			}
 		}
 
 		w.logger.flushLogWithError(tx, err)
@@ -438,6 +506,11 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 		// If the error not an instance of pgconn.PgError, then it is unexpected.
 		pgErr := new(pgconn.PgError)
 		if !errors.As(err, &pgErr) {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				err = nil
+				w.logger.writeLog("WARNING: Connection failed at server")
+				return err
+			}
 			err = errors.Mark(
 				errors.Wrap(err, "***UNEXPECTED COMMIT ERROR; Received a non pg error"),
 				errRunInTxnFatalSentinel,
@@ -602,7 +675,7 @@ func (l *logger) flushLogWithError(tx pgx.Tx, err error) {
 	}()
 
 	l.flushLogAndLock(tx, err.Error(), true)
-	l.currentLogEntry.mu.Unlock()
+	defer l.currentLogEntry.mu.Unlock()
 }
 
 // flushLog outputs the currentLogEntry of the schemaChangeWorker.
@@ -612,7 +685,7 @@ func (l *logger) flushLog(tx pgx.Tx, message string) {
 		return
 	}
 	l.flushLogAndLock(tx, message, true)
-	l.currentLogEntry.mu.Unlock()
+	defer l.currentLogEntry.mu.Unlock()
 }
 
 // flushLogAndLock prints the currentLogEntry of the schemaChangeWorker and does not release

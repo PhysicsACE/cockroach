@@ -15,6 +15,7 @@ package upgrademanager
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -35,9 +36,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/migrationstable"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradecluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradejob"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -123,7 +127,7 @@ func safeToUpgradeTenant(
 	if overrides == nil {
 		return false, errors.AssertionFailedf("overrides informer is nil in secondary tenant")
 	}
-	storageClusterVersion := overrides.(*settingswatcher.SettingsWatcher).GetStorageClusterVersion()
+	storageClusterVersion := overrides.(*settingswatcher.SettingsWatcher).GetStorageClusterActiveVersion()
 	if storageClusterVersion.Less(tenantClusterVersion.Version) {
 		// We assert here if we find a tenant with a higher cluster version than
 		// the storage cluster. It's dangerous to run in this mode because the
@@ -194,7 +198,9 @@ func (m *Manager) RunPermanentUpgrades(ctx context.Context, upToVersion roachpb.
 		// without using jobs, so that the side effect of the migrations are
 		// minimized and tests continue to be happy as they were before the
 		// permanent migrations were introduced.
-		return m.runPermanentMigrationsWithoutJobsForTests(ctx, user)
+		// We use WithoutChecks here as this is test only code and we don't want
+		// to blindly retry multiple migrations in one go.
+		return m.runPermanentMigrationsWithoutJobsForTests(startup.WithoutChecks(ctx), user)
 	}
 
 	// Do a best-effort check to see if all upgrades have already executed and so
@@ -207,13 +213,18 @@ func (m *Manager) RunPermanentUpgrades(ctx context.Context, upToVersion roachpb.
 	latest := permanentUpgrades[len(permanentUpgrades)-1]
 	lastVer := latest.Version()
 	enterpriseEnabled := base.CCLDistributionAndEnterpriseEnabled(m.settings, m.clusterID)
-	lastUpgradeCompleted, err := migrationstable.CheckIfMigrationCompleted(
-		ctx, lastVer, nil /* txn */, m.ie,
-		// We'll do a follower read. This is all best effort anyway, and the
-		// follower read should keep the startup time low in the common case where
-		// all upgrades have run a long time ago before this node start.
-		enterpriseEnabled,
-		migrationstable.StaleRead)
+	lastUpgradeCompleted, err := startup.RunIdempotentWithRetryEx(ctx,
+		m.deps.Stopper.ShouldQuiesce(),
+		"check if migration completed",
+		func(ctx context.Context) (bool, error) {
+			return migrationstable.CheckIfMigrationCompleted(
+				ctx, lastVer, nil /* txn */, m.ie,
+				// We'll do a follower read. This is all best effort anyway, and the
+				// follower read should keep the startup time low in the common case where
+				// all upgrades have run a long time ago before this node start.
+				enterpriseEnabled,
+				migrationstable.StaleRead)
+		})
 	if err != nil {
 		return err
 	}
@@ -225,7 +236,7 @@ func (m *Manager) RunPermanentUpgrades(ctx context.Context, upToVersion roachpb.
 	} else {
 		// The stale read said that the upgrades had not run. Let's try a consistent read too since
 		log.Infof(ctx,
-			"the last last permanent upgrade (v%s) does not appear to have completed; attempting to run all upgrades",
+			"the last permanent upgrade (v%s) does not appear to have completed; attempting to run all upgrades",
 			lastVer)
 	}
 
@@ -248,7 +259,7 @@ func (m *Manager) RunPermanentUpgrades(ctx context.Context, upToVersion roachpb.
 		//
 		// TODO(andrei): Get rid of this once compatibility with 22.2 is not necessary.
 		startupMigrationAlreadyRan, err := checkOldStartupMigrationRan(
-			ctx, u.V22_2StartupMigrationName(), m.deps.DB.KV(), m.codec)
+			ctx, m.deps.Stopper, u.V22_2StartupMigrationName(), m.deps.DB.KV(), m.codec)
 		if err != nil {
 			return err
 		}
@@ -259,7 +270,11 @@ func (m *Manager) RunPermanentUpgrades(ctx context.Context, upToVersion roachpb.
 				u.Version())
 			// Mark the upgrade as completed so that we can get rid of this logic when
 			// compatibility with 22.2 is no longer necessary.
-			if err := migrationstable.MarkMigrationCompletedIdempotent(ctx, m.ie, u.Version()); err != nil {
+			if err := startup.RunIdempotentWithRetry(ctx,
+				m.deps.Stopper.ShouldQuiesce(),
+				"mark upgrade complete", func(ctx context.Context) (err error) {
+					return migrationstable.MarkMigrationCompletedIdempotent(ctx, m.ie, u.Version())
+				}); err != nil {
 				return err
 			}
 			continue
@@ -277,13 +292,18 @@ func (m *Manager) RunPermanentUpgrades(ctx context.Context, upToVersion roachpb.
 // old startupmigration with the given name has run. If it did, the
 // corresponding upgrade should not run.
 func checkOldStartupMigrationRan(
-	ctx context.Context, migrationName string, db *kv.DB, codec keys.SQLCodec,
+	ctx context.Context, stopper *stop.Stopper, migrationName string, db *kv.DB, codec keys.SQLCodec,
 ) (bool, error) {
 	if migrationName == "" {
 		return false, nil
 	}
 	migrationKey := append(codec.StartupMigrationKeyPrefix(), roachpb.RKey(migrationName)...)
-	kv, err := db.Get(ctx, migrationKey)
+	kv, err := startup.RunIdempotentWithRetryEx(ctx,
+		stopper.ShouldQuiesce(),
+		"check old startup migration",
+		func(ctx context.Context) (kv kv.KeyValue, err error) {
+			return db.Get(ctx, migrationKey)
+		})
 	if err != nil {
 		return false, err
 	}
@@ -314,6 +334,28 @@ func (m *Manager) runPermanentMigrationsWithoutJobsForTests(
 	return nil
 }
 
+func (m *Manager) postToPauseChannelAndWaitForResume(ctx context.Context) {
+	log.Infof(ctx, "pausing at pause point %d", m.knobs.InterlockPausePoint)
+	// To handle the case where the pause point is hit on every migration (which
+	// is the common case), reset the interlock pause point when woken up so
+	// that we won't sleep again.
+	m.knobs.InterlockPausePoint = upgradebase.NoPause
+
+	// Post to the pause point channel.
+	select {
+	case *m.knobs.InterlockReachedPausePointChannel <- struct{}{}:
+	case <-m.deps.Stopper.ShouldQuiesce():
+		return
+	}
+
+	// Wait on the resume channel.
+	select {
+	case <-*m.knobs.InterlockResumeChannel:
+	case <-m.deps.Stopper.ShouldQuiesce():
+		return
+	}
+}
+
 func (m *Manager) Migrate(
 	ctx context.Context,
 	user username.SQLUsername,
@@ -335,6 +377,17 @@ func (m *Manager) Migrate(
 		return nil
 	}
 
+	// Validation functions for updating the settings table. We use this in the
+	// tenant upgrade case to ensure that no new SQL servers were started
+	// mid-upgrade, with versions that are incompatible with the attempted
+	// upgrade (because their binary version is too low).
+	validate := func(ctx context.Context, txn *kv.Txn) error {
+		return m.deps.Cluster.ValidateAfterUpdateSystemVersion(ctx, txn)
+	}
+	skipValidation := func(ctx context.Context, txn *kv.Txn) error {
+		return nil
+	}
+
 	// Determine whether it's safe to perform the upgrade for secondary tenants.
 	if safe, err := safeToUpgradeTenant(ctx, m.codec, m.settings.OverridesInformer, from); !safe {
 		return err
@@ -346,6 +399,11 @@ func (m *Manager) Migrate(
 		return nil
 	}
 
+	// We only need to persist the first fence to the settings table for
+	// secondary tenant upgrades, and even then, only for the first migration
+	// performed in the loop below.
+	mustPersistFenceVersion := !m.codec.ForSystemTenant()
+
 	// Sanity check that we'll actually be able to perform the real
 	// cluster version bump, cluster-wide, before potentially creating a job
 	// that might be doomed to fail.
@@ -354,106 +412,154 @@ func (m *Manager) Migrate(
 		if err := validateTargetClusterVersion(ctx, m.deps.Cluster, clusterversion.ClusterVersion{Version: finalVersion}); err != nil {
 			return err
 		}
+		if m.knobs.InterlockPausePoint == upgradebase.AfterFirstCheckForInstances {
+			m.postToPauseChannelAndWaitForResume(ctx)
+		}
 	}
 
 	if err := m.checkPreconditions(ctx, clusterVersions); err != nil {
 		return err
 	}
 
+	// The loop below runs the actual migrations and pushes out the version gate
+	// to every server (SQL server in the case of secondary tenants, or
+	// combined KV/Storage server in the case of the storage layer) in the
+	// cluster. Each server will persist the version, bump the local
+	// version gates, and then return. The upgrade associated with the specific
+	// version is executed before any server in the cluster has the
+	// corresponding version activated. Migrations that depend on a certain
+	// version already being activated will need to register using a cluster
+	// version greater than it.
+	//
+	// For each intermediate version, we'll need to first bump the fence
+	// version before bumping the "real" one. Doing so allows us to provide
+	// the invariant that whenever a cluster version is active, all servers
+	// in the cluster (including ones added concurrently during version
+	// upgrades) are running binaries that know about the version. This is
+	// discussed in greater detail below in the [Fence versions] section.
+	//
+	// Note: tenants don't persist their version information anywhere aside from
+	// in the settings table. Nodes however, persist the version information in
+	// each store. As a result, the section below (up to "Fence versions")
+	// applies to storage cluster upgrades only.
+	//
+	// # Storage cluster upgrades
+	//
+	// Below-raft upgrades mutate replica state, making use of the
+	// Migrate(version=V) primitive which they issue against the entire
+	// keyspace. These upgrades typically want to rely on the invariant
+	// that there are no extant replicas in the system that haven't seen the
+	// specific Migrate command.
+	//
+	// This is partly achieved through the implementation of the Migrate
+	// command itself, which waits until it's applied on all followers[2]
+	// before returning. This also addresses the concern of extant snapshots
+	// with pre-migrated state possibly instantiating older version
+	// replicas. The intended learner replicas are listed as part of the
+	// range descriptor, and is also waited on for during command
+	// application. As for stale snapshots, if they specify a replicaID
+	// that's no longer part of the raft group, they're discarded by the
+	// recipient. Snapshots are also discarded unless they move the LAI
+	// forward.
+	//
+	// That still leaves rooms for replicas in the replica GC queue to evade
+	// detection. To address this, below-raft upgrades typically take a
+	// two-phrase approach (the TruncatedAndRangeAppliedStateMigration being
+	// one example of this), where after having migrated the entire keyspace
+	// to version V, and after having prevented subsequent snapshots
+	// originating from replicas with versions < V, the upgrade sets out
+	// to purge outdated replicas in the system[3]. Specifically it
+	// processes all replicas in the GC queue with a version < V (which are
+	// not accessible during the application of the Migrate command).
+	//
+	// [1]: See ReplicaState.Version.
+	// [2]: See Replica.executeWriteBatch, specifically how proposals with the
+	//      Migrate request are handled downstream of raft.
+	// [3]: See PurgeOutdatedReplicas from the SystemUpgrade service.
+	//
+	// # Fence versions
+	//
+	// The upgrade infrastructure makes use of internal fence
+	// versions when stepping through consecutive versions. It's
+	// instructive to walk through how we expect a version upgrade
+	// from v21.1 to v21.2 to take place, and how we behave in the
+	// presence of new v21.1 or v21.2 servers being added to the cluster.
+	//
+	//   - All servers are running v21.1
+	//   - All servers are rolled into v21.2 binaries, but with active
+	//     cluster version still as v21.1
+	//   - The first version bump will be into v21.2-1(fence), see the
+	//     upgrade manager above for where that happens
+	//
+	// Then concurrently:
+	//
+	//   - A new server is added to the cluster, but running binary v21.1
+	//   - We try bumping the cluster gates to v21.2-1(fence)
+	//
+	// If the v21.1 server manages to sneak in before the version bump,
+	// it's fine as the version bump is a no-op one (all fence versions
+	// are). Any subsequent bumps (including the "actual" one bumping to
+	// v21.2) will fail during the validation step where we'll first
+	// check to see that all servers are running v21.2 binaries.
+	//
+	// If the v21.1 server is only added after v21.2-1(fence) is active,
+	// it won't be able to actually join the cluster (it'll be prevented
+	// by the join RPC or, in the tenant case, by the check in preStart that
+	// the binary version of the SQL server is compatible with that of the
+	// tenant active version.
+	//
+	// All of which is to say that once we've seen the servers list
+	// stabilize (as UntilClusterStable enforces), any new servers that
+	// can join the cluster will run a release that support the fence
+	// version, and by design also supports the actual version (which is
+	// the direct successor of the fence).
 	for _, clusterVersion := range clusterVersions {
 		log.Infof(ctx, "stepping through %s", clusterVersion)
+
 		cv := clusterversion.ClusterVersion{Version: clusterVersion}
-		// First, run the actual upgrade if any.
-		mig, exists := m.GetUpgrade(clusterVersion)
-		if exists {
-			if err := m.runMigration(ctx, mig, user, clusterVersion, !m.knobs.DontUseJobs); err != nil {
-				return err
-			}
+
+		fenceVersion := upgrade.FenceVersionFor(ctx, cv)
+		if err := bumpClusterVersion(ctx, m.deps.Cluster, fenceVersion); err != nil {
+			return err
+		}
+		if m.knobs.InterlockPausePoint == upgradebase.AfterFenceRPC {
+			m.postToPauseChannelAndWaitForResume(ctx)
 		}
 
-		// Next we'll push out the version gate to every node in the cluster.
-		// Each node will persist the version, bump the local version gates, and
-		// then return. The upgrade associated with the specific version is
-		// executed before any node in the cluster has the corresponding
-		// version activated. Migrations that depend on a certain version
-		// already being activated will need to registered using a cluster
-		// version greater than it.
-		//
-		// For each intermediate version, we'll need to first bump the fence
-		// version before bumping the "real" one. Doing so allows us to provide
-		// the invariant that whenever a cluster version is active, all Nodes in
-		// the cluster (including ones added concurrently during version
-		// upgrades) are running binaries that know about the version.
-
-		// Below-raft upgrades mutate replica state, making use of the
-		// Migrate(version=V) primitive which they issue against the entire
-		// keyspace. These upgrades typically want to rely on the invariant
-		// that there are no extant replicas in the system that haven't seen the
-		// specific Migrate command.
-		//
-		// This is partly achieved through the implementation of the Migrate
-		// command itself, which waits until it's applied on all followers[2]
-		// before returning. This also addresses the concern of extant snapshots
-		// with pre-migrated state possibly instantiating older version
-		// replicas. The intended learner replicas are listed as part of the
-		// range descriptor, and is also waited on for during command
-		// application. As for stale snapshots, if they specify a replicaID
-		// that's no longer part of the raft group, they're discarded by the
-		// recipient. Snapshots are also discarded unless they move the LAI
-		// forward.
-		//
-		// That still leaves rooms for replicas in the replica GC queue to evade
-		// detection. To address this, below-raft upgrades typically take a
-		// two-phrase approach (the TruncatedAndRangeAppliedStateMigration being
-		// one example of this), where after having migrated the entire keyspace
-		// to version V, and after having prevented subsequent snapshots
-		// originating from replicas with versions < V, the upgrade sets out
-		// to purge outdated replicas in the system[3]. Specifically it
-		// processes all replicas in the GC queue with a version < V (which are
-		// not accessible during the application of the Migrate command).
-		//
-		// [1]: See ReplicaState.Version.
-		// [2]: See Replica.executeWriteBatch, specifically how proposals with the
-		//      Migrate request are handled downstream of raft.
-		// [3]: See PurgeOutdatedReplicas from the SystemUpgrade service.
-
-		{
-			// The upgrades infrastructure makes use of internal fence
-			// versions when stepping through consecutive versions. It's
-			// instructive to walk through how we expect a version upgrade
-			// from v21.1 to v21.2 to take place, and how we behave in the
-			// presence of new v21.1 or v21.2 Nodes being added to the cluster.
-			//
-			//   - All Nodes are running v21.1
-			//   - All Nodes are rolled into v21.2 binaries, but with active
-			//     cluster version still as v21.1
-			//   - The first version bump will be into v21.2-1(fence), see the
-			//     upgrade manager above for where that happens
-			//
-			// Then concurrently:
-			//
-			//   - A new node is added to the cluster, but running binary v21.1
-			//   - We try bumping the cluster gates to v21.2-1(fence)
-			//
-			// If the v21.1 Nodes manages to sneak in before the version bump,
-			// it's fine as the version bump is a no-op one (all fence versions
-			// are). Any subsequent bumps (including the "actual" one bumping to
-			// v21.2) will fail during the validation step where we'll first
-			// check to see that all Nodes are running v21.2 binaries.
-			//
-			// If the v21.1 node is only added after v21.2-1(fence) is active,
-			// it won't be able to actually join the cluster (it'll be prevented
-			// by the join RPC).
-			//
-			// All of which is to say that once we've seen the node list
-			// stabilize (as UntilClusterStable enforces), any new nodes that
-			// can join the cluster will run a release that support the fence
-			// version, and by design also supports the actual version (which is
-			// the direct successor of the fence).
-			fenceVersion := upgrade.FenceVersionFor(ctx, cv)
-			if err := bumpClusterVersion(ctx, m.deps.Cluster, fenceVersion); err != nil {
-				return err
+		// In the case where we're upgrading secondary tenants there's an extra
+		// dance that must be performed. After we write the fence version to
+		// the settings table we must validate that the set of SQL servers
+		// running, matches those that were present when we performed the bump
+		// above. This is to handle the case where a SQL server with an old
+		// binary starts up in between the bump and the persistence of the fence
+		// version. In that case, the SQL server will be permitted to startup,
+		// but the upgrade can not continue. The retry logic here will detect
+		// the SQL server with the old binary, and the upgrade will fail. If
+		// instead, the newly started SQL server has a binary version which is
+		// upgrade-compatible, the retry will detect that and the upgrade will
+		// proceed. Note that we only need to do this extra dance when we write
+		// the first fence of a given upgrade process, since for subsequent
+		// fences, the too-low-binary SQL server will be prevented from starting
+		// by the check in preStart.
+		if mustPersistFenceVersion {
+			var err error
+			for {
+				err = updateSystemVersionSetting(ctx, fenceVersion, validate)
+				if errors.Is(err, upgradecluster.InconsistentSQLServersError) {
+					if err := bumpClusterVersion(ctx, m.deps.Cluster, fenceVersion); err != nil {
+						return err
+					}
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				break
 			}
+			mustPersistFenceVersion = false
+		}
+		if m.knobs.InterlockPausePoint == upgradebase.AfterFenceWriteToSettingsTable {
+			m.postToPauseChannelAndWaitForResume(ctx)
 		}
 
 		// Now sanity check that we'll actually be able to perform the real
@@ -461,17 +567,39 @@ func (m *Manager) Migrate(
 		if err := validateTargetClusterVersion(ctx, m.deps.Cluster, cv); err != nil {
 			return err
 		}
+		if m.knobs.InterlockPausePoint == upgradebase.AfterSecondCheckForInstances {
+			m.postToPauseChannelAndWaitForResume(ctx)
+		}
+
+		// Run the actual upgrade, if any.
+		mig, exists := m.GetUpgrade(clusterVersion)
+		if exists {
+			if err := m.runMigration(ctx, mig, user, clusterVersion, !m.knobs.DontUseJobs); err != nil {
+				return err
+			}
+		}
+
+		if m.knobs.InterlockPausePoint == upgradebase.AfterMigration {
+			m.postToPauseChannelAndWaitForResume(ctx)
+		}
 
 		// Finally, bump the real version cluster-wide.
 		err := bumpClusterVersion(ctx, m.deps.Cluster, cv)
 		if err != nil {
 			return err
 		}
-		// Bump up the cluster version for tenants, which
-		// will bump over individual version bumps.
-		err = updateSystemVersionSetting(ctx, cv)
+		if m.knobs.InterlockPausePoint == upgradebase.AfterVersionBumpRPC {
+			m.postToPauseChannelAndWaitForResume(ctx)
+		}
+
+		// Updates the version info inside the tenant or host cluster's
+		// (system tenant) settings table.
+		err = updateSystemVersionSetting(ctx, cv, skipValidation)
 		if err != nil {
 			return err
+		}
+		if m.knobs.InterlockPausePoint == upgradebase.AfterVersionWriteToSettingsTable {
+			m.postToPauseChannelAndWaitForResume(ctx)
 		}
 	}
 
@@ -504,7 +632,19 @@ func validateTargetClusterVersion(
 		tx context.Context, client serverpb.MigrationClient,
 	) error {
 		_, err := client.ValidateTargetClusterVersion(ctx, req)
-		return err
+		// The tenant upgrade interlock is new in 23.1, as a result, before
+		// 23.1 there was no Migration RPC for tenants. If we see the error that
+		// no Migration RPC has been started, we assume that the tenant pods
+		// in question are running on a version that predates 23.1, and return
+		// that friendlier error instead. This code can be removed when we no
+		// longer expect to see tenant pods running below version 23.1.
+		// TODO(ajstorm): once the multitenant-upgrade test runs cleanly, make
+		//  this error more structured.
+		if err != nil && strings.Contains(err.Error(), "unknown service cockroach.server.serverpb.Migration") {
+			err = errors.HandledWithMessage(err, "validate cluster version failed: some tenant pods running on binary less than 23.1")
+		}
+		return errors.WithHint(errors.Wrapf(err, "error validating the version of one or more SQL server instances"),
+			"check the binary versions of all running SQL server instances to ensure that they are compatible with the attempted upgrade version")
 	})
 }
 
@@ -514,8 +654,9 @@ func forEveryNodeUntilClusterStable(
 	c upgrade.Cluster,
 	f func(ctx context.Context, client serverpb.MigrationClient) error,
 ) error {
+	log.Infof(ctx, "executing operation %s", redact.Safe(op))
 	return c.UntilClusterStable(ctx, func() error {
-		return c.ForEveryNode(ctx, op, f)
+		return c.ForEveryNodeOrServer(ctx, op, f)
 	})
 }
 
@@ -533,7 +674,10 @@ func (m *Manager) runMigration(
 	if !useJob {
 		// Some tests don't like it when jobs are run at server startup, because
 		// they pollute the jobs table. So, we run the upgrade directly.
-
+		// To run jobs synchronously we must also disable startup retry assertions
+		// since this code doesn't do retries and we also don't want to complicate
+		// test only code.
+		ctx := startup.WithoutChecks(ctx)
 		alreadyCompleted, err := migrationstable.CheckIfMigrationCompleted(
 			ctx, version, nil /* txn */, m.ie, false /* enterpriseEnabled */, migrationstable.ConsistentRead,
 		)
@@ -550,6 +694,7 @@ func (m *Manager) runMigration(
 			// The TenantDeps used here are incomplete, but enough for the "permanent
 			// upgrades" that run under this testing knob.
 			if err := upg.Run(ctx, mig.Version(), upgrade.TenantDeps{
+				KVDB:             m.deps.DB.KV(),
 				DB:               m.deps.DB,
 				Codec:            m.codec,
 				Settings:         m.settings,
@@ -573,16 +718,33 @@ func (m *Manager) runMigration(
 		// long-running upgrades, this is useful.
 		//
 		// If the job already exists, we wait for it to finish.
-		alreadyCompleted, alreadyExisting, id, err := m.getOrCreateMigrationJob(ctx, user, version, mig.Name())
-		if alreadyCompleted || err != nil {
+		var (
+			alreadyCompleted, alreadyExisting bool
+			id                                jobspb.JobID
+		)
+		if err := startup.RunIdempotentWithRetry(ctx,
+			m.deps.Stopper.ShouldQuiesce(),
+			"upgrade create job", func(ctx context.Context) (err error) {
+				alreadyCompleted, alreadyExisting, id, err = m.getOrCreateMigrationJob(ctx, user, version,
+					mig.Name())
+				return err
+			}); alreadyCompleted || err != nil {
 			return err
 		}
 		if alreadyExisting {
 			log.Infof(ctx, "waiting for %s", mig.Name())
-			return m.jr.WaitForJobs(ctx, []jobspb.JobID{id})
+			return startup.RunIdempotentWithRetry(ctx,
+				m.deps.Stopper.ShouldQuiesce(),
+				"upgrade wait jobs", func(ctx context.Context) error {
+					return m.jr.WaitForJobs(ctx, []jobspb.JobID{id})
+				})
 		} else {
 			log.Infof(ctx, "running %s", mig.Name())
-			return m.jr.Run(ctx, []jobspb.JobID{id})
+			return startup.RunIdempotentWithRetry(ctx,
+				m.deps.Stopper.ShouldQuiesce(),
+				"upgrade run jobs", func(ctx context.Context) error {
+					return m.jr.Run(ctx, []jobspb.JobID{id})
+				})
 		}
 	}
 }
@@ -616,26 +778,57 @@ func (m *Manager) getOrCreateMigrationJob(
 	return alreadyCompleted, alreadyExisting, jobID, nil
 }
 
+const (
+	preJobInfoTableQuery = `
+SELECT id, status
+FROM (
+     SELECT id, status,
+     crdb_internal.pb_to_json(
+	'cockroach.sql.jobs.jobspb.Payload',
+	payload,
+	false -- emit_defaults
+     ) AS pl
+     FROM system.jobs
+     WHERE status IN ` + jobs.NonTerminalStatusTupleString + `
+)
+WHERE ((pl->'migration')->'clusterVersion') = $1::JSONB`
+	// PostJobInfoQuery avoids the crdb_internal.system_jobs table
+	// to avoid expensive full scans.
+	// Exported for testing.
+	PostJobInfoTableQuery = `
+WITH
+running_migration_jobs AS (
+    SELECT id, status
+    FROM system.jobs
+    WHERE status IN ` + jobs.NonTerminalStatusTupleString + `
+    AND job_type = 'MIGRATION'
+),
+payloads AS (
+    SELECT job_id, value
+    FROM system.job_info AS payload
+    WHERE info_key = 'legacy_payload'
+    AND job_id IN (SELECT id FROM running_migration_jobs)
+    ORDER BY written DESC
+)
+SELECT id, status FROM (
+    SELECT distinct(id), status, crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', payloads.value, false) AS pl
+    FROM running_migration_jobs AS j
+    INNER JOIN payloads ON j.id = payloads.job_id
+) WHERE ((pl->'migration')->'clusterVersion') = $1::JSONB`
+)
+
 func (m *Manager) getRunningMigrationJob(
 	ctx context.Context, txn isql.Txn, version roachpb.Version,
 ) (found bool, jobID jobspb.JobID, _ error) {
 	// Wrap the version into a ClusterVersion so that the JSON looks like what the
 	// Payload proto has inside.
 	cv := clusterversion.ClusterVersion{Version: version}
-	const query = `
-SELECT id, status
-	FROM (
-		SELECT id,
-		status,
-		crdb_internal.pb_to_json(
-			'cockroach.sql.jobs.jobspb.Payload',
-			payload,
-      false -- emit_defaults
-		) AS pl
-	FROM system.jobs
-  WHERE status IN ` + jobs.NonTerminalStatusTupleString + `
-	)
-	WHERE pl->'migration'->'clusterVersion' = $1::JSON;`
+	var query string
+	if m.settings.Version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled) {
+		query = PostJobInfoTableQuery
+	} else {
+		query = preJobInfoTableQuery
+	}
 	jsonMsg, err := protoreflect.MessageToJSON(&cv, protoreflect.FmtFlags{EmitDefaults: false})
 	if err != nil {
 		return false, 0, errors.Wrap(err, "failed to marshal version to JSON")

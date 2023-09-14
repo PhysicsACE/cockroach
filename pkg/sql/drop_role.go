@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
@@ -53,7 +52,7 @@ func (p *planner) DropRole(ctx context.Context, n *tree.DropRole) (planNode, err
 func (p *planner) DropRoleNode(
 	ctx context.Context, roleSpecs tree.RoleSpecList, ifExists bool, isRole bool, opName string,
 ) (*DropRoleNode, error) {
-	if err := p.CheckRoleOption(ctx, roleoption.CREATEROLE); err != nil {
+	if err := p.CheckGlobalPrivilegeOrRoleOption(ctx, privilege.CREATEROLE); err != nil {
 		return nil, err
 	}
 
@@ -212,6 +211,22 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		dbDesc, err := lCtx.getDatabaseByID(schemaDesc.GetParentID())
 		if err != nil {
 			return err
+		}
+
+		for _, u := range schemaDesc.GetPrivileges().Users {
+			if _, ok := userNames[u.User()]; ok {
+				if privilegeObjectFormatter.Len() > 0 {
+					privilegeObjectFormatter.WriteString(", ")
+				}
+				sn := tree.ObjectNamePrefix{
+					ExplicitCatalog: true,
+					CatalogName:     tree.Name(dbDesc.GetName()),
+					ExplicitSchema:  true,
+					SchemaName:      tree.Name(schemaDesc.GetName()),
+				}
+				privilegeObjectFormatter.FormatNode(&sn)
+				break
+			}
 		}
 
 		if err := accumulateDependentDefaultPrivileges(schemaDesc.GetDefaultPrivilegeDescriptor(), userNames, dbDesc.GetName(), schemaDesc.GetName()); err != nil {
@@ -435,6 +450,17 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		}
 		numRoleSettingsRowsDeleted += rowsDeleted
 
+		_, err = params.p.InternalSQLTxn().ExecEx(
+			params.ctx,
+			opName,
+			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
+			`UPDATE system.web_sessions SET "revokedAt" = now() WHERE username = $1 AND "revokedAt" IS NULL;`,
+			normalizedUsername,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Bump role-related table versions to force a refresh of membership/auth

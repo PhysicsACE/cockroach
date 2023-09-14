@@ -31,19 +31,25 @@ func (d *delegator) delegateShowDefaultPrivileges(
 
 	schemaClause := " AND schema_name IS NULL"
 	if n.Schema != "" {
-		schemaClause = fmt.Sprintf(" AND schema_name = %s", lexbase.EscapeSQLString(n.Schema.String()))
+		schemaClause = fmt.Sprintf(" AND schema_name = %s", lexbase.EscapeSQLString(string(n.Schema)))
 	}
 
 	query := fmt.Sprintf(
 		"SELECT role, for_all_roles, object_type, grantee, privilege_type, is_grantable "+
 			"FROM crdb_internal.default_privileges WHERE database_name = %s%s",
-		lexbase.EscapeSQLString(currentDatabase.Normalize()),
+		lexbase.EscapeSQLString(string(currentDatabase)),
 		schemaClause,
 	)
 
 	if n.ForAllRoles {
 		query += " AND for_all_roles=true"
 	} else if len(n.Roles) > 0 {
+		targetCol := "grantee"
+		if !n.ForGrantee {
+			targetCol = "role"
+			query += " AND for_all_roles=false"
+		}
+
 		targetRoles, err := decodeusername.FromRoleSpecList(
 			d.evalCtx.SessionData(), username.PurposeValidation, n.Roles,
 		)
@@ -51,7 +57,7 @@ func (d *delegator) delegateShowDefaultPrivileges(
 			return nil, err
 		}
 
-		query = fmt.Sprintf("%s AND for_all_roles=false AND role IN (", query)
+		query = fmt.Sprintf("%s AND %s IN (", query, targetCol)
 		for i, role := range targetRoles {
 			if i != 0 {
 				query += fmt.Sprintf(", '%s'", role.Normalized())
@@ -66,5 +72,5 @@ func (d *delegator) delegateShowDefaultPrivileges(
 			query, d.evalCtx.SessionData().User())
 	}
 	query += " ORDER BY 1,2,3,4,5"
-	return parse(query)
+	return d.parse(query)
 }

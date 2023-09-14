@@ -28,13 +28,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs/schedulebase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -194,8 +192,8 @@ func TestSerializesScheduledChangefeedExecutionArgs(t *testing.T) {
 			query: "CREATE SCHEDULE FOR CHANGEFEED d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH initial_scan='only' RECURRING '@hourly'",
 			es: expectedSchedule{
 				nameRe:         "CHANGEFEED .+",
-				changefeedStmt: "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH initial_scan = 'only'",
-				shownStmt:      "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=redacted' WITH initial_scan = 'only'",
+				changefeedStmt: "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH OPTIONS (initial_scan = 'only')",
+				shownStmt:      "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=redacted' WITH OPTIONS (initial_scan = 'only')",
 				period:         time.Hour,
 			},
 		},
@@ -204,7 +202,7 @@ func TestSerializesScheduledChangefeedExecutionArgs(t *testing.T) {
 			query: "CREATE SCHEDULE FOR CHANGEFEED foo INTO 'webhook-https://0/changefeed' WITH initial_scan = 'only' RECURRING '@hourly'",
 			es: expectedSchedule{
 				nameRe:         "CHANGEFEED .+",
-				changefeedStmt: "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed' WITH initial_scan = 'only'",
+				changefeedStmt: "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed' WITH OPTIONS (initial_scan = 'only')",
 				period:         time.Hour,
 			},
 		},
@@ -220,8 +218,8 @@ func TestSerializesScheduledChangefeedExecutionArgs(t *testing.T) {
 			queryArgs: []interface{}{th.env.Now()},
 			es: expectedSchedule{
 				nameRe:         "foo-changefeed",
-				changefeedStmt: "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH format = 'JSON', initial_scan = 'only'",
-				shownStmt:      "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=redacted' WITH format = 'JSON', initial_scan = 'only'",
+				changefeedStmt: "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH OPTIONS (format = 'JSON', initial_scan = 'only')",
+				shownStmt:      "CREATE CHANGEFEED FOR TABLE d.public.foo INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=redacted' WITH OPTIONS (format = 'JSON', initial_scan = 'only')",
 				period:         time.Hour,
 				runsNow:        true,
 			},
@@ -238,8 +236,8 @@ func TestSerializesScheduledChangefeedExecutionArgs(t *testing.T) {
 			queryArgs: []interface{}{th.env.Now()},
 			es: expectedSchedule{
 				nameRe:         "foo-changefeed",
-				changefeedStmt: "CREATE CHANGEFEED INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH format = 'JSON', initial_scan = 'only', schema_change_policy = 'stop' AS SELECT * FROM d.public.foo",
-				shownStmt:      "CREATE CHANGEFEED INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=redacted' WITH format = 'JSON', initial_scan = 'only', schema_change_policy = 'stop' AS SELECT * FROM d.public.foo",
+				changefeedStmt: "CREATE CHANGEFEED INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH OPTIONS (format = 'JSON', initial_scan = 'only', schema_change_policy = 'stop') AS SELECT * FROM d.public.foo",
+				shownStmt:      "CREATE CHANGEFEED INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=redacted' WITH OPTIONS (format = 'JSON', initial_scan = 'only', schema_change_policy = 'stop') AS SELECT * FROM d.public.foo",
 				period:         time.Hour,
 				runsNow:        true,
 			},
@@ -291,8 +289,9 @@ func TestCreateChangefeedScheduleChecksPermissionsDuringDryRun(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DisableDefaultTestTenant: true,
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			DistSQL: &execinfra.TestingKnobs{
@@ -307,8 +306,6 @@ func TestCreateChangefeedScheduleChecksPermissionsDuringDryRun(t *testing.T) {
 			},
 		},
 	})
-	ctx := context.Background()
-	s := srv.(*server.TestServer)
 	defer s.Stopper().Stop(ctx)
 	rootDB := sqlutils.MakeSQLRunner(db)
 	rootDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
@@ -346,7 +343,7 @@ func TestCreateChangefeedScheduleIfNotExists(t *testing.T) {
 	th.sqlDB.Exec(t, "CREATE TABLE t1 (a INT)")
 
 	const scheduleLabel = "foo"
-	const createQuery = "CREATE SCHEDULE IF NOT EXISTS '%s' FOR CHANGEFEED TABLE t1 INTO 's3://bucket?AUTH=implicit' WITH initial_scan = 'only' RECURRING '@daily'"
+	const createQuery = "CREATE SCHEDULE IF NOT EXISTS '%s' FOR CHANGEFEED TABLE t1 INTO 'null://' WITH initial_scan = 'only' RECURRING '@daily'"
 
 	th.sqlDB.Exec(t, fmt.Sprintf(createQuery, scheduleLabel))
 
@@ -390,7 +387,7 @@ func TestCreateChangefeedScheduleInExplicitTxnRollback(t *testing.T) {
 	require.NoError(t, res.Err())
 
 	th.sqlDB.Exec(t, "BEGIN;")
-	th.sqlDB.Exec(t, "CREATE SCHEDULE FOR CHANGEFEED TABLE t1 INTO 's3://bucket?AUTH=implicit' WITH initial_scan = 'only' RECURRING '@daily';")
+	th.sqlDB.Exec(t, "CREATE SCHEDULE FOR CHANGEFEED TABLE t1 INTO 'null://' WITH initial_scan = 'only' RECURRING '@daily';")
 	th.sqlDB.Exec(t, "ROLLBACK;")
 
 	res = th.sqlDB.Query(t, "SELECT id FROM [SHOW SCHEDULES FOR CHANGEFEED]")
@@ -708,13 +705,13 @@ func TestCheckScheduleAlreadyExists(t *testing.T) {
 
 	ctx := context.Background()
 
+	sd := sql.NewInternalSessionData(ctx, execCfg.Settings, "test")
+	sd.Database = "d"
 	p, cleanup := sql.NewInternalPlanner("test",
 		execCfg.DB.NewTxn(ctx, "test-planner"),
 		username.RootUserName(), &sql.MemoryMetrics{}, &execCfg,
-		sessiondatapb.SessionData{
-			Database:   "d",
-			SearchPath: sessiondata.DefaultSearchPath.GetPathArray(),
-		})
+		sd,
+	)
 	defer cleanup()
 
 	present, err := schedulebase.CheckScheduleAlreadyExists(ctx, p.(sql.PlanHookState), "simple")
@@ -743,13 +740,13 @@ func TestFullyQualifyTables(t *testing.T) {
 	require.NoError(t, err)
 	createChangeFeedStmt := stmt.AST.(*tree.CreateChangefeed)
 
+	sd := sql.NewInternalSessionData(ctx, execCfg.Settings, "test")
+	sd.Database = "ocean"
 	p, cleanupPlanHook := sql.NewInternalPlanner("test",
 		execCfg.DB.NewTxn(ctx, "test-planner"),
 		username.RootUserName(), &sql.MemoryMetrics{}, &execCfg,
-		sessiondatapb.SessionData{
-			Database:   "ocean",
-			SearchPath: sessiondata.DefaultSearchPath.GetPathArray(),
-		})
+		sd,
+	)
 	defer cleanupPlanHook()
 
 	tablePatterns := make([]tree.TablePattern, 0)

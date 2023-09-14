@@ -26,6 +26,7 @@ import {
   defaultFilters,
   Filter,
   getFullFiltersAsStringRecord,
+  SelectedFilters,
 } from "../../queryFilter";
 import { queryByName, syncHistory } from "../../util";
 import { getTableSortFromURL } from "../../sortedtable/getTableSortFromURL";
@@ -54,13 +55,14 @@ export type SchemaInsightsViewStateProps = {
   filters: SchemaInsightEventFilters;
   sortSetting: SortSetting;
   hasAdminRole: boolean;
+  csIndexUnusedDuration: string;
   maxSizeApiReached?: boolean;
 };
 
 export type SchemaInsightsViewDispatchProps = {
   onFiltersChange: (filters: SchemaInsightEventFilters) => void;
   onSortChange: (ss: SortSetting) => void;
-  refreshSchemaInsights: () => void;
+  refreshSchemaInsights: (csIndexUnusedDuration: string) => void;
   refreshUserSQLRoles: () => void;
 };
 
@@ -82,6 +84,7 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
   onFiltersChange,
   onSortChange,
   maxSizeApiReached,
+  csIndexUnusedDuration,
 }: SchemaInsightsViewProps) => {
   const isCockroachCloud = useContext(CockroachCloudContext);
   const [pagination, setPagination] = useState<ISortedTablePagination>({
@@ -94,13 +97,17 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
   );
 
   useEffect(() => {
+    const refreshSchema = (): void => {
+      refreshSchemaInsights(csIndexUnusedDuration);
+    };
+
     // Refresh every 1 minute.
-    refreshSchemaInsights();
-    const interval = setInterval(refreshSchemaInsights, 60 * 1000);
+    refreshSchema();
+    const interval = setInterval(refreshSchema, 60 * 1000);
     return () => {
       clearInterval(interval);
     };
-  }, [refreshSchemaInsights]);
+  }, [refreshSchemaInsights, csIndexUnusedDuration]);
 
   useEffect(() => {
     // Refresh every 5 minutes.
@@ -135,7 +142,7 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
     // redux changes and syncs the URL params with redux.
     syncHistory(
       {
-        ascending: sortSetting.ascending.toString(),
+        ascending: sortSetting.ascending?.toString(),
         columnTitle: sortSetting.columnTitle,
         ...getFullFiltersAsStringRecord(filters),
         [SCHEMA_INSIGHT_SEARCH_PARAM]: search,
@@ -220,6 +227,12 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
           />
         </PageConfigItem>
       </PageConfig>
+      <SelectedFilters
+        filters={filters}
+        onRemoveFilter={onSubmitFilters}
+        onClearFilters={clearFilters}
+        className={cx("margin-adjusted")}
+      />
       <div className={cx("table-area")}>
         <Loading
           loading={schemaInsights === null}
@@ -236,7 +249,6 @@ export const SchemaInsightsView: React.FC<SchemaInsightsViewProps> = ({
                   totalCount={filteredSchemaInsights?.length}
                   arrayItemName="schema insights"
                   activeFilters={countActiveFilters}
-                  onClearFilters={clearFilters}
                 />
               </div>
               <InsightsSortedTable

@@ -66,7 +66,7 @@ type Settings struct {
 // TODO(radu): move this functionality into settings.Values, provide a way to
 // obtain it along with the current value consistently.
 type OverridesInformer interface {
-	IsOverridden(settingName string) bool
+	IsOverridden(settingKey settings.InternalKey) bool
 }
 
 // TelemetryOptOut controls whether to opt out of telemetry (including Sentry) or not.
@@ -144,7 +144,9 @@ func MakeClusterSettings() *Settings {
 // object is needed, but cluster settings don't play a crucial role.
 func MakeTestingClusterSettings() *Settings {
 	return MakeTestingClusterSettingsWithVersions(
-		clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryVersion, true /* initializeVersion */)
+		clusterversion.TestingBinaryVersion,
+		clusterversion.TestingBinaryVersion,
+		true /* initializeVersion */)
 }
 
 // MakeTestingClusterSettingsWithVersions returns a Settings object that has its

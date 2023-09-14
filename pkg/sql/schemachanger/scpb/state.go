@@ -13,7 +13,9 @@ package scpb
 import (
 	"sort"
 	"strings"
+	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
@@ -45,6 +47,25 @@ type CurrentState struct {
 	Revertible bool
 }
 
+// ByteSize returns an estimated memory allocation for a schema change state `s`.
+// We created this function since the protobuf `s.Size()` method is the size of
+// `s` when it's serialized, and often differs greatly from the actual size in
+// memory.
+//
+// TODO (xiang): gogoproto `oneof` directive, as used today for scpb.ElementProto
+// is quite memory-inefficient and is the biggest contribution to the memory diff.
+// Change it to use protobuf native `oneof`.
+func (s CurrentState) ByteSize() (ret int64) {
+	ret += int64(unsafe.Sizeof(Target{})+2*unsafe.Sizeof(Status(0))) * int64(cap(s.TargetState.Targets))
+	for _, s := range s.TargetState.Statements {
+		ret += int64(s.Size())
+	}
+	ret += int64(s.TargetState.Authorization.Size())
+	ret += int64(cap(s.Initial)+cap(s.Current)) * int64(unsafe.Sizeof(Status(0)))
+	ret += int64(unsafe.Sizeof(false))
+	return ret
+}
+
 // WithCurrentStatuses returns a shallow copy of the current state
 // with a new set of current statuses.
 func (s CurrentState) WithCurrentStatuses(current []Status) CurrentState {
@@ -73,6 +94,11 @@ func (s *CurrentState) Rollback() {
 	}
 	for i := range s.Targets {
 		t := &s.Targets[i]
+		// If the metadata is not populated this element
+		// only usd for tracking.
+		if !t.IsLinkedToSchemaChange() {
+			continue
+		}
 		switch t.TargetStatus {
 		case Status_ABSENT:
 			t.TargetStatus = Status_PUBLIC
@@ -108,12 +134,26 @@ type Element interface {
 	element()
 }
 
+type ElementGetter interface {
+	Element() Element
+}
+
 //go:generate go run element_generator.go --in elements.proto --out elements_generated.go
 //go:generate go run element_uml_generator.go --out uml/table.puml
 
 // Element returns an Element from its wrapper for serialization.
 func (e *ElementProto) Element() Element {
-	return e.GetValue().(Element)
+	return e.GetElementOneOf().(ElementGetter).Element()
+}
+
+// IsLinkedToSchemaChange return if a Target is linked to a schema change.
+func (t *Target) IsLinkedToSchemaChange() bool {
+	return t.Metadata.IsLinkedToSchemaChange()
+}
+
+// IsLinkedToSchemaChange return if a TargetMetadata is linked to a schema change.
+func (t *TargetMetadata) IsLinkedToSchemaChange() bool {
+	return t.Size() > 0
 }
 
 // MakeTarget constructs a new Target. The passed elem must be one of the oneOf
@@ -125,9 +165,7 @@ func MakeTarget(status TargetStatus, elem Element, metadata *TargetMetadata) Tar
 	if metadata != nil {
 		t.Metadata = *protoutil.Clone(metadata).(*TargetMetadata)
 	}
-	if !t.SetValue(elem) {
-		panic(errors.Errorf("unknown element type %T", elem))
-	}
+	t.SetElement(elem)
 	return t
 }
 
@@ -186,7 +224,11 @@ func MakeCurrentStateFromDescriptors(descriptorStates []*DescriptorState) (Curre
 			stmts[stmt.StatementRank] = stmt.Statement
 		}
 		s.Authorization = cs.Authorization
+		if cs.NameMapping.ID != catid.InvalidDescID {
+			s.NameMappings = append(s.NameMappings, *protoutil.Clone(&cs.NameMapping).(*NameMapping))
+		}
 	}
+	sort.Sort(NameMappings(s.NameMappings))
 	sort.Sort(&stateAndRanks{CurrentState: &s, ranks: targetRanks})
 	var sr stmtsAndRanks
 	for rank, stmt := range stmts {

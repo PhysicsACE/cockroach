@@ -13,35 +13,32 @@ package tests
 import (
 	"context"
 	"fmt"
-	"runtime"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
 
 func registerSchemaChangeMixedVersions(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:  "schemachange/mixed-versions",
-		Owner: registry.OwnerSQLSchema,
+		Owner: registry.OwnerSQLFoundations,
 		// This tests the work done for 20.1 that made schema changes jobs and in
 		// addition prevented making any new schema changes on a mixed cluster in
 		// order to prevent bugs during upgrades.
 		Cluster:    r.MakeClusterSpec(4),
 		NativeLibs: registry.LibGEOS,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			if c.IsLocal() && runtime.GOARCH == "arm64" {
-				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
-			}
 			maxOps := 100
 			concurrency := 5
 			if c.IsLocal() {
 				maxOps = 10
 				concurrency = 2
 			}
-			runSchemaChangeMixedVersions(ctx, t, c, maxOps, concurrency, *t.BuildVersion())
+			runSchemaChangeMixedVersions(ctx, t, c, maxOps, concurrency, t.BuildVersion())
 		},
 	})
 }
@@ -51,6 +48,7 @@ func uploadAndInitSchemaChangeWorkload() versionStep {
 		// Stage workload on all nodes as the load node to run workload is chosen
 		// randomly.
 		u.c.Put(ctx, t.DeprecatedWorkload(), "./workload", u.c.All())
+		u.c.Put(ctx, t.Cockroach(), "./cockroach-doctor", u.c.All())
 		u.c.Run(ctx, u.c.All(), "./workload init schemachange")
 	}
 }
@@ -70,25 +68,39 @@ func runSchemaChangeWorkloadStep(loadNode, maxOps, concurrency int) versionStep 
 	}
 }
 
+func runSchemaChangeDoctorValidate() versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		runCmd := []string{
+			"./cockroach-doctor",
+			"debug doctor examine cluster --insecure",
+		}
+		u.c.Run(ctx,
+			u.c.All().RandNode(),
+			runCmd...)
+	}
+}
+
 func runSchemaChangeMixedVersions(
 	ctx context.Context,
 	t test.Test,
 	c cluster.Cluster,
 	maxOps int,
 	concurrency int,
-	buildVersion version.Version,
+	buildVersion *version.Version,
 ) {
-	predecessorVersion, err := version.PredecessorVersion(buildVersion)
+	predecessorVersion, err := release.LatestPredecessor(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	schemaChangeStep := runSchemaChangeWorkloadStep(c.All().RandNode()[0], maxOps, concurrency)
+	schemaChangeValidationStep := runSchemaChangeDoctorValidate()
 	if buildVersion.Major() < 20 {
 		// Schema change workload is meant to run only on versions 19.2 or higher.
 		// If the main version is below 20.1 then then predecessor version will be
 		// below 19.2.
 		schemaChangeStep = nil
+		schemaChangeValidationStep = nil
 	}
 
 	u := newVersionUpgradeTest(c,
@@ -101,43 +113,57 @@ func runSchemaChangeMixedVersions(
 
 		preventAutoUpgradeStep(1),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 
 		// Roll the nodes into the new version one by one, while repeatedly running
 		// schema changes. We use an empty string for the version below, which means
 		// use the main ./cockroach binary (i.e. the one being tested in this run).
 		binaryUpgradeStep(c.Node(3), clusterupgrade.MainVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(2), clusterupgrade.MainVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(1), clusterupgrade.MainVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(4), clusterupgrade.MainVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 
 		// Roll back again, which ought to be fine because the cluster upgrade was
 		// not finalized.
 		binaryUpgradeStep(c.Node(2), predecessorVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(4), predecessorVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(3), predecessorVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(1), predecessorVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 
 		// Roll nodes forward and finalize upgrade.
 		binaryUpgradeStep(c.Node(4), clusterupgrade.MainVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(3), clusterupgrade.MainVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(1), clusterupgrade.MainVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 		binaryUpgradeStep(c.Node(2), clusterupgrade.MainVersion),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 
 		allowAutoUpgradeStep(1),
 		waitForUpgradeStep(c.All()),
 		schemaChangeStep,
+		schemaChangeValidationStep,
 	)
 
 	u.run(ctx, t)

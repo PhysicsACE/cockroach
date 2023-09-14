@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	rload "github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -500,8 +501,10 @@ type testRange struct {
 	qps, reqCPU       float64
 }
 
-func loadRanges(rr *ReplicaRankings, s *Store, ranges []testRange, loadDimension load.Dimension) {
-	acc := NewReplicaAccumulator(loadDimension)
+func loadRanges(rr *ReplicaRankings, s *Store, ranges []testRange) {
+	// Track both CPU and QPS by default, the ordering the consumer uses will
+	// depend on the current rebalance objective.
+	acc := NewReplicaAccumulator(load.Queries, load.CPU)
 	for i, r := range ranges {
 		rangeID := roachpb.RangeID(i + 1)
 		repl := &Replica{store: s, RangeID: rangeID}
@@ -521,7 +524,7 @@ func loadRanges(rr *ReplicaRankings, s *Store, ranges []testRange, loadDimension
 		}
 		// NB: We set the index to 2 corresponding to the match in
 		// TestingRaftStatusFn. Matches that are 0 are considered behind.
-		repl.mu.state.TruncatedState = &roachpb.RaftTruncatedState{Index: 2}
+		repl.mu.state.TruncatedState = &kvserverpb.RaftTruncatedState{Index: 2}
 		for _, storeID := range r.nonVoters {
 			repl.mu.state.Desc.InternalReplicas = append(repl.mu.state.Desc.InternalReplicas, roachpb.ReplicaDescriptor{
 				NodeID:    roachpb.NodeID(storeID),
@@ -537,7 +540,7 @@ func loadRanges(rr *ReplicaRankings, s *Store, ranges []testRange, loadDimension
 
 		acc.AddReplica(candidateReplica{
 			Replica: repl,
-			usage:   RangeUsageInfoForRepl(repl),
+			usage:   repl.RangeUsageInfo(),
 		})
 	}
 	rr.Update(acc)
@@ -607,7 +610,7 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 	// order to pass replicaIsBehind checks, fake out the function for getting
 	// raft status with one that always returns all replicas as up to date.
 	sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
-		return TestingRaftStatusFn(r)
+		return TestingRaftStatusFn(r.Desc(), r.StoreID())
 	}
 
 	testCases := []struct {
@@ -746,28 +749,30 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 			expectTarget: 5,
 		},
 
+		// NB: The lease has just enough load to be worthwhile rebalancing.
 		{
 			storeIDs:     []roachpb.StoreID{1, 4},
-			qps:          1.5,
-			reqCPU:       1.5 * float64(time.Millisecond),
+			qps:          minLeaseLoadFraction * localDesc.Capacity.QueriesPerSecond,
+			reqCPU:       minLeaseLoadFraction * localDesc.Capacity.CPUPerSecond,
 			expectTarget: 4,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
-			qps:          1.5,
-			reqCPU:       1.5 * float64(time.Millisecond),
+			qps:          minLeaseLoadFraction * localDesc.Capacity.QueriesPerSecond,
+			reqCPU:       minLeaseLoadFraction * localDesc.Capacity.CPUPerSecond,
 			expectTarget: 5,
 		},
+		// NB: The lease is no longer worth rebalancing.
 		{
 			storeIDs:     []roachpb.StoreID{1, 4},
-			qps:          1.49,
-			reqCPU:       1.49 * float64(time.Millisecond),
+			qps:          minLeaseLoadFraction*localDesc.Capacity.QueriesPerSecond - 1,
+			reqCPU:       minLeaseLoadFraction*localDesc.Capacity.CPUPerSecond - 1,
 			expectTarget: 0,
 		},
 		{
 			storeIDs:     []roachpb.StoreID{1, 5},
-			qps:          1.49,
-			reqCPU:       1.49 * float64(time.Millisecond),
+			qps:          minLeaseLoadFraction*localDesc.Capacity.QueriesPerSecond - 1,
+			reqCPU:       minLeaseLoadFraction*localDesc.Capacity.CPUPerSecond - 1,
 			expectTarget: 0,
 		},
 		{
@@ -787,8 +792,8 @@ func TestChooseLeaseToTransfer(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run("", withQPSCPU(t, objectiveProvider, func(t *testing.T) {
 			lbRebalanceDimension := objectiveProvider.Objective().ToDimension()
-			loadRanges(rr, s, []testRange{{voters: tc.storeIDs, qps: tc.qps, reqCPU: tc.reqCPU}}, lbRebalanceDimension)
-			hottestRanges := sr.replicaRankings.TopLoad()
+			loadRanges(rr, s, []testRange{{voters: tc.storeIDs, qps: tc.qps, reqCPU: tc.reqCPU}})
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
 			options := sr.scorerOptions(ctx, lbRebalanceDimension)
 			options.LoadThreshold = allocatorimpl.WithAllDims(0.1)
 			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
@@ -902,7 +907,7 @@ func TestChooseRangeToRebalanceRandom(t *testing.T) {
 			// order to pass replicaIsBehind checks, fake out the function for getting
 			// raft status with one that always returns all replicas as up to date.
 			sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
-				return TestingRaftStatusFn(r)
+				return TestingRaftStatusFn(r.Desc(), r.StoreID())
 			}
 			sp.OverrideIsStoreReadyForRoutineReplicaTransferFn = func(_ context.Context, this roachpb.StoreID) bool {
 				for _, deadStore := range deadStores {
@@ -929,10 +934,10 @@ func TestChooseRangeToRebalanceRandom(t *testing.T) {
 			loadRanges(
 				rr, s, []testRange{
 					{voters: voterStores, nonVoters: nonVoterStores, qps: perReplicaQPS, reqCPU: perReplicaReqCPU},
-				}, lbRebalanceDimension,
+				},
 			)
 
-			hottestRanges := sr.replicaRankings.TopLoad()
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
 			options := sr.scorerOptions(ctx, lbRebalanceDimension)
 			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
 			rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{ReplicaEnforcementLevel: allocatorimpl.IOOverloadThresholdIgnore}
@@ -1256,7 +1261,7 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			// order to pass replicaIsBehind checks, fake out the function for getting
 			// raft status with one that always returns all replicas as up to date.
 			sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
-				return TestingRaftStatusFn(r)
+				return TestingRaftStatusFn(r.Desc(), r.StoreID())
 			}
 			s.cfg.DefaultSpanConfig.NumVoters = int32(len(tc.voters))
 			s.cfg.DefaultSpanConfig.NumReplicas = int32(len(tc.voters) + len(tc.nonVoters))
@@ -1270,10 +1275,10 @@ func TestChooseRangeToRebalanceAcrossHeterogeneousZones(t *testing.T) {
 			loadRanges(
 				rr, s, []testRange{
 					{voters: tc.voters, nonVoters: tc.nonVoters, qps: testingQPS, reqCPU: testingReqCPU},
-				}, lbRebalanceDimension,
+				},
 			)
 
-			hottestRanges := sr.replicaRankings.TopLoad()
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
 			options := sr.scorerOptions(ctx, lbRebalanceDimension)
 			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, LBRebalancingLeasesAndReplicas)
 			rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
@@ -1360,10 +1365,9 @@ func TestChooseRangeToRebalanceIgnoresRangeOnBestStores(t *testing.T) {
 					qps:    100,
 					reqCPU: 100 * float64(time.Millisecond)},
 			},
-			lbRebalanceDimension,
 		)
 
-		hottestRanges := sr.replicaRankings.TopLoad()
+		hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
 		options := sr.scorerOptions(ctx, lbRebalanceDimension)
 		rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
 		rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
@@ -1522,16 +1526,15 @@ func TestChooseRangeToRebalanceOffHotNodes(t *testing.T) {
 			// order to pass replicaIsBehind checks, fake out the function for getting
 			// raft status with one that always returns all replicas as up to date.
 			sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
-				return TestingRaftStatusFn(r)
+				return TestingRaftStatusFn(r.Desc(), r.StoreID())
 			}
 
 			s.cfg.DefaultSpanConfig.NumReplicas = int32(len(tc.voters))
 			loadRanges(rr, s,
 				[]testRange{{voters: tc.voters, qps: tc.QPS, reqCPU: tc.reqCPU}},
-				lbRebalanceDimension,
 			)
 
-			hottestRanges := sr.replicaRankings.TopLoad()
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
 			options := sr.scorerOptions(ctx, lbRebalanceDimension)
 			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
 			rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
@@ -1560,21 +1563,19 @@ func TestNoLeaseTransferToBehindReplicas(t *testing.T) {
 	// Set up a fake RaftStatus that indicates s5 is behind (but all other stores
 	// are caught up). We thus shouldn't transfer a lease to s5.
 	behindTestingRaftStatusFn := func(
-		r interface {
-			Desc() *roachpb.RangeDescriptor
-			StoreID() roachpb.StoreID
-		},
+		desc *roachpb.RangeDescriptor,
+		storeID roachpb.StoreID,
 	) *raft.Status {
 		status := &raft.Status{
 			Progress: make(map[uint64]tracker.Progress),
 		}
-		replDesc, ok := r.Desc().GetReplicaDescriptor(r.StoreID())
-		require.True(t, ok, "Could not find replica descriptor for replica on store with id %d", r.StoreID())
+		replDesc, ok := desc.GetReplicaDescriptor(storeID)
+		require.True(t, ok, "Could not find replica descriptor for replica on store with id %d", storeID)
 
 		status.Lead = uint64(replDesc.ReplicaID)
 		status.RaftState = raft.StateLeader
 		status.Commit = 2
-		for _, replica := range r.Desc().InternalReplicas {
+		for _, replica := range desc.InternalReplicas {
 			match := uint64(2)
 			if replica.StoreID == roachpb.StoreID(5) {
 				match = 0
@@ -1615,15 +1616,15 @@ func TestNoLeaseTransferToBehindReplicas(t *testing.T) {
 
 		sr := NewStoreRebalancer(cfg.AmbientCtx, cfg.Settings, rq, rr, objectiveProvider)
 		sr.getRaftStatusFn = func(r CandidateReplica) *raft.Status {
-			return behindTestingRaftStatusFn(r)
+			return behindTestingRaftStatusFn(r.Desc(), r.StoreID())
 		}
 		lbRebalanceDimension := sr.RebalanceObjective().ToDimension()
 
 		// Load in a range with replicas on an overfull node, a slightly underfull
 		// node, and a very underfull node.
-		loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 4, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}}, lbRebalanceDimension)
+		loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 4, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}})
 
-		hottestRanges := sr.replicaRankings.TopLoad()
+		hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
 		options := sr.scorerOptions(ctx, lbRebalanceDimension)
 		rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
 		repl := rctx.hottestRanges[0]
@@ -1638,9 +1639,9 @@ func TestNoLeaseTransferToBehindReplicas(t *testing.T) {
 		// Then do the same, but for replica rebalancing. Make s5 an existing replica
 		// that's behind, and see how a new replica is preferred as the leaseholder
 		// over it.
-		loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 3, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}}, lbRebalanceDimension)
+		loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 3, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}})
 
-		hottestRanges = sr.replicaRankings.TopLoad()
+		hottestRanges = sr.replicaRankings.TopLoad(lbRebalanceDimension)
 		options = sr.scorerOptions(ctx, lbRebalanceDimension)
 		rctx = sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
 		rctx.options.IOOverloadOptions = allocatorimpl.IOOverloadOptions{
@@ -1798,9 +1799,9 @@ func TestStoreRebalancerIOOverloadCheck(t *testing.T) {
 
 			// Load in a range with replicas on an overfull node, a slightly underfull
 			// node, and a very underfull node.
-			loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 3, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}}, lbRebalanceDimension)
+			loadRanges(rr, s, []testRange{{voters: []roachpb.StoreID{1, 3, 5}, qps: 100, reqCPU: 100 * float64(time.Millisecond)}})
 
-			hottestRanges := sr.replicaRankings.TopLoad()
+			hottestRanges := sr.replicaRankings.TopLoad(lbRebalanceDimension)
 			options := sr.scorerOptions(ctx, lbRebalanceDimension)
 			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
 			require.Greater(t, len(rctx.hottestRanges), 0)
@@ -1818,16 +1819,11 @@ func TestStoreRebalancerIOOverloadCheck(t *testing.T) {
 // TestingRaftStatusFn returns a raft status where all replicas are up to date and
 // the replica on the store with ID StoreID is the leader. It may be used for
 // testing.
-func TestingRaftStatusFn(
-	r interface {
-		Desc() *roachpb.RangeDescriptor
-		StoreID() roachpb.StoreID
-	},
-) *raft.Status {
+func TestingRaftStatusFn(desc *roachpb.RangeDescriptor, storeID roachpb.StoreID) *raft.Status {
 	status := &raft.Status{
 		Progress: make(map[uint64]tracker.Progress),
 	}
-	replDesc, ok := r.Desc().GetReplicaDescriptor(r.StoreID())
+	replDesc, ok := desc.GetReplicaDescriptor(storeID)
 	if !ok {
 		return status
 	}
@@ -1835,7 +1831,7 @@ func TestingRaftStatusFn(
 	status.Lead = uint64(replDesc.ReplicaID)
 	status.RaftState = raft.StateLeader
 	status.Commit = 2
-	for _, replica := range r.Desc().InternalReplicas {
+	for _, replica := range desc.InternalReplicas {
 		status.Progress[uint64(replica.ReplicaID)] = tracker.Progress{
 			Match: 2,
 			State: tracker.StateReplicate,

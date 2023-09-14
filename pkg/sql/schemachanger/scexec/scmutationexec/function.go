@@ -41,6 +41,7 @@ func (i *immediateVisitor) CreateFunctionDescriptor(
 		params,
 		op.Function.ReturnType.Type,
 		op.Function.ReturnSet,
+		op.Function.IsProcedure,
 		&catpb.PrivilegeDescriptor{Version: catpb.Version21_2},
 		outputParams,
 	)

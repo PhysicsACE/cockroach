@@ -73,6 +73,20 @@ func (desc *wrapper) HasConcurrentSchemaChanges() bool {
 		len(desc.MutationJobs) > 0
 }
 
+// ConcurrentSchemaChangeJobIDs implements catalog.Descriptor.
+func (desc *wrapper) ConcurrentSchemaChangeJobIDs() (ret []catpb.JobID) {
+	if desc.DeclarativeSchemaChangerState != nil &&
+		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID {
+		ret = append(ret, desc.DeclarativeSchemaChangerState.JobID)
+	}
+	if len(desc.MutationJobs) > 0 {
+		for _, mutationJob := range desc.MutationJobs {
+			ret = append(ret, mutationJob.JobID)
+		}
+	}
+	return ret
+}
+
 // SkipNamespace implements the descriptor interface.
 func (desc *wrapper) SkipNamespace() bool {
 	// Virtual tables are hard-coded and don't have entries in the
@@ -612,4 +626,9 @@ func (desc *wrapper) ForEachUDTDependentForHydration(fn func(t *types.T) error) 
 		}
 	}
 	return nil
+}
+
+// IsSchemaLocked implements the TableDescriptor interface.
+func (desc *wrapper) IsSchemaLocked() bool {
+	return desc.SchemaLocked
 }

@@ -39,7 +39,7 @@ func runClockJump(ctx context.Context, t test.Test, c cluster.Cluster, tc clockJ
 	if err := c.RunE(ctx, c.Node(1), "test -x ./cockroach"); err != nil {
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
 	}
-	c.Wipe(ctx)
+	c.Wipe(ctx, false /* preserveCerts */)
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
 	db := c.Conn(ctx, t.L(), c.Spec().NodeCount)
@@ -139,6 +139,7 @@ func registerClockJumpTests(r registry.Registry) {
 			// These tests muck with NTP, therefore we don't want the cluster reused
 			// by others.
 			Cluster: r.MakeClusterSpec(1, spec.ReuseTagged("offset-injector"), spec.TerminateOnMigration()),
+			Leases:  registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runClockJump(ctx, t, c, tc)
 			},

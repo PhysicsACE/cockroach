@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -32,7 +33,8 @@ func declareKeysRecoverTransaction(
 	rs ImmutableRangeState,
 	_ *kvpb.Header,
 	req kvpb.Request,
-	latchSpans, _ *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
 ) {
 	rr := req.(*kvpb.RecoverTxnRequest)
@@ -217,7 +219,7 @@ func RecoverTxn(
 		reply.RecoveredTxn.Status = roachpb.ABORTED
 	}
 	txnRecord := reply.RecoveredTxn.AsRecord()
-	if err := storage.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &txnRecord); err != nil {
+	if err := storage.MVCCPutProto(ctx, readWriter, key, hlc.Timestamp{}, &txnRecord, storage.MVCCWriteOptions{Stats: cArgs.Stats}); err != nil {
 		return result.Result{}, err
 	}
 

@@ -18,6 +18,7 @@ import { DatabasesPage, DatabasesPageProps } from "./databasesPage";
 
 import * as H from "history";
 import { defaultFilters } from "src/queryFilter";
+import { indexUnusedDuration } from "src/util/constants";
 const history = H.createHashHistory();
 
 const withLoadingIndicator: DatabasesPageProps = {
@@ -25,6 +26,8 @@ const withLoadingIndicator: DatabasesPageProps = {
   loaded: false,
   lastError: undefined,
   automaticStatsCollectionEnabled: true,
+  indexRecommendationsEnabled: false,
+  csIndexUnusedDuration: indexUnusedDuration,
   databases: [],
   sortSetting: {
     ascending: false,
@@ -37,7 +40,6 @@ const withLoadingIndicator: DatabasesPageProps = {
   refreshDatabases: () => {},
   refreshSettings: () => {},
   refreshDatabaseDetails: () => {},
-  refreshTableStats: () => {},
   location: history.location,
   history,
   match: {
@@ -53,6 +55,8 @@ const withoutData: DatabasesPageProps = {
   loaded: true,
   lastError: null,
   automaticStatsCollectionEnabled: true,
+  indexRecommendationsEnabled: false,
+  csIndexUnusedDuration: indexUnusedDuration,
   databases: [],
   sortSetting: {
     ascending: false,
@@ -65,7 +69,6 @@ const withoutData: DatabasesPageProps = {
   refreshDatabases: () => {},
   refreshSettings: () => {},
   refreshDatabaseDetails: () => {},
-  refreshTableStats: () => {},
   location: history.location,
   history,
   match: {
@@ -82,6 +85,8 @@ const withData: DatabasesPageProps = {
   lastError: null,
   showNodeRegionsColumn: true,
   automaticStatsCollectionEnabled: true,
+  indexRecommendationsEnabled: true,
+  csIndexUnusedDuration: indexUnusedDuration,
   sortSetting: {
     ascending: false,
     columnTitle: "name",
@@ -102,7 +107,6 @@ const withData: DatabasesPageProps = {
       sizeInBytes: _.random(1000.0) * 1024 ** _.random(1, 2),
       tableCount: _.random(5, 100),
       rangeCount: _.random(50, 500),
-      missingTables: [],
       nodesByRegionString:
         "gcp-europe-west1(n8), gcp-us-east1(n1), gcp-us-west1(n6)",
       numIndexRecommendations: 0,
@@ -112,7 +116,6 @@ const withData: DatabasesPageProps = {
   refreshDatabases: () => {},
   refreshSettings: () => {},
   refreshDatabaseDetails: () => {},
-  refreshTableStats: () => {},
   location: history.location,
   history,
   match: {

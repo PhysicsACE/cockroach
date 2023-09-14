@@ -27,8 +27,7 @@ import {
 } from "src/util/constants";
 import * as fakeApi from "src/util/fakeApi";
 import { mapStateToProps, mapDispatchToProps } from "./redux";
-import moment from "moment";
-import { makeTimestamp } from "src/views/databases/utils";
+import moment from "moment-timezone";
 
 function fakeRouteComponentProps(
   k1: string,
@@ -109,13 +108,14 @@ class TestDriver {
       ).toBe(true);
     }
     // Assert objects without moments are equal.
-    delete this.properties().details.lastRead;
+    const props = this.properties();
+    delete props.details.lastRead;
     delete expected.details.lastRead;
-    delete this.properties().details.lastReset;
+    delete props.details.lastReset;
     delete expected.details.lastReset;
-    delete this.properties().timeScale;
+    delete props.timeScale;
     delete expected.timeScale;
-    expect(this.properties()).toEqual(expected);
+    expect(props).toEqual(expected);
   }
 
   async refreshIndexStats() {
@@ -155,11 +155,11 @@ describe("Index Details Page", function () {
           loaded: false,
           createStatement: "",
           totalReads: 0,
-          lastRead: moment(),
-          lastReset: moment(),
           indexRecommendations: [],
           tableID: undefined,
           indexID: undefined,
+          lastRead: util.minDate,
+          lastReset: util.minDate,
         },
         breadcrumbItems: null,
       },
@@ -178,10 +178,10 @@ describe("Index Details Page", function () {
             },
             stats: {
               total_read_count: new Long(2),
-              last_read: makeTimestamp("2021-11-19T23:01:05.167627Z"),
+              last_read: util.stringToTimestamp("2021-11-19T23:01:05.167627Z"),
               total_rows_read: new Long(0),
               total_write_count: new Long(0),
-              last_write: makeTimestamp("0001-01-01T00:00:00Z"),
+              last_write: util.stringToTimestamp("0001-01-01T00:00:00Z"),
               total_rows_written: new Long(0),
             },
           },
@@ -191,7 +191,7 @@ describe("Index Details Page", function () {
             "CREATE INDEX jobs_created_by_type_created_by_id_idx ON system.public.jobs USING btree (created_by_type ASC, created_by_id ASC) STORING (status)",
         },
       ],
-      last_reset: makeTimestamp("2021-11-12T20:18:22.167627Z"),
+      last_reset: util.stringToTimestamp("2021-11-12T20:18:22.167627Z"),
     });
 
     await driver.refreshIndexStats();
@@ -214,10 +214,10 @@ describe("Index Details Page", function () {
           "CREATE INDEX jobs_created_by_type_created_by_id_idx ON system.public.jobs USING btree (created_by_type ASC, created_by_id ASC) STORING (status)",
         totalReads: 2,
         lastRead: util.TimestampToMoment(
-          makeTimestamp("2021-11-19T23:01:05.167627Z"),
+          util.stringToTimestamp("2021-11-19T23:01:05.167627Z"),
         ),
         lastReset: util.TimestampToMoment(
-          makeTimestamp("2021-11-12T20:18:22.167627Z"),
+          util.stringToTimestamp("2021-11-12T20:18:22.167627Z"),
         ),
         indexRecommendations: [],
       },

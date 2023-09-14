@@ -1,9 +1,9 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "kv",
     srcs = [
+        "admission.go",
         "batch.go",
         "db.go",
         "doc.go",
@@ -22,6 +22,7 @@ go_library(
         "//pkg/kv/kvbase",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/closedts",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/sql/sessiondatapb",
@@ -29,7 +30,6 @@ go_library(
         "//pkg/testutils",
         "//pkg/util/admission",
         "//pkg/util/admission/admissionpb",
-        "//pkg/util/contextutil",
         "//pkg/util/duration",
         "//pkg/util/errorutil/unimplemented",
         "//pkg/util/hlc",
@@ -38,6 +38,7 @@ go_library(
         "//pkg/util/retry",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
+        "//pkg/util/timeutil",
         "//pkg/util/tracing",
         "//pkg/util/tracing/tracingpb",
         "//pkg/util/uuid",
@@ -51,6 +52,7 @@ go_test(
     name = "kv_test",
     size = "medium",
     srcs = [
+        "admission_test.go",
         "client_test.go",
         "db_test.go",
         "main_test.go",
@@ -68,6 +70,7 @@ go_test(
         "//pkg/keys",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/kv/kvserver/liveness/livenesspb",
@@ -84,6 +87,7 @@ go_test(
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
+        "//pkg/util/admission/admissionpb",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
@@ -102,5 +106,3 @@ go_test(
         "@org_golang_x_sync//errgroup",
     ],
 )
-
-get_x_data(name = "get_x_data")

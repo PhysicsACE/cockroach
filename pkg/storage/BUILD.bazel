@@ -1,6 +1,4 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//build:STRINGER.bzl", "stringer")
 
 go_library(
     name = "storage",
@@ -17,7 +15,7 @@ go_library(
         "fingerprint_writer.go",
         "in_mem.go",
         "intent_interleaving_iter.go",
-        "intent_reader_writer.go",
+        "lock_table_iterator.go",
         "min_version.go",
         "mvcc.go",
         "mvcc_incremental_iterator.go",
@@ -58,6 +56,7 @@ go_library(
         "//pkg/kv/kvserver/diskmap",
         "//pkg/kv/kvserver/uncertainty",
         "//pkg/roachpb",
+        "//pkg/security/username",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql/catalog/fetchpb",
@@ -73,7 +72,6 @@ go_library(
         "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/humanizeutil",
-        "//pkg/util/ioctx",
         "//pkg/util/iterutil",
         "//pkg/util/log",
         "//pkg/util/log/eventpb",
@@ -90,7 +88,7 @@ go_library(
         "@com_github_cockroachdb_pebble//:pebble",
         "@com_github_cockroachdb_pebble//bloom",
         "@com_github_cockroachdb_pebble//objstorage",
-        "@com_github_cockroachdb_pebble//objstorage/shared",
+        "@com_github_cockroachdb_pebble//objstorage/remote",
         "@com_github_cockroachdb_pebble//rangekey",
         "@com_github_cockroachdb_pebble//record",
         "@com_github_cockroachdb_pebble//replay",
@@ -121,7 +119,7 @@ go_test(
         "engine_test.go",
         "external_helpers_test.go",
         "intent_interleaving_iter_test.go",
-        "intent_reader_writer_test.go",
+        "lock_table_iterator_test.go",
         "main_test.go",
         "min_version_test.go",
         "mvcc_history_metamorphic_iterator_test.go",
@@ -144,11 +142,14 @@ go_test(
     args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":storage"],
+    exec_properties = {"Pool": "medium"},
+    shard_count = 2,
     deps = [
         "//pkg/base",
         "//pkg/clusterversion",
         "//pkg/keys",
         "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/kv/kvserver/diskmap",
         "//pkg/kv/kvserver/spanset",
@@ -166,6 +167,7 @@ go_test(
         "//pkg/testutils/datapathutils",
         "//pkg/testutils/echotest",
         "//pkg/testutils/skip",
+        "//pkg/testutils/testfixtures",
         "//pkg/testutils/zerofields",
         "//pkg/util",
         "//pkg/util/admission",
@@ -186,7 +188,7 @@ go_test(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_errors//oserror",
         "@com_github_cockroachdb_pebble//:pebble",
-        "@com_github_cockroachdb_pebble//objstorage",
+        "@com_github_cockroachdb_pebble//objstorage/objstorageprovider",
         "@com_github_cockroachdb_pebble//sstable",
         "@com_github_cockroachdb_pebble//vfs",
         "@com_github_cockroachdb_redact//:redact",
@@ -197,5 +199,3 @@ go_test(
         "@org_golang_x_sync//errgroup",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -18,13 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
@@ -42,7 +40,7 @@ type serverIdx int
 const RandomServer serverIdx = -1
 
 type testTenant struct {
-	tenant                   serverutils.TestTenantInterface
+	tenant                   serverutils.ApplicationLayerInterface
 	tenantConn               *gosql.DB
 	tenantDB                 *sqlutils.SQLRunner
 	tenantStatus             serverpb.SQLStatusServer
@@ -70,7 +68,7 @@ func (h *testTenant) TenantContentionRegistry() *contention.Registry {
 	return h.tenantContentionRegistry
 }
 
-func (h *testTenant) GetTenant() serverutils.TestTenantInterface {
+func (h *testTenant) GetTenant() serverutils.ApplicationLayerInterface {
 	return h.tenant
 }
 
@@ -80,7 +78,7 @@ func (h *testTenant) GetTenantDB() *gosql.DB {
 
 // TestTenant exposes an interface for testing an individual tenant
 type TestTenant interface {
-	GetTenant() serverutils.TestTenantInterface
+	GetTenant() serverutils.ApplicationLayerInterface
 	GetTenantDB() *gosql.DB
 	GetTenantConn() *sqlutils.SQLRunner
 	TenantSQLStats() *persistedsqlstats.PersistedSQLStats
@@ -100,7 +98,7 @@ func newTestTenant(
 	tenant, tenantConn := serverutils.StartTenant(t, server, args)
 	sqlDB := sqlutils.MakeSQLRunner(tenantConn)
 	status := tenant.StatusServer().(serverpb.SQLStatusServer)
-	sqlStats := tenant.PGServer().(*pgwire.Server).SQLServer.
+	sqlStats := tenant.SQLServer().(*sql.Server).
 		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
 	contentionRegistry := tenant.ExecutorConfig().(sql.ExecutorConfig).ContentionRegistry
 
@@ -145,26 +143,11 @@ func NewTestTenantHelper(
 ) TenantTestHelper {
 	t.Helper()
 
-	return NewTestTenantHelperWithTenantArgs(t, tenantClusterSize, knobs, func(int, *base.TestTenantArgs) {})
-}
-
-// NewTestTenantHelperWithTenantArgs constructs a TenantTestHelper instance,
-// offering the caller the opportunity to modify the arguments passed when
-// starting each tenant.
-func NewTestTenantHelperWithTenantArgs(
-	t *testing.T,
-	tenantClusterSize int,
-	knobs base.TestingKnobs,
-	customizeTenantArgs func(tenantIdx int, tenantArgs *base.TestTenantArgs),
-) TenantTestHelper {
-	t.Helper()
-
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs = knobs
-	// We're running tenant tests, no need for a default tenant.
-	params.DisableDefaultTestTenant = true
-	testCluster := serverutils.StartNewTestCluster(t, 1 /* numNodes */, base.TestClusterArgs{
-		ServerArgs: params,
+	testCluster := serverutils.StartCluster(t, 1 /* numNodes */, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs:             knobs,
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		},
 	})
 	server := testCluster.Server(0)
 
@@ -174,9 +157,8 @@ func NewTestTenantHelperWithTenantArgs(
 			t,
 			server,
 			tenantClusterSize,
-			security.EmbeddedTenantIDs()[0],
+			securitytest.EmbeddedTenantIDs()[0],
 			knobs,
-			customizeTenantArgs,
 		),
 		// Spin up a small tenant cluster under a different tenant ID to test
 		// tenant isolation.
@@ -184,9 +166,8 @@ func NewTestTenantHelperWithTenantArgs(
 			t,
 			server,
 			1, /* tenantClusterSize */
-			security.EmbeddedTenantIDs()[1],
+			securitytest.EmbeddedTenantIDs()[1],
 			knobs,
-			func(int, *base.TestTenantArgs) {},
 		),
 	}
 }
@@ -234,16 +215,15 @@ func newTenantClusterHelper(
 	tenantClusterSize int,
 	tenantID uint64,
 	knobs base.TestingKnobs,
-	customizeTenantArgs func(tenantIdx int, tenantArgs *base.TestTenantArgs),
 ) TenantClusterHelper {
 	t.Helper()
 
 	var cluster tenantCluster = make([]TestTenant, tenantClusterSize)
 	for i := 0; i < tenantClusterSize; i++ {
-		args := tests.CreateTestTenantParams(roachpb.MustMakeTenantID(tenantID))
-		args.TestingKnobs = knobs
-		customizeTenantArgs(i, &args)
-		cluster[i] = newTestTenant(t, server, args)
+		cluster[i] = newTestTenant(t, server, base.TestTenantArgs{
+			TenantID:     roachpb.MustMakeTenantID(tenantID),
+			TestingKnobs: knobs,
+		})
 	}
 
 	return cluster
@@ -266,7 +246,7 @@ func (c tenantCluster) TenantHTTPClient(t *testing.T, idx serverIdx, isAdmin boo
 		client, err = c.Tenant(idx).GetTenant().GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
 	}
 	require.NoError(t, err)
-	return &httpClient{t: t, client: client, baseURL: c[idx].GetTenant().AdminURL()}
+	return &httpClient{t: t, client: client, baseURL: c[idx].GetTenant().AdminURL().String()}
 }
 
 func (c tenantCluster) TenantAdminHTTPClient(t *testing.T, idx serverIdx) *httpClient {

@@ -57,6 +57,7 @@ exports_files([
 # gazelle:resolve go github.com/cockroachdb/cockroach/pkg/util/json_test //pkg/util/json:json_test
 # gazelle:resolve go google.golang.org/genproto/googleapis/pubsub/v1 @org_golang_google_genproto//googleapis/pubsub/v1:pubsub
 # gazelle:resolve go google.golang.org/genproto/googleapis/cloud/kms/v1 @org_golang_google_genproto//googleapis/cloud/kms/v1:kms
+# gazelle:resolve go google.golang.org/genproto/googleapis/devtools/build/v1 @org_golang_google_genproto//googleapis/devtools/build/v1:build
 
 # See pkg/kv/kvpb/gen/BUILD.bazel for more details.
 #
@@ -118,6 +119,9 @@ exports_files([
 # gazelle:exclude pkg/sql/lexbase/keywords.go
 # gazelle:exclude pkg/sql/lexbase/tokens.go
 # gazelle:exclude pkg/sql/lexbase/reserved_keywords.go
+# gazelle:exclude pkg/sql/plpgsql/parser/lexbase/keywords.go
+# gazelle:exclude pkg/sql/plpgsql/parser/lexbase/tokens.go
+# gazelle:exclude pkg/sql/plpgsql/parser/lexbase/reserved_keywords.go
 # gazelle:exclude pkg/sql/scanner/token_names_test.go
 # gazelle:exclude pkg/sql/schemachanger/scexec/mocks_generated_test.go
 # gazelle:exclude pkg/cmd/prereqs/testdata
@@ -129,6 +133,8 @@ exports_files([
 # gazelle:exclude pkg/ui/distoss/distoss_no_bazel.go
 # gazelle:exclude pkg/util/buildutil/crdb_test_off.go
 # gazelle:exclude pkg/util/buildutil/crdb_test_on.go
+# gazelle:exclude pkg/testutils/bazelcodecover/crdb_test_off.go
+# gazelle:exclude pkg/testutils/bazelcodecover/crdb_test_on.go
 # gazelle:exclude pkg/acceptance/compose/gss/psql/*
 # gazelle:exclude pkg/acceptance/test_main.go
 #
@@ -183,6 +189,7 @@ nogo(
             "@org_golang_x_tools//go/analysis/passes/unreachable:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/unsafeptr:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/unusedresult:go_default_library",
+            "//pkg/testutils/lint/passes/deferunlockcheck",
             "//pkg/testutils/lint/passes/descriptormarshal",
             "//pkg/testutils/lint/passes/errcheck",
             "//pkg/testutils/lint/passes/errcmp",

@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
@@ -556,7 +555,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b MACADDR8)`, 45813, `macaddr8`, ``},
 		{`CREATE TABLE a(b MONEY)`, 41578, `money`, ``},
 		{`CREATE TABLE a(b PATH)`, 21286, `path`, ``},
-		{`CREATE TABLE a(b PG_LSN)`, 0, `pg_lsn`, ``},
 		{`CREATE TABLE a(b POINT)`, 21286, `point`, ``},
 		{`CREATE TABLE a(b POLYGON)`, 21286, `polygon`, ``},
 		{`CREATE TABLE a(b TXID_SNAPSHOT)`, 0, `txid_snapshot`, ``},
@@ -581,6 +579,9 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`UPSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``, ``},
 
 		{`SELECT 1 OPERATOR(public.+) 2`, 65017, ``, ``},
+
+		{`SELECT percentile_disc ( 0.50 ) WITHIN GROUP ( ORDER BY PRIMARY KEY tbl ) FROM tbl;`, 109847, `order by index`, ``},
+		{`SELECT percentile_disc ( 0.50 ) WITHIN GROUP ( ORDER BY INDEX_AFTER_ORDER_BY_BEFORE_AT INT . LIKE @ FAMILY );`, 109847, `order by index`, ``},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {

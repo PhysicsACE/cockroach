@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -73,7 +73,8 @@ func TestPebbleIterator_Corruption(t *testing.T) {
 		LowerBound: []byte("a"),
 		UpperBound: []byte("z"),
 	}
-	iter := newPebbleIterator(p.db, iterOpts, StandardDurability)
+	iter, err := newPebbleIterator(p.db, iterOpts, StandardDurability, p)
+	require.NoError(t, err)
 
 	// Seeking into the table catches the corruption.
 	ok, err := iter.SeekEngineKeyGE(ek)
@@ -82,6 +83,10 @@ func TestPebbleIterator_Corruption(t *testing.T) {
 
 	// Closing the iter results in a panic due to the corruption.
 	require.Panics(t, func() { iter.Close() })
+
+	// Should have laid down marker file to prevent startup.
+	_, err = p.Stat(base.PreventedStartupFile(p.GetAuxiliaryDir()))
+	require.NoError(t, err)
 }
 
 func randStr(fill []byte, rng *rand.Rand) {
@@ -95,8 +100,7 @@ func randStr(fill []byte, rng *rand.Rand) {
 func TestPebbleIterator_ExternalCorruption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	version := clusterversion.ByKey(clusterversion.V22_2)
-	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
+	st := cluster.MakeTestingClusterSettings()
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	var f bytes.Buffer

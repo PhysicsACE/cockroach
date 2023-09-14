@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
-	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -44,9 +43,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -69,15 +70,7 @@ var settingDistSQLNumRunners = settings.RegisterIntSetting(
 	// The choice of the default multiple of 4 was made in order to get the
 	// original value of 16 on machines with 4 CPUs.
 	4*int64(runtime.GOMAXPROCS(0)), /* defaultValue */
-	func(v int64) error {
-		if v < 0 {
-			return errors.Errorf("cannot be set to a negative value: %d", v)
-		}
-		if v > distSQLNumRunnersMax {
-			return errors.Errorf("cannot be set to a value exceeding %d: %d", distSQLNumRunnersMax, v)
-		}
-		return nil
-	},
+	settings.IntInRange(0, distSQLNumRunnersMax),
 )
 
 // Somewhat arbitrary upper bound.
@@ -85,11 +78,11 @@ var distSQLNumRunnersMax = 256 * int64(runtime.GOMAXPROCS(0))
 
 // runnerRequest is the request that is sent (via a channel) to a worker.
 type runnerRequest struct {
-	ctx           context.Context
-	podNodeDialer *nodedialer.Dialer
-	flowReq       *execinfrapb.SetupFlowRequest
-	sqlInstanceID base.SQLInstanceID
-	resultChan    chan<- runnerResult
+	ctx               context.Context
+	sqlInstanceDialer *nodedialer.Dialer
+	flowReq           *execinfrapb.SetupFlowRequest
+	sqlInstanceID     base.SQLInstanceID
+	resultChan        chan<- runnerResult
 }
 
 // runnerResult is returned by a worker (via a channel) for each received
@@ -97,6 +90,22 @@ type runnerRequest struct {
 type runnerResult struct {
 	nodeID base.SQLInstanceID
 	err    error
+}
+
+type runnerDialErr struct {
+	err error
+}
+
+func (e *runnerDialErr) Error() string {
+	return e.err.Error()
+}
+
+func (e *runnerDialErr) Cause() error {
+	return e.err
+}
+
+func isDialErr(err error) bool {
+	return errors.HasType(err, (*runnerDialErr)(nil))
 }
 
 // run executes the request. An error, if encountered, is both sent on the
@@ -108,8 +117,11 @@ func (req runnerRequest) run() error {
 		physicalplan.ReleaseFlowSpec(&req.flowReq.Flow)
 	}()
 
-	conn, err := req.podNodeDialer.Dial(req.ctx, roachpb.NodeID(req.sqlInstanceID), rpc.DefaultClass)
+	conn, err := req.sqlInstanceDialer.Dial(req.ctx, roachpb.NodeID(req.sqlInstanceID), rpc.DefaultClass)
 	if err != nil {
+		// Mark this error as special runnerDialErr so that we could retry this
+		// distributed query as local.
+		err = &runnerDialErr{err: err}
 		res.err = err
 		return err
 	}
@@ -244,8 +256,7 @@ func (dsp *DistSQLPlanner) initCancelingWorkers(initCtx context.Context) {
 						continue
 					}
 					log.VEventf(parentCtx, 2, "worker %d is canceling at most %d flows on node %d", workerID, len(req.FlowIDs), sqlInstanceID)
-					// TODO: Double check that we only ever cancel flows on SQL nodes/pods here.
-					conn, err := dsp.podNodeDialer.Dial(parentCtx, roachpb.NodeID(sqlInstanceID), rpc.DefaultClass)
+					conn, err := dsp.sqlInstanceDialer.Dial(parentCtx, roachpb.NodeID(sqlInstanceID), rpc.DefaultClass)
 					if err != nil {
 						// We failed to dial the node, so we give up given that
 						// our cancellation is best effort. It is possible that
@@ -253,7 +264,7 @@ func (dsp *DistSQLPlanner) initCancelingWorkers(initCtx context.Context) {
 						continue
 					}
 					client := execinfrapb.NewDistSQLClient(conn)
-					_ = contextutil.RunWithTimeout(
+					_ = timeutil.RunWithTimeout(
 						parentCtx,
 						"cancel dead flows",
 						cancelRequestTimeout,
@@ -539,11 +550,11 @@ func (dsp *DistSQLPlanner) setupFlows(
 		req := setupReq
 		req.Flow = *flowSpec
 		runReq := runnerRequest{
-			ctx:           runnerCtx,
-			podNodeDialer: dsp.podNodeDialer,
-			flowReq:       &req,
-			sqlInstanceID: nodeID,
-			resultChan:    resultChan,
+			ctx:               runnerCtx,
+			sqlInstanceDialer: dsp.sqlInstanceDialer,
+			flowReq:           &req,
+			sqlInstanceID:     nodeID,
+			resultChan:        resultChan,
 		}
 
 		// Send out a request to the workers; if no worker is available, run
@@ -576,11 +587,9 @@ func (dsp *DistSQLPlanner) setupFlows(
 	// and we do so in a separate goroutine.
 	//
 	// We need to synchronize the new goroutine with flow.Cleanup() being called
-	// for two reasons:
-	// - flow.Cleanup() is the last thing before DistSQLPlanner.Run returns at
-	// which point the rowResultWriter is no longer protected by the mutex of
-	// the DistSQLReceiver
-	// - flow.Cancel can only be called before flow.Cleanup.
+	// since flow.Cleanup() is the last thing before DistSQLPlanner.Run returns
+	// at which point the rowResultWriter is no longer protected by the mutex of
+	// the DistSQLReceiver.
 	cleanupCalledMu := struct {
 		syncutil.Mutex
 		called bool
@@ -608,8 +617,6 @@ func (dsp *DistSQLPlanner) setupFlows(
 				seenError = true
 				func() {
 					cleanupCalledMu.Lock()
-					// Flow.Cancel cannot be called after or concurrently with
-					// Flow.Cleanup.
 					defer cleanupCalledMu.Unlock()
 					if cleanupCalledMu.called {
 						// Cleanup of the local flow has already been performed,
@@ -640,6 +647,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 }
 
 const clientRejectedMsg string = "client rejected when attempting to run DistSQL plan"
+const executingParallelAndSerialChecks = "executing %d checks concurrently and %d checks serially"
 
 // Run executes a physical plan. The plan should have been finalized using
 // FinalizePlan.
@@ -657,7 +665,7 @@ const clientRejectedMsg string = "client rejected when attempting to run DistSQL
 // - evalCtx is the evaluation context in which the plan will run. It might be
 // mutated.
 // - finishedSetupFn, if non-nil, is called synchronously after all the
-// processors have successfully started up.
+// processors have been created but haven't started running yet.
 func (dsp *DistSQLPlanner) Run(
 	ctx context.Context,
 	planCtx *PlanningCtx,
@@ -689,14 +697,9 @@ func (dsp *DistSQLPlanner) Run(
 	localState.MustUseLeaf = planCtx.mustUseLeafTxn
 	localState.Txn = txn
 	localState.LocalProcs = plan.LocalProcessors
-	// If we have access to a planner and are currently being used to plan
-	// statements in a user transaction, then take the descs.Collection to resolve
-	// types with during flow execution. This is necessary to do in the case of
-	// a transaction that has already created or updated some types. If we do not
-	// use the local descs.Collection, we would attempt to acquire a lease on
-	// modified types when accessing them, which would error out.
-	if planCtx.planner != nil &&
-		(!planCtx.planner.isInternalPlanner || planCtx.usePlannerDescriptorsForLocalFlow) {
+	localState.LocalVectorSources = plan.LocalVectorSources
+	if planCtx.planner != nil {
+		// Note that the planner's collection will only be used for local plans.
 		localState.Collection = planCtx.planner.Descriptors()
 	}
 
@@ -748,8 +751,28 @@ func (dsp *DistSQLPlanner) Run(
 			// TODO(yuzefovich): fix the propagation of the lock spans with the
 			// leaf txns and remove this check. See #94290.
 			containsNonDefaultLocking := planCtx.planner != nil && planCtx.planner.curPlan.flags.IsSet(planFlagContainsNonDefaultLocking)
-			if !containsNonDefaultLocking {
-				if execinfra.CanUseStreamer(dsp.st) {
+
+			// We also currently disable the usage of the Streamer API whenever
+			// we have a wrapped planNode. This is done to prevent scenarios
+			// where some of planNodes will use the RootTxn (via the internal
+			// executor) which prohibits the usage of the LeafTxn for this flow.
+			//
+			// Note that we're disallowing the Streamer API in more cases than
+			// strictly necessary (i.e. there are planNodes that don't use the
+			// txn at all), but auditing each planNode implementation to see
+			// which are using the internal executor is error-prone, so we just
+			// disable the Streamer API for the "super-set" of problematic
+			// cases.
+			mustUseRootTxn := func() bool {
+				for _, p := range plan.Processors {
+					if p.Spec.Core.LocalPlanNode != nil {
+						return true
+					}
+				}
+				return false
+			}()
+			if !containsNonDefaultLocking && !mustUseRootTxn {
+				if evalCtx.SessionData().StreamerEnabled {
 					for _, proc := range plan.Processors {
 						if jr := proc.Spec.Core.JoinReader; jr != nil {
 							// Both index and lookup joins, with and without
@@ -764,7 +787,7 @@ func (dsp *DistSQLPlanner) Run(
 		}
 		if localState.MustUseLeafTxn() {
 			// Set up leaf txns using the txnCoordMeta if we need to.
-			tis, err := txn.GetLeafTxnInputStateOrRejectClient(ctx)
+			tis, err := txn.GetLeafTxnInputState(ctx)
 			if err != nil {
 				log.Infof(ctx, "%s: %s", clientRejectedMsg, err)
 				recv.SetError(err)
@@ -799,7 +822,7 @@ func (dsp *DistSQLPlanner) Run(
 	defer dsp.distSQLSrv.ServerConfig.Metrics.QueryStop()
 
 	recv.outputTypes = plan.GetResultTypes()
-	if multitenant.TenantRUEstimateEnabled.Get(&dsp.st.SV) &&
+	if execinfra.IncludeRUEstimateInExplainAnalyze.Get(&dsp.st.SV) &&
 		dsp.distSQLSrv.TenantCostController != nil && planCtx.planner != nil {
 		if instrumentation := planCtx.planner.curPlan.instrumentation; instrumentation != nil {
 			// Only collect the network egress estimate for a tenant that is running
@@ -831,14 +854,32 @@ func (dsp *DistSQLPlanner) Run(
 	if planCtx.planner != nil {
 		statementSQL = planCtx.planner.stmt.StmtNoConstants
 	}
-	ctx, flow, err := dsp.setupFlows(
-		ctx, evalCtx, planCtx, leafInputState, flows, recv, localState, statementSQL,
-	)
-	// Make sure that the local flow is always cleaned up if it was created.
+
+	var flow flowinfra.Flow
+	var err error
+	if i := planCtx.getPortalPauseInfo(); i != nil && i.resumableFlow.flow != nil {
+		flow = i.resumableFlow.flow
+	} else {
+		ctx, flow, err = dsp.setupFlows(
+			ctx, evalCtx, planCtx, leafInputState, flows, recv, localState, statementSQL,
+		)
+		if i != nil {
+			// TODO(yuzefovich): add a check that this flow runs in a single goroutine.
+			i.resumableFlow.flow = flow
+			i.resumableFlow.outputTypes = plan.GetResultTypes()
+		}
+	}
+
 	if flow != nil {
-		defer func() {
-			flow.Cleanup(ctx)
-		}()
+		// Make sure that the local flow is always cleaned up if it was created.
+		// If the flow is not for retained portal, we clean the flow up here.
+		// Otherwise, we delay the clean up via portalPauseInfo.flowCleanup until
+		// the portal is closed.
+		if planCtx.getPortalPauseInfo() == nil {
+			defer func() {
+				flow.Cleanup(ctx)
+			}()
+		}
 	}
 	if err != nil {
 		recv.SetError(err)
@@ -861,7 +902,8 @@ func (dsp *DistSQLPlanner) Run(
 		return
 	}
 
-	flow.Run(ctx)
+	noWait := planCtx.getPortalPauseInfo() != nil
+	flow.Run(ctx, noWait)
 }
 
 // DistSQLReceiver is an execinfra.RowReceiver and execinfra.BatchReceiver that
@@ -901,6 +943,10 @@ type DistSQLReceiver struct {
 	// discardRows is set when we want to discard rows (for testing/benchmarks).
 	// See EXECUTE .. DISCARD ROWS.
 	discardRows bool
+
+	// dataPushed is set once at least one row, one batch, or one non-error
+	// piece of metadata is pushed to the result writer.
+	dataPushed bool
 
 	// commErr keeps track of the error received from interacting with the
 	// resultWriter. This represents a "communication error" and as such is unlike
@@ -948,8 +994,8 @@ type DistSQLReceiver struct {
 
 	testingKnobs struct {
 		// pushCallback, if set, will be called every time DistSQLReceiver.Push
-		// is called, with the same arguments.
-		pushCallback func(rowenc.EncDatumRow, *execinfrapb.ProducerMetadata)
+		// or DistSQLReceiver.PushBatch is called, with the same arguments.
+		pushCallback func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata)
 	}
 }
 
@@ -959,7 +1005,7 @@ type rowResultWriter interface {
 	// AddRow writes a result row.
 	// Note that the caller owns the row slice and might reuse it.
 	AddRow(ctx context.Context, row tree.Datums) error
-	IncrementRowsAffected(ctx context.Context, n int)
+	SetRowsAffected(ctx context.Context, n int)
 	SetError(error)
 	Err() error
 }
@@ -1050,8 +1096,8 @@ func (w *errOnlyResultWriter) AddBatch(ctx context.Context, batch coldata.Batch)
 	panic("AddBatch not supported by errOnlyResultWriter")
 }
 
-func (w *errOnlyResultWriter) IncrementRowsAffected(ctx context.Context, n int) {
-	panic("IncrementRowsAffected not supported by errOnlyResultWriter")
+func (w *errOnlyResultWriter) SetRowsAffected(ctx context.Context, n int) {
+	panic("SetRowsAffected not supported by errOnlyResultWriter")
 }
 
 // RowResultWriter is a thin wrapper around a RowContainer.
@@ -1068,9 +1114,9 @@ func NewRowResultWriter(rowContainer *rowContainerHelper) *RowResultWriter {
 	return &RowResultWriter{rowContainer: rowContainer}
 }
 
-// IncrementRowsAffected implements the rowResultWriter interface.
-func (b *RowResultWriter) IncrementRowsAffected(ctx context.Context, n int) {
-	b.rowsAffected += n
+// SetRowsAffected implements the rowResultWriter interface.
+func (b *RowResultWriter) SetRowsAffected(ctx context.Context, n int) {
+	b.rowsAffected = n
 }
 
 // AddRow implements the rowResultWriter interface.
@@ -1108,9 +1154,9 @@ func NewCallbackResultWriter(
 	return &CallbackResultWriter{fn: fn}
 }
 
-// IncrementRowsAffected is part of the rowResultWriter interface.
-func (c *CallbackResultWriter) IncrementRowsAffected(ctx context.Context, n int) {
-	c.rowsAffected += n
+// SetRowsAffected is part of the rowResultWriter interface.
+func (c *CallbackResultWriter) SetRowsAffected(ctx context.Context, n int) {
+	c.rowsAffected = n
 }
 
 // AddRow is part of the rowResultWriter interface.
@@ -1183,6 +1229,20 @@ func MakeDistSQLReceiver(
 	r.resultWriterMu.row = resultWriter
 	r.resultWriterMu.batch = batchWriter
 	return r
+}
+
+// resetForLocalRerun prepares the DistSQLReceiver to be used again for
+// executing the plan - that encountered an error when run in the distributed
+// fashion - locally.
+func (r *DistSQLReceiver) resetForLocalRerun(stats topLevelQueryStats) {
+	r.resultWriterMu.row.SetError(nil)
+	r.updateStatus.Store(false)
+	r.status = execinfra.NeedMoreRows
+	r.dataPushed = false
+	r.closed = false
+	r.stats = stats
+	r.egressCounter = nil
+	atomic.StoreUint64(r.progressAtomic, math.Float64bits(0))
 }
 
 // Release releases this DistSQLReceiver back to the pool.
@@ -1294,6 +1354,9 @@ func (r *DistSQLReceiver) checkConcurrentError() {
 func (r *DistSQLReceiver) pushMeta(meta *execinfrapb.ProducerMetadata) execinfra.ConsumerStatus {
 	if metaWriter, ok := r.resultWriterMu.row.(MetadataResultWriter); ok {
 		metaWriter.AddMeta(r.ctx, meta)
+		if meta.Err == nil {
+			r.dataPushed = true
+		}
 	}
 	if meta.LeafTxnFinalState != nil {
 		if r.txn != nil {
@@ -1345,6 +1408,8 @@ func (r *DistSQLReceiver) handleCommErr(commErr error) {
 	} else if errors.Is(commErr, errIEResultChannelClosed) {
 		log.VEvent(r.ctx, 1, "encountered errIEResultChannelClosed (transitioning to draining)")
 		r.status = execinfra.DrainRequested
+	} else if errors.Is(commErr, ErrPortalLimitHasBeenReached) {
+		r.status = execinfra.SwitchToAnotherPortal
 	} else {
 		// Set the error on the resultWriter to notify the consumer about
 		// it. Most clients don't care to differentiate between
@@ -1363,7 +1428,7 @@ func (r *DistSQLReceiver) handleCommErr(commErr error) {
 		// sql/pgwire.limitedCommandResult.moreResultsNeeded). Instead of
 		// changing the signature of AddRow, we have a sentinel error that
 		// is handled specially here.
-		if !errors.Is(commErr, ErrLimitedResultNotSupported) {
+		if !errors.Is(commErr, ErrLimitedResultNotSupported) && !errors.Is(commErr, ErrStmtNotSupportedForPausablePortal) {
 			r.commErr = commErr
 		}
 	}
@@ -1375,7 +1440,7 @@ func (r *DistSQLReceiver) Push(
 ) execinfra.ConsumerStatus {
 	r.checkConcurrentError()
 	if r.testingKnobs.pushCallback != nil {
-		r.testingKnobs.pushCallback(row, meta)
+		r.testingKnobs.pushCallback(row, nil /* batch */, meta)
 	}
 	if meta != nil {
 		return r.pushMeta(meta)
@@ -1392,7 +1457,7 @@ func (r *DistSQLReceiver) Push(
 		// We only need the row count. planNodeToRowSource is set up to handle
 		// ensuring that the last stage in the pipeline will return a single-column
 		// row with the row count in it, so just grab that and exit.
-		r.resultWriterMu.row.IncrementRowsAffected(r.ctx, n)
+		r.resultWriterMu.row.SetRowsAffected(r.ctx, n)
 		return r.status
 	}
 
@@ -1446,6 +1511,7 @@ func (r *DistSQLReceiver) Push(
 	if commErr := r.resultWriterMu.row.AddRow(r.ctx, r.row); commErr != nil {
 		r.handleCommErr(commErr)
 	}
+	r.dataPushed = true
 	return r.status
 }
 
@@ -1454,6 +1520,9 @@ func (r *DistSQLReceiver) PushBatch(
 	batch coldata.Batch, meta *execinfrapb.ProducerMetadata,
 ) execinfra.ConsumerStatus {
 	r.checkConcurrentError()
+	if r.testingKnobs.pushCallback != nil {
+		r.testingKnobs.pushCallback(nil /* row */, batch, meta)
+	}
 	if meta != nil {
 		return r.pushMeta(meta)
 	}
@@ -1473,7 +1542,7 @@ func (r *DistSQLReceiver) PushBatch(
 		// We only need the row count. planNodeToRowSource is set up to handle
 		// ensuring that the last stage in the pipeline will return a single-column
 		// row with the row count in it, so just grab that and exit.
-		r.resultWriterMu.row.IncrementRowsAffected(r.ctx, int(batch.ColVec(0).Int64()[0]))
+		r.resultWriterMu.row.SetRowsAffected(r.ctx, int(batch.ColVec(0).Int64()[0]))
 		return r.status
 	}
 
@@ -1498,16 +1567,33 @@ func (r *DistSQLReceiver) PushBatch(
 	if commErr := r.resultWriterMu.batch.AddBatch(r.ctx, batch); commErr != nil {
 		r.handleCommErr(commErr)
 	}
+	r.dataPushed = true
 	return r.status
 }
 
 var (
 	// ErrLimitedResultNotSupported is an error produced by pgwire
-	// indicating an unsupported feature of row count limits was attempted.
-	ErrLimitedResultNotSupported = unimplemented.NewWithIssue(40195, "multiple active portals not supported")
+	// indicating the user attempted to have multiple active portals but
+	// either without setting session variable multiple_active_portals_enabled to
+	// true or the underlying query does not satisfy the restriction.
+	ErrLimitedResultNotSupported = unimplemented.NewWithIssue(
+		40195,
+		"multiple active portals not supported, "+
+			"please set session variable multiple_active_portals_enabled to true. "+
+			"Note: this feature is in preview",
+	)
+	// ErrStmtNotSupportedForPausablePortal is returned when the user have set
+	// session variable multiple_active_portals_enabled to true but set an unsupported
+	// statement for a portal.
+	ErrStmtNotSupportedForPausablePortal = unimplemented.NewWithIssue(
+		98911,
+		"the statement for a pausable portal must be a read-only SELECT query"+
+			" with no sub-queries or post-queries",
+	)
 	// ErrLimitedResultClosed is a sentinel error produced by pgwire
 	// indicating the portal should be closed without error.
-	ErrLimitedResultClosed = errors.New("row count limit closed")
+	ErrLimitedResultClosed       = errors.New("row count limit closed")
+	ErrPortalLimitHasBeenReached = errors.New("limit has been reached")
 )
 
 // ProducerDone is part of the execinfra.RowReceiver interface.
@@ -1524,7 +1610,8 @@ func (r *DistSQLReceiver) ProducerDone() {
 // function updates the passed-in planner to make sure that the "inner" plans
 // use the LeafTxns if the "outer" plan happens to have concurrency. It also
 // returns a non-nil cleanup function that must be called once all plans (the
-// "outer" as well as all "inner" ones) are done.
+// "outer" as well as all "inner" ones) are done. The returned functions can be
+// called multiple times.
 func getFinishedSetupFn(planner *planner) (finishedSetupFn func(flowinfra.Flow), cleanup func()) {
 	finishedSetupFn = func(localFlow flowinfra.Flow) {
 		if localFlow.GetFlowCtx().Txn.Type() == kv.LeafTxn {
@@ -1540,6 +1627,8 @@ func getFinishedSetupFn(planner *planner) (finishedSetupFn func(flowinfra.Flow),
 // PlanAndRunAll combines running the main query, subqueries and cascades/checks.
 // If an error is returned, the connection needs to stop processing queries.
 // Query execution errors stored in recv; they are not returned.
+// NB: the plan (in planner.curPlan) is not closed, so it is the caller's
+// responsibility to do so.
 func (dsp *DistSQLPlanner) PlanAndRunAll(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
@@ -1547,8 +1636,15 @@ func (dsp *DistSQLPlanner) PlanAndRunAll(
 	planner *planner,
 	recv *DistSQLReceiver,
 	evalCtxFactory func(usedConcurrently bool) *extendedEvalContext,
-) error {
-	defer planner.curPlan.close(ctx)
+) (retErr error) {
+	defer func() {
+		if ppInfo := planCtx.getPortalPauseInfo(); ppInfo != nil && !ppInfo.resumableFlow.cleanup.isComplete {
+			ppInfo.resumableFlow.cleanup.isComplete = true
+		}
+		if retErr != nil && planCtx.getPortalPauseInfo() != nil {
+			planCtx.getPortalPauseInfo().resumableFlow.cleanup.run()
+		}
+	}()
 	if len(planner.curPlan.subqueryPlans) != 0 {
 		// Create a separate memory account for the results of the subqueries.
 		// Note that we intentionally defer the closure of the account until we
@@ -1578,8 +1674,33 @@ func (dsp *DistSQLPlanner) PlanAndRunAll(
 			ctx, evalCtx, planCtx, planner.txn, planner.curPlan.main, recv, finishedSetupFn,
 		)
 	}()
+
+	if p := planCtx.getPortalPauseInfo(); p != nil {
+		if buildutil.CrdbTestBuild && p.resumableFlow.flow == nil {
+			checkErr := errors.AssertionFailedf("flow for portal %s cannot be found", planner.pausablePortal.Name)
+			if recv.commErr != nil {
+				recv.commErr = errors.CombineErrors(recv.commErr, checkErr)
+			} else {
+				return checkErr
+			}
+		}
+		if !p.resumableFlow.cleanup.isComplete {
+			p.resumableFlow.cleanup.appendFunc(namedFunc{
+				fName: "cleanup flow", f: func() {
+					p.resumableFlow.flow.Cleanup(ctx)
+				},
+			})
+		}
+	}
+
 	if recv.commErr != nil || recv.getError() != nil {
 		return recv.commErr
+	}
+
+	if knobs := evalCtx.ExecCfg.DistSQLRunTestingKnobs; knobs != nil {
+		if fn := knobs.RunBeforeCascadesAndChecks; fn != nil {
+			fn(planner.Txn().ID())
+		}
 	}
 
 	dsp.PlanAndRunCascadesAndChecks(
@@ -1645,21 +1766,6 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	skipDistSQLDiagramGeneration bool,
 	mustUseLeafTxn bool,
 ) error {
-	subqueryMonitor := mon.NewMonitor(
-		"subquery",
-		mon.MemoryResource,
-		dsp.distSQLSrv.Metrics.CurBytesCount,
-		dsp.distSQLSrv.Metrics.MaxBytesHist,
-		-1, /* use default block size */
-		noteworthyMemoryUsageBytes,
-		dsp.distSQLSrv.Settings,
-	)
-	subqueryMonitor.StartNoReserved(ctx, evalCtx.Planner.Mon())
-	defer subqueryMonitor.Stop(ctx)
-
-	subqueryMemAccount := subqueryMonitor.MakeBoundAccount()
-	defer subqueryMemAccount.Close(ctx)
-
 	distributeSubquery := getPlanDistribution(
 		ctx, planner.Descriptors().HasUncommittedTypes(),
 		planner.SessionData().DistSQLMode, subqueryPlan.plan,
@@ -1805,14 +1911,30 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	return nil
 }
 
+var distributedQueryRerunAsLocalEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.distsql.distributed_query_rerun_locally.enabled",
+	"determines whether the distributed plans can be rerun locally for some errors",
+	true,
+)
+
 // PlanAndRun generates a physical plan from a planNode tree and executes it. It
-// assumes that the tree is supported (see CheckSupport).
+// assumes that the tree is supported (see checkSupportForPlanNode).
 //
 // All errors encountered are reported to the DistSQLReceiver's resultWriter.
 // Additionally, if the error is a "communication error" (an error encountered
 // while using that resultWriter), the error is also stored in
 // DistSQLReceiver.commErr. That can be tested to see if a client session needs
 // to be closed.
+//
+// An allow-list of errors that are encountered during the distributed query
+// execution are transparently retried by re-planning and re-running the query
+// as local (as long as no data has been communicated to the result writer).
+//
+// - finishedSetupFn, if non-nil, is called synchronously after all the local
+// processors have been created but haven't started running yet. If the query is
+// re-planned as local after having encountered an error during distributed
+// execution, then finishedSetupFn will be called twice.
 func (dsp *DistSQLPlanner) PlanAndRun(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
@@ -1823,16 +1945,87 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 	finishedSetupFn func(localFlow flowinfra.Flow),
 ) {
 	log.VEventf(ctx, 2, "creating DistSQL plan with isLocal=%v", planCtx.isLocal)
-
+	// Copy query-level stats before executing this plan in case we need to
+	// re-run it as local.
+	subqueriesStats := recv.stats
 	physPlan, physPlanCleanup, err := dsp.createPhysPlan(ctx, planCtx, plan)
 	defer physPlanCleanup()
 	if err != nil {
 		recv.SetError(err)
+	} else {
+		finalizePlanWithRowCount(ctx, planCtx, physPlan, planCtx.planner.curPlan.mainRowCount)
+		recv.expectedRowsRead = int64(physPlan.TotalEstimatedScannedRows)
+		dsp.Run(ctx, planCtx, txn, physPlan, recv, evalCtx, finishedSetupFn)
+	}
+	if planCtx.isLocal {
+		// If the plan was local, then we're done regardless of whether an error
+		// was encountered or not.
 		return
 	}
-	finalizePlanWithRowCount(ctx, planCtx, physPlan, planCtx.planner.curPlan.mainRowCount)
-	recv.expectedRowsRead = int64(physPlan.TotalEstimatedScannedRows)
-	dsp.Run(ctx, planCtx, txn, physPlan, recv, evalCtx, finishedSetupFn)
+	if distributedErr := recv.getError(); distributedErr != nil &&
+		distributedQueryRerunAsLocalEnabled.Get(&dsp.st.SV) {
+		// If we had a distributed plan which resulted in an error, we want to
+		// retry this query as local in some cases. In particular, this retry
+		// mechanism allows us to hide transient network problems, and - more
+		// importantly - in the multi-tenant model it allows us to go around the
+		// problem when "not ready" SQL instance is being used for DistSQL
+		// planning (e.g. the instance might have been brought down, but the
+		// cache on top of the system table hasn't been updated accordingly).
+		//
+		// The rationale for why it is ok to do so is that we'll create
+		// brand-new processors that aren't affiliated to the distributed plan
+		// that was just cleaned up. It's worth mentioning that the planNode
+		// tree couldn't have been reused in this way, but if we needed to
+		// execute any planNodes directly, then we would have to run such a plan
+		// in a local fashion. In other words, the fact that we had a
+		// distributed plan initially guarantees that we don't have any
+		// planNodes to be concerned about.
+		// TODO(yuzefovich): consider introducing this retry mechanism to sub-
+		// and post-queries too.
+		if recv.dataPushed || plan.isPhysicalPlan() {
+			// If some data has already been pushed to the result writer, we
+			// cannot retry. Also, we cannot re-plan locally if we used the
+			// experimental DistSQL spec planning factory.
+			return
+		}
+		if recv.commErr != nil || ctx.Err() != nil {
+			// For communication errors, we don't try to rerun the query since
+			// the connection is toast. We also give up if the context
+			// cancellation has already occurred.
+			return
+		}
+		if !sqlerrors.IsDistSQLRetryableError(distributedErr) &&
+			!pgerror.IsSQLRetryableError(distributedErr) &&
+			!flowinfra.IsFlowRetryableError(distributedErr) &&
+			!isDialErr(distributedErr) {
+			// Only re-run the query if we think there is a high chance of a
+			// successful local execution.
+			return
+		}
+		log.VEventf(ctx, 1, "encountered an error when running the distributed plan, re-running it as local: %v", distributedErr)
+		recv.resetForLocalRerun(subqueriesStats)
+		telemetry.Inc(sqltelemetry.DistributedErrorLocalRetryAttempt)
+		defer func() {
+			if recv.getError() == nil {
+				telemetry.Inc(sqltelemetry.DistributedErrorLocalRetrySuccess)
+			}
+		}()
+		// Note that since we're going to execute the query locally now, there
+		// is no point in providing the locality filter since it will be ignored
+		// anyway, so we don't use NewPlanningCtxWithOracle constructor.
+		localPlanCtx := dsp.NewPlanningCtx(
+			ctx, evalCtx, planCtx.planner, evalCtx.Txn, DistributionTypeNone,
+		)
+		localPhysPlan, localPhysPlanCleanup, err := dsp.createPhysPlan(ctx, localPlanCtx, plan)
+		defer localPhysPlanCleanup()
+		if err != nil {
+			recv.SetError(err)
+			return
+		}
+		finalizePlanWithRowCount(ctx, localPlanCtx, localPhysPlan, localPlanCtx.planner.curPlan.mainRowCount)
+		recv.expectedRowsRead = int64(localPhysPlan.TotalEstimatedScannedRows)
+		dsp.Run(ctx, localPlanCtx, txn, localPhysPlan, recv, evalCtx, finishedSetupFn)
+	}
 }
 
 // PlanAndRunCascadesAndChecks runs any cascade and check queries.
@@ -2048,21 +2241,6 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	associateNodeWithComponents func(exec.Node, execComponents),
 	addTopLevelQueryStats func(stats *topLevelQueryStats),
 ) error {
-	postqueryMonitor := mon.NewMonitor(
-		"postquery",
-		mon.MemoryResource,
-		dsp.distSQLSrv.Metrics.CurBytesCount,
-		dsp.distSQLSrv.Metrics.MaxBytesHist,
-		-1, /* use default block size */
-		noteworthyMemoryUsageBytes,
-		dsp.distSQLSrv.Settings,
-	)
-	postqueryMonitor.StartNoReserved(ctx, planner.Mon())
-	defer postqueryMonitor.Stop(ctx)
-
-	postqueryMemAccount := postqueryMonitor.MakeBoundAccount()
-	defer postqueryMemAccount.Close(ctx)
-
 	distributePostquery := getPlanDistribution(
 		ctx, planner.Descriptors().HasUncommittedTypes(),
 		planner.SessionData().DistSQLMode, postqueryPlan,
@@ -2097,8 +2275,9 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	postqueryResultWriter := &errOnlyResultWriter{}
 	postqueryRecv.resultWriterMu.row = postqueryResultWriter
 	postqueryRecv.resultWriterMu.batch = postqueryResultWriter
-	// Postqueries cannot have "inner" plans, so we use nil finishedSetupFn.
-	dsp.Run(ctx, postqueryPlanCtx, planner.txn, postqueryPhysPlan, postqueryRecv, evalCtx, nil /* finishedSetupFn */)
+	finishedSetupFn, cleanup := getFinishedSetupFn(planner)
+	defer cleanup()
+	dsp.Run(ctx, postqueryPlanCtx, planner.txn, postqueryPhysPlan, postqueryRecv, evalCtx, finishedSetupFn)
 	return postqueryRecv.getError()
 }
 
@@ -2212,7 +2391,9 @@ func (dsp *DistSQLPlanner) planAndRunChecksInParallel(
 		numParallelChecks--
 	}
 
-	log.VEventf(ctx, 2, "executing %d checks concurrently and %d checks serially", numParallelChecks, len(checkPlans)-numParallelChecks)
+	log.VEventf(
+		ctx, 2, executingParallelAndSerialChecks, numParallelChecks, len(checkPlans)-numParallelChecks,
+	)
 
 	// Set up a wait group so that the main (current) goroutine can block until
 	// all concurrent checks return. We cannot short-circuit if one of the

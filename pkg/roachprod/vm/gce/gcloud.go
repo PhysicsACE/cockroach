@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,12 +32,17 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
+	cloudbilling "google.golang.org/api/cloudbilling/v1beta"
 )
 
 const (
-	defaultProject = "cockroach-ephemeral"
-	// ProviderName is gce.
-	ProviderName = "gce"
+	defaultProject      = "cockroach-ephemeral"
+	ProviderName        = "gce"
+	DefaultImage        = "ubuntu-2004-focal-v20230817"
+	ARM64Image          = "ubuntu-2004-focal-arm64-v20230817"
+	FIPSImage           = "ubuntu-pro-fips-2004-focal-v20230811"
+	defaultImageProject = "ubuntu-os-cloud"
+	FIPSImageProject    = "ubuntu-os-pro-cloud"
 )
 
 // providerInstance is the instance to be registered into vm.Providers by Init.
@@ -48,7 +54,10 @@ func DefaultProject() string {
 }
 
 // projects for which a cron GC job exists.
-var projectsWithGC = []string{defaultProject, "andrei-jepsen"}
+var projectsWithGC = []string{defaultProject}
+
+// Denotes if this provider was successfully initialized.
+var initialized = false
 
 // Init registers the GCE provider into vm.Providers.
 //
@@ -66,6 +75,8 @@ func Init() error {
 			"(https://cloud.google.com/sdk/downloads)")
 		return errors.New("gcloud not found")
 	}
+	providerInstance.DNSProvider = NewDNSProvider()
+	initialized = true
 	vm.Providers[ProviderName] = providerInstance
 	return nil
 }
@@ -88,7 +99,7 @@ func runJSONCommand(args []string, parsed interface{}) error {
 	}
 
 	if err := json.Unmarshal(rawJSON, &parsed); err != nil {
-		return errors.Wrapf(err, "failed to parse json %s", rawJSON)
+		return errors.Wrapf(err, "failed to parse json %s: %v", rawJSON, rawJSON)
 	}
 
 	return nil
@@ -106,6 +117,13 @@ type jsonVM struct {
 			Name  string
 			NatIP string
 		}
+	}
+	Scheduling struct {
+		AutomaticRestart          bool
+		Preemptible               bool
+		OnHostMaintenance         string
+		InstanceTerminationAction string
+		ProvisioningModel         string
 	}
 	MachineType string
 	SelfLink    string
@@ -130,16 +148,6 @@ func (jsonVM *jsonVM) toVM(
 		vmErrors = append(vmErrors, vm.ErrNoExpiration)
 	}
 
-	// lastComponent splits a url path and returns only the last part. This is
-	// used because some of the fields in jsonVM are defined using URLs like:
-	//  "https://www.googleapis.com/compute/v1/projects/cockroach-shared/zones/us-east1-b/machineTypes/n1-standard-16"
-	// We want to strip this down to "n1-standard-16", so we only want the last
-	// component.
-	lastComponent := func(url string) string {
-		s := strings.Split(url, "/")
-		return s[len(s)-1]
-	}
-
 	// Extract network information
 	var publicIP, privateIP, vpc string
 	if len(jsonVM.NetworkInterfaces) == 0 {
@@ -154,6 +162,10 @@ func (jsonVM *jsonVM) toVM(
 			vpc = lastComponent(jsonVM.NetworkInterfaces[0].Network)
 		}
 	}
+	if jsonVM.Scheduling.OnHostMaintenance == "" {
+		// N.B. 'onHostMaintenance' is always non-empty, hence its absense implies a parsing error
+		vmErrors = append(vmErrors, vm.ErrBadScheduling)
+	}
 
 	machineType := lastComponent(jsonVM.MachineType)
 	zone := lastComponent(jsonVM.Zone)
@@ -167,22 +179,41 @@ func (jsonVM *jsonVM) toVM(
 	}
 
 	var volumes []vm.Volume
+	var localDisks []vm.Volume
+
+	parseDiskSize := func(size string) int {
+		if val, err := strconv.Atoi(size); err == nil {
+			return val
+		} else {
+			vmErrors = append(vmErrors, errors.Newf("invalid disk size: %q", size))
+		}
+		return 0
+	}
 
 	for _, jsonVMDisk := range jsonVM.Disks {
-		if jsonVMDisk.Source != "" && !jsonVMDisk.Boot {
+		if jsonVMDisk.Source == "" && jsonVMDisk.Type == "SCRATCH" {
+			// This is a scratch disk.
+			localDisks = append(localDisks, vm.Volume{
+				Size:               parseDiskSize(jsonVMDisk.DiskSizeGB),
+				ProviderVolumeType: "local-ssd",
+			})
+			continue
+		}
+		if !jsonVMDisk.Boot {
+			// Find a persistent volume (detailedDisk) matching the attached non-boot disk.
 			for _, detailedDisk := range disks {
 				if detailedDisk.SelfLink == jsonVMDisk.Source {
 					vol := vm.Volume{
-						ProviderResourceID: detailedDisk.Name,
-						ProviderVolumeType: jsonVMDisk.Type,
-						Zone:               jsonVM.Zone,
+						// NB: See TODO in toDescribeVolumeCommandResponse. We
+						// should be able to "just" use detailedDisk.Name here,
+						// but we're abusing that field elsewhere, and
+						// incorrectly. Using SelfLink is correct.
+						ProviderResourceID: lastComponent(detailedDisk.SelfLink),
+						ProviderVolumeType: detailedDisk.Type,
+						Zone:               lastComponent(detailedDisk.Zone),
 						Name:               detailedDisk.Name,
 						Labels:             detailedDisk.Labels,
-					}
-					if val, err := strconv.Atoi(jsonVMDisk.DiskSizeGB); err == nil {
-						vol.Size = val
-					} else {
-						vmErrors = append(vmErrors, errors.Newf("invalid disk size: %q", jsonVMDisk.DiskSizeGB))
+						Size:               parseDiskSize(detailedDisk.SizeGB),
 					}
 					volumes = append(volumes, vol)
 				}
@@ -196,19 +227,21 @@ func (jsonVM *jsonVM) toVM(
 		Errors:                 vmErrors,
 		DNS:                    fmt.Sprintf("%s.%s.%s", jsonVM.Name, zone, project),
 		Lifetime:               lifetime,
+		Preemptible:            jsonVM.Scheduling.Preemptible,
 		Labels:                 jsonVM.Labels,
 		PrivateIP:              privateIP,
 		Provider:               ProviderName,
+		DNSProvider:            ProviderName,
 		ProviderID:             jsonVM.Name,
 		PublicIP:               publicIP,
+		PublicDNS:              fmt.Sprintf("%s.%s", jsonVM.Name, Subdomain),
 		RemoteUser:             remoteUser,
 		VPC:                    vpc,
 		MachineType:            machineType,
 		Zone:                   zone,
 		Project:                project,
-		SQLPort:                config.DefaultSQLPort,
-		AdminUIPort:            config.DefaultAdminUIPort,
 		NonBootAttachedVolumes: volumes,
+		LocalDisks:             localDisks,
 	}
 }
 
@@ -222,16 +255,17 @@ func DefaultProviderOpts() *ProviderOpts {
 	return &ProviderOpts{
 		// projects needs space for one project, which is set by the flags for
 		// commands that accept a single project.
-		MachineType:          "n1-standard-4",
+		MachineType:          "n2-standard-4",
 		MinCPUPlatform:       "",
 		Zones:                nil,
-		Image:                "ubuntu-2004-focal-v20210603",
+		Image:                DefaultImage,
 		SSDCount:             1,
 		PDVolumeType:         "pd-ssd",
 		PDVolumeSize:         500,
 		TerminateOnMigration: false,
 		useSharedUser:        true,
 		preemptible:          false,
+		useSpot:              false,
 	}
 }
 
@@ -262,21 +296,24 @@ type ProviderOpts struct {
 	useSharedUser bool
 	// use preemptible instances
 	preemptible bool
+	// use spot instances (i.e., latest version of preemptibles which can run > 24 hours)
+	useSpot bool
 }
 
 // Provider is the GCE implementation of the vm.Provider interface.
 type Provider struct {
+	vm.DNSProvider
 	Projects       []string
 	ServiceAccount string
 }
 
-type snapshotCreateJson struct {
+type snapshotJson struct {
 	CreationSizeBytes  string    `json:"creationSizeBytes"`
 	CreationTimestamp  time.Time `json:"creationTimestamp"`
 	Description        string    `json:"description"`
 	DiskSizeGb         string    `json:"diskSizeGb"`
 	DownloadBytes      string    `json:"downloadBytes"`
-	Id                 string    `json:"id"`
+	ID                 string    `json:"id"`
 	Kind               string    `json:"kind"`
 	LabelFingerprint   string    `json:"labelFingerprint"`
 	Name               string    `json:"name"`
@@ -289,44 +326,110 @@ type snapshotCreateJson struct {
 	StorageLocations   []string  `json:"storageLocations"`
 }
 
-func (p *Provider) SnapshotVolume(
-	volume vm.Volume, name, description string, labels map[string]string,
-) (string, error) {
+func (p *Provider) CreateVolumeSnapshot(
+	l *logger.Logger, volume vm.Volume, vsco vm.VolumeSnapshotCreateOpts,
+) (vm.VolumeSnapshot, error) {
 	args := []string{
 		"compute",
+		"--project", p.GetProject(),
 		"snapshots",
-		"create", name,
+		"create", vsco.Name,
 		"--source-disk", volume.ProviderResourceID,
 		"--source-disk-zone", volume.Zone,
-		"--description", description,
+		"--description", vsco.Description,
 		"--format", "json",
 	}
 
-	var createJsonResponse snapshotCreateJson
-	err := runJSONCommand(args, &createJsonResponse)
-	if err != nil {
-		return "", err
+	var createJsonResponse snapshotJson
+	if err := runJSONCommand(args, &createJsonResponse); err != nil {
+		return vm.VolumeSnapshot{}, err
 	}
 
 	sb := strings.Builder{}
-	for k, v := range labels {
+	for k, v := range vsco.Labels {
 		fmt.Fprintf(&sb, "%s=%s,", serializeLabel(k), serializeLabel(v))
 	}
 	s := sb.String()
 
 	args = []string{
 		"compute",
+		"--project", p.GetProject(),
 		"snapshots",
-		"add-labels", name,
+		"add-labels", vsco.Name,
 		"--labels", s[:len(s)-1],
+	}
+	cmd := exec.Command("gcloud", args...)
+	if _, err := cmd.CombinedOutput(); err != nil {
+		return vm.VolumeSnapshot{}, err
+	}
+	return vm.VolumeSnapshot{
+		ID:   createJsonResponse.ID,
+		Name: createJsonResponse.Name,
+	}, nil
+}
+
+func (p *Provider) ListVolumeSnapshots(
+	l *logger.Logger, vslo vm.VolumeSnapshotListOpts,
+) ([]vm.VolumeSnapshot, error) {
+	args := []string{
+		"compute",
+		"--project", p.GetProject(),
+		"snapshots",
+		"list",
+		"--format", "json(name,id)",
+	}
+	var filters []string
+	if vslo.NamePrefix != "" {
+		filters = append(filters, fmt.Sprintf("name:%s", vslo.NamePrefix))
+	}
+	if !vslo.CreatedBefore.IsZero() {
+		filters = append(filters, fmt.Sprintf("creationTimestamp<'%s'", vslo.CreatedBefore.Format("2006-01-02")))
+	}
+	for k, v := range vslo.Labels {
+		filters = append(filters, fmt.Sprintf("labels.%s=%s", k, v))
+	}
+	if len(filters) > 0 {
+		args = append(args, "--filter", strings.Join(filters, " AND "))
+	}
+
+	var snapshotsJSONResponse []snapshotJson
+	if err := runJSONCommand(args, &snapshotsJSONResponse); err != nil {
+		return nil, err
+	}
+
+	var snapshots []vm.VolumeSnapshot
+	for _, snapshotJson := range snapshotsJSONResponse {
+		if !strings.HasPrefix(snapshotJson.Name, vslo.NamePrefix) {
+			continue
+		}
+		snapshots = append(snapshots, vm.VolumeSnapshot{
+			ID:   snapshotJson.ID,
+			Name: snapshotJson.Name,
+		})
+	}
+	sort.Sort(vm.VolumeSnapshots(snapshots))
+	return snapshots, nil
+}
+
+func (p *Provider) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
+	if len(snapshots) == 0 {
+		return nil
+	}
+	args := []string{
+		"compute",
+		"--project", p.GetProject(),
+		"snapshots",
+		"delete",
+	}
+	for _, snapshot := range snapshots {
+		args = append(args, snapshot.Name)
 	}
 
 	cmd := exec.Command("gcloud", args...)
-	_, err = cmd.CombinedOutput()
-	if err != nil {
-		return "", err
+	if _, err := cmd.CombinedOutput(); err != nil {
+		return err
 	}
-	return createJsonResponse.Name, nil
+	return nil
 }
 
 type describeVolumeCommandResponse struct {
@@ -345,19 +448,25 @@ type describeVolumeCommandResponse struct {
 	Users                  []string          `json:"users"`
 }
 
-func (p *Provider) CreateVolume(vco vm.VolumeCreateOpts) (vol vm.Volume, err error) {
-	// TODO(leon): SourceSnapshotID and IOPS, are not handled
-	if vco.SourceSnapshotID != "" || vco.IOPS != 0 {
-		err = errors.New("Creating a volume with SourceSnapshotID or IOPS is not supported at this time.")
+func (p *Provider) CreateVolume(
+	l *logger.Logger, vco vm.VolumeCreateOpts,
+) (vol vm.Volume, err error) {
+	// TODO(leon): IOPS is not handled.
+	if vco.IOPS != 0 {
+		err = errors.New("Creating a volume with IOPS is not supported at this time.")
 		return vol, err
 	}
 	args := []string{
 		"compute",
+		"--project", p.GetProject(),
 		"disks",
 		"create", vco.Name,
 		"--size", strconv.Itoa(vco.Size),
 		"--zone", vco.Zone,
 		"--format", "json",
+	}
+	if vco.SourceSnapshotID != "" {
+		args = append(args, "--source-snapshot", vco.SourceSnapshotID)
 	}
 
 	if vco.Size == 0 {
@@ -370,7 +479,7 @@ func (p *Provider) CreateVolume(vco vm.VolumeCreateOpts) (vol vm.Volume, err err
 
 	if vco.Architecture != "" {
 		if vco.Architecture == "ARM64" || vco.Architecture == "X86_64" {
-			args = append(args, "--architecture=", vco.Architecture)
+			args = append(args, "--architecture", vco.Architecture)
 		} else {
 			return vol, errors.Newf("Expected architecture to be one of ARM64, X86_64 got %s\n", vco.Architecture)
 		}
@@ -378,7 +487,7 @@ func (p *Provider) CreateVolume(vco vm.VolumeCreateOpts) (vol vm.Volume, err err
 
 	switch vco.Type {
 	case "local-ssd", "pd-balanced", "pd-extreme", "pd-ssd", "pd-standard":
-		args = append(args, "--type=", vco.Type)
+		args = append(args, "--type", vco.Type)
 	case "":
 	// use the default
 	default:
@@ -400,36 +509,148 @@ func (p *Provider) CreateVolume(vco vm.VolumeCreateOpts) (vol vm.Volume, err err
 	if err != nil {
 		return vol, err
 	}
-	sb := strings.Builder{}
-	for k, v := range vco.Labels {
-		fmt.Fprintf(&sb, "%s=%s,", serializeLabel(k), serializeLabel(v))
-	}
-	s := sb.String()
-
-	args = []string{
-		"compute",
-		"disks",
-		"add-labels", vco.Name,
-		"--labels", s[:len(s)-1],
-		"--zone", vco.Zone,
-	}
-	cmd := exec.Command("gcloud", args...)
-	_, err = cmd.CombinedOutput()
-	if err != nil {
-		return vol, err
+	if len(vco.Labels) > 0 {
+		sb := strings.Builder{}
+		for k, v := range vco.Labels {
+			fmt.Fprintf(&sb, "%s=%s,", serializeLabel(k), serializeLabel(v))
+		}
+		s := sb.String()
+		args = []string{
+			"compute",
+			"--project", p.GetProject(),
+			"disks",
+			"add-labels", vco.Name,
+			"--labels", s[:len(s)-1],
+			"--zone", vco.Zone,
+		}
+		cmd := exec.Command("gcloud", args...)
+		if _, err := cmd.CombinedOutput(); err != nil {
+			return vm.Volume{}, err
+		}
 	}
 
 	return vm.Volume{
 		ProviderResourceID: createdVolume.Name,
+		ProviderVolumeType: lastComponent(createdVolume.Type),
+		Zone:               lastComponent(createdVolume.Zone),
+		Encrypted:          false, // only used for aws
 		Name:               createdVolume.Name,
-		ProviderVolumeType: createdVolume.Type,
-		Zone:               vco.Zone,
+		Labels:             createdVolume.Labels,
 		Size:               size,
-		Labels:             vco.Labels,
-	}, err
+	}, nil
+}
+
+func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) error {
+	{ // Detach disks.
+		args := []string{
+			"compute",
+			"--project", p.GetProject(),
+			"instances",
+			"detach-disk", vm.Name,
+			"--disk", volume.ProviderResourceID,
+			"--zone", volume.Zone,
+		}
+		cmd := exec.Command("gcloud", args...)
+		if _, err := cmd.CombinedOutput(); err != nil {
+			return err
+		}
+	}
+	{ // Delete disks.
+		args := []string{
+			"compute",
+			"--project", p.GetProject(),
+			"disks",
+			"delete",
+			volume.ProviderResourceID,
+			"--zone", volume.Zone,
+			"--quiet",
+		}
+		cmd := exec.Command("gcloud", args...)
+		if _, err := cmd.CombinedOutput(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *Provider) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) {
+	var attachedDisks []attachDiskCmdDisk
+	var describedVolumes []describeVolumeCommandResponse
+
+	{
+		// We're running the equivalent of:
+		//  	gcloud compute instances describe irfansharif-snapshot-0001 \
+		//  		--project cockroach-ephemeral --zone us-east1-b \
+		// 			--format json(disks)
+		//
+		// We'll use this data to filter out boot disks.
+		var commandResponse instanceDisksResponse
+		args := []string{
+			"compute",
+			"instances",
+			"describe",
+			v.Name,
+			"--project", p.GetProject(),
+			"--zone", v.Zone,
+			"--format", "json(disks)",
+		}
+		if err := runJSONCommand(args, &commandResponse); err != nil {
+			return nil, err
+		}
+		attachedDisks = commandResponse.Disks
+	}
+
+	{
+		// We're running the equivalent of
+		// 		gcloud compute disks list --project cockroach-ephemeral \
+		//			--filter "users:(irfansharif-snapshot-0001)" --format json
+		//
+		// This contains more per-disk metadata than the command above, but
+		// annoyingly does not contain whether the disk is a boot volume.
+		args := []string{
+			"compute",
+			"disks",
+			"list",
+			"--project", p.GetProject(),
+			"--filter", fmt.Sprintf("users:(%s)", v.Name),
+			"--format", "json",
+		}
+		if err := runJSONCommand(args, &describedVolumes); err != nil {
+			return nil, err
+		}
+	}
+
+	var volumes []vm.Volume
+	for idx := range attachedDisks {
+		attachedDisk := attachedDisks[idx]
+		if attachedDisk.Boot {
+			continue
+		}
+		describedVolume := describedVolumes[idx]
+		size, err := strconv.Atoi(describedVolume.SizeGB)
+		if err != nil {
+			return nil, err
+		}
+		volumes = append(volumes, vm.Volume{
+			ProviderResourceID: describedVolume.Name,
+			ProviderVolumeType: lastComponent(describedVolume.Type),
+			Zone:               lastComponent(describedVolume.Zone),
+			Encrypted:          false, // only used for aws
+			Name:               describedVolume.Name,
+			Labels:             describedVolume.Labels,
+			Size:               size,
+		})
+	}
+
+	// TODO(irfansharif): Update v.NonBootAttachedVolumes? It's awkward to have
+	// that field at all.
+	return volumes, nil
 }
 
 type instanceDisksResponse struct {
+	// Disks that are attached to the instance.
+	// N.B. Unattached disks can be enumerated via,
+	//	gcloud compute --project $project disks list --filter="-users:*"
 	Disks []attachDiskCmdDisk `json:"disks"`
 }
 type attachDiskCmdDisk struct {
@@ -445,10 +666,11 @@ type attachDiskCmdDisk struct {
 	Type       string `json:"type"`
 }
 
-func (p *Provider) AttachVolumeToVM(volume vm.Volume, vm *vm.VM) (string, error) {
-	// Volume attach
+func (p *Provider) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (string, error) {
+	// Volume attach.
 	args := []string{
 		"compute",
+		"--project", p.GetProject(),
 		"instances",
 		"attach-disk",
 		vm.ProviderID,
@@ -475,9 +697,10 @@ func (p *Provider) AttachVolumeToVM(volume vm.Volume, vm *vm.VM) (string, error)
 			volume.ProviderResourceID, vm.ProviderID)
 	}
 
-	// Volume auto delete
+	// Volume auto delete.
 	args = []string{
 		"compute",
+		"--project", p.GetProject(),
 		"instances",
 		"set-disk-auto-delete", vm.ProviderID,
 		"--auto-delete",
@@ -570,7 +793,7 @@ func (p *Provider) GetProjects() []string {
 
 // ConfigureCreateFlags implements vm.ProviderOptions.
 func (o *ProviderOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
-	flags.StringVar(&o.MachineType, "machine-type", "n1-standard-4", "DEPRECATED")
+	flags.StringVar(&o.MachineType, "machine-type", "n2-standard-4", "DEPRECATED")
 	_ = flags.MarkDeprecated("machine-type", "use "+ProviderName+"-machine-type instead")
 	flags.StringSliceVar(&o.Zones, "zones", nil, "DEPRECATED")
 	_ = flags.MarkDeprecated("zones", "use "+ProviderName+"-zones instead")
@@ -578,13 +801,14 @@ func (o *ProviderOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&providerInstance.ServiceAccount, ProviderName+"-service-account",
 		providerInstance.ServiceAccount, "Service account to use")
 
-	flags.StringVar(&o.MachineType, ProviderName+"-machine-type", "n1-standard-4",
+	flags.StringVar(&o.MachineType, ProviderName+"-machine-type", "n2-standard-4",
 		"Machine type (see https://cloud.google.com/compute/docs/machine-types)")
 	flags.StringVar(&o.MinCPUPlatform, ProviderName+"-min-cpu-platform", "",
 		"Minimum CPU platform (see https://cloud.google.com/compute/docs/instances/specify-min-cpu-platform)")
-	flags.StringVar(&o.Image, ProviderName+"-image", "ubuntu-2004-focal-v20210603",
+	flags.StringVar(&o.Image, ProviderName+"-image", DefaultImage,
 		"Image to use to create the vm, "+
-			"use `gcloud compute images list --filter=\"family=ubuntu-2004-lts\"` to list available images")
+			"use `gcloud compute images list --filter=\"family=ubuntu-2004-lts\"` to list available images. "+
+			"Note: this option is ignored if --fips is passed.")
 
 	flags.IntVar(&o.SSDCount, ProviderName+"-local-ssd-count", 1,
 		"Number of local SSDs to create, only used if local-ssd=true")
@@ -601,7 +825,10 @@ func (o *ProviderOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 			"will be repeated N times. If > 1 zone specified, nodes will be geo-distributed\n"+
 			"regardless of geo (default [%s])",
 			strings.Join(defaultZones, ",")))
-	flags.BoolVar(&o.preemptible, ProviderName+"-preemptible", false, "use preemptible GCE instances")
+	flags.BoolVar(&o.preemptible, ProviderName+"-preemptible", false,
+		"use preemptible GCE instances (lifetime cannot exceed 24h)")
+	flags.BoolVar(&o.useSpot, ProviderName+"-use-spot", false,
+		"use spot GCE instances (like preemptible but lifetime can exceed 24h)")
 	flags.BoolVar(&o.TerminateOnMigration, ProviderName+"-terminateOnMigration", false,
 		"use 'TERMINATE' maintenance policy (for GCE live migrations)")
 }
@@ -629,7 +856,7 @@ func (o *ProviderOpts) ConfigureClusterFlags(flags *pflag.FlagSet, opt vm.Multip
 }
 
 // CleanSSH TODO(peter): document
-func (p *Provider) CleanSSH() error {
+func (p *Provider) CleanSSH(l *logger.Logger) error {
 	for _, prj := range p.GetProjects() {
 		args := []string{"compute", "config-ssh", "--project", prj, "--quiet", "--remove"}
 		cmd := exec.Command("gcloud", args...)
@@ -643,7 +870,7 @@ func (p *Provider) CleanSSH() error {
 }
 
 // ConfigSSH is part of the vm.Provider interface
-func (p *Provider) ConfigSSH(zones []string) error {
+func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
 	// Populate SSH config files with Host entries from each instance in active projects.
 	for _, prj := range p.GetProjects() {
 		args := []string{"compute", "config-ssh", "--project", prj, "--quiet"}
@@ -655,6 +882,54 @@ func (p *Provider) ConfigSSH(zones []string) error {
 		}
 	}
 	return nil
+}
+
+func (p *Provider) editLabels(
+	l *logger.Logger, vms vm.List, labels map[string]string, remove bool,
+) error {
+	cmdArgs := []string{"compute", "instances"}
+	if remove {
+		cmdArgs = append(cmdArgs, "remove-labels")
+	} else {
+		cmdArgs = append(cmdArgs, "add-labels")
+	}
+
+	tagArgs := make([]string, 0, len(labels))
+	for key, value := range labels {
+		if remove {
+			tagArgs = append(tagArgs, key)
+		} else {
+			tagArgs = append(tagArgs, fmt.Sprintf("%s=%s", key, vm.SanitizeLabel(value)))
+		}
+	}
+	tagArgsString := strings.Join(tagArgs, ",")
+	commonArgs := []string{"--project", p.GetProject(), fmt.Sprintf("--labels=%s", tagArgsString)}
+
+	for _, v := range vms {
+		vmArgs := make([]string, len(cmdArgs))
+		copy(vmArgs, cmdArgs)
+
+		vmArgs = append(vmArgs, v.Name, "--zone", v.Zone)
+		vmArgs = append(vmArgs, commonArgs...)
+		cmd := exec.Command("gcloud", vmArgs...)
+		if b, err := cmd.CombinedOutput(); err != nil {
+			return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", vmArgs, string(b))
+		}
+	}
+	return nil
+}
+
+// AddLabels adds the given labels to the given VMs.
+func (p *Provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	return p.editLabels(l, vms, labels, false /* remove */)
+}
+
+func (p *Provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
+	labelsMap := make(map[string]string, len(labels))
+	for _, label := range labels {
+		labelsMap[label] = ""
+	}
+	return p.editLabels(l, vms, labelsMap, true /* remove */)
 }
 
 // Create TODO(peter): document
@@ -688,12 +963,43 @@ func (p *Provider) Create(
 	}
 
 	// Fixed args.
+	image := providerOpts.Image
+	imageProject := defaultImageProject
+	useArmAMI := strings.HasPrefix(strings.ToLower(providerOpts.MachineType), "t2a-")
+	if useArmAMI && (opts.Arch != "" && opts.Arch != string(vm.ArchARM64)) {
+		return errors.Errorf("machine type %s is arm64, but requested arch is %s", providerOpts.MachineType, opts.Arch)
+	}
+	if useArmAMI && opts.SSDOpts.UseLocalSSD {
+		return errors.New("local SSDs are not supported with T2A instances, use --local-ssd=false")
+	}
+	if useArmAMI {
+		if len(providerOpts.Zones) == 0 {
+			zones = []string{"us-central1-a"}
+		} else {
+			for _, zone := range providerOpts.Zones {
+				if !strings.HasPrefix(zone, "us-central1-") {
+					return errors.New("T2A instances are not supported outside of us-central1")
+				}
+			}
+		}
+	}
+	//TODO(srosenberg): remove this once we have a better way to detect ARM64 machines
+	if useArmAMI {
+		image = ARM64Image
+		l.Printf("Using ARM64 AMI: %s for machine type: %s", image, providerOpts.MachineType)
+	}
+	if opts.Arch == string(vm.ArchFIPS) {
+		// NB: if FIPS is enabled, it overrides the image passed via CLI (--gce-image)
+		image = FIPSImage
+		imageProject = FIPSImageProject
+		l.Printf("Using FIPS-enabled AMI: %s for machine type: %s", image, providerOpts.MachineType)
+	}
 	args := []string{
 		"compute", "instances", "create",
 		"--subnet", "default",
 		"--scopes", "cloud-platform",
-		"--image", providerOpts.Image,
-		"--image-project", "ubuntu-os-cloud",
+		"--image", image,
+		"--image-project", imageProject,
 		"--boot-disk-type", "pd-ssd",
 	}
 
@@ -717,6 +1023,8 @@ func (p *Provider) Create(
 		// Preemptible instances require the following arguments set explicitly
 		args = append(args, "--maintenance-policy", "TERMINATE")
 		args = append(args, "--no-restart-on-failure")
+	} else if providerOpts.useSpot {
+		args = append(args, "--provisioning-model", "SPOT")
 	} else {
 		if providerOpts.TerminateOnMigration {
 			args = append(args, "--maintenance-policy", "TERMINATE")
@@ -728,15 +1036,15 @@ func (p *Provider) Create(
 	extraMountOpts := ""
 	// Dynamic args.
 	if opts.SSDOpts.UseLocalSSD {
-		// n2-class and c2-class GCP machines cannot be requested with only 1
-		// SSD; minimum number of actual SSDs is 2.
-		// TODO(pbardea): This is more general for machine types that
-		// come in different sizes.
-		// See: https://cloud.google.com/compute/docs/disks/
-		n2MachineTypes := regexp.MustCompile("^[cn]2-.+-16")
-		if n2MachineTypes.MatchString(providerOpts.MachineType) && providerOpts.SSDCount == 1 {
-			fmt.Fprint(os.Stderr, "WARNING: SSD count must be at least 2 for n2 and c2 machine types with 16vCPU. Setting --gce-local-ssd-count to 2.\n")
-			providerOpts.SSDCount = 2
+		if counts, err := AllowedLocalSSDCount(providerOpts.MachineType); err != nil {
+			return err
+		} else {
+			// Make sure the minimum number of local SSDs is met.
+			minCount := counts[0]
+			if providerOpts.SSDCount < minCount {
+				l.Printf("WARNING: SSD count must be at least %d for %q. Setting --gce-local-ssd-count to %d", minCount, providerOpts.MachineType, minCount)
+				providerOpts.SSDCount = minCount
+			}
 		}
 		for i := 0; i < providerOpts.SSDCount; i++ {
 			args = append(args, "--local-ssd", "interface=NVME")
@@ -750,6 +1058,9 @@ func (p *Provider) Create(
 			fmt.Sprintf("size=%dGB", providerOpts.PDVolumeSize),
 			"auto-delete=yes",
 		}
+		// TODO(pavelkalinnikov): support disk types with "provisioned-throughput"
+		// option, such as Hyperdisk Throughput:
+		// https://cloud.google.com/compute/docs/disks/add-hyperdisk#hyperdisk-throughput.
 		args = append(args, "--create-disk", strings.Join(pdProps, ","))
 		// Enable DISCARD commands for persistent disks, as is advised in:
 		// https://cloud.google.com/compute/docs/disks/optimizing-pd-performance#formatting_parameters.
@@ -757,7 +1068,7 @@ func (p *Provider) Create(
 	}
 
 	// Create GCE startup script file.
-	filename, err := writeStartupScript(extraMountOpts, opts.SSDOpts.FileSystem, providerOpts.UseMultipleDisks)
+	filename, err := writeStartupScript(extraMountOpts, opts.SSDOpts.FileSystem, providerOpts.UseMultipleDisks, opts.Arch == string(vm.ArchFIPS))
 	if err != nil {
 		return errors.Wrapf(err, "could not write GCE startup script to temp file")
 	}
@@ -776,33 +1087,40 @@ func (p *Provider) Create(
 	time = strings.ToLower(strings.ReplaceAll(time, ":", "_"))
 	m[vm.TagCreated] = time
 
-	var sb strings.Builder
+	var labelPairs []string
+	addLabel := func(key, value string) {
+		labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", key, value))
+	}
+
 	for key, value := range opts.CustomLabels {
-		_, ok := m[key]
+		_, ok := m[strings.ToLower(key)]
 		if ok {
 			return fmt.Errorf("duplicate label name defined: %s", key)
 		}
-		fmt.Fprintf(&sb, "%s=%s,", key, value)
+		addLabel(key, value)
 	}
 	for key, value := range m {
-		fmt.Fprintf(&sb, "%s=%s,", key, value)
+		addLabel(key, value)
 	}
-	s := sb.String()
-	args = append(args, "--labels", s[:len(s)-1])
+	labels := strings.Join(labelPairs, ",")
 
+	args = append(args, "--labels", labels)
 	args = append(args, "--metadata-from-file", fmt.Sprintf("startup-script=%s", filename))
 	args = append(args, "--project", project)
 	args = append(args, fmt.Sprintf("--boot-disk-size=%dGB", opts.OsVolumeSize))
 	var g errgroup.Group
 
 	nodeZones := vm.ZonePlacement(len(zones), len(names))
-	zoneHostNames := make([][]string, min(len(zones), len(names)))
+	// N.B. when len(zones) > len(names), we don't need to map unused zones
+	zoneToHostNames := make(map[string][]string, min(len(zones), len(names)))
 	for i, name := range names {
-		zoneIdx := nodeZones[i]
-		zoneHostNames[zoneIdx] = append(zoneHostNames[zoneIdx], name)
+		zone := zones[nodeZones[i]]
+		zoneToHostNames[zone] = append(zoneToHostNames[zone], name)
 	}
-	for zoneIdx, zoneHosts := range zoneHostNames {
-		argsWithZone := append(args[:len(args):len(args)], "--zone", zones[zoneIdx])
+	l.Printf("Creating %d instances, distributed across [%s]", len(names), strings.Join(zones, ", "))
+
+	for zone, zoneHosts := range zoneToHostNames {
+		argsWithZone := append(args[:len(args):len(args)], "--zone", zone)
 		argsWithZone = append(argsWithZone, zoneHosts...)
 		g.Go(func() error {
 			cmd := exec.Command("gcloud", argsWithZone...)
@@ -815,6 +1133,118 @@ func (p *Provider) Create(
 		})
 
 	}
+	err = g.Wait()
+	if err != nil {
+		return err
+	}
+
+	return propagateDiskLabels(l, project, labels, zoneToHostNames, &opts)
+}
+
+// Given a machine type, return the allowed number (> 0) of local SSDs, sorted in ascending order.
+// N.B. Only n1, n2 and c2 instances are supported since we don't typically use other instance types.
+// Consult https://cloud.google.com/compute/docs/disks/#local_ssd_machine_type_restrictions for other types of instances.
+func AllowedLocalSSDCount(machineType string) ([]int, error) {
+	machineTypes := regexp.MustCompile(`^([cn])(\d+)-.+-(\d+)$`)
+	matches := machineTypes.FindStringSubmatch(machineType)
+
+	if len(matches) >= 3 {
+		family := matches[1] + matches[2]
+		numCpus, err := strconv.Atoi(matches[3])
+		if err != nil {
+			return nil, err
+		}
+		if family == "n1" {
+			return []int{1, 2, 3, 4, 5, 6, 7, 8, 16, 24}, nil
+		}
+		switch family {
+		case "n2":
+			if numCpus <= 10 {
+				return []int{1, 2, 4, 8, 16, 24}, nil
+			}
+			if numCpus <= 20 {
+				return []int{2, 4, 8, 16, 24}, nil
+			}
+			if numCpus <= 40 {
+				return []int{4, 8, 16, 24}, nil
+			}
+			if numCpus <= 80 {
+				return []int{8, 16, 24}, nil
+			}
+			if numCpus <= 128 {
+				return []int{16, 24}, nil
+			}
+		case "c2":
+			if numCpus <= 8 {
+				return []int{1, 2, 4, 8}, nil
+			}
+			if numCpus <= 16 {
+				return []int{2, 4, 8}, nil
+			}
+			if numCpus <= 30 {
+				return []int{4, 8}, nil
+			}
+			if numCpus <= 60 {
+				return []int{8}, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("unsupported machine type: %q", machineType)
+}
+
+// N.B. neither boot disk nor additional persistent disks are assigned VM labels by default.
+// Hence, we must propagate them. See: https://cloud.google.com/compute/docs/labeling-resources#labeling_boot_disks
+func propagateDiskLabels(
+	l *logger.Logger,
+	project string,
+	labels string,
+	zoneToHostNames map[string][]string,
+	opts *vm.CreateOpts,
+) error {
+	var g errgroup.Group
+
+	l.Printf("Propagating labels across all disks")
+	argsPrefix := []string{"compute", "disks", "update"}
+	argsPrefix = append(argsPrefix, "--update-labels", labels)
+	argsPrefix = append(argsPrefix, "--project", project)
+
+	for zone, zoneHosts := range zoneToHostNames {
+		zoneArg := []string{"--zone", zone}
+
+		for _, host := range zoneHosts {
+			hostName := host
+
+			g.Go(func() error {
+				bootDiskArgs := append([]string(nil), argsPrefix...)
+				bootDiskArgs = append(bootDiskArgs, zoneArg...)
+				// N.B. boot disk has the same name as the host.
+				bootDiskArgs = append(bootDiskArgs, hostName)
+				cmd := exec.Command("gcloud", bootDiskArgs...)
+
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", bootDiskArgs, output)
+				}
+				return nil
+			})
+
+			if !opts.SSDOpts.UseLocalSSD {
+				g.Go(func() error {
+					persistentDiskArgs := append([]string(nil), argsPrefix...)
+					persistentDiskArgs = append(persistentDiskArgs, zoneArg...)
+					// N.B. additional persistent disks are suffixed with the offset, starting at 1.
+					persistentDiskArgs = append(persistentDiskArgs, fmt.Sprintf("%s-1", hostName))
+					cmd := exec.Command("gcloud", persistentDiskArgs...)
+
+					output, err := cmd.CombinedOutput()
+					if err != nil {
+						return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", persistentDiskArgs, output)
+					}
+					return nil
+				})
+			}
+		}
+	}
 	return g.Wait()
 }
 
@@ -826,7 +1256,7 @@ func min(a, b int) int {
 }
 
 // Delete TODO(peter): document
-func (p *Provider) Delete(vms vm.List) error {
+func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 	// Map from project to map of zone to list of machines in that project/zone.
 	projectZoneMap := make(map[string]map[string][]string)
 	for _, v := range vms {
@@ -870,7 +1300,7 @@ func (p *Provider) Delete(vms vm.List) error {
 }
 
 // Reset implements the vm.Provider interface.
-func (p *Provider) Reset(vms vm.List) error {
+func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 	// Map from project to map of zone to list of machines in that project/zone.
 	projectZoneMap := make(map[string]map[string][]string)
 	for _, v := range vms {
@@ -913,29 +1343,14 @@ func (p *Provider) Reset(vms vm.List) error {
 }
 
 // Extend TODO(peter): document
-func (p *Provider) Extend(vms vm.List, lifetime time.Duration) error {
-	// The gcloud command only takes a single instance.  Unlike Delete() above, we have to
-	// perform the iteration here.
-	for _, v := range vms {
-		args := []string{"compute", "instances", "add-labels"}
-
-		args = append(args, "--project", v.Project)
-		args = append(args, "--zone", v.Zone)
-		args = append(args, "--labels", fmt.Sprintf("lifetime=%s", lifetime))
-		args = append(args, v.Name)
-
-		cmd := exec.Command("gcloud", args...)
-
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
-		}
-	}
-	return nil
+func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
+	return p.AddLabels(l, vms, map[string]string{
+		"lifetime": lifetime.String(),
+	})
 }
 
 // FindActiveAccount TODO(peter): document
-func (p *Provider) FindActiveAccount() (string, error) {
+func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 	args := []string{"auth", "list", "--format", "json", "--filter", "status~ACTIVE"}
 
 	accounts := make([]jsonAuth, 0)
@@ -959,6 +1374,10 @@ func (p *Provider) FindActiveAccount() (string, error) {
 
 // List queries gcloud to produce a list of VM info objects.
 func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) {
+	if opts.IncludeVolumes {
+		l.Printf("WARN: --include-volumes is disabled; attached disks info will be partial")
+	}
+
 	var vms vm.List
 	for _, prj := range p.GetProjects() {
 		args := []string{"compute", "instances", "list", "--project", prj, "--format", "json"}
@@ -1000,11 +1419,163 @@ func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) 
 		for _, jsonVM := range jsonVMS {
 			defaultOpts := p.CreateProviderOpts().(*ProviderOpts)
 			disks := userVMToDetailedDisk[jsonVM.SelfLink]
+
+			if len(disks) == 0 {
+				// Since `--include-volumes` is disabled, we convert attachDiskCmdDisk to describeVolumeCommandResponse.
+				// The former is a subset of the latter. Some information like `Labels` will be missing.
+				disks = toDescribeVolumeCommandResponse(jsonVM.Disks, jsonVM.Zone)
+			}
 			vms = append(vms, *jsonVM.toVM(prj, disks, defaultOpts))
 		}
 	}
 
+	if opts.ComputeEstimatedCost {
+		if err := populateCostPerHour(l, vms); err != nil {
+			// N.B. We continue despite the error since it doesn't prevent 'List' and other commands which may depend on it.
+
+			l.Errorf("Error during cost estimation (will continue without): %v", err)
+			if strings.Contains(err.Error(), "could not find default credentials") {
+				l.Printf("To fix this, run `gcloud auth application-default login`")
+			}
+		}
+	}
+
 	return vms, nil
+}
+
+// Convert attachDiskCmdDisk to describeVolumeCommandResponse and link via SelfLink, Source.
+func toDescribeVolumeCommandResponse(
+	disks []attachDiskCmdDisk, zone string,
+) []describeVolumeCommandResponse {
+	res := make([]describeVolumeCommandResponse, 0, len(disks))
+
+	diskType := func(s string) string {
+		if s == "PERSISTENT" {
+			// Unfortunately, we don't know if it's a pd-ssd or pd-standard. We assume pd_ssd since those are common.
+			return "pd-ssd"
+		}
+		return "unknown"
+	}
+
+	for _, d := range disks {
+		if d.Source == "" && d.Type == "SCRATCH" {
+			// Skip scratch disks.
+			continue
+		}
+		res = append(res, describeVolumeCommandResponse{
+			// TODO(irfansharif): Use of the device name here is wrong -- it's
+			// ends up being things like "persistent-disk-1" but in other, more
+			// correct uses, it's "irfansharif-snapshot-0001-1". In fact, this
+			// whole transformation from attachDiskCmdDisk to
+			// describeVolumeCommandResponse if funky. Use something like
+			// (Provider).ListVolumes instead.
+			Name:     d.DeviceName,
+			SelfLink: d.Source,
+			SizeGB:   d.DiskSizeGB,
+			Type:     diskType(d.Type),
+			Zone:     zone,
+		})
+	}
+	return res
+}
+
+// populateCostPerHour adds an approximate cost per hour to each VM in the list,
+// using a basic estimation method.
+//  1. Compute and attached disks are estimated at the list prices, ignoring
+//     all discounts, but including any automatically applied credits.
+//  2. Boot disk costs are completely ignored.
+//  3. Network egress costs are completely ignored.
+//  4. Blob storage costs are completely ignored.
+func populateCostPerHour(l *logger.Logger, vms vm.List) error {
+	// Construct cost estimation service
+	ctx := context.Background()
+	service, err := cloudbilling.NewService(ctx)
+	if err != nil {
+		return err
+	}
+	beta := cloudbilling.NewV1betaService(service)
+	scenario := cloudbilling.EstimateCostScenarioWithListPriceRequest{
+		CostScenario: &cloudbilling.CostScenario{
+			ScenarioConfig: &cloudbilling.ScenarioConfig{
+				EstimateDuration: "3600s",
+			},
+			Workloads: []*cloudbilling.Workload{},
+		},
+	}
+	// Workload estimation service can handle 100 workloads at a time, so page
+	// 100 VMs at a time.
+	for len(vms) > 0 {
+		scenario.CostScenario.Workloads = scenario.CostScenario.Workloads[:0]
+		var page vm.List
+		if len(vms) <= 100 {
+			page, vms = vms, nil
+		} else {
+			page, vms = vms[:100], vms[100:]
+		}
+		for _, vm := range page {
+			machineType := vm.MachineType
+			zone := vm.Zone
+
+			workload := cloudbilling.Workload{
+				Name: vm.Name,
+				ComputeVmWorkload: &cloudbilling.ComputeVmWorkload{
+					InstancesRunning: &cloudbilling.Usage{
+						UsageRateTimeline: &cloudbilling.UsageRateTimeline{
+							UsageRateTimelineEntries: []*cloudbilling.UsageRateTimelineEntry{
+								{
+									// We're estimating the cost of 1 vm at a time.
+									UsageRate: 1,
+								},
+							},
+						},
+					},
+					Preemptible: vm.Preemptible,
+					MachineType: &cloudbilling.MachineType{
+						PredefinedMachineType: &cloudbilling.PredefinedMachineType{
+							MachineType: machineType,
+						},
+					},
+					PersistentDisks: []*cloudbilling.PersistentDisk{},
+					Region:          zone[:len(zone)-2],
+				},
+			}
+			for _, v := range vm.NonBootAttachedVolumes {
+				workload.ComputeVmWorkload.PersistentDisks = append(workload.ComputeVmWorkload.PersistentDisks, &cloudbilling.PersistentDisk{
+					DiskSize: &cloudbilling.Usage{
+						UsageRateTimeline: &cloudbilling.UsageRateTimeline{
+							Unit: "GiBy",
+							UsageRateTimelineEntries: []*cloudbilling.UsageRateTimelineEntry{
+								{
+									UsageRate: float64(v.Size),
+								},
+							},
+						},
+					},
+					DiskType: v.ProviderVolumeType,
+					Scope:    "SCOPE_ZONAL",
+				})
+			}
+			scenario.CostScenario.Workloads = append(scenario.CostScenario.Workloads, &workload)
+		}
+		estimate, err := beta.EstimateCostScenario(&scenario).Do()
+		if err != nil {
+			l.Errorf("Error estimating VM costs (will continue without): %v", err)
+			continue
+		}
+		workloadEstimates := estimate.CostEstimationResult.SegmentCostEstimates[0].WorkloadCostEstimates
+		for i := range workloadEstimates {
+			workloadEstimate := workloadEstimates[i].WorkloadTotalCostEstimate.NetCostEstimate
+			page[i].CostPerHour = float64(workloadEstimate.Units) + float64(workloadEstimate.Nanos)/1e9
+			// Add the estimated cost of local disks since the billing API only supports persistent disks.
+			for _, v := range page[i].LocalDisks {
+				// "For example, in the Iowa, Oregon, Taiwan, and Belgium regions, local SSDs cost $0.080 per GB per month."
+				// Normalized to per hour billing, 0.08 / 730 = 0.0001095890410958904
+				// https://cloud.google.com/compute/disks-image-pricing#disk
+				page[i].CostPerHour += float64(v.Size) * 0.00011
+			}
+		}
+	}
+	return nil
 }
 
 func serializeLabel(s string) string {
@@ -1026,7 +1597,7 @@ func (p *Provider) Name() string {
 
 // Active is part of the vm.Provider interface.
 func (p *Provider) Active() bool {
-	return true
+	return initialized
 }
 
 // ProjectActive is part of the vm.Provider interface.
@@ -1037,4 +1608,16 @@ func (p *Provider) ProjectActive(project string) bool {
 		}
 	}
 	return false
+}
+
+// lastComponent splits a url path and returns only the last part. This is
+// used because some fields in GCE APIs are defined using URLs like:
+//
+//	"https://www.googleapis.com/compute/v1/projects/cockroach-shared/zones/us-east1-b/machineTypes/n2-standard-16"
+//
+// We want to strip this down to "n2-standard-16", so we only want the last
+// component.
+func lastComponent(url string) string {
+	s := strings.Split(url, "/")
+	return s[len(s)-1]
 }

@@ -43,10 +43,12 @@ func TestEvaluator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, "SET CLUSTER SETTING kv.rangefeed.enabled = true")
 	sqlDB.Exec(t, `CREATE TYPE status AS ENUM ('open', 'closed', 'inactive')`)
 	sqlDB.Exec(t, `
 CREATE TABLE foo (
@@ -331,9 +333,7 @@ $$`)
 			stmt: `SELECT
                a, b, c,
                (CASE WHEN (cdc_prev).c IS NULL THEN 'not there' ELSE (cdc_prev).c END) AS old_c
-             FROM foo
-             WHERE (cdc_prev).crdb_internal_mvcc_timestamp IS NULL OR
-                   (cdc_prev).crdb_internal_mvcc_timestamp < crdb_internal_mvcc_timestamp`,
+             FROM foo`,
 			expectMainFamily: []decodeExpectation{
 				{
 					expectUnwatchedErr: true,
@@ -635,8 +635,9 @@ func TestUnsupportedCDCFunctions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 	sqlDB := sqlutils.MakeSQLRunner(db)
@@ -739,7 +740,7 @@ func randEncDatumPrimaryFamily(
 
 // readSortedRangeFeedValues reads n values, and sorts them based on key order.
 func readSortedRangeFeedValues(
-	t *testing.T, n int, row func(t *testing.T) *kvpb.RangeFeedValue,
+	t *testing.T, n int, row func(t testing.TB) *kvpb.RangeFeedValue,
 ) (res []kvpb.RangeFeedValue) {
 	t.Helper()
 	for i := 0; i < n; i++ {
@@ -786,8 +787,12 @@ func newEvaluatorWithNormCheck(
 		defaultDBSessionData, hlc.Timestamp{}, withDiff), nil
 }
 
-var defaultDBSessionData = sessiondatapb.SessionData{
-	Database:                   "defaultdb",
-	SearchPath:                 sessiondata.DefaultSearchPath.GetPathArray(),
-	TrigramSimilarityThreshold: 0.3,
+var defaultDBSessionData = &sessiondata.SessionData{
+	SessionData: sessiondatapb.SessionData{
+		Database:                   "defaultdb",
+		TrigramSimilarityThreshold: 0.3,
+		UserProto:                  username.RootUserName().EncodeProto(),
+	},
+	SequenceState: sessiondata.NewSequenceState(),
+	SearchPath:    sessiondata.DefaultSearchPathForUser(username.RootUserName()),
 }

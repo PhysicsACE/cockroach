@@ -14,7 +14,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"encoding/json"
-	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -23,37 +23,36 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
+
+func countEvents(
+	ctx context.Context, db *gosql.DB, eventType kvserverpb.RangeLogEventType,
+) (int, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM system.rangelog WHERE "eventType" = $1`,
+		eventType.String()).Scan(&count)
+	return count, err
+}
 
 func TestLogSplits(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	ts := s.(*server.TestServer)
 	ctx := context.Background()
+	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	countSplits := func() int {
-		var count int
-		err := db.QueryRowContext(ctx,
-			`SELECT count(*) FROM system.rangelog WHERE "eventType" = $1`,
-			kvserverpb.RangeLogEventType_split.String()).Scan(&count)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return count
-	}
-
 	// Count the number of split events.
-	initialSplits := countSplits()
+	initialSplits, err := countEvents(ctx, db, kvserverpb.RangeLogEventType_split)
+	require.NoError(t, err)
 
 	// Generate an explicit split event.
 	if err := kvDB.AdminSplit(
@@ -64,12 +63,18 @@ func TestLogSplits(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify that the count has increased by at least one. Realistically it's
-	// almost always by exactly one, but if there are any other splits they
-	// might race in after the previous call to countSplits().
-	if now := countSplits(); now <= initialSplits {
-		t.Fatalf("expected >= %d splits, found %d", initialSplits, now)
-	}
+	// Logging is done in an async task, so it may need some extra time to finish.
+	testutils.SucceedsSoon(t, func() error {
+		currentSplits, err := countEvents(ctx, db, kvserverpb.RangeLogEventType_split)
+		require.NoError(t, err)
+		// Verify that the count has increased by at least one. Realistically it's
+		// almost always by exactly one, but if there are any other splits they
+		// might race in after the previous call to countSplits().
+		if currentSplits <= initialSplits {
+			return errors.Newf("expected > %d splits, found %d", initialSplits, currentSplits)
+		}
+		return nil
+	})
 
 	// verify that RangeID always increases (a good way to see that the splits
 	// are logged correctly)
@@ -114,7 +119,7 @@ func TestLogSplits(t *testing.T) {
 		t.Fatal(rows.Err())
 	}
 
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+	store, pErr := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -156,26 +161,16 @@ func TestLogMerges(t *testing.T) {
 	})
 	defer s.Stopper().Stop(ctx)
 
-	ts := s.(*server.TestServer)
-	store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
+	store, pErr := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
 
-	countRangeLogMerges := func() int {
-		var count int
-		err := db.QueryRowContext(ctx,
-			`SELECT count(*) FROM system.rangelog WHERE "eventType" = $1`,
-			kvserverpb.RangeLogEventType_merge.String()).Scan(&count)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return count
-	}
-
 	// No ranges should have merged immediately after startup.
-	if n := countRangeLogMerges(); n != 0 {
-		t.Fatalf("expected 0 initial merges, but got %d", n)
+	initialMerges, err := countEvents(ctx, db, kvserverpb.RangeLogEventType_merge)
+	require.NoError(t, err)
+	if initialMerges != 0 {
+		t.Fatalf("expected 0 initial merges, but got %d", initialMerges)
 	}
 	if n := store.Metrics().RangeMerges.Count(); n != 0 {
 		t.Errorf("expected 0 initial merges, but got %d", n)
@@ -200,12 +195,18 @@ func TestLogMerges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n := countRangeLogMerges(); n != 1 {
-		t.Fatalf("expected 1 merge, but got %d", n)
-	}
-	if n := store.Metrics().RangeMerges.Count(); n != 1 {
-		t.Errorf("expected 1 merge, but got %d", n)
-	}
+	// Logging is done in an async task, so it may need some extra time to finish.
+	testutils.SucceedsSoon(t, func() error {
+		currentMerges, err := countEvents(ctx, db, kvserverpb.RangeLogEventType_merge)
+		require.NoError(t, err)
+		if currentMerges != 1 {
+			return errors.Newf("expected 1 merge, but got %d", currentMerges)
+		}
+		if n := store.Metrics().RangeMerges.Count(); n != 1 {
+			return errors.Newf("expected 1 merge, but got %d", n)
+		}
+		return nil
+	})
 
 	rows, err := db.QueryContext(ctx,
 		`SELECT "rangeID", "otherRangeID", info FROM system.rangelog WHERE "eventType" = $1`,
@@ -251,7 +252,9 @@ func TestLogMerges(t *testing.T) {
 func TestLogRebalances(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
@@ -266,7 +269,7 @@ func TestLogRebalances(t *testing.T) {
 	// StoreID 1 is present on the testserver. If this assumption changes in the
 	// future, *any* store will work, but a new method will need to be added to
 	// Stores (or a creative usage of VisitStores could suffice).
-	store, err := s.(*server.TestServer).Stores().GetStore(roachpb.StoreID(1))
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(roachpb.StoreID(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +278,11 @@ func TestLogRebalances(t *testing.T) {
 	const details = "test"
 	logEvent := func(changeType roachpb.ReplicaChangeType, reason kvserverpb.RangeLogEventReason) {
 		if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return store.LogReplicaChangeTest(ctx, txn, changeType, desc.InternalReplicas[0], *desc, reason, details)
+			// Not logging async here because logging is the only part of this
+			// transaction. If we wanted to log async we would need to add another
+			// fake operation to the transaction, so it can commit and invoke the
+			// commit trigger, which does the logging.
+			return store.LogReplicaChangeTest(ctx, txn, changeType, desc.InternalReplicas[0], *desc, reason, details, false)
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -294,16 +301,6 @@ func TestLogRebalances(t *testing.T) {
 	checkMetrics(2 /*adds*/, 0 /*remove*/)
 	logEvent(roachpb.REMOVE_VOTER, kvserverpb.ReasonRangeOverReplicated)
 	checkMetrics(2 /*adds*/, 1 /*remove*/)
-
-	// Open a SQL connection to verify that the events have been logged.
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), "TestLogRebalances", url.User(username.RootUser))
-	defer cleanupFn()
-
-	sqlDB, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqlDB.Close()
 
 	// verify that two add replica events have been logged.
 	rows, err := sqlDB.QueryContext(ctx,
@@ -408,4 +405,114 @@ func TestLogRebalances(t *testing.T) {
 	if a, e := count, 1; a != e {
 		t.Errorf("expected %d RemoveReplica events logged, found %d", e, a)
 	}
+}
+
+// TestAsyncLogging tests the logAsync flag and the writeToRangeLogTable by
+// attempting to log a range split with a very long reason string. The multi-MB
+// string forces the logging to fail. In the case where logAsync is true, the
+// logging is best-effort and the rest of the transaction commits. In the case
+// where logAsync is false, the failed logging forces the transaction to retry.
+func TestAsyncLogging(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
+	require.NoError(t, err)
+
+	// Log a fake split event inside a transaction that also writes to key a.
+	logEvent := func(reason string, logAsync bool) error {
+		return kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			e := txn.Put(ctx, "a", "b")
+			require.NoError(t, e)
+			desc := roachpb.RangeDescriptor{}
+			return store.LogSplitTest(ctx, txn, desc, desc, reason, logAsync)
+		})
+	}
+
+	// A string used as the split reason; 100MB long.
+	longReason := strings.Repeat("r", 100*1024*1024)
+	initialSplits, err := countEvents(ctx, db, kvserverpb.RangeLogEventType_split)
+	require.NoError(t, err)
+
+	t.Run("failed-async-log", func(t *testing.T) {
+		// Logging is done in an async task, so it may need some extra time to finish.
+		testutils.SucceedsSoon(t, func() error {
+			// Start with a key-value pair a-a.
+			err = kvDB.Put(ctx, "a", "a")
+			require.NoError(t, err)
+			// Pass a very long reason string to the event logger to ensure logging
+			// fails.
+			err = logEvent(longReason, true)
+			// Logging errors are not returned here because logging runs as an async
+			// task.
+			require.NoError(t, err)
+			currentSplits, err := countEvents(ctx, db, kvserverpb.RangeLogEventType_split)
+			require.NoError(t, err)
+			// The current splits should be the same as the initial splits because
+			// writing to the rangelog table failed.
+			require.Equal(t, initialSplits, currentSplits)
+			v, err := kvDB.Get(ctx, "a")
+			require.NoError(t, err)
+			val, _ := v.Value.GetBytes()
+			// The rest of the transaction is expected to have succeeded and updated the
+			// value for key a from a to b.
+			require.Equal(t, "b", string(val))
+			return nil
+		})
+	})
+
+	t.Run("failed-sync-log", func(t *testing.T) {
+		// Logging is done in an async task, so it may need some extra time to finish.
+		testutils.SucceedsSoon(t, func() error {
+			// Start with a key-value pair a-a.
+			err = kvDB.Put(ctx, "a", "a")
+			require.NoError(t, err)
+			// Pass a very long reason string to the event logger to ensure logging
+			// fails.
+			err = logEvent(longReason, false)
+			// Logging is not async, so we expect to see an error here.
+			require.Regexp(t, "command is too large: .*", err)
+			currentSplits, err := countEvents(ctx, db, kvserverpb.RangeLogEventType_split)
+			require.NoError(t, err)
+			// The current splits should be the same as the initial splits because
+			// writing to the rangelog table failed.
+			require.Equal(t, initialSplits, currentSplits)
+			v, err := kvDB.Get(ctx, "a")
+			require.NoError(t, err)
+			val, _ := v.Value.GetBytes()
+			// The entire transaction failed, so we expect to see the same value, a, for
+			// key a.
+			require.Equal(t, "a", string(val))
+			return nil
+		})
+	})
+
+	t.Run("successful-log", func(t *testing.T) {
+		// Logging is done in an async task, so it may need some extra time to finish.
+		testutils.SucceedsSoon(t, func() error {
+			testutils.RunTrueAndFalse(t, "log-async", func(t *testing.T, logAsync bool) {
+				// Start with a key-value pair a-a.
+				err = kvDB.Put(ctx, "a", "a")
+				require.NoError(t, err)
+				// Log a reasonable size event, no error expected.
+				err = logEvent("reason", logAsync)
+				require.NoError(t, err)
+				currentSplits, err := countEvents(ctx, db, kvserverpb.RangeLogEventType_split)
+				require.NoError(t, err)
+				// Writing to rangelog succeeded, so we expect to see more splits than
+				// initially.
+				require.Greater(t, currentSplits, initialSplits)
+				v, err := kvDB.Get(ctx, "a")
+				require.NoError(t, err)
+				val, _ := v.Value.GetBytes()
+				// The rest of the transaction is expected to have succeeded and updated
+				// the value for key a from a to b.
+				require.Equal(t, "b", string(val))
+			})
+			return nil
+		})
+	})
 }

@@ -16,14 +16,16 @@ import (
 	"net/http/pprof"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	proxyproto "github.com/pires/go-proxyproto"
+	"github.com/prometheus/common/expfmt"
 )
 
 var (
@@ -105,11 +107,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVars(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set(httputil.ContentTypeHeader, httputil.PlaintextContentType)
+	contentType := expfmt.Negotiate(r.Header)
+	w.Header().Set(httputil.ContentTypeHeader, string(contentType))
 	scrape := func(pm *metric.PrometheusExporter) {
 		pm.ScrapeRegistry(s.metricsRegistry, true /* includeChildMetrics*/)
 	}
-	if err := s.prometheusExporter.ScrapeAndPrintAsText(w, scrape); err != nil {
+	if err := s.prometheusExporter.ScrapeAndPrintAsText(w, contentType, scrape); err != nil {
 		log.Errorf(r.Context(), "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -162,18 +165,32 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 // a health check endpoint at /_status/healthz, and pprof debug
 // endpoints at /debug/pprof.
 func (s *Server) ServeHTTP(ctx context.Context, ln net.Listener) error {
-	srv := http.Server{
-		Handler: s.mux,
+	if s.handler.RequireProxyProtocol {
+		ln = &proxyproto.Listener{
+			Listener: ln,
+			Policy: func(upstream net.Addr) (proxyproto.Policy, error) {
+				// There is a possibility where components doing healthchecking
+				// (e.g. Kubernetes) do not support the PROXY protocol directly.
+				// We use the `USE` policy here (which is also the default) to
+				// optionally allow the PROXY protocol to be supported. If a
+				// connection doesn't have the proxy headers, it'll just be
+				// treated as a regular one.
+				return proxyproto.USE, nil
+			},
+			ValidateHeader: s.handler.testingKnobs.validateProxyHeader,
+		}
 	}
 
-	go func() {
+	srv := http.Server{Handler: s.mux}
+
+	err := s.Stopper.RunAsyncTask(ctx, "sqlproxy-http-cleanup", func(ctx context.Context) {
 		<-ctx.Done()
 
 		// Wait up to 15 seconds for the HTTP server to shut itself
 		// down. The HTTP service is an auxiliary service for health
 		// checking and metrics, which does not need a completely
 		// graceful shutdown.
-		_ = contextutil.RunWithTimeout(
+		_ = timeutil.RunWithTimeout(
 			context.Background(),
 			"http server shutdown",
 			15*time.Second,
@@ -181,11 +198,13 @@ func (s *Server) ServeHTTP(ctx context.Context, ln net.Listener) error {
 				// Ignore any errors as this routine will only be called
 				// when the server is shutting down.
 				_ = srv.Shutdown(shutdownCtx)
-
 				return nil
 			},
 		)
-	}()
+	})
+	if err != nil {
+		return err
+	}
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -198,6 +217,18 @@ func (s *Server) ServeHTTP(ctx context.Context, ln net.Listener) error {
 // Incoming client connections are taken through the Postgres handshake and
 // relayed to the configured backend server.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	if s.handler.RequireProxyProtocol {
+		ln = &proxyproto.Listener{
+			Listener: ln,
+			Policy: func(upstream net.Addr) (proxyproto.Policy, error) {
+				// REQUIRE enforces the connection to send a PROXY header.
+				// The connection will be rejected if one was not present.
+				return proxyproto.REQUIRE, nil
+			},
+			ValidateHeader: s.handler.testingKnobs.validateProxyHeader,
+		}
+	}
+
 	err := s.Stopper.RunAsyncTask(ctx, "listen-quiesce", func(ctx context.Context) {
 		<-s.Stopper.ShouldQuiesce()
 		if err := ln.Close(); err != nil && !grpcutil.IsClosedConnection(err) {

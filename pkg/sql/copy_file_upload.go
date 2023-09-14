@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -65,7 +66,7 @@ func checkIfFileExists(ctx context.Context, c *copyMachine, dest, copyTargetTabl
 	}
 	defer store.Close()
 
-	_, err = store.ReadFile(ctx, "")
+	_, _, err = store.ReadFile(ctx, "", cloud.ReadOptions{})
 	if err == nil {
 		// Can ignore this parse error as it would have been caught when creating a
 		// new ExternalStorage above and so we never expect it to non-nil.
@@ -99,6 +100,7 @@ func newFileUploadMachine(
 
 	// We need a planner to do the initial planning, even if a planner
 	// is not required after that.
+	c.txnOpt.initPlanner(ctx, c.p)
 	cleanup := c.p.preparePlannerForCopy(ctx, &c.txnOpt, false /* finalBatch */, c.implicitTxn)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
@@ -151,7 +153,7 @@ func newFileUploadMachine(
 	c.format = tree.CopyFormatText
 	c.null = `\N`
 	c.delimiter = '\t'
-	c.rows.Init(c.rowsMemAcc, colinfo.ColTypeInfoFromResCols(c.resultColumns), copyBatchRowSize)
+	c.rows.Init(c.rowsMemAcc, colinfo.ColTypeInfoFromResCols(c.resultColumns), CopyBatchRowSize)
 	c.scratchRow = make(tree.Datums, len(c.resultColumns))
 	return
 }
@@ -194,7 +196,7 @@ func (f *fileUploadMachine) run(ctx context.Context) error {
 func (f *fileUploadMachine) writeFile(ctx context.Context, finalBatch bool) error {
 	for i := 0; i < f.c.rows.Len(); i++ {
 		r := f.c.rows.At(i)
-		b := []byte(*r[0].(*tree.DBytes))
+		b := r[0].(*tree.DBytes).UnsafeBytes()
 		n, err := f.w.Write(b)
 		if err != nil {
 			return err

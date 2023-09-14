@@ -14,13 +14,14 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func init() {
@@ -31,17 +32,15 @@ func declareKeysRequestLease(
 	rs ImmutableRangeState,
 	_ *kvpb.Header,
 	_ kvpb.Request,
-	latchSpans, _ *spanset.SpanSet,
+	latchSpans *spanset.SpanSet,
+	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
 ) {
 	// NOTE: RequestLease is run on replicas that do not hold the lease, so
 	// acquiring latches would not help synchronize with other requests. As
-	// such, the request does not actually acquire latches over these spans
-	// (see concurrency.shouldAcquireLatches). However, we continue to
-	// declare the keys in order to appease SpanSet assertions under race.
-	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeLeaseKey(rs.GetRangeID())})
-	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangePriorReadSummaryKey(rs.GetRangeID())})
-	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
+	// such, the request does not declare latches. See also
+	// concurrency.shouldIgnoreLatches().
+	latchSpans.DisableUndeclaredAccessAssertions()
 }
 
 // RequestLease sets the range lease for this range. The command fails
@@ -161,6 +160,7 @@ func RequestLease(
 		priorReadSum = &worstCaseSum
 	}
 
+	log.VEventf(ctx, 2, "lease request: prev lease: %+v, new lease: %+v", prevLease, newLease)
 	return evalNewLease(ctx, cArgs.EvalCtx, readWriter, cArgs.Stats,
 		newLease, prevLease, priorReadSum, isExtension, false /* isTransfer */)
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -46,7 +47,7 @@ import (
 // mutating the original requests).
 func optimizePuts(
 	reader storage.Reader, origReqs []kvpb.RequestUnion, distinctSpans bool,
-) []kvpb.RequestUnion {
+) ([]kvpb.RequestUnion, error) {
 	var minKey, maxKey roachpb.Key
 	var unique map[string]struct{}
 	if !distinctSpans {
@@ -54,12 +55,15 @@ func optimizePuts(
 	}
 	// Returns false on occurrence of a duplicate key.
 	maybeAddPut := func(key roachpb.Key) bool {
-		// Note that casting the byte slice key to a string does not allocate.
+		// The lookup will not copy key but the map insertion will, but since the
+		// map doesn't escape and we don't mutate the keys its safe to
+		// not allocate for both.
+		mapKey := encoding.UnsafeConvertBytesToString(key)
 		if unique != nil {
-			if _, ok := unique[string(key)]; ok {
+			if _, ok := unique[mapKey]; ok {
 				return false
 			}
-			unique[string(key)] = struct{}{}
+			unique[mapKey] = struct{}{}
 		}
 		if minKey == nil || bytes.Compare(key, minKey) < 0 {
 			minKey = key
@@ -91,17 +95,20 @@ func optimizePuts(
 	}
 
 	if firstUnoptimizedIndex < optimizePutThreshold { // don't bother if below this threshold
-		return origReqs
+		return origReqs, nil
 	}
 	// iter is being used to find the parts of the key range that is empty. We
 	// don't need to see intents for this purpose since intents also have
 	// provisional values that we will see.
-	iter := reader.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	iter, err := reader.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 		KeyTypes: storage.IterKeyTypePointsAndRanges,
 		// We want to include maxKey in our scan. Since UpperBound is exclusive, we
 		// need to set it to the key after maxKey.
 		UpperBound: maxKey.Next(),
 	})
+	if err != nil {
+		return nil, err
+	}
 	defer iter.Close()
 
 	// If there are enough puts in the run to justify calling seek,
@@ -114,9 +121,9 @@ func optimizePuts(
 		// TODO(bdarnell): return an error here instead of silently
 		// running without the optimization?
 		log.Errorf(context.TODO(), "Seek returned error; disabling blind-put optimization: %+v", err)
-		return origReqs
-	} else if ok && bytes.Compare(iter.Key().Key, maxKey) <= 0 {
-		iterKey = iter.Key().Key
+		return origReqs, nil
+	} else if ok && bytes.Compare(iter.UnsafeKey().Key, maxKey) <= 0 {
+		iterKey = iter.UnsafeKey().Key.Clone()
 	}
 	// Set the prefix of the run which is being written to virgin
 	// keyspace to "blindly" put values.
@@ -142,7 +149,7 @@ func optimizePuts(
 			}
 		}
 	}
-	return reqs
+	return reqs, nil
 }
 
 // evaluateBatch evaluates a batch request by splitting it up into its
@@ -179,10 +186,15 @@ func evaluateBatch(
 	baHeader := ba.Header
 
 	br := ba.CreateReply()
+	var err error
 
 	// Optimize any contiguous sequences of put and conditional put ops.
 	if len(baReqs) >= optimizePutThreshold && evalPath == readWrite {
-		baReqs = optimizePuts(readWriter, baReqs, baHeader.DistinctSpans)
+		baReqs, err = optimizePuts(readWriter, baReqs, baHeader.DistinctSpans)
+	}
+	if err != nil {
+		pErr := kvpb.NewErrorWithTxn(err, baHeader.Txn)
+		return nil, result.Result{}, pErr
 	}
 
 	// Create a clone of the transaction to store the new txn state produced on
@@ -215,25 +227,11 @@ func evaluateBatch(
 
 	var mergedResult result.Result
 
-	// WriteTooOldErrors have particular handling. When a request encounters the
-	// error, we'd like to lay down an intent in order to avoid writers being
-	// starved. So, for blind writes, we swallow the error and instead we set the
-	// WriteTooOld flag on the response. For non-blind writes (e.g. CPut), we
-	// can't do that and so we just return the WriteTooOldError - see note on
-	// IsRead() stanza below. Upon receiving either a WriteTooOldError or a
-	// response with the WriteTooOld flag set, the client will attempt to bump
-	// the txn's read timestamp through a refresh. If successful, the client
-	// will retry this batch (in both cases).
-	//
-	// In any case, evaluation of the current batch always continue after a
-	// WriteTooOldError in order to find out if there's more conflicts and chose
-	// a final write timestamp.
-	var writeTooOldState struct {
-		err *kvpb.WriteTooOldError
-		// cantDeferWTOE is set when a WriteTooOldError cannot be deferred past the
-		// end of the current batch.
-		cantDeferWTOE bool
-	}
+	// WriteTooOldErrors have particular handling. Evaluation of the current batch
+	// continues after a WriteTooOldError in order to find out if there's more
+	// conflicts and chose the highest timestamp to return for more efficient
+	// retries.
+	var deferredWriteTooOldErr *kvpb.WriteTooOldError
 
 	// Only collect the scan stats if the tracing is enabled.
 	var ss *kvpb.ScanStats
@@ -253,6 +251,17 @@ func evaluateBatch(
 	for index, union := range baReqs {
 		// Execute the command.
 		args := union.GetInner()
+
+		if deferredWriteTooOldErr != nil && args.Method() == kvpb.EndTxn {
+			// ... unless we have been deferring a WriteTooOld error and have now
+			// reached an EndTxn request. In such cases, break and return the error.
+			// The transaction needs to handle the WriteTooOld error before it tries
+			// to commit. This short-circuiting is not necessary for correctness as
+			// the write batch will be discarded in favor of the deferred error, but
+			// we don't want to bother with potentially expensive EndTxn evaluation if
+			// we know the result will be thrown away.
+			break
+		}
 
 		if baHeader.Txn != nil {
 			// Set the Request's sequence number on the TxnMeta for this
@@ -325,79 +334,6 @@ func evaluateBatch(
 			reply.SetHeader(headerCopy)
 		}
 
-		if err != nil {
-			// If an EndTxn wants to restart because of a write too old, we
-			// might have a better error to return to the client.
-			if retErr := (*kvpb.TransactionRetryError)(nil); errors.As(err, &retErr) &&
-				retErr.Reason == kvpb.RETRY_WRITE_TOO_OLD &&
-				args.Method() == kvpb.EndTxn && writeTooOldState.err != nil {
-				err = writeTooOldState.err
-				// Don't defer this error. We could perhaps rely on the client observing
-				// the WriteTooOld flag and retry the batch, but we choose not too.
-				writeTooOldState.cantDeferWTOE = true
-			} else if wtoErr := (*kvpb.WriteTooOldError)(nil); errors.As(err, &wtoErr) {
-				// We got a WriteTooOldError. We continue on to run all
-				// commands in the batch in order to determine the highest
-				// timestamp for more efficient retries. If the batch is
-				// transactional, we continue to lay down intents so that
-				// other concurrent overlapping transactions are forced
-				// through intent resolution and the chances of this batch
-				// succeeding when it will be retried are increased.
-				if writeTooOldState.err != nil {
-					writeTooOldState.err.ActualTimestamp.Forward(
-						wtoErr.ActualTimestamp)
-				} else {
-					writeTooOldState.err = wtoErr
-				}
-
-				// For read-write requests that observe key-value state, we don't have
-				// the option of leaving an intent behind when they encounter a
-				// WriteTooOldError, so we have to return an error instead of a response
-				// with the WriteTooOld flag set (which would also leave intents
-				// behind). These requests need to be re-evaluated at the bumped
-				// timestamp in order for their results to be valid. The current
-				// evaluation resulted in an result that could well be different from
-				// what the request would return if it were evaluated at the bumped
-				// timestamp, which would cause the request to be rejected if it were
-				// sent again with the same sequence number after a refresh.
-				//
-				// Similarly, for read-only requests that encounter a WriteTooOldError,
-				// we don't have the option of returning a response with the WriteTooOld
-				// flag set because a response is not even generated in tandem with the
-				// WriteTooOldError. We could fix this and then allow WriteTooOldErrors
-				// to be deferred in these cases, but doing so would buy more into the
-				// extremely error-prone approach of retuning responses and errors
-				// together throughout the MVCC read path. Doing so is not desirable as
-				// it has repeatedly caused bugs in the past. Instead, we'd like to get
-				// rid of this pattern entirely and instead address the TODO below.
-				//
-				// TODO(andrei): What we really want to do here is either speculatively
-				// evaluate the request at the bumped timestamp and return that
-				// speculative result, or leave behind an unreplicated lock that won't
-				// prevent the request for evaluating again at the same sequence number
-				// but at a bumped timestamp.
-				if !kvpb.IsBlindWrite(args) {
-					writeTooOldState.cantDeferWTOE = true
-				}
-
-				if baHeader.Txn != nil {
-					log.VEventf(ctx, 2, "setting WriteTooOld because of key: %s. wts: %s -> %s",
-						args.Header().Key, baHeader.Txn.WriteTimestamp, wtoErr.ActualTimestamp)
-					baHeader.Txn.WriteTimestamp.Forward(wtoErr.ActualTimestamp)
-					baHeader.Txn.WriteTooOld = true
-				} else {
-					// For non-transactional requests, there's nowhere to defer the error
-					// to. And the request has to fail because non-transactional batches
-					// should read and write at the same timestamp.
-					writeTooOldState.cantDeferWTOE = true
-				}
-
-				// Clear error; we're done processing the WTOE for now and we'll return
-				// to considering it below after we've evaluated all requests.
-				err = nil
-			}
-		}
-
 		// Even on error, we need to propagate the result of evaluation.
 		//
 		// TODO(tbg): find out if that's true and why and improve the comment.
@@ -409,12 +345,38 @@ func evaluateBatch(
 			)
 		}
 
+		// Handle errors thrown by evaluation, either eagerly or through deferral.
 		if err != nil {
-			pErr := kvpb.NewErrorWithTxn(err, baHeader.Txn)
-			// Initialize the error index.
-			pErr.SetErrorIndex(int32(index))
+			var wtoErr *kvpb.WriteTooOldError
+			switch {
+			case errors.As(err, &wtoErr):
+				// We got a WriteTooOldError. We continue on to run all commands in the
+				// batch in order to determine the highest timestamp for more efficient
+				// retries.
+				if deferredWriteTooOldErr != nil {
+					deferredWriteTooOldErr.ActualTimestamp.Forward(wtoErr.ActualTimestamp)
+				} else {
+					deferredWriteTooOldErr = wtoErr
+				}
 
-			return nil, mergedResult, pErr
+				if baHeader.Txn != nil {
+					log.VEventf(ctx, 2, "advancing write timestamp due to "+
+						"WriteTooOld error on key: %s. wts: %s -> %s",
+						args.Header().Key, baHeader.Txn.WriteTimestamp, wtoErr.ActualTimestamp)
+					baHeader.Txn.WriteTimestamp.Forward(wtoErr.ActualTimestamp)
+				}
+
+				// Clear error and fall through to the success path; we're done
+				// processing the error for now. We'll return it below after we've
+				// evaluated all requests.
+				err = nil
+
+			default:
+				// For all other error types, immediately propagate the error.
+				pErr := kvpb.NewErrorWithTxn(err, baHeader.Txn)
+				pErr.SetErrorIndex(int32(index))
+				return nil, mergedResult, pErr
+			}
 		}
 
 		// If the last request was carried out with a limit, subtract the number
@@ -449,20 +411,16 @@ func evaluateBatch(
 	}
 
 	// If we made it here, there was no error during evaluation, with the exception of
-	// a deferred WTOE. If it can't be deferred - return it now; otherwise it is swallowed.
-	// Note that we don't attach an Index to the returned Error.
+	// a deferred WriteTooOld error. Return that now.
 	//
 	// TODO(tbg): we could attach the index of the first WriteTooOldError seen, but does
 	// that buy us anything?
-	if writeTooOldState.cantDeferWTOE {
+	if deferredWriteTooOldErr != nil {
 		// NB: we can't do any error wrapping here yet due to compatibility with 20.2 nodes;
 		// there needs to be an ErrorDetail here.
-		return nil, mergedResult, kvpb.NewErrorWithTxn(writeTooOldState.err, baHeader.Txn)
+		// TODO(nvanbenschoten): this comment is now stale. Address it.
+		return nil, mergedResult, kvpb.NewErrorWithTxn(deferredWriteTooOldErr, baHeader.Txn)
 	}
-
-	// The batch evaluation will not return an error (i.e. either everything went
-	// fine or we're deferring a WriteTooOldError by having bumped
-	// baHeader.Txn.WriteTimestamp).
 
 	// Update the batch response timestamp field to the timestamp at which the
 	// batch's reads were evaluated.
@@ -553,12 +511,13 @@ func evaluateCommand(
 	return pd, err
 }
 
-// canDoServersideRetry looks at the error produced by evaluating ba (or the
-// WriteTooOldFlag in br.Txn if there's no error) and decides if it's possible
-// to retry the batch evaluation at a higher timestamp. Retrying is sometimes
-// possible in case of some retriable errors which ask for higher timestamps:
-// for transactional requests, retrying is possible if the transaction had not
-// performed any prior reads that need refreshing.
+// canDoServersideRetry looks at the error produced by evaluating ba and decides
+// if it's possible to retry the batch evaluation at a higher timestamp.
+//
+// Retrying is sometimes possible in case of some retriable errors which ask for
+// higher timestamps. For transactional requests, retrying is possible if the
+// transaction had not performed any prior reads that need refreshing. For
+// non-transactional requests, retrying is always possible.
 //
 // This function is called both below and above latching, which is indicated by
 // the concurrency guard argument. The concurrency guard, if not nil, indicates
@@ -578,10 +537,12 @@ func canDoServersideRetry(
 	ctx context.Context,
 	pErr *kvpb.Error,
 	ba *kvpb.BatchRequest,
-	br *kvpb.BatchResponse,
 	g *concurrency.Guard,
 	deadline hlc.Timestamp,
 ) bool {
+	if pErr == nil {
+		log.Fatalf(ctx, "canDoServersideRetry called without error")
+	}
 	if ba.Txn != nil {
 		if !ba.CanForwardReadTimestamp {
 			return false
@@ -597,22 +558,12 @@ func canDoServersideRetry(
 
 	var newTimestamp hlc.Timestamp
 	if ba.Txn != nil {
-		if pErr != nil {
-			var ok bool
-			ok, newTimestamp = kvpb.TransactionRefreshTimestamp(pErr)
-			if !ok {
-				return false
-			}
-		} else {
-			if !br.Txn.WriteTooOld {
-				log.Fatalf(ctx, "expected the WriteTooOld flag to be set")
-			}
-			newTimestamp = br.Txn.WriteTimestamp
+		var ok bool
+		ok, newTimestamp = kvpb.TransactionRefreshTimestamp(pErr)
+		if !ok {
+			return false
 		}
 	} else {
-		if pErr == nil {
-			log.Fatalf(ctx, "canDoServersideRetry called for non-txn request without error")
-		}
 		switch tErr := pErr.GetDetail().(type) {
 		case *kvpb.WriteTooOldError:
 			newTimestamp = tErr.RetryTimestamp()

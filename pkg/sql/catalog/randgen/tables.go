@@ -44,13 +44,16 @@ func (g *testSchemaGenerator) genMultipleTables(
 	}()
 
 	// Compute the shared table privileges just once.
-	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
 		db.GetDefaultPrivilegeDescriptor(),
 		sc.GetDefaultPrivilegeDescriptor(),
 		db.GetID(),
 		g.cfg.user,
 		privilege.Tables,
 	)
+	if err != nil {
+		panic(genError{err: err})
+	}
 
 	// Compute the names ahead of time; this also takes care of
 	// avoiding duplicates.
@@ -176,7 +179,6 @@ func (g *testSchemaGenerator) genOneTable(
 	tmpl.desc.UnexposedParentSchemaID = sc.GetID()
 	tmpl.desc.Privileges = privs
 	tmpl.desc.Temporary = sc.SchemaKind() == catalog.SchemaTemporary
-	tmpl.desc.PrimaryIndex.Name = "primary"
 	if g.cfg.RandomizeColumns {
 		nameGenCfg := g.cfg.NameGen
 		nameGenCfg.Number = false
@@ -185,6 +187,16 @@ func (g *testSchemaGenerator) genOneTable(
 			colName := ng.GenerateOne(0)
 			tmpl.desc.Columns[i+1].Name = colName
 			tmpl.desc.Families[0].ColumnNames[i+1] = colName
+			for j := range tmpl.desc.PrimaryIndex.KeyColumnNames {
+				if tmpl.desc.PrimaryIndex.KeyColumnIDs[j] == tmpl.desc.Columns[i+1].ID {
+					tmpl.desc.PrimaryIndex.KeyColumnNames[j] = colName
+				}
+			}
+			for j := range tmpl.desc.PrimaryIndex.StoreColumnNames {
+				if tmpl.desc.PrimaryIndex.StoreColumnIDs[j] == tmpl.desc.Columns[i+1].ID {
+					tmpl.desc.PrimaryIndex.StoreColumnNames[j] = colName
+				}
+			}
 		}
 		ng := randident.NewNameGenerator(&nameGenCfg, g.rand, "primary")
 		idxName := ng.GenerateOne(0)

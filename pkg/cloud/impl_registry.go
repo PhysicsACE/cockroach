@@ -66,10 +66,10 @@ func registerLimiterSettings(providerType cloudpb.ExternalStorageProvider) {
 		sinkName = "nullsink" // keep the settings name pieces free of reserved keywords.
 	}
 
-	readRateName := fmt.Sprintf("cloudstorage.%s.read.node_rate_limit", sinkName)
-	readBurstName := fmt.Sprintf("cloudstorage.%s.read.node_burst_limit", sinkName)
-	writeRateName := fmt.Sprintf("cloudstorage.%s.write.node_rate_limit", sinkName)
-	writeBurstName := fmt.Sprintf("cloudstorage.%s.write.node_burst_limit", sinkName)
+	readRateName := settings.InternalKey(fmt.Sprintf("cloudstorage.%s.read.node_rate_limit", sinkName))
+	readBurstName := settings.InternalKey(fmt.Sprintf("cloudstorage.%s.read.node_burst_limit", sinkName))
+	writeRateName := settings.InternalKey(fmt.Sprintf("cloudstorage.%s.write.node_rate_limit", sinkName))
+	writeBurstName := settings.InternalKey(fmt.Sprintf("cloudstorage.%s.write.node_burst_limit", sinkName))
 
 	limiterSettings[providerType] = readAndWriteSettings{
 		read: rateAndBurstSettings{
@@ -163,40 +163,6 @@ func ExternalStorageFromURI(
 		db, limiters, metrics, opts...)
 }
 
-// SanitizeExternalStorageURI returns the external storage URI with with some
-// secrets redacted, for use when showing these URIs in the UI, to provide some
-// protection from shoulder-surfing. The param is still present -- just
-// redacted -- to make it clearer that that value is indeed persisted interally.
-// extraParams which should be scrubbed -- for params beyond those that the
-// various cloud-storage URIs supported by this package know about -- can be
-// passed allowing this function to be used to scrub other URIs too (such as
-// non-cloudstorage changefeed sinks).
-func SanitizeExternalStorageURI(path string, extraParams []string) (string, error) {
-	uri, err := url.Parse(path)
-	if err != nil {
-		return "", err
-	}
-	if uri.Scheme == "experimental-workload" || uri.Scheme == "workload" || uri.Scheme == "null" {
-		return path, nil
-	}
-
-	params := uri.Query()
-	for param := range params {
-		if _, ok := redactedQueryParams[param]; ok {
-			params.Set(param, "redacted")
-		} else {
-			for _, p := range extraParams {
-				if param == p {
-					params.Set(param, "redacted")
-				}
-			}
-		}
-	}
-
-	uri.RawQuery = params.Encode()
-	return uri.String(), nil
-}
-
 // MakeExternalStorage creates an ExternalStorage from the given config.
 func MakeExternalStorage(
 	ctx context.Context,
@@ -265,7 +231,7 @@ type Limiters map[cloudpb.ExternalStorageProvider]rwLimiter
 func makeLimiter(
 	ctx context.Context, sv *settings.Values, s rateAndBurstSettings,
 ) *quotapool.RateLimiter {
-	lim := quotapool.NewRateLimiter(s.rate.Key(), quotapool.Limit(0), 0)
+	lim := quotapool.NewRateLimiter(string(s.rate.Name()), quotapool.Limit(0), 0)
 	fn := func(ctx context.Context) {
 		rate := quotapool.Limit(s.rate.Get(sv))
 		if rate == 0 {
@@ -327,19 +293,10 @@ func (e *esWrapper) wrapWriter(ctx context.Context, w io.WriteCloser) io.WriteCl
 	return w
 }
 
-func (e *esWrapper) ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error) {
-	r, err := e.ExternalStorage.ReadFile(ctx, basename)
-	if err != nil {
-		return r, err
-	}
-
-	return e.wrapReader(ctx, r), nil
-}
-
-func (e *esWrapper) ReadFileAt(
-	ctx context.Context, basename string, offset int64,
+func (e *esWrapper) ReadFile(
+	ctx context.Context, basename string, opts ReadOptions,
 ) (ioctx.ReadCloserCtx, int64, error) {
-	r, s, err := e.ExternalStorage.ReadFileAt(ctx, basename, offset)
+	r, s, err := e.ExternalStorage.ReadFile(ctx, basename, opts)
 	if err != nil {
 		return r, s, err
 	}

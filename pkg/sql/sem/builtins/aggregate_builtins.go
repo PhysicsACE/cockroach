@@ -38,24 +38,9 @@ import (
 )
 
 func init() {
-	// Add all aggregates to the builtins map after a few sanity checks.
 	for k, v := range aggregates {
-		for _, a := range v.overloads {
-			if a.Class != tree.AggregateClass {
-				panic(errors.AssertionFailedf("%s: aggregate functions should be marked with the tree.AggregateClass "+
-					"function class, found %v", k, v))
-			}
-			if a.AggregateFunc == nil {
-				panic(errors.AssertionFailedf("%s: aggregate functions should have eval.AggregateFunc constructors, "+
-					"found %v", k, a))
-			}
-			if a.WindowFunc == nil {
-				panic(errors.AssertionFailedf("%s: aggregate functions should have tree.WindowFunc constructors, "+
-					"found %v", k, a))
-			}
-		}
-
-		registerBuiltin(k, v)
+		const enforceClass = true
+		registerBuiltin(k, v, tree.AggregateClass, enforceClass)
 	}
 }
 
@@ -712,8 +697,6 @@ func makeAggOverloadWithReturnType(
 	}
 
 	return tree.Overload{
-		// See the comment about aggregate functions in the definitions
-		// of the Builtins array above.
 		Types:         paramTypes,
 		ReturnType:    retType,
 		AggregateFunc: f,
@@ -875,12 +858,22 @@ func (agg *stMakeLineAgg) Add(
 	}
 	switch g.(type) {
 	case *geom.Point, *geom.LineString, *geom.MultiPoint:
-		if err := agg.acc.Grow(ctx, int64(len(g.FlatCoords())*8)); err != nil {
-			return err
-		}
-		agg.flatCoords = append(agg.flatCoords, g.FlatCoords()...)
+		return agg.appendFlatCoords(ctx, g)
+	default:
+		return nil
 	}
-	return nil
+}
+
+const floatSize = int64(unsafe.Sizeof(float64(0)))
+
+func (agg *stMakeLineAgg) appendFlatCoords(ctx context.Context, g geom.T) error {
+	capBefore := int64(cap(agg.flatCoords))
+	agg.flatCoords = append(agg.flatCoords, g.FlatCoords()...)
+	capAfter := int64(cap(agg.flatCoords))
+	if capAfter == capBefore {
+		return nil
+	}
+	return agg.acc.Grow(ctx, (capAfter-capBefore)*floatSize)
 }
 
 // Result implements the AggregateFunc interface.
@@ -888,21 +881,37 @@ func (agg *stMakeLineAgg) Result() (tree.Datum, error) {
 	if len(agg.flatCoords) == 0 {
 		return tree.DNull, nil
 	}
+	// TODO(yuzefovich): plumb proper context as the function argument.
+	ctx := context.Background()
+	// Making the geometry from the accumulated flat coordinates requires
+	// marshalling the new line string object, which roughly uses the same
+	// amount of memory as the geom.T object itself, so we double the memory
+	// usage.
+	usedMem := agg.acc.Used()
+	if err := agg.acc.Grow(ctx, usedMem); err != nil {
+		return nil, err
+	}
 	g, err := geo.MakeGeometryFromGeomT(geom.NewLineStringFlat(agg.layout, agg.flatCoords))
 	if err != nil {
 		return nil, err
 	}
+	// It is the caller's responsibility to account for the returned DGeometry,
+	// so we can now shrink the memory account back.
+	agg.acc.Shrink(ctx, usedMem)
 	return tree.NewDGeometry(g), nil
 }
 
 // Reset implements the AggregateFunc interface.
-func (agg *stMakeLineAgg) Reset(ctx context.Context) {
+func (agg *stMakeLineAgg) Reset(context.Context) {
+	// Note that since we're keeping the reference to the flat coordinates, we
+	// need to keep the memory accounting unchanged (flatCoords is the only
+	// memory usage tracked against the account).
 	agg.flatCoords = agg.flatCoords[:0]
-	agg.acc.Empty(ctx)
 }
 
 // Close implements the AggregateFunc interface.
 func (agg *stMakeLineAgg) Close(ctx context.Context) {
+	agg.flatCoords = nil
 	agg.acc.Close(ctx)
 }
 
@@ -1001,13 +1010,23 @@ func (agg *stCollectAgg) Add(
 	if firstArg == tree.DNull {
 		return nil
 	}
-	if err := agg.acc.Grow(ctx, int64(firstArg.Size())); err != nil {
+	// We will keep the reference to the argument as geom.T object, so estimate
+	// its memory usage upfront.
+	estimate := int64(firstArg.Size())
+	if err := agg.acc.Grow(ctx, estimate); err != nil {
 		return err
 	}
 	geomArg := tree.MustBeDGeometry(firstArg)
 	t, err := geomArg.AsGeomT()
 	if err != nil {
 		return err
+	}
+	// Now that we have the actual geom.T object we're going to store, get its
+	// actual memory usage and reconcile the memory account.
+	if actual := geo.GeomTSize(t); actual != estimate {
+		if err = agg.acc.Resize(ctx, estimate, actual); err != nil {
+			return err
+		}
 	}
 	if agg.coll != nil && agg.coll.SRID() != t.SRID() {
 		c, err := geo.MakeGeometryFromGeomT(agg.coll)
@@ -1019,7 +1038,7 @@ func (agg *stCollectAgg) Add(
 
 	// Fast path for geometry collections
 	if gc, ok := agg.coll.(*geom.GeometryCollection); ok {
-		return gc.Push(t)
+		return agg.geometryCollectionPush(ctx, gc, t)
 	}
 
 	// Try to append to a multitype, if possible.
@@ -1055,7 +1074,7 @@ func (agg *stCollectAgg) Add(
 		if err := agg.acc.Grow(ctx, usedMem); err != nil {
 			return err
 		}
-		gc, err = agg.multiToCollection(agg.coll)
+		gc, err = agg.multiToCollection(ctx, agg.coll)
 		if err != nil {
 			return err
 		}
@@ -1065,27 +1084,49 @@ func (agg *stCollectAgg) Add(
 		gc = geom.NewGeometryCollection().SetSRID(t.SRID())
 	}
 	agg.coll = gc
-	return gc.Push(t)
+	return agg.geometryCollectionPush(ctx, gc, t)
 }
 
-func (agg *stCollectAgg) multiToCollection(multi geom.T) (*geom.GeometryCollection, error) {
+const geomTSize = int64(unsafe.Sizeof(geom.T(nil)))
+
+// geometryCollectionPush is a helper method that calls gc.Push(t) as well as
+// performs some additional memory accounting.
+func (agg *stCollectAgg) geometryCollectionPush(
+	ctx context.Context, gc *geom.GeometryCollection, t geom.T,
+) error {
+	// geom.GeometryCollection.geoms can have non-trivial overhead, so we
+	// account for that.
+	capBefore := int64(cap(gc.Geoms()))
+	if err := gc.Push(t); err != nil {
+		return err
+	}
+	capAfter := int64(cap(gc.Geoms()))
+	if capAfter == capBefore {
+		return nil
+	}
+	return agg.acc.Grow(ctx, (capAfter-capBefore)*geomTSize)
+}
+
+func (agg *stCollectAgg) multiToCollection(
+	ctx context.Context, multi geom.T,
+) (*geom.GeometryCollection, error) {
 	gc := geom.NewGeometryCollection().SetSRID(multi.SRID())
 	switch t := multi.(type) {
 	case *geom.MultiPoint:
 		for i := 0; i < t.NumPoints(); i++ {
-			if err := gc.Push(t.Point(i)); err != nil {
+			if err := agg.geometryCollectionPush(ctx, gc, t.Point(i)); err != nil {
 				return nil, err
 			}
 		}
 	case *geom.MultiLineString:
 		for i := 0; i < t.NumLineStrings(); i++ {
-			if err := gc.Push(t.LineString(i)); err != nil {
+			if err := agg.geometryCollectionPush(ctx, gc, t.LineString(i)); err != nil {
 				return nil, err
 			}
 		}
 	case *geom.MultiPolygon:
 		for i := 0; i < t.NumPolygons(); i++ {
-			if err := gc.Push(t.Polygon(i)); err != nil {
+			if err := agg.geometryCollectionPush(ctx, gc, t.Polygon(i)); err != nil {
 				return nil, err
 			}
 		}
@@ -1100,10 +1141,25 @@ func (agg *stCollectAgg) Result() (tree.Datum, error) {
 	if agg.coll == nil {
 		return tree.DNull, nil
 	}
+	// TODO(yuzefovich): plumb proper context as the function argument.
+	ctx := context.Background()
+	// Making the geometry from the accumulated geom.T object requires
+	// marshalling that object which roughly uses the same amount of memory as
+	// the geom.T object itself (at least in case of the GeometryCollection), so
+	// we double the memory usage.
+	usedMem := agg.acc.Used()
+	if err := agg.acc.Grow(ctx, usedMem); err != nil {
+		return nil, err
+	}
 	g, err := geo.MakeGeometryFromGeomT(agg.coll)
 	if err != nil {
 		return nil, err
 	}
+	// We no longer need to hold on the accumulated geom.T object, so we can nil
+	// it out. Additionally, it is the caller's responsibility to account for
+	// the returned DGeometry, so we can also clear the memory account. Both of
+	// these things are done in Reset.
+	agg.Reset(ctx)
 	return tree.NewDGeometry(g), nil
 }
 
@@ -1284,6 +1340,41 @@ const sizeOfSTMakeLineAggregate = int64(unsafe.Sizeof(stMakeLineAgg{}))
 const sizeOfSTUnionAggregate = int64(unsafe.Sizeof(stUnionAgg{}))
 const sizeOfSTCollectAggregate = int64(unsafe.Sizeof(stCollectAgg{}))
 const sizeOfSTExtentAggregate = int64(unsafe.Sizeof(stExtentAgg{}))
+
+// aggregateWithIntermediateResult is a common interface for aggregate functions
+// which can return a result without loss of precision. This is useful when an
+// aggregate function uses the result of another in its own calculations.
+type aggregateWithIntermediateResult interface {
+	eval.AggregateFunc
+	intermediateResult() (tree.Datum, error)
+}
+
+// roundIntermediateDecimalResult retrieves the intermediate result of the
+// given aggregate, and rounds it using the default decimal context. This can
+// be used to calculate the final result for an aggregate that implements
+// aggregateWithIntermediateResult.
+func roundIntermediateDecimalResult(a aggregateWithIntermediateResult) (tree.Datum, error) {
+	res, err := a.intermediateResult()
+	if err != nil || res == tree.DNull {
+		return res, err
+	}
+	dd := res.(*tree.DDecimal)
+	_, err = tree.DecimalCtx.Round(&dd.Decimal, &dd.Decimal)
+	if err != nil {
+		return nil, err
+	}
+	// Remove trailing zeros. Depending on the order in which the input
+	// is processed, some number of trailing zeros could be added to the
+	// output. Remove them so that the results are the same regardless of order.
+	dd.Reduce(&dd.Decimal)
+	return dd, nil
+}
+
+var _ aggregateWithIntermediateResult = &intSqrDiffAggregate{}
+var _ aggregateWithIntermediateResult = &decimalSqrDiffAggregate{}
+var _ aggregateWithIntermediateResult = &decimalSumSqrDiffsAggregate{}
+var _ aggregateWithIntermediateResult = &decimalVarPopAggregate{}
+var _ aggregateWithIntermediateResult = &decimalVarianceAggregate{}
 
 // singleDatumAggregateBase is a utility struct that helps aggregate builtins
 // that store a single datum internally track their memory usage related to
@@ -3736,27 +3827,7 @@ func (a *decimalSqrDiffAggregate) intermediateResult() (tree.Datum, error) {
 }
 
 func (a *decimalSqrDiffAggregate) Result() (tree.Datum, error) {
-	res, err := a.intermediateResult()
-	if err != nil || res == tree.DNull {
-		return res, err
-	}
-
-	dd := res.(*tree.DDecimal)
-	// Sqrdiff calculation is used in variance and var_pop as one of intermediate
-	// results. We want the intermediate results to be as precise as possible.
-	// That's why sqrdiff uses IntermediateCtx, but due to operations reordering
-	// in distributed mode the result might be different (see issue #13689,
-	// PR #18701). By rounding the end result to the DecimalCtx precision we avoid
-	// such inconsistencies.
-	_, err = tree.DecimalCtx.Round(&dd.Decimal, &a.sqrDiff)
-	if err != nil {
-		return nil, err
-	}
-	// Remove trailing zeros. Depending on the order in which the input
-	// is processed, some number of trailing zeros could be added to the
-	// output. Remove them so that the results are the same regardless of order.
-	dd.Decimal.Reduce(&dd.Decimal)
-	return dd, nil
+	return roundIntermediateDecimalResult(a)
 }
 
 // Reset implements eval.AggregateFunc interface.
@@ -3839,7 +3910,7 @@ func (a *floatSumSqrDiffsAggregate) Add(
 	// considering that we are losing 11 bits on a 52+-bit operation and
 	// that users dealing with floating points should be aware
 	// of floating-point imprecision.
-	a.sqrDiff += sqrDiff + delta*delta*float64(count)*float64(a.count)/float64(totalCount)
+	a.sqrDiff += sqrDiff + float64(count)*float64(a.count)*(delta/float64(totalCount))*delta
 	a.count = totalCount
 	a.mean += delta * float64(count) / float64(a.count)
 	return nil
@@ -3969,21 +4040,7 @@ func (a *decimalSumSqrDiffsAggregate) intermediateResult() (tree.Datum, error) {
 }
 
 func (a *decimalSumSqrDiffsAggregate) Result() (tree.Datum, error) {
-	res, err := a.intermediateResult()
-	if err != nil || res == tree.DNull {
-		return res, err
-	}
-
-	dd := res.(*tree.DDecimal)
-	_, err = tree.DecimalCtx.Round(&dd.Decimal, &dd.Decimal)
-	if err != nil {
-		return nil, err
-	}
-	// Remove trailing zeros. Depending on the order in which the input
-	// is processed, some number of trailing zeros could be added to the
-	// output. Remove them so that the results are the same regardless of order.
-	dd.Reduce(&dd.Decimal)
-	return dd, nil
+	return roundIntermediateDecimalResult(a)
 }
 
 // Reset implements eval.AggregateFunc interface.
@@ -4010,12 +4067,9 @@ type floatSqrDiff interface {
 }
 
 type decimalSqrDiff interface {
-	eval.AggregateFunc
+	aggregateWithIntermediateResult
 	Count() *apd.Decimal
 	Tmp() *apd.Decimal
-	// intermediateResult returns the current value of the accumulation without
-	// rounding.
-	intermediateResult() (tree.Datum, error)
 }
 
 type floatVarianceAggregate struct {
@@ -4092,8 +4146,7 @@ func (a *floatVarianceAggregate) Result() (tree.Datum, error) {
 	return tree.NewDFloat(tree.DFloat(float64(*sqrDiff.(*tree.DFloat)) / (float64(a.agg.Count()) - 1))), nil
 }
 
-// Result calculates the variance from the member square difference aggregator.
-func (a *decimalVarianceAggregate) Result() (tree.Datum, error) {
+func (a *decimalVarianceAggregate) intermediateResult() (tree.Datum, error) {
 	if a.agg.Count().Cmp(decimalTwo) < 0 {
 		return tree.DNull, nil
 	}
@@ -4105,7 +4158,7 @@ func (a *decimalVarianceAggregate) Result() (tree.Datum, error) {
 		return nil, err
 	}
 	dd := &tree.DDecimal{}
-	if _, err = tree.DecimalCtx.Quo(&dd.Decimal, &sqrDiff.(*tree.DDecimal).Decimal, a.agg.Tmp()); err != nil {
+	if _, err = tree.IntermediateCtx.Quo(&dd.Decimal, &sqrDiff.(*tree.DDecimal).Decimal, a.agg.Tmp()); err != nil {
 		return nil, err
 	}
 	// Remove trailing zeros. Depending on the order in which the input is
@@ -4114,6 +4167,11 @@ func (a *decimalVarianceAggregate) Result() (tree.Datum, error) {
 	// order.
 	dd.Decimal.Reduce(&dd.Decimal)
 	return dd, nil
+}
+
+// Result calculates the variance from the member square difference aggregator.
+func (a *decimalVarianceAggregate) Result() (tree.Datum, error) {
+	return roundIntermediateDecimalResult(a)
 }
 
 // Reset implements eval.AggregateFunc interface.
@@ -4208,8 +4266,7 @@ func (a *floatVarPopAggregate) Result() (tree.Datum, error) {
 	return tree.NewDFloat(tree.DFloat(float64(*sqrDiff.(*tree.DFloat)) / (float64(a.agg.Count())))), nil
 }
 
-// Result calculates the population variance from the member square difference aggregator.
-func (a *decimalVarPopAggregate) Result() (tree.Datum, error) {
+func (a *decimalVarPopAggregate) intermediateResult() (tree.Datum, error) {
 	if a.agg.Count().Cmp(decimalOne) < 0 {
 		return tree.DNull, nil
 	}
@@ -4218,15 +4275,19 @@ func (a *decimalVarPopAggregate) Result() (tree.Datum, error) {
 		return nil, err
 	}
 	dd := &tree.DDecimal{}
-	if _, err = tree.DecimalCtx.Quo(&dd.Decimal, &sqrDiff.(*tree.DDecimal).Decimal, a.agg.Count()); err != nil {
+	if _, err = tree.IntermediateCtx.Quo(&dd.Decimal, &sqrDiff.(*tree.DDecimal).Decimal, a.agg.Count()); err != nil {
 		return nil, err
 	}
-	// Remove trailing zeros. Depending on the order in which the input is
-	// processed, some number of trailing zeros could be added to the
-	// output. Remove them so that the results are the same regardless of
-	// order.
-	dd.Decimal.Reduce(&dd.Decimal)
+	// Remove trailing zeros. Depending on the order in which the input
+	// is processed, some number of trailing zeros could be added to the
+	// output. Remove them so that the results are the same regardless of order.
+	dd.Reduce(&dd.Decimal)
 	return dd, nil
+}
+
+// Result calculates the population variance from the member square difference aggregator.
+func (a *decimalVarPopAggregate) Result() (tree.Datum, error) {
+	return roundIntermediateDecimalResult(a)
 }
 
 // Reset implements eval.AggregateFunc interface.
@@ -4264,7 +4325,7 @@ type floatStdDevAggregate struct {
 }
 
 type decimalStdDevAggregate struct {
-	agg eval.AggregateFunc
+	agg aggregateWithIntermediateResult
 }
 
 // Both StdDev and FinalStdDev aggregators have the same codepath for
@@ -4276,7 +4337,8 @@ type decimalStdDevAggregate struct {
 func newIntStdDevAggregate(
 	params []*types.T, evalCtx *eval.Context, arguments tree.Datums,
 ) eval.AggregateFunc {
-	return &decimalStdDevAggregate{agg: newIntVarianceAggregate(params, evalCtx, arguments)}
+	agg := newIntVarianceAggregate(params, evalCtx, arguments)
+	return &decimalStdDevAggregate{agg: agg.(aggregateWithIntermediateResult)}
 }
 
 func newFloatStdDevAggregate(
@@ -4288,7 +4350,8 @@ func newFloatStdDevAggregate(
 func newDecimalStdDevAggregate(
 	params []*types.T, evalCtx *eval.Context, arguments tree.Datums,
 ) eval.AggregateFunc {
-	return &decimalStdDevAggregate{agg: newDecimalVarianceAggregate(params, evalCtx, arguments)}
+	agg := newDecimalVarianceAggregate(params, evalCtx, arguments)
+	return &decimalStdDevAggregate{agg: agg.(aggregateWithIntermediateResult)}
 }
 
 func newFloatFinalStdDevAggregate(
@@ -4300,13 +4363,15 @@ func newFloatFinalStdDevAggregate(
 func newDecimalFinalStdDevAggregate(
 	params []*types.T, evalCtx *eval.Context, arguments tree.Datums,
 ) eval.AggregateFunc {
-	return &decimalStdDevAggregate{agg: newDecimalFinalVarianceAggregate(params, evalCtx, arguments)}
+	agg := newDecimalFinalVarianceAggregate(params, evalCtx, arguments)
+	return &decimalStdDevAggregate{agg: agg.(aggregateWithIntermediateResult)}
 }
 
 func newIntStdDevPopAggregate(
 	params []*types.T, evalCtx *eval.Context, arguments tree.Datums,
 ) eval.AggregateFunc {
-	return &decimalStdDevAggregate{agg: newIntVarPopAggregate(params, evalCtx, arguments)}
+	agg := newIntVarPopAggregate(params, evalCtx, arguments)
+	return &decimalStdDevAggregate{agg: agg.(aggregateWithIntermediateResult)}
 }
 
 func newFloatStdDevPopAggregate(
@@ -4318,13 +4383,15 @@ func newFloatStdDevPopAggregate(
 func newDecimalStdDevPopAggregate(
 	params []*types.T, evalCtx *eval.Context, arguments tree.Datums,
 ) eval.AggregateFunc {
-	return &decimalStdDevAggregate{agg: newDecimalVarPopAggregate(params, evalCtx, arguments)}
+	agg := newDecimalVarPopAggregate(params, evalCtx, arguments)
+	return &decimalStdDevAggregate{agg: agg.(aggregateWithIntermediateResult)}
 }
 
 func newDecimalFinalStdDevPopAggregate(
 	params []*types.T, evalCtx *eval.Context, arguments tree.Datums,
 ) eval.AggregateFunc {
-	return &decimalStdDevAggregate{agg: newDecimalFinalVarPopAggregate(params, evalCtx, arguments)}
+	agg := newDecimalFinalVarPopAggregate(params, evalCtx, arguments)
+	return &decimalStdDevAggregate{agg: agg.(aggregateWithIntermediateResult)}
 }
 
 func newFloatFinalStdDevPopAggregate(
@@ -4369,13 +4436,7 @@ func (a *floatStdDevAggregate) Result() (tree.Datum, error) {
 
 // Result computes the square root of the variance aggregator.
 func (a *decimalStdDevAggregate) Result() (tree.Datum, error) {
-	// TODO(richardwu): both decimalVarianceAggregate and
-	// finalDecimalVarianceAggregate return a decimal result with
-	// default tree.DecimalCtx precision. We want to be able to specify that the
-	// varianceAggregate use tree.IntermediateCtx (with the extra precision)
-	// since it is returning an intermediate value for stdDevAggregate (of
-	// which we take the Sqrt).
-	variance, err := a.agg.Result()
+	variance, err := a.agg.intermediateResult()
 	if err != nil {
 		return nil, err
 	}

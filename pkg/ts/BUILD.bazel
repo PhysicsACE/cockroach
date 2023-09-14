@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -16,7 +15,6 @@ go_library(
         "rollup.go",
         "server.go",
         "timespan.go",
-        "util.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/ts",
     visibility = ["//visibility:public"],
@@ -26,14 +24,13 @@ go_library(
         "//pkg/kv/kvclient/kvtenant",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
-        "//pkg/kv/kvserver/allocator/storepool",
+        "//pkg/kv/kvserver/liveness",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/storage",
-        "//pkg/ts/catalog",
         "//pkg/ts/tspb",
-        "//pkg/util/contextutil",
+        "//pkg/ts/tsutil",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
         "//pkg/util/log",
@@ -75,18 +72,21 @@ go_test(
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvclient/kvtenant",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
+        "//pkg/multitenant/tenantcapabilities",
         "//pkg/roachpb",
-        "//pkg/rpc",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
+        "//pkg/security/username",
         "//pkg/server",
         "//pkg/settings/cluster",
         "//pkg/storage",
         "//pkg/testutils",
         "//pkg/testutils/localtestcluster",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/testcluster",
         "//pkg/ts/testmodel",
         "//pkg/ts/tspb",
         "//pkg/util/hlc",
@@ -101,5 +101,3 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
-
-get_x_data(name = "get_x_data")

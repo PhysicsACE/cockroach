@@ -12,6 +12,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -21,5 +23,7 @@ import (
 func TestMain(m *testing.M) {
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	serverutils.InitTestServerFactory(server.TestServerFactory)
+	kvtenantccl.InitConnectorFactory()
+	defer ccl.TestingEnableEnterprise()()
 	os.Exit(m.Run())
 }

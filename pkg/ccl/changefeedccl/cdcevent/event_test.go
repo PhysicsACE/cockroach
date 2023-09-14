@@ -38,8 +38,9 @@ func TestEventDescriptor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE TYPE status AS ENUM ('open', 'closed', 'inactive')`)
@@ -136,10 +137,13 @@ func TestEventDecoder(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, "SET CLUSTER SETTING kv.rangefeed.enabled = true")
 	sqlDB.Exec(t, `CREATE TYPE status AS ENUM ('open', 'closed', 'inactive')`)
 	sqlDB.Exec(t, `
 CREATE TABLE foo (
@@ -407,7 +411,6 @@ CREATE TABLE foo (
 			}
 		})
 	}
-
 }
 
 func TestEventColumnOrderingWithSchemaChanges(t *testing.T) {
@@ -416,10 +419,12 @@ func TestEventColumnOrderingWithSchemaChanges(t *testing.T) {
 	skip.UnderRace(t)
 	skip.UnderStress(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, "SET CLUSTER SETTING kv.rangefeed.enabled = true")
 	// Use alter column type to force column reordering.
 	sqlDB.Exec(t, `SET enable_experimental_alter_column_type_general = true`)
 
@@ -751,5 +756,52 @@ func TestMakeRowFromTuple(t *testing.T) {
 		require.Equal(t, current.valAsString, tree.AsStringWithFlags(d, tree.FmtExport))
 		return nil
 	}))
+}
 
+func BenchmarkEventDecoder(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
+	b.StopTimer()
+	srv, db, _ := serverutils.StartServer(b, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+
+	s := srv.ApplicationLayer()
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(b, "SET CLUSTER SETTING kv.rangefeed.enabled = true")
+	sqlDB.Exec(b, `
+CREATE TABLE foo (
+  a INT, 
+  b STRING, 
+  c STRING,
+  PRIMARY KEY (b, a)
+)`)
+
+	tableDesc := cdctest.GetHydratedTableDescriptor(b, s.ExecutorConfig(), "foo")
+	popRow, cleanup := cdctest.MakeRangeFeedValueReader(b, s.ExecutorConfig(), tableDesc)
+	sqlDB.Exec(b, "INSERT INTO foo VALUES (5, 'hello', 'world')")
+	v := popRow(b)
+	cleanup()
+
+	targets := changefeedbase.Targets{}
+	targets.Add(changefeedbase.Target{
+		TableID: tableDesc.GetID(),
+	})
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+	ctx := context.Background()
+	decoder, err := NewEventDecoder(ctx, &execCfg, targets, false, false)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, err := decoder.DecodeKV(
+			ctx, roachpb.KeyValue{Key: v.Key, Value: v.Value}, CurrentRow, v.Timestamp(), false)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
 }

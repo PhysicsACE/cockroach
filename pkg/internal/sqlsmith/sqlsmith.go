@@ -86,6 +86,7 @@ type Smither struct {
 	disableLimits              bool
 	disableWindowFuncs         bool
 	disableAggregateFuncs      bool
+	disableMutations           bool
 	simpleDatums               bool
 	avoidConsts                bool
 	outputSort                 bool
@@ -104,6 +105,8 @@ type Smither struct {
 	disableInsertSelect        bool
 	disableDivision            bool
 	disableDecimals            bool
+	disableOIDs                bool
+	disableUDFs                bool
 
 	bulkSrv     *httptest.Server
 	bulkFiles   map[string][]byte
@@ -170,6 +173,9 @@ var prettyCfg = func() tree.PrettyCfg {
 	cfg.Simplify = false
 	return cfg
 }()
+
+// TestingPrettyCfg is only exposed to be used in tests.
+var TestingPrettyCfg = prettyCfg
 
 // Generate returns a random SQL string.
 func (s *Smither) Generate() string {
@@ -264,11 +270,17 @@ func (o option) Apply(s *Smither) {
 	o.apply(s)
 }
 
+// DisableEverything disables every kind of statement.
+var DisableEverything = simpleOption("disable every kind of statement", func(s *Smither) {
+	s.stmtWeights = nil
+})
+
 // DisableMutations causes the Smither to not emit statements that could
 // mutate any on-disk data.
 var DisableMutations = simpleOption("disable mutations", func(s *Smither) {
 	s.stmtWeights = nonMutatingStatements
 	s.tableExprWeights = nonMutatingTableExprs
+	s.disableMutations = true
 })
 
 // SetComplexity configures the Smither's complexity, in other words the
@@ -312,6 +324,17 @@ var DisableDDLs = simpleOption("disable DDLs", func(s *Smither) {
 		{2, makeRollbackToSavepoint},
 		{2, makeCommit},
 		{2, makeRollback},
+	}
+})
+
+// OnlySingleDMLs causes the Smither to only emit single-statement DML (SELECT,
+// INSERT, UPDATE, DELETE).
+var OnlySingleDMLs = simpleOption("only single DMLs", func(s *Smither) {
+	s.stmtWeights = []statementWeight{
+		{20, makeSelect},
+		{5, makeInsert},
+		{5, makeUpdate},
+		{1, makeDelete},
 	}
 })
 
@@ -489,6 +512,16 @@ var DisableDecimals = simpleOption("disable decimals", func(s *Smither) {
 	s.disableDecimals = true
 })
 
+// DisableOIDs disables use of OID types in the query.
+var DisableOIDs = simpleOption("disable OIDs", func(s *Smither) {
+	s.disableOIDs = true
+})
+
+// DisableUDFs causes the Smither to disable user-defined functions.
+var DisableUDFs = simpleOption("disable udfs", func(s *Smither) {
+	s.disableUDFs = true
+})
+
 // CompareMode causes the Smither to generate statements that have
 // deterministic output.
 var CompareMode = multiOption(
@@ -512,6 +545,12 @@ var PostgresMode = multiOption(
 	simpleOption("postgres", func(s *Smither) {
 		s.postgres = true
 	})(),
+	// Postgres does not support index hinting.
+	DisableIndexHints(),
+	// CockroachDB supports OID type but the same OID value might be assigned to
+	// different objects from Postgres, and we thus disable using OID types in
+	// randomly generated queries.
+	DisableOIDs(),
 
 	// Some func impls differ from postgres, so skip them here.
 	// #41709
@@ -535,6 +574,9 @@ var PostgresMode = multiOption(
 	IgnoreFNs("^postgis_.*build_date"),
 	IgnoreFNs("^postgis_.*version"),
 	IgnoreFNs("^postgis_.*scripts"),
+	IgnoreFNs("hlc_to_timestamp"),
+	IgnoreFNs("st_s2covering"),
+	IgnoreFNs("sum_int"),
 )
 
 // MutatingMode causes the Smither to generate mutation statements in the same

@@ -22,10 +22,12 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -33,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
 
@@ -152,8 +155,8 @@ type Metrics struct {
 // proberOpsI is an interface that the prober will use to run ops against some
 // system. This interface exists so that ops can be mocked for tests.
 type proberOpsI interface {
-	Read(key interface{}) func(context.Context, *kv.Txn) error
-	Write(key interface{}) func(context.Context, *kv.Txn) error
+	Read(key roachpb.Key) func(context.Context, *kv.Txn) error
+	Write(key roachpb.Key) func(context.Context, *kv.Txn) error
 }
 
 // proberTxn is an interface that the prober will use to run txns. This
@@ -173,8 +176,11 @@ type proberTxn interface {
 type ProberOps struct{}
 
 // We attempt to commit a txn that reads some data at the key.
-func (p *ProberOps) Read(key interface{}) func(context.Context, *kv.Txn) error {
+func (p *ProberOps) Read(key roachpb.Key) func(context.Context, *kv.Txn) error {
 	return func(ctx context.Context, txn *kv.Txn) error {
+		if err := p.validateKey(key); err != nil {
+			return err
+		}
 		_, err := txn.Get(ctx, key)
 		return err
 	}
@@ -187,8 +193,11 @@ func (p *ProberOps) Read(key interface{}) func(context.Context, *kv.Txn) error {
 // there is no need to clean up data at the key post range split / merge.
 // Note that MVCC tombstones may be left by the probe, but this is okay, as
 // GC will clean it up.
-func (p *ProberOps) Write(key interface{}) func(context.Context, *kv.Txn) error {
+func (p *ProberOps) Write(key roachpb.Key) func(context.Context, *kv.Txn) error {
 	return func(ctx context.Context, txn *kv.Txn) error {
+		if err := p.validateKey(key); err != nil {
+			return err
+		}
 		// Use a single batch so that the entire txn requires a single pass
 		// through Raft. It's not strictly necessary that we Put before we
 		// Del the key, because a Del is blind and leaves a tombstone even
@@ -199,6 +208,43 @@ func (p *ProberOps) Write(key interface{}) func(context.Context, *kv.Txn) error 
 		b.Del(key)
 		return txn.CommitInBatch(ctx, b)
 	}
+}
+
+// errorIsExpectedDuringNormalOperation filters out errors that may be returned
+// during normal operation of CRDB.
+//
+// One such example is the `was permanently removed from the cluster at` error
+// that is returned to the kvclient of decommissioned nodes. This error does not
+// affect user traffic, since such traffic is drained off the node by the time it
+// becomes decommissioned.
+//
+// Since such errors do not indicate a problem with CRDB, kvprober does not report
+// them as an error in its metrics.
+func errorIsExpectedDuringNormalOperation(err error) bool {
+	// Note that errors *other* than decommissioned status errors, such as
+	// `use of closed network connection`, happen *occasionally* on the kvclient
+	// of a decommissioned node. The full set of other errors is not known exactly,
+	// and the errors mostly lack structure. Since they happen rarely, and since
+	// the intended use of kvprober is to page on a sustained error rate, not a
+	// single error, we choose to only filter out errors via the
+	// kvpb.IsDecommissionedStatusErr function.
+	return kvpb.IsDecommissionedStatusErr(err)
+}
+
+// validateKey returns an error if the key is not valid for use by the kvprober.
+// This is a sanity check to ensure that the kvprober does not corrupt user data
+// in the global keyspace or other system data in the local keyspace.
+func (p *ProberOps) validateKey(key roachpb.Key) error {
+	_, suffix, _, err := keys.DecodeRangeKey(key)
+	if err != nil {
+		return errors.NewAssertionErrorWithWrappedErrf(err,
+			"key %q is not a valid probe key; could not decode range key", key)
+	}
+	if !suffix.Equal(keys.LocalRangeProbeSuffix.AsRawKey()) {
+		return errors.AssertionFailedf(
+			"key %q is not a valid probe key; incorrect range key suffix", key)
+	}
+	return nil
 }
 
 // proberTxnImpl is used to run transactions.
@@ -230,18 +276,18 @@ func NewProber(opts Opts) *Prober {
 			ReadProbeAttempts: metric.NewCounter(metaReadProbeAttempts),
 			ReadProbeFailures: metric.NewCounter(metaReadProbeFailures),
 			ReadProbeLatency: metric.NewHistogram(metric.HistogramOptions{
-				Mode:     metric.HistogramModePreferHdrLatency,
-				Metadata: metaReadProbeLatency,
-				Duration: opts.HistogramWindowInterval,
-				Buckets:  metric.NetworkLatencyBuckets,
+				Mode:         metric.HistogramModePreferHdrLatency,
+				Metadata:     metaReadProbeLatency,
+				Duration:     opts.HistogramWindowInterval,
+				BucketConfig: metric.IOLatencyBuckets,
 			}),
 			WriteProbeAttempts: metric.NewCounter(metaWriteProbeAttempts),
 			WriteProbeFailures: metric.NewCounter(metaWriteProbeFailures),
 			WriteProbeLatency: metric.NewHistogram(metric.HistogramOptions{
-				Mode:     metric.HistogramModePreferHdrLatency,
-				Metadata: metaWriteProbeLatency,
-				Duration: opts.HistogramWindowInterval,
-				Buckets:  metric.NetworkLatencyBuckets,
+				Mode:         metric.HistogramModePreferHdrLatency,
+				Metadata:     metaWriteProbeLatency,
+				Duration:     opts.HistogramWindowInterval,
+				BucketConfig: metric.IOLatencyBuckets,
 			}),
 			WriteProbeQuarantineOldestDuration: metric.NewFunctionalGauge(
 				metaWriteProbeQuarantineOldestDuration,
@@ -327,8 +373,12 @@ func (p *Prober) readProbeImpl(ctx context.Context, ops proberOpsI, txns proberT
 		return
 	}
 	if err != nil {
-		log.Health.Errorf(ctx, "can't make a plan: %v", err)
-		p.metrics.ProbePlanFailures.Inc(1)
+		if errorIsExpectedDuringNormalOperation(err) {
+			log.Health.Warningf(ctx, "making a plan failed with expected error: %v", err)
+		} else {
+			log.Health.Errorf(ctx, "can't make a plan: %v", err)
+			p.metrics.ProbePlanFailures.Inc(1)
+		}
 		return
 	}
 
@@ -346,7 +396,7 @@ func (p *Prober) readProbeImpl(ctx context.Context, ops proberOpsI, txns proberT
 	// Slow enough response times are not different than errors from the
 	// perspective of the user.
 	timeout := readTimeout.Get(&p.settings.SV)
-	err = contextutil.RunWithTimeout(ctx, "read probe", timeout, func(ctx context.Context) error {
+	err = timeutil.RunWithTimeout(ctx, "read probe", timeout, func(ctx context.Context) error {
 		// We read a "range-local" key dedicated to probing. See pkg/keys for more.
 		// There is no data at the key, but that is okay. Even tho there is no data
 		// at the key, the prober still executes a read operation on the range.
@@ -358,9 +408,13 @@ func (p *Prober) readProbeImpl(ctx context.Context, ops proberOpsI, txns proberT
 		return txns.TxnRootKV(ctx, f)
 	})
 	if err != nil {
-		// TODO(josh): Write structured events with log.Structured.
-		log.Health.Errorf(ctx, "kv.Get(%s), r=%v failed with: %v", step.Key, step.RangeID, err)
-		p.metrics.ReadProbeFailures.Inc(1)
+		if errorIsExpectedDuringNormalOperation(err) {
+			log.Health.Warningf(ctx, "kv.Get(%s), r=%v failed with expected error: %v", step.Key, step.RangeID, err)
+		} else {
+			// TODO(josh): Write structured events with log.Structured.
+			log.Health.Errorf(ctx, "kv.Get(%s), r=%v failed with: %v", step.Key, step.RangeID, err)
+			p.metrics.ReadProbeFailures.Inc(1)
+		}
 		return
 	}
 
@@ -390,8 +444,12 @@ func (p *Prober) writeProbeImpl(ctx context.Context, ops proberOpsI, txns prober
 		return
 	}
 	if err != nil {
-		log.Health.Errorf(ctx, "can't make a plan: %v", err)
-		p.metrics.ProbePlanFailures.Inc(1)
+		if errorIsExpectedDuringNormalOperation(err) {
+			log.Health.Warningf(ctx, "making a plan failed with expected error: %v", err)
+		} else {
+			log.Health.Errorf(ctx, "can't make a plan: %v", err)
+			p.metrics.ProbePlanFailures.Inc(1)
+		}
 		return
 	}
 
@@ -402,7 +460,7 @@ func (p *Prober) writeProbeImpl(ctx context.Context, ops proberOpsI, txns prober
 	// Slow enough response times are not different than errors from the
 	// perspective of the user.
 	timeout := writeTimeout.Get(&p.settings.SV)
-	err = contextutil.RunWithTimeout(ctx, "write probe", timeout, func(ctx context.Context) error {
+	err = timeutil.RunWithTimeout(ctx, "write probe", timeout, func(ctx context.Context) error {
 		f := ops.Write(step.Key)
 		if bypassAdmissionControl.Get(&p.settings.SV) {
 			return txns.Txn(ctx, f)
@@ -410,11 +468,17 @@ func (p *Prober) writeProbeImpl(ctx context.Context, ops proberOpsI, txns prober
 		return txns.TxnRootKV(ctx, f)
 	})
 	if err != nil {
-		added := p.quarantineWritePool.maybeAdd(ctx, step)
-		log.Health.Errorf(
-			ctx, "kv.Txn(Put(%s); Del(-)), r=%v failed with: %v [quarantined=%t]", step.Key, step.RangeID, err, added,
-		)
-		p.metrics.WriteProbeFailures.Inc(1)
+		if errorIsExpectedDuringNormalOperation(err) {
+			log.Health.Warningf(
+				ctx, "kv.Txn(Put(%s); Del(-)), r=%v failed with expected error: %v", step.Key, step.RangeID, err,
+			)
+		} else {
+			added := p.quarantineWritePool.maybeAdd(ctx, step)
+			log.Health.Errorf(
+				ctx, "kv.Txn(Put(%s); Del(-)), r=%v failed with: %v [quarantined=%t]", step.Key, step.RangeID, err, added,
+			)
+			p.metrics.WriteProbeFailures.Inc(1)
+		}
 		return
 	}
 	// This will no-op if not in the quarantine pool.

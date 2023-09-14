@@ -23,13 +23,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -41,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -126,25 +125,11 @@ func getFirstStoreMetric(t *testing.T, s serverutils.TestServerInterface, name s
 	t.Helper()
 	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 	require.NoError(t, err)
-
-	var c int64
-	var found bool
-	store.Registry().Each(func(n string, v interface{}) {
-		if name == n {
-			switch t := v.(type) {
-			case *metric.Counter:
-				c = t.Count()
-				found = true
-			case *metric.Gauge:
-				c = t.Value()
-				found = true
-			}
-		}
-	})
-	if !found {
-		panic(fmt.Sprintf("couldn't find metric %s", name))
+	count, err := store.Metrics().GetStoreMetric(name)
+	if err != nil {
+		panic(err)
 	}
-	return c
+	return count
 }
 
 func TestAddReplicaViaLearner(t *testing.T) {
@@ -156,7 +141,7 @@ func TestAddReplicaViaLearner(t *testing.T) {
 	var receivedSnap int64
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		if atomic.CompareAndSwapInt64(&receivedSnap, 0, 1) {
 			close(blockUntilSnapshotCh)
 		} else {
@@ -252,7 +237,7 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 	activateBlocking := int64(1)
 	var count int64
 	knobs, ltk := makeReplicationTestKnobs()
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		if atomic.LoadInt64(&activateBlocking) > 0 {
 			// Signal waitForRebalanceToBlockCh to indicate the testing knob was hit.
 			close(waitForRebalanceToBlockCh)
@@ -264,7 +249,7 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 	ltk.storeKnobs.BeforeSendSnapshotThrottle = func() {
 		atomic.AddInt64(&count, 1)
 	}
-	ltk.storeKnobs.AfterSendSnapshotThrottle = func() {
+	ltk.storeKnobs.AfterSnapshotThrottle = func() {
 		atomic.AddInt64(&count, -1)
 	}
 	ctx := context.Background()
@@ -350,76 +335,147 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 	require.NoError(t, g.Wait())
 }
 
+type expectedMetric struct {
+	DelegateSnapshotSuccesses int64
+	DelegateSnapshotFailures  int64
+	RangeSnapshotRecvFailed   int64
+	RangeSnapshotRecvUnusable int64
+}
+
+func verifySnapshotMetrics(
+	t *testing.T, tc *testcluster.TestCluster, expected map[int]expectedMetric,
+) {
+	for id, metrics := range expected {
+		server := tc.Server(id)
+		store, _ := server.GetStores().(*kvserver.Stores).GetStore(server.GetFirstStoreID())
+		weakEqualf(t, metrics.DelegateSnapshotSuccesses, store.Metrics().DelegateSnapshotSuccesses.Count(), "metric successes, %d", id)
+		weakEqualf(t, metrics.DelegateSnapshotFailures, store.Metrics().DelegateSnapshotFailures.Count(), "metric failures, %d", id)
+		weakEqualf(t, metrics.RangeSnapshotRecvFailed, store.Metrics().RangeSnapshotRecvFailed.Count(), "metric recv failed, %d", id)
+		weakEqualf(t, metrics.RangeSnapshotRecvUnusable, store.Metrics().RangeSnapshotRecvUnusable.Count(), "metric recv unusable, %d", id)
+	}
+}
+
+const issuesFixed = false
+
+// TODO(baptist): This should be require.Equalf, but this is not consistent
+// enough. There are two reasons this is inconsistent.
+// 1) Raft snapshots still sometimes sneak in. (#96841)
+// 2) The delegate hasn't seen the updated descriptor in time.
+func weakEqualf(t *testing.T, successes int64, count int64, s string, id int) {
+	if issuesFixed {
+		require.Equalf(t, successes, count, s, id)
+	} else {
+		if successes != count {
+			log.Warningf(context.Background(), "Not equal, expected %d, got %d for %s %d", successes, count, s, id)
+		}
+	}
+}
+
 // TestDelegateSnapshot verifies that the correct delegate is chosen when
 // sending snapshots to stores.
-// TODO: It is currently disabled because with raft snapshots sometimes being
-// required and not going through snapshot delegation, the results are
-// unpredictable.
 func TestDelegateSnapshot(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 96841, "Occasionally fails until 87553 is resolved")
-
 	ctx := context.Background()
 
-	// Synchronize on the moment before the snapshot gets sent to measure the
-	// state at that time.
-	requestChannel := make(chan *kvserverpb.DelegateSendSnapshotRequest, 10)
-
-	setupFn := func(t *testing.T) (
-		*testcluster.TestCluster,
-		roachpb.Key,
-	) {
-		knobs, ltk := makeReplicationTestKnobs()
-		ltk.storeKnobs.DisableRaftSnapshotQueue = true
-
-		ltk.storeKnobs.SendSnapshot = func(request *kvserverpb.DelegateSendSnapshotRequest) {
+	// Record snapshots as they are sent on this channel for later analysis.
+	requestChannel := make(chan *kvserverpb.DelegateSendSnapshotRequest, 2)
+	knobs, ltk := makeReplicationTestKnobs()
+	ltk.storeKnobs.SendSnapshot = func(request *kvserverpb.DelegateSendSnapshotRequest) {
+		// TODO(abaptist): Remove this condition once 96841 is fixed. This
+		// accounts spurious raft snapshots that are sent. Also disable the raft
+		// snapshot queue using ltk.storeKnobs.DisableRaftSnapshotQueue = true.
+		if request.SenderQueueName != kvserverpb.SnapshotRequest_RAFT_SNAPSHOT_QUEUE {
 			requestChannel <- request
 		}
-
-		localityA := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "a"}}}
-		localityB := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "b"}}}
-
-		localityServerArgs := make(map[int]base.TestServerArgs)
-		localityServerArgs[0] = base.TestServerArgs{Knobs: knobs, Locality: localityA}
-		localityServerArgs[1] = base.TestServerArgs{Knobs: knobs, Locality: localityA}
-		localityServerArgs[2] = base.TestServerArgs{Knobs: knobs, Locality: localityB}
-		localityServerArgs[3] = base.TestServerArgs{Knobs: knobs, Locality: localityB}
-
-		tc := testcluster.StartTestCluster(
-			t, 4, base.TestClusterArgs{
-				ServerArgsPerNode: localityServerArgs,
-				ReplicationMode:   base.ReplicationManual,
-			},
-		)
-		scratchKey := tc.ScratchRange(t)
-		return tc, scratchKey
 	}
 
-	tc, scratchKey := setupFn(t)
+	localityA := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "a"}}}
+	localityB := roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "b"}}}
+	localityServerArgs := map[int]base.TestServerArgs{
+		0: {Knobs: knobs, Locality: localityA},
+		1: {Knobs: knobs, Locality: localityA},
+		2: {Knobs: knobs, Locality: localityB},
+		3: {Knobs: knobs, Locality: localityB},
+	}
+
+	tc := testcluster.StartTestCluster(
+		t, 4, base.TestClusterArgs{
+			ServerArgsPerNode: localityServerArgs,
+			ReplicationMode:   base.ReplicationManual,
+		},
+	)
+	verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+		0: {0, 0, 0, 0},
+		1: {0, 0, 0, 0},
+		2: {0, 0, 0, 0},
+		3: {0, 0, 0, 0},
+	})
+
+	scratchKey := tc.ScratchRange(t)
 	defer tc.Stopper().Stop(ctx)
-
-	// Node 3 (loc B) can only get the data from node 1 as its the only one that has it.
-	_ = tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2)...)
-	request := <-requestChannel
-	require.Equal(t, request.DelegatedSender.StoreID, roachpb.StoreID(1))
-	// Drain the channel. Unfortunately there are occasionally spurious raft snapshots sent.
-	for len(requestChannel) > 0 {
-		<-requestChannel
+	// Node 3 (loc B) can only get the data from node 1 as it is the only replica.
+	{
+		_ = tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2)...)
+		request := <-requestChannel
+		require.Equalf(t, request.DelegatedSender.StoreID, roachpb.StoreID(1), "Wrong sender for request %+v", request)
 	}
 
-	// Node 4 (loc B) should get the snapshot from node 3 as its the same locality.
-	_ = tc.AddVotersOrFatal(t, scratchKey, tc.Targets(3)...)
-	request = <-requestChannel
-	require.Equal(t, request.DelegatedSender.StoreID, roachpb.StoreID(3))
-	for len(requestChannel) > 0 {
-		<-requestChannel
+	verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+		0: {0, 0, 0, 0},
+		1: {0, 0, 0, 0},
+		2: {0, 0, 0, 0},
+		3: {0, 0, 0, 0},
+	})
+
+	// Node 4 (loc B) should get the delegated snapshot from node 3 which is the
+	// same locality.
+	{
+		leaderDesc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(3)...)
+		// Wait until we are sure the delegate store has received the descriptor. It
+		// can't delegate until it receives the latest generation descriptor.
+		testutils.SucceedsSoon(t, func() error {
+			var desc roachpb.RangeDescriptor
+			rKey := keys.MustAddr(scratchKey)
+			require.NoError(t, tc.Servers[2].DB().GetProto(ctx, keys.RangeDescriptorKey(rKey), &desc))
+			if desc.Generation != leaderDesc.Generation {
+				return errors.Newf("Generation mismatch %d != %d", desc.Generation, leaderDesc.Generation)
+			}
+			return nil
+		})
+
+		request := <-requestChannel
+		require.Equalf(t, request.DelegatedSender.StoreID, roachpb.StoreID(3), "Wrong type of request %+v", request)
+		// TODO(abaptist): Remove this loop. Sometimes the delegated request fails
+		// due to Raft updating the generation before we can delegate. Even with the
+		// loop above to get the delegate on the correct generation, this is racy if
+		// there is a raft snapshot. We fall back to not using our snapshot if the
+		// generation fails, but this means that a second request is sent from the
+		// leaseholder.
+		for len(requestChannel) > 0 {
+			<-requestChannel
+		}
+
+		verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+			0: {1, 0, 0, 0},
+			1: {0, 0, 0, 0},
+			2: {0, 0, 0, 0},
+			3: {0, 0, 0, 0},
+		})
 	}
 
-	// Node 2 (loc A) should get the snapshot from node 1 as it is the same locality.
-	_ = tc.AddVotersOrFatal(t, scratchKey, tc.Targets(1)...)
-	request = <-requestChannel
-	require.Equal(t, request.DelegatedSender.StoreID, roachpb.StoreID(1))
+	// Node 2 (loc A) should get the snapshot from node 1 as they have the same locality.
+	{
+		_ = tc.AddVotersOrFatal(t, scratchKey, tc.Targets(1)...)
+		request := <-requestChannel
+		require.Equalf(t, request.DelegatedSender.StoreID, roachpb.StoreID(1), "Wrong type of request %+v", request)
+	}
+	verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+		0: {1, 0, 0, 0},
+		1: {0, 0, 0, 0},
+		2: {0, 0, 0, 0},
+		3: {0, 0, 0, 0},
+	})
 }
 
 // TestDelegateSnapshotFails is a test that ensure we fail fast when the
@@ -434,7 +490,11 @@ func TestDelegateSnapshotFails(t *testing.T) {
 		desc []roachpb.ReplicaDescriptor
 	}
 
-	setupFn := func(t *testing.T) (
+	setupFn := func(t *testing.T,
+		receiveFunc func(context.Context, *kvserverpb.SnapshotRequest_Header) error,
+		sendFunc func(*kvserverpb.DelegateSendSnapshotRequest),
+		processRaft func(roachpb.StoreID) bool,
+	) (
 		*testcluster.TestCluster,
 		roachpb.Key,
 	) {
@@ -448,6 +508,9 @@ func TestDelegateSnapshotFails(t *testing.T) {
 				defer senders.mu.Unlock()
 				return senders.desc
 			}
+		ltk.storeKnobs.ReceiveSnapshot = receiveFunc
+		ltk.storeKnobs.SendSnapshot = sendFunc
+		ltk.storeKnobs.DisableProcessRaft = processRaft
 
 		tc := testcluster.StartTestCluster(
 			t, 4, base.TestClusterArgs{
@@ -464,7 +527,7 @@ func TestDelegateSnapshotFails(t *testing.T) {
 	// the learner is on. Assert that the failure is detected and change replicas
 	// fails fast.
 	t.Run("receiver", func(t *testing.T) {
-		tc, scratchKey := setupFn(t)
+		tc, scratchKey := setupFn(t, nil, nil, nil)
 		defer tc.Stopper().Stop(ctx)
 
 		desc, err := tc.LookupRange(scratchKey)
@@ -478,24 +541,28 @@ func TestDelegateSnapshotFails(t *testing.T) {
 		)
 
 		require.True(t, testutils.IsError(err, "partitioned"), `expected partitioned error got: %+v`, err)
+		verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+			0: {0, 0, 0, 0},
+			1: {0, 0, 0, 0},
+			2: {0, 0, 0, 0},
+			3: {0, 0, 0, 0},
+		})
 	})
 
 	// Add a follower replica to act as the snapshot sender, and kill the server
 	// the sender is on. Assert that the failure is detected and change replicas
 	// fails fast.
 	t.Run("sender_no_fallback", func(t *testing.T) {
-		tc, scratchKey := setupFn(t)
+		tc, scratchKey := setupFn(t, nil, nil, nil)
 		defer tc.Stopper().Stop(ctx)
 
 		// Add a replica that will be the delegated sender, and another so we have
-		// quorum with this node down
+		// quorum with this node down.
 		desc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2, 3)...)
 
-		replicaDesc, ok := desc.GetReplicaDescriptor(3)
-		require.True(t, ok)
 		// Always use node 3 (index 2) as the only delegate.
 		senders.mu.Lock()
-		senders.desc = append(senders.desc, replicaDesc)
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3})
 		senders.mu.Unlock()
 
 		// Now stop accepting traffic to node 3 (index 2).
@@ -505,27 +572,30 @@ func TestDelegateSnapshotFails(t *testing.T) {
 		_, err = tc.Servers[0].DB().AdminChangeReplicas(
 			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
 		)
-		log.Infof(ctx, "Err=%v", err)
-		require.True(t, testutils.IsError(err, "partitioned"), `expected partitioned error got: %+v`, err)
+		// The delegate can not send this request since it does not have the latest
+		// generation descriptor.
+		require.ErrorContains(t, err, "generation has changed")
+		verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+			0: {0, 1, 0, 0},
+			1: {0, 0, 0, 0},
+			2: {0, 0, 0, 0},
+			3: {0, 0, 0, 0},
+		})
 	})
 
 	// Identical setup as the previous test, but allow a fallback to the leaseholder.
 	t.Run("sender_with_fallback", func(t *testing.T) {
-		tc, scratchKey := setupFn(t)
+		tc, scratchKey := setupFn(t, nil, nil, nil)
 		defer tc.Stopper().Stop(ctx)
 
 		// Add a replica that will be the delegated sender, and another so we have
 		// quorum with this node down
 		desc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2, 3)...)
 
-		replicaDesc, ok := desc.GetReplicaDescriptor(3)
-		require.True(t, ok)
-		leaseholderDesc, ok := desc.GetReplicaDescriptor(1)
-		require.True(t, ok)
 		// First try to use node 3 (index 2) as the delegate, but fall back to the leaseholder on failure.
 		senders.mu.Lock()
-		senders.desc = append(senders.desc, replicaDesc)
-		senders.desc = append(senders.desc, leaseholderDesc)
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3})
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 1})
 		senders.mu.Unlock()
 
 		// Now stop accepting traffic to node 3 (index 2).
@@ -536,6 +606,164 @@ func TestDelegateSnapshotFails(t *testing.T) {
 			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
 		)
 		require.NoError(t, err)
+		verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+			0: {0, 1, 0, 0},
+			1: {0, 0, 0, 0},
+			2: {0, 0, 0, 0},
+			3: {0, 0, 0, 0},
+		})
+	})
+	t.Run("receiver_rejects", func(t *testing.T) {
+		var block atomic.Int32
+		tc, scratchKey := setupFn(
+			t,
+			func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
+				// TODO(abaptist): Remove this check once #96841 is fixed.
+				if h.SenderQueueName == kvserverpb.SnapshotRequest_RAFT_SNAPSHOT_QUEUE {
+					return nil
+				}
+				if val := block.Load(); val > 0 {
+					block.Add(-1)
+					return errors.Newf("BAM: receive error %d", val)
+				}
+				return nil
+			},
+			nil,
+			nil,
+		)
+		defer tc.Stopper().Stop(ctx)
+
+		// Add a replica that will be the delegated sender, and another so we have
+		// quorum with this node down
+		desc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2, 3)...)
+
+		// First try to use node 3 (index 2) as the delegate, but fall back to the leaseholder on failure.
+		senders.mu.Lock()
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 3, StoreID: 3})
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 1})
+		senders.mu.Unlock()
+
+		block.Store(2)
+		_, err := tc.Servers[0].DB().AdminChangeReplicas(
+			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+		)
+		require.ErrorContains(t, err, "BAM: receive error")
+
+		// There will be two attempts to send this, both fail.
+		verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+			0: {0, 1, 0, 0},
+			1: {0, 0, 2, 0},
+			2: {0, 0, 0, 0},
+			3: {0, 0, 0, 0},
+		})
+	})
+	// Test that the delegate that doesn't have the snapshot that we fall back to
+	// the leaseholder and correctly increment the stats.
+	t.Run("delegate_missing_range", func(t *testing.T) {
+		tc, scratchKey := setupFn(t, nil, nil, nil)
+		defer tc.Stopper().Stop(ctx)
+		desc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2)...)
+
+		// First try to use node 4 (index 3) as the delegate, but fall back to the leaseholder on failure.
+		senders.mu.Lock()
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 4, StoreID: 4})
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 1})
+		senders.mu.Unlock()
+
+		_, err := tc.Servers[0].DB().AdminChangeReplicas(
+			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+		)
+		require.NoError(t, err)
+
+		verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+			0: {0, 1, 0, 0},
+			1: {0, 0, 0, 0},
+			2: {0, 0, 0, 0},
+			3: {0, 0, 0, 0},
+		})
+	})
+
+	// NB: This test indicates a potential problem with delegated snapshots as
+	// they currently work. The generation changes on a change replica request,
+	// however if the delegation request races ahead of the Raft level update,
+	// then the delegate will not be used. In testing we don't see this often,
+	// however it is something to watch out for especially on overloaded servers.
+	t.Run("delegate_raft_slow", func(t *testing.T) {
+		var block atomic.Bool
+		tc, scratchKey := setupFn(t, nil, nil,
+			func(id roachpb.StoreID) bool {
+				return id == 4 && block.Load()
+			})
+		defer tc.Stopper().Stop(ctx)
+		desc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2, 3)...)
+
+		// Choose the store which we are about to block.
+		senders.mu.Lock()
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 4, StoreID: 4})
+		senders.mu.Unlock()
+
+		// Don't allow store 4 to see the new descriptor through Raft.
+		block.Store(true)
+		_, err := tc.Servers[0].DB().AdminChangeReplicas(
+			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+		)
+		require.ErrorContains(t, err, "generation has changed")
+
+		verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+			0: {0, 1, 0, 0},
+			1: {0, 0, 0, 0},
+			2: {0, 0, 0, 0},
+			3: {0, 0, 0, 0},
+		})
+	})
+
+	// This test ensures that the leader doesn't truncate while the delegate
+	// snapshot is in flight. Right after the leader sends the delegate request,
+	// but before the snapshot has been created, truncate the log. This test is
+	// not "as good" as it could be since the new node is in the probe state so
+	// the log truncation constraints aren't really necessary since we don't
+	// truncate anything in that state. This test will be better if it could be
+	// tested on Raft snapshots.
+	t.Run("truncate_during_send", func(t *testing.T) {
+		var blockRaft atomic.Bool
+		var truncateLog func()
+
+		tc, scratchKey := setupFn(t, nil,
+			func(*kvserverpb.DelegateSendSnapshotRequest) {
+				if blockRaft.Load() {
+					truncateLog()
+				}
+			}, nil)
+		defer tc.Stopper().Stop(ctx)
+		// This will truncate the log on the first store.
+		truncateLog = func() {
+			server := tc.Servers[0]
+			store, _ := server.GetStores().(*kvserver.Stores).GetStore(server.GetFirstStoreID())
+			store.MustForceRaftLogScanAndProcess()
+		}
+
+		desc := tc.AddVotersOrFatal(t, scratchKey, tc.Targets(2, 3)...)
+
+		// Chose a delegate to block.
+		senders.mu.Lock()
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 4, StoreID: 4})
+		senders.desc = append(senders.desc, roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 1})
+		senders.mu.Unlock()
+		// First try to use node 3 (index 2) as the delegate, but fall back to the leaseholder on failure.
+
+		// Don't allow the new store to see Raft updates.
+		blockRaft.Store(true)
+		_, err := tc.Servers[0].DB().AdminChangeReplicas(
+			ctx, scratchKey, desc, kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(1)),
+		)
+		require.NoError(t, err)
+
+		verifySnapshotMetrics(t, tc, map[int]expectedMetric{
+			0: {1, 0, 0, 0},
+			1: {0, 0, 0, 0},
+			2: {0, 0, 0, 0},
+			3: {0, 0, 0, 0},
+		})
 	})
 }
 
@@ -544,7 +772,7 @@ func TestLearnerRaftConfState(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	verifyLearnerInRaftOnNodes := func(
-		key roachpb.Key, id roachpb.ReplicaID, servers []*server.TestServer,
+		key roachpb.Key, id roachpb.ReplicaID, servers []serverutils.TestServerInterface,
 	) {
 		t.Helper()
 		var repls []*kvserver.Replica
@@ -633,7 +861,7 @@ func TestLearnerSnapshotFailsRollback(t *testing.T) {
 	runTest := func(t *testing.T, replicaType roachpb.ReplicaType) {
 		var rejectSnapshotErr atomic.Value // error
 		knobs, ltk := makeReplicationTestKnobs()
-		ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+		ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 			if err := rejectSnapshotErr.Load().(error); err != nil {
 				return err
 			}
@@ -722,9 +950,10 @@ func testRaftSnapshotsToNonVoters(t *testing.T, drainReceivingNode bool) {
 	scratchStartKey := tc.ScratchRange(t)
 	g, ctx := errgroup.WithContext(ctx)
 
+	metrics := []string{".rebalancing", ".recovery", ".unknown", ""}
 	// Record the snapshot metrics before anything has been sent / received.
-	senderTotalBefore, senderMetricsMapBefore := getSnapshotBytesMetrics(t, tc, 0 /* serverIdx */)
-	receiverTotalBefore, receiverMetricsMapBefore := getSnapshotBytesMetrics(t, tc, 1 /* serverIdx */)
+	senderMetricsMapBefore := getSnapshotBytesMetrics(t, tc, 0 /* serverIdx */, metrics)
+	receiverMetricsMapBefore := getSnapshotBytesMetrics(t, tc, 1 /* serverIdx */, metrics)
 
 	// Add a new voting replica, but don't initialize it. Note that
 	// `tc.AddNonVoters` will not return until the newly added non-voter is
@@ -755,8 +984,7 @@ func testRaftSnapshotsToNonVoters(t *testing.T, drainReceivingNode bool) {
 		// effect on the outcome of this test.
 		const drainingServerIdx = 1
 		const drainingNodeID = drainingServerIdx + 1
-		client, err := tc.GetAdminClient(ctx, t, drainingServerIdx)
-		require.NoError(t, err)
+		client := tc.GetAdminClient(t, drainingServerIdx)
 		drain(ctx, t, client, drainingNodeID)
 	}
 
@@ -800,36 +1028,34 @@ func testRaftSnapshotsToNonVoters(t *testing.T, drainReceivingNode bool) {
 	require.NoError(t, g.Wait())
 
 	// Record the snapshot metrics for the sender after the raft snapshot was sent.
-	senderTotalAfter, senderMetricsMapAfter := getSnapshotBytesMetrics(t, tc, 0)
+	senderMetricsMapAfter := getSnapshotBytesMetrics(t, tc, 0, metrics)
 
 	// Asserts that the raft snapshot (aka recovery snapshot) bytes sent have been
 	// recorded and that it was not double counted in a different metric.
-	senderTotalDelta, senderMapDelta := getSnapshotMetricsDiff(senderTotalBefore, senderMetricsMapBefore, senderTotalAfter, senderMetricsMapAfter)
+	senderMapDelta := getSnapshotMetricsDiff(senderMetricsMapBefore, senderMetricsMapAfter)
 
-	senderTotalExpected := snapshotBytesMetrics{sentBytes: snapshotLength, rcvdBytes: 0}
-	senderMapExpected := map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics{
-		kvserverpb.SnapshotRequest_REBALANCE: {sentBytes: 0, rcvdBytes: 0},
-		kvserverpb.SnapshotRequest_RECOVERY:  {sentBytes: snapshotLength, rcvdBytes: 0},
-		kvserverpb.SnapshotRequest_UNKNOWN:   {sentBytes: 0, rcvdBytes: 0},
+	senderMapExpected := map[string]snapshotBytesMetrics{
+		".rebalancing": {sentBytes: 0, rcvdBytes: 0},
+		".recovery":    {sentBytes: snapshotLength, rcvdBytes: 0},
+		".unknown":     {sentBytes: 0, rcvdBytes: 0},
+		"":             {sentBytes: snapshotLength, rcvdBytes: 0},
 	}
-	require.Equal(t, senderTotalExpected, senderTotalDelta)
 	require.Equal(t, senderMapExpected, senderMapDelta)
 
 	// Record the snapshot metrics for the receiver after the raft snapshot was
 	// received.
-	receiverTotalAfter, receiverMetricsMapAfter := getSnapshotBytesMetrics(t, tc, 1)
+	receiverMetricsMapAfter := getSnapshotBytesMetrics(t, tc, 1, metrics)
 
 	// Asserts that the raft snapshot (aka recovery snapshot) bytes received have
 	// been recorded and that it was not double counted in a different metric.
-	receiverTotalDelta, receiverMapDelta := getSnapshotMetricsDiff(receiverTotalBefore, receiverMetricsMapBefore, receiverTotalAfter, receiverMetricsMapAfter)
+	receiverMapDelta := getSnapshotMetricsDiff(receiverMetricsMapBefore, receiverMetricsMapAfter)
 
-	receiverTotalExpected := snapshotBytesMetrics{sentBytes: 0, rcvdBytes: snapshotLength}
-	receiverMapExpected := map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics{
-		kvserverpb.SnapshotRequest_REBALANCE: {sentBytes: 0, rcvdBytes: 0},
-		kvserverpb.SnapshotRequest_RECOVERY:  {sentBytes: 0, rcvdBytes: snapshotLength},
-		kvserverpb.SnapshotRequest_UNKNOWN:   {sentBytes: 0, rcvdBytes: 0},
+	receiverMapExpected := map[string]snapshotBytesMetrics{
+		".rebalancing": {sentBytes: 0, rcvdBytes: 0},
+		".recovery":    {sentBytes: 0, rcvdBytes: snapshotLength},
+		".unknown":     {sentBytes: 0, rcvdBytes: 0},
+		"":             {sentBytes: 0, rcvdBytes: snapshotLength},
 	}
-	require.Equal(t, receiverTotalExpected, receiverTotalDelta)
 	require.Equal(t, receiverMapExpected, receiverMapDelta)
 }
 
@@ -863,13 +1089,12 @@ func TestSnapshotsToDrainingNodes(t *testing.T) {
 			},
 		)
 		defer tc.Stopper().Stop(ctx)
-		client, err := tc.GetAdminClient(ctx, t, drainingServerIdx)
-		require.NoError(t, err)
+		client := tc.GetAdminClient(t, drainingServerIdx)
 		drain(ctx, t, client, drainingNodeID)
 
 		// Now, we try to add a replica to it, we expect that to fail.
 		scratchKey := tc.ScratchRange(t)
-		_, err = tc.AddVoters(scratchKey, makeReplicationTargets(drainingNodeID)...)
+		_, err := tc.AddVoters(scratchKey, makeReplicationTargets(drainingNodeID)...)
 		require.Regexp(t, "store is draining", err)
 	})
 
@@ -946,51 +1171,79 @@ func TestSplitWithLearnerOrJointConfig(t *testing.T) {
 func TestSplitRetriesOnFailedExitOfJointConfig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ctx := context.Background()
 
-	var rangeIDAtomic int64
-	var rejectedCount int
-	const maxRejects = 3
-	reqFilter := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
-		rangeID := roachpb.RangeID(atomic.LoadInt64(&rangeIDAtomic))
-		if ba.RangeID == rangeID && ba.IsSingleTransferLeaseRequest() && rejectedCount < maxRejects {
-			rejectedCount++
-			repl := ba.Requests[0].GetTransferLease().Lease.Replica
-			status := raftutil.ReplicaStateProbe
-			err := kvserver.NewLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(repl, status)
-			return kvpb.NewError(err)
-		}
-		return nil
+	testCases := []struct {
+		name  string
+		errFn func(*kvpb.TransferLeaseRequest) error
+	}{
+		{
+			name: "targetMayNeedSnapshot",
+			errFn: func(req *kvpb.TransferLeaseRequest) error {
+				repl := req.Lease.Replica
+				status := raftutil.ReplicaStateProbe
+				return kvserver.NewLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(repl, status)
+			},
+		},
+		{
+			name: "replicaNotFound",
+			errFn: func(_ *kvpb.TransferLeaseRequest) error {
+				return roachpb.ErrReplicaNotFound
+			},
+		},
+		{
+			name: "replicaCannotHoldLease",
+			errFn: func(_ *kvpb.TransferLeaseRequest) error {
+				return roachpb.ErrReplicaCannotHoldLease
+			},
+		},
 	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var rangeIDAtomic int64
+			var rejectedCount int
+			const maxRejects = 3
+			reqFilter := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+				rangeID := roachpb.RangeID(atomic.LoadInt64(&rangeIDAtomic))
+				if ba.RangeID == rangeID && ba.IsSingleTransferLeaseRequest() && rejectedCount < maxRejects {
+					rejectedCount++
+					req := ba.Requests[0].GetTransferLease()
+					err := tc.errFn(req)
+					return kvpb.NewError(err)
+				}
+				return nil
+			}
 
-	knobs, ltk := makeReplicationTestKnobs()
-	knobs.Store.(*kvserver.StoreTestingKnobs).TestingRequestFilter = reqFilter
-	tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
-		ServerArgs:      base.TestServerArgs{Knobs: knobs},
-		ReplicationMode: base.ReplicationManual,
-	})
-	defer tc.Stopper().Stop(ctx)
+			ctx := context.Background()
+			knobs, ltk := makeReplicationTestKnobs()
+			knobs.Store.(*kvserver.StoreTestingKnobs).TestingRequestFilter = reqFilter
+			tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
+				ServerArgs:      base.TestServerArgs{Knobs: knobs},
+				ReplicationMode: base.ReplicationManual,
+			})
+			defer tc.Stopper().Stop(ctx)
 
-	scratchStartKey := tc.ScratchRange(t)
-	scratchDesc := tc.LookupRangeOrFatal(t, scratchStartKey)
-	atomic.StoreInt64(&rangeIDAtomic, int64(scratchDesc.RangeID))
+			scratchStartKey := tc.ScratchRange(t)
+			scratchDesc := tc.LookupRangeOrFatal(t, scratchStartKey)
+			atomic.StoreInt64(&rangeIDAtomic, int64(scratchDesc.RangeID))
 
-	// Rebalance the range from one store to the other. This will enter a joint
-	// configuration and then stop because of the testing knobs.
-	atomic.StoreInt64(&ltk.replicationAlwaysUseJointConfig, 1)
-	atomic.StoreInt64(&ltk.replicaAddStopAfterJointConfig, 1)
-	tc.RebalanceVoterOrFatal(ctx, t, scratchStartKey, tc.Target(0), tc.Target(1))
+			// Rebalance the range from one store to the other. This will enter a joint
+			// configuration and then stop because of the testing knobs.
+			atomic.StoreInt64(&ltk.replicationAlwaysUseJointConfig, 1)
+			atomic.StoreInt64(&ltk.replicaAddStopAfterJointConfig, 1)
+			tc.RebalanceVoterOrFatal(ctx, t, scratchStartKey, tc.Target(0), tc.Target(1))
 
-	// Perform a split of the range. This will auto-transitions us out of the
-	// joint conf before doing work. However, because of the filter we installed
-	// above, this will first run into a series of retryable errors when
-	// attempting to perform a lease transfer. The split should retry until the
-	// join configuration completes.
-	left, right := tc.SplitRangeOrFatal(t, scratchStartKey.Next())
-	require.False(t, left.Replicas().InAtomicReplicationChange(), left)
-	require.False(t, right.Replicas().InAtomicReplicationChange(), right)
+			// Perform a split of the range. This will auto-transitions us out of the
+			// joint conf before doing work. However, because of the filter we installed
+			// above, this will first run into a series of retryable errors when
+			// attempting to perform a lease transfer. The split should retry until the
+			// joint configuration completes.
+			left, right := tc.SplitRangeOrFatal(t, scratchStartKey.Next())
+			require.False(t, left.Replicas().InAtomicReplicationChange(), left)
+			require.False(t, right.Replicas().InAtomicReplicationChange(), right)
 
-	require.Equal(t, maxRejects, rejectedCount)
+			require.Equal(t, maxRejects, rejectedCount)
+		})
+	}
 }
 
 func TestReplicateQueueSeesLearnerOrJointConfig(t *testing.T) {
@@ -1118,7 +1371,7 @@ func TestRaftSnapshotQueueSeesLearner(t *testing.T) {
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
 	ltk.storeKnobs.DisableRaftSnapshotQueue = true
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		select {
 		case <-blockSnapshotsCh:
 		case <-time.After(10 * time.Second):
@@ -1182,7 +1435,7 @@ func TestLearnerAdminChangeReplicasRace(t *testing.T) {
 	blockUntilSnapshotCh := make(chan struct{}, 2)
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		blockUntilSnapshotCh <- struct{}{}
 		<-blockSnapshotsCh
 		return nil
@@ -1398,7 +1651,8 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s'`,
 		testingTargetDuration))
 	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '%s'`, testingSideTransportInterval))
-	db.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true`)
+	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '%s'`, testingRangeFeedInterval))
+	db.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.follower_reads.enabled = true`)
 
 	scratchStartKey := tc.ScratchRange(t)
 	var scratchDesc roachpb.RangeDescriptor
@@ -1408,7 +1662,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 
 	check := func() {
 		ts := tc.Server(0).Clock().Now()
-		txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0, int32(tc.Server(0).SQLInstanceID()))
+		txn := roachpb.MakeTransaction("txn", nil, 0, 0, ts, 0, int32(tc.Server(0).SQLInstanceID()), 0)
 		req := &kvpb.BatchRequest{Header: kvpb.Header{
 			RangeID:   scratchDesc.RangeID,
 			Timestamp: ts,
@@ -1466,7 +1720,6 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 
 func TestLearnerOrJointConfigAdminRelocateRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 95500, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1477,10 +1730,33 @@ func TestLearnerOrJointConfigAdminRelocateRange(t *testing.T) {
 	})
 	defer tc.Stopper().Stop(ctx)
 
+	tc.WaitForNodeLiveness(t)
+
 	scratchStartKey := tc.ScratchRange(t)
 	ltk.withStopAfterLearnerAtomic(func() {
 		_ = tc.AddVotersOrFatal(t, scratchStartKey, tc.Target(1))
 		_ = tc.AddVotersOrFatal(t, scratchStartKey, tc.Target(2))
+	})
+
+	{
+		// Ensure that the test starts with the expected number of learners:
+		// (n1,s1):1, (n2,s2):2 LEARNER, (n3,s3):3 LEARNER
+		desc := tc.LookupRangeOrFatal(t, scratchStartKey)
+		require.Len(t, desc.Replicas().LearnerDescriptors(), 2)
+	}
+
+	// Assert that initially there are no snapshots in flight to learners. This
+	// is an important precondition before testing AdminRelocateRange below, as
+	// AdminRelocateRange won't handle learners which have inflight snapshots and
+	// this test will flake.
+	testutils.SucceedsSoon(t, func() error {
+		desc := tc.LookupRangeOrFatal(t, scratchStartKey)
+		repl, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
+		require.NoError(t, err)
+		if repl.HasOutstandingLearnerSnapshotInFlightForTesting() {
+			return errors.Errorf("outstanding learner snapshot in flight %s", desc)
+		}
+		return nil
 	})
 
 	check := func(voterTargets []roachpb.ReplicationTarget) {
@@ -1699,10 +1975,11 @@ func TestLearnerAndJointConfigAdminMerge(t *testing.T) {
 func TestMergeQueueDoesNotInterruptReplicationChange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 94951)
 	ctx := context.Background()
 	var activateSnapshotTestingKnob int64
+	var snapshotStarted int64
 	blockSnapshot := make(chan struct{})
+	snapshotInProgress := make(chan struct{})
 	tc := testcluster.StartTestCluster(
 		t, 2, base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
@@ -1712,8 +1989,16 @@ func TestMergeQueueDoesNotInterruptReplicationChange(t *testing.T) {
 						// Disable load-based splitting, so that the absence of sufficient
 						// QPS measurements do not prevent ranges from merging.
 						DisableLoadBasedSplitting: true,
-						ReceiveSnapshot: func(_ *kvserverpb.SnapshotRequest_Header) error {
+						ReceiveSnapshot: func(_ context.Context, _ *kvserverpb.SnapshotRequest_Header) error {
 							if atomic.LoadInt64(&activateSnapshotTestingKnob) == 1 {
+								// While the snapshot RPC should only happen once given
+								// that the cluster is running under manual replication,
+								// retries or other mechanisms can cause this to be called
+								// multiple times, so let's ensure we only close the channel
+								// snapshotInProgress once by using the snapshotStarted flag.
+								if atomic.CompareAndSwapInt64(&snapshotStarted, 0, 1) {
+									close(snapshotInProgress)
+								}
 								<-blockSnapshot
 							}
 							return nil
@@ -1742,7 +2027,7 @@ func TestMergeQueueDoesNotInterruptReplicationChange(t *testing.T) {
 	require.NoError(t, err)
 
 	select {
-	case <-time.After(100 * time.Millisecond):
+	case <-snapshotInProgress:
 	// Continue.
 	case <-replicationChange:
 		t.Fatal("did not expect the replication change to complete")
@@ -1755,20 +2040,18 @@ func TestMergeQueueDoesNotInterruptReplicationChange(t *testing.T) {
 
 	db := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 	// TestCluster currently overrides this when used with ReplicationManual.
-	db.Exec(t, `SET CLUSTER SETTING kv.range_merge.queue_enabled = true`)
+	db.Exec(t, `SET CLUSTER SETTING kv.range_merge.queue.enabled = true`)
 
-	testutils.SucceedsSoon(t, func() error {
-		// While this replication change is stalled, we'll trigger a merge and
-		// ensure that the merge correctly notices that there is a snapshot in
-		// flight and ignores the range.
-		store, repl := getFirstStoreReplica(t, tc.Server(0), scratchKey)
-		_, processErr, enqueueErr := store.Enqueue(
-			ctx, "merge", repl, true /* skipShouldQueue */, false, /* async */
-		)
-		require.NoError(t, enqueueErr)
-		require.True(t, kvserver.IsReplicationChangeInProgressError(processErr))
-		return nil
-	})
+	// While this replication change is stalled, we'll trigger a merge and
+	// ensure that the merge correctly notices that there is a snapshot in
+	// flight and ignores the range.
+	store, repl := getFirstStoreReplica(t, tc.Server(0), scratchKey)
+	_, processErr, enqueueErr := store.Enqueue(
+		ctx, "merge", repl, true /* skipShouldQueue */, false, /* async */
+	)
+	require.NoError(t, enqueueErr)
+	require.Truef(t, kvserver.IsReplicationChangeInProgressError(processErr),
+		"expected replication change in progress error, got %+v", processErr)
 }
 
 func TestMergeQueueSeesLearnerOrJointConfig(t *testing.T) {
@@ -1786,7 +2069,7 @@ func TestMergeQueueSeesLearnerOrJointConfig(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	db := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 	// TestCluster currently overrides this when used with ReplicationManual.
-	db.Exec(t, `SET CLUSTER SETTING kv.range_merge.queue_enabled = true`)
+	db.Exec(t, `SET CLUSTER SETTING kv.range_merge.queue.enabled = true`)
 
 	scratchStartKey := tc.ScratchRange(t)
 	origDesc := tc.LookupRangeOrFatal(t, scratchStartKey)
@@ -1888,73 +2171,45 @@ type snapshotBytesMetrics struct {
 	rcvdBytes int64
 }
 
-// getSnapshotBytesMetrics returns metrics on the number of snapshot bytes sent
-// and received by a server. tc and serverIdx specify the index of the target
-// server on the TestCluster TC. The function returns the total number of
-// snapshot bytes sent/received, as well as a map with granular metrics on the
-// number of snapshot bytes sent and received for each type of snapshot. The
-// return value is of the form (totalBytes, granularMetrics), where totalBytes
-// is a `snapshotBytesMetrics` struct containing the total bytes sent/received,
-// and granularMetrics is the map mentioned above.
+// getSnapshotBytesMetrics retrieves the count of each snapshot metric specified
+// in the metricsName associated with the target serverIdx server and returns
+// the result as a map. The keys in the map correspond to the strings in input
+// metricsName. The corresponding value is a `snapshotBytesMetrics` struct
+// containing the total bytes sent/received of the metric.
 func getSnapshotBytesMetrics(
-	t *testing.T, tc *testcluster.TestCluster, serverIdx int,
-) (snapshotBytesMetrics, map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics) {
-	granularMetrics := make(map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics)
+	t *testing.T, tc *testcluster.TestCluster, serverIdx int, metricsName []string,
+) map[string]snapshotBytesMetrics {
+	metrics := make(map[string]snapshotBytesMetrics)
 
-	granularMetrics[kvserverpb.SnapshotRequest_UNKNOWN] = snapshotBytesMetrics{
-		sentBytes: getFirstStoreMetric(t, tc.Server(serverIdx), "range.snapshots.unknown.sent-bytes"),
-		rcvdBytes: getFirstStoreMetric(t, tc.Server(serverIdx), "range.snapshots.unknown.rcvd-bytes"),
-	}
-	granularMetrics[kvserverpb.SnapshotRequest_RECOVERY] = snapshotBytesMetrics{
-		sentBytes: getFirstStoreMetric(t, tc.Server(serverIdx), "range.snapshots.recovery.sent-bytes"),
-		rcvdBytes: getFirstStoreMetric(t, tc.Server(serverIdx), "range.snapshots.recovery.rcvd-bytes"),
-	}
-	granularMetrics[kvserverpb.SnapshotRequest_REBALANCE] = snapshotBytesMetrics{
-		sentBytes: getFirstStoreMetric(t, tc.Server(serverIdx), "range.snapshots.rebalancing.sent-bytes"),
-		rcvdBytes: getFirstStoreMetric(t, tc.Server(serverIdx), "range.snapshots.rebalancing.rcvd-bytes"),
+	findSnapshotBytesMetrics := func(metricName string) snapshotBytesMetrics {
+		sentMetricStr := fmt.Sprintf("range.snapshots%v.sent-bytes", metricName)
+		rcvdMetricStr := fmt.Sprintf("range.snapshots%v.rcvd-bytes", metricName)
+		return snapshotBytesMetrics{
+			sentBytes: getFirstStoreMetric(t, tc.Server(serverIdx), sentMetricStr),
+			rcvdBytes: getFirstStoreMetric(t, tc.Server(serverIdx), rcvdMetricStr),
+		}
 	}
 
-	totalBytes := snapshotBytesMetrics{
-		sentBytes: getFirstStoreMetric(t, tc.Server(serverIdx), "range.snapshots.sent-bytes"),
-		rcvdBytes: getFirstStoreMetric(t, tc.Server(serverIdx), "range.snapshots.rcvd-bytes"),
+	for _, v := range metricsName {
+		metrics[v] = findSnapshotBytesMetrics(v)
 	}
-
-	return totalBytes, granularMetrics
+	return metrics
 }
 
-// getSnapshotMetricsDiff returns the delta between snapshot byte metrics
-// recorded at different times. Metrics can be recorded using the
-// getSnapshotBytesMetrics helper function, and the delta is returned in the
-// form (totalBytes, granularMetrics). totalBytes is a
-// snapshotBytesMetrics struct containing the difference in total bytes
-// sent/received, and granularMetrics is the map of snapshotBytesMetrics structs
-// containing deltas for each type of snapshot.
+// getSnapshotMetricsDiff returns the difference between the values of
+// corresponding snapshot metrics in two maps. Assumption: beforeMap and
+// afterMap contain the same set of keys.
 func getSnapshotMetricsDiff(
-	beforeTotal snapshotBytesMetrics,
-	beforeMap map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics,
-	afterTotal snapshotBytesMetrics,
-	afterMap map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics,
-) (snapshotBytesMetrics, map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics) {
-	diffTotal := snapshotBytesMetrics{
-		sentBytes: afterTotal.sentBytes - beforeTotal.sentBytes,
-		rcvdBytes: afterTotal.rcvdBytes - beforeTotal.rcvdBytes,
+	beforeMap map[string]snapshotBytesMetrics, afterMap map[string]snapshotBytesMetrics,
+) map[string]snapshotBytesMetrics {
+	diffMap := make(map[string]snapshotBytesMetrics)
+	for metricName, beforeValue := range beforeMap {
+		diffMap[metricName] = snapshotBytesMetrics{
+			afterMap[metricName].sentBytes - beforeValue.sentBytes,
+			afterMap[metricName].rcvdBytes - beforeValue.rcvdBytes,
+		}
 	}
-	diffMap := map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics{
-		kvserverpb.SnapshotRequest_REBALANCE: {
-			sentBytes: afterMap[kvserverpb.SnapshotRequest_REBALANCE].sentBytes - beforeMap[kvserverpb.SnapshotRequest_REBALANCE].sentBytes,
-			rcvdBytes: afterMap[kvserverpb.SnapshotRequest_REBALANCE].rcvdBytes - beforeMap[kvserverpb.SnapshotRequest_REBALANCE].rcvdBytes,
-		},
-		kvserverpb.SnapshotRequest_RECOVERY: {
-			sentBytes: afterMap[kvserverpb.SnapshotRequest_RECOVERY].sentBytes - beforeMap[kvserverpb.SnapshotRequest_RECOVERY].sentBytes,
-			rcvdBytes: afterMap[kvserverpb.SnapshotRequest_RECOVERY].rcvdBytes - beforeMap[kvserverpb.SnapshotRequest_RECOVERY].rcvdBytes,
-		},
-		kvserverpb.SnapshotRequest_UNKNOWN: {
-			sentBytes: afterMap[kvserverpb.SnapshotRequest_UNKNOWN].sentBytes - beforeMap[kvserverpb.SnapshotRequest_UNKNOWN].sentBytes,
-			rcvdBytes: afterMap[kvserverpb.SnapshotRequest_UNKNOWN].rcvdBytes - beforeMap[kvserverpb.SnapshotRequest_UNKNOWN].rcvdBytes,
-		},
-	}
-
-	return diffTotal, diffMap
+	return diffMap
 }
 
 // This function returns the number of bytes sent for a snapshot. It follows the
@@ -1974,10 +2229,10 @@ func getExpectedSnapshotSizeBytes(
 	}
 	defer snap.Close()
 
-	b := originStore.TODOEngine().NewUnindexedBatch(true)
+	b := originStore.TODOEngine().NewWriteBatch()
 	defer b.Close()
 
-	err = rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true, /* replicatedOnly */
+	err = rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true /* replicatedOnly */, rditer.ReplicatedSpansAll,
 		func(iter storage.EngineIterator, _ roachpb.Span, keyType storage.IterKeyType) error {
 			var err error
 			for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {
@@ -2016,22 +2271,27 @@ func getExpectedSnapshotSizeBytes(
 	return int64(b.Len()), err
 }
 
-// Tests the accuracy of the 'range.snapshots.rebalancing.rcvd-bytes' and
-// 'range.snapshots.rebalancing.sent-bytes' metrics. This test adds a new
-// replica to a cluster, and during the process, a learner snapshot is sent to
-// the new replica.
-func TestRebalancingSnapshotMetrics(t *testing.T) {
+// This test verifies the accuracy of snapshot metrics -
+// `range.snapshots.[rebalancing|cross-region|cross-zone].rcvd-bytes` and
+// `range.snapshots.[rebalancing|cross-region|cross-zone].sent-bytes`. It
+// involves adding two new replicas on different nodes within the cluster,
+// resulting in two learner snapshots sent across. The test then compares the
+// metrics prior to and after sending the snapshot to verify the accuracy.
+func TestRebalancingAndCrossRegionZoneSnapshotMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	knobs, ltk := makeReplicationTestKnobs()
 	ltk.storeKnobs.DisableRaftSnapshotQueue = true
 
-	// Synchronize on the moment before the snapshot gets sent so we can measure
-	// the state at that time.
 	blockUntilSnapshotSendCh := make(chan struct{})
 	blockSnapshotSendCh := make(chan struct{})
 	ltk.storeKnobs.SendSnapshot = func(request *kvserverpb.DelegateSendSnapshotRequest) {
+		// This testing knob allows accurate calculation of expected snapshot bytes
+		// by unblocking the current goroutine when `HandleDelegatedSnapshot` is
+		// about to send the snapshot. In addition, it also blocks the new
+		// goroutine, which was created to send the snapshot, until the calculation
+		// is complete (more info below).
 		close(blockUntilSnapshotSendCh)
 		select {
 		case <-blockSnapshotSendCh:
@@ -2040,69 +2300,191 @@ func TestRebalancingSnapshotMetrics(t *testing.T) {
 		}
 	}
 
+	// The initial setup ensures the correct configuration for three nodes (with
+	// different localities), single-range.
+	const numNodes = 3
+	serverArgs := make(map[int]base.TestServerArgs)
+
+	// The servers localities are configured so that the first snapshot sent from
+	// server0 to server1 is cross-region. The second snapshot sent from server0
+	// to server2 is cross-zone within same region.
+	serverLocality := [numNodes]roachpb.Locality{
+		{Tiers: []roachpb.Tier{{Key: "region", Value: "us-east"}, {Key: "az", Value: "us-east-1"}}},
+		{Tiers: []roachpb.Tier{{Key: "region", Value: "us-west"}, {Key: "az", Value: "us-west-1"}}},
+		{Tiers: []roachpb.Tier{{Key: "region", Value: "us-east"}, {Key: "az", Value: "us-east-2"}}},
+	}
+	for i := 0; i < numNodes; i++ {
+		serverArgs[i] = base.TestServerArgs{
+			Locality: serverLocality[i],
+			Knobs:    knobs,
+		}
+	}
+
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
-		ServerArgs:      base.TestServerArgs{Knobs: knobs},
-		ReplicationMode: base.ReplicationManual,
-	})
+	tc := testcluster.StartTestCluster(
+		t, numNodes, base.TestClusterArgs{
+			ServerArgsPerNode: serverArgs,
+			ReplicationMode:   base.ReplicationManual,
+		},
+	)
+
 	defer tc.Stopper().Stop(ctx)
 
 	scratchStartKey := tc.ScratchRange(t)
+	// sendSnapshotFromServer is a testing helper that sends a learner snapshot
+	// from server[0] to server[serverIndex] and returns the expected size (in
+	// bytes) of the snapshot sent.
+	sendSnapshotToServer := func(serverIndex int, changeReplicaFn func(roachpb.Key, ...roachpb.ReplicationTarget) (roachpb.RangeDescriptor, error)) int64 {
+		blockUntilSnapshotSendCh = make(chan struct{})
+		blockSnapshotSendCh = make(chan struct{})
+		g := ctxgroup.WithContext(ctx)
+		g.GoCtx(func(ctx context.Context) error {
+			// A new replica at servers[serverIndex] is now added to the cluster,
+			// resulting in a learner snapshot to be sent from servers[0] to
+			// servers[serverIndex]. This function is executed in a new goroutine to
+			// help us capture the expected snapshot bytes count accurately.
+			desc := tc.LookupRangeOrFatal(t, scratchStartKey)
+			desc, err := changeReplicaFn(scratchStartKey, tc.Target(serverIndex))
+			scratchStartKey = desc.StartKey.AsRawKey()
+			return err
+		})
 
+		// The current goroutine is blocked until the new goroutine, which has just
+		// been added, is about to send the snapshot (see the testing knob above).
+		// This allows us to calculate the snapshot bytes count accurately,
+		// accounting for any state changes that happen between calling
+		// changeReplicaFn and the snapshot being sent.
+		<-blockUntilSnapshotSendCh
+		store, repl := getFirstStoreReplica(t, tc.Server(0), scratchStartKey)
+		snapshotLength, err := getExpectedSnapshotSizeBytes(ctx, store, repl, kvserverpb.SnapshotRequest_INITIAL)
+		require.NoError(t, err)
+
+		close(blockSnapshotSendCh)
+		// Wait the new goroutine (sending the snapshot) to complete before
+		// measuring the after-sending-snapshot metrics.
+		require.NoError(t, g.Wait())
+		return snapshotLength
+	}
+
+	metrics := []string{".rebalancing", ".recovery", ".unknown", ".cross-region", ".cross-zone", ""}
 	// Record the snapshot metrics before anything has been sent / received.
-	senderTotalBefore, senderMetricsMapBefore := getSnapshotBytesMetrics(t, tc, 0 /* serverIdx */)
-	receiverTotalBefore, receiverMetricsMapBefore := getSnapshotBytesMetrics(t, tc, 1 /* serverIdx */)
+	senderBefore := getSnapshotBytesMetrics(t, tc, 0 /* serverIdx */, metrics)
+	firstReceiverBefore := getSnapshotBytesMetrics(t, tc, 1 /* serverIdx */, metrics)
+	secReceiverBefore := getSnapshotBytesMetrics(t, tc, 2 /* serverIdx */, metrics)
 
-	g := ctxgroup.WithContext(ctx)
-	g.GoCtx(func(ctx context.Context) error {
-		_, err := tc.AddVoters(scratchStartKey, tc.Target(1))
-		return err
+	// The first replica is added as a non-voter to help avoid failure in stress
+	// testing. A possible explanation in the failure is - if the first replica
+	// was added as a voter, it can be stuck in a state to receive the snapshot.
+	// This can cause failure to reach quorum during the second snapshot transfer.
+	firstSnapshotLength := sendSnapshotToServer(1, tc.AddNonVoters)
+	secSnapshotLength := sendSnapshotToServer(2, tc.AddVoters)
+	totalSnapshotLength := firstSnapshotLength + secSnapshotLength
+
+	// A learner snapshot should have been sent from the sender(server[0]) to the
+	// server[1] and server[2].
+	t.Run("sender", func(t *testing.T) {
+		// Compare the snapshot metrics for the sender after sending two snapshots to
+		// server[1] and server[2].
+		senderAfter := getSnapshotBytesMetrics(t, tc, 0 /* serverIdx */, metrics)
+		senderDelta := getSnapshotMetricsDiff(senderBefore, senderAfter)
+		senderExpected := map[string]snapshotBytesMetrics{
+			".rebalancing": {sentBytes: totalSnapshotLength, rcvdBytes: 0},
+			".recovery":    {sentBytes: 0, rcvdBytes: 0},
+			".unknown":     {sentBytes: 0, rcvdBytes: 0},
+			// The first snapshot was sent from server0 to server1, so it is
+			// cross-region.
+			".cross-region": {sentBytes: firstSnapshotLength, rcvdBytes: 0},
+			// The second snapshot was sent from server0 to server2, so it is
+			// cross-zone within same region.
+			".cross-zone": {sentBytes: secSnapshotLength, rcvdBytes: 0},
+			"":            {sentBytes: totalSnapshotLength, rcvdBytes: 0},
+		}
+		require.Equal(t, senderExpected, senderDelta)
 	})
 
-	// Wait until the snapshot is about to be sent before calculating what the
-	// snapshot size should be. This allows our snapshot measurement to account
-	// for any state changes that happen between calling AddVoters and the
-	// snapshot being sent.
-	<-blockUntilSnapshotSendCh
-	store, repl := getFirstStoreReplica(t, tc.Server(0), scratchStartKey)
-	snapshotLength, err := getExpectedSnapshotSizeBytes(ctx, store, repl, kvserverpb.SnapshotRequest_INITIAL)
-	require.NoError(t, err)
+	t.Run("first receiver", func(t *testing.T) {
+		// Compare the snapshot metrics for server[1] after receiving the first
+		// snapshot.
+		firstReceiverMetricsAfter := getSnapshotBytesMetrics(t, tc, 1 /* serverIdx */, metrics)
+		firstReceiverDelta := getSnapshotMetricsDiff(firstReceiverBefore, firstReceiverMetricsAfter)
+		firstReceiverExpected := map[string]snapshotBytesMetrics{
+			".rebalancing": {sentBytes: 0, rcvdBytes: firstSnapshotLength},
+			".recovery":    {sentBytes: 0, rcvdBytes: 0},
+			".unknown":     {sentBytes: 0, rcvdBytes: 0},
+			// The first snapshot was sent from server0 to server1, so it is
+			// cross-region.
+			".cross-region": {sentBytes: 0, rcvdBytes: firstSnapshotLength},
+			".cross-zone":   {sentBytes: 0, rcvdBytes: 0},
+			"":              {sentBytes: 0, rcvdBytes: firstSnapshotLength},
+		}
+		require.Equal(t, firstReceiverExpected, firstReceiverDelta)
+	})
 
-	close(blockSnapshotSendCh)
-	require.NoError(t, g.Wait())
+	t.Run("second receiver", func(t *testing.T) {
+		// Compare the snapshot metrics for server[2] after receiving the second
+		// snapshot.
+		secReceiverAfter := getSnapshotBytesMetrics(t, tc, 2 /* serverIdx */, metrics)
+		secReceiverDelta := getSnapshotMetricsDiff(secReceiverBefore, secReceiverAfter)
+		secReceiverExpected := map[string]snapshotBytesMetrics{
+			".rebalancing": {sentBytes: 0, rcvdBytes: secSnapshotLength},
+			".recovery":    {sentBytes: 0, rcvdBytes: 0},
+			".unknown":     {sentBytes: 0, rcvdBytes: 0},
+			// The second snapshot was sent from server0 to server2, so it is
+			// cross-zone within same region.
+			".cross-region": {sentBytes: 0, rcvdBytes: 0},
+			".cross-zone":   {sentBytes: 0, rcvdBytes: secSnapshotLength},
+			"":              {sentBytes: 0, rcvdBytes: secSnapshotLength},
+		}
+		require.Equal(t, secReceiverExpected, secReceiverDelta)
+	})
 
-	// Record the snapshot metrics for the sender after a voter has been added. A
-	// learner snapshot should have been sent from the sender to the receiver.
-	senderTotalAfter, senderMetricsMapAfter := getSnapshotBytesMetrics(t, tc, 0)
+}
 
-	// Asserts that the learner snapshot (aka rebalancing snapshot) bytes sent
-	// have been recorded and that it was not double counted in a different
-	// metric.
-	senderTotalDelta, senderMapDelta := getSnapshotMetricsDiff(senderTotalBefore, senderMetricsMapBefore, senderTotalAfter, senderMetricsMapAfter)
+// TestAddVotersWithoutRaftQueue verifies that in normal operations Raft
+// snapshots are not required. This test creates a range with a single voter,
+// then adds two additional voters. Most of the time this succeeds, however it
+// fails (today) occasionally due to the addition of the first voter being
+// "incomplete" and therefore the second voter is not able to be added because
+// there is no quorum.
+//
+// Specifically the following sequence of events happens when the leader adds
+// the first voter:
+//  1. AdminChangeReplicasRequest is processed on n1.
+//     a) Adds a n2 as a LEARNER to raft.
+//     b) Sends an initial snapshot to n2.
+//     c) n2 receives and applies the snapshot.
+//     d) n2 responds that it successfully applied the snapshot.
+//     e) n1 receives the response and updates state to Follower.
+//  2. Before step c above, n1 sends a MsgApp to n2
+//     a) MsgApp - entries up-to and including the conf change.
+//     b) The MsgApp is received and REJECTED because the term is wrong.
+//     c) After 1e above, n1 receives the rejection.
+//     d) n1 updates n2 from StateReplicate to StateProbe and then StateSnapshot.
+//
+// From n2's perspective, it receives the MsgApp prior to the initial snapshot.
+// This results in it responding with a rejected MsgApp. Later it receives the
+// snapshot and correctly applies it. However, when n1 sees the rejected MsgApp,
+// it moves n2 status to StateProbe and stops sending Raft updates to it as it
+// plans to fix it with a Raft Snapshot. As the raft snapshot queue is disabled
+// this never happens and the state is stuck as a non-Learner in StateProbe. At
+// this point, the Raft group is wedged since it only has 1/2 nodes available
+// for Raft consensus.
+func TestAddVotersWithoutRaftQueue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 
-	senderTotalExpected := snapshotBytesMetrics{sentBytes: snapshotLength, rcvdBytes: 0}
-	senderMapExpected := map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics{
-		kvserverpb.SnapshotRequest_REBALANCE: {sentBytes: snapshotLength, rcvdBytes: 0},
-		kvserverpb.SnapshotRequest_RECOVERY:  {sentBytes: 0, rcvdBytes: 0},
-		kvserverpb.SnapshotRequest_UNKNOWN:   {sentBytes: 0, rcvdBytes: 0},
-	}
-	require.Equal(t, senderTotalExpected, senderTotalDelta)
-	require.Equal(t, senderMapExpected, senderMapDelta)
+	// Disable the raft snapshot queue to make sure we don't require a raft snapshot.
+	tc := testcluster.StartTestCluster(
+		t, 3, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{DisableRaftSnapshotQueue: true}},
+			},
+			ReplicationMode: base.ReplicationManual,
+		},
+	)
+	defer tc.Stopper().Stop(ctx)
 
-	// Record the snapshot metrics for the receiver after a voter has been added.
-	receiverTotalAfter, receiverMetricsMapAfter := getSnapshotBytesMetrics(t, tc, 1)
-
-	// Asserts that the learner snapshot (aka rebalancing snapshot) bytes received
-	// have been recorded and that it was not double counted in a different
-	// metric.
-	receiverTotalDelta, receiverMapDelta := getSnapshotMetricsDiff(receiverTotalBefore, receiverMetricsMapBefore, receiverTotalAfter, receiverMetricsMapAfter)
-
-	receiverTotalExpected := snapshotBytesMetrics{sentBytes: 0, rcvdBytes: snapshotLength}
-	receiverMapExpected := map[kvserverpb.SnapshotRequest_Priority]snapshotBytesMetrics{
-		kvserverpb.SnapshotRequest_REBALANCE: {sentBytes: 0, rcvdBytes: snapshotLength},
-		kvserverpb.SnapshotRequest_RECOVERY:  {sentBytes: 0, rcvdBytes: 0},
-		kvserverpb.SnapshotRequest_UNKNOWN:   {sentBytes: 0, rcvdBytes: 0},
-	}
-	require.Equal(t, receiverTotalExpected, receiverTotalDelta)
-	require.Equal(t, receiverMapExpected, receiverMapDelta)
+	key := tc.ScratchRange(t)
+	tc.AddVotersOrFatal(t, key, tc.Target(1))
+	tc.AddVotersOrFatal(t, key, tc.Target(2))
 }

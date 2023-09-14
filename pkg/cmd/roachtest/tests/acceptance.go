@@ -27,11 +27,12 @@ func registerAcceptance(r registry.Registry) {
 		numNodes          int
 		timeout           time.Duration
 		encryptionSupport registry.EncryptionSupport
+		defaultLeases     bool
 	}{
 		registry.OwnerKV: {
 			{name: "decommission-self", fn: runDecommissionSelf},
 			{name: "event-log", fn: runEventLog},
-			{name: "gossip/peerings", fn: runGossipPeerings, skip: "flaky test. tracked in #96091"},
+			{name: "gossip/peerings", fn: runGossipPeerings},
 			{name: "gossip/restart", fn: runGossipRestart},
 			{
 				name:              "gossip/restart-node-one",
@@ -39,7 +40,6 @@ func registerAcceptance(r registry.Registry) {
 				encryptionSupport: registry.EncryptionAlwaysDisabled,
 			},
 			{name: "gossip/locality-address", fn: runCheckLocalityIPAddress},
-			{name: "reset-quorum", fn: runResetQuorum, numNodes: 8},
 			{
 				name: "many-splits", fn: runManySplits,
 				encryptionSupport: registry.EncryptionMetamorphic,
@@ -63,13 +63,20 @@ func registerAcceptance(r registry.Registry) {
 		},
 		registry.OwnerTestEng: {
 			{
-				name:    "version-upgrade",
-				fn:      runVersionUpgrade,
-				timeout: 30 * time.Minute,
+				name:          "version-upgrade",
+				fn:            runVersionUpgrade,
+				timeout:       30 * time.Minute,
+				defaultLeases: true,
+			},
+		},
+		registry.OwnerDisasterRecovery: {
+			{
+				name:     "c2c",
+				fn:       runAcceptanceClusterReplication,
+				numNodes: 3,
 			},
 		},
 	}
-	tags := []string{"default", "quick"}
 	specTemplate := registry.TestSpec{
 		// NB: teamcity-post-failures.py relies on the acceptance tests
 		// being named acceptance/<testname> and will avoid posting a
@@ -79,7 +86,7 @@ func registerAcceptance(r registry.Registry) {
 		// will be posted.
 		Name:    "acceptance",
 		Timeout: 10 * time.Minute,
-		Tags:    tags,
+		Tags:    registry.Tags("default", "quick"),
 	}
 
 	for owner, tests := range testCases {
@@ -99,6 +106,9 @@ func registerAcceptance(r registry.Registry) {
 				spec.Timeout = tc.timeout
 			}
 			spec.EncryptionSupport = tc.encryptionSupport
+			if !tc.defaultLeases {
+				spec.Leases = registry.MetamorphicLeases
+			}
 			spec.Run = func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				tc.fn(ctx, t, c)
 			}

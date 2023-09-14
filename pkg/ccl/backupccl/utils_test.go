@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -32,42 +33,43 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuptestutils"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/workload/bank"
-	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const (
-	singleNode                  = 1
-	multiNode                   = 3
+	singleNode                  = backuptestutils.SingleNode
+	multiNode                   = backuptestutils.MultiNode
 	backupRestoreDefaultRanges  = 10
 	backupRestoreRowPayloadSize = 100
-	localFoo                    = "nodelocal://0/foo"
+	localFoo                    = "nodelocal://1/foo"
 )
 
-// smallEngineBlocks configures Pebble with a block size of 1 byte, to provoke
-// bugs in time-bound iterators. We disable this in race builds, which can
-// be too slow.
-var smallEngineBlocks = !util.RaceEnabled && util.ConstantWithMetamorphicTestBool("small-engine-blocks", false)
+// InitManualReplication calls tc.ToggleReplicateQueues(false).
+//
+// Note that the test harnesses that use this typically call
+// tc.WaitForFullReplication before calling this method,
+// so up-replication has usually already taken place.
+var InitManualReplication = backuptestutils.InitManualReplication
 
 func backupRestoreTestSetupWithParams(
 	t testing.TB,
@@ -76,91 +78,20 @@ func backupRestoreTestSetupWithParams(
 	init func(tc *testcluster.TestCluster),
 	params base.TestClusterArgs,
 ) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, tempDir string, cleanup func()) {
-	ctx := logtags.AddTag(context.Background(), "backup-restore-test-setup", nil)
-
-	dir, dirCleanupFn := testutils.TempDir(t)
-	params.ServerArgs.ExternalIODir = dir
-	params.ServerArgs.UseDatabase = "data"
-	if len(params.ServerArgsPerNode) > 0 {
-		for i := range params.ServerArgsPerNode {
-			param := params.ServerArgsPerNode[i]
-			param.ExternalIODir = dir
-			param.UseDatabase = "data"
-			params.ServerArgsPerNode[i] = param
-		}
-	}
-
-	if smallEngineBlocks {
-		if params.ServerArgs.Knobs.Store == nil {
-			params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{}
-		}
-		params.ServerArgs.Knobs.Store.(*kvserver.StoreTestingKnobs).SmallEngineBlocks = true
-	}
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
-	}
-
-	params.ServerArgs.Knobs.KeyVisualizer = &keyvisualizer.TestingKnobs{
-		SkipJobBootstrap:        true,
-		SkipZoneConfigBootstrap: true,
-	}
-	tc = testcluster.StartTestCluster(t, clusterSize, params)
-	init(tc)
-
-	const payloadSize = 100
-	splits := 10
-	if numAccounts == 0 {
-		splits = 0
-	}
-	bankData := bank.FromConfig(numAccounts, numAccounts, payloadSize, splits)
-
-	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
-
-	// Lower the initial buffering adder ingest size to allow concurrent import jobs to run without
-	// borking the memory monitor.
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.pk_buffer_size = '16MiB'`)
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.index_buffer_size = '16MiB'`)
-
-	// Set the max buffer size to something low to prevent backup/restore tests
-	// from hitting OOM errors. If any test cares about this setting in
-	// particular, they will override it inline after setting up the test cluster.
-	sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '16MiB'`)
-	sqlDB.Exec(t, `CREATE DATABASE data`)
-	l := workloadsql.InsertsDataLoader{BatchSize: 1000, Concurrency: 4}
-	if _, err := workloadsql.Setup(ctx, sqlDB.DB.(*gosql.DB), bankData, l); err != nil {
-		t.Fatalf("%+v", err)
-	}
-
-	if err := tc.WaitForFullReplication(); err != nil {
-		t.Fatal(err)
-	}
-
-	cleanupFn := func() {
-		backuptestutils.CheckForInvalidDescriptors(t, tc.Conns[0])
-		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
-		dirCleanupFn()         // cleans up dir, which is the nodelocal:// storage
-	}
-
-	return tc, sqlDB, dir, cleanupFn
+	return backuptestutils.StartBackupRestoreTestCluster(t, clusterSize,
+		backuptestutils.WithInitFunc(init),
+		backuptestutils.WithParams(params),
+		backuptestutils.WithBank(numAccounts))
 }
 
 func backupRestoreTestSetup(
 	t testing.TB, clusterSize int, numAccounts int, init func(*testcluster.TestCluster),
 ) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, tempDir string, cleanup func()) {
-	// TODO (msbutler): DisableDefaultTestTenant should be disabled by the caller of this function
+	// TODO (msbutler): The DefaultTestTenant should be disabled by the caller of this function
 	return backupRestoreTestSetupWithParams(t, clusterSize, numAccounts, init,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
-				Knobs: base.TestingKnobs{
-					TenantCapabilitiesTestingKnobs: &tenantcapabilities.TestingKnobs{
-						// TODO(arul): This can be removed once
-						// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-						AuthorizerSkipAdminSplitCapabilityChecks: true,
-					},
-				},
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 			}})
 }
 
@@ -170,87 +101,14 @@ func backupRestoreTestSetupEmpty(
 	tempDir string,
 	init func(*testcluster.TestCluster),
 	params base.TestClusterArgs,
-) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, cleanup func()) {
+) (*testcluster.TestCluster, *sqlutils.SQLRunner, func()) {
 	// TODO (msbutler): this should be disabled by callers of this function
-	params.ServerArgs.DisableDefaultTestTenant = true
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
-	}
-	return backupRestoreTestSetupEmptyWithParams(t, clusterSize, tempDir, init, params)
-}
-
-func backupRestoreTestSetupEmptyWithParams(
-	t testing.TB,
-	clusterSize int,
-	dir string,
-	init func(tc *testcluster.TestCluster),
-	params base.TestClusterArgs,
-) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, cleanup func()) {
-	ctx := logtags.AddTag(context.Background(), "backup-restore-test-setup-empty", nil)
-
-	params.ServerArgs.ExternalIODir = dir
-	if len(params.ServerArgsPerNode) > 0 {
-		for i := range params.ServerArgsPerNode {
-			param := params.ServerArgsPerNode[i]
-			param.ExternalIODir = dir
-			params.ServerArgsPerNode[i] = param
-		}
-	}
-
-	if smallEngineBlocks {
-		if params.ServerArgs.Knobs.Store == nil {
-			params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{}
-		}
-		params.ServerArgs.Knobs.Store.(*kvserver.StoreTestingKnobs).SmallEngineBlocks = true
-	}
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
-	}
-
-	tc = testcluster.StartTestCluster(t, clusterSize, params)
-	init(tc)
-
-	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
-
-	cleanupFn := func() {
-		backuptestutils.CheckForInvalidDescriptors(t, tc.Conns[0])
-		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
-	}
-
-	return tc, sqlDB, cleanupFn
-}
-
-func createEmptyCluster(
-	t testing.TB, clusterSize int,
-) (sqlDB *sqlutils.SQLRunner, tempDir string, cleanup func()) {
-	ctx := context.Background()
-
-	dir, dirCleanupFn := testutils.TempDir(t)
-	params := base.TestClusterArgs{}
-	params.ServerArgs.ExternalIODir = dir
-	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
-		SmallEngineBlocks: smallEngineBlocks,
-	}
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
-	}
-	tc := testcluster.StartTestCluster(t, clusterSize, params)
-
-	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
-
-	cleanupFn := func() {
-		backuptestutils.CheckForInvalidDescriptors(t, tc.Conns[0])
-		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
-		dirCleanupFn()         // cleans up dir, which is the nodelocal:// storage
-	}
-
-	return sqlDB, dir, cleanupFn
+	params.ServerArgs.DefaultTestTenant = base.TODOTestTenantDisabled
+	tc, sqlDB, _, cleanup := backuptestutils.StartBackupRestoreTestCluster(t, clusterSize,
+		backuptestutils.WithTempDir(tempDir),
+		backuptestutils.WithInitFunc(init),
+		backuptestutils.WithParams(params))
+	return tc, sqlDB, cleanup
 }
 
 // getStatsQuery returns a SQL query that will return the properties of the
@@ -534,7 +392,7 @@ func thresholdFromTrace(t *testing.T, traceString string) hlc.Timestamp {
 
 func setAndWaitForTenantReadOnlyClusterSetting(
 	t *testing.T,
-	setting string,
+	settingName settings.SettingName,
 	systemTenantRunner *sqlutils.SQLRunner,
 	tenantRunner *sqlutils.SQLRunner,
 	tenantID roachpb.TenantID,
@@ -545,7 +403,7 @@ func setAndWaitForTenantReadOnlyClusterSetting(
 		t,
 		fmt.Sprintf(
 			"ALTER TENANT [$1] SET CLUSTER SETTING %s = '%s'",
-			setting,
+			settingName,
 			val,
 		),
 		tenantID.ToUint64(),
@@ -555,7 +413,7 @@ func setAndWaitForTenantReadOnlyClusterSetting(
 		var currentVal string
 		tenantRunner.QueryRow(t,
 			fmt.Sprintf(
-				"SHOW CLUSTER SETTING %s", setting,
+				"SHOW CLUSTER SETTING %s", settingName,
 			),
 		).Scan(&currentVal)
 
@@ -657,18 +515,14 @@ func upsertUntilBackpressure(
 	t *testing.T, rRand *rand.Rand, conn *gosql.DB, database, table string,
 ) {
 	t.Helper()
-	testutils.SucceedsSoon(t, func() error {
+	for i := 1; i < 50; i++ {
 		_, err := conn.Exec(fmt.Sprintf("UPSERT INTO %s.%s VALUES (1, $1)", database, table),
-			randutil.RandBytes(rRand, 1<<15))
-		if err == nil {
-			return errors.New("expected `backpressure` error")
+			randutil.RandBytes(rRand, 5<<20))
+		if testutils.IsError(err, "backpressure") {
+			return
 		}
-
-		if !testutils.IsError(err, "backpressure") {
-			return errors.NewAssertionErrorWithWrappedErrf(err, "expected `backpressure` error")
-		}
-		return nil
-	})
+	}
+	assert.Fail(t, "expected `backpressure` error")
 }
 
 // requireRecoveryEvent fetches all available log entries on disk after
@@ -683,7 +537,7 @@ func requireRecoveryEvent(
 	expected eventpb.RecoveryEvent,
 ) {
 	testutils.SucceedsSoon(t, func() error {
-		log.Flush()
+		log.FlushFiles()
 		entries, err := log.FetchEntriesFromFiles(
 			startTime,
 			math.MaxInt64,
@@ -717,4 +571,85 @@ func requireRecoveryEvent(
 		require.Equal(t, expected, actual)
 		return nil
 	})
+}
+
+// Verify that during restore, if a restore span has too many files to fit in
+// the memory budget with a single SST iterator, the restore processor should
+// repeatedly open and process iterators for as many files as can fit within the
+// budget until the span is finished.
+//
+//lint:ignore U1000 unused
+func runTestRestoreMemoryMonitoring(t *testing.T, numSplits, numInc, restoreProcessorMaxFiles int) {
+	const splitSize = 10
+	numAccounts := numSplits * splitSize
+	var expectedNumFiles int
+	var actualNumFiles int
+	restoreProcessorKnobCount := atomic.Uint32{}
+	args := base.TestServerArgs{
+		DefaultTestTenant: base.TODOTestTenantDisabled,
+		SQLMemoryPoolSize: 1 << 30, // Large enough for all mem limit settings.
+		Knobs: base.TestingKnobs{
+			DistSQL: &execinfra.TestingKnobs{
+				BackupRestoreTestingKnobs: &sql.BackupRestoreTestingKnobs{
+					RunAfterProcessingRestoreSpanEntry: func(ctx context.Context, entry *execinfrapb.RestoreSpanEntry) {
+						// The total size of the backup files should be less than the target
+						// SST size, thus should all fit in one import span.
+						require.Equal(t, actualNumFiles, len(entry.Files))
+						restoreProcessorKnobCount.Add(1)
+					},
+				},
+			},
+		},
+	}
+	params := base.TestClusterArgs{ServerArgs: args}
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, params)
+	defer cleanupFn()
+
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.sst_memory_limit.enabled=true")
+	sqlDB.Exec(t, "SET CLUSTER SETTING kv.bulk_io_write.restore_node_concurrency=2")
+
+	// Add some splits in the table, and set the target file size to be something
+	// small so that we get one flushed file per split in the backup.
+	sqlDB.Exec(t, "ALTER TABLE data.bank SPLIT AT SELECT generate_series($1::INT, $2, $3)", 0, numAccounts, splitSize)
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.backup.file_size = '1b'")
+	sqlDB.Exec(t, "BACKUP data.bank INTO 'userfile:///backup'")
+
+	// Take some incremental backups after mutating some rows. Take note of the
+	// splits that have been changed as that determines the number of incremental
+	// files that are created.
+	var numIncFiles int
+	for i := 0; i < numInc; i++ {
+		incSplitsWithFile := make(map[int]bool)
+
+		for n := 0; n < 100; n++ {
+			id := rand.Intn(numAccounts)
+			sqlDB.Exec(t, `UPDATE data.bank SET balance = balance + 1 WHERE id = $1`, id)
+			split := id / splitSize
+			incSplitsWithFile[split] = true
+		}
+
+		sqlDB.Exec(t, `BACKUP data.bank INTO latest IN 'userfile:///backup' WITH revision_history`)
+		numIncFiles += len(incSplitsWithFile)
+	}
+
+	// Verify the file counts in the backup is at least what's expected. The
+	// actual number can be more due to elastic CPU preempting export responses.
+	expectedNumFiles += numSplits + numIncFiles
+	sqlDB.QueryRow(t, "SELECT count(*) FROM [SHOW BACKUP FILES FROM latest IN 'userfile:///backup']").Scan(&actualNumFiles)
+	require.GreaterOrEqual(t, actualNumFiles, expectedNumFiles)
+
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.per_processor_memory_limit = $1", restoreProcessorMaxFiles*sstReaderOverheadBytesPerFile)
+
+	sqlDB.Exec(t, "CREATE DATABASE data2")
+	sqlDB.Exec(t, "RESTORE data.bank FROM latest IN 'userfile:///backup' WITH OPTIONS (into_db='data2')")
+
+	// Assert that the restore processor is processing the same span multiple
+	// times, and the count is based on what's expected from the memory budget.
+	// The expected number is just the ceiling of actualNumFiles/restoreProcessorMaxFiles.
+	require.Equal(t, (actualNumFiles-1)/restoreProcessorMaxFiles+1, int(restoreProcessorKnobCount.Load()))
+
+	// Verify data in the restored table.
+	expectedFingerprints := sqlDB.QueryStr(t, "SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE data.bank")
+	actualFingerprints := sqlDB.QueryStr(t, "SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE data2.bank")
+	require.Equal(t, expectedFingerprints, actualFingerprints)
 }

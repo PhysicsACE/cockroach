@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -95,10 +97,11 @@ func TestCompositeSensitive(t *testing.T) {
 		}
 
 		b := optbuilder.NewScalar(context.Background(), &semaCtx, &evalCtx, &f)
-		if err := b.Build(expr); err != nil {
+		scalar, err := b.Build(expr)
+		if err != nil {
 			d.Fatalf(t, "error building: %v", err)
 		}
-		return fmt.Sprintf("%v", memo.CanBeCompositeSensitive(md, f.Memo().RootExpr()))
+		return fmt.Sprintf("%v", memo.CanBeCompositeSensitive(md, scalar))
 	})
 }
 
@@ -142,7 +145,7 @@ func TestMemoIsStale(t *testing.T) {
 
 	// Revoke access to the underlying table. The user should retain indirect
 	// access via the view.
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).Revoked = true
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).Revoked = true
 
 	// Initialize context with starting values.
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
@@ -276,6 +279,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().LargeFullScanRows = 0
 	notStale()
 
+	// Stale txn rows read error.
+	evalCtx.SessionData().TxnRowsReadErr = 1000
+	stale()
+	evalCtx.SessionData().TxnRowsReadErr = 0
+	notStale()
+
 	// Stale null ordered last.
 	evalCtx.SessionData().NullOrderedLast = true
 	stale()
@@ -354,6 +363,51 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().OptimizerAlwaysUseHistograms = false
 	notStale()
 
+	// Stale optimizer_hoist_uncorrelated_equality_subqueries.
+	evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries = true
+	stale()
+	evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries = false
+	notStale()
+
+	// Stale optimizer_use_improved_computed_column_filters_derivation.
+	evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = false
+	notStale()
+
+	// Stale optimizer_use_improved_join_elimination.
+	evalCtx.SessionData().OptimizerUseImprovedJoinElimination = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedJoinElimination = false
+	notStale()
+
+	// Stale enable_implicit_fk_locking_for_serializable.
+	evalCtx.SessionData().ImplicitFKLockingForSerializable = true
+	stale()
+	evalCtx.SessionData().ImplicitFKLockingForSerializable = false
+	notStale()
+
+	// Stale enable_durable_locking_for_serializable.
+	evalCtx.SessionData().DurableLockingForSerializable = true
+	stale()
+	evalCtx.SessionData().DurableLockingForSerializable = false
+	notStale()
+
+	// Stale txn isolation level.
+	evalCtx.TxnIsoLevel = isolation.ReadCommitted
+	stale()
+	evalCtx.TxnIsoLevel = isolation.Serializable
+	notStale()
+
+	// User no longer has access to view.
+	catalog.View(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abcview")).Revoked = true
+	_, err = o.Memo().IsStale(ctx, &evalCtx, catalog)
+	if exp := "user does not have privilege"; !testutils.IsError(err, exp) {
+		t.Fatalf("expected %q error, but got %+v", exp, err)
+	}
+	catalog.View(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abcview")).Revoked = false
+	notStale()
+
 	// Stale data sources and schema. Create new catalog so that data sources are
 	// recreated and can be modified independently.
 	catalog = testcat.New()
@@ -366,25 +420,16 @@ func TestMemoIsStale(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// User no longer has access to view.
-	catalog.View(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abcview")).Revoked = true
-	_, err = o.Memo().IsStale(ctx, &evalCtx, catalog)
-	if exp := "user does not have privilege"; !testutils.IsError(err, exp) {
-		t.Fatalf("expected %q error, but got %+v", exp, err)
-	}
-	catalog.View(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abcview")).Revoked = false
-	notStale()
-
 	// Table ID changes.
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabID = 1
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).TabID = 1
 	stale()
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabID = 53
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).TabID = 53
 	notStale()
 
 	// Table Version changes.
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabVersion = 1
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).TabVersion = 1
 	stale()
-	catalog.Table(tree.NewTableNameWithSchema("t", tree.PublicSchemaName, "abc")).TabVersion = 0
+	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).TabVersion = 0
 	notStale()
 }
 

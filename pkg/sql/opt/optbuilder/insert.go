@@ -214,7 +214,11 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	}
 
 	// Check if this table has already been mutated in another subquery.
-	b.checkMultipleMutations(tab, ins.OnConflict == nil /* simpleInsert */)
+	mutType := generalMutation
+	if ins.OnConflict == nil {
+		mutType = simpleInsert
+	}
+	b.checkMultipleMutations(tab, mutType)
 
 	var mb mutationBuilder
 	if ins.OnConflict != nil && ins.OnConflict.IsUpsertAlias() {
@@ -242,7 +246,7 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		mb.addTargetNamedColsForInsert(ins.Columns)
 	} else {
 		values := mb.extractValuesInput(ins.Rows)
-		if values != nil {
+		if values != nil && len(values.Rows) > 0 {
 			// Target columns are implicitly targeted by VALUES expression in the
 			// same order they appear in the target table schema.
 			mb.addTargetTableColsForInsert(len(values.Rows[0]))
@@ -450,7 +454,7 @@ func (mb *mutationBuilder) checkPrimaryKeyForInsert() {
 			continue
 		}
 
-		panic(pgerror.Newf(pgcode.InvalidForeignKey,
+		panic(pgerror.Newf(pgcode.NotNullViolation,
 			"missing %q primary key column", col.ColName()))
 	}
 }

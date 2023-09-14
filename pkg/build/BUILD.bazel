@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
@@ -16,6 +15,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/build",
     visibility = ["//visibility:public"],
     x_defs = {
+        "github.com/cockroachdb/cockroach/pkg/build.buildTagOverride": "{STABLE_BUILD_TAG}",
         "github.com/cockroachdb/cockroach/pkg/build.cgoTargetTriple": "{STABLE_BUILD_TARGET_TRIPLE}",
         "github.com/cockroachdb/cockroach/pkg/build.channel": "{STABLE_BUILD_CHANNEL}",
         "github.com/cockroachdb/cockroach/pkg/build.rev": "{BUILD_REV}",
@@ -23,6 +23,7 @@ go_library(
         "github.com/cockroachdb/cockroach/pkg/build.utcTime": "{BUILD_UTCTIME}",
     },
     deps = [
+        "//pkg/util/buildutil",
         "//pkg/util/envutil",
         "//pkg/util/version",
     ],
@@ -52,5 +53,3 @@ go_test(
     embed = [":build"],
     deps = ["@com_github_stretchr_testify//require"],
 )
-
-get_x_data(name = "get_x_data")

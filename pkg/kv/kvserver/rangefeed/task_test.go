@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -229,10 +230,11 @@ func TestInitResolvedTSScan(t *testing.T) {
 	startKey := roachpb.RKey("d")
 	endKey := roachpb.RKey("w")
 
-	makeTxn := func(key string, id uuid.UUID, ts hlc.Timestamp) roachpb.Transaction {
+	makeTxn := func(key string, id uuid.UUID, iso isolation.Level, ts hlc.Timestamp) roachpb.Transaction {
 		txnMeta := enginepb.TxnMeta{
 			Key:            []byte(key),
 			ID:             id,
+			IsoLevel:       iso,
 			Epoch:          1,
 			WriteTimestamp: ts,
 			MinTimestamp:   ts,
@@ -246,12 +248,12 @@ func TestInitResolvedTSScan(t *testing.T) {
 	txn1ID := uuid.MakeV4()
 	txn1TS := hlc.Timestamp{WallTime: 15}
 	txn1Key := "txnKey1"
-	txn1 := makeTxn(txn1Key, txn1ID, txn1TS)
+	txn1 := makeTxn(txn1Key, txn1ID, isolation.Serializable, txn1TS)
 
 	txn2ID := uuid.MakeV4()
 	txn2TS := hlc.Timestamp{WallTime: 21}
 	txn2Key := "txnKey2"
-	txn2 := makeTxn(txn2Key, txn2ID, txn2TS)
+	txn2 := makeTxn(txn2Key, txn2ID, isolation.ReadCommitted, txn2TS)
 
 	type op struct {
 		kv  storage.MVCCKeyValue
@@ -297,7 +299,7 @@ func TestInitResolvedTSScan(t *testing.T) {
 		}
 		for _, op := range testData {
 			kv := op.kv
-			err := storage.MVCCPut(ctx, engine, nil, kv.Key.Key, kv.Key.Timestamp, hlc.ClockTimestamp{}, roachpb.Value{RawBytes: kv.Value}, op.txn)
+			err := storage.MVCCPut(ctx, engine, kv.Key.Key, kv.Key.Timestamp, roachpb.Value{RawBytes: kv.Value}, storage.MVCCWriteOptions{Txn: op.txn})
 			require.NoError(t, err)
 		}
 		return engine
@@ -305,13 +307,13 @@ func TestInitResolvedTSScan(t *testing.T) {
 
 	expEvents := []*event{
 		{ops: []enginepb.MVCCLogicalOp{
-			writeIntentOpWithKey(txn2ID, []byte("txnKey2"), hlc.Timestamp{WallTime: 21}),
+			writeIntentOpWithKey(txn2ID, []byte("txnKey2"), isolation.ReadCommitted, hlc.Timestamp{WallTime: 21}),
 		}},
 		{ops: []enginepb.MVCCLogicalOp{
-			writeIntentOpWithKey(txn1ID, []byte("txnKey1"), hlc.Timestamp{WallTime: 15}),
+			writeIntentOpWithKey(txn1ID, []byte("txnKey1"), isolation.Serializable, hlc.Timestamp{WallTime: 15}),
 		}},
 		{ops: []enginepb.MVCCLogicalOp{
-			writeIntentOpWithKey(txn1ID, []byte("txnKey1"), hlc.Timestamp{WallTime: 15}),
+			writeIntentOpWithKey(txn1ID, []byte("txnKey1"), isolation.Serializable, hlc.Timestamp{WallTime: 15}),
 		}},
 		{initRTS: true},
 	}
@@ -322,9 +324,12 @@ func TestInitResolvedTSScan(t *testing.T) {
 		"legacy intent scanner": {
 			intentScanner: func() (IntentScanner, func()) {
 				engine := makeEngine()
-				iter := engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+				iter, err := engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 					UpperBound: endKey.AsRawKey(),
 				})
+				if err != nil {
+					t.Fatal(err)
+				}
 				return NewLegacyIntentScanner(iter), func() { engine.Close() }
 			},
 		},
@@ -333,10 +338,13 @@ func TestInitResolvedTSScan(t *testing.T) {
 				engine := makeEngine()
 				lowerBound, _ := keys.LockTableSingleKey(startKey.AsRawKey(), nil)
 				upperBound, _ := keys.LockTableSingleKey(endKey.AsRawKey(), nil)
-				iter := engine.NewEngineIterator(storage.IterOptions{
+				iter, err := engine.NewEngineIterator(storage.IterOptions{
 					LowerBound: lowerBound,
 					UpperBound: upperBound,
 				})
+				if err != nil {
+					t.Fatal(err)
+				}
 				return NewSeparatedIntentScanner(iter), func() { engine.Close() }
 			},
 		},
@@ -345,7 +353,7 @@ func TestInitResolvedTSScan(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			// Mock processor. We just needs its eventC.
-			p := Processor{
+			p := LegacyProcessor{
 				Config: Config{
 					Span: roachpb.RSpan{
 						Key:    startKey,
@@ -356,7 +364,7 @@ func TestInitResolvedTSScan(t *testing.T) {
 			}
 			isc, cleanup := tc.intentScanner()
 			defer cleanup()
-			initScan := newInitResolvedTSScan(&p, isc)
+			initScan := newInitResolvedTSScan(p.Span, &p, isc)
 			initScan.Run(context.Background())
 			// Compare the event channel to the expected events.
 			assert.Equal(t, len(expEvents), len(p.eventC))
@@ -487,13 +495,16 @@ func TestTxnPushAttempt(t *testing.T) {
 
 	// Mock processor. We configure its key span to exclude one of txn2's lock
 	// spans and a portion of three of txn4's lock spans.
-	p := Processor{eventC: make(chan *event, 100)}
+	p := LegacyProcessor{eventC: make(chan *event, 100)}
 	p.Span = roachpb.RSpan{Key: roachpb.RKey("b"), EndKey: roachpb.RKey("m")}
 	p.TxnPusher = &tp
 
 	txns := []enginepb.TxnMeta{txn1Meta, txn2Meta, txn3Meta, txn4Meta}
 	doneC := make(chan struct{})
-	pushAttempt := newTxnPushAttempt(&p, txns, hlc.Timestamp{WallTime: 15}, doneC)
+	pushAttempt := newTxnPushAttempt(p.Span, p.TxnPusher, &p, txns, hlc.Timestamp{WallTime: 15},
+		func() {
+			close(doneC)
+		})
 	pushAttempt.Run(context.Background())
 	<-doneC // check if closed
 

@@ -23,15 +23,15 @@ import (
 )
 
 var hibernateReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedHibernateTag = "5.6.9"
+var supportedHibernateTag = "5.6.15"
 
 type hibernateOptions struct {
 	testName string
 	testDir  string
 	buildCmd,
 	testCmd string
-	blocklistWithName blocklistWithName
-	dbSetupFunc       func(ctx context.Context, t test.Test, c cluster.Cluster)
+	listWithName listWithName
+	dbSetupFunc  func(ctx context.Context, t test.Test, c cluster.Cluster)
 }
 
 var (
@@ -40,9 +40,14 @@ var (
 		testDir:  "hibernate-core",
 		buildCmd: `cd /mnt/data1/hibernate/hibernate-core/ && ./../gradlew test -Pdb=cockroachdb ` +
 			`--tests org.hibernate.jdbc.util.BasicFormatterTest.*`,
-		testCmd:           "cd /mnt/data1/hibernate/hibernate-core/ && ./../gradlew test -Pdb=cockroachdb",
-		blocklistWithName: blocklistWithName{blocklistname: "hibernateBlockList", blocklist: hibernateBlockList},
-		dbSetupFunc:       nil,
+		testCmd: "cd /mnt/data1/hibernate/hibernate-core/ && ./../gradlew test -Pdb=cockroachdb",
+		listWithName: listWithName{
+			blocklistName:  "hibernateBlockList",
+			blocklist:      hibernateBlockList,
+			ignorelistName: "hibernateIgnoreList",
+			ignorelist:     hibernateIgnoreList,
+		},
+		dbSetupFunc: nil,
 	}
 	hibernateSpatialOpts = hibernateOptions{
 		testName: "hibernate-spatial",
@@ -51,7 +56,12 @@ var (
 			`--tests org.hibernate.spatial.dialect.postgis.*`,
 		testCmd: `cd /mnt/data1/hibernate/hibernate-spatial && ` +
 			`HIBERNATE_CONNECTION_LEAK_DETECTION=true ./../gradlew test -Pdb=cockroachdb_spatial`,
-		blocklistWithName: blocklistWithName{blocklistname: "hibernateSpatialBlockList", blocklist: hibernateSpatialBlockList},
+		listWithName: listWithName{
+			blocklistName:  "hibernateSpatialBlockList",
+			blocklist:      hibernateSpatialBlockList,
+			ignorelistName: "hibernateSpatialIgnoreList",
+			ignorelist:     hibernateSpatialIgnoreList,
+		},
 		dbSetupFunc: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			db := c.Conn(ctx, t.L(), 1)
 			defer db.Close()
@@ -169,8 +179,8 @@ func registerHibernate(r registry.Registry, opt hibernateOptions) {
 			t.Fatal(err)
 		}
 
-		blocklistName := opt.blocklistWithName.blocklistname
-		expectedFailures := opt.blocklistWithName.blocklist
+		blocklistName := opt.listWithName.blocklistName
+		expectedFailures := opt.listWithName.blocklist
 
 		t.L().Printf("Running cockroach version %s, using blocklist %s", version, blocklistName)
 
@@ -228,16 +238,17 @@ func registerHibernate(r registry.Registry, opt hibernateOptions) {
 
 		parseAndSummarizeJavaORMTestsResults(
 			ctx, t, c, node, "hibernate" /* ormName */, output,
-			blocklistName, expectedFailures, nil /* ignorelist */, version, supportedHibernateTag,
+			blocklistName, expectedFailures, opt.listWithName.ignorelist, version, supportedHibernateTag,
 		)
 	}
 
 	r.Add(registry.TestSpec{
 		Name:       opt.testName,
-		Owner:      registry.OwnerSQLSessions,
+		Owner:      registry.OwnerSQLFoundations,
 		Cluster:    r.MakeClusterSpec(1),
+		Leases:     registry.MetamorphicLeases,
 		NativeLibs: registry.LibGEOS,
-		Tags:       []string{`default`, `orm`},
+		Tags:       registry.Tags(`default`, `orm`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runHibernate(ctx, t, c)
 		},

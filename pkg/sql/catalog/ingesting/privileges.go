@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -45,6 +46,7 @@ func GetIngestingDescriptorPrivileges(
 	wroteDBs map[descpb.ID]catalog.DatabaseDescriptor,
 	wroteSchemas map[descpb.ID]catalog.SchemaDescriptor,
 	descCoverage tree.DescriptorCoverage,
+	includePublicSchemaCreatePriv bool,
 ) (updatedPrivileges *catpb.PrivilegeDescriptor, err error) {
 	switch desc := desc.(type) {
 	case catalog.TableDescriptor:
@@ -58,6 +60,7 @@ func GetIngestingDescriptorPrivileges(
 			wroteSchemas,
 			descCoverage,
 			privilege.Table,
+			includePublicSchemaCreatePriv,
 		)
 	case catalog.SchemaDescriptor:
 		return getIngestingPrivilegesForTableOrSchema(
@@ -70,6 +73,7 @@ func GetIngestingDescriptorPrivileges(
 			wroteSchemas,
 			descCoverage,
 			privilege.Schema,
+			includePublicSchemaCreatePriv,
 		)
 	case catalog.TypeDescriptor:
 		// If the ingestion is not a cluster restore we cannot know that the users
@@ -103,6 +107,7 @@ func getIngestingPrivilegesForTableOrSchema(
 	wroteSchemas map[descpb.ID]catalog.SchemaDescriptor,
 	descCoverage tree.DescriptorCoverage,
 	privilegeType privilege.ObjectType,
+	includePublicSchemaCreatePriv bool,
 ) (updatedPrivileges *catpb.PrivilegeDescriptor, err error) {
 	if _, ok := wroteDBs[desc.GetParentID()]; ok {
 		// If we're creating a new database in this ingestion, the tables and
@@ -110,8 +115,8 @@ func getIngestingPrivilegesForTableOrSchema(
 		// are granted on object creation.
 		switch privilegeType {
 		case privilege.Schema:
-			if desc.GetName() == tree.PublicSchema {
-				updatedPrivileges = catpb.NewPublicSchemaPrivilegeDescriptor()
+			if desc.GetName() == catconstants.PublicSchemaName {
+				updatedPrivileges = catpb.NewPublicSchemaPrivilegeDescriptor(includePublicSchemaCreatePriv)
 			} else {
 				updatedPrivileges = catpb.NewBasePrivilegeDescriptor(user)
 			}
@@ -163,9 +168,12 @@ func getIngestingPrivilegesForTableOrSchema(
 			return nil, errors.Newf("unexpected privilege type %T", privilegeType)
 		}
 
-		updatedPrivileges = catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		updatedPrivileges, err = catprivilege.CreatePrivilegesFromDefaultPrivileges(
 			dbDefaultPrivileges, schemaDefaultPrivileges, parentDB.GetID(), user, targetObject,
 		)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return updatedPrivileges, nil
 }

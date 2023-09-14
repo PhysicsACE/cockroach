@@ -30,9 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
@@ -67,13 +69,22 @@ func New() *Catalog {
 			SchemaID: 1,
 			SchemaName: cat.SchemaName{
 				CatalogName:     testDB,
-				SchemaName:      tree.PublicSchemaName,
+				SchemaName:      catconstants.PublicSchemaName,
 				ExplicitSchema:  true,
 				ExplicitCatalog: true,
 			},
 			dataSources: make(map[string]dataSource),
 		},
 	}
+}
+
+func (tc *Catalog) LookupDatabaseName(
+	_ context.Context, _ cat.Flags, name string,
+) (tree.Name, error) {
+	if name != testDB {
+		return "", sqlerrors.NewUndefinedDatabaseError(name)
+	}
+	return tree.Name(name), nil
 }
 
 // ResolveSchema is part of the cat.Catalog interface.
@@ -99,14 +110,14 @@ func (tc *Catalog) ResolveSchema(
 		// No luck so far. Compatibility with CockroachDB v1.1: use D.public
 		// instead.
 		toResolve.CatalogName = name.SchemaName
-		toResolve.SchemaName = tree.PublicSchemaName
+		toResolve.SchemaName = catconstants.PublicSchemaName
 		toResolve.ExplicitCatalog = true
 		return tc.resolveSchema(&toResolve)
 	}
 
 	// Neither schema or catalog was specified, so use t.public.
 	toResolve.CatalogName = tree.Name(testDB)
-	toResolve.SchemaName = tree.PublicSchemaName
+	toResolve.SchemaName = catconstants.PublicSchemaName
 	return tc.resolveSchema(&toResolve)
 }
 
@@ -116,7 +127,7 @@ func (tc *Catalog) GetAllSchemaNamesForDB(
 ) ([]cat.SchemaName, error) {
 	var schemaNames []cat.SchemaName
 	var scName cat.SchemaName
-	scName.SchemaName = tree.PublicSchemaName
+	scName.SchemaName = catconstants.PublicSchemaName
 	scName.ExplicitSchema = true
 	scName.CatalogName = tree.Name(dbName)
 	scName.ExplicitCatalog = true
@@ -151,7 +162,7 @@ func (tc *Catalog) ResolveDataSource(
 		// No luck so far. Compatibility with CockroachDB v1.1: try D.public.T
 		// instead.
 		toResolve.CatalogName = name.SchemaName
-		toResolve.SchemaName = tree.PublicSchemaName
+		toResolve.SchemaName = catconstants.PublicSchemaName
 		toResolve.ExplicitCatalog = true
 		ds, err = tc.resolveDataSource(&toResolve)
 		if err == nil {
@@ -160,7 +171,7 @@ func (tc *Catalog) ResolveDataSource(
 	} else {
 		// This is a naked data source name. Use the current database.
 		toResolve.CatalogName = tree.Name(testDB)
-		toResolve.SchemaName = tree.PublicSchemaName
+		toResolve.SchemaName = catconstants.PublicSchemaName
 		ds, err = tc.resolveDataSource(&toResolve)
 		if err == nil {
 			return ds, toResolve, nil
@@ -173,6 +184,11 @@ func (tc *Catalog) ResolveDataSource(
 		// We rely on the check in CreateTable against this table's schema to infer
 		// that this is a virtual table.
 		return tc.CreateTable(table), *name, nil
+	}
+	if view, ok := resolveVirtualView(name); ok {
+		// We rely on the check in CreateView against this table's schema to infer
+		// that this is a virtual table.
+		return tc.CreateView(view), *name, nil
 	}
 
 	// If this didn't end up being a virtual table, then return the original
@@ -300,13 +316,18 @@ func (tc *Catalog) RoleExists(ctx context.Context, role username.SQLUsername) (b
 	return true, nil
 }
 
+// Optimizer is part of the cat.Catalog interface.
+func (tc *Catalog) Optimizer() interface{} {
+	return nil
+}
+
 func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.SchemaName, error) {
 	if string(toResolve.CatalogName) != testDB {
 		return nil, cat.SchemaName{}, pgerror.Newf(pgcode.InvalidSchemaName,
 			"target database or schema does not exist")
 	}
 
-	if string(toResolve.SchemaName) != tree.PublicSchema {
+	if string(toResolve.SchemaName) != catconstants.PublicSchemaName {
 		return nil, cat.SchemaName{}, pgerror.Newf(pgcode.InvalidName,
 			"schema cannot be modified: %q", tree.ErrString(toResolve))
 	}
@@ -341,6 +362,20 @@ func (tc *Catalog) Table(name *tree.TableName) *Table {
 	}
 	panic(pgerror.Newf(pgcode.WrongObjectType,
 		"\"%q\" is not a table", tree.ErrString(name)))
+}
+
+// LookupTable returns the test table that was previously added with the given
+// name but returns an error if the name does not exist instead of panicking.
+func (tc *Catalog) LookupTable(name *tree.TableName) (*Table, error) {
+	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
+	if err != nil {
+		return nil, err
+	}
+	if tab, ok := ds.(*Table); ok {
+		return tab, nil
+	}
+	return nil, pgerror.Newf(pgcode.WrongObjectType,
+		"\"%q\" is not a table", tree.ErrString(name))
 }
 
 // Tables returns a list of all tables added to the test catalog.
@@ -469,8 +504,8 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 		tc.CreateType(stmt)
 		return "", nil
 
-	case *tree.CreateFunction:
-		tc.CreateFunction(stmt)
+	case *tree.CreateRoutine:
+		tc.CreateRoutine(stmt)
 		return "", nil
 
 	case *tree.SetZoneConfig:
@@ -522,7 +557,7 @@ func (tc *Catalog) qualifyTableName(name *tree.TableName) {
 			return
 		}
 
-		if name.SchemaName == tree.PublicSchemaName {
+		if name.SchemaName == catconstants.PublicSchemaName {
 			// Use the current database.
 			name.CatalogName = testDB
 			return
@@ -530,13 +565,13 @@ func (tc *Catalog) qualifyTableName(name *tree.TableName) {
 
 		// Compatibility with CockroachDB v1.1: use D.public.T.
 		name.CatalogName = name.SchemaName
-		name.SchemaName = tree.PublicSchemaName
+		name.SchemaName = catconstants.PublicSchemaName
 		return
 	}
 
 	// Use the current database.
 	name.CatalogName = testDB
-	name.SchemaName = tree.PublicSchemaName
+	name.SchemaName = catconstants.PublicSchemaName
 }
 
 // Schema implements the cat.Schema interface for testing purposes.
@@ -704,7 +739,7 @@ var _ cat.Table = &Table{}
 
 func (tt *Table) String() string {
 	tp := treeprinter.New()
-	cat.FormatTable(tt.Catalog, tt, tp)
+	cat.FormatTable(tt.Catalog, tt, tp, false /* redactableValues */)
 	return tp.String()
 }
 
@@ -896,6 +931,11 @@ func (tt *Table) GetDatabaseID() descpb.ID {
 	return tt.DatabaseID
 }
 
+// IsHypothetical is part of the cat.Table interface.
+func (tt *Table) IsHypothetical() bool {
+	return false
+}
+
 // FindOrdinal returns the ordinal of the column with the given name.
 func (tt *Table) FindOrdinal(name string) int {
 	for i, col := range tt.Columns {
@@ -981,8 +1021,11 @@ type Index struct {
 	// Inverted is true when this index is an inverted index.
 	Inverted bool
 
-	// NotVisible is true when this index is a not visible index.
-	NotVisible bool
+	// Invisibility specifies the invisibility of an index and can be any float64
+	// between [0.0, 1.0]. An index with invisibility 0.0 means that the index is
+	// visible. An index with invisibility 1.0 means that the index is fully not
+	// visible.
+	Invisibility float64
 
 	Columns []cat.IndexColumn
 
@@ -1049,9 +1092,9 @@ func (ti *Index) IsInverted() bool {
 	return ti.Inverted
 }
 
-// IsNotVisible is part of the cat.Index interface.
-func (ti *Index) IsNotVisible() bool {
-	return ti.NotVisible
+// GetInvisibility is part of the cat.Index interface.
+func (ti *Index) GetInvisibility() float64 {
+	return ti.Invisibility
 }
 
 // ColumnCount is part of the cat.Index interface.
@@ -1183,6 +1226,7 @@ type TableStat struct {
 	evalCtx       *eval.Context
 	histogram     []cat.HistogramBucket
 	histogramType *types.T
+	tc            *Catalog
 }
 
 var _ cat.TableStatistic = &TableStat{}
@@ -1243,7 +1287,10 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	if err != nil {
 		panic(err)
 	}
-	colType := tree.MustBeStaticallyKnownType(colTypeRef)
+	colType, err := tree.ResolveType(context.Background(), colTypeRef, ts.tc)
+	if err != nil {
+		return nil
+	}
 
 	var offset int
 	if ts.js.NullCount > 0 {

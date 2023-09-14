@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -142,10 +141,8 @@ SELECT nextval(105:::REGCLASS);`,
 		_, typ, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typn)
 		require.NoError(t, err)
 		require.Equal(t, "notmyworkday", typ.GetName())
-		require.Equal(t,
-			[]descpb.ID{110},
-			typ.GetReferencingDescriptorIDs(),
-		)
+		require.Equal(t, 1, typ.NumReferencingDescriptors())
+		require.Equal(t, descpb.ID(110), typ.GetReferencingDescriptorID(0))
 
 		return nil
 	})
@@ -154,9 +151,10 @@ SELECT nextval(105:::REGCLASS);`,
 
 func TestVersionGatingUDFInCheckConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
-		params, _ := tests.CreateTestServerParams()
+		params, _ := createTestServerParams()
 		// Override binary version to be older.
 		params.Knobs.Server = &server.TestingKnobs{
 			DisableAutomaticVersionUpgrade: make(chan struct{}),
@@ -173,7 +171,7 @@ func TestVersionGatingUDFInCheckConstraints(t *testing.T) {
 	})
 
 	t.Run("new_schema_changer_version_disabled", func(t *testing.T) {
-		params, _ := tests.CreateTestServerParams()
+		params, _ := createTestServerParams()
 		// Override binary version to be older.
 		params.Knobs.Server = &server.TestingKnobs{
 			DisableAutomaticVersionUpgrade: make(chan struct{}),
@@ -198,7 +196,7 @@ func TestVersionGatingUDFInColumnDefault(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
-		params, _ := tests.CreateTestServerParams()
+		params, _ := createTestServerParams()
 		// Override binary version to be older.
 		params.Knobs.Server = &server.TestingKnobs{
 			DisableAutomaticVersionUpgrade: make(chan struct{}),
@@ -217,7 +215,7 @@ func TestVersionGatingUDFInColumnDefault(t *testing.T) {
 	})
 
 	t.Run("new_schema_changer_version_disabled", func(t *testing.T) {
-		params, _ := tests.CreateTestServerParams()
+		params, _ := createTestServerParams()
 		// Override binary version to be older.
 		params.Knobs.Server = &server.TestingKnobs{
 			DisableAutomaticVersionUpgrade: make(chan struct{}),
@@ -335,7 +333,8 @@ SELECT nextval(106:::REGCLASS);`,
 		typn := tree.MakeQualifiedTypeName("defaultdb", "public", "notmyworkday")
 		_, typ, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typn)
 		require.NoError(t, err)
-		require.Equal(t, []descpb.ID{112}, typ.GetReferencingDescriptorIDs())
+		require.Equal(t, 1, typ.NumReferencingDescriptors())
+		require.Equal(t, descpb.ID(112), typ.GetReferencingDescriptorID(0))
 
 		// All objects with "1" suffix should have back references to the function,
 		// "2" should have empty references since it's not used yet.
@@ -378,7 +377,8 @@ SELECT nextval(107:::REGCLASS);`,
 		typn := tree.MakeQualifiedTypeName("defaultdb", "public", "notmyworkday")
 		_, typ, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typn)
 		require.NoError(t, err)
-		require.Equal(t, []descpb.ID{112}, typ.GetReferencingDescriptorIDs())
+		require.Equal(t, 1, typ.NumReferencingDescriptors())
+		require.Equal(t, descpb.ID(112), typ.GetReferencingDescriptorID(0))
 
 		// Now all objects with "2" suffix in name should have back references "1"
 		// had before, and "1" should have empty references.

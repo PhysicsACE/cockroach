@@ -12,13 +12,14 @@ import React, { useState, useRef } from "react";
 import { Button, Dropdown } from "antd";
 import "antd/lib/button/style";
 import "antd/lib/dropdown/style";
-import moment, { Moment } from "moment";
+import moment, { Moment } from "moment-timezone";
 import { DateRangeMenu } from "src/dateRangeMenu";
 import { CaretDown } from "src/icon/caretDown";
 import classNames from "classnames/bind";
 
 import styles from "./rangeSelector.module.scss";
 import { TimeWindow } from "./timeScaleTypes";
+import { Timezone } from "src/timestamp";
 
 const cx = classNames.bind(styles);
 
@@ -224,7 +225,7 @@ const RangeSelect = ({
                         {selected.timeEnd}
                       </span>{" "}
                       <span className={cx("Select-value-label__sufix")}>
-                        (UTC)
+                        <Timezone />
                       </span>
                     </>
                   )}

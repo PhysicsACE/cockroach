@@ -19,7 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -32,10 +32,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/circuit"
+	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -301,7 +301,6 @@ func TestReplicaCircuitBreaker_Leaseholder_QuorumLoss(t *testing.T) {
 // leases have lots of special casing internally, this is easy to get wrong.
 func TestReplicaCircuitBreaker_Follower_QuorumLoss(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 76781, "flaky test")
 	defer log.Scope(t).Close(t)
 	tc := setupCircuitBreakerTest(t)
 	defer tc.Stopper().Stop(context.Background())
@@ -395,12 +394,58 @@ func TestReplicaCircuitBreaker_Liveness_QuorumLoss(t *testing.T) {
 	require.NoError(t, tc.Write(n1))
 }
 
+// In this test, a txn anchored on the range losing quorum also has an intent on
+// a healthy range. Quorum is lost before committing, poisoning latches for the
+// txn info. When resolving the intent on the healthy range, it will hit a
+// poisoned latch. This should result in a ReplicaUnavailableError from the
+// original range that lost quorum, not from the range with the intent.
+func TestReplicaCircuitBreaker_ResolveIntent_QuorumLoss(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	tc := setupCircuitBreakerTest(t)
+	defer tc.Stopper().Stop(ctx)
+
+	// Get lease on n1.
+	require.NoError(t, tc.Write(n1))
+
+	// Split off a healthy range, which will inherit a lease on n1. Remove the
+	// replica on n2, so that it remains healthy when we take down n2.
+	failKey := tc.ScratchRange(t)
+	okKey := failKey.Next()
+	failDesc, _ := tc.SplitRangeOrFatal(t, okKey)
+	okDesc := tc.RemoveVotersOrFatal(t, okKey, tc.Target(n2))
+	t.Logf("failDesc=%s", failDesc)
+	t.Logf("okDesc=%s", okDesc)
+
+	// Start a transaction, anchoring it on the faulty range.
+	db := tc.Server(n1).DB()
+	txn := db.NewTxn(ctx, "test")
+	require.NoError(t, txn.Put(ctx, failKey, "fail"))
+	require.NoError(t, txn.Put(ctx, okKey, "ok"))
+
+	// Lose quorum.
+	tc.StopServer(n2)
+	tc.HeartbeatNodeLiveness(t, n1)
+
+	// Attempt to commit. It should fail, but will poison latches on
+	// the faulty range.
+	tc.SetSlowThreshold(time.Second)
+	err := txn.Commit(ctx)
+	tc.RequireIsBreakerOpen(t, err)
+
+	// Read the key from the healthy range. It should fail due to a poisoned latch
+	// on the txn's anchored range. This error should appear to come from the
+	// failed range, not from the healthy range.
+	_, err = db.Get(ctx, okKey)
+	tc.RequireIsBreakerOpen(t, err)
+	ruErr := &kvpb.ReplicaUnavailableError{}
+	require.True(t, errors.As(err, &ruErr))
+	require.Equal(t, failDesc.RangeID, ruErr.Desc.RangeID)
+}
+
 type dummyStream struct {
 	name string
-	t    interface {
-		Helper()
-		Logf(string, ...interface{})
-	}
 	ctx  context.Context
 	recv chan *kvpb.RangeFeedEvent
 }
@@ -411,15 +456,32 @@ func (s *dummyStream) Context() context.Context {
 
 func (s *dummyStream) Send(ev *kvpb.RangeFeedEvent) error {
 	if ev.Val == nil && ev.Error == nil {
-		s.t.Logf("%s: ignoring event: %v", s.name, ev)
 		return nil
 	}
+
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	case s.recv <- ev:
 		return nil
 	}
+}
+
+func waitReplicaRangeFeed(
+	ctx context.Context,
+	r *kvserver.Replica,
+	req *kvpb.RangeFeedRequest,
+	stream kvpb.RangeFeedEventSink,
+) error {
+	rfErr, ctxErr := future.Wait(ctx, r.RangeFeed(req, stream, nil /* pacer */))
+	if ctxErr != nil {
+		return ctxErr
+	}
+	var event kvpb.RangeFeedEvent
+	event.SetValue(&kvpb.RangeFeedError{
+		Error: *kvpb.NewError(rfErr),
+	})
+	return stream.Send(&event)
 }
 
 // This test verifies that RangeFeed bypasses the circuit breaker. When the
@@ -441,9 +503,9 @@ func TestReplicaCircuitBreaker_RangeFeed(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream1 := &dummyStream{t: t, ctx: ctx, name: "rangefeed1", recv: make(chan *kvpb.RangeFeedEvent)}
+	stream1 := &dummyStream{ctx: ctx, name: "rangefeed1", recv: make(chan *kvpb.RangeFeedEvent)}
 	require.NoError(t, tc.Stopper().RunAsyncTask(ctx, "stream1", func(ctx context.Context) {
-		err := tc.repls[0].RangeFeed(args, stream1, nil /* pacer */).GoError()
+		err := waitReplicaRangeFeed(ctx, tc.repls[0].Replica, args, stream1)
 		if ctx.Err() != nil {
 			return // main goroutine stopping
 		}
@@ -495,9 +557,9 @@ func TestReplicaCircuitBreaker_RangeFeed(t *testing.T) {
 
 	// Start another stream during the "outage" to make sure it isn't rejected by
 	// the breaker.
-	stream2 := &dummyStream{t: t, ctx: ctx, name: "rangefeed2", recv: make(chan *kvpb.RangeFeedEvent)}
+	stream2 := &dummyStream{ctx: ctx, name: "rangefeed2", recv: make(chan *kvpb.RangeFeedEvent)}
 	require.NoError(t, tc.Stopper().RunAsyncTask(ctx, "stream2", func(ctx context.Context) {
-		err := tc.repls[0].RangeFeed(args, stream2, nil /* pacer */).GoError()
+		err := waitReplicaRangeFeed(ctx, tc.repls[0].Replica, args, stream2)
 		if ctx.Err() != nil {
 			return // main goroutine stopping
 		}
@@ -691,6 +753,10 @@ func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
 	var rangeID int64             // atomic
 	slowThresh := &atomic.Value{} // supports .SetSlowThreshold(x)
 	slowThresh.Store(time.Duration(0))
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	// TODO(erikgrinaker): We may not need this for all circuit breaker tests.
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 	storeKnobs := &kvserver.StoreTestingKnobs{
 		SlowReplicationThresholdOverride: func(ba *kvpb.BatchRequest) time.Duration {
 			t.Helper()
@@ -724,6 +790,7 @@ func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
 			pErr := kvpb.NewErrorf("test prevents lease acquisition by n2")
 			return 0, pErr
 		},
+		RangeLeaseAcquireTimeoutOverride: testutils.DefaultSucceedsSoonDuration,
 	}
 	// In some tests we'll restart servers, which means that we will be waiting
 	// for raft elections. Speed this up by campaigning aggressively. This also
@@ -734,23 +801,22 @@ func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
 	raftCfg.SetDefaults()
 	raftCfg.RaftHeartbeatIntervalTicks = 1
 	raftCfg.RaftElectionTimeoutTicks = 2
-	reg := server.NewStickyInMemEnginesRegistry()
+	reg := server.NewStickyVFSRegistry()
 	args := base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
+			Settings:   st,
 			RaftConfig: raftCfg,
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					WallClock:            manualClock,
-					StickyEngineRegistry: reg,
+					WallClock:         manualClock,
+					StickyVFSRegistry: reg,
 				},
 				Store: storeKnobs,
 			},
 		},
 	}
 	tc := testcluster.StartTestCluster(t, 2, args)
-	tc.Stopper().AddCloser(stop.CloserFn(reg.CloseAllStickyInMemEngines))
-
 	_, err := tc.ServerConn(0).Exec(`SET CLUSTER SETTING kv.replica_circuit_breaker.slow_replication_threshold = '45s'`)
 	require.NoError(t, err)
 
@@ -836,7 +902,22 @@ func (cbt *circuitBreakerTest) ExpireAllLeasesAndN1LivenessRecord(
 		self, ok := lv.Self()
 		require.True(t, ok)
 
-		cbt.ManualClock.Forward(self.Expiration.WallTime)
+		ts := hlc.Timestamp{WallTime: self.Expiration.WallTime}
+		require.NoError(t, srv.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
+			s.VisitReplicas(func(replica *kvserver.Replica) (wantMore bool) {
+				lease, next := replica.GetLease()
+				if lease.Expiration != nil {
+					ts.Forward(*lease.Expiration)
+				}
+				if next.Expiration != nil {
+					ts.Forward(*next.Expiration)
+				}
+				return true // more
+			})
+			return nil
+		}))
+
+		cbt.ManualClock.Forward(ts.WallTime)
 		if idx == n1 {
 			// Invalidate n1's liveness record, to make sure that ranges on n1 need
 			// to acquire a new lease (vs waiting for a heartbeat to the liveness
@@ -850,7 +931,7 @@ func (cbt *circuitBreakerTest) ExpireAllLeasesAndN1LivenessRecord(
 			testutils.SucceedsSoon(t, func() error {
 				self, ok := lv.Self()
 				require.True(t, ok)
-				if self.IsLive(cbt.Server(n2).Clock().Now().GoTime()) {
+				if self.IsLive(cbt.Server(n2).Clock().Now()) {
 					// Someone else must have incremented epoch.
 					return nil
 				}
@@ -923,10 +1004,10 @@ func (cbt *circuitBreakerTest) SendCtxTS(
 func (cbt *circuitBreakerTest) WriteDS(idx int) error {
 	cbt.t.Helper()
 	put := kvpb.NewPut(cbt.repls[idx].Desc().StartKey.AsRawKey(), roachpb.MakeValueFromString("hello"))
-	return cbt.sendViaDistSender(cbt.Servers[idx].DistSender(), put)
+	return cbt.sendViaDistSender(cbt.Servers[idx].DistSenderI().(kv.Sender), put)
 }
 
-func (cbt *circuitBreakerTest) sendViaDistSender(ds *kvcoord.DistSender, req kvpb.Request) error {
+func (cbt *circuitBreakerTest) sendViaDistSender(ds kv.Sender, req kvpb.Request) error {
 	cbt.t.Helper()
 	ba := &kvpb.BatchRequest{}
 	ba.Add(req)
@@ -988,14 +1069,14 @@ func (cbt *circuitBreakerTest) Write(idx int) error {
 func (cbt *circuitBreakerTest) Read(idx int) error {
 	cbt.t.Helper()
 	repl := cbt.repls[idx]
-	get := kvpb.NewGet(repl.Desc().StartKey.AsRawKey(), false /* forUpdate */)
+	get := kvpb.NewGet(repl.Desc().StartKey.AsRawKey(), kvpb.NonLocking)
 	return cbt.Send(idx, get)
 }
 
 func (cbt *circuitBreakerTest) FollowerRead(idx int) error {
 	cbt.t.Helper()
 	repl := cbt.repls[idx]
-	get := kvpb.NewGet(repl.Desc().StartKey.AsRawKey(), false /* forUpdate */)
+	get := kvpb.NewGet(repl.Desc().StartKey.AsRawKey(), kvpb.NonLocking)
 	ctx := context.Background()
 	ts := repl.GetCurrentClosedTimestamp(ctx)
 	return cbt.SendCtxTS(ctx, idx, get, ts)

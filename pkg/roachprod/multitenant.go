@@ -45,38 +45,30 @@ func StartTenant(
 		return err
 	}
 
-	if tc.Name == hc.Name {
-		// We allow using the same cluster, but the node sets must be disjoint.
-		for _, n1 := range tc.Nodes {
-			for _, n2 := range hc.Nodes {
-				if n1 == n2 {
-					return errors.Errorf("host and tenant nodes must be disjoint")
-				}
-			}
-		}
-	}
-
 	startOpts.Target = install.StartTenantSQL
 	if startOpts.TenantID < 2 {
 		return errors.Errorf("invalid tenant ID %d (must be 2 or higher)", startOpts.TenantID)
 	}
+	// TODO(herko): Allow users to pass in a tenant name.
+	startOpts.TenantName = fmt.Sprintf("tenant-%d", startOpts.TenantID)
 
-	// Create tenant, if necessary. We need to run this SQL against a single host,
-	// so temporarily restrict the target nodes to 1.
-	saveNodes := hc.Nodes
-	hc.Nodes = hc.Nodes[:1]
+	// Create tenant, if necessary. We need to run this SQL against a single host.
 	l.Printf("Creating tenant metadata")
-	if err := hc.ExecSQL(ctx, l, "", []string{
+	if err := hc.ExecSQL(ctx, l, hc.Nodes[:1], "", 0, []string{
 		`-e`,
 		fmt.Sprintf(createTenantIfNotExistsQuery, startOpts.TenantID),
 	}); err != nil {
 		return err
 	}
-	hc.Nodes = saveNodes
 
+	l.Printf("Starting tenant nodes")
 	var kvAddrs []string
 	for _, node := range hc.Nodes {
-		kvAddrs = append(kvAddrs, fmt.Sprintf("%s:%d", hc.Host(node), hc.NodePort(node)))
+		port, err := hc.NodePort(ctx, node)
+		if err != nil {
+			return err
+		}
+		kvAddrs = append(kvAddrs, fmt.Sprintf("%s:%d", hc.Host(node), port))
 	}
 	startOpts.KVAddrs = strings.Join(kvAddrs, ",")
 	startOpts.KVCluster = hc

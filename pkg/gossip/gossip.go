@@ -57,7 +57,6 @@ import (
 	"time"
 	"unsafe"
 
-	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -233,8 +232,6 @@ type Gossip struct {
 	clientsMu struct {
 		syncutil.Mutex
 		clients []*client
-		// One breaker per client for the life of the process.
-		breakers map[string]*circuit.Breaker
 	}
 
 	disconnected chan *client  // Channel of disconnected clients
@@ -307,15 +304,14 @@ func New(
 	stopper.AddCloser(stop.CloserFn(g.server.AmbientContext.FinishEventLog))
 
 	registry.AddMetric(g.outgoing.gauge)
-	g.clientsMu.breakers = map[string]*circuit.Breaker{}
 
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	// Add ourselves as a SystemConfig watcher.
 	g.mu.is.registerCallback(KeyDeprecatedSystemConfig, g.updateSystemConfig)
 	// Add ourselves as a node descriptor watcher.
 	g.mu.is.registerCallback(MakePrefixPattern(KeyNodeDescPrefix), g.updateNodeAddress)
 	g.mu.is.registerCallback(MakePrefixPattern(KeyStoreDescPrefix), g.updateStoreMap)
-	g.mu.Unlock()
 
 	return g
 }
@@ -355,6 +351,11 @@ func (g *Gossip) AssertNotStarted(ctx context.Context) {
 	if g.started {
 		log.Fatalf(ctx, "gossip instance was already started")
 	}
+}
+
+// GetNodeID gets the NodeID.
+func (g *Gossip) GetNodeID() roachpb.NodeID {
+	return g.NodeID.Get()
 }
 
 // GetNodeMetrics returns the gossip node metrics.
@@ -540,18 +541,20 @@ func (g *Gossip) GetStoreDescriptor(storeID roachpb.StoreID) (*roachpb.StoreDesc
 // LogStatus logs the current status of gossip such as the incoming and
 // outgoing connections.
 func (g *Gossip) LogStatus() {
-	g.mu.RLock()
-	var n int
-	g.nodeDescs.Range(func(_ int64, _ unsafe.Pointer) bool {
-		n++
-		return true
-	})
-	status := redact.SafeString("ok")
-	if g.mu.is.getInfo(KeySentinel) == nil {
-		status = redact.SafeString("stalled")
-	}
-	g.mu.RUnlock()
-
+	n, status := func() (int, redact.SafeString) {
+		var inc int
+		g.mu.RLock()
+		defer g.mu.RUnlock()
+		g.nodeDescs.Range(func(_ int64, _ unsafe.Pointer) bool {
+			inc++
+			return true
+		})
+		s := redact.SafeString("ok")
+		if g.mu.is.getInfo(KeySentinel) == nil {
+			s = redact.SafeString("stalled")
+		}
+		return inc, s
+	}()
 	ctx := g.AnnotateCtx(context.TODO())
 	log.Health.Infof(ctx, "gossip status (%s, %d node%s)\n%s%s",
 		status, n, util.Pluralize(int64(n)),
@@ -942,9 +945,11 @@ func (g *Gossip) GetClusterID() (uuid.UUID, error) {
 // GetInfo returns an info value by key or an KeyNotPresentError if specified
 // key does not exist or has expired.
 func (g *Gossip) GetInfo(key string) ([]byte, error) {
-	g.mu.RLock()
-	i := g.mu.is.getInfo(key)
-	g.mu.RUnlock()
+	i := func() *Info {
+		g.mu.RLock()
+		defer g.mu.RUnlock()
+		return g.mu.is.getInfo(key)
+	}()
 
 	if i != nil {
 		if err := i.Value.Verify([]byte(key)); err != nil {
@@ -1007,8 +1012,8 @@ func (g *Gossip) tryClearInfoWithTTL(key string, ttl time.Duration) (bool, error
 // is regossiped as soon as possible when its lease changes hands.
 func (g *Gossip) InfoOriginatedHere(key string) bool {
 	g.mu.RLock()
+	defer g.mu.RUnlock()
 	info := g.mu.is.getInfo(key)
-	g.mu.RUnlock()
 	return info != nil && info.NodeID == g.NodeID.Get()
 }
 
@@ -1069,13 +1074,15 @@ var Redundant redundantCallbacks
 // received. The callback method is invoked with the info key which
 // matched pattern. Returns a function to unregister the callback.
 func (g *Gossip) RegisterCallback(pattern string, method Callback, opts ...CallbackOption) func() {
-	g.mu.Lock()
-	unregister := g.mu.is.registerCallback(pattern, method, opts...)
-	g.mu.Unlock()
+	unregister := func() func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.mu.is.registerCallback(pattern, method, opts...)
+	}()
 	return func() {
 		g.mu.Lock()
+		defer g.mu.Unlock()
 		unregister()
-		g.mu.Unlock()
 	}
 }
 
@@ -1313,9 +1320,11 @@ func (g *Gossip) manage(rpcContext *rpc.Context) {
 							}()
 						} else {
 							if log.V(1) {
-								g.clientsMu.Lock()
-								log.Dev.Infof(ctx, "couldn't find least useful client among %+v", g.clientsMu.clients)
-								g.clientsMu.Unlock()
+								func() {
+									g.clientsMu.Lock()
+									defer g.clientsMu.Unlock()
+									log.Dev.Infof(ctx, "couldn't find least useful client among %+v", g.clientsMu.clients)
+								}()
 							}
 						}
 					}
@@ -1324,10 +1333,11 @@ func (g *Gossip) manage(rpcContext *rpc.Context) {
 			case <-stallTimer.C:
 				stallTimer.Read = true
 				stallTimer.Reset(jitteredInterval(g.stallInterval))
-
-				g.mu.Lock()
-				g.maybeSignalStatusChangeLocked()
-				g.mu.Unlock()
+				func() {
+					g.mu.Lock()
+					defer g.mu.Unlock()
+					g.maybeSignalStatusChangeLocked()
+				}()
 			}
 		}
 	})
@@ -1456,17 +1466,11 @@ func (g *Gossip) signalConnectedLocked() {
 func (g *Gossip) startClientLocked(addr util.UnresolvedAddr, rpcContext *rpc.Context) {
 	g.clientsMu.Lock()
 	defer g.clientsMu.Unlock()
-	breaker, ok := g.clientsMu.breakers[addr.String()]
-	if !ok {
-		name := fmt.Sprintf("gossip %v->%v", rpcContext.Config.Addr, addr)
-		breaker = rpcContext.NewBreaker(name)
-		g.clientsMu.breakers[addr.String()] = breaker
-	}
 	ctx := g.AnnotateCtx(context.TODO())
 	log.VEventf(ctx, 1, "starting new client to %s", addr)
 	c := newClient(g.server.AmbientContext, &addr, g.serverMetrics)
 	g.clientsMu.clients = append(g.clientsMu.clients, c)
-	c.startLocked(g, g.disconnected, rpcContext, g.server.stopper, breaker)
+	c.startLocked(g, g.disconnected, rpcContext, g.server.stopper)
 }
 
 // removeClientLocked removes the specified client. Called when a client

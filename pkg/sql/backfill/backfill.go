@@ -27,9 +27,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -163,11 +166,12 @@ func (cb *ColumnBackfiller) init(
 	return cb.fetcher.Init(
 		ctx,
 		row.FetcherInitArgs{
-			Txn:        txn,
-			Alloc:      &cb.alloc,
-			MemMonitor: cb.mon,
-			Spec:       &spec,
-			TraceKV:    traceKV,
+			Txn:                        txn,
+			Alloc:                      &cb.alloc,
+			MemMonitor:                 cb.mon,
+			Spec:                       &spec,
+			TraceKV:                    traceKV,
+			ForceProductionKVBatchSize: cb.evalCtx.TestingKnobs.ForceProductionValues,
 		},
 	)
 }
@@ -372,6 +376,11 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 		for j, e := range cb.updateExprs {
 			val, err := eval.Expr(ctx, cb.evalCtx, e)
 			if err != nil {
+				if errors.Is(err, eval.ErrNilTxnInClusterContext) {
+					// Cannot use expressions that depend on the transaction of the
+					// evaluation context as the default value for backfill.
+					return roachpb.Key{}, pgerror.WithCandidateCode(err, pgcode.FeatureNotSupported)
+				}
 				return roachpb.Key{}, sqlerrors.NewInvalidSchemaDefinitionError(err)
 			}
 			if j < len(cb.added) && !cb.added[j].IsNullable() && val == tree.DNull {
@@ -498,7 +507,7 @@ func (ib *IndexBackfiller) InitForLocalUse(
 ) error {
 
 	// Initialize ib.added.
-	ib.initIndexes(desc)
+	ib.initIndexes(desc, nil /* allowList */)
 
 	// Initialize ib.cols and ib.colIdxMap.
 	if err := ib.initCols(desc); err != nil {
@@ -633,11 +642,12 @@ func (ib *IndexBackfiller) InitForDistributedUse(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	desc catalog.TableDescriptor,
+	allowList []catid.IndexID,
 	mon *mon.BytesMonitor,
 ) error {
 
 	// Initialize ib.added.
-	ib.initIndexes(desc)
+	ib.initIndexes(desc, allowList)
 
 	// Initialize ib.indexBackfillerCols.
 	if err := ib.initCols(desc); err != nil {
@@ -721,19 +731,25 @@ func (ib *IndexBackfiller) initCols(desc catalog.TableDescriptor) (err error) {
 }
 
 // initIndexes is a helper to populate index metadata of an IndexBackfiller. It
-// populates the added field. It returns a set of column ordinals that must be
-// fetched in order to backfill the added indexes.
-func (ib *IndexBackfiller) initIndexes(desc catalog.TableDescriptor) {
+// populates the added field to be all adding index mutations.
+// If `allowList` is non-nil, we only add those in this list.
+// If `allowList` is nil, we add all adding index mutations.
+func (ib *IndexBackfiller) initIndexes(desc catalog.TableDescriptor, allowList []catid.IndexID) {
+	var allowListAsSet catid.IndexSet
+	if len(allowList) > 0 {
+		allowListAsSet = catid.MakeIndexIDSet(allowList...)
+	}
+
 	mutations := desc.AllMutations()
 	mutationID := mutations[0].MutationID()
-
 	// Mutations in the same transaction have the same ID. Loop through the
 	// mutations and collect all index mutations.
 	for _, m := range mutations {
 		if m.MutationID() != mutationID {
 			break
 		}
-		if IndexMutationFilter(m) {
+		if IndexMutationFilter(m) &&
+			(allowListAsSet.Empty() || allowListAsSet.Contains(m.AsIndex().GetID())) {
 			idx := m.AsIndex()
 			ib.added = append(ib.added, idx)
 		}
@@ -835,11 +851,12 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 	if err := fetcher.Init(
 		ctx,
 		row.FetcherInitArgs{
-			Txn:        txn,
-			Alloc:      &ib.alloc,
-			MemMonitor: ib.mon,
-			Spec:       &spec,
-			TraceKV:    traceKV,
+			Txn:                        txn,
+			Alloc:                      &ib.alloc,
+			MemMonitor:                 ib.mon,
+			Spec:                       &spec,
+			TraceKV:                    traceKV,
+			ForceProductionKVBatchSize: ib.evalCtx.TestingKnobs.ForceProductionValues,
 		},
 	); err != nil {
 		return nil, nil, 0, err
@@ -876,6 +893,11 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 			}
 			val, err := eval.Expr(ctx, ib.evalCtx, texpr)
 			if err != nil {
+				if errors.Is(err, eval.ErrNilTxnInClusterContext) {
+					// Cannot use expressions that depend on the transaction of the
+					// evaluation context as the default value for backfill.
+					err = pgerror.WithCandidateCode(err, pgcode.FeatureNotSupported)
+				}
 				return err
 			}
 			colIdx, ok := ib.colIdxMap.Get(colID)

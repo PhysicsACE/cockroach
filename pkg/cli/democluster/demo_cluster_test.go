@@ -39,8 +39,8 @@ import (
 func newDemoCtx() *Context {
 	return &Context{
 		NumNodes:            1,
-		SQLPoolMemorySize:   128 << 20, // 128MB, chosen to fit 9 nodes on 2GB machine.
-		CacheSize:           64 << 20,  // 64MB, chosen to fit 9 nodes on 2GB machine.
+		SQLPoolMemorySize:   256 << 20, // 256MiB, chosen to fit 9 nodes on 4GB machine.
+		CacheSize:           64 << 20,  // 64MiB, chosen to fit 9 nodes on 4GB machine.
 		DefaultKeySize:      1024,
 		DefaultCALifetime:   24 * time.Hour,
 		DefaultCertLifetime: 2 * time.Hour,
@@ -51,7 +51,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEnginesRegistry := server.NewStickyInMemEnginesRegistry()
+	stickyVFSRegistry := server.NewStickyVFSRegistry()
 
 	testCases := []struct {
 		serverIdx         int
@@ -67,7 +67,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 			sqlPoolMemorySize: 2 << 10,
 			cacheSize:         1 << 10,
 			expected: base.TestServerArgs{
-				DisableDefaultTestTenant:  true,
+				DefaultTestTenant:         base.TODOTestTenantDisabled,
 				PartOfCluster:             true,
 				JoinAddr:                  "127.0.0.1",
 				DisableTLSForHTTP:         true,
@@ -81,7 +81,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 				EnableDemoLoginEndpoint:   true,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						StickyEngineRegistry: stickyEnginesRegistry,
+						StickyVFSRegistry: stickyVFSRegistry,
 					},
 				},
 			},
@@ -92,7 +92,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 			sqlPoolMemorySize: 4 << 10,
 			cacheSize:         4 << 10,
 			expected: base.TestServerArgs{
-				DisableDefaultTestTenant:  true,
+				DefaultTestTenant:         base.TODOTestTenantDisabled,
 				PartOfCluster:             true,
 				JoinAddr:                  "127.0.0.1",
 				Addr:                      "127.0.0.1:1336",
@@ -106,7 +106,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 				EnableDemoLoginEndpoint:   true,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						StickyEngineRegistry: stickyEnginesRegistry,
+						StickyVFSRegistry: stickyVFSRegistry,
 					},
 				},
 			},
@@ -120,7 +120,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 			demoCtx.CacheSize = tc.cacheSize
 			demoCtx.SQLPort = 1234
 			demoCtx.HTTPPort = 4567
-			actual := demoCtx.testServerArgsForTransientCluster(unixSocketDetails{}, tc.serverIdx, tc.joinAddr, "", stickyEnginesRegistry)
+			actual := demoCtx.testServerArgsForTransientCluster(unixSocketDetails{}, tc.serverIdx, tc.joinAddr, "", stickyVFSRegistry)
 			stopper := actual.Stopper
 			defer stopper.Stop(context.Background())
 
@@ -128,7 +128,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 			assert.Equal(
 				t,
 				fmt.Sprintf("demo-server%d", tc.serverIdx),
-				actual.StoreSpecs[0].StickyInMemoryEngineID,
+				actual.StoreSpecs[0].StickyVFSID,
 			)
 
 			// We cannot compare these.
@@ -145,9 +145,10 @@ func TestTransientClusterSimulateLatencies(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// This is slow under race as it starts a 9-node cluster which
+	// This is slow under race and deadlock as it starts a 9-node cluster which
 	// has a very high simulated latency between each node.
 	skip.UnderRace(t)
+	skip.UnderDeadlock(t)
 
 	demoCtx := newDemoCtx()
 	// Set up an empty 9-node cluster with simulated latencies.
@@ -168,13 +169,13 @@ func TestTransientClusterSimulateLatencies(t *testing.T) {
 
 	// Setup the transient cluster.
 	c := transientCluster{
-		demoCtx:              demoCtx,
-		stopper:              stop.NewStopper(),
-		demoDir:              certsDir,
-		stickyEngineRegistry: server.NewStickyInMemEnginesRegistry(),
-		infoLog:              log.Infof,
-		warnLog:              log.Warningf,
-		shoutLog:             log.Ops.Shoutf,
+		demoCtx:           demoCtx,
+		stopper:           stop.NewStopper(),
+		demoDir:           certsDir,
+		stickyVFSRegistry: server.NewStickyVFSRegistry(),
+		infoLog:           log.Infof,
+		warnLog:           log.Warningf,
+		shoutLog:          log.Ops.Shoutf,
 	}
 	// Stop the cluster when the test exits, including when it fails.
 	// This also calls the Stop() method on the stopper, and thus
@@ -260,7 +261,6 @@ func TestTransientClusterMultitenant(t *testing.T) {
 
 	// This test is too slow to complete under the race detector, sometimes.
 	skip.UnderRace(t)
-	skip.WithIssue(t, 96162)
 
 	defer TestingForceRandomizeDemoPorts()()
 
@@ -281,13 +281,13 @@ func TestTransientClusterMultitenant(t *testing.T) {
 
 	// Setup the transient cluster.
 	c := transientCluster{
-		demoCtx:              demoCtx,
-		stopper:              stop.NewStopper(),
-		demoDir:              certsDir,
-		stickyEngineRegistry: server.NewStickyInMemEnginesRegistry(),
-		infoLog:              log.Infof,
-		warnLog:              log.Warningf,
-		shoutLog:             log.Ops.Shoutf,
+		demoCtx:           demoCtx,
+		stopper:           stop.NewStopper(),
+		demoDir:           certsDir,
+		stickyVFSRegistry: server.NewStickyVFSRegistry(),
+		infoLog:           log.Infof,
+		warnLog:           log.Warningf,
+		shoutLog:          log.Ops.Shoutf,
 	}
 	// Stop the cluster when the test exits, including when it fails.
 	// This also calls the Stop() method on the stopper, and thus
@@ -295,12 +295,13 @@ func TestTransientClusterMultitenant(t *testing.T) {
 	defer c.Close(ctx)
 
 	require.NoError(t, c.generateCerts(ctx, certsDir))
+	require.NoError(t, c.Start(ctx))
 
 	// Also ensure the context gets canceled when the stopper
 	// terminates above.
-	ctx, _ = c.stopper.WithCancelOnQuiesce(ctx)
-
-	require.NoError(t, c.Start(ctx))
+	var cancel func()
+	ctx, cancel = c.stopper.WithCancelOnQuiesce(ctx)
+	defer cancel()
 
 	testutils.RunTrueAndFalse(t, "forSecondaryTenant", func(t *testing.T, forSecondaryTenant bool) {
 		url, err := c.getNetworkURLForServer(ctx, 0,
@@ -309,12 +310,13 @@ func TestTransientClusterMultitenant(t *testing.T) {
 		sqlConnCtx := clisqlclient.Context{}
 		conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.ToPQ().String())
 		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, conn.Close())
 		}()
 
 		// Create a table on each tenant to make sure that the tenants are separate.
-		require.NoError(t, conn.Exec(context.Background(), "CREATE TABLE a (a int PRIMARY KEY)"))
+		require.NoError(t, conn.Exec(ctx, "CREATE TABLE a (a int PRIMARY KEY)"))
+
+		log.Infof(ctx, "test succeeded")
+		t.Log("test succeeded")
 	})
 }

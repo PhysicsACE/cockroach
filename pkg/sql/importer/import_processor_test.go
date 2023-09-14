@@ -241,6 +241,7 @@ func TestImportIgnoresProcessedFiles(t *testing.T) {
 		EvalCtx: &evalCtx,
 		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
+			JobRegistry:     &jobs.Registry{},
 			Settings:        &cluster.Settings{},
 			ExternalStorage: externalStorageFactory,
 			DB:              fakeDB{},
@@ -313,12 +314,12 @@ func TestImportIgnoresProcessedFiles(t *testing.T) {
 			spec := setInputOffsets(t, testCase.spec.getConverterSpec(), testCase.inputOffsets)
 			post := execinfrapb.PostProcessSpec{}
 
-			processor, err := newReadImportDataProcessor(ctx, flowCtx, 0, *spec, &post, &errorReportingRowReceiver{t})
+			processor, err := newReadImportDataProcessor(ctx, flowCtx, 0, *spec, &post)
 			if err != nil {
 				t.Fatalf("Could not create data processor: %v", err)
 			}
 
-			processor.Run(ctx)
+			processor.Run(ctx, &errorReportingRowReceiver{t})
 		})
 	}
 }
@@ -365,6 +366,7 @@ func TestImportHonorsResumePosition(t *testing.T) {
 		EvalCtx: &evalCtx,
 		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
+			JobRegistry:     &jobs.Registry{},
 			Settings:        &cluster.Settings{},
 			ExternalStorage: externalStorageFactory,
 			DB:              fakeDB{},
@@ -494,6 +496,7 @@ func TestImportHandlesDuplicateKVs(t *testing.T) {
 		EvalCtx: &evalCtx,
 		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
+			JobRegistry:     &jobs.Registry{},
 			Settings:        &cluster.Settings{},
 			ExternalStorage: externalStorageFactory,
 			DB:              fakeDB{},
@@ -607,9 +610,9 @@ func setImportReaderParallelism(parallelism int32) func() {
 	rowexec.NewReadImportDataProcessor = func(
 		ctx context.Context, flowCtx *execinfra.FlowCtx, processorID int32,
 		spec execinfrapb.ReadImportDataSpec, post *execinfrapb.PostProcessSpec,
-		output execinfra.RowReceiver) (execinfra.Processor, error) {
+	) (execinfra.Processor, error) {
 		spec.ReaderParallelism = parallelism
-		return factory(ctx, flowCtx, processorID, spec, post, output)
+		return factory(ctx, flowCtx, processorID, spec, post)
 	}
 
 	return func() {
@@ -630,9 +633,13 @@ func queryJob(db sqlutils.DBHandle, jobID jobspb.JobID) (js jobState) {
 		status: "",
 		prog:   jobspb.ImportProgress{},
 	}
+
+	stmt := `
+SELECT status, payload, progress FROM crdb_internal.system_jobs WHERE id = $1
+`
 	var progressBytes, payloadBytes []byte
 	js.err = db.QueryRowContext(
-		context.Background(), "SELECT status, payload, progress FROM system.jobs WHERE id = $1", jobID).Scan(
+		context.Background(), stmt, jobID).Scan(
 		&js.status, &payloadBytes, &progressBytes)
 	if js.err != nil {
 		return
@@ -685,7 +692,7 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 		base.TestServerArgs{
 			// Hangs when run from a test tenant. More investigation is
 			// required here. Tracked with #76378.
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 				DistSQL: &execinfra.TestingKnobs{
@@ -708,10 +715,10 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 	var jobID jobspb.JobID = -1
 	var importSummary roachpb.RowCount
 
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
+	registry.TestingWrapResumerConstructor(jobspb.TypeImport,
 		// Arrange for our special job resumer to be
 		// returned the very first time we start the import.
-		jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
+		func(raw jobs.Resumer) jobs.Resumer {
 			resumer := raw.(*importResumer)
 			resumer.testingKnobs.alwaysFlushJobProgress = true
 			resumer.testingKnobs.afterImport = func(summary roachpb.RowCount) error {
@@ -726,8 +733,7 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 				}
 			}
 			return resumer
-		},
-	}
+		})
 
 	testBarrier, csvBarrier := newSyncBarrier()
 	csv1 := newCsvGenerator(0, 10*batchSize+1, &intGenerator{}, &strGenerator{})
@@ -793,7 +799,7 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 		base.TestServerArgs{
 			// Test hangs when run within a test tenant. More investigation
 			// is required here. Tracked with #76378.
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 				DistSQL: &execinfra.TestingKnobs{
@@ -816,10 +822,10 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 	var jobID jobspb.JobID = -1
 	var importSummary roachpb.RowCount
 
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
+	registry.TestingWrapResumerConstructor(jobspb.TypeImport,
 		// Arrange for our special job resumer to be
 		// returned the very first time we start the import.
-		jobspb.TypeImport: func(raw jobs.Resumer) jobs.Resumer {
+		func(raw jobs.Resumer) jobs.Resumer {
 			resumer := raw.(*importResumer)
 			resumer.testingKnobs.alwaysFlushJobProgress = true
 			resumer.testingKnobs.afterImport = func(summary roachpb.RowCount) error {
@@ -835,8 +841,7 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 				}
 			}
 			return resumer
-		},
-	}
+		})
 
 	csv1 := newCsvGenerator(0, 10*batchSize+1, &intGenerator{}, &strGenerator{})
 	csv2 := newCsvGenerator(0, 20*batchSize-1, &intGenerator{}, &strGenerator{})

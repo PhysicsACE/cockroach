@@ -140,7 +140,7 @@ const (
 	// MVCCIncrementalIterIntentPolicyAggregate will not fail on
 	// first encountered intent, but will proceed further. All
 	// found intents will be aggregated into a single
-	// WriteIntentError which would be updated during
+	// LockConflictError which would be updated during
 	// iteration. Consumer would be free to decide if it wants to
 	// keep collecting entries and intents or skip entries.
 	MVCCIncrementalIterIntentPolicyAggregate
@@ -176,7 +176,7 @@ type MVCCIncrementalIterOptions struct {
 // restrictive than the start and end time range.
 func NewMVCCIncrementalIterator(
 	reader Reader, opts MVCCIncrementalIterOptions,
-) *MVCCIncrementalIterator {
+) (*MVCCIncrementalIterator, error) {
 	// Default to MaxTimestamp for EndTime, since the code assumes it is set.
 	if opts.EndTime.IsEmpty() {
 		opts.EndTime = hlc.MaxTimestamp
@@ -191,16 +191,20 @@ func NewMVCCIncrementalIterator(
 	}
 
 	var iter MVCCIterator
+	var err error
 	var timeBoundIter MVCCIterator
 	if useTBI {
 		// An iterator without the timestamp hints is created to ensure that the
 		// iterator visits every required version of every key that has changed.
-		iter = reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+		iter, err = reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
 			KeyTypes:             opts.KeyTypes,
 			LowerBound:           opts.StartKey,
 			UpperBound:           opts.EndKey,
 			RangeKeyMaskingBelow: opts.RangeKeyMaskingBelow,
 		})
+		if err != nil {
+			return nil, err
+		}
 		// The timeBoundIter is only required to see versioned keys, since the
 		// intents will be found by iter. It can also always enable range key
 		// masking at the start time, since we never care about point keys below it
@@ -210,7 +214,7 @@ func NewMVCCIncrementalIterator(
 		if tbiRangeKeyMasking.LessEq(opts.StartTime) && opts.KeyTypes == IterKeyTypePointsAndRanges {
 			tbiRangeKeyMasking = opts.StartTime.Next()
 		}
-		timeBoundIter = reader.NewMVCCIterator(MVCCKeyIterKind, IterOptions{
+		timeBoundIter, err = reader.NewMVCCIterator(MVCCKeyIterKind, IterOptions{
 			KeyTypes:   opts.KeyTypes,
 			LowerBound: opts.StartKey,
 			UpperBound: opts.EndKey,
@@ -220,13 +224,20 @@ func NewMVCCIncrementalIterator(
 			MaxTimestampHint:     opts.EndTime,
 			RangeKeyMaskingBelow: tbiRangeKeyMasking,
 		})
+		if err != nil {
+			iter.Close()
+			return nil, err
+		}
 	} else {
-		iter = reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+		iter, err = reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
 			KeyTypes:             opts.KeyTypes,
 			LowerBound:           opts.StartKey,
 			UpperBound:           opts.EndKey,
 			RangeKeyMaskingBelow: opts.RangeKeyMaskingBelow,
 		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &MVCCIncrementalIterator{
@@ -235,7 +246,7 @@ func NewMVCCIncrementalIterator(
 		endTime:       opts.EndTime,
 		timeBoundIter: timeBoundIter,
 		intentPolicy:  opts.IntentPolicy,
-	}
+	}, nil
 }
 
 // SeekGE implements SimpleMVCCIterator.
@@ -248,11 +259,11 @@ func (i *MVCCIncrementalIterator) SeekGE(startKey MVCCKey) {
 			i.valid = false
 			return
 		}
-		tbiKey := i.timeBoundIter.Key().Key
-		if tbiKey.Compare(startKey.Key) > 0 {
+		unsafeTBIKey := i.timeBoundIter.UnsafeKey().Key
+		if unsafeTBIKey.Compare(startKey.Key) > 0 {
 			// If the first key that the TBI sees is ahead of the given startKey, we
 			// can seek directly to the first version of the key.
-			startKey = MakeMVCCMetadataKey(tbiKey)
+			startKey = MakeMVCCMetadataKey(unsafeTBIKey.Clone())
 		}
 	}
 	prevRangeKey := i.rangeKeys.Bounds.Key.Clone()
@@ -435,9 +446,9 @@ func (i *MVCCIncrementalIterator) updateMeta() error {
 	if i.startTime.Less(metaTimestamp) && metaTimestamp.LessEq(i.endTime) {
 		switch i.intentPolicy {
 		case MVCCIncrementalIterIntentPolicyError:
-			i.err = &kvpb.WriteIntentError{
-				Intents: []roachpb.Intent{
-					roachpb.MakeIntent(i.meta.Txn, i.iter.Key().Key),
+			i.err = &kvpb.LockConflictError{
+				Locks: []roachpb.Lock{
+					roachpb.MakeIntent(i.meta.Txn, i.iter.UnsafeKey().Key.Clone()).AsLock(),
 				},
 			}
 			i.valid = false
@@ -446,7 +457,7 @@ func (i *MVCCIncrementalIterator) updateMeta() error {
 			// We are collecting intents, so we need to save it and advance to its proposed value.
 			// Caller could then use a value key to update proposed row counters for the sake of bookkeeping
 			// and advance more.
-			i.intents = append(i.intents, roachpb.MakeIntent(i.meta.Txn, i.iter.Key().Key))
+			i.intents = append(i.intents, roachpb.MakeIntent(i.meta.Txn, i.iter.UnsafeKey().Key.Clone()))
 			return nil
 		case MVCCIncrementalIterIntentPolicyEmit:
 			// We will emit this intent to the caller.
@@ -761,15 +772,16 @@ func (i *MVCCIncrementalIterator) NumCollectedIntents() int {
 	return len(i.intents)
 }
 
-// TryGetIntentError returns kvpb.WriteIntentError if intents were encountered
+// TryGetIntentError returns kvpb.LockConflictError if intents were encountered
 // during iteration and intent aggregation is enabled. Otherwise function
-// returns nil. kvpb.WriteIntentError will contain all encountered intents.
+// returns nil. kvpb.LockConflictError will contain all encountered intents.
+// TODO(nvanbenschoten): rename to TryGetLockConflictError.
 func (i *MVCCIncrementalIterator) TryGetIntentError() error {
 	if len(i.intents) == 0 {
 		return nil
 	}
-	return &kvpb.WriteIntentError{
-		Intents: i.intents,
+	return &kvpb.LockConflictError{
+		Locks: roachpb.AsLocks(i.intents),
 	}
 }
 

@@ -35,10 +35,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const (
-	localTimeFormat = "2006-01-02 15:04:05.999999-07:00"
-)
-
 var lsNodesColumnHeaders = []string{
 	"id",
 }
@@ -353,7 +349,7 @@ func runDecommissionNode(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
+	conn, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
 		return errors.Wrap(err, "failed to connect to the node")
 	}
@@ -796,7 +792,8 @@ func decommissionPreCheckReady(resp *serverpb.DecommissionPreCheckResponse) bool
 		return true
 	}
 	for _, nodeCheckResult := range resp.CheckedNodes {
-		if nodeCheckResult.DecommissionReadiness != serverpb.DecommissionPreCheckResponse_READY {
+		if !(nodeCheckResult.DecommissionReadiness == serverpb.DecommissionPreCheckResponse_READY ||
+			nodeCheckResult.DecommissionReadiness == serverpb.DecommissionPreCheckResponse_ALREADY_DECOMMISSIONED) {
 			return false
 		}
 	}
@@ -817,7 +814,7 @@ func runRecommissionNode(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
+	conn, finish, err := getClientGRPCConn(ctx, serverCfg)
 	if err != nil {
 		return errors.Wrap(err, "failed to connect to the node")
 	}

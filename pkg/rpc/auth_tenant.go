@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -155,7 +156,14 @@ func (a tenantAuthorizer) authorize(
 		return a.capabilitiesAuthorizer.HasNodeStatusCapability(ctx, tenID)
 
 	case "/cockroach.ts.tspb.TimeSeries/Query":
-		return a.capabilitiesAuthorizer.HasTSDBQueryCapability(ctx, tenID)
+		return a.authTSDBQuery(ctx, tenID, req.(*tspb.TimeSeriesQueryRequest))
+
+	case "/cockroach.blobs.Blob/List",
+		"/cockroach.blobs.Blob/Delete",
+		"/cockroach.blobs.Blob/Stat",
+		"/cockroach.blobs.Blob/GetStream",
+		"/cockroach.blobs.Blob/PutStream":
+		return a.capabilitiesAuthorizer.HasNodelocalStorageCapability(ctx, tenID)
 
 	default:
 		return authErrorf("unknown method %q", fullMethod)
@@ -199,10 +207,13 @@ func (a tenantAuthorizer) authGetRangeDescriptors(
 func (a tenantAuthorizer) authSpanStats(
 	tenID roachpb.TenantID, args *roachpb.SpanStatsRequest,
 ) error {
-	return validateSpan(tenID, roachpb.Span{
-		Key:    args.StartKey.AsRawKey(),
-		EndKey: args.EndKey.AsRawKey(),
-	})
+	for _, span := range args.Spans {
+		err := validateSpan(tenID, span)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // authRangeLookup authorizes the provided tenant to invoke the RangeLookup RPC
@@ -379,6 +390,26 @@ func (a tenantAuthorizer) authSpanConfigConformance(
 	return nil
 }
 
+// authTSDBQuery authorizes the provided tenant to invoke the TSDB Query RPC
+// with the provided args. A non-system tenant is only allowed to query its own
+// time series.
+func (a tenantAuthorizer) authTSDBQuery(
+	ctx context.Context, id roachpb.TenantID, request *tspb.TimeSeriesQueryRequest,
+) error {
+	for _, query := range request.Queries {
+		if !query.TenantID.IsSet() {
+			return authError("tsdb query with unspecified tenant not permitted")
+		}
+		if !query.TenantID.Equal(id) {
+			return authErrorf("tsdb query with invalid tenant not permitted")
+		}
+	}
+	if err := a.capabilitiesAuthorizer.HasTSDBQueryCapability(ctx, id); err != nil {
+		return authError(err.Error())
+	}
+	return nil
+}
+
 // validateSpanConfigTarget validates that the tenant is authorized to interact
 // with the supplied span config target. In particular, span targets must be
 // wholly contained within the tenant keyspace and system span config targets
@@ -451,10 +482,10 @@ func contextWithoutClientTenant(ctx context.Context) context.Context {
 
 func tenantPrefix(tenID roachpb.TenantID) roachpb.RSpan {
 	// TODO(nvanbenschoten): consider caching this span.
-	prefix := roachpb.RKey(keys.MakeTenantPrefix(tenID))
+	sp := keys.MakeTenantSpan(tenID)
 	return roachpb.RSpan{
-		Key:    prefix,
-		EndKey: prefix.PrefixEnd(),
+		Key:    roachpb.RKey(sp.Key),
+		EndKey: roachpb.RKey(sp.EndKey),
 	}
 }
 
