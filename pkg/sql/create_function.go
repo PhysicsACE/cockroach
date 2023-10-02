@@ -234,7 +234,6 @@ func (n *createFunctionNode) getMutableFuncDesc(
 	paramNameSeen := make(map[tree.Name]struct{})
 	variadicSeen := false
 	defaultSeen := false
-	outSeen := false
 	fmt.Print("INPUT", n.cf.Params)
 	for _, param := range n.cf.Params {
 

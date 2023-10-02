@@ -839,7 +839,7 @@ statement error pgcode 42P13 pq: SQL functions cannot have arguments of type rec
 CREATE FUNCTION f(r RECORD) RETURNS INT LANGUAGE SQL AS 'SELECT i'
 
 # TODO(mgartner): Technically $3 is a parameter, and the error message should be
-# more similar to Postgres's "there is no parameter $3".
+# more similar to Postgres's "there is no parameter $3".'
 statement error pgcode 42P02 no value provided for placeholder: \$3
 CREATE FUNCTION err(x INT, y INT) RETURNS INT LANGUAGE SQL AS 'SELECT x + y + $1 + $2 + $3'
 

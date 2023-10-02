@@ -4725,7 +4725,7 @@ routine_param_class:
 | OUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'OUT' argument class") }
 | INOUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'INOUT' argument class") }
 | IN OUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'IN OUT' argument class") }
-| VARIADIC { return unimplementedWithIssueDetail(sqllex, 88947, "variadic user-defined functions") }
+| VARIADIC { $$.val = tree.RoutineParamVariadic }
 
 routine_param_type:
   typename

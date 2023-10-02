@@ -515,7 +515,7 @@ func (desc *immutable) GetResolvedFuncDefinition(
 		// 	},
 		// 	IsUDF:                    true,
 		// 	UDFContainsOnlySignature: true,
-			IsProcedure:              sig.IsProcedure,
+		//	IsProcedure:              sig.IsProcedure,
 		// }
 		// if funcDescPb.Signatures[i].ReturnSet {
 		// 	overload.Class = tree.GeneratorClass

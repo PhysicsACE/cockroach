@@ -207,7 +207,7 @@ func validateParameters(n *tree.CreateRoutine) {
 			seen[param.Name] = struct{}{}
 		}
 
-		if param.Class == tree.FunctionParamVariadic {
+		if param.Class == tree.RoutineParamVariadic {
 
 			if (variadicSeen) {
 				panic(pgerror.Newf(
@@ -223,9 +223,6 @@ func validateParameters(n *tree.CreateRoutine) {
 		}
 
 		if defaultSeen {
-			if param.Class == tree.FunctionParamOut {
-				continue
-			}
 			panic(pgerror.Newf(
 				pgcode.InvalidFunctionDefinition, "Input parameters after one with a default value must also have a default value"))
 		}
