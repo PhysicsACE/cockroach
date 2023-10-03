@@ -327,7 +327,7 @@ func (b *Builder) buildRoutine(
 			}
 		}
 		var plBuilder plpgsqlBuilder
-		plBuilder.init(b, colRefs, o.Types.(tree.ParamTypes), stmt.AST, rtyp)
+		plBuilder.init(b, colRefs, o.Types.(tree.ParamTypesWithModes), stmt.AST, rtyp)
 		stmtScope := plBuilder.build(stmt.AST, bodyScope)
 		b.finishBuildLastStmt(stmtScope, bodyScope, isSetReturning, f)
 		body = []memo.RelExpr{stmtScope.expr}

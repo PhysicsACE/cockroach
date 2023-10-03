@@ -832,6 +832,18 @@ SELECT int_identity((1/0)::INT)
 
 subtest end
 
+subtest defaultvalues
+
+statement ok
+CREATE FUNCTION f_97854 (i INT, j INT DEFAULT 2) RETURNS INT LANGUAGE SQL AS 'SELECT j';
+
+query I
+SELECT f_97854(1)
+----
+2
+
+subtest end
+
 
 subtest args
 

@@ -607,7 +607,7 @@ func maybeLookupRoutine(
 			qualifiedDef.Overloads = append(qualifiedDef.Overloads, prefixedOverload)
 		}
 
-		udfDef, err = udfDef.MergeWith(curUdfDef)
+		udfDef, err = udfDef.MergeWith(qualifiedDef)
 		if err != nil {
 			return nil, err
 		}

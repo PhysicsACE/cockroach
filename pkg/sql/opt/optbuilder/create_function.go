@@ -139,7 +139,7 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 	// named parameters to the scope so that references to them in the body can
 	// be resolved.
 	bodyScope := b.allocScope()
-	var paramTypes tree.ParamTypes
+	var paramTypes tree.ParamTypesWithModes
 	for i := range cf.Params {
 		param := &cf.Params[i]
 		typ, err := tree.ResolveType(b.ctx, param.Type, b.semaCtx.TypeResolver)
@@ -170,7 +170,7 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 
 		// Collect the parameters for PLpgSQL routines.
 		if language == tree.RoutineLangPLpgSQL {
-			paramTypes = append(paramTypes, tree.ParamType{
+			paramTypes = append(paramTypes, tree.ParamTypeWithModes{
 				Name: param.Name.String(),
 				Typ:  typ,
 			})

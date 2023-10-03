@@ -112,7 +112,7 @@ type plpgsqlBuilder struct {
 	colRefs *opt.ColSet
 
 	// params tracks the names and types for the original function parameters.
-	params []tree.ParamType
+	params []tree.ParamTypeWithModes
 
 	// decls is the set of variable declarations for a PL/pgSQL function.
 	decls []ast.Declaration
@@ -152,7 +152,7 @@ type plpgsqlBuilder struct {
 }
 
 func (b *plpgsqlBuilder) init(
-	ob *Builder, colRefs *opt.ColSet, params []tree.ParamType, block *ast.Block, returnType *types.T,
+	ob *Builder, colRefs *opt.ColSet, params []tree.ParamTypeWithModes, block *ast.Block, returnType *types.T,
 ) {
 	b.ob = ob
 	b.colRefs = colRefs
