@@ -521,6 +521,7 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		typ,
 		&fn.def.FunctionProperties,
 		fn.overload,
+		false,
 	)
 
 	// Some aggregation functions need an order by clause to be deterministic.

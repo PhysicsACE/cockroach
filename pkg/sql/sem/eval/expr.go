@@ -700,4 +700,8 @@ func (e *evaluator) EvalUnqualifiedStar(
 	return nil, errors.AssertionFailedf("unhandled type %T", star)
 }
 
+func (e *evaluator) EvalSerializedExpr(ctx context.Context, expr *tree.SerializedExpr) (tree.Datum, error) {
+	return nil, errors.AssertionFailedf("serialized expr should not be seen by executor")
+}
+
 var _ tree.ExprEvaluator = (*evaluator)(nil)

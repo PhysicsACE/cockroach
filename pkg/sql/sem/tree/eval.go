@@ -90,7 +90,7 @@ func unaryOpFixups(
 ) map[UnaryOperatorSymbol]*UnaryOpOverloads {
 	for _, overload := range ops {
 		for _, impl := range overload.overloads {
-			impl.types = ParamTypes{{"arg", impl.Typ}}
+			impl.types = ParamTypes{{Name: "arg", Typ: impl.Typ}}
 			impl.retType = FixedReturnType(impl.ReturnType)
 		}
 	}
@@ -245,6 +245,10 @@ type BinOp struct {
 
 func (op *BinOp) params() TypeList {
 	return op.types
+}
+
+func(op *BinOp) numDefaultParams() int {
+	return 0
 }
 
 func (op *BinOp) matchParams(l, r *types.T) bool {
@@ -464,7 +468,7 @@ func init() {
 func init() {
 	for _, overload := range BinOps {
 		_ = overload.ForEachBinOp(func(impl *BinOp) error {
-			impl.types = ParamTypes{{"left", impl.LeftType}, {"right", impl.RightType}}
+			impl.types = ParamTypes{{Name: "left", Typ: impl.LeftType}, {Name: "right", Typ: impl.RightType}}
 			impl.retType = FixedReturnType(impl.ReturnType)
 			return nil
 		})
@@ -1387,6 +1391,10 @@ func (op *CmpOp) params() TypeList {
 	return op.types
 }
 
+func (op *CmpOp) numDefaultParams() int {
+	return 0
+}
+
 func (op *CmpOp) matchParams(l, r *types.T) bool {
 	return op.params().MatchAt(l, 0) && op.params().MatchAt(r, 1)
 }
@@ -1452,7 +1460,7 @@ func cmpOpFixups(
 
 	for _, overloads := range cmpOps {
 		_ = overloads.ForEachCmpOp(func(op *CmpOp) error {
-			op.types = ParamTypes{{"left", op.LeftType}, {"right", op.RightType}}
+			op.types = ParamTypes{{Name: "left", Typ: op.LeftType}, {Name: "right", Typ: op.RightType}}
 			return nil
 		})
 	}

@@ -23,11 +23,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -228,8 +230,10 @@ func (n *createFunctionNode) getMutableFuncDesc(
 ) (fnDesc *funcdesc.Mutable, isNew bool, err error) {
 	// Resolve parameter types.
 	paramTypes := make([]*types.T, len(n.cf.Params))
-	pbParams := make([]descpb.FunctionDescriptor_Parameter, len(n.cf.Params))
+	pbParams := make([]descpb.FunctionDescriptor_Parameter, 0)
 	paramNameSeen := make(map[tree.Name]struct{})
+	variadicSeen := false
+	defaultSeen := false
 	for i, param := range n.cf.Params {
 		if param.Name != "" {
 			if _, ok := paramNameSeen[param.Name]; ok {
@@ -240,12 +244,54 @@ func (n *createFunctionNode) getMutableFuncDesc(
 			}
 			paramNameSeen[param.Name] = struct{}{}
 		}
-		pbParam, err := makeFunctionParam(params.ctx, param, params.p)
+		pbParam, err := makeFunctionParam(params.ctx, param, params.p, params.p.SemaCtx())
 		if err != nil {
 			return nil, false, err
 		}
-		pbParams[i] = pbParam
-		paramTypes[i] = pbParam.Type
+
+		if (pbParam.Class == catpb.Function_Param_VARIADIC) {
+			if (variadicSeen) {
+				return nil, false, pgerror.Newf(
+					pgcode.InvalidFunctionDefinition, "Cannot have more than one parameter with mode VARIADIC", param.Name,
+				)
+			}
+
+			if !(pbParam.Type.Family() == types.ArrayFamily) {
+				return nil, false, pgerror.Newf(
+					pgcode.InvalidFunctionDefinition, "VARIADIC parameter must be an array type",
+				)
+			}
+
+
+
+			arrType := pbParam.Type.ArrayContents()
+			pbParam.Type = arrType
+
+			variadicSeen = true
+			pbParams = append(pbParams, pbParam)
+			continue
+		}
+
+		if (variadicSeen) {
+			return nil, false, pgerror.Newf(
+				pgcode.InvalidFunctionDefinition, "VARIADIC parameter must be the last parameter in defined list", param.Name,
+			)
+		}
+
+		if (defaultSeen) {
+			if (pbParam.DefaultExpr == "") {
+				return nil, false, pgerror.Newf(
+					pgcode.InvalidFunctionDefinition, "Input parameters after one with a default value must also have a default value", param.Name,
+				)
+			}
+		}
+
+		if (pbParam.DefaultExpr != "") {
+			defaultSeen = true
+		}
+
+
+		pbParams = append(pbParams, pbParam)
 	}
 
 	// Try to look up an existing function.
@@ -468,7 +514,7 @@ func resetFuncOption(udfDesc *funcdesc.Mutable) {
 }
 
 func makeFunctionParam(
-	ctx context.Context, param tree.RoutineParam, typeResolver tree.TypeReferenceResolver,
+	ctx context.Context, param tree.RoutineParam, typeResolver tree.TypeReferenceResolver, semaCtx *tree.SemaContext,
 ) (descpb.FunctionDescriptor_Parameter, error) {
 	pbParam := descpb.FunctionDescriptor_Parameter{
 		Name: string(param.Name),
@@ -485,7 +531,28 @@ func makeFunctionParam(
 	}
 
 	if param.DefaultVal != nil {
-		return descpb.FunctionDescriptor_Parameter{}, unimplemented.NewWithIssue(100962, "default value")
+		defaultExpr, err := schemaexpr.SanitizeVarFreeExpr(
+			ctx,
+			param.DefaultVal,
+			pbParam.Type,
+			"DEFAULT",
+			semaCtx,
+			volatility.Volatile,
+			true,
+		)
+
+		if err != nil {
+			return descpb.FunctionDescriptor_Parameter{}, err
+		}
+
+		var visitor tree.UDFDisallowanceVisitor
+		tree.WalkExpr(&visitor, defaultExpr)
+		if visitor.FoundUDF {
+			return descpb.FunctionDescriptor_Parameter{},
+			unimplemented.NewWithIssue(83234, "usage of user-defined function in Default values is not supported")
+		}
+
+		pbParam.DefaultExpr = tree.Serialize(defaultExpr)
 	}
 
 	return pbParam, nil

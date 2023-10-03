@@ -543,8 +543,33 @@ func maybeLookupRoutine(
 			return nil, pgerror.Newf(pgcode.UndefinedSchema, "schema %q does not exist", fn.Schema())
 		}
 
-		udfDef, _ := prefix.Schema.GetResolvedFuncDefinition(fn.Object())
-		return udfDef, nil
+		udfDef, found := prefix.Schema.GetResolvedFuncDefinition(fn.Object())
+
+		if !found {
+			return nil, nil
+		}
+
+		qualifiedDef := &tree.ResolvedFunctionDefinition{
+			Name: udfDef.Name,
+			Overloads: make([]tree.QualifiedOverload, 0, len(udfDef.SignatureIds)),
+		}
+
+		g := sr.byIDGetterBuilder().WithoutNonPublic().WithoutOtherParent(sr.typeResolutionDbID).Get()
+		for _, sig := range udfDef.SignatureIds {
+			funcDesc, err := g.Function(ctx, descpb.ID(sig))
+			if err != nil {
+				return nil, err
+			}
+
+			ret, err := funcDesc.ToOverload()
+			if err != nil {
+				return nil, err
+			}
+			prefixedOverload := tree.MakeQualifiedOverload(udfDef.Schema, ret)
+			qualifiedDef.Overloads = append(qualifiedDef.Overloads, prefixedOverload)
+		}
+
+		return qualifiedDef, nil
 	}
 
 	var udfDef *tree.ResolvedFunctionDefinition
@@ -561,6 +586,27 @@ func maybeLookupRoutine(
 		if !found {
 			continue
 		}
+
+		qualifiedDef := &tree.ResolvedFunctionDefinition{
+			Name: curUdfDef.Name,
+			Overloads: make([]tree.QualifiedOverload, 0, len(curUdfDef.SignatureIds)),
+		}
+
+		g := sr.byIDGetterBuilder().WithoutNonPublic().WithoutOtherParent(sr.typeResolutionDbID).Get()
+		for _, sig := range curUdfDef.SignatureIds {
+			funcDesc, err := g.Function(ctx, descpb.ID(sig))
+			if err != nil {
+				return nil, err
+			}
+
+			ret, err := funcDesc.ToOverload()
+			if err != nil {
+				return nil, err
+			}
+			prefixedOverload := tree.MakeQualifiedOverload(curUdfDef.Schema, ret)
+			qualifiedDef.Overloads = append(qualifiedDef.Overloads, prefixedOverload)
+		}
+
 		udfDef, err = udfDef.MergeWith(curUdfDef)
 		if err != nil {
 			return nil, err

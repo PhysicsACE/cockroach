@@ -88,6 +88,7 @@ func MakeDefaultExprs(
 				col.GetType(),
 				props,
 				&overloads[0],
+				false,
 			), semaCtx, col.GetType()); err != nil {
 				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 					"failed to type check the cast of %v to %v", expr, col.GetType())

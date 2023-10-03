@@ -548,6 +548,10 @@ func (desc *Mutable) SetParentSchemaID(id descpb.ID) {
 	desc.ParentSchemaID = id
 }
 
+func (desc *Mutable) SetDefaultParam(ordinal int, defaultExpr string) {
+	desc.Params[ordinal].DefaultExpr = defaultExpr
+}
+
 // AddConstraintReference adds back reference to a constraint to the function.
 func (desc *Mutable) AddConstraintReference(id descpb.ID, constraintID descpb.ConstraintID) error {
 	for _, dep := range desc.DependsOn {
@@ -712,11 +716,11 @@ func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 		Language:   desc.getCreateExprLang(),
 	}
 
-	argTypes := make(tree.ParamTypes, 0, len(desc.Params))
+	argTypes := make(tree.ParamTypesWithModes, 0, len(desc.Params))
 	for _, param := range desc.Params {
 		argTypes = append(
 			argTypes,
-			tree.ParamType{Name: param.Name, Typ: param.Type},
+			tree.ParamTypeWithModes{Name: param.Name, Typ: param.Type, Default: param.DefaultExpr, IsVariadic: (param.Class == catpb.Function_Param_VARIADIC),},
 		)
 	}
 	ret.Types = argTypes
@@ -786,8 +790,8 @@ func (desc *immutable) ToCreateExpr() (ret *tree.CreateRoutine, err error) {
 			Type:  desc.Params[i].Type,
 			Class: toTreeNodeParamClass(desc.Params[i].Class),
 		}
-		if desc.Params[i].DefaultExpr != nil {
-			ret.Params[i].DefaultVal, err = parser.ParseExpr(*desc.Params[i].DefaultExpr)
+		if desc.Params[i].DefaultExpr != "" {
+			ret.Params[i].DefaultVal, err = parser.ParseExpr(desc.Params[i].DefaultExpr)
 			if err != nil {
 				return nil, err
 			}

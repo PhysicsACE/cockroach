@@ -777,6 +777,7 @@ var countStar = func() tree.TypedExpr {
 		typ,
 		&fn.FunctionProperties,
 		fn.Definition[0],
+		false,
 	)
 }()
 

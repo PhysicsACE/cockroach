@@ -748,7 +748,15 @@ func (node *CoalesceExpr) GetWhenCondition(i int) (whenCond Expr) {
 }
 
 // DefaultVal represents the DEFAULT expression.
-type DefaultVal struct{}
+type DefaultVal struct{
+	// DefaultVal accepts an optional field which is a serialized expr
+	// which can be parsed and typed during building. This is needed 
+	// to execute default values to UDFs as the parsing of serialized 
+	// exprs cannot be done in TypeCheck due to cyclic dependencies between 
+	// the tree package and the parser package. It will still work the same 
+	// for its uses to represent default options SQL statements. 
+	stringExpr string
+}
 
 // Format implements the NodeFormatter interface.
 func (node DefaultVal) Format(ctx *FmtCtx) {
@@ -757,6 +765,12 @@ func (node DefaultVal) Format(ctx *FmtCtx) {
 
 // ResolvedType implements the TypedExpr interface.
 func (DefaultVal) ResolvedType() *types.T { return nil }
+
+func (DefaultVal) NewTypedDefaultVal(serialized string) *DefaultVal {
+	return &DefaultVal{
+		stringExpr: serialized,
+	}
+}
 
 // PartitionMaxVal represents the MAXVALUE expression.
 type PartitionMaxVal struct{}
@@ -1281,6 +1295,10 @@ type FuncExpr struct {
 	typeAnnotation
 	fnProps *FunctionProperties
 	fn      *Overload
+	// IsVariadic signifies if a variadic argument was passed as a expr
+	IsVariadic bool
+	// Resulting Expression List
+	ResExprs TypedExprs
 }
 
 // NewTypedFuncExpr returns a FuncExpr that is already well-typed and resolved.
@@ -1293,6 +1311,7 @@ func NewTypedFuncExpr(
 	typ *types.T,
 	props *FunctionProperties,
 	overload *Overload,
+	variable bool,
 ) *FuncExpr {
 	f := &FuncExpr{
 		Func:           ref,

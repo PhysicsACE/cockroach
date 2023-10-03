@@ -49,6 +49,15 @@ type ResolvedFunctionDefinition struct {
 	Overloads []QualifiedOverload
 }
 
+type ResolvedFunctionReferences struct {
+
+	Name string
+
+	Schema string
+	
+	SignatureIds []uint32
+}
+
 type qualifiedOverloads []QualifiedOverload
 
 func (qo qualifiedOverloads) len() int {

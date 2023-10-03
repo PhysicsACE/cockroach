@@ -1578,7 +1578,7 @@ message FunctionDescriptor {
     optional cockroach.sql.catalog.catpb.Function.Param.Class class = 1 [(gogoproto.nullable) = false];
     optional string name = 2 [(gogoproto.nullable) = false];
     optional sql.sem.types.T type = 3;
-    optional string default_expr = 4;
+    optional string default_expr = 4 [(gogoproto.nullable) = false];
   }
 
   message ReturnType {
