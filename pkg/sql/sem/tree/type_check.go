@@ -1332,8 +1332,8 @@ func (expr *FuncExpr) TypeCheck(
 
 		seenIdxs.Remove(idx)
 
-		if (i == srcParams.Length() - 1 && srcParams.acceptsVariadic()) {
-			variadicArray := NewTypedArray(s.typedExprs[idx], types.MakeArray(srcParams.variadicType()))
+		if (idx == srcParams.Length() - 1 && srcParams.acceptsVariadic()) {
+			variadicArray := NewTypedArray(s.typedExprs[idx:idx + 1], types.MakeArray(srcParams.variadicType()))
 			typeNames[idx] = variadicArray
 			continue
 		}
@@ -3431,7 +3431,7 @@ func getMostSignificantOverload(
 			if !(found) {
 				found = true
 				ret = r
-				exact = r.numExact(typedInputExprs)
+				exact = r.params().numExact(typedInputExprs)
 				continue
 			}
 
@@ -3442,7 +3442,7 @@ func getMostSignificantOverload(
 			prevSig := prevParams.inputSig(typedInputExprs)
 			srcSig := srcParams.inputSig(typedInputExprs)
 
-			numMatches := r.numExact(typedInputExprs)
+			numMatches := srcParams.numExact(typedInputExprs)
 
 			if (checkSigAmbiguity(prevSig, srcSig)) {
 
@@ -3531,6 +3531,7 @@ func getMostSignificantOverload(
 			}
 
 			return ret, nil
+		}
 	}
 	if !found {
 		// This should never happen. Otherwise, it means we get function from a

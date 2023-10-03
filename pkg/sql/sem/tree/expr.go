@@ -1322,6 +1322,7 @@ func NewTypedFuncExpr(
 		typeAnnotation: typeAnnotation{typ: typ},
 		fn:             overload,
 		fnProps:        props,
+		IsVariadic:     variable,
 	}
 	for i, e := range exprs {
 		f.Exprs[i] = e
@@ -1733,6 +1734,38 @@ func (node *ColumnAccessExpr) Format(ctx *FmtCtx) {
 	}
 }
 
+// SerializedExpr is used as a container to hold serialized expressions to be 
+// parsed and executed
+type SerializedExpr struct{
+
+	// stringExpr is a serialized expr which can be parsed and typed during building. 
+	// This is needed to execute default values to UDFs as the parsing of serialized 
+	// exprs cannot be done in TypeCheck due to cyclic dependencies between 
+	// the tree package and the parser package. It will still work the same 
+	// for its uses to represent default options SQL statements. 
+	StringExpr string
+
+	typeAnnotation
+}
+
+// Format implements the NodeFormatter interface.
+func (node SerializedExpr) Format(ctx *FmtCtx) {
+	ctx.WriteString(node.StringExpr)
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (node SerializedExpr) ResolvedType() *types.T { 
+	return types.Any
+ }
+
+func NewTypedSerializedExpr(serialized string) *SerializedExpr {
+	node := &SerializedExpr{
+		StringExpr: serialized,
+	}
+	node.typ = nil
+	return node
+}
+
 func (node *AliasedTableExpr) String() string { return AsString(node) }
 func (node *ParenTableExpr) String() string   { return AsString(node) }
 func (node *JoinTableExpr) String() string    { return AsString(node) }
@@ -1804,3 +1837,4 @@ func (node PartitionMinVal) String() string   { return AsString(node) }
 func (node *Placeholder) String() string      { return AsString(node) }
 func (node dNull) String() string             { return AsString(node) }
 func (list *NameList) String() string         { return AsString(list) }
+func (node *SerializedExpr) String() string   { return AsString(node) }

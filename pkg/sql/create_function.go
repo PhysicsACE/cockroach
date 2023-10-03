@@ -229,12 +229,11 @@ func (n *createFunctionNode) getMutableFuncDesc(
 	scDesc catalog.SchemaDescriptor, params runParams,
 ) (fnDesc *funcdesc.Mutable, isNew bool, err error) {
 	// Resolve parameter types.
-	paramTypes := make([]*types.T, len(n.cf.Params))
 	pbParams := make([]descpb.FunctionDescriptor_Parameter, 0)
 	paramNameSeen := make(map[tree.Name]struct{})
 	variadicSeen := false
 	defaultSeen := false
-	for i, param := range n.cf.Params {
+	for _, param := range n.cf.Params {
 		if param.Name != "" {
 			if _, ok := paramNameSeen[param.Name]; ok {
 				// Argument names cannot be used more than once.

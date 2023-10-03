@@ -528,7 +528,6 @@ func (p ParamTypesWithModes) String() string {
 
 func (p ParamTypesWithModes) inputSig(exprs []TypedExpr) []*types.T {
 
-	paramDict := p.getTyps()
 	sig := make([]*types.T, 0)
 	iterator := 0
 	minimum := p.Length()
@@ -540,17 +539,10 @@ func (p ParamTypesWithModes) inputSig(exprs []TypedExpr) []*types.T {
 		iterator = 1
 	}
 
-	for i, expr := range exprs[:minimum - iterator] {
-		if argExpr, ok := expr.(*NamedArgExpr); ok {
-			typ := paramDict[string(argExpr.ArgName)]
-			sig = append(sig, typ)
-			continue
-		}
+	for i := range exprs[:minimum - iterator] {
 
 		sig = append(sig, p[i].Typ)
 	}
-
-	// fmt.Print("GENERATRED SIG", sig)
 
 	if (iterator == 1) {
 		sig = append(sig, p.GetAt(p.Length() - 1))
@@ -570,7 +562,6 @@ func (p ParamTypesWithModes) variadicType() *types.T {
 func (p ParamTypesWithModes) numExact(exprs []TypedExpr) int {
 
 	count := 0
-	paramDict := p.getNames()
 
 	iterator := 0
 
@@ -579,14 +570,6 @@ func (p ParamTypesWithModes) numExact(exprs []TypedExpr) int {
 	}
 
 	for i, expr := range exprs[:p.Length() - iterator] {
-		if argExpr, ok := expr.(*NamedArgExpr); ok {
-			idx := paramDict[string(argExpr.ArgName)]
-			if p.MatchAtIdentical(expr.ResolvedType(), idx) {
-				count++
-			}
-			continue
-		}
-
 		if p.MatchAtIdentical(expr.ResolvedType(), i) {
 			count++
 		}
@@ -706,16 +689,9 @@ func (p ParamTypes) String() string {
 
 func (p ParamTypes) inputSig(exprs []TypedExpr) []*types.T {
 
-	paramDict := p.getTyps()
 	sig := make([]*types.T, 0)
 
-	for i, expr := range exprs {
-		if namedArg, ok := expr.(*NamedArgExpr); ok {
-			typ := paramDict[string(namedArg.ArgName)]
-			sig = append(sig, typ)
-			continue
-		}
-
+	for i := range exprs {
 		sig = append(sig, p[i].Typ)
 	}
 
@@ -733,17 +709,8 @@ func (p ParamTypes) variadicType() *types.T {
 func (p ParamTypes) numExact(exprs []TypedExpr) int {
 
 	count := 0
-	paramDict := p.getNames()
 
 	for i, expr := range exprs {
-		if namedArg, ok := expr.(*NamedArgExpr); ok {
-			idx := paramDict[string(namedArg.ArgName)]
-			if p.MatchAtIdentical(expr.ResolvedType(), idx) {
-				count++
-			}
-			continue
-		}
-
 		if p.MatchAtIdentical(expr.ResolvedType(), i) {
 			count ++
 		}

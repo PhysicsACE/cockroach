@@ -222,6 +222,7 @@ func (b *Builder) buildRoutine(
 				nil, /* outCol */
 				colRefs,
 			)
+		}
 
 	}
 
