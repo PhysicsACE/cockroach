@@ -3283,7 +3283,7 @@ func getMostSignificantOverload(
 			if !(found) {
 				found = true
 				ret = r
-				exact = r.numExact(typedInputExprs)
+				exact = r.params().numExact(typedInputExprs)
 				continue
 			}
 
@@ -3297,7 +3297,7 @@ func getMostSignificantOverload(
 			prevSig := prevParams.inputSig(typedInputExprs)
 			srcSig := srcParams.inputSig(typedInputExprs)
 
-			numMatches := r.numExact(typedInputExprs)
+			numMatches := srcParams.numExact(typedInputExprs)
 
 			if (checkSigAmbiguity(prevSig, srcSig)) {
 
