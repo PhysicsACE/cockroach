@@ -836,11 +836,18 @@ subtest defaultvalues
 
 statement ok
 CREATE FUNCTION f_97854 (i INT, j INT DEFAULT 2) RETURNS INT LANGUAGE SQL AS 'SELECT j';
+CREATE FUNCTION f_97854 (i INT, VARIADIC j INT[]) RETURNS INT LANGUAGE SQL AS 'SELECT i + array_length(j, 1)';
 
 query I
 SELECT f_97854(1)
 ----
 2
+
+query I
+SELECT f_97854(1, 2, 3, 4, 5)
+----
+5
+
 
 subtest end
 
