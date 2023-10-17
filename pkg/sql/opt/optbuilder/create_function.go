@@ -150,6 +150,8 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 	// be resolved.
 	bodyScope := b.allocScope()
 	var paramTypes tree.ParamTypes
+	var outputTypes tree.ParamTypes
+	var strict bool
 	for i := range cf.Params {
 		param := &cf.Params[i]
 		typ, err := tree.ResolveType(b.ctx, param.Type, b.semaCtx.TypeResolver)
@@ -168,6 +170,14 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 					"PL/pgSQL functions with RECORD input arguments are not yet supported",
 				))
 			}
+		}
+
+		if (param.Class == tree.RoutineParamInOut || param.Class == tree.RoutineParamInOut) {
+			outputTypes = append(outputTypes, tree.ParamType{
+				Name: param.Name.String(),
+				Typ:  typ,
+			})
+			strict = true
 		}
 
 		// Add the parameter to the base scope of the body.
@@ -194,6 +204,12 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 	if err != nil {
 		panic(err)
 	}
+
+	if (len(outputTypes) > 0) {
+		funcReturnType = (len(outputTypes) == 1) ? outputTypes[0] : types.MakeTuple(outputTypes)
+		cf.ReturnType.Type = funcReturnType
+	}
+
 	typedesc.GetTypeDescriptorClosure(funcReturnType).ForEach(func(id descpb.ID) {
 		typeDeps.Add(int(id))
 	})
@@ -270,7 +286,7 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 		// TODO(mgartner): stmtScope.cols does not describe the result
 		// columns of the statement. We should use physical.Presentation
 		// instead.
-		err = validateReturnType(b.ctx, b.semaCtx, funcReturnType, stmtScope.cols)
+		err = validateReturnType(b.ctx, b.semaCtx, funcReturnType, stmtScope.cols, strict)
 		if err != nil {
 			panic(err)
 		}
@@ -314,7 +330,7 @@ func formatFuncBodyStmt(fmtCtx *tree.FmtCtx, ast tree.NodeFormatter, newLine boo
 }
 
 func validateReturnType(
-	ctx context.Context, semaCtx *tree.SemaContext, expected *types.T, cols []scopeColumn,
+	ctx context.Context, semaCtx *tree.SemaContext, expected *types.T, cols []scopeColumn, strict bool
 ) error {
 	// The return type must be supported by the current cluster version.
 	checkUnsupportedType(ctx, semaCtx, expected)
@@ -338,7 +354,7 @@ func validateReturnType(
 	}
 
 	// If return type is RECORD, any column types are valid.
-	if types.IsRecordType(expected) {
+	if (types.IsRecordType(expected) && !strict) {
 		return nil
 	}
 

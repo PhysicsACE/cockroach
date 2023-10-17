@@ -85,6 +85,7 @@ type CreateRoutine struct {
 	Replace     bool
 	Name        RoutineName
 	Params      RoutineParams
+	OutParams   RoutineParams
 	ReturnType  RoutineReturnType
 	Options     RoutineOptions
 	RoutineBody *RoutineBody

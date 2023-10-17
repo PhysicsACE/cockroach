@@ -247,6 +247,8 @@ func (n *createFunctionNode) getMutableFuncDesc(
 	paramTypes := make([]*types.T, len(n.cf.Params))
 	pbParams := make([]descpb.FunctionDescriptor_Parameter, len(n.cf.Params))
 	paramNameSeen := make(map[tree.Name]struct{})
+	outputParams := make([]descpb.FunctionDescriptor_Parameter, 0)
+	outSeen := false
 	for i, param := range n.cf.Params {
 		if param.Name != "" {
 			if _, ok := paramNameSeen[param.Name]; ok {
@@ -261,6 +263,14 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		if err != nil {
 			return nil, false, err
 		}
+
+		if pbParam.Class == catpb.Function_Param_OUT || pbParam.Class == catpb.Function_Param_IN_OUT {
+			outputParams = append(outputParams, pbParam)
+			if !(n.cf.IsProcedure) {
+				continue
+			}
+		}
+
 		pbParams[i] = pbParam
 		paramTypes[i] = pbParam.Type
 	}

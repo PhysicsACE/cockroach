@@ -4763,9 +4763,9 @@ routine_param:
 
 routine_param_class:
   IN { $$.val = tree.RoutineParamIn }
-| OUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'OUT' argument class") }
-| INOUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'INOUT' argument class") }
-| IN OUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'IN OUT' argument class") }
+| OUT { $$.val = tree.RoutineParamOut }
+| INOUT { $$.val = tree.RoutineParamInOut }
+| IN OUT { $$.val = tree.RoutineParamInOut }
 | VARIADIC { return unimplementedWithIssueDetail(sqllex, 88947, "variadic user-defined functions") }
 
 routine_param_type:
