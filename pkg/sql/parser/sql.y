@@ -1533,6 +1533,7 @@ func (u *sqlSymUnion) beginTransaction() *tree.BeginTransaction {
 %type <tree.Expr> where_clause opt_where_clause
 %type <*tree.ArraySubscript> array_subscript
 %type <tree.Expr> opt_slice_bound
+%type <tree.Expr> opt_slicing_bound
 %type <*tree.IndexFlags> opt_index_flags
 %type <*tree.IndexFlags> index_flags_param
 %type <*tree.IndexFlags> index_flags_param_list
@@ -16152,7 +16153,7 @@ array_subscript:
   {
     $$.val = &tree.ArraySubscript{Begin: $2.expr()}
   }
-| '[' opt_slice_bound ':' opt_slice_bound ']'
+| '[' opt_slicing_bound ':' opt_slicing_bound ']'
   {
     $$.val = &tree.ArraySubscript{Begin: $2.expr(), End: $4.expr(), Slice: true}
   }
@@ -16162,6 +16163,13 @@ opt_slice_bound:
 | /*EMPTY*/
   {
     $$.val = tree.Expr(nil)
+  }
+
+opt_slicing_bound:
+  a_expr
+| /*EMPTY*/
+  {
+    $$.val = tree.DNull
   }
 
 array_subscripts:
