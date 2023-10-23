@@ -331,6 +331,32 @@ SELECT f(1, 5), f(-5, 5), f(0, 1)
 ----
 10  10  0
 
+statement ok
+CREATE OR REPLACE FUNCTION f(a INT, b INT) RETURNS INT AS $$
+  DECLARE
+    sum INT := 0;
+    i INT := 0;
+    j INT := 0;
+  BEGIN
+    <<p>>
+    LOOP
+      IF i >= 3 THEN EXIT; END IF;
+      i := i + 1;
+      LOOP
+        IF j >= 2 THEN CONTINUE p; END IF;
+        sum := sum + j;
+        j := j + 1;
+      END LOOP;
+    END LOOP p;
+    RETURN sum;
+  END
+$$ LANGUAGE PLpgSQL;
+
+query I
+SELECT f(1, 5)
+----
+4
+
 # TODO(drewk): add back the dijkstra test once UDFs calling other UDFs is
 # allowed.
 

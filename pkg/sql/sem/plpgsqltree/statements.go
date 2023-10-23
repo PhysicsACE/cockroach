@@ -61,6 +61,7 @@ type Block struct {
 	Decls      []Statement
 	Body       []Statement
 	Exceptions []Exception
+	EndLabel   string
 }
 
 // TODO(drewk): format Label and Exceptions fields.
@@ -347,6 +348,7 @@ type Loop struct {
 	StatementImpl
 	Label string
 	Body  []Statement
+	EndLabel string
 }
 
 func (s *Loop) PlpgSQLStatementTag() string {
@@ -378,6 +380,7 @@ type While struct {
 	Label     string
 	Condition Expr
 	Body      []Statement
+	EndLabel  string
 }
 
 func (s *While) Format(ctx *tree.FmtCtx) {
@@ -415,6 +418,7 @@ type ForInt struct {
 	Step    Expr
 	Reverse int
 	Body    []Statement
+	EndLabel string
 }
 
 func (s *ForInt) Format(ctx *tree.FmtCtx) {
@@ -436,6 +440,7 @@ type ForQuery struct {
 	Label string
 	Var   Variable
 	Body  []Statement
+	EndLabel string
 }
 
 func (s *ForQuery) Format(ctx *tree.FmtCtx) {
@@ -513,6 +518,7 @@ type ForEachArray struct {
 	Slice int // TODO(drewk): not sure what this is
 	Expr  Expr
 	Body  []Statement
+	EndLabel string
 }
 
 func (s *ForEachArray) Format(ctx *tree.FmtCtx) {

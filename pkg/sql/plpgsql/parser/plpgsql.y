@@ -386,6 +386,7 @@ pl_block: opt_block_label decl_sect BEGIN proc_sect exception_sect END opt_label
       Decls: $2.statements(),
       Body: $4.statements(),
       Exceptions: $5.exceptions(),
+      EndLabel: $7,
     }
   }
 ;
@@ -940,6 +941,7 @@ stmt_loop: opt_loop_label LOOP loop_body opt_label ';'
     $$.val = &plpgsqltree.Loop{
       Label: $1,
       Body: $3.statements(),
+      EndLabel: $4,
     }
   }
 ;
@@ -956,6 +958,7 @@ stmt_while: opt_loop_label WHILE expr_until_loop LOOP loop_body opt_label ';'
       Label: $1,
       Condition: cond,
       Body: $5.statements(),
+      EndLabel: $6,
     }
   }
 ;

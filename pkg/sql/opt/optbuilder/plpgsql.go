@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/container/orderedmap"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
@@ -148,7 +149,18 @@ type plpgsqlBuilder struct {
 	blockState *tree.BlockState
 
 	hasExceptionBlock bool
+
 	identCounter      int
+
+	// labelMap maps the labels to their respective index in continuations to 
+	// support artitray CONTINUE for an arbitrary label
+	labelMap  *orderedmap.OrderedMap[string, int]
+
+	// labelEndMap maps the labels to their respective index in exitContinuations
+	// to support EXIT for an arbitray label
+	labelEndMap *orderedmap.OrderedMap[string, int]
+
+	testmap map[string]int
 }
 
 func (b *plpgsqlBuilder) init(
@@ -160,6 +172,9 @@ func (b *plpgsqlBuilder) init(
 	b.returnType = returnType
 	b.varTypes = make(map[tree.Name]*types.T)
 	b.cursors = make(map[tree.Name]ast.CursorDeclaration)
+	b.labelMap = orderedmap.NewOrderedMap[string, int]()
+	b.labelEndMap = orderedmap.NewOrderedMap[string, int]()
+	b.testmap = make(map[string]int)
 	for i := range block.Decls {
 		switch dec := block.Decls[i].(type) {
 		case *ast.Declaration:
@@ -334,10 +349,18 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 
 		case *ast.Loop:
 			if t.Label != "" {
-				panic(unimplemented.New(
-					"LOOP label",
-					"LOOP statement labels are not yet supported",
-				))
+
+				if t.Label != t.EndLabel {
+					panic(pgerror.New(pgcode.Syntax, "The label and end label for a block must be the same"))
+				}
+
+				if _, ok := b.labelMap.Get(t.Label); ok {
+					panic(pgerror.New(pgcode.Syntax, "Multiple blocks cannot have the same name"))
+				}
+				b.labelMap.Insert(t.Label, len(b.continuations))
+				b.labelEndMap.Insert(t.Label, len(b.exitContinuations))
+				b.testmap[t.Label] = len(b.continuations)
+
 			}
 			// LOOP control flow is handled similarly to IF statements, but two
 			// continuation functions are used - one that executes the loop body, and
@@ -390,9 +413,9 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 
 		case *ast.Exit:
 			if t.Label != "" {
-				panic(unimplemented.New(
-					"EXIT label",
-					"EXIT statement labels are not yet supported",
+				panic(pgerror.New(
+					pgcode.Syntax,
+					"labels not supported for exit",
 				))
 			}
 			if t.Condition != nil {
@@ -414,10 +437,16 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 
 		case *ast.Continue:
 			if t.Label != "" {
-				panic(unimplemented.New(
-					"CONTINUE label",
-					"CONTINUE statement labels are not yet supported",
-				))
+				names := make([]string, 0)
+				for _, v := range b.continuations {
+					names = append(names, v.def.Name)
+				}
+				fmt.Println("Continue statement reached", names, b.labelMap)
+				if con := b.getLabelContinuation(t.Label); con != nil {
+					return b.callContinuation(con, s)
+				} else {
+					panic(pgerror.New(pgcode.Syntax, "CONTINUE cannot be used outside a loop"))
+				}
 			}
 			if t.Condition != nil {
 				panic(unimplemented.New(
@@ -1323,10 +1352,28 @@ func (b *plpgsqlBuilder) getExitContinuation() *continuation {
 	return &b.exitContinuations[len(b.exitContinuations)-1]
 }
 
+func (b *plpgsqlBuilder) getLabelExitContinuation(label string) *continuation {
+	if val, ok := b.labelEndMap.Get(label); ok {
+		return &b.exitContinuations[val]
+	}
+	panic(pgerror.Newf(pgcode.Syntax, "No current block struct with label \"%s\"", label))
+}
+
 func (b *plpgsqlBuilder) getLoopContinuation() *continuation {
 	for i := len(b.continuations) - 1; i >= 0; i-- {
 		if b.continuations[i].def.IsRecursive {
 			return &b.continuations[i]
+		}
+	}
+	return nil
+}
+
+func (b *plpgsqlBuilder) getLabelContinuation(label string) *continuation {
+	fmt.Println("WHen callend", label, b.labelMap)
+	fmt.Println("Testing map", b.testmap)
+	if val, ok := b.labelMap.Get(label); ok {
+		if b.continuations[val].def.IsRecursive {
+			return &b.continuations[val]
 		}
 	}
 	return nil
