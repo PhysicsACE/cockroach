@@ -1,0 +1,20 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "orderedmap",
+    srcs = ["orderedmap.go"],
+    importpath = "github.com/cockroachdb/cockroach/pkg/util/container/orderedmap",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/util/container/list",
+    ],
+)
+
+go_test(
+    name = "orderedmap_test",
+    srcs = [
+        "orderedmap_test.go",
+    ],
+    args = ["-test.timeout=295s"],
+    embed = [":orderedmap"],
+)
