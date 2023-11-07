@@ -1565,6 +1565,15 @@ func (a *ArraySubscripts) Format(ctx *FmtCtx) {
 type IndirectionExpr struct {
 	Expr        Expr
 	Indirection ArraySubscripts
+	// True if IndirectionExpr is created internally in optBuilder for update statements
+	IsAssign    bool
+	// Name is the unresolved column name for subscripts used in update statements
+	Name        Name
+	// Holds a list of Exprs for updates. Length of Values equals length of Additional
+	// and zip(Values, Additional) represents a subscription path with its respective
+	// update value
+	Values      []Expr
+	Additional  []ArraySubscripts
 
 	typeAnnotation
 }
@@ -1589,6 +1598,20 @@ func (node *IndirectionExpr) Format(ctx *FmtCtx) {
 		exprFmtWithParen(ctx, node.Expr)
 	}
 	ctx.FormatNode(&node.Indirection)
+}
+
+func (node *IndirectionExpr) addAdditionalPath(path ArraySubscripts) {
+	if node.Additional == nil {
+		node.Additional = make([]ArraySubscripts, 0)
+	}
+	node.Additional = append(node.Additional, path)
+}
+
+func (node *IndirectionExpr) addAdditionalValue(val Expr) {
+	if node.Values == nil {
+		node.Values = make([]Expr, 0)
+	}
+	node.Values = append(node.Values, val)
 }
 
 type annotateSyntaxMode int

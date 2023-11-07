@@ -126,7 +126,7 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 	}
 
 	for _, expr := range exprs {
-		mb.addTargetColsByName(expr.Names)
+		mb.addTargetColsByRefs(expr)
 
 		if expr.Tuple {
 			n := -1
@@ -137,8 +137,8 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				// Use the data types of the target columns to resolve expressions
 				// with ambiguous types (e.g. should 1 be interpreted as an INT or
 				// as a FLOAT).
-				desiredTypes := make([]*types.T, len(expr.Names))
-				targetIdx := len(mb.targetColList) - len(expr.Names)
+				desiredTypes := make([]*types.T, len(expr.ColumnRefs))
+				targetIdx := len(mb.targetColList) - len(expr.ColumnRefs)
 				for i := range desiredTypes {
 					desiredTypes[i] = mb.md.ColumnMeta(mb.targetColList[targetIdx+i]).Type
 				}
@@ -153,10 +153,10 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				panic(unimplementedWithIssueDetailf(35713, fmt.Sprintf("%T", expr.Expr),
 					"source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression; not supported: %T", expr.Expr))
 			}
-			if len(expr.Names) != n {
+			if len(expr.ColumnRefs) != n {
 				panic(pgerror.Newf(pgcode.Syntax,
 					"number of columns (%d) does not match number of values (%d)",
-					len(expr.Names), n))
+					len(expr.ColumnRefs), n))
 			}
 		}
 	}
@@ -229,6 +229,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	subquery := 0
 	for _, set := range exprs {
 		if set.Tuple {
+			subscriptFlag := false
 			switch t := set.Expr.(type) {
 			case *tree.Subquery:
 				// Get the subquery scope that was built by addTargetColsForUpdate.
@@ -240,6 +241,13 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 					ord := mb.tabID.ColumnOrdinal(mb.targetColList[n])
 					targetCol := mb.tab.Column(ord)
 					subqueryScope.cols[i].name = scopeColName(targetCol.ColName())
+
+					if _, ok := mb.updateAgg[targetcol.ColName()]; ok {
+						mb.updateAgg[ref.Name].addAdditionalValue(subqueryScope.cols[i].getExpr())
+						n++
+						subscriptFlag = true
+						continue
+					}
 
 					// Add the column ID to the list of columns to update.
 					mb.updateColIDs[ord] = subqueryScope.cols[i].id
@@ -266,14 +274,48 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 				projectionsScope.appendColumnsFromScope(subqueryScope)
 
 			case *tree.Tuple:
-				for _, expr := range t.Exprs {
-					addCol(expr, mb.targetColList[n])
+				for i, ref := range set.ColumnRefs {
+					if len(ref.Subscripts) > 0 {
+						mb.updateAgg[ref.Name].addAdditionalValue(t.Exprs[i])
+						subscriptFlag = true
+					}
+					if subscriptFlag {
+						n++ 
+						continue
+					}
+					addCol(t.Exprs[i], mb.targetColList[n])
 					n++
 				}
 			}
 		} else {
-			addCol(set.Expr, mb.targetColList[n])
+			expr := set.Expr
+			if len(set.ColumnRefs) > 1 {
+				panic(errors.AssertionFailedf("expected <= 1 column ref, found %d", len(set.ColumnRefs)))
+			}
+			for _, ref := range set.ColumnRefs {
+				// For JSONB subscripts, replace with json_set.
+				if len(ref.Subscripts) > 0 {
+					mb.updateAgg[ref.Name].addAdditionalValue(expr)
+					subscriptFlag = true
+				}
+			}
+			if subscriptFlag {
+				n++
+				continue
+			}
+			addCol(expr, mb.targetColList[n])
 			n++
+		}
+	}
+
+	// For container types that may be updated multiple times in a update
+	// statement, we add them at the end by incrementally building out
+	// the access paths and their respective update values before adding 
+	// them to the update cols. 
+	for name, expr := range mb.updateAgg {
+		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
+			colID := mb.tabID.ColumnID(ord)
+			addcol(expr, colID)
 		}
 	}
 
