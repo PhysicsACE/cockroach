@@ -745,8 +745,28 @@ define Array {
 # and slicing are not supported.
 [Scalar]
 define Indirection {
-    Input ScalarExpr
-    Index ScalarExpr
+    Input     ScalarExpr
+    Index     ScalarListExpr
+    Updates   ScalarListExpr
+    IsAssign  bool
+}
+
+# Defines a update path with its associated value in an update statement
+# that has container subscriptions
+[Scalar, ListItem]
+define SubscriptPath {
+    Path   ScalarListExpr
+    Value  ScalarExpr
+}
+
+# IndirectionSubscript represents a single subscripting opeation. An
+# Indirection can have multiple IndirectionSubscripts. Currently, multiple
+# subscripts are only implemented for jsonb types. 
+[Scalar, ListItem]
+define IndirectionSubscript {
+    Begin    ScalarExpr
+    End      ScalarExpr
+    IsSlice  bool
 }
 
 # ArrayFlatten is an ARRAY(<subquery>) expression. ArrayFlatten takes as input

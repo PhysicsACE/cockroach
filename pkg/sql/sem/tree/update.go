@@ -60,6 +60,29 @@ func (node *Update) Format(ctx *FmtCtx) {
 	}
 }
 
+// Represents a reference to a column with potential subscript
+type ColumnRef struct {
+	Name          Name
+	Subscripts    ArraySubscripts
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ColumnRef) Format(ctx *FmtCtx) {
+	ctx.FormatNode(&node.Name)
+	ctx.FormatNode(&node.Subscripts)
+}
+
+type ColumnRefList []ColumnRef
+
+func (l *ColumnRefList) Format(ctx *FmtCtx) {
+	for i := range *l {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatNode(&(*l)[i])
+	}
+}
+
 // UpdateExprs represents a list of update expressions.
 type UpdateExprs []*UpdateExpr
 
@@ -76,7 +99,7 @@ func (node *UpdateExprs) Format(ctx *FmtCtx) {
 // UpdateExpr represents an update expression.
 type UpdateExpr struct {
 	Tuple bool
-	Names NameList
+	ColumnRefs ColumnRefList
 	Expr  Expr
 }
 
@@ -87,7 +110,7 @@ func (node *UpdateExpr) Format(ctx *FmtCtx) {
 		open, close = "(", ")"
 	}
 	ctx.WriteString(open)
-	ctx.FormatNode(&node.Names)
+	ctx.FormatNode(&node.ColumnRefs)
 	ctx.WriteString(close)
 	ctx.WriteString(" = ")
 	ctx.FormatNode(node.Expr)

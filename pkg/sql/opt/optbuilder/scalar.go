@@ -177,17 +177,58 @@ func (b *Builder) buildScalar(
 		}
 
 		out = b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		indicies := make(memo.ScalarListExpr, len(t.Indirection))
 
-		for _, subscript := range t.Indirection {
+		for i, subscript := range t.Indirection {
 			if subscript.Slice {
-				panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
+				indicies[i] = b.factory.ConstructIndirectionSubscript(
+					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+					b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+					true,
+				)
+				continue
 			}
-
-			out = b.factory.ConstructIndirection(
-				out,
+			indicies[i] = b.factory.ConstructIndirectionSubscript(
 				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				false,
 			)
 		}
+
+		updates := make(memo.ScalarListExpr, len(t.Additional))
+
+		for i := range len(t.Additional) {
+			path := t.Additional[i]
+			value := t.Values[i]
+			indicies := make(memo.ScalarListExpr, len(path))
+			for i, subscript := range path {
+				if subscript.Slice {
+					indicies[i] = b.factory.ConstructIndirectionSubscript(
+						b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+						b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+						true,
+					)
+					continue
+				}
+				indicies[i] = b.factory.ConstructIndirectionSubscript(
+					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+					b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+					false,
+				)
+			}
+
+			updates[i] = b.factor.ConstructSubscriptPath(
+				indicies,
+				b.buildScalar(value.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			)
+		}
+
+		out = b.factory.ConstructIndirection(
+			out,
+			indicies,
+			t.IsAssign,
+			updates,
+		)
 
 	case *tree.IfErrExpr:
 		cond := b.buildScalar(t.Cond.(tree.TypedExpr), inScope, nil, nil, colRefs)

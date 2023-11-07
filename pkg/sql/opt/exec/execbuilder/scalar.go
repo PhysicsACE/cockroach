@@ -474,17 +474,44 @@ func (b *Builder) buildAnyScalar(
 func (b *Builder) buildIndirection(
 	ctx *buildScalarCtx, scalar opt.ScalarExpr,
 ) (tree.TypedExpr, error) {
+	indirection := scalar.(*memo.IndirectionExpr)
+	begin := make(tree.TypedExprs, len(indirection.Index))
+	end := make(tree.TypedExprs, len(indirection.Index))
+	sliceFlags := make([]bool, len(indirection.Index))
+
 	expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 	if err != nil {
 		return nil, err
 	}
 
-	index, err := b.buildScalar(ctx, scalar.Child(1).(opt.ScalarExpr))
-	if err != nil {
-		return nil, err
+	for i := 0; i < len(indirection.Index); i++ {
+		indirectionsubscript := indirection.Index[i].(*memo.IndirectionSubscriptExpr)
+		beginExpr, err := b.buildScalar(ctx, indirection.Index[i].Child(0).(opt.ScalarExpr))
+		if err != nil {
+			return nil, err
+		}
+		begin[i] = beginExpr
+		endExpr, err := b.buildScalar(ctx, indirection.Index[i].Child(1).(opt.ScalarExpr))
+		if err != nil {
+			return nil, err
+		}
+		end[i] = endExpr
+		sliceFlags[i] = indirectionsubscript.IsSlice
 	}
 
-	return tree.NewTypedIndirectionExpr(expr, index, scalar.DataType()), nil
+	// for i := 0; i < len(indirection.Updates); i++ {
+	// 	path := indirection.Updates[i].(*memo.SubscriptPathExpr)
+
+	// }
+
+	return tree.NewTypedIndirectionExpr(
+		expr,
+		begin,
+		end,
+		sliceFlags,
+		indirection.IsAssign,
+		scalar.DataType(),
+	), nil
 }
 
 func (b *Builder) buildCollate(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {

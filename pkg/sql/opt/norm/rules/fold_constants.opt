@@ -150,15 +150,15 @@ $result
 #   ARRAY[1, 2, 3][2]
 #
 # The rule replaces the indirection operator with the referenced array element.
-[FoldIndirection, Normalize]
-(Indirection
-    $input:*
-    $index:* &
-        (IsConstValueOrGroupOfConstValues $index) &
-        (Let ($result $ok):(FoldIndirection $input $index) $ok)
-)
-=>
-$result
+# [FoldIndirection, Normalize]
+# (Indirection
+#    $input:*
+#    $index:* &
+#        (IsConstSubscripts $index) &
+#        (Let ($result $ok):(FoldIndirection $input $index) $ok)
+# )
+# =>
+# $result
 
 # FoldColumnAccess eliminates a column access operator applied to a tuple value
 # that is statically constructed, like this:

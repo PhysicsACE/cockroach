@@ -291,7 +291,8 @@ func (e *evaluator) EvalIndexedVar(ctx context.Context, iv *tree.IndexedVar) (tr
 func (e *evaluator) EvalIndirectionExpr(
 	ctx context.Context, expr *tree.IndirectionExpr,
 ) (tree.Datum, error) {
-	var subscriptIdx int
+	var subscriptBeginIdx int
+	var subscriptEndIdx int
 
 	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
@@ -304,8 +305,61 @@ func (e *evaluator) EvalIndirectionExpr(
 	switch d.ResolvedType().Family() {
 	case types.ArrayFamily:
 		for i, t := range expr.Indirection {
-			if t.Slice || i > 0 {
+
+			if i > 0 {
 				return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+			}
+
+			if t.Slice {
+				arr := tree.MustBeDArray(d)
+				beginDatum, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
+				if err != nil {
+					return nil, err
+				}
+				if beginDatum == tree.DNull {
+					subscriptBeginIdx = 1
+				} else {
+					subscriptBeginIdx = int(tree.MustBeDInt(beginDatum))
+				}
+
+				endDatum, err := t.End.(tree.TypedExpr).Eval(ctx, e)
+				if err != nil {
+					return nil, err
+				}
+				if endDatum == tree.DNull {
+					subscriptEndIdx = arr.Len()
+				} else {
+					subscriptEndIdx = int(tree.MustBeDInt(endDatum))
+				}
+
+				subscriptArray := tree.NewDArray(arr.ParamTyp)
+
+				if subscriptEndIdx < subscriptBeginIdx || (subscriptBeginIdx < 0 && subscriptEndIdx < 0) ||
+					(subscriptBeginIdx > arr.Len() && subscriptEndIdx > arr.Len()) {
+						return subscriptArray, nil
+				}
+
+				maximum := func(a int, b int) int {
+					if a <= b {
+						return b
+					}
+					return a
+				}
+
+				minimum := func(a int, b int) int {
+					if a <= b {
+						return a
+					}
+					return b
+				}
+
+				for i := maximum(0, subscriptBeginIdx - 1); i <= minimum(subscriptEndIdx - 1, arr.Len() - 1); i++ {
+					if err := subscriptArray.Append(arr.Array[i]); err != nil {
+						return nil, err
+					}
+				}
+
+				return subscriptArray, nil
 			}
 
 			beginDatum, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
@@ -315,7 +369,7 @@ func (e *evaluator) EvalIndirectionExpr(
 			if beginDatum == tree.DNull {
 				return tree.DNull, nil
 			}
-			subscriptIdx = int(tree.MustBeDInt(beginDatum))
+			subscriptBeginIdx = int(tree.MustBeDInt(beginDatum))
 		}
 
 		// Index into the DArray, using 1-indexing.
@@ -323,12 +377,12 @@ func (e *evaluator) EvalIndirectionExpr(
 
 		// VECTOR types use 0-indexing.
 		if arr.FirstIndex() == 0 {
-			subscriptIdx++
+			subscriptBeginIdx++
 		}
-		if subscriptIdx < 1 || subscriptIdx > arr.Len() {
+		if subscriptBeginIdx < 1 || subscriptBeginIdx > arr.Len() {
 			return tree.DNull, nil
 		}
-		return arr.Array[subscriptIdx-1], nil
+		return arr.Array[subscriptBeginIdx-1], nil
 	case types.JsonFamily:
 		j := tree.MustBeDJSON(d)
 		curr := j.JSON

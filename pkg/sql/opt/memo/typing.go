@@ -188,6 +188,7 @@ func init() {
 	typingFuncMap[opt.SubqueryOp] = typeSubquery
 	typingFuncMap[opt.ColumnAccessOp] = typeColumnAccess
 	typingFuncMap[opt.IndirectionOp] = typeIndirection
+	typingFuncMap[opt.IndirectionSubscriptOp] = typeIndirectionSubscript
 	typingFuncMap[opt.CollateOp] = typeCollate
 	typingFuncMap[opt.ArrayFlattenOp] = typeArrayFlatten
 	typingFuncMap[opt.IfErrOp] = typeIfErr
@@ -272,6 +273,10 @@ func typeIndirection(e opt.ScalarExpr) *types.T {
 	default:
 		panic(errors.AssertionFailedf("unknown type indirection type %s", t.SQLString()))
 	}
+}
+
+func typeIndirectionSubscript(e opt.ScalarExpr) *types.T {
+	return types.Any
 }
 
 // typeCollate returns the collated string typed with the given locale.

@@ -412,14 +412,42 @@ func NewTypedComparisonExprWithSubOp(
 }
 
 // NewTypedIndirectionExpr returns a new IndirectionExpr that is verified to be well-typed.
-func NewTypedIndirectionExpr(expr, index TypedExpr, typ *types.T) *IndirectionExpr {
-	node := &IndirectionExpr{
-		Expr:        expr,
-		Indirection: ArraySubscripts{&ArraySubscript{Begin: index}},
+// func NewTypedIndirectionExpr(expr, index TypedExpr, typ *types.T) *IndirectionExpr {
+// 	node := &IndirectionExpr{
+// 		Expr:        expr,
+// 		Indirection: ArraySubscripts{&ArraySubscript{Begin: index}},
+// 	}
+// 	node.typ = typ
+// 	return node
+// }
+
+func NewTypedIndirectionExpr(expr TypedExpr, begin, end []TypedExpr, sliceFlags []bool, isAssign bool, typ *types.T) *IndirectionExpr {
+	subscripts := make([]*ArraySubscript, len(begin))
+	var containsSlice bool
+	for i := 0; i < len(begin); i++ {
+		subscripts[i] = &ArraySubscript{
+			Begin: begin[i],
+			End: end[i],
+			Slice: sliceFlags[i],
+		}
+
+		if sliceFlags[i] {
+			containsSlice = true
+		}
 	}
-	node.typ = typ
+	node := &IndirectionExpr{
+		Expr: expr,
+		Indirection: subscripts,
+		IsAssign: isAssign,
+	}
+
+	if containsSlice {
+		node.typ = types.MakeArray(typ)
+	} else {
+		node.typ = typ
+	}
 	return node
-}
+}	
 
 // NewTypedCollateExpr returns a new CollateExpr that is verified to be well-typed.
 func NewTypedCollateExpr(expr TypedExpr, locale string) *CollateExpr {
@@ -1565,6 +1593,12 @@ func (a *ArraySubscripts) Format(ctx *FmtCtx) {
 type IndirectionExpr struct {
 	Expr        Expr
 	Indirection ArraySubscripts
+	IsAssign    bool
+	// Name is the unresolved column name for subscripts used in update statements
+	Name        Name
+
+	Values      []Expr
+	Additional  []ArraySubscripts
 
 	typeAnnotation
 }
@@ -1589,6 +1623,20 @@ func (node *IndirectionExpr) Format(ctx *FmtCtx) {
 		exprFmtWithParen(ctx, node.Expr)
 	}
 	ctx.FormatNode(&node.Indirection)
+}
+
+func (node *IndirectionExpr) addAdditionalPath(path ArraySubscripts) {
+	if node.Additional == nil {
+		node.Additional = make([]ArraySubscripts, 0)
+	}
+	node.Additional = append(node.Additional, path)
+}
+
+func (node *IndirectionExpr) addAdditionalValue(val Expr) {
+	if node.Values == nil {
+		node.Values = make([]Expr, 0)
+	}
+	node.Values = append(node.Values, val)
 }
 
 type annotateSyntaxMode int
