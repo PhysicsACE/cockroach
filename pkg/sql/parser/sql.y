@@ -896,7 +896,7 @@ func (u *sqlSymUnion) beginTransaction() *tree.BeginTransaction {
 %token <*tree.NumVal> ICONST FCONST
 %token <*tree.Placeholder> PLACEHOLDER
 %token <str> TYPECAST TYPEANNOTATE DOT_DOT
-%token <str> LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%token <str> LESS_EQUALS GREATER_EQUALS NOT_EQUALS COLON_EQUALS
 %token <str> NOT_REGMATCH REGIMATCH NOT_REGIMATCH
 %token <str> ERROR
 
@@ -1695,6 +1695,7 @@ func (u *sqlSymUnion) beginTransaction() *tree.BeginTransaction {
 %type <tree.RoutineObj> function_with_paramtypes
 %type <tree.RoutineObjs> function_with_paramtypes_list
 %type <empty> opt_link_sym
+%type <tree.NamedArgExpr> named_argument
 
 %type <*tree.LabelSpec> label_spec
 
@@ -15946,6 +15947,12 @@ expr_list:
 | expr_list ',' a_expr
   {
     $$.val = append($1.exprs(), $3.expr())
+  }
+
+named_argument:
+  name COLON_EQUALS a_expr
+  {
+    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), Expr: $3.expr()}
   }
 
 type_list:

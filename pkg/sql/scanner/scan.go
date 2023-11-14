@@ -355,6 +355,10 @@ func (s *SQLScanner) Scan(lval ScanSymType) {
 			s.pos++
 			lval.SetID(lexbase.TYPECAST)
 			return
+		case '=':
+			s.pos++
+			lval.SetID(lexbase.COLON_EQUALS)
+			return
 		}
 		return
 

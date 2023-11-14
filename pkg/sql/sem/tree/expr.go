@@ -1260,6 +1260,20 @@ func NewTypedUnaryExpr(op UnaryOperator, expr TypedExpr, typ *types.T) *UnaryExp
 	return node
 }
 
+type NamedArgExpr struct {
+	// The name of the parameter 
+	ArgName     Name
+	// The expr value associated with the ArgName
+	Expr        Expr
+
+	typeAnnotation
+}
+
+// Format implements the NodeFormatter interface.
+func (node *NamedArgExpr) Format(ctx *FmtCtx) {
+
+}
+
 // FuncExpr represents a function call.
 type FuncExpr struct {
 	Func  ResolvableFunctionReference
