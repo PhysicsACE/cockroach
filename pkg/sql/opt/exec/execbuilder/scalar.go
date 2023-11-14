@@ -478,6 +478,8 @@ func (b *Builder) buildIndirection(
 	begin := make(tree.TypedExprs, len(indirection.Index))
 	end := make(tree.TypedExprs, len(indirection.Index))
 	sliceFlags := make([]bool, len(indirection.Index))
+	// values := make(tree.TypedExprs, len(indirection.Updates))
+	// paths := make([]tree.ArraySubscripts, len(indirection.Updates))
 
 	expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 	if err != nil {
@@ -500,8 +502,28 @@ func (b *Builder) buildIndirection(
 	}
 
 	// for i := 0; i < len(indirection.Updates); i++ {
-	// 	path := indirection.Updates[i].(*memo.SubscriptPathExpr)
-
+	// 	subscriptPath := indirection.Updates[i].(*memo.SubscriptPathExpr)
+	// 	valueExpr, err := b.buildScalar(ctx, indirection.Updates[i].Child(1).(opt.ScalarExpr))
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	values[i] = valueExpr
+	// 	pathBegin := make(tree.TypedExprs, len(subscriptPath.Path))
+	// 	pathEnd := make(tree.TypedExprs, len(subscriptPath.Path))
+	// 	for j := 0; j < len(subscriptPath.Path); j++ {
+	// 		accessor := subscriptPath.Path[i].(*memo.IndirectionSubscriptExpr)
+	// 		beginExpr, err := b.buildScalar(ctx, indirection.Index[i].Child(0).(opt.ScalarExpr))
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 		begin[i] = beginExpr
+	// 		endExpr, err := b.buildScalar(ctx, indirection.Index[i].Child(1).(opt.ScalarExpr))
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 		end[i] = endExpr
+	// 		sliceFlags[i] = indirectionsubscript.IsSlice
+	// 	}
 	// }
 
 	return tree.NewTypedIndirectionExpr(
