@@ -242,8 +242,9 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 					targetCol := mb.tab.Column(ord)
 					subqueryScope.cols[i].name = scopeColName(targetCol.ColName())
 
-					if _, ok := mb.updateAgg[targetcol.ColName()]; ok {
-						mb.updateAgg[ref.Name].addAdditionalValue(subqueryScope.cols[i].getExpr())
+					if _, ok := mb.updateAgg[targetCol.ColName()]; ok {
+						ref := set.ColumnRefs[i]
+						mb.updateAgg[ref.Name].AddAdditionalValue(subqueryScope.cols[i].getExpr())
 						n++
 						subscriptFlag = true
 						continue
@@ -276,7 +277,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 			case *tree.Tuple:
 				for i, ref := range set.ColumnRefs {
 					if len(ref.Subscripts) > 0 {
-						mb.updateAgg[ref.Name].addAdditionalValue(t.Exprs[i])
+						mb.updateAgg[ref.Name].AddAdditionalValue(t.Exprs[i])
 						subscriptFlag = true
 					}
 					if subscriptFlag {
@@ -295,7 +296,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 			for _, ref := range set.ColumnRefs {
 				// For JSONB subscripts, replace with json_set.
 				if len(ref.Subscripts) > 0 {
-					mb.updateAgg[ref.Name].addAdditionalValue(expr)
+					mb.updateAgg[ref.Name].AddAdditionalValue(expr)
 					subscriptFlag = true
 				}
 			}
@@ -315,7 +316,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	for name, expr := range mb.updateAgg {
 		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
 			colID := mb.tabID.ColumnID(ord)
-			addcol(expr, colID)
+			addCol(expr, colID)
 		}
 	}
 

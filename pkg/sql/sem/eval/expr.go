@@ -301,7 +301,24 @@ func (e *evaluator) EvalIndirectionExpr(
 	if d == tree.DNull {
 		return d, nil
 	}
-
+	// If an assignment IndirectionExpr was created by optBuilder,
+	// we go through all of the updates found and return the resulting datum
+	// to be placed in the update row. A hice concequences of performing all subscription
+	// execution through IndirectionExpr is that for future container types (e.g. hstore),
+	// all that is required to support subscription is a fetch case below for the specific type
+	// and an associated executor for SubscriptionRoutine to perform incremental updates. 
+	if t.IsAssign {
+		updateRoutine := &SubscriptionRoutine{
+			d,
+			t.Additional,
+			t.Values,
+		}
+		res, err := updateRoutine.execute()
+		if err != nil {
+			return nil, err
+		}
+		return res
+	}
 	switch d.ResolvedType().Family() {
 	case types.ArrayFamily:
 		for i, t := range expr.Indirection {

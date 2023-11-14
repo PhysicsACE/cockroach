@@ -300,7 +300,7 @@ func (u *sqlSymUnion) shardedIndexDef() *tree.ShardedIndexDef {
 func (u *sqlSymUnion) nameList() tree.NameList {
     return u.val.(tree.NameList)
 }
-func (u.*sqlSymUnion) columnRefList() tree.ColumnRefList {
+func (u *sqlSymUnion) columnRefList() tree.ColumnRefList {
   return u.val.(tree.ColumnRefList)
 }
 func (u *sqlSymUnion) enumValueList() tree.EnumValueList {

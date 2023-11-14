@@ -1625,14 +1625,14 @@ func (node *IndirectionExpr) Format(ctx *FmtCtx) {
 	ctx.FormatNode(&node.Indirection)
 }
 
-func (node *IndirectionExpr) addAdditionalPath(path ArraySubscripts) {
+func (node *IndirectionExpr) AddAdditionalPath(path ArraySubscripts) {
 	if node.Additional == nil {
 		node.Additional = make([]ArraySubscripts, 0)
 	}
 	node.Additional = append(node.Additional, path)
 }
 
-func (node *IndirectionExpr) addAdditionalValue(val Expr) {
+func (node *IndirectionExpr) AddAdditionalValue(val Expr) {
 	if node.Values == nil {
 		node.Values = make([]Expr, 0)
 	}

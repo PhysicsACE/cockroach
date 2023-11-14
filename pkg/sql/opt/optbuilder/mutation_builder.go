@@ -210,7 +210,7 @@ type mutationBuilder struct {
 	// Mapping to incrementally build update expressions for UPDATE statements 
 	// where a column is part of the SET statement multiple times. Note that this
 	// can only occur if the column type is a container and is being subscripted. 
-	updateAgg  map[tree.Name]*IndirectionExpr
+	updateAgg  map[tree.Name]*tree.IndirectionExpr
 }
 
 func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias tree.TableName) {
@@ -240,7 +240,7 @@ func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias 
 
 	// Add the table and its columns (including mutation columns) to metadata.
 	mb.tabID = mb.md.AddTable(tab, &mb.alias)
-	mb.updateAgg = make(map[tree.Name]*IndirectionExpr)
+	mb.updateAgg = make(map[tree.Name]*tree.IndirectionExpr)
 }
 
 // setFetchColIDs sets the list of columns that are fetched in order to provide
@@ -512,12 +512,12 @@ func (mb *mutationBuilder) addTargetColsByName(names tree.NameList) {
 	}
 }
 
-func (mb *mutationBuilder) addTargetColsByRefs(expr tree.UpdateExpr) {
+func (mb *mutationBuilder) addTargetColsByRefs(expr *tree.UpdateExpr) {
 	for _, ref := range expr.ColumnRefs {
 		name := ref.Name
 
 		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
-			if mb.tab.column(ord).Kind() == cat.System {
+			if mb.tab.Column(ord).Kind() == cat.System {
 				panic(pgerror.Newf(pgcode.InvalidColumnReference, "cannot modify system column %q", name))
 			}
 
@@ -533,11 +533,11 @@ func (mb *mutationBuilder) addTargetColsByRefs(expr tree.UpdateExpr) {
 			if ref.Subscripts != nil {
 				if _, ok := mb.updateAgg[tabCol.ColName()]; !ok {
 					mb.updateAgg[tabCol.ColName()] = &tree.IndirectionExpr{
-						Expr: &tree.UnresolvedName(NumParts: 1, Parts: tree.NameParts{string(name)}),
+						Expr: &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{string(name)}},
 						IsAssign: true,
 					}
 				}
-				mb.updateAgg[name].addAdditionalPath(ref.Subscripts)
+				mb.updateAgg[name].AddAdditionalPath(ref.Subscripts)
 			}
 
 			colID := mb.tabID.ColumnID(ord)
@@ -547,9 +547,6 @@ func (mb *mutationBuilder) addTargetColsByRefs(expr tree.UpdateExpr) {
 						"multiple assignments to the same column without subscripts %q", tabCol.ColName()))
 				}
 
-				if _, ok := mb.updateAgg[tabCol.ColName()]; ok {
-					mb.updateAgg[tabCol.ColName()][ord]
-				}
 				continue
 			}
 
@@ -586,8 +583,6 @@ func (mb *mutationBuilder) addTargetCol(ord int) {
 
 	mb.targetColList = append(mb.targetColList, colID)
 }
-
-func
 
 // extractValuesInput tests whether the given input is a VALUES clause with no
 // WITH, ORDER BY, or LIMIT modifier. If so, it's returned, otherwise nil is

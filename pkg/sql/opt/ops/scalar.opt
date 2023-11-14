@@ -753,7 +753,7 @@ define Indirection {
 
 # Defines a update path with its associated value in an update statement
 # that has container subscriptions
-[Scalar, ListItem]
+[Scalar]
 define SubscriptPath {
     Path   ScalarListExpr
     Value  ScalarExpr
@@ -762,7 +762,7 @@ define SubscriptPath {
 # IndirectionSubscript represents a single subscripting opeation. An
 # Indirection can have multiple IndirectionSubscripts. Currently, multiple
 # subscripts are only implemented for jsonb types. 
-[Scalar, ListItem]
+[Scalar]
 define IndirectionSubscript {
     Begin    ScalarExpr
     End      ScalarExpr

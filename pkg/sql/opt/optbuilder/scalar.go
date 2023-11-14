@@ -197,28 +197,28 @@ func (b *Builder) buildScalar(
 
 		updates := make(memo.ScalarListExpr, len(t.Additional))
 
-		for i := range len(t.Additional) {
+		for i := range t.Additional {
 			path := t.Additional[i]
 			value := t.Values[i]
-			indicies := make(memo.ScalarListExpr, len(path))
+			indexes := make(memo.ScalarListExpr, len(path))
 			for i, subscript := range path {
 				if subscript.Slice {
-					indicies[i] = b.factory.ConstructIndirectionSubscript(
+					indexes[i] = b.factory.ConstructIndirectionSubscript(
 						b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
 						b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
 						true,
 					)
 					continue
 				}
-				indicies[i] = b.factory.ConstructIndirectionSubscript(
+				indexes[i] = b.factory.ConstructIndirectionSubscript(
 					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
 					b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
 					false,
 				)
 			}
 
-			updates[i] = b.factor.ConstructSubscriptPath(
-				indicies,
+			updates[i] = b.factory.ConstructSubscriptPath(
+				indexes,
 				b.buildScalar(value.(tree.TypedExpr), inScope, nil, nil, colRefs),
 			)
 		}
@@ -226,8 +226,8 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructIndirection(
 			out,
 			indicies,
-			t.IsAssign,
 			updates,
+			t.IsAssign,
 		)
 
 	case *tree.IfErrExpr:
