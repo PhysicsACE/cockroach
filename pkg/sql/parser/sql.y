@@ -1695,7 +1695,6 @@ func (u *sqlSymUnion) beginTransaction() *tree.BeginTransaction {
 %type <tree.RoutineObj> function_with_paramtypes
 %type <tree.RoutineObjs> function_with_paramtypes_list
 %type <empty> opt_link_sym
-%type <tree.NamedArgExpr> named_argument
 
 %type <*tree.LabelSpec> label_spec
 
@@ -1710,7 +1709,7 @@ func (u *sqlSymUnion) beginTransaction() *tree.BeginTransaction {
 %left      AND
 %right     NOT
 %nonassoc  IS ISNULL NOTNULL   // IS sets precedence for IS NULL, etc
-%nonassoc  '<' '>' '=' LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%nonassoc  '<' '>' '=' LESS_EQUALS GREATER_EQUALS NOT_EQUALS COLON_EQUALS
 %nonassoc  '~' BETWEEN IN LIKE ILIKE SIMILAR NOT_REGMATCH REGIMATCH NOT_REGIMATCH NOT_LA
 %nonassoc  ESCAPE              // ESCAPE must be just above LIKE/ILIKE/SIMILAR
 %nonassoc  CONTAINS CONTAINED_BY '?' JSON_SOME_EXISTS JSON_ALL_EXISTS
@@ -14864,6 +14863,10 @@ a_expr:
       Right: $4.expr(),
     }
   }
+| name COLON_EQUALS a_expr
+  {
+    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), Expr: $3.expr()}
+  }
 | DEFAULT
   {
     $$.val = tree.DefaultVal{}
@@ -15947,12 +15950,6 @@ expr_list:
 | expr_list ',' a_expr
   {
     $$.val = append($1.exprs(), $3.expr())
-  }
-
-named_argument:
-  name COLON_EQUALS a_expr
-  {
-    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), Expr: $3.expr()}
   }
 
 type_list:
