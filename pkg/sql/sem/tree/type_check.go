@@ -688,7 +688,11 @@ func (expr *IndirectionExpr) TypeCheck(
 		expr.typ = typ.ArrayContents()
 		for i, t := range expr.Indirection {
 			if t.Slice {
-				return nil, unimplemented.NewWithIssuef(32551, "ARRAY slicing in %s", expr)
+				endExpr, err := typeCheckAndRequire(ctx, semaCtx, t.End, types.Int, "ARRAY subscript")
+				if err != nil {
+					return nil, err
+				}
+				t.End = endExpr
 			}
 			if i > 0 {
 				return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)

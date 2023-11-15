@@ -180,12 +180,19 @@ func (b *Builder) buildScalar(
 
 		for _, subscript := range t.Indirection {
 			if subscript.Slice {
-				panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
+				out = b.factory.ConstructIndirection(
+					out,
+					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+					b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+					true,
+				)
+				continue
 			}
-
 			out = b.factory.ConstructIndirection(
 				out,
 				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				false,
 			)
 		}
 

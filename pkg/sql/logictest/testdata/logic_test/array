@@ -308,20 +308,20 @@ SELECT (123)[2]
 
 # array slicing
 
-query error unimplemented: ARRAY slicing
-SELECT ARRAY['a', 'b', 'c'][:]
-
-query error unimplemented: ARRAY slicing
-SELECT ARRAY['a', 'b', 'c'][1:]
-
-query error unimplemented: ARRAY slicing
+query T
 SELECT ARRAY['a', 'b', 'c'][1:2]
+----
+{a,b}
 
-query error unimplemented: ARRAY slicing
-SELECT ARRAY['a', 'b', 'c'][:2]
+query T
+SELECT ARRAY['a', 'b', 'c'][1:]
+----
+{a,b,c}
 
-query error unimplemented: ARRAY slicing
+query T
 SELECT ARRAY['a', 'b', 'c'][2:1]
+----
+NULL
 
 # other forms of indirection
 

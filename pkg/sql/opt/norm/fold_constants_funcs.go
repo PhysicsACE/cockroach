@@ -543,9 +543,10 @@ func (c *CustomFuncs) FoldComparison(
 // FoldIndirection evaluates an array indirection operator with constant inputs.
 // It returns the referenced array element as a constant value, or ok=false if
 // the evaluation results in an error.
-func (c *CustomFuncs) FoldIndirection(input, index opt.ScalarExpr) (_ opt.ScalarExpr, ok bool) {
+func (c *CustomFuncs) FoldIndirection(input, index, end opt.ScalarExpr, slice bool) (_ opt.ScalarExpr, ok bool) {
 	// Index is 1-based, so convert to 0-based.
 	indexD := memo.ExtractConstDatum(index)
+	end := memo.ExtractConstDatum(end)
 
 	// Case 1: The input is a static array constructor.
 	if arr, ok := input.(*memo.ArrayExpr); ok {
