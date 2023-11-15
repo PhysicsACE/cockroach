@@ -26,7 +26,6 @@ go_library(
         "overload.go",
         "parse_doid.go",
         "settings.go",
-        "subscription.go",
         "testing_knobs.go",
         "tuple.go",
         "unary_op.go",
