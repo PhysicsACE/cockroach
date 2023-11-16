@@ -156,6 +156,16 @@ func (expr *ColumnAccessExpr) Walk(v Visitor) Expr {
 	return expr
 }
 
+func (expr *NamedArgExpr) Walk(v Visitor) Expr {
+	e, changed := WalkExpr(v, expr.Expr)
+	if changed {
+		exprCopy := *expr
+		exprCopy.Expr = e
+		return &exprCopy
+	}
+	return expr
+}
+
 // Walk implements the Expr interface.
 func (expr *TupleStar) Walk(v Visitor) Expr {
 	e, changed := WalkExpr(v, expr.Expr)

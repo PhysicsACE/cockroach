@@ -14464,6 +14464,10 @@ a_expr:
   {
     $$.val = &tree.AnnotateTypeExpr{Expr: $1.expr(), Type: $3.typeReference(), SyntaxMode: tree.AnnotateShort}
   }
+| name COLON_EQUALS a_expr
+  {
+    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), Expr: $3.expr()}
+  }
 | a_expr COLLATE collation_name
   {
     $$.val = &tree.CollateExpr{Expr: $1.expr(), Locale: $3}
@@ -14863,10 +14867,6 @@ a_expr:
       Right: $4.expr(),
     }
   }
-| name COLON_EQUALS a_expr
-  {
-    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), Expr: $3.expr()}
-  }
 | DEFAULT
   {
     $$.val = tree.DefaultVal{}
@@ -14891,6 +14891,10 @@ b_expr:
 | b_expr TYPEANNOTATE typename
   {
     $$.val = &tree.AnnotateTypeExpr{Expr: $1.expr(), Type: $3.typeReference(), SyntaxMode: tree.AnnotateShort}
+  }
+| name COLON_EQUALS b_expr
+  {
+    $$.val = &tree.NamedArgExpr{ArgName: tree.Name($1), Expr: $3.expr()}
   }
 | '+' b_expr %prec UMINUS
   {

@@ -1266,12 +1266,37 @@ type NamedArgExpr struct {
 	// The expr value associated with the ArgName
 	Expr        Expr
 
+	Variadic    bool
+
 	typeAnnotation
+}
+
+// NewNamedArgExpr returns a new NamedArgExpr that is verified to be well-typed.
+func NewTypedNamedArgExpr(argName Name, expr TypedExpr, typ *types.T, variable bool) *NamedArgExpr {
+	node := &NamedArgExpr{
+		ArgName: argName,
+		Expr: expr,
+		Variadic: variable,
+	}
+	node.typ = typ
+	return node
 }
 
 // Format implements the NodeFormatter interface.
 func (node *NamedArgExpr) Format(ctx *FmtCtx) {
+	if (node.Variadic) {
+		ctx.WriteString("VARIADIC")
+	}
+	ctx.FormatNode(&node.ArgName)
+	ctx.WriteString(" := ")
+	ctx.FormatNode(node.Expr)
+}
 
+func (node *NamedArgExpr) ResolvedType() *types.T {
+	if node.typ == nil {
+		return types.Any
+	}
+	return node.typ
 }
 
 // FuncExpr represents a function call.
@@ -1801,3 +1826,4 @@ func (node PartitionMinVal) String() string   { return AsString(node) }
 func (node *Placeholder) String() string      { return AsString(node) }
 func (node dNull) String() string             { return AsString(node) }
 func (list *NameList) String() string         { return AsString(list) }
+func (node *NamedArgExpr) String() string     { return AsString(node) }

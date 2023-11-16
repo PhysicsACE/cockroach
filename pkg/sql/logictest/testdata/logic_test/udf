@@ -742,3 +742,15 @@ statement error unknown function: public.LOWERCASE_HINT_ERROR_EXPLICIT_SCHEMA_FN
 SELECT public."LOWERCASE_HINT_ERROR_EXPLICIT_SCHEMA_FN"();
 
 subtest end
+
+subtest namedparameters 
+
+statement ok
+CREATE FUNCTION f_97854 (i INT, j INT) RETURNS INT LANGUAGE SQL AS $$ SELECT i + j $$;
+
+query I
+SELECT f_97854(i := 1, j := 2)
+----
+3
+
+subtest end

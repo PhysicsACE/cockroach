@@ -891,6 +891,20 @@ func (expr *ColumnAccessExpr) TypeCheck(
 	return expr, nil
 }
 
+func (expr *NamedArgExpr) TypeCheck(
+	ctx context.Context, semaCtx *SemaContext, desired *types.T,
+) (TypedExpr, error) {
+	subExpr, err := expr.Expr.TypeCheck(ctx, semaCtx, types.Any)
+	if err != nil {
+		return nil, err
+	}
+
+	resolvedType := subExpr.ResolvedType()
+	expr.Expr = subExpr
+	expr.typ = resolvedType
+	return expr, nil
+}
+
 // TypeCheck implements the Expr interface.
 func (expr *CoalesceExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
@@ -1115,6 +1129,13 @@ func CheckIsWindowOrAgg(def *ResolvedFunctionDefinition) error {
 func (expr *FuncExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
+
+	for _, expr := range expr.Exprs {
+		if _, ok := expr.(*NamedArgExpr); ok {
+			return nil, errors.AssertionFailedf("named args not allowed")
+		}
+	}
+
 	searchPath := EmptySearchPath
 	var resolver FunctionReferenceResolver
 	if semaCtx != nil {
