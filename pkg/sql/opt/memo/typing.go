@@ -268,6 +268,10 @@ func typeIndirection(e opt.ScalarExpr) *types.T {
 	case types.JsonFamily:
 		return t
 	case types.ArrayFamily:
+		indirection := e.(*IndirectionExpr)
+		if indirection.Slice {
+			return types.MakeArray(t.ArrayContents())
+		}
 		return t.ArrayContents()
 	default:
 		panic(errors.AssertionFailedf("unknown type indirection type %s", t.SQLString()))
