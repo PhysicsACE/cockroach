@@ -463,7 +463,7 @@ $value
 
 # ConvertJSONSubscriptToFetchValue converts json subscripting
 # `[...]` into a fetch value operator `->`.
-[ConvertJSONSubscriptToFetchValue, Normalize]
-(Indirection $input:* $index:* & (IsJSON $input))
-=>
-(FetchVal $input $index)
+# [ConvertJSONSubscriptToFetchValue, Normalize]
+# (Indirection $input:* $index:* & (IsJSON $input))
+# =>
+#(FetchVal $input $index)

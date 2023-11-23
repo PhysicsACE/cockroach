@@ -745,10 +745,11 @@ define Array {
 # and slicing are not supported.
 [Scalar]
 define Indirection {
-    Input ScalarExpr
-    Index ScalarExpr
-    End   ScalarExpr
-    Slice bool
+    Input   ScalarExpr
+    Index   ScalarListExpr
+    End     ScalarListExpr
+    Value   ScalarListExpr
+    Slice   bool
 }
 
 # ArrayFlatten is an ARRAY(<subquery>) expression. ArrayFlatten takes as input

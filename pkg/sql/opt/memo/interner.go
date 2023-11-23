@@ -706,6 +706,15 @@ func (h *hasher) HashZipExpr(val ZipExpr) {
 	}
 }
 
+// func (h *hasher) HashSubscriptListExpr(val SubscriptListExpr) {
+// 	for i := range val {
+// 		item := &val[i]
+// 		h.HashScalarExpr(item.Begin)
+// 		h.HashScalarExpr(item.End)
+// 		h.HashBool(item.Slice)
+// 	}
+// }
+
 func (h *hasher) HashFKChecksExpr(val FKChecksExpr) {
 	for i := range val {
 		h.HashRelExpr(val[i].Check)
@@ -1165,6 +1174,20 @@ func (h *hasher) IsZipExprEqual(l, r ZipExpr) bool {
 	}
 	return true
 }
+
+// func (h *hasher) IsSubscriptListExprEqual(l, r SubscriptListExpr) bool {
+// 	if len(l) != len(r) {
+// 		return false
+// 	}
+// 	for i := range l {
+// 		if l[i].Begin != r[i].Begin || 
+// 		 l[i].End != r[i].End ||
+// 		 l[i].Slice != r[i].Slice {
+// 			return false
+// 		 }
+// 	}
+// 	return true
+// }
 
 func (h *hasher) IsFKChecksExprEqual(l, r FKChecksExpr) bool {
 	if len(l) != len(r) {

@@ -177,21 +177,65 @@ func (b *Builder) buildScalar(
 		}
 
 		out = b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		containsSlice := false
+
+		if t.Assign {
+			for i, p := range t.Path {
+				begin := make(memo.ScalarListExpr, len(p))
+				end := make(memo.ScalarListExpr, len(p))
+				value := memo.ScalarListExpr{
+					b.buildScalar(t.Value[i].(tree.TypedExpr), inScope, nil, nil, colRefs),
+				}
+				for j, subscript := range p {
+					if subscript.Slice {
+						begin[j] = b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs)
+						end[j] = b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs)
+						containsSlice = true
+						continue
+					}
+					begin[j] = b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs)
+					end[j] = b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs)
+				}
+				out = b.factory.ConstructIndirection(
+					out,
+					begin,
+					end,
+					value,
+					containsSlice,
+				)
+				containsSlice = false
+			}
+			return
+		}
 
 		for _, subscript := range t.Indirection {
 			if subscript.Slice {
+				begin := memo.ScalarListExpr{
+					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				}
+				end := memo.ScalarListExpr{
+					b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				}
 				out = b.factory.ConstructIndirection(
 					out,
-					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
-					b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+					begin,
+					end,
+					memo.EmptyScalarListExpr,
 					true,
 				)
 				continue
 			}
+			begin := memo.ScalarListExpr{
+				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			}
+			end := memo.ScalarListExpr{
+				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			}
 			out = b.factory.ConstructIndirection(
 				out,
-				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
-				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				begin,
+				end,
+				memo.EmptyScalarListExpr,
 				false,
 			)
 		}

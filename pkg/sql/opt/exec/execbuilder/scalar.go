@@ -480,17 +480,66 @@ func (b *Builder) buildIndirection(
 		return nil, err
 	}
 
-	beginIndex, err := b.buildScalar(ctx, scalar.Child(1).(opt.ScalarExpr))
-	if err != nil {
-		return nil, err
+	indirections := make(tree.ArraySubscripts, len(indirection.Index))
+	for i := range indirection.Index {
+		begin, err := b.buildScalar(ctx, indirection.Index[i])
+		if err != nil {
+			return nil, err
+		}
+		end, err := b.buildScalar(ctx, indirection.End[i])
+		if err != nil {
+			return nil, err
+		}
+		indirections[i] = &tree.ArraySubscript{Begin: begin, 
+			End: end, 
+			Slice: indirection.Slice,
+		}
 	}
 
-	endIndex, err := b.buildScalar(ctx, scalar.Child(2).(opt.ScalarExpr))
-	if err != nil {
-		return nil, err
+	values := make(tree.TypedExprs, len(indirection.Value))
+	for i := range indirection.Value {
+		values[i], err = b.buildScalar(ctx, indirection.Value[i])
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return tree.NewTypedIndirectionExpr(expr, beginIndex, endIndex, indirection.Slice, scalar.DataType()), nil
+	// coalesce := scalar.(*memo.CoalesceExpr)
+	// exprs := make(tree.TypedExprs, len(coalesce.Args))
+	// var err error
+	// for i := range exprs {
+	// 	exprs[i], err = b.buildScalar(ctx, coalesce.Args[i])
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// }
+
+	// path := make(tree.ArraySubscripts, len(indirection.Path))
+	// for i := range len(indirection.Path) {
+	// 	subscript := &indirection.Path[i]
+	// 	begin, err := b.buildScalar(ctx, subscript.Begin)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+
+	// 	end, err := b.buildScalar(ctx, subscript.End)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+
+	// 	path[i] = &tree.ArraySubscript{
+	// 		Begin: begin,
+	// 		End: end,
+	// 		Slice: subscript.Slice
+	// 	}
+	// }
+
+	// valueExpr, err := b.buildScalar(ctx, scalar.Child(4).(opt.ScalarExpr))
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	return tree.NewTypedIndirectionExpr(expr, indirections, values, indirection.Slice, scalar.DataType()), nil
 }
 
 func (b *Builder) buildCollate(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {

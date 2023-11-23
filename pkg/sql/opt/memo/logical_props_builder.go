@@ -1625,6 +1625,12 @@ func (b *logicalPropsBuilder) buildZipItemProps(item *ZipItem, scalar *props.Sca
 	BuildSharedProps(item.Fn, &scalar.Shared, b.evalCtx)
 }
 
+// func (b *logicalPropsBuilder) buildSubscriptItemProps(item *SubscriptItem, scalar *props.Scalar) {
+// 	item.Typ = item.Begin.DataType()
+// 	BuildSharedProps(item.Begin, &scalar.Shared, b.evalCtx)
+// 	BuildSharedProps(item.End, &scalar.Shared, b.evalCtx)
+// }
+
 // BuildSharedProps fills in the shared properties derived from the given
 // expression's subtree. It will only recurse into a child when it is not
 // already caching properties.

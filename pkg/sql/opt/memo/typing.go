@@ -269,6 +269,9 @@ func typeIndirection(e opt.ScalarExpr) *types.T {
 		return t
 	case types.ArrayFamily:
 		indirection := e.(*IndirectionExpr)
+		if len(indirection.Value) > 0 {
+			return types.MakeArray(t.ArrayContents())
+		}
 		if indirection.Slice {
 			return types.MakeArray(t.ArrayContents())
 		}
