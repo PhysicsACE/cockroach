@@ -240,7 +240,7 @@ func (b *Builder) buildRoutine(
 		paramTypes, ok := o.Types.(tree.ParamTypesWithModes)
 		if !ok {
 			panic(unimplemented.NewWithIssue(88947,
-				"variadiac user-defined functions are not yet supported"))
+				"Incorrect parameter format returned. Should not have happened"))
 		}
 
 		conditionalType := func(t *types.T, variadic bool) *types.T {

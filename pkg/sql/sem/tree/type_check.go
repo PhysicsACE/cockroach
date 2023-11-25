@@ -3344,9 +3344,12 @@ func (stripFuncsVisitor) VisitPost(expr Expr) Expr { return expr }
 
 // getMostSignificantOverload returns the overload from the most significant
 // schema. If there are more than one overload available from the most
-// significant schema, ambiguity error will be thrown. If search path is not
-// given or no UDF found, there should be only one candidate overload and be
-// returned. Otherwise, ambiguity error is also thrown.
+// significant schema, the udf without a VARIADIC argument is preferred.
+// Otherwise, the overload with the most number of exact mates w.r.t the input
+// Exprs will be chosen. If multiple overloads have the same number of identical
+// type matches in the most significant schema in the search path, then an abgious
+// error will be thrown. If search path is not given or no UDF found, there should 
+// be only one candidate overload and be returned. Otherwise, ambiguity error is also thrown.
 //
 // Note: even the input is a slice of overloadImpl, they're essentially a slice
 // of QualifiedOverload. Also, the input should not be empty.
@@ -3403,17 +3406,14 @@ func getMostSignificantOverload(
 	}
 
 	checkSigAmbiguity := func(ov1 []*types.T, ov2 []*types.T) bool {
-
 		if (len(ov1) != len(ov2)) {
 			return false
 		}
-
 		for i := 0; i < len(ov1); i++ {
 			if !(ov1[i].Identical(ov2[i])) {
 				return false
 			}
 		}
-
 		return true
 	}
 
@@ -3422,7 +3422,6 @@ func getMostSignificantOverload(
 		if len(oImpls) == 1 {
 			return qualifiedOverloads[oImpls[0]], nil
 		}
-
 		found := false
 		var ret QualifiedOverload
 		var exact int
@@ -3434,42 +3433,30 @@ func getMostSignificantOverload(
 				exact = r.params().numExact(typedInputExprs)
 				continue
 			}
-
 			srcParams := r.params()
 			prevParams := ret.params()
-
-
 			prevSig := prevParams.inputSig(typedInputExprs)
 			srcSig := srcParams.inputSig(typedInputExprs)
-
 			numMatches := srcParams.numExact(typedInputExprs)
-
 			if (checkSigAmbiguity(prevSig, srcSig)) {
-
 				if (srcParams.acceptsVariadic() && prevParams.acceptsVariadic()) {
 					return QualifiedOverload{}, ambiguousError()
 				}
-
 				if srcParams.acceptsVariadic() {
 					continue
 				}
-
 				if prevParams.acceptsVariadic() {
 					ret = r
 					exact = numMatches
 					continue
 				}
-
 				return QualifiedOverload{}, ambiguousError()
 			}
-
 			if (numMatches > exact) {
 				ret = r
 				exact = numMatches
 			}
-
 		}
-
 		return ret, nil
 	}
 

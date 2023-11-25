@@ -307,7 +307,7 @@ var (
 // Make a pg_get_viewdef function with the given arguments.
 func makePGGetViewDef(paramTypes tree.ParamTypes) tree.Overload {
 	return tree.Overload{
-		Types:      paramTypes,
+		Types:      ParamTypesWithModes,
 		ReturnType: tree.FixedReturnType(types.String),
 		Body: `SELECT definition
 		FROM pg_catalog.pg_views v
@@ -327,7 +327,7 @@ func makePGGetViewDef(paramTypes tree.ParamTypes) tree.Overload {
 // Make a pg_get_constraintdef function with the given arguments.
 func makePGGetConstraintDef(paramTypes tree.ParamTypes) tree.Overload {
 	return tree.Overload{
-		Types:      paramTypes,
+		Types:      ParamTypesWithModes,
 		ReturnType: tree.FixedReturnType(types.String),
 		Body:       `SELECT condef FROM pg_catalog.pg_constraint WHERE oid=$1 LIMIT 1`,
 		Info:       notUsableInfo,
@@ -695,7 +695,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	"pg_get_functiondef": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: fmt.Sprintf(
 				`SELECT COALESCE(create_statement, prosrc)
@@ -716,7 +716,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	"pg_get_function_arguments": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body:       getFunctionArgStringQuery,
 			Info: "Returns the argument list (with defaults) necessary to identify a function, " +
@@ -730,7 +730,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	"pg_get_function_arg_default": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}, {Name: "arg_num", Typ: types.Int4}},
+			Types:      tree.ParamTypesWithModes{{Name: "func_oid", Typ: types.Oid}, {Name: "arg_num", Typ: types.Int4}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body:       "SELECT NULL",
 			Info: "Get textual representation of a function argument's default value. " +
@@ -751,7 +751,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	"pg_get_function_result": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT t.typname
              FROM pg_catalog.pg_proc p
@@ -772,7 +772,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	"pg_get_function_identity_arguments": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body:       getFunctionArgStringQuery,
 			Info: "Returns the argument list (without defaults) necessary to identify a function, " +
@@ -788,7 +788,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	"pg_get_indexdef": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo, DistsqlBlocklist: true},
 		tree.Overload{
-			Types:             tree.ParamTypes{{Name: "index_oid", Typ: types.Oid}},
+			Types:             tree.ParamTypesWithModes{{Name: "index_oid", Typ: types.Oid}},
 			ReturnType:        tree.FixedReturnType(types.String),
 			Body:              `SELECT indexdef FROM pg_catalog.pg_indexes WHERE crdb_oid = $1`,
 			Info:              "Gets the CREATE INDEX command for index",
@@ -797,7 +797,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			Language:          tree.RoutineLangSQL,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "index_oid", Typ: types.Oid}, {Name: "column_no", Typ: types.Int}, {Name: "pretty_bool", Typ: types.Bool}},
+			Types:      tree.ParamTypesWithModes{{Name: "index_oid", Typ: types.Oid}, {Name: "column_no", Typ: types.Int}, {Name: "pretty_bool", Typ: types.Bool}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT CASE
     				WHEN $2 = 0 THEN defs.indexdef
@@ -989,7 +989,7 @@ var pgBuiltins = map[string]builtinDefinition{
 
 	"pg_get_userbyid": makeBuiltin(tree.FunctionProperties{DistsqlBlocklist: true},
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "role_oid", Typ: types.Oid},
 			},
 			ReturnType:        tree.FixedReturnType(types.String),
@@ -1008,7 +1008,7 @@ var pgBuiltins = map[string]builtinDefinition{
 		// The real implementation returns a record; we fake it by returning a
 		// comma-delimited string enclosed by parentheses.
 		tree.Overload{
-			Types: tree.ParamTypes{{Name: "sequence_oid", Typ: types.Oid}},
+			Types: tree.ParamTypesWithModes{{Name: "sequence_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.MakeLabeledTuple(
 				[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Bool, types.Int, types.Oid},
 				[]string{"start_value", "minimum_value", "maxmimum_value", "increment", "cycle_option", "cache_size", "data_type"},
@@ -1070,7 +1070,7 @@ var pgBuiltins = map[string]builtinDefinition{
 
 	"col_description": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "table_oid", Typ: types.Oid}, {Name: "column_number", Typ: types.Int}},
+			Types:      tree.ParamTypesWithModes{{Name: "table_oid", Typ: types.Oid}, {Name: "column_number", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			// Note: the following is equivalent to:
 			//
@@ -1101,7 +1101,7 @@ var pgBuiltins = map[string]builtinDefinition{
 
 	"obj_description": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "object_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT description
 						 FROM pg_catalog.pg_description
@@ -1116,7 +1116,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			Language:          tree.RoutineLangSQL,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}, {Name: "catalog_name", Typ: types.String}},
+			Types:      tree.ParamTypesWithModes{{Name: "object_oid", Typ: types.Oid}, {Name: "catalog_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT d.description
 							FROM pg_catalog.pg_description d
@@ -1139,7 +1139,7 @@ var pgBuiltins = map[string]builtinDefinition{
 
 	"shobj_description": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}, {Name: "catalog_name", Typ: types.String}},
+			Types:      tree.ParamTypesWithModes{{Name: "object_oid", Typ: types.Oid}, {Name: "catalog_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT d.description
 							FROM pg_catalog.pg_shdescription d
@@ -1244,7 +1244,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_function_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
              FROM pg_catalog.pg_proc p
@@ -1262,7 +1262,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_table_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
              FROM pg_catalog.pg_class c
@@ -1284,7 +1284,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_type_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
              FROM pg_catalog.pg_type t
@@ -2081,7 +2081,7 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://github.com/postgres/postgres/blob/master/src/backend/catalog/information_schema.sql
 	"information_schema._pg_index_position": makeBuiltin(defProps(),
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "oid", Typ: types.Oid},
 				{Name: "col", Typ: types.Int2},
 			},
@@ -2188,7 +2188,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			Category: builtinconstants.CategorySystemInfo,
 		},
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "name", Typ: types.String}, {Name: "oid", Typ: types.Oid}},
+			Types:      tree.ParamTypesWithModes{{Name: "name", Typ: types.String}, {Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Name),
 			Body: `
 SELECT
