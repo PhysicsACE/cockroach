@@ -176,10 +176,12 @@ func (b *Builder) buildScalar(
 			panic(unimplementedWithIssueDetailf(32552, "ind", "multidimensional indexing is not supported"))
 		}
 
+
 		out = b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
 		containsSlice := false
 
 		if t.Assign {
+			fmt.Println("INdirection made it to optbuilder ")
 			for i, p := range t.Path {
 				begin := make(memo.ScalarListExpr, len(p))
 				end := make(memo.ScalarListExpr, len(p))
@@ -205,7 +207,8 @@ func (b *Builder) buildScalar(
 				)
 				containsSlice = false
 			}
-			return
+			// panic(pgerror.Newf(pgcode.Syntax, "subscripting refs optbuilder"))
+			break
 		}
 
 		for _, subscript := range t.Indirection {
@@ -542,6 +545,7 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructConstVal(t, t.ResolvedType())
 
 	default:
+		fmt.Println("error causing: ", scalar)
 		panic(unimplemented.Newf(fmt.Sprintf("optbuilder.%T", scalar), "not yet implemented: scalar expression: %T", scalar))
 	}
 

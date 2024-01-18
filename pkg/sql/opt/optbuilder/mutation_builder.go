@@ -206,6 +206,11 @@ type mutationBuilder struct {
 	// inputForInsertExpr stores the result of outscope.expr from the most
 	// recent call to buildInputForInsert.
 	inputForInsertExpr memo.RelExpr
+
+	// Mapping to incrementally build update expressions for UPDATE statements 
+	// where a column is part of the SET statement multiple times. Note that this
+	// can only occur if the column type is a container and is being subscripted. 
+	updateAgg  map[tree.Name]*tree.IndirectionExpr
 }
 
 func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias tree.TableName) {
@@ -235,6 +240,7 @@ func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias 
 
 	// Add the table and its columns (including mutation columns) to metadata.
 	mb.tabID = mb.md.AddTable(tab, &mb.alias)
+	mb.updateAgg = make(map[tree.Name]*tree.IndirectionExpr)
 }
 
 // setFetchColIDs sets the list of columns that are fetched in order to provide
@@ -503,6 +509,51 @@ func (mb *mutationBuilder) addTargetColsByName(names tree.NameList) {
 			continue
 		}
 		panic(colinfo.NewUndefinedColumnError(string(name)))
+	}
+}
+
+func (mb *mutationBuilder) addTargetColsByRefs(expr *tree.UpdateExpr) {
+	for _, ref := range expr.ColumnRefs {
+		name := ref.Name
+
+		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
+			if mb.tab.Column(ord).Kind() == cat.System {
+				panic(pgerror.Newf(pgcode.InvalidColumnReference, "cannot modify system column %q", name))
+			}
+
+			tabCol := mb.tab.Column(ord)
+			if tabCol.IsMutation() {
+				panic(makeBackfillError(tabCol.ColName()))
+			}
+
+			if tabCol.IsComputed() {
+				panic(schemaexpr.CannotWriteToComputedColError(string(tabCol.ColName())))
+			}
+
+			if ref.Subscripts != nil {
+				if _, ok := mb.updateAgg[tabCol.ColName()]; !ok {
+					mb.updateAgg[tabCol.ColName()] = &tree.IndirectionExpr{
+						Expr: &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{string(name)}},
+						Assign: true,
+					}
+				}
+				mb.updateAgg[name].AddAdditionalPath(ref.Subscripts)
+			}
+
+			colID := mb.tabID.ColumnID(ord)
+			if mb.targetColSet.Contains(colID) {
+				if ref.Subscripts == nil {
+					panic(pgerror.Newf(pgcode.Syntax,
+						"multiple assignments to the same column without subscripts %q", tabCol.ColName()))
+				}
+
+				continue
+			}
+
+			mb.targetColSet.Add(colID)
+			mb.targetColList = append(mb.targetColList, colID)
+		}
+
 	}
 }
 

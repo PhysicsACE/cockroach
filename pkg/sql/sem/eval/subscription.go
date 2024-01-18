@@ -13,17 +13,17 @@ package eval
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	// "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	// "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	// "github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/intsets"
+	// "github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/errors"
 )
 
-type execFunc func(context.Context, *evaluator, tree.Datum, []tree.ArraySubscripts, tree.Datum) (tree.Datum, error)
+type execFunc func(context.Context, *evaluator, tree.Datum, tree.ArraySubscripts, tree.TypedExpr) (tree.Datum, error)
 
 // func arrayUpdate(ctx context.Context, e *evaluator, container tree.Datum, subscripts tree.ArraySubscripts, value tree.TypedExpr) (tree.Datum, error) {
 // 	res := tree.MustBeDArray(container)
@@ -143,7 +143,7 @@ type execFunc func(context.Context, *evaluator, tree.Datum, []tree.ArraySubscrip
 func jsonUpdate(ctx context.Context, e *evaluator, container tree.Datum, subscripts tree.ArraySubscripts, value tree.TypedExpr) (tree.Datum, error) {
 	j := tree.MustBeDJSON(container)
 	curr := j.JSON
-	val, err := value.(tree.TypedExpr).Eval(ctx, e)
+	val, err := value.Eval(ctx, e)
 	if err != nil {
 		return tree.DNull, err
 	}
@@ -152,158 +152,160 @@ func jsonUpdate(ctx context.Context, e *evaluator, container tree.Datum, subscri
 	return recursiveUpdate(curr, subscripts, to, ctx, e)
 }
 
-func setValKeyOrIdx(j json.JSON, subscript tree.ArraySubscript, to json.JSON) (json.JSON, error) {
-	switch v := j.(type) {
-	case *json.jsonEncoded:
-		n, err := v.shallowDecode()
-		if err != nil {
-			return nil, err
-		}
-		return setValKeyOrIdx(n, key, to)
-	case json.jsonObject:
+func setValKeyOrIdx(j json.JSON, subscript *tree.ArraySubscript, to json.JSON, ctx context.Context, e *evaluator) (json.JSON, error) {
+	switch v := j.Type(); v {
+	case json.ObjectJSONType:
+		vObj := json.GetJsonObject(j)
 		field, err := subscript.Begin.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
-			return tree.DNull, err
+			return nil, err
 		}
 		if field == tree.DNull {
 			return j, nil
 		}
-		return v.SetKey(string(tree.MustBeDString(field)), to, true)
-	case json.jsonArray:
+		return vObj.SetKey(string(tree.MustBeDString(field)), to, true)
+	case json.ArrayJSONType:
+		vArr := json.GetJsonArray(j)
 		field, err := subscript.Begin.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
-			return tree.DNull, err
+			return nil, err
 		}
 		if field == tree.DNull {
 			return j, nil
 		}
 		idx := int(tree.MustBeDInt(field))
 		if idx < 0 {
-			idx = len(v) + idx
+			idx = len(vArr) + idx
 		}
-		var result json.jsonArray
+		var result []json.JSON
 		if idx < 0 {
-			result = make(jsonArray, len(v)+1)
-			copy(result[1:], v)
+			result = make([]json.JSON, len(vArr)+1)
+			copy(result[1:], vArr)
 			result[0] = to
-		} else if idx >= len(v) {
-			result = make(jsonArray, len(v)+1)
-			copy(result, v)
+		} else if idx >= len(vArr) {
+			result = make([]json.JSON, len(vArr)+1)
+			copy(result, vArr)
 			result[len(result)-1] = to
 		} else {
-			result = make(jsonArray, len(v))
-			copy(result, v)
+			result = make([]json.JSON, len(vArr))
+			copy(result, vArr)
 			result[idx] = to
 		}
-		return result, nil
+		return json.ConvertToJsonArray(result), nil
 	}
+	return j, nil
 }
 
 func recursiveUpdate(container json.JSON, subscripts tree.ArraySubscripts, value json.JSON, ctx context.Context, e *evaluator) (tree.Datum, error) {
 	switch len(subscripts) {
 	case 0:
-		return container, nil
+		return tree.NewDJSON(container), nil
 	case 1:
-		return container, nil
+		return tree.NewDJSON(container), nil
 	default:
-		switch v := container.(type) {
-		case *json.jsonEncoded:
-			n, err := v.shallowDecode()
-			if err != nil {
-				return tree.DNull, err
-			}
-			return recursiveUpdate(n, subscripts, value)
-		default:
-			currSub := subscripts[0]
-			if currSub.Slice {
-				return tree.DNull, errors.AssertionFailedf("jsonb subscripts do not support slices")
-			}
-			field, err := currSub.Begin.(tree.TypedExpr).Eval(ctx, e)
-			if err != nil {
-				return tree.DNull, err
-			}
-			if field == tree.DNull {
-				return tree.DNull, nil
-			}
-			var curr json.JSON
-			switch field.ResolvedType().Family() {
-			case types.StringFamily:
-				if curr, err = container.FetchValKeyOrIdx(string(tree.MustBeDString(field))); err != nil {
-					return tree.DNull, err
-				}
-			case types.IntFamily:
-				if curr, err = curr.FetchValIdx(int(tree.MustBeDInt(field))); err != nil {
-					return tree.DNull, err
-				}
-			default:
-				return tree.DNull, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
-			}
-			if curr == nil {
-				return contaier, nil
-			}
-			sub, err := recursiveUpdate(curr, subscripts[1:], value, ctx, e)
-			if err != nil {
-				return tree.DNull, err
-			}
-			return setValKeyOrIdx(contaier, subscripts[0], sub)
+		currSub := subscripts[0]
+		if currSub.Slice {
+			return tree.DNull, errors.AssertionFailedf("jsonb subscripts do not support slices")
 		}
-	}
-}
-
-type SubscriptionRoutine struct {
-	// The datum value of the column
-	Expr      tree.Datum
-	// All subscription paths that need to be updated
-	Paths     []tree.ArraySubscripts
-	// Associated values for paths for update
-	Values    []tree.TypedExpr
-	// The current index that we need to update
-	index     int
-	// The function that performs the update for a given path and value pair
-	// Each supported container type should implement it's own executor function
-	// to support subscription updates inside UPDATE statements
-	executor  execFunc
-	// Context required to perform expression evaluations
-	context   context.Context
-	// Evaluator required to perform expression evaluations
-	e         *evaluator
-}
-
-func (r *SubscriptionRoutine) init(expr tree.Datum, paths []tree.ArraySubscripts, values []tree.TypedExpr) {
-	r.Expr = expr
-	r.Paths = paths
-	r.Values = values
-	r.index = 0
-
-
-}
-
-func (r *SubscriptionRoutine) GetResult() tree.Datum {
-	return r.Expr
-}
-
-// Since the same column can be mutated multiple times with an update statement,
-// we iterate over the specified paths and their respective values compute all mutations
-// for a given container column before updating its value in the new row. We do this
-// by incrementally applying the individual updates and updating the Expr field so that
-// by the end of the iterations, the value of Expr represents that final updated container
-func (r *SubscriptionRoutine) Execute() (tree.Datum, error) {
-	for r.index < len(r.Paths) {
-		switch r.Expr.ResolvedType().Family() {
-		case types.ArrayFamily:
-			r.exector = arrayUpdate
-		case types.JsonFamily:
-			r.executor = jsonUpdate
-		default:
-			return tree.DNull, errors.AssertionFailedf("Unsupported contaier subscription. Should have been rejected during planning")
-		}
-
-		increment, err := r.executor(r.context, r.e, r.Expr, r.Paths[r.index], r.Values[r.index])
+		field, err := currSub.Begin.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
 			return tree.DNull, err
 		}
-		r.Expr = increment
-		r.index += 1
+		if field == tree.DNull {
+			return tree.DNull, nil
+		}
+		curr := container
+		switch field.ResolvedType().Family() {
+		case types.StringFamily:
+			if curr, err = curr.FetchValKeyOrIdx(string(tree.MustBeDString(field))); err != nil {
+				return tree.DNull, err
+			}
+		case types.IntFamily:
+			if curr, err = curr.FetchValIdx(int(tree.MustBeDInt(field))); err != nil {
+				return tree.DNull, err
+			}
+		default:
+			return tree.DNull, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
+		}
+		if curr == nil {
+			return tree.NewDJSON(container), nil
+		}
+		sub, err := recursiveUpdate(curr, subscripts[1:], value, ctx, e)
+		if err != nil {
+			return tree.DNull, err
+		}
+		newJSON, err := setValKeyOrIdx(container, subscripts[0], tree.MustBeDJSON(sub).JSON, ctx, e)
+		if err != nil {
+			return tree.DNull, err
+		}
+		return tree.NewDJSON(newJSON), nil
 	}
-	return r.Expr, nil
 }
+
+func GetAssignExecutor(container tree.Datum) (execFunc, error) {
+	switch container.ResolvedType().Family() {
+	case types.JsonFamily:
+		return jsonUpdate, nil
+	default:
+		return nil, errors.AssertionFailedf("Unsupported feature should have been rejected during planning")
+	}
+}
+
+// func GetFetchExecutor(
+// 	ctx context.Context, e *evaluator, container tree.Datum,
+// ) (tree.Datum, error) {
+// 	switch container.ResolvedType().Family() {
+// 	default:
+// 		return nil, errors.AssertionFailedf("Unsupported feature should have been rejected during planning")
+// 	}
+// }
+
+// type SubscriptionRoutine struct {
+// 	// The datum value of the column
+// 	Expr      tree.Datum
+// 	// All subscription paths that need to be updated
+// 	Paths     []tree.ArraySubscripts
+// 	// Associated values for paths for update
+// 	Values    []tree.TypedExpr
+// 	// The function that performs the update for a given path and value pair
+// 	// Each supported container type should implement it's own executor function
+// 	// to support subscription updates inside UPDATE statements
+// 	Executor  execFunc
+// 	// Context required to perform expression evaluations
+// 	context   context.Context
+// 	// Evaluator required to perform expression evaluations
+// 	e         *evaluator
+// }
+
+// func (r *SubscriptionRoutine) init(ctx context.Context, e *evaluator, expr tree.Datum, paths []tree.ArraySubscripts, values []tree.TypedExpr) {
+// 	r.context = ctx
+// 	r.e = e 
+// 	r.Paths = paths
+// 	r.Values = values
+
+// 	switch container.ResolvedType().Family() {
+// 	case types.JsonFamily:
+// 		r.Expr = tree.MustBeDJSON(expr)
+// 		r.Executor = jsonUpdate
+// 	default:
+// 		return
+// 	}
+// }
+
+// func (r *SubscriptionRoutine) GetResult() tree.Datum {
+// 	return r.Expr
+// }
+
+// // Since the same column can be mutated multiple times with an update statement,
+// // we iterate over the specified paths and their respective values compute all mutations
+// // for a given container column before updating its value in the new row. We do this
+// // by incrementally applying the individual updates and updating the Expr field so that
+// // by the end of the iterations, the value of Expr represents that final updated container
+// func (r *SubscriptionRoutine) Execute() (tree.Datum, error) {
+// 	for i := range len(r.Paths) {
+// 		if r.Expr, err = r.Executor(r.context, r.e, r.Expr, r.Paths[i], r.Values[i]); err != nil {
+// 			return nil, err
+// 		}
+// 	}
+// 	return r.Expr, nil
+// }

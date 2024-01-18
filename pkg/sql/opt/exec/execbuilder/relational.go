@@ -1030,6 +1030,7 @@ func (b *Builder) applySimpleProject(
 }
 
 func (b *Builder) buildProject(prj *memo.ProjectExpr) (execPlan, error) {
+	// panic(pgerror.Newf(pgcode.Syntax, "project subscription ref"))
 	md := b.mem.Metadata()
 	input, err := b.buildRelational(prj.Input)
 	if err != nil {

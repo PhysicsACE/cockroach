@@ -1606,6 +1606,20 @@ func (node *IndirectionExpr) Format(ctx *FmtCtx) {
 	ctx.FormatNode(&node.Indirection)
 }
 
+func (node *IndirectionExpr) AddAdditionalPath(path ArraySubscripts) {
+	if node.Path == nil {
+		node.Path = make([]ArraySubscripts, 0)
+	}
+	node.Path = append(node.Path, path)
+}
+
+func (node *IndirectionExpr) AddAdditionalValue(val TypedExpr) {
+	if node.Value == nil {
+		node.Value = make([]Expr, 0)
+	}
+	node.Value = append(node.Value, val)
+}
+
 type annotateSyntaxMode int
 
 // These constants separate the syntax X:::Y from ANNOTATE_TYPE(X, Y)

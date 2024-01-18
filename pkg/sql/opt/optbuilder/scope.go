@@ -532,6 +532,12 @@ func (s *scope) isOuterColumn(id opt.ColumnID) bool {
 func (s *scope) colSet() opt.ColSet {
 	var colSet opt.ColSet
 	for i := range s.cols {
+		if (s.cols[i].id <= 0) {
+			fmt.Println("negative scope caused by", s.cols[i].String(), s.cols[i].name.MetadataName(), s.cols[i].id)
+			for j := range s.cols {
+				fmt.Println("negative scope", j, s.cols[j].String(), s.cols[j].name.MetadataName())
+			}
+		}
 		colSet.Add(s.cols[i].id)
 	}
 	return colSet

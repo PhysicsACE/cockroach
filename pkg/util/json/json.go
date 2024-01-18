@@ -2285,6 +2285,22 @@ func deepInsert(j JSON, path []string, to JSON, insertAfter bool) (JSON, error) 
 	}
 }
 
+// Wrapper to type cast to jsonArray for external packages 
+func GetJsonArray(arr JSON) jsonArray {
+	return arr.(jsonArray)
+}
+
+// Wrapper to type cast to jsonObject for external packages
+func GetJsonObject(obj JSON) jsonObject {
+	return obj.(jsonObject)
+}
+
+func ConvertToJsonArray(arr []JSON) jsonArray {
+	result := make(jsonArray, len(arr))
+	copy(result, arr)
+	return result
+}
+
 func (j jsonObject) FetchValKeyOrIdx(key string) (JSON, error) {
 	return j.FetchValKey(key)
 }

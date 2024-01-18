@@ -375,6 +375,8 @@ func (expr *IndirectionExpr) copyNode() *IndirectionExpr {
 		subscriptCopy := *t
 		exprCopy.Indirection[i] = &subscriptCopy
 	}
+	exprCopy.Path = append([]ArraySubscripts(nil), exprCopy.Path...)
+	exprCopy.Value = append(Exprs(nil), exprCopy.Value...)
 	return &exprCopy
 }
 
@@ -392,7 +394,7 @@ func (expr *IndirectionExpr) Walk(v Visitor) Expr {
 
 	for i, t := range expr.Indirection {
 		if t.Begin != nil {
-			e, changed := WalkExpr(v, t.Begin)
+			e, changed = WalkExpr(v, t.Begin)
 			if changed {
 				if ret == expr {
 					ret = expr.copyNode()
@@ -401,7 +403,7 @@ func (expr *IndirectionExpr) Walk(v Visitor) Expr {
 			}
 		}
 		if t.End != nil {
-			e, changed := WalkExpr(v, t.End)
+			e, changed = WalkExpr(v, t.End)
 			if changed {
 				if ret == expr {
 					ret = expr.copyNode()
@@ -409,6 +411,37 @@ func (expr *IndirectionExpr) Walk(v Visitor) Expr {
 				ret.Indirection[i].End = e
 			}
 		}
+	}
+
+	for i, s := range expr.Path {
+		for j, t := range s {
+			if t.Begin != nil {
+				e, changed = WalkExpr(v, t.Begin)
+				if changed {
+					if ret == expr {
+						ret = expr.copyNode()
+					}
+					ret.Path[i][j].Begin = e
+				}
+			}
+			if t.End != nil {
+				e, changed = WalkExpr(v, t.End)
+				if changed {
+					if ret == expr {
+						ret = expr.copyNode()
+					}
+					ret.Path[i][j].End = e
+				}
+			}
+		}
+	}
+
+	value, changedV := walkExprSlice(v, expr.Value)
+	if changedV {
+		if ret == expr {
+			ret = expr.copyNode()
+		}
+		ret.Value = value
 	}
 
 	return ret

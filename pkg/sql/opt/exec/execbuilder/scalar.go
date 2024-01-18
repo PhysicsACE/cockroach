@@ -12,6 +12,7 @@ package execbuilder
 
 import (
 	"context"
+	// "fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -474,35 +475,48 @@ func (b *Builder) buildAnyScalar(
 func (b *Builder) buildIndirection(
 	ctx *buildScalarCtx, scalar opt.ScalarExpr,
 ) (tree.TypedExpr, error) {
-	indirection := scalar.(*memo.IndirectionExpr)
-	expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
-	if err != nil {
-		return nil, err
-	}
+	panic(pgerror.Newf(pgcode.Syntax, "subscripting refs execbuilder"))
+	// indirection := scalar.(*memo.IndirectionExpr)
+	// expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
+	// if err != nil {
+	// 	return nil, err
+	// }
 
-	indirections := make(tree.ArraySubscripts, len(indirection.Index))
-	for i := range indirection.Index {
-		begin, err := b.buildScalar(ctx, indirection.Index[i])
-		if err != nil {
-			return nil, err
-		}
-		end, err := b.buildScalar(ctx, indirection.End[i])
-		if err != nil {
-			return nil, err
-		}
-		indirections[i] = &tree.ArraySubscript{Begin: begin, 
-			End: end, 
-			Slice: indirection.Slice,
-		}
-	}
+	// if len(indirection.Value) > 0 {
+	// 	panic(pgerror.Newf(pgcode.Syntax, "subscripting ref execbuilder"))
+	// }
 
-	values := make(tree.TypedExprs, len(indirection.Value))
-	for i := range indirection.Value {
-		values[i], err = b.buildScalar(ctx, indirection.Value[i])
-		if err != nil {
-			return nil, err
-		}
-	}
+	// indirections := make(tree.ArraySubscripts, len(indirection.Index))
+	// for i := range indirection.Index {
+	// 	fmt.Println("Index iterations ", i)
+	// 	begin, err := b.buildScalar(ctx, indirection.Index[i])
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	end, err := b.buildScalar(ctx, indirection.End[i])
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	indirections[i] = &tree.ArraySubscript{
+	// 		Begin: begin, 
+	// 		End: end, 
+	// 		Slice: indirection.Slice,
+	// 	}
+	// }
+
+	// values := make(tree.TypedExprs, len(indirection.Value))
+	// for i := range indirection.Value {
+	// 	fmt.Println("Values iterations ", i)
+	// 	subscalar, err := b.buildScalar(ctx, indirection.Value[i])
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	values[i] = subscalar
+	// }
+
+	// fmt.Println("update values received by execbuilder: ", indirection.Value)
+
+	// return nil, errors.AssertionFailedf("indirection update execbuilder check")
 
 	// coalesce := scalar.(*memo.CoalesceExpr)
 	// exprs := make(tree.TypedExprs, len(coalesce.Args))
@@ -539,7 +553,7 @@ func (b *Builder) buildIndirection(
 	// 	return nil, err
 	// }
 
-	return tree.NewTypedIndirectionExpr(expr, indirections, values, indirection.Slice, scalar.DataType()), nil
+	// return tree.NewTypedIndirectionExpr(expr, indirections, values, indirection.Slice, scalar.DataType()), nil
 }
 
 func (b *Builder) buildCollate(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
