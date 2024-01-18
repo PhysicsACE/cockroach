@@ -574,7 +574,7 @@ func (c *CustomFuncs) FoldIndirection(input, index opt.ScalarExpr) (_ opt.Scalar
 			panic(errors.AssertionFailedf("expected array or json; found %s", input.DataType().SQLString()))
 		}
 		inputD := memo.ExtractConstDatum(input)
-		texpr := tree.NewTypedIndirectionExpr(inputD, indexD, resolvedType)
+		texpr := tree.NewTypedIndirectionExpr(inputD, indexD, false, resolvedType)
 		result, err := eval.Expr(c.f.ctx, c.f.evalCtx, texpr)
 		if err == nil {
 			return c.f.ConstructConstVal(result, texpr.ResolvedType()), true

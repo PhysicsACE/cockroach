@@ -413,10 +413,11 @@ func NewTypedComparisonExprWithSubOp(
 }
 
 // NewTypedIndirectionExpr returns a new IndirectionExpr that is verified to be well-typed.
-func NewTypedIndirectionExpr(expr, index TypedExpr, typ *types.T) *IndirectionExpr {
+func NewTypedIndirectionExpr(expr, index TypedExpr, assign bool, typ *types.T) *IndirectionExpr {
 	node := &IndirectionExpr{
 		Expr:        expr,
 		Indirection: ArraySubscripts{&ArraySubscript{Begin: index}},
+		Assign:      assign,
 	}
 	node.typ = typ
 	return node
@@ -1570,6 +1571,7 @@ func (a *ArraySubscripts) Format(ctx *FmtCtx) {
 type IndirectionExpr struct {
 	Expr        Expr
 	Indirection ArraySubscripts
+	Assign      bool
 
 	typeAnnotation
 }

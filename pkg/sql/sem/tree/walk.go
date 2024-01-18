@@ -411,6 +411,8 @@ func (expr *IndirectionExpr) Walk(v Visitor) Expr {
 		}
 	}
 
+	fmt.Println("Walking check: ", expr.Assign, "vs ", ret.Assign)
+
 	return ret
 }
 

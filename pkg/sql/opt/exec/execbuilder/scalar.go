@@ -12,6 +12,7 @@ package execbuilder
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -474,6 +475,10 @@ func (b *Builder) buildAnyScalar(
 func (b *Builder) buildIndirection(
 	ctx *buildScalarCtx, scalar opt.ScalarExpr,
 ) (tree.TypedExpr, error) {
+
+	indirection := scalar.(*memo.IndirectionExpr)
+	fmt.Println("Execbuilder check: ", indirection.Assign)
+
 	expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 	if err != nil {
 		return nil, err
@@ -484,7 +489,7 @@ func (b *Builder) buildIndirection(
 		return nil, err
 	}
 
-	return tree.NewTypedIndirectionExpr(expr, index, scalar.DataType()), nil
+	return tree.NewTypedIndirectionExpr(expr, index, indirection.Assign, scalar.DataType()), nil
 }
 
 func (b *Builder) buildCollate(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
