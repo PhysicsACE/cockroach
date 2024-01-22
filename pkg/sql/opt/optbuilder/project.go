@@ -11,6 +11,7 @@
 package optbuilder
 
 import (
+	"fmt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -274,7 +275,6 @@ func (b *Builder) finishBuildScalar(
 	if outScope == nil {
 		return scalar
 	}
-
 	// Avoid synthesizing a new column if possible.
 	if col := outScope.findExistingCol(
 		texpr, false, /* allowSideEffects */

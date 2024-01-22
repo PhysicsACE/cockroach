@@ -190,6 +190,16 @@ func (b *Builder) buildScalar(
 			)
 		}
 
+		if len(t.Indirection) == 0 {
+			fmt.Println("GOOOTTT HEEERERERE")
+			fmt.Println("Before construction assign value ", t.Assign)
+			out = b.factory.ConstructIndirection(
+				out,
+				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				true,
+			)
+		}
+
 	case *tree.IfErrExpr:
 		cond := b.buildScalar(t.Cond.(tree.TypedExpr), inScope, nil, nil, colRefs)
 
