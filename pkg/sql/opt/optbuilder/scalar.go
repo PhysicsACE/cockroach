@@ -186,7 +186,7 @@ func (b *Builder) buildScalar(
 			out = b.factory.ConstructIndirection(
 				out,
 				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
-				t.Assign,
+				false,
 			)
 		}
 
