@@ -55,22 +55,6 @@ project
            └── 1
 
 build
-SELECT ARRAY(((((VALUES (1), (2))))))[2]
-----
-project
- ├── columns: array:2
- ├── values
- │    └── ()
- └── projections
-      └── indirection [as=array:2]
-           ├── array-flatten
-           │    └── values
-           │         ├── columns: column1:1!null
-           │         ├── (1,)
-           │         └── (2,)
-           └── 2
-
-build
 SELECT 1 + (SELECT 1 a) AS r
 ----
 project

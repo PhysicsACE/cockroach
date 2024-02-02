@@ -413,12 +413,24 @@ func NewTypedComparisonExprWithSubOp(
 }
 
 // NewTypedIndirectionExpr returns a new IndirectionExpr that is verified to be well-typed.
-func NewTypedIndirectionExpr(expr, index TypedExpr, assign bool, typ *types.T) *IndirectionExpr {
+func NewTypedIndirectionExpr(expr TypedExpr, indirection ArraySubscripts, updates TypedExprs, Slice bool, typ *types.T) *IndirectionExpr {
 	node := &IndirectionExpr{
 		Expr:        expr,
-		Indirection: ArraySubscripts{&ArraySubscript{Begin: index}},
-		Assign:      assign,
+		Indirection: indirection,
+		Paths:       []ArraySubscripts{indirection},
+		Updates:     make(Exprs, len(updates)),
+		Assign:      (len(updates) > 0),
 	}
+
+	for i := range updates {
+		node.Updates[i] = updates[i]
+	}
+
+	if Slice {
+		node.typ = types.MakeArray(typ)
+		return node
+	}
+
 	node.typ = typ
 	return node
 }
@@ -1378,6 +1390,7 @@ const (
 
 // Format implements the NodeFormatter interface.
 func (node *FuncExpr) Format(ctx *FmtCtx) {
+	fmt.Println("format funcexpr ", node)
 	var typ string
 	if node.Type != 0 {
 		typ = funcTypeName[node.Type] + " "
@@ -1571,9 +1584,25 @@ func (a *ArraySubscripts) Format(ctx *FmtCtx) {
 type IndirectionExpr struct {
 	Expr        Expr
 	Indirection ArraySubscripts
+	Paths       []ArraySubscripts
+	Updates     []Expr
 	Assign      bool
 
 	typeAnnotation
+}
+
+func (node *IndirectionExpr) AddAdditionalPath(path ArraySubscripts) {
+	if node.Paths == nil {
+		node.Paths = make([]ArraySubscripts, 0)
+	}
+	node.Paths = append(node.Paths, path)
+}
+
+func (node *IndirectionExpr) AddAdditionalUpdate(val TypedExpr) {
+	if node.Updates == nil {
+		node.Updates = make([]Expr, 0)
+	}
+	node.Updates = append(node.Updates, val)
 }
 
 // Format implements the NodeFormatter interface.
@@ -1583,6 +1612,7 @@ func (node *IndirectionExpr) Format(ctx *FmtCtx) {
 	// will get interpreted as part of the type.
 	// Ex. ('{a}'::_typ)[1] vs. '{a}'::_typ[1].
 	// Ex. (ARRAY['a'::typ]:::typ[])[1] vs. ARRAY['a'::typ]:::typ[][1].
+	fmt.Println("format IndirectionExpr ")
 	var annotateArray bool
 	if arr, ok := node.Expr.(*Array); ctx.HasFlags(FmtParsable) && ok && arr.typ != nil {
 		if arr.typ.ArrayContents().Family() != types.UnknownFamily {
@@ -1596,6 +1626,9 @@ func (node *IndirectionExpr) Format(ctx *FmtCtx) {
 		exprFmtWithParen(ctx, node.Expr)
 	}
 	ctx.FormatNode(&node.Indirection)
+	if node.Assign {
+		ctx.WriteString("Assign")
+	}
 }
 
 type annotateSyntaxMode int

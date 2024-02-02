@@ -132,7 +132,7 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 	}
 
 	for _, expr := range exprs {
-		mb.addTargetColsByRefs(expr.ColumnRefs)
+		mb.addTargetColsByExpr(expr)
 
 		if expr.Tuple {
 			n := -1
@@ -222,6 +222,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 		// Add new column to the projections scope.
 		texpr := inScope.resolveType(expr, targetCol.DatumType())
+		fmt.Printf("texpr type: %T\n ", texpr)
 		targetColName := targetCol.ColName()
 		colName := scopeColName(targetColName).WithMetadataName(string(targetColName) + "_new")
 		scopeCol := projectionsScope.addColumn(colName, texpr)
@@ -233,7 +234,12 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 	n := 0
 	subquery := 0
+	// For subscription updates that rely on a subquery, we need to promote
+	// the indirectionexpr to an outer projection to be able to apply all
+	// of the required updates. It behaves similar to a computed column
+	promotions := make(map[tree.Name]*tree.IndirectionExpr)
 	for _, set := range exprs {
+		subscriptFlag := false
 		if set.Tuple {
 			switch t := set.Expr.(type) {
 			case *tree.Subquery:
@@ -246,6 +252,15 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 					ord := mb.tabID.ColumnOrdinal(mb.targetColList[n])
 					targetCol := mb.tab.Column(ord)
 					subqueryScope.cols[i].name = scopeColName(targetCol.ColName())
+
+					if _, ok := mb.updateAgg[targetCol.ColName()]; ok {
+						ref := set.ColumnRefs[i]
+						mb.updateAgg[targetCol.ColName()].AddAdditionalUpdate(subqueryScope.cols[i])
+						promotions[targetCol.ColName()] = mb.updateAgg[targetCol.ColName()]
+						n++
+						subscriptFlag = true
+						continue
+					}
 
 					// Add the column ID to the list of columns to update.
 					mb.updateColIDs[ord] = subqueryScope.cols[i].id
@@ -272,13 +287,24 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 				projectionsScope.appendColumnsFromScope(subqueryScope)
 
 			case *tree.Tuple:
-				for _, expr := range t.Exprs {
-					addCol(expr, mb.targetColList[n])
+				for i, ref := range set.ColumnRefs {
+					if len(ref.Subscripts) > 0 {
+						ord := mb.tabID.ColumnOrdinal(mb.targetColList[n])
+						targetCol := mb.tab.Column(ord)
+						texpr := inScope.resolveType(t.Exprs[i], targetCol.DatumType())
+						mb.updateAgg[ref.Name].AddAdditionalUpdate(texpr)
+						subscriptFlag = true
+					}
+
+					if subscriptFlag {
+						n++ 
+						continue
+					}
+					addCol(t.Exprs[i], mb.targetColList[n])
 					n++
 				}
 			}
 		} else {
-
 			expr := set.Expr
 			if len(set.ColumnRefs) > 1 {
 				panic(errors.AssertionFailedf("expected <= 1 column ref, found %d", len(set.ColumnRefs)))
@@ -286,32 +312,45 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 			for _, ref := range set.ColumnRefs {
 				// For JSONB subscripts, replace with json_set.
 				if len(ref.Subscripts) > 0 {
-					arr := &tree.Array{}
-					for _, t := range ref.Subscripts {
-						if t.Slice {
-							panic(pgerror.Newf(pgcode.DatatypeMismatch, "cannot reference a slice in UPDATE"))
-						}
-						// Cast all expressions to strings to support mixing strings and ints.
-						// JSONB automatically knows how to evaluate strings to int indexes and vice versa.
-						arr.Exprs = append(arr.Exprs, &tree.CastExpr{Expr: t.Begin, Type: types.String})
-					}
-					expr = &tree.IndirectionExpr{
-						Expr: &tree.UnresolvedName{
-							NumParts: 1,
-							Parts: tree.NameParts{string(ref.Name)},
-						},
-						Assign: true,
-					}
+					ord := mb.tabID.ColumnOrdinal(mb.targetColList[n])
+					targetCol := mb.tab.Column(ord)
+					texpr := inScope.resolveType(expr, targetCol.DatumType())
+					mb.updateAgg[ref.Name].AddAdditionalUpdate(texpr)
+					subscriptFlag = true
 				}
 			}
-
+			if subscriptFlag {
+				n++
+				continue
+			}
 			addCol(expr, mb.targetColList[n])
 			n++
 		}
 	}
 
+	// For container types that may be updated multiple times in a update
+	// statement, we add them at the end by incrementally building out
+	// the access paths and their respective update values before adding 
+	// them to the update cols. 
+	for name, expr := range mb.updateAgg {
+		if _, ok := promotions[name]; ok {
+			continue
+		}
+		// panic(pgerror.Newf(pgcode.Syntax, "subscripting refs not allowed"))
+		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
+			colID := mb.tabID.ColumnID(ord)
+			addCol(expr, colID)
+		}
+		fmt.Println("updateColIDs ", mb.updateColIDs)
+	}
+
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
+
 	mb.outScope = projectionsScope
+
+	// Add additional update expressions for columns that depend on the input
+	// query for values
+	mb.addGeneratedComputedColumns()
 
 	// Add assignment casts for update columns.
 	mb.addAssignmentCasts(mb.updateColIDs)

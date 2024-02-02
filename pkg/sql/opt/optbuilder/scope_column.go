@@ -195,6 +195,7 @@ func (c *scopeColumn) Format(ctx *tree.FmtCtx) {
 	// equivalence. If that flag is present, then use the unique column id to
 	// differentiate this column from other columns.
 	if ctx.HasFlags(tree.FmtCheckEquivalence) {
+		fmt.Println("scope col format ", c.id)
 		// Use double @ to distinguish from Cockroach column ordinals.
 		ctx.Printf("@@%d", c.id)
 		return

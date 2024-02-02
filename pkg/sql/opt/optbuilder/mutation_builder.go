@@ -208,6 +208,15 @@ type mutationBuilder struct {
 	// inputForInsertExpr stores the result of outscope.expr from the most
 	// recent call to buildInputForInsert.
 	inputForInsertExpr memo.RelExpr
+	
+	// Mapping to incrementally build update expressions for UPDATE statements 
+	// where a column is part of the SET statement multiple times. Note that this
+	// can only occur if the column type is a container and is being subscripted.  
+	updateAgg map[tree.Name]*tree.IndirectionExpr
+
+	// Generated updates for update expressions that need to be projected 
+	// after the base input is generated
+	// generatedUpdates map[tree.Name]*tree.IndirectionExpr
 }
 
 func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias tree.TableName) {
@@ -237,6 +246,8 @@ func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias 
 
 	// Add the table and its columns (including mutation columns) to metadata.
 	mb.tabID = mb.md.AddTable(tab, &mb.alias)
+	mb.updateAgg = make(map[tree.Name]*tree.IndirectionExpr)
+	// mb.generatedUpdates = make(map[tree.Name]*tree.IndirectionExpr)
 }
 
 // setFetchColIDs sets the list of columns that are fetched in order to provide
@@ -554,6 +565,50 @@ func (mb *mutationBuilder) addTargetCol(ord int) {
 	mb.targetColList = append(mb.targetColList, colID)
 }
 
+func (mb *mutationBuilder) addTargetColsByExpr(expr *tree.UpdateExpr) {
+	for _, ref := range expr.ColumnRefs {
+		name := ref.Name
+		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
+			if mb.tab.Column(ord).Kind() == cat.System {
+				panic(pgerror.Newf(pgcode.InvalidColumnReference, "cannot modify system column %q", name))
+			}
+
+			tabcol := mb.tab.Column(ord)
+			if tabCol.IsMutation() {
+				panic(makeBackfillError(tabcol.ColName()))
+			}
+
+			if tabCol.IsComputed() {
+				panic(schemaexpr.CannotWriteToComputedColError(string(tabCol.ColName())))
+			}
+			
+			if ref.Subscripts != nil {
+				if _, ok := mb.updateAgg[tabCol.ColName()]; !ok {
+					mb.updateAgg[tabCol.ColName()] = &tree.IndirectionExpr{
+						Expr: &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{string(name)}},
+						Assign: true,
+					}
+				}
+
+				mb.updateAgg[name].AddAdditionalPaths(ref.Subscripts)
+			}
+
+			colID := mb.tabID.ColumnID(ord)
+			if mb.targetColSet.Contains(colID) {
+				if ref.Subscripts == nil {
+					panic(pgerror.Newf(pgcode.Syntax,
+						"multiple assignments to the same column %q", tabcol.ColName()
+					))
+				}
+				continue
+			}
+
+			mb.targetColSet.Add(colID)
+			mb.targetColList = append(mb.targetColList, colID)
+		}
+	}
+}
+
 // extractValuesInput tests whether the given input is a VALUES clause with no
 // WITH, ORDER BY, or LIMIT modifier. If so, it's returned, otherwise nil is
 // returned.
@@ -644,6 +699,31 @@ func (mb *mutationBuilder) replaceDefaultExprs(inRows *tree.Select) (outRows *tr
 	}
 	return inRows
 }
+
+// addGeneratedComputedColumns is a helper method for addSynthesizedColsForUpdate
+// that generates any update expressions that depends on the values of the other
+// columns from the input. For example, when subscription is used to update a container
+// type column with update values provided by a subquery, we use this method to 
+// generate projections on top of the input to aggregate the subquery datums with
+// other updates to the same column.
+// func (mb *mutationBuilder) addGeneratedComputedColumns() {
+// 	// We will construct a new Project operator that will contain the newly
+// 	// synthesized column(s).
+// 	pb := makeProjectionBuilder(mb.b, mb.outScope)
+
+// 	for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
+// 		tabCol := mb.tab.Column(i)
+// 		if _, ok := mb.generatedUpdates[C.ColName()]; !ok {
+// 			continue
+// 		}
+
+// 		colName := scopeColName(tabCol.ColName()).WithMetadataName(
+// 			string(tabCol.ColName()) + "_new",
+// 		)
+// 		newCol, _ := pb.Add(colName, mb.generatedUpdates[tabCol.ColName()], tabCol.DatumType())
+// 		mb.updateColIDs[i] = newCol
+// 	}
+// }
 
 // addSynthesizedDefaultCols is a helper method for addSynthesizedColsForInsert
 // and addSynthesizedColsForUpdate that scans the list of Ordinary and WriteOnly

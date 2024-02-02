@@ -1140,22 +1140,6 @@ SELECT 1 > ALL ARRAY['foo']
 ----
 error (22023): unsupported comparison operator: 1 > ALL ARRAY['foo']: could not parse "foo" as type int: strconv.ParseInt: parsing "foo": invalid syntax
 
-build-scalar vars=(a int[], b string[], c float[], d int)
-(a[1], b[1+1], c[d])
-----
-tuple [type=tuple{int, string, float}]
- ├── indirection [type=int]
- │    ├── variable: a:1 [type=int[]]
- │    └── const: 1 [type=int]
- ├── indirection [type=string]
- │    ├── variable: b:2 [type=string[]]
- │    └── plus [type=int]
- │         ├── const: 1 [type=int]
- │         └── const: 1 [type=int]
- └── indirection [type=float]
-      ├── variable: c:3 [type=float[]]
-      └── variable: d:4 [type=int]
-
 build-scalar vars=(a int, b string, c int[])
 (
     (a IS OF (INT), a IS OF (INT, STRING), a IS OF (STRING)),

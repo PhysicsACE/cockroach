@@ -284,6 +284,7 @@ func (s *scope) addColumn(name scopeColumnName, expr tree.TypedExpr) *scopeColum
 		typ:  expr.ResolvedType(),
 		expr: expr,
 	})
+	fmt.Println("col idx in scope ", len(s.cols) - 1)
 	return &s.cols[len(s.cols)-1]
 }
 
@@ -609,18 +610,22 @@ func findExistingColInList(
 	expr tree.TypedExpr, cols []scopeColumn, allowSideEffects bool, evalCtx *eval.Context,
 ) *scopeColumn {
 	exprStr := symbolicExprStr(expr)
+	fmt.Println("symbolicexpr ", exprStr)
 	for i := range cols {
 		col := &cols[i]
 		if expr == col {
 			return col
 		}
 		if exprStr == col.getExprStr() {
+			fmt.Println("found col ", col.getExprStr())
 			if allowSideEffects || col.scalar == nil {
+				fmt.Println("return col allowsideeffects ", i)
 				return col
 			}
 			var p props.Shared
 			memo.BuildSharedProps(col.scalar, &p, evalCtx)
 			if !p.VolatilitySet.HasVolatile() {
+				fmt.Println("return col volatility")
 				return col
 			}
 		}

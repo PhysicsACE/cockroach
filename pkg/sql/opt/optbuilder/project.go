@@ -31,10 +31,14 @@ func (b *Builder) constructProjectForScope(inScope, projectionsScope *scope) {
 		projectionsScope.copyOrdering(inScope)
 	}
 
+	fmt.Println("constructprojectforscope")
+
 	// Don't add an unnecessary "pass through" project.
 	if projectionsScope.hasSameColumns(inScope) {
+		fmt.Println("Same Columnsss")
 		projectionsScope.expr = inScope.expr
 	} else {
+		fmt.Println("construct a project")
 		projectionsScope.expr = b.constructProject(
 			inScope.expr,
 			append(projectionsScope.cols, projectionsScope.extraCols...),
@@ -275,10 +279,13 @@ func (b *Builder) finishBuildScalar(
 	if outScope == nil {
 		return scalar
 	}
+
+	fmt.Printf("finishbuildscalar type: %T\n", texpr)
 	// Avoid synthesizing a new column if possible.
 	if col := outScope.findExistingCol(
 		texpr, false, /* allowSideEffects */
 	); col != nil && col != outCol {
+		fmt.Println("findExistingCol", col, "vs", outCol, "=", col == outCol)
 		outCol.id = col.id
 		outCol.scalar = scalar
 		return scalar

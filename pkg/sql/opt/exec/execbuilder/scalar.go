@@ -12,7 +12,6 @@ package execbuilder
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -477,19 +476,41 @@ func (b *Builder) buildIndirection(
 ) (tree.TypedExpr, error) {
 
 	indirection := scalar.(*memo.IndirectionExpr)
-	fmt.Println("Execbuilder check: ", indirection.Assign)
 
 	expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 	if err != nil {
 		return nil, err
 	}
 
-	index, err := b.buildScalar(ctx, scalar.Child(1).(opt.ScalarExpr))
-	if err != nil {
-		return nil, err
+	indirections := make(tree.ArraySubscripts, len(indirection.Begin))
+	for i := range indirection.Begin {
+		begin, err := b.buildScalar(ctx, indirection.Begin[i])
+		if err != nil {
+			return nil, err
+		}
+
+		end, err := b.buildScalar(ctx, indirection.End[i])
+		if err != nil {
+			return nil, err
+		}
+
+		indirections[i] = &tree.ArraySubscript{
+			Begin: begin,
+			End: end,
+			Slice: indirection.Slice,
+		}
 	}
 
-	return tree.NewTypedIndirectionExpr(expr, index, indirection.Assign, scalar.DataType()), nil
+	updates := make(tree.TypedExprs)
+	for i := range indirection.Updates {
+		updateExpr, err := b.buildScalar(ctx, indirection.Updates[i])
+		if err != nil {
+			return nil, err
+		}
+		updates = append(updates, updateExpr)
+	}
+
+	return tree.NewTypedIndirectionExpr(expr, indirections, updates, indirection.Slice, scalar.DataType()), nil
 }
 
 func (b *Builder) buildCollate(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {
