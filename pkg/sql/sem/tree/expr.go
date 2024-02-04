@@ -1603,6 +1603,7 @@ func (node *IndirectionExpr) Format(ctx *FmtCtx) {
 	} else {
 		exprFmtWithParen(ctx, node.Expr)
 	}
+	ctx.WriteString("Assign:True")
 	ctx.FormatNode(&node.Indirection)
 }
 
