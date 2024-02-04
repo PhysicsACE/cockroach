@@ -350,7 +350,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 	// Add additional update expressions for columns that depend on the input
 	// query for values
-	mb.addGeneratedComputedColumns()
+	// mb.addGeneratedComputedColumns()
 
 	// Add assignment casts for update columns.
 	mb.addAssignmentCasts(mb.updateColIDs)
