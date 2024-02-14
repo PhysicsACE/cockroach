@@ -243,11 +243,13 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 					subqueryScope.cols[i].name = scopeColName(targetCol.ColName())
 
 					if _, ok := mb.updateAgg[targetCol.ColName()]; ok {
-						ref := set.ColumnRefs[i]
-						mb.updateAgg[ref.Name].AddAdditionalValue(subqueryScope.cols[i].getExpr())
-						n++
-						subscriptFlag = true
-						continue
+						// ref := set.ColumnRefs[i]
+						// mb.updateAgg[ref.Name].AddAdditionalValue(subqueryScope.cols[i])
+						// n++
+						// subscriptFlag = true
+						// continue
+						panic(pgerror.Newf(pgcode.Syntax,
+							"subscription with subqueries is unimplemented"))
 					}
 
 					// Add the column ID to the list of columns to update.

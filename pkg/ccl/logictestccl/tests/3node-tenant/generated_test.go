@@ -2039,6 +2039,13 @@ func TestTenantLogic_subquery_correlated(
 	runLogicTest(t, "subquery_correlated")
 }
 
+func TestTenantLogic_subscription(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "subscription")
+}
+
 func TestTenantLogic_synthetic_privileges(
 	t *testing.T,
 ) {

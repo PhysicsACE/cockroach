@@ -269,12 +269,9 @@ func typeIndirection(e opt.ScalarExpr) *types.T {
 		return t
 	case types.ArrayFamily:
 		indirection := e.(*IndirectionExpr)
-		if len(indirection.Value) > 0 {
+		if len(indirection.Value) > 0 || indirection.Slice {
 			// return types.MakeArray(t.ArrayContents())
-			panic(errors.AssertionFailedf("updates for subscripting not available yet"))
-		}
-		if indirection.Slice {
-			return types.MakeArray(t.ArrayContents())
+			return t
 		}
 		return t.ArrayContents()
 	default:

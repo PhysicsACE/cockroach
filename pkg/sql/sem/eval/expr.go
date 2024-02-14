@@ -12,13 +12,12 @@ package eval
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
-	// "github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -292,8 +291,8 @@ func (e *evaluator) EvalIndexedVar(ctx context.Context, iv *tree.IndexedVar) (tr
 func (e *evaluator) EvalIndirectionExpr(
 	ctx context.Context, expr *tree.IndirectionExpr,
 ) (tree.Datum, error) {
-	// var subscriptBeginIdx int
-	// var subscriptEndIdx int
+	var subscriptBeginIdx int
+	var subscriptEndIdx int
 
 	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
@@ -303,127 +302,131 @@ func (e *evaluator) EvalIndirectionExpr(
 		return d, nil
 	}
 
-	fmt.Println("Assignment indirection test ", expr.Assign)
-	return nil, errors.AssertionFailedf("indirection update not supported yet")
+	// fmt.Println("Assignment indirection test ", expr.Assign)
+	// return nil, errors.AssertionFailedf("indirection update not supported yet")
 
-	// if expr.Assign {
-		// executor, err := GetAssignExecutor(d)
-		// if err != nil {
-		// 	return nil, err
-		// }
-		// for i := range expr.Path {
-		// 	if d, err = executor(ctx, e, d, expr.Path[i], expr.Value[i].(tree.TypedExpr)); err != nil {
-		// 		return nil, err
-		// 	}
-		// }
-		// return d, nil
+	if expr.Assign {
+		executor, err := FetchUpdateExecutor(d.ResolvedType())
+		if err != nil {
+			return nil, err
+		}
 
-		// return nil, errors.AssertionFailedf("indirection update not supported yet")
-	// }
+		updateExpr := expr.Value[0]
+		updateDatum, err := updateExpr.(tree.TypedExpr).Eval(ctx, e)
+		if err != nil {
+			return nil, err
+		}
 
-	// switch d.ResolvedType().Family() {
-	// case types.ArrayFamily:
-	// 	arr := tree.MustBeDArray(d)
-	// 	for i, t := range expr.Indirection {
-	// 		if i > 0 {
-	// 			return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
-	// 		}
+		res, err := executor(ctx, e, d, expr.Indirection, updateDatum)
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
 
-	// 		if t.Slice {
+	switch d.ResolvedType().Family() {
+	case types.ArrayFamily:
+		arr := tree.MustBeDArray(d)
+		for i, t := range expr.Indirection {
+			if i > 0 {
+				return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+			}
 
-	// 			beginDatum, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
-	// 			if err != nil {
-	// 				return nil, err
-	// 			}
-	// 			if beginDatum == tree.DNull {
-	// 				subscriptBeginIdx = 1
-	// 			} else {
-	// 				subscriptBeginIdx = int(tree.MustBeDInt(beginDatum))
-	// 			}
+			if t.Slice {
 
-	// 			endDatum, err := t.End.(tree.TypedExpr).Eval(ctx, e)
-	// 			if err != nil {
-	// 				return nil, err
-	// 			}
+				beginDatum, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
+				if err != nil {
+					return nil, err
+				}
+				if beginDatum == tree.DNull {
+					subscriptBeginIdx = 1
+				} else {
+					subscriptBeginIdx = int(tree.MustBeDInt(beginDatum))
+				}
 
-	// 			if endDatum == tree.DNull {
-	// 				subscriptEndIdx = arr.Len() 
-	// 			} else {
-	// 				subscriptEndIdx = int(tree.MustBeDInt(endDatum))
-	// 			}
+				endDatum, err := t.End.(tree.TypedExpr).Eval(ctx, e)
+				if err != nil {
+					return nil, err
+				}
 
-	// 			// if arr.FirstIndex() == 0 {
-	// 			// 	subscriptBeginIdx++
-	// 			// 	subscriptEndIdx++
-	// 			// }
+				if endDatum == tree.DNull {
+					subscriptEndIdx = arr.Len() 
+				} else {
+					subscriptEndIdx = int(tree.MustBeDInt(endDatum))
+				}
 
-	// 			if subscriptBeginIdx < 1 || subscriptBeginIdx > arr.Len() || subscriptEndIdx > arr.Len() || subscriptEndIdx < subscriptBeginIdx {
-	// 				return tree.DNull, nil
-	// 			}
+				// if arr.FirstIndex() == 0 {
+				// 	subscriptBeginIdx++
+				// 	subscriptEndIdx++
+				// }
 
-	// 			// return arr.Array[(subscriptBeginIdx-1):subscriptEndIdx], nil
-	// 			subscriptArray := tree.NewDArray(arr.ParamTyp)
-	// 			for i := subscriptBeginIdx - 1; i <= subscriptEndIdx - 1; i++ {
-	// 				if err := subscriptArray.Append(arr.Array[i]); err != nil {
-	// 					return nil, err
-	// 				}
-	// 			}
+				if subscriptBeginIdx < 1 || subscriptBeginIdx > arr.Len() || subscriptEndIdx > arr.Len() || subscriptEndIdx < subscriptBeginIdx {
+					return tree.DNull, nil
+				}
 
-	// 			return subscriptArray, nil
-	// 		}
+				// return arr.Array[(subscriptBeginIdx-1):subscriptEndIdx], nil
+				subscriptArray := tree.NewDArray(arr.ParamTyp)
+				for i := subscriptBeginIdx - 1; i <= subscriptEndIdx - 1; i++ {
+					if err := subscriptArray.Append(arr.Array[i]); err != nil {
+						return nil, err
+					}
+				}
 
-	// 		beginDatum, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
-	// 		if err != nil {
-	// 			return nil, err
-	// 		}
-	// 		if beginDatum == tree.DNull {
-	// 			return tree.DNull, nil
-	// 		}
-	// 		subscriptBeginIdx = int(tree.MustBeDInt(beginDatum))
-	// 	}
+				return subscriptArray, nil
+			}
 
-	// 	// VECTOR types use 0-indexing.
-	// 	if arr.FirstIndex() == 0 {
-	// 		subscriptBeginIdx++
-	// 	}
-	// 	if subscriptBeginIdx < 1 || subscriptBeginIdx > arr.Len() {
-	// 		return tree.DNull, nil
-	// 	}
-	// 	return arr.Array[subscriptBeginIdx-1], nil
-	// case types.JsonFamily:
-	// 	j := tree.MustBeDJSON(d)
-	// 	curr := j.JSON
-	// 	for _, t := range expr.Indirection {
-	// 		if t.Slice {
-	// 			return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
-	// 		}
+			beginDatum, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if beginDatum == tree.DNull {
+				return tree.DNull, nil
+			}
+			subscriptBeginIdx = int(tree.MustBeDInt(beginDatum))
+		}
 
-	// 		field, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
-	// 		if err != nil {
-	// 			return nil, err
-	// 		}
-	// 		if field == tree.DNull {
-	// 			return tree.DNull, nil
-	// 		}
-	// 		switch field.ResolvedType().Family() {
-	// 		case types.StringFamily:
-	// 			if curr, err = curr.FetchValKeyOrIdx(string(tree.MustBeDString(field))); err != nil {
-	// 				return nil, err
-	// 			}
-	// 		case types.IntFamily:
-	// 			if curr, err = curr.FetchValIdx(int(tree.MustBeDInt(field))); err != nil {
-	// 				return nil, err
-	// 			}
-	// 		default:
-	// 			return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
-	// 		}
-	// 		if curr == nil {
-	// 			return tree.DNull, nil
-	// 		}
-	// 	}
-	// 	return tree.NewDJSON(curr), nil
-	// }
-	// return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+		// VECTOR types use 0-indexing.
+		if arr.FirstIndex() == 0 {
+			subscriptBeginIdx++
+		}
+		if subscriptBeginIdx < 1 || subscriptBeginIdx > arr.Len() {
+			return tree.DNull, nil
+		}
+		return arr.Array[subscriptBeginIdx-1], nil
+	case types.JsonFamily:
+		j := tree.MustBeDJSON(d)
+		curr := j.JSON
+		for _, t := range expr.Indirection {
+			if t.Slice {
+				return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+			}
+
+			field, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if field == tree.DNull {
+				return tree.DNull, nil
+			}
+			switch field.ResolvedType().Family() {
+			case types.StringFamily:
+				if curr, err = curr.FetchValKeyOrIdx(string(tree.MustBeDString(field))); err != nil {
+					return nil, err
+				}
+			case types.IntFamily:
+				if curr, err = curr.FetchValIdx(int(tree.MustBeDInt(field))); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+			}
+			if curr == nil {
+				return tree.DNull, nil
+			}
+		}
+		return tree.NewDJSON(curr), nil
+	}
+	return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
 }
 
 func (e *evaluator) EvalDefaultVal(ctx context.Context, expr *tree.DefaultVal) (tree.Datum, error) {

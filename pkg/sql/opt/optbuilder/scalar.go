@@ -176,7 +176,6 @@ func (b *Builder) buildScalar(
 			panic(unimplementedWithIssueDetailf(32552, "ind", "multidimensional indexing is not supported"))
 		}
 
-
 		out = b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
 		containsSlice := false
 
@@ -188,6 +187,14 @@ func (b *Builder) buildScalar(
 				value := memo.ScalarListExpr{
 					b.buildScalar(t.Value[i].(tree.TypedExpr), inScope, nil, nil, colRefs),
 				}
+
+				for _, subscript := range p {
+					if subscript.Slice {
+						containsSlice = true
+						break
+					}
+				}
+
 				for j, subscript := range p {
 					if subscript.Slice {
 						begin[j] = b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs)
@@ -195,6 +202,13 @@ func (b *Builder) buildScalar(
 						containsSlice = true
 						continue
 					}
+
+					if containsSlice {
+						begin[j] = b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs)
+						end[j] = b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs)
+						continue
+					}
+
 					begin[j] = b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs)
 					end[j] = b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs)
 				}
@@ -209,6 +223,13 @@ func (b *Builder) buildScalar(
 			}
 			// panic(pgerror.Newf(pgcode.Syntax, "subscripting refs optbuilder"))
 			break
+		}
+
+		for _, subscript := range t.Indirection {
+			if subscript.Slice {
+				containsSlice = true
+				break
+			}
 		}
 
 		for _, subscript := range t.Indirection {
@@ -228,6 +249,24 @@ func (b *Builder) buildScalar(
 				)
 				continue
 			}
+
+			if containsSlice {
+				begin := memo.ScalarListExpr{
+					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				}
+				end := memo.ScalarListExpr{
+					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				}
+				out = b.factory.ConstructIndirection(
+					out,
+					begin,
+					end,
+					memo.EmptyScalarListExpr,
+					true,
+				)
+				continue
+			}
+
 			begin := memo.ScalarListExpr{
 				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
 			}

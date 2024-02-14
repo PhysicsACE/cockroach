@@ -705,6 +705,36 @@ func (expr *IndirectionExpr) TypeCheck(
 			t.Begin = beginExpr
 		}
 
+		if len(expr.Path) > 0 {
+			for i, t := range expr.Path {
+				if i > 0 {
+					return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
+				}
+
+				for _, p := range t {
+					if p.Slice {
+						endExpr, err := typeCheckAndRequire(ctx, semaCtx, p.End, types.Int, "ARRAY subscript")
+						if err != nil {
+							return nil, err
+						}
+						p.End = endExpr
+					}
+
+					beginExpr, err := typeCheckAndRequire(ctx, semaCtx, p.Begin, types.Int, "ARRAY subscript")
+					if err != nil {
+						return nil, err
+					}
+					p.Begin = beginExpr
+				}
+
+				valExpr, err := expr.Value[i].TypeCheck(ctx, semaCtx, types.Any)
+				if err != nil {
+					return nil, err
+				}
+				expr.Value[i] = valExpr
+			}
+		}
+
 		if OnTypeCheckArraySubscript != nil {
 			OnTypeCheckArraySubscript()
 		}
@@ -731,6 +761,42 @@ func (expr *IndirectionExpr) TypeCheck(
 				)
 			}
 			t.Begin = beginExpr
+		}
+
+		if len(expr.Path) > 0 {
+			for i, t := range expr.Path {
+				if i > 0 {
+					return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
+				}
+				for _, p := range t {
+					if p.Slice {
+						return nil, pgerror.Newf(pgcode.DatatypeMismatch, "jsonb subscript does not support slices")
+					}
+					beginExpr, err := typeCheckAndRequire(ctx, semaCtx, p.Begin, types.Any, "ARRAY subscript")
+					if err != nil {
+						return nil, err
+					}
+					switch beginExpr.ResolvedType().Family() {
+					case types.IntFamily, types.StringFamily, types.UnknownFamily:
+					default:
+						return nil, errors.WithHint(
+							pgerror.Newf(
+								pgcode.DatatypeMismatch,
+								"unexpected JSON subscript type: %s",
+								beginExpr.ResolvedType().SQLString(),
+							),
+							"subscript type must be integer or text",
+						)
+					}
+					p.Begin = beginExpr
+				}
+
+				valExpr, err := expr.Value[i].TypeCheck(ctx, semaCtx, types.Any)
+				if err != nil {
+					return nil, err
+				}
+				expr.Value[i] = valExpr
+			}
 		}
 
 		if OnTypeCheckJSONBSubscript != nil {
