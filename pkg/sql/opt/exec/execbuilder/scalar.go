@@ -474,17 +474,22 @@ func (b *Builder) buildAnyScalar(
 func (b *Builder) buildIndirection(
 	ctx *buildScalarCtx, scalar opt.ScalarExpr,
 ) (tree.TypedExpr, error) {
+	indirection := scalar.(*memo.IndirectionExpr)
 	expr, err := b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 	if err != nil {
 		return nil, err
 	}
 
-	index, err := b.buildScalar(ctx, scalar.Child(1).(opt.ScalarExpr))
-	if err != nil {
-		return nil, err
+	indirections := make(tree.Exprs, len(indirection.Begin))
+	var err error
+	for i := range indirection.Begin {
+		indirections[i], err = b.buildScalar(ctx, indirection.Begin[i])
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return tree.NewTypedIndirectionExpr(expr, index, scalar.DataType()), nil
+	return tree.NewTypedIndirectionExpr(expr, indirections[0], scalar.DataType()), nil
 }
 
 func (b *Builder) buildCollate(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {

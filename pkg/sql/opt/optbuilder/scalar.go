@@ -183,9 +183,18 @@ func (b *Builder) buildScalar(
 				panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
 			}
 
+			begin := memo.ScalarListExpr{
+				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			}
+			end := memo.ScalarListExpr{
+				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+
 			out = b.factory.ConstructIndirection(
 				out,
-				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				begin,
+				end,
+				memo.EmptyScalarListExpr,
+				false
 			)
 		}
 
