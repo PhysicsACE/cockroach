@@ -254,8 +254,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 					subqueryScope.cols[i].name = scopeColName(targetCol.ColName())
 
 					if _, ok := mb.updateAgg[targetCol.ColName()]; ok {
-						ref := set.ColumnRefs[i]
-						mb.updateAgg[targetCol.ColName()].AddAdditionalUpdate(subqueryScope.cols[i])
+						mb.updateAgg[targetCol.ColName()].AddAdditionalUpdate(subqueryScope.cols[i].getExpr())
 						promotions[targetCol.ColName()] = mb.updateAgg[targetCol.ColName()]
 						n++
 						subscriptFlag = true

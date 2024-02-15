@@ -573,9 +573,9 @@ func (mb *mutationBuilder) addTargetColsByExpr(expr *tree.UpdateExpr) {
 				panic(pgerror.Newf(pgcode.InvalidColumnReference, "cannot modify system column %q", name))
 			}
 
-			tabcol := mb.tab.Column(ord)
+			tabCol := mb.tab.Column(ord)
 			if tabCol.IsMutation() {
-				panic(makeBackfillError(tabcol.ColName()))
+				panic(makeBackfillError(tabCol.ColName()))
 			}
 
 			if tabCol.IsComputed() {
@@ -590,15 +590,13 @@ func (mb *mutationBuilder) addTargetColsByExpr(expr *tree.UpdateExpr) {
 					}
 				}
 
-				mb.updateAgg[name].AddAdditionalPaths(ref.Subscripts)
+				mb.updateAgg[name].AddAdditionalPath(ref.Subscripts)
 			}
 
 			colID := mb.tabID.ColumnID(ord)
 			if mb.targetColSet.Contains(colID) {
 				if ref.Subscripts == nil {
-					panic(pgerror.Newf(pgcode.Syntax,
-						"multiple assignments to the same column %q", tabcol.ColName()
-					))
+					panic(pgerror.Newf(pgcode.Syntax, "multiple assignments to the same column %q", tabCol.ColName()))
 				}
 				continue
 			}

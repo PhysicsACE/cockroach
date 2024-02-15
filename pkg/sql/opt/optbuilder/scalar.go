@@ -185,7 +185,7 @@ func (b *Builder) buildScalar(
 				begin := make(memo.ScalarListExpr, len(p))
 				end := make(memo.ScalarListExpr, len(p))
 				update := memo.ScalarListExpr{
-					b.buildScalar(t.Updates[i].(tree.TypedExpr), inScope, nil, nil, colRefs)
+					b.buildScalar(t.Updates[i].(tree.TypedExpr), inScope, nil, nil, colRefs),
 				}
 
 				for _, subscript := range p {

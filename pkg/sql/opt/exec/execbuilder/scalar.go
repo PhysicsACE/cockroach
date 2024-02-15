@@ -501,7 +501,7 @@ func (b *Builder) buildIndirection(
 		}
 	}
 
-	updates := make(tree.TypedExprs)
+	updates := make(tree.TypedExprs, 0)
 	for i := range indirection.Updates {
 		updateExpr, err := b.buildScalar(ctx, indirection.Updates[i])
 		if err != nil {
