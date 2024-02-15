@@ -480,12 +480,12 @@ func (b *Builder) buildIndirection(
 		return nil, err
 	}
 
-	indirections := make(tree.Exprs, len(indirection.Begin))
-	var err error
+	indirections := make(tree.TypedExprs, len(indirection.Begin))
+	var e error
 	for i := range indirection.Begin {
-		indirections[i], err = b.buildScalar(ctx, indirection.Begin[i])
-		if err != nil {
-			return nil, err
+		indirections[i], e = b.buildScalar(ctx, indirection.Begin[i])
+		if e != nil {
+			return nil, e
 		}
 	}
 

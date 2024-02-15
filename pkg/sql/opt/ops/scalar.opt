@@ -746,7 +746,7 @@ define Array {
 [Scalar]
 define Indirection {
     Input   ScalarExpr
-    Index   ScalarListExpr
+    Begin   ScalarListExpr
     End     ScalarListExpr
     Value   ScalarListExpr
     Slice   bool

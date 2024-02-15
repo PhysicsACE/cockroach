@@ -188,13 +188,14 @@ func (b *Builder) buildScalar(
 			}
 			end := memo.ScalarListExpr{
 				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			}
 
 			out = b.factory.ConstructIndirection(
 				out,
 				begin,
 				end,
 				memo.EmptyScalarListExpr,
-				false
+				false,
 			)
 		}
 
