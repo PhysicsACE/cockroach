@@ -748,7 +748,7 @@ define Indirection {
     Input   ScalarExpr
     Begin   ScalarListExpr
     End     ScalarListExpr
-    Value   ScalarListExpr
+    Updates   ScalarListExpr
     Slice   bool
 }
 

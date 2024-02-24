@@ -413,10 +413,21 @@ func NewTypedComparisonExprWithSubOp(
 }
 
 // NewTypedIndirectionExpr returns a new IndirectionExpr that is verified to be well-typed.
-func NewTypedIndirectionExpr(expr, index TypedExpr, typ *types.T) *IndirectionExpr {
+func NewTypedIndirectionExpr(expr TypedExpr, indirection ArraySubscripts, updates TypedExprs, Slice bool, typ *types.T) *IndirectionExpr {
 	node := &IndirectionExpr{
 		Expr:        expr,
-		Indirection: ArraySubscripts{&ArraySubscript{Begin: index}},
+		Indirection: indirection,
+		Paths:       []ArraySubscripts{indirection},
+		Updates:     make(Exprs, len(updates)),
+		Assign:      (len(updates) > 0),
+	}
+
+	for i := range updates {
+		node.Updates[i] = updates[i]
+	}
+	if Slice {
+		node.typ = types.MakeArray(typ)
+		return node
 	}
 	node.typ = typ
 	return node
@@ -1562,8 +1573,25 @@ func (a *ArraySubscripts) Format(ctx *FmtCtx) {
 type IndirectionExpr struct {
 	Expr        Expr
 	Indirection ArraySubscripts
+	Paths       []ArraySubscripts
+	Updates     []Expr
+	Assign      bool
 
 	typeAnnotation
+}
+
+func (node *IndirectionExpr) AddAdditionalPath(path ArraySubscripts) {
+	if node.Paths == nil {
+		node.Paths = make([]ArraySubscripts, 0)
+	}
+	node.Paths = append(node.Paths, path)
+}
+
+func (node *IndirectionExpr) AddAdditionalUpdate(val Expr) {
+	if node.Updates == nil {
+		node.Updates = make([]Expr, 0)
+	}
+	node.Updates = append(node.Updates, val)
 }
 
 // Format implements the NodeFormatter interface.
@@ -1586,6 +1614,9 @@ func (node *IndirectionExpr) Format(ctx *FmtCtx) {
 		exprFmtWithParen(ctx, node.Expr)
 	}
 	ctx.FormatNode(&node.Indirection)
+	if node.Assign {
+		ctx.WriteString(" ASSIGN ")
+	}
 }
 
 type annotateSyntaxMode int

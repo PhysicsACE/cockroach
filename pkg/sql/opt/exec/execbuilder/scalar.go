@@ -480,16 +480,35 @@ func (b *Builder) buildIndirection(
 		return nil, err
 	}
 
-	indirections := make(tree.TypedExprs, len(indirection.Begin))
-	var e error
+	indirections := make(tree.ArraySubscripts, len(indirection.Begin))
 	for i := range indirection.Begin {
-		indirections[i], e = b.buildScalar(ctx, indirection.Begin[i])
-		if e != nil {
-			return nil, e
+		begin, err := b.buildScalar(ctx, indirection.Begin[i])
+		if err != nil {
+			return nil, err
+		}
+
+		end, err := b.buildScalar(ctx, indirection.End[i])
+		if err != nil {
+			return nil, err
+		}
+
+		indirections[i] = &tree.ArraySubscript{
+			Begin: begin,
+			End: end,
+			Slice: indirection.Slice,
 		}
 	}
 
-	return tree.NewTypedIndirectionExpr(expr, indirections[0], scalar.DataType()), nil
+	updates := make(tree.TypedExprs, 0)
+	for i := range indirection.Updates {
+		updateExpr, err := b.buildScalar(ctx, indirection.Updates[i])
+		if err != nil {
+			return nil, err
+		}
+		updates = append(updates, updateExpr)
+	}
+
+	return tree.NewTypedIndirectionExpr(expr, indirections, updates, indirection.Slice, scalar.DataType()), nil
 }
 
 func (b *Builder) buildCollate(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {

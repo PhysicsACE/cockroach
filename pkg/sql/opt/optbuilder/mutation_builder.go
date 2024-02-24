@@ -208,6 +208,17 @@ type mutationBuilder struct {
 	// inputForInsertExpr stores the result of outscope.expr from the most
 	// recent call to buildInputForInsert.
 	inputForInsertExpr memo.RelExpr
+
+	// Mapping from a table column to the indirectionexpr responsible 
+	// for outputing the correct subscription update
+	refAgg map[opt.ColumnID]*tree.IndirectionExpr
+
+	// If it is not possible to perform a subscription update in the current
+	// scope (ie subscription updates with values being provided by a 
+	// correlated subquery), we promote that column and treat it as a 
+	// generated computed column. A projection is built on top of the input
+	// for the expr to properly evaluate all updates.
+	generatedCols opt.ColSet
 }
 
 func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias tree.TableName) {
@@ -237,6 +248,8 @@ func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias 
 
 	// Add the table and its columns (including mutation columns) to metadata.
 	mb.tabID = mb.md.AddTable(tab, &mb.alias)
+	mb.refAgg = make(map[opt.ColumnID]*tree.IndirectionExpr)
+	mb.generatedCols = opt.ColSet{}
 }
 
 // setFetchColIDs sets the list of columns that are fetched in order to provide
@@ -533,6 +546,83 @@ func (mb *mutationBuilder) addTargetCol(ord int) {
 	mb.targetColSet.Add(colID)
 
 	mb.targetColList = append(mb.targetColList, colID)
+}
+
+// addTargetColsByColumnRefs adds one target column for each of the columnrefs
+// given in the list. It also tracks and accumulates multiple subscription 
+// mutations for the same column to output a single column. 
+func (mb *mutationBuilder) addTargetColsByColumnRefs(refs tree.ColumnRefList) {
+	for _, ref := range refs {
+		name := ref.Name
+		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
+			if mb.tab.Column(ord).Kind() == cat.System {
+				panic(pgerror.Newf(pgcode.InvalidColumnReference, "cannot modify system column %q", name))
+			}
+			
+			tabCol := mb.tab.Column(ord)
+			if tabCol.IsMutation() {
+				panic(makeBackfillError(tabCol.ColName()))
+			}
+
+			if tabCol.IsComputed() {
+				panic(schemaexpr.CannotWriteToComputedColError(string(tabCol.ColName())))
+			}
+
+			colID := mb.tabID.ColumnID(ord)
+			if ref.Subscripts != nil {
+				if _, ok := mb.refAgg[colID]; !ok {
+					mb.refAgg[colID] = &tree.IndirectionExpr{
+						Expr: &tree.UnresolvedName{
+							NumParts: 1,
+							Parts:    tree.NameParts{string(name)},
+						},
+						Assign: true,
+					}
+				}
+				mb.refAgg[colID].AddAdditionalPath(ref.Subscripts)
+			}
+
+			if mb.targetColSet.Contains(colID) {
+				if ref.Subscripts == nil {
+					panic(pgerror.Newf(pgcode.Syntax,
+						"multiple assignments to the same column %q", tabCol.ColName()))
+				}
+			}
+
+			mb.targetColSet.Add(colID)
+			mb.targetColList = append(mb.targetColList, colID)
+		}
+	}
+}
+
+func (mb *mutationBuilder) addGeneratedColsForUpdate() {
+	mb.addGeneratedColsImpl(mb.updateColIDs)
+}
+
+func (mb *mutationBuilder) addGeneratedColsForInsert() {
+	mb.addGeneratedColsImpl(mb.insertColIDs)
+}
+
+// addGeneratedCols adds generated columns as a projection over the update cols
+// to properly compute the new updated values. This is currently used when 
+// container types are updated through subscripts and are receiving update 
+// values through subquries
+func (mb *mutationBuilder) addGeneratedColsImpl(colList opt.OptionalColList) {
+	if mb.generatedCols.Len() > 0 {
+		pb := makeProjectionBuilder(mb.b, mb.outScope)
+		mb.generatedCols.ForEach(func(colID opt.ColumnID) {
+			ord := mb.tabID.ColumnOrdinal(colID)
+			targetCol := mb.tab.Column(ord)
+			targetColName := targetCol.ColName()
+			colName := scopeColName(targetColName).WithMetadataName(
+				string(targetColName) + "_new",
+			)
+			expr := mb.refAgg[colID]
+			newCol, _ := pb.Add(colName, expr, targetCol.DatumType())
+			colList[ord] = newCol
+		})
+		mb.outScope = pb.Finish()
+	}
 }
 
 // extractValuesInput tests whether the given input is a VALUES clause with no
