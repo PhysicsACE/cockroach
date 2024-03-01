@@ -143,23 +143,6 @@ $result
 =>
 $result
 
-# FoldIndirection eliminates a constant array indirection operator applied to an
-# array with a statically known number of elements, like this:
-#
-#   ARRAY[i, i+1][1]
-#   ARRAY[1, 2, 3][2]
-#
-# The rule replaces the indirection operator with the referenced array element.
-[FoldIndirection, Normalize]
-(Indirection
-    $input:*
-    $index:* &
-        (IsConstValueOrGroupOfConstValues $index) &
-        (Let ($result $ok):(FoldIndirection $input $index) $ok)
-)
-=>
-$result
-
 # FoldColumnAccess eliminates a column access operator applied to a tuple value
 # that is statically constructed, like this:
 #

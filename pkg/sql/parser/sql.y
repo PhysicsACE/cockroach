@@ -300,6 +300,9 @@ func (u *sqlSymUnion) shardedIndexDef() *tree.ShardedIndexDef {
 func (u *sqlSymUnion) nameList() tree.NameList {
     return u.val.(tree.NameList)
 }
+func (u *sqlSymUnion) columnRefList() tree.ColumnRefList {
+  return u.val.(tree.ColumnRefList)
+}
 func (u *sqlSymUnion) enumValueList() tree.EnumValueList {
     return u.val.(tree.EnumValueList)
 }
@@ -323,6 +326,9 @@ func (u *sqlSymUnion) tableNames() tree.TableNames {
 }
 func (u *sqlSymUnion) indexFlags() *tree.IndexFlags {
     return u.val.(*tree.IndexFlags)
+}
+func (u *sqlSymUnion) columnRef() tree.ColumnRef {
+    return u.val.(tree.ColumnRef)
 }
 func (u *sqlSymUnion) arraySubscript() *tree.ArraySubscript {
     return u.val.(*tree.ArraySubscript)
@@ -1484,6 +1490,8 @@ func (u *sqlSymUnion) showFingerprintOptions() *tree.ShowFingerprintOptions {
 %type <tree.UpdateExprs> set_clause_list
 %type <*tree.UpdateExpr> set_clause multiple_set_clause
 %type <tree.ArraySubscripts> array_subscripts
+%type <tree.ColumnRef> column_ref
+%type <tree.ColumnRefList> column_ref_list
 %type <tree.GroupBy> group_clause
 %type <tree.Exprs> group_by_list
 %type <tree.Expr> group_by_item
@@ -12610,16 +12618,35 @@ set_clause:
 | multiple_set_clause
 
 single_set_clause:
-  column_name '=' a_expr
+  column_ref '=' a_expr
   {
-    $$.val = &tree.UpdateExpr{Names: tree.NameList{tree.Name($1)}, Expr: $3.expr()}
+    $$.val = &tree.UpdateExpr{ColumnRefs: tree.ColumnRefList{$1.columnRef()}, Expr: $3.expr()}
   }
-| column_name '.' error { return unimplementedWithIssue(sqllex, 27792) }
 
 multiple_set_clause:
-  '(' insert_column_list ')' '=' in_expr
+  '(' column_ref_list ')' '=' in_expr
   {
-    $$.val = &tree.UpdateExpr{Tuple: true, Names: $2.nameList(), Expr: $5.expr()}
+    $$.val = &tree.UpdateExpr{Tuple: true, ColumnRefs: $2.columnRefList(), Expr: $5.expr()}
+  }
+
+column_ref:
+  column_name
+  {
+    $$.val = tree.ColumnRef{Name: tree.Name($1)}
+  }
+| column_name array_subscripts
+  {
+    $$.val = tree.ColumnRef{Name: tree.Name($1), Subscripts: $2.arraySubscripts()}
+  }
+
+column_ref_list:
+  column_ref
+  {
+    $$.val = tree.ColumnRefList{$1.columnRef()}
+  }
+| column_ref_list ',' column_ref
+  {
+    $$.val = append($1.columnRefList(), $3.columnRef())
   }
 
 // %Help: REASSIGN OWNED BY - change ownership of all objects
@@ -16323,7 +16350,7 @@ opt_slice_bound:
   a_expr
 | /*EMPTY*/
   {
-    $$.val = tree.Expr(nil)
+    $$.val = tree.DNull
   }
 
 array_subscripts:

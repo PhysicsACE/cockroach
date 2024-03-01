@@ -720,6 +720,69 @@ func (b *Builder) checkPrivilege(name opt.MDDepName, ds cat.DataSource, priv pri
 	b.factory.Metadata().AddDependency(name, ds, priv)
 }
 
+// Convert a partial update or insert into an executable assignment. If a 
+// column is updated or have values inserted multiple times in a single statement
+// the individual updates will be stacked together into a singluar expression. See
+// the logic for IndirectionExpr in buildScalar for more details.
+func (b *Builder) constructAssignment(
+	input opt.ScalarExpr,
+	subs tree.ArraySubscripts,
+	value tree.Expr,
+	inScope *scope,
+	colRefs *opt.ColSet,
+) opt.ScalarExpr {
+	if len(subs) == 1 {
+		subscript := subs[0]
+		begin := memo.ScalarListExpr{
+			b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		}
+		end := memo.ScalarListExpr{
+			b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		}
+		assignment := memo.ScalarListExpr{
+			b.buildScalar(value.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		}
+		return b.factory.ConstructIndirection(
+			input,
+			begin,
+			end,
+			assignment,
+			subscript.Slice,
+		)
+	} else {
+		subscript := subs[0]
+		begin := memo.ScalarListExpr{
+			b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		}
+		end := memo.ScalarListExpr{
+			b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		}
+		forward := b.factory.ConstructIndirection(
+			input,
+			begin,
+			end,
+			memo.EmptyScalarListExpr,
+			subscript.Slice,
+		)
+		assignment := memo.ScalarListExpr{
+			b.constructAssignment(
+				forward,
+				subs[1:],
+				value,
+				inScope,
+				colRefs,
+			),
+		}
+		return b.factory.ConstructIndirection(
+			input,
+			begin,
+			end,
+			assignment,
+			subscript.Slice,
+		)
+	}
+}
+
 // resolveNumericColumnRefs converts a list of tree.ColumnIDs from a
 // tree.TableRef to a list of ordinal positions within the given table. Mutation
 // columns are not visible. See tree.Table for more information on column

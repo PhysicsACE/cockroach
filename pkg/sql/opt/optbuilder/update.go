@@ -132,7 +132,7 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 	}
 
 	for _, expr := range exprs {
-		mb.addTargetColsByName(expr.Names)
+		mb.addTargetColsByColumnRefs(expr.ColumnRefs)
 
 		if expr.Tuple {
 			n := -1
@@ -143,8 +143,8 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				// Use the data types of the target columns to resolve expressions
 				// with ambiguous types (e.g. should 1 be interpreted as an INT or
 				// as a FLOAT).
-				desiredTypes := make([]*types.T, len(expr.Names))
-				targetIdx := len(mb.targetColList) - len(expr.Names)
+				desiredTypes := make([]*types.T, len(expr.ColumnRefs))
+				targetIdx := len(mb.targetColList) - len(expr.ColumnRefs)
 				for i := range desiredTypes {
 					desiredTypes[i] = mb.md.ColumnMeta(mb.targetColList[targetIdx+i]).Type
 				}
@@ -159,10 +159,10 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				panic(unimplementedWithIssueDetailf(35713, fmt.Sprintf("%T", expr.Expr),
 					"source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression; not supported: %T", expr.Expr))
 			}
-			if len(expr.Names) != n {
+			if len(expr.ColumnRefs) != n {
 				panic(pgerror.Newf(pgcode.Syntax,
 					"number of columns (%d) does not match number of values (%d)",
-					len(expr.Names), n))
+					len(expr.ColumnRefs), n))
 			}
 		}
 	}
@@ -234,6 +234,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	n := 0
 	subquery := 0
 	for _, set := range exprs {
+		// subscriptFlag := false
 		if set.Tuple {
 			switch t := set.Expr.(type) {
 			case *tree.Subquery:
@@ -243,9 +244,25 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 				// Type check and rename columns.
 				for i := range subqueryScope.cols {
-					ord := mb.tabID.ColumnOrdinal(mb.targetColList[n])
+					colID := mb.targetColList[n]
+					ord := mb.tabID.ColumnOrdinal(colID)
 					targetCol := mb.tab.Column(ord)
 					subqueryScope.cols[i].name = scopeColName(targetCol.ColName())
+
+					// if _, ok := mb.refAgg[colID]; ok {
+					// 	generatedExpr := &tree.UnresolvedName{
+					// 		NumParts: 1,
+					// 		Parts:    tree.NameParts{string(targetCol.ColName())},
+					// 	}
+					// 	mb.refAgg[colID].AddAdditionalUpdate(generatedExpr)
+					// 	mb.generatedCols.Add(colID)
+					// 	subscriptFlag = true
+					// }
+
+					// if subscriptFlag {
+					// 	n++
+					// 	continue
+					// }
 
 					// Add the column ID to the list of columns to update.
 					mb.updateColIDs[ord] = subqueryScope.cols[i].id
@@ -272,19 +289,74 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 				projectionsScope.appendColumnsFromScope(subqueryScope)
 
 			case *tree.Tuple:
-				for _, expr := range t.Exprs {
-					addCol(expr, mb.targetColList[n])
+				for i := range set.ColumnRefs {
+					// colID := mb.targetColList[n]
+					// if len(ref.Subscripts) > 0 {
+					// 	mb.refAgg[colID].AddAdditionalUpdate(t.Exprs[i])
+					// 	subscriptFlag = true
+					// }
+
+					// if subscriptFlag {
+					// 	n++
+					// 	continue
+					// }
+
+					addCol(t.Exprs[i], mb.targetColList[n])
 					n++
 				}
 			}
 		} else {
-			addCol(set.Expr, mb.targetColList[n])
+			// expr := set.Expr
+			// if len(set.ColumnRefs) > 0 {
+			// 	panic(errors.AssertionFailedf("expected <= 1 column ref, found %d", len(set.ColumnRefs)))
+			// }
+			// colID := mb.targetColList[n]
+			// for _, ref := range set.ColumnRefs {
+			// 	if len(ref.Subscripts) > 0 {
+			// 		mb.refAgg[colID].AddAdditionalUpdate(expr)
+			// 		subscriptFlag = true
+			// 	}
+			// }
+
+			// if subscriptFlag {
+			// 	n++
+			// 	continue
+			// }
+
+			// expr := set.Expr
+			// if len(set.ColumnRefs) > 0 {
+			// 	panic(errors.AssertionFailedf("expected <= 1 column ref, found %d", len(set.ColumnRefs)))
+			// }
+
+			expr := set.Expr
+
+			for _, ref := range set.ColumnRefs {
+				if len(ref.Subscripts) > 0 {
+					expr = &tree.IndirectionExpr{
+						Expr: &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{string(ref.Name)}},
+						Indirection: ref.Subscripts,
+					}
+				}
+			}
+
+			addCol(expr, mb.targetColList[n])
 			n++
 		}
 	}
 
+	// for colID, expr := range mb.refAgg {
+	// 	if mb.generatedCols.Contains(colID) {
+	// 		continue
+	// 	}
+	// 	addCol(expr, colID)
+	// }
+
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 	mb.outScope = projectionsScope
+
+	// if mb.generatedCols.Len() > 0 {
+	// 	mb.addGeneratedColsForUpdate()
+	// }
 
 	// Add assignment casts for update columns.
 	mb.addAssignmentCasts(mb.updateColIDs)

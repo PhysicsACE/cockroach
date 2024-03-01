@@ -293,6 +293,10 @@ func (e *evaluator) EvalIndirectionExpr(
 ) (tree.Datum, error) {
 	var subscriptIdx int
 
+	if expr.Assign {
+		return nil, errors.AssertionFailedf("assignment not supported yet")
+	}
+
 	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err

@@ -178,16 +178,42 @@ func (b *Builder) buildScalar(
 
 		out = b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
 
+		// if t.Assign {
+		// 	for i, path := range t.Paths {
+		// 		out = b.constructAssignment(
+		// 			out,
+		// 			path,
+		// 			t.Updates[i],
+		// 			inScope,
+		// 			colRefs,
+		// 		)
+		// 	}
+		// } else {
 		for _, subscript := range t.Indirection {
-			if subscript.Slice {
-				panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
+			// if subscript.Slice {
+			// 	panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
+			// }
+
+			begin := memo.ScalarListExpr{
+				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			}
+			end := memo.ScalarListExpr{
+				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			}
+
+			values := memo.ScalarListExpr{
+				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
 			}
 
 			out = b.factory.ConstructIndirection(
 				out,
-				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				begin,
+				end,
+				values,
+				subscript.Slice,
 			)
 		}
+		// }
 
 	case *tree.IfErrExpr:
 		cond := b.buildScalar(t.Cond.(tree.TypedExpr), inScope, nil, nil, colRefs)
