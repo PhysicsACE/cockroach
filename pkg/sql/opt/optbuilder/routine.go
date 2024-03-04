@@ -191,11 +191,35 @@ func (b *Builder) buildRoutine(
 
 	// Build the argument expressions.
 	var args memo.ScalarListExpr
-	if len(f.Exprs) > 0 {
-		args = make(memo.ScalarListExpr, len(f.Exprs))
-		for i, pexpr := range f.Exprs {
+	var argDefaults map[int]string
+	if len(f.ResExprs) > 0 {
+		args = make(memo.ScalarListExpr, len(f.ResExprs))
+		for i, pexpr := range f.ResExprs {
+			if _, ok := pexpr.(*tree.DefaultVal); ok {
+				if argDefaults == nil {
+					argDefaults = f.ResolvedOverload().Types.GetDefaults()
+				}
+				defaultStr := argDefaults[i]
+				parsedDefault, err := parser.ParseExpr(defaultStr)
+				if err != nil {
+					panic(err)
+				}
+				typ, err := parsedDefault.TypeCheck(b.ctx, b.semaCtx, types.Any)
+				if err != nil {
+					panic(err)
+				}
+				args[i] = b.buildScalar(
+					typ,
+					inScope,
+					nil,
+					nil,
+					colRefs,
+				)
+				continue
+			}
+
 			args[i] = b.buildScalar(
-				pexpr.(tree.TypedExpr),
+				pexpr,
 				inScope,
 				nil, /* outScope */
 				nil, /* outCol */
@@ -215,16 +239,22 @@ func (b *Builder) buildRoutine(
 	bodyScope := b.allocScope()
 	var params opt.ColList
 	if o.Types.Length() > 0 {
-		paramTypes, ok := o.Types.(tree.ParamTypes)
+		paramTypes, ok := o.Types.(tree.ParamTypesWithModes)
 		if !ok {
 			panic(unimplemented.NewWithIssue(88947,
-				"variadiac user-defined functions are not yet supported"))
+				"Incorrect parameter format returned. Should not have happened"))
+		}
+		conditionalType := func(t *types.T, variadic bool) *types.T {
+			if variadic {
+				return types.MakeArray(t)
+			}
+			return t
 		}
 		params = make(opt.ColList, len(paramTypes))
 		for i := range paramTypes {
 			paramType := &paramTypes[i]
 			argColName := funcParamColName(tree.Name(paramType.Name), i)
-			col := b.synthesizeColumn(bodyScope, argColName, paramType.Typ, nil /* expr */, nil /* scalar */)
+			col := b.synthesizeColumn(bodyScope, argColName, conditionalType(paramType.Typ, paramType.IsVariadic), nil /* expr */, nil /* scalar */)
 			col.setParamOrd(i)
 			params[i] = col.id
 		}
@@ -306,7 +336,7 @@ func (b *Builder) buildRoutine(
 		}
 		var expr memo.RelExpr
 		var physProps *physical.Required
-		plBuilder := newPLpgSQLBuilder(b, def.Name, colRefs, o.Types.(tree.ParamTypes), rtyp)
+		plBuilder := newPLpgSQLBuilder(b, def.Name, colRefs, o.Types.(tree.ParamTypesWithModes), rtyp)
 		stmtScope := plBuilder.buildRootBlock(stmt.AST, bodyScope)
 		finishResolveType(stmtScope)
 		expr, physProps, isMultiColDataSource =

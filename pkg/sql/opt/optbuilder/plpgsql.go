@@ -173,7 +173,7 @@ func newPLpgSQLBuilder(
 	ob *Builder,
 	routineName string,
 	colRefs *opt.ColSet,
-	params []tree.ParamType,
+	params []tree.ParamTypeWithModes,
 	returnType *types.T,
 ) *plpgsqlBuilder {
 	const initialBlocksCap = 2

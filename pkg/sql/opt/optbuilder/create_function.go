@@ -167,7 +167,7 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 	// named parameters to the scope so that references to them in the body can
 	// be resolved.
 	bodyScope := b.allocScope()
-	var paramTypes tree.ParamTypes
+	var paramTypes tree.ParamTypesWithModes
 	var outParamTypes []*types.T
 	// When multiple OUT parameters are present, parameter names become the
 	// labels in the output RECORD type.
@@ -213,7 +213,7 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 
 		// Collect the parameters for PLpgSQL routines.
 		if language == tree.RoutineLangPLpgSQL {
-			paramTypes = append(paramTypes, tree.ParamType{
+			paramTypes = append(paramTypes, tree.ParamTypeWithModes{
 				Name: param.Name.String(),
 				Typ:  typ,
 			})

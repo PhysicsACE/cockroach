@@ -16,15 +16,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -107,17 +108,54 @@ func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
 	for i, param := range n.Params {
 		// TODO(chengxiong): create `FunctionParamDefaultExpression` element when
 		// default parameter default expression is enabled.
+		paramType := b.ResolveTypeRef(param.Type)
 		if param.DefaultVal != nil {
-			panic(unimplemented.NewWithIssue(100962, "default value"))
+			defaultExpr, err := schemaexpr.SanitizeVarFreeExpr(
+				b,
+				param.DefaultVal,
+				paramType.Type,
+				"DEFAULT",
+				b.SemaCtx(),
+				volatility.Volatile,
+				true,
+			)
+
+			if err != nil {
+				panic(pgerror.Newf(pgcode.InvalidParameterValue, "UDF parameter default expr cannot have variables"))
+			}
+
+			var visitor tree.UDFDisallowanceVisitor
+			tree.WalkExpr(&visitor, defaultExpr)
+			if visitor.FoundUDF {
+				panic(pgerror.Newf(pgcode.InvalidFunctionDefinition, "Cannot reference UDF inside default value expression"))
+			}
+
+			defExpr := &scpb.Expression{
+				Expr: catpb.Expression(tree.Serialize(defaultExpr)),
+			}
+			
+			b.Add(&scpb.FunctionParamDefaultExpression{
+				FunctionID: fnID,
+				Ordinal: uint32(i),
+				Expression: *defExpr,
+			})
 		}
 		paramCls, err := funcinfo.ParamClassToProto(param.Class)
 		if err != nil {
 			panic(err)
 		}
+		if paramCls == catpb.Function_Param_VARIADIC {
+			if !(paramType.Type.Family() == types.ArrayFamily) {
+				panic(pgerror.Newf(pgcode.InvalidFunctionDefinition, "VARIADIC parameter must be an array"))
+			}
+
+			arrType := paramType.Type.ArrayContents()
+			paramType = b.ResolveTypeRef(arrType)
+		}
 		fn.Params[i] = scpb.Function_Parameter{
 			Name:  string(param.Name),
 			Class: catpb.FunctionParamClass{Class: paramCls},
-			Type:  b.ResolveTypeRef(param.Type),
+			Type:  paramType,
 		}
 	}
 

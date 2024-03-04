@@ -104,8 +104,10 @@ func (i *immediateVisitor) SetFunctionBody(ctx context.Context, op scop.SetFunct
 func (i *immediateVisitor) SetFunctionParamDefaultExpr(
 	ctx context.Context, op scop.SetFunctionParamDefaultExpr,
 ) error {
-	// TODO(chengxiong): when default parameter value is supported, we need to
-	// address references here because functions, types and sequences can be used
-	// with a default value expression.
+	fn, err := i.checkOutFunction(ctx, op.Expr.FunctionID)
+	if err != nil {
+		return err
+	}
+	fn.SetParamDefaultExpr(int(op.Expr.Ordinal), string(op.Expr.Expression.Expr))
 	return nil
 }

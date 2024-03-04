@@ -1179,6 +1179,9 @@ func (expr *FuncExpr) TypeCheck(
 	s := getOverloadTypeChecker(
 		(*qualifiedOverloads)(&def.Overloads), expr.Exprs...,
 	)
+	if (expr.IsVariadic) {
+		s.variadic = true
+	}
 	defer s.release()
 
 	if err := func() error {
@@ -1372,6 +1375,47 @@ func (expr *FuncExpr) TypeCheck(
 	for i, subExpr := range s.typedExprs {
 		expr.Exprs[i] = subExpr
 	}
+
+	srcParams := overloadImpl.params()
+	typeNames := make([]TypedExpr, srcParams.Length())
+	variableSeen := 0
+	var seenIdxs intsets.Fast
+	defaultList := srcParams.GetDefaults()
+
+	if (srcParams.Length() > 0) {
+		seenIdxs.AddRange(0, srcParams.Length() - 1)
+	}
+
+	if (srcParams.Length() < len(s.typedExprs)) {
+		variadicArray := NewTypedArray(s.typedExprs[srcParams.Length() - 1:], types.MakeArray(srcParams.variadicType()))
+		typeNames[len(typeNames) - 1] = variadicArray
+		variableSeen = len(s.typedExprs) - srcParams.Length() + 1
+		seenIdxs.Remove(srcParams.Length() - 1)
+	}
+
+	for idx, expr := range s.typedExprs[:len(s.typedExprs) - variableSeen] {
+
+		seenIdxs.Remove(idx)
+
+		if (idx == srcParams.Length() - 1 && srcParams.AcceptsVariadic()) {
+			variadicArray := NewTypedArray(s.typedExprs[idx:idx + 1], types.MakeArray(srcParams.variadicType()))
+			typeNames[idx] = variadicArray
+			continue
+		}
+
+		typeNames[idx] = expr
+	}
+
+	for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
+
+		if _ , ok := defaultList[i]; ok {
+			typeNames[i] = &DefaultVal{}
+			continue
+		}
+
+	}
+
+	expr.ResExprs = typeNames
 
 	expr.Func.FunctionReference = def
 	expr.fn = overloadImpl
@@ -3444,6 +3488,61 @@ func getMostSignificantOverload(
 		return qualifiedOverloads[oImpls[matchIdx]], nil
 	}
 
+	checkSigAmbiguity := func(ov1 []*types.T, ov2 []*types.T) bool {
+		if (len(ov1) != len(ov2)) {
+			return false
+		}
+		for i := 0; i < len(ov1); i++ {
+			if !(ov1[i].Identical(ov2[i])) {
+				return false
+			}
+		}
+		return true
+	}
+
+	preferentialOverload := func(oImpls []uint8) (QualifiedOverload, error) {
+
+		if len(oImpls) == 1 {
+			return qualifiedOverloads[oImpls[0]], nil
+		}
+		found := false
+		var ret QualifiedOverload
+		var exact int
+		for _, idx := range filter {
+			r := qualifiedOverloads[idx]
+			if !(found) {
+				found = true
+				ret = r
+				exact = r.params().numExact(typedInputExprs)
+				continue
+			}
+			srcParams := r.params()
+			prevParams := ret.params()
+			prevSig := prevParams.inputSig(typedInputExprs)
+			srcSig := srcParams.inputSig(typedInputExprs)
+			numMatches := srcParams.numExact(typedInputExprs)
+			if (checkSigAmbiguity(prevSig, srcSig)) {
+				if (srcParams.AcceptsVariadic() && prevParams.AcceptsVariadic()) {
+					return QualifiedOverload{}, ambiguousError()
+				}
+				if srcParams.AcceptsVariadic() {
+					continue
+				}
+				if prevParams.AcceptsVariadic() {
+					ret = r
+					exact = numMatches
+					continue
+				}
+				return QualifiedOverload{}, ambiguousError()
+			}
+			if (numMatches > exact) {
+				ret = r
+				exact = numMatches
+			}
+		}
+		return ret, nil
+	}
+
 	if searchPath == nil || searchPath == EmptySearchPath {
 		return checkAmbiguity(filter)
 	}
@@ -3465,7 +3564,7 @@ func getMostSignificantOverload(
 		seenSchema = o.Schema
 	}
 
-	if !udfFound || uniqueSchema {
+	if !udfFound {
 		// If there is no UDF, there is no need to go through the search path. This
 		// is based on the fact that pg_catalog is either implicitly or explicitly
 		// in the search path. And there are quite a few hacks which make builtin
@@ -3480,21 +3579,28 @@ func getMostSignificantOverload(
 		return checkAmbiguity(filter)
 	}
 
+	if uniqueSchema {
+		return preferentialOverload(filter)
+	}
+
 	found := false
-	var ret QualifiedOverload
+	var retDef QualifiedOverload
 	for i, n := 0, searchPath.NumElements(); i < n; i++ {
 		schema := searchPath.GetSchema(i)
+		schemaFilter := make([]uint8, 0)
 		for _, idx := range filter {
 			if r := qualifiedOverloads[idx]; r.Schema == schema {
-				if found {
-					return QualifiedOverload{}, ambiguousError()
-				}
-				found = true
-				ret = r
+				schemaFilter = append(schemaFilter, idx)
 			}
 		}
-		if found {
-			break
+		if (len(schemaFilter) > 0) {
+			ret, err := preferentialOverload(schemaFilter)
+
+			if err != nil {
+				return QualifiedOverload{}, err
+			}
+
+			return ret, nil
 		}
 	}
 	if !found {
@@ -3503,7 +3609,7 @@ func getMostSignificantOverload(
 		// explicit schema, but get some function from other schemas are fetched.
 		return QualifiedOverload{}, pgerror.Newf(pgcode.UndefinedFunction, "unknown signature: %s", getFuncSig())
 	}
-	return ret, nil
+	return retDef, nil
 }
 
 // UnsupportedTypeChecker is used to check that a type is supported by the

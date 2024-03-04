@@ -1738,6 +1738,11 @@ func TestSchemaChangeComparator_subquery_correlated(t *testing.T) {
 	var logicTestFile = "pkg/sql/logictest/testdata/logic_test/subquery_correlated"
 	runSchemaChangeComparatorTest(t, logicTestFile)
 }
+func TestSchemaChangeComparator_subscription(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	var logicTestFile = "pkg/sql/logictest/testdata/logic_test/subscription"
+	runSchemaChangeComparatorTest(t, logicTestFile)
+}
 func TestSchemaChangeComparator_synthetic_privileges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var logicTestFile = "pkg/sql/logictest/testdata/logic_test/synthetic_privileges"

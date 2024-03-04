@@ -5217,7 +5217,7 @@ value if you rely on the HLC for accuracy.`,
 		// This overload is provided for compatibility with CC Serverless
 		// v22.2 and previous versions.
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
@@ -5229,7 +5229,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		// This overload is provided for use in tests.
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "id", Typ: types.Int},
 				{Name: "name", Typ: types.String},
 			},
@@ -5241,7 +5241,7 @@ value if you rely on the HLC for accuracy.`,
 		},
 		// This overload is deprecated. Use CREATE VIRTUAL CLUSTER instead.
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
@@ -5261,7 +5261,7 @@ DO NOT USE -- USE 'CREATE VIRTUAL CLUSTER' INSTEAD`,
 			Undocumented: true,
 		},
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
@@ -5485,7 +5485,7 @@ DO NOT USE -- USE 'CREATE VIRTUAL CLUSTER' INSTEAD`,
 			DistsqlBlocklist: true,
 		},
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "descriptor_id", Typ: types.Int},
 				{Name: "corruption", Typ: types.String},
 			},
@@ -6751,7 +6751,7 @@ SELECT
 			DistsqlBlocklist: true,
 		},
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "names", Typ: types.String},
 				{Name: "number", Typ: types.Int},
 			},
@@ -6767,7 +6767,7 @@ generate_test_objects('{"names":pat, "counts":[num]}'::jsonb)
 			Language:   tree.RoutineLangSQL,
 		},
 		tree.Overload{
-			Types: tree.ParamTypes{
+			Types: tree.ParamTypesWithModes{
 				{Name: "names", Typ: types.String},
 				{Name: "counts", Typ: types.IntArray},
 			},

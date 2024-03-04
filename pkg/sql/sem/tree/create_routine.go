@@ -400,7 +400,7 @@ const (
 // parameter (i.e. either IN or INOUT).
 func IsInParamClass(class RoutineParamClass) bool {
 	switch class {
-	case RoutineParamIn, RoutineParamInOut:
+	case RoutineParamIn, RoutineParamInOut, RoutineParamVariadic:
 		return true
 	default:
 		return false

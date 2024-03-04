@@ -499,43 +499,19 @@ func (desc *immutable) GetObjectTypeString() string {
 // populated them.
 func (desc *immutable) GetResolvedFuncDefinition(
 	name string,
-) (*tree.ResolvedFunctionDefinition, bool) {
+) (*tree.ResolvedFunctionReferences, bool) {
 	funcDescPb, found := desc.GetFunction(name)
 	if !found {
 		return nil, false
 	}
-	funcDef := &tree.ResolvedFunctionDefinition{
+	funcDef := &tree.ResolvedFunctionReferences{
 		Name:      name,
-		Overloads: make([]tree.QualifiedOverload, 0, len(funcDescPb.Signatures)),
+		SignatureIds: make([]uint32, 0, len(funcDescPb.Signatures)),
+		Schema: desc.GetName(),
 	}
 	for i := range funcDescPb.Signatures {
 		sig := &funcDescPb.Signatures[i]
-		retType := sig.ReturnType
-		routineType := tree.UDFRoutine
-		if sig.IsProcedure {
-			routineType = tree.ProcedureRoutine
-		}
-		overload := &tree.Overload{
-			Oid: catid.FuncIDToOID(sig.ID),
-			ReturnType: func(args []tree.TypedExpr) *types.T {
-				return retType
-			},
-			Type:                     routineType,
-			UDFContainsOnlySignature: true,
-		}
-		if funcDescPb.Signatures[i].ReturnSet {
-			overload.Class = tree.GeneratorClass
-		}
-		paramTypes := make(tree.ParamTypes, 0, len(sig.ArgTypes))
-		for _, paramType := range sig.ArgTypes {
-			paramTypes = append(
-				paramTypes,
-				tree.ParamType{Typ: paramType},
-			)
-		}
-		overload.Types = paramTypes
-		prefixedOverload := tree.MakeQualifiedOverload(desc.GetName(), overload)
-		funcDef.Overloads = append(funcDef.Overloads, prefixedOverload)
+		funcDef.SignatureIds = append(funcDef.SignatureIds, uint32(sig.ID))
 	}
 
 	return funcDef, true
