@@ -419,17 +419,6 @@ type ParamTypeWithModes struct {
 
 // Match is part of the TypeList interface.
 func (p ParamTypesWithModes) Match(types []*types.T) bool {
-	if len(types) > len(p) {
-		if !p.AcceptsVariadic() {
-			return false
-		}
-
-		for i := len(p) - 1; i < len(types); i++ {
-			if !types[i].Equivalent(p[i].Typ) {
-				return false
-			}
-		}
-	}
 
 	var seenIdxs intsets.Fast
 	seenIdxs.AddRange(0, len(p) - 1)
@@ -450,6 +439,9 @@ func (p ParamTypesWithModes) Match(types []*types.T) bool {
 }
 
 func (p ParamTypesWithModes) MatchIdentical(types []*types.T) bool {
+	if len(types) != len(p) {
+		return false
+	}
 	for i := range types {
 		if !p.MatchAtIdentical(types[i], i) {
 			return false

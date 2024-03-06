@@ -787,9 +787,12 @@ subtest default_variadic
 statement ok
 CREATE FUNCTION f_97854 (i INT, j INT DEFAULT 2) RETURNS INT LANGUAGE SQL AS 'SELECT j';
 
+statement ok
+CREATE FUNCTION f_97854 (VARIADIC j int[]) RETURNS INT LANGUAGE SQL AS 'SELECT 5';
+
 query I
-SELECT f_97854(1)
+SELECT f_97854(1, 3, 4, 5)
 ----
-2
+5
 
 subtest end
