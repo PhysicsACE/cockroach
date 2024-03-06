@@ -9,6 +9,7 @@
 package backupccl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"runtime"
@@ -36,12 +37,9 @@ import (
 	bulkutil "github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -82,7 +80,7 @@ type restoreDataProcessor struct {
 	// Aggregator that aggregates StructuredEvents emitted in the
 	// restoreDataProcessors' trace recording.
 	agg      *bulkutil.TracingAggregator
-	aggTimer *timeutil.Timer
+	aggTimer timeutil.Timer
 
 	// qp is a MemoryBackedQuotaPool that restricts the amount of memory that
 	// can be used by this processor to open iterators on SSTs.
@@ -101,12 +99,6 @@ var (
 const restoreDataProcName = "restoreDataProcessor"
 
 const maxConcurrentRestoreWorkers = 32
-
-// sstReaderOverheadBytesPerFile and sstReaderEncryptedOverheadBytesPerFile were obtained
-// benchmarking external SST iterators on GCP and AWS and selecting the highest
-// observed memory per file.
-const sstReaderOverheadBytesPerFile = 5 << 20
-const sstReaderEncryptedOverheadBytesPerFile = 8 << 20
 
 // minWorkerMemReservation is the minimum amount of memory reserved per restore
 // data processor worker. It should be greater than
@@ -148,27 +140,6 @@ var numRestoreWorkers = settings.RegisterIntSetting(
 	settings.PositiveInt,
 )
 
-// restorePerProcessorMemoryLimit is the limit on the memory used by a
-// restoreDataProcessor. The actual limit is the lowest of this setting
-// and the limit determined by restorePerProcessorMemoryLimitSQLFraction
-// and --max-sql-memory.
-var restorePerProcessorMemoryLimit = settings.RegisterByteSizeSetting(
-	settings.ApplicationLevel,
-	"bulkio.restore.per_processor_memory_limit",
-	"limit on the amount of memory that can be used by a restore processor",
-	1<<30, // 1 GiB
-)
-
-// restorePerProcessorMemoryLimitSQLFraction is the maximum percentage of the
-// SQL memory pool that could be used by a restoreDataProcessor.
-var restorePerProcessorMemoryLimitSQLFraction = settings.RegisterFloatSetting(
-	settings.ApplicationLevel,
-	"bulkio.restore.per_processor_memory_limit_sql_fraction",
-	"limit on the amount of memory that can be used by a restore processor as a fraction of max SQL memory",
-	0.5,
-	settings.NonNegativeFloatWithMaximum(1.0),
-)
-
 func newRestoreDataProcessor(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
@@ -184,28 +155,7 @@ func newRestoreDataProcessor(
 		progCh:  make(chan backuppb.RestoreProgress, maxConcurrentRestoreWorkers),
 	}
 
-	var memMonitor *mon.BytesMonitor
-	var limit int64
-	if spec.MemoryMonitorSSTs {
-		limit = restorePerProcessorMemoryLimit.Get(&flowCtx.EvalCtx.Settings.SV)
-		sqlFraction := restorePerProcessorMemoryLimitSQLFraction.Get(&flowCtx.EvalCtx.Settings.SV)
-		sqlFractionLimit := int64(sqlFraction * float64(flowCtx.Cfg.RootSQLMemoryPoolSize))
-		if sqlFractionLimit < limit {
-			log.Infof(ctx, "using a maximum of %s memory per restore data processor (%f of max SQL memory %s)",
-				humanizeutil.IBytes(sqlFractionLimit), sqlFraction,
-				humanizeutil.IBytes(flowCtx.Cfg.RootSQLMemoryPoolSize))
-			limit = sqlFractionLimit
-		}
-
-		memMonitor = flowCtx.Cfg.BackupMonitor
-		if knobs, ok := flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {
-			if knobs.BackupMemMonitor != nil {
-				memMonitor = knobs.BackupMemMonitor
-			}
-		}
-	}
-
-	rd.qp = backuputils.NewMemoryBackedQuotaPool(ctx, memMonitor, "restore-mon", limit)
+	rd.qp = backuputils.NewMemoryBackedQuotaPool(ctx, flowCtx.Cfg.BackupMonitor, "restore-mon", 0)
 	if err := rd.Init(ctx, rd, post, restoreDataOutputTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{input},
@@ -228,7 +178,6 @@ func newRestoreDataProcessor(
 func (rd *restoreDataProcessor) Start(ctx context.Context) {
 	ctx = logtags.AddTag(ctx, "job", rd.spec.JobID)
 	rd.agg = bulkutil.TracingAggregatorForContext(ctx)
-	rd.aggTimer = timeutil.NewTimer()
 	// If the aggregator is nil, we do not want the timer to fire.
 	if rd.agg != nil {
 		rd.aggTimer.Reset(15 * time.Second)
@@ -348,11 +297,7 @@ type resumeEntry struct {
 }
 
 // openSSTs opens all files in entry starting from the resumeIdx and returns a
-// multiplexed SST iterator over the files. If memory monitoring is enabled and
-// opening an additional file would exceed the current memory budget, a partial
-// iterator over only the currently opened files would be returned, along with an
-// updated resume idx, which the caller should use with openSSTs again to get an
-// iterator over the remaining files.
+// multiplexed SST iterator over the files.
 func (rd *restoreDataProcessor) openSSTs(
 	ctx context.Context, entry execinfrapb.RestoreSpanEntry, resume *resumeEntry,
 ) (mergedSST, *resumeEntry, error) {
@@ -372,13 +317,12 @@ func (rd *restoreDataProcessor) openSSTs(
 
 	// getIter returns a multiplexed iterator covering the currently accumulated
 	// files over the channel.
-	getIter := func(iter storage.SimpleMVCCIterator, dirsToSend []cloud.ExternalStorage, iterAllocs []*quotapool.IntAlloc, completeUpTo hlc.Timestamp) (mergedSST, error) {
+	getIter := func(iter storage.SimpleMVCCIterator, dirsToSend []cloud.ExternalStorage, completeUpTo hlc.Timestamp) (mergedSST, error) {
 		readAsOfIter := storage.NewReadAsOfIterator(iter, rd.spec.RestoreTime)
 
 		cleanup := func() {
 			log.VInfof(ctx, 1, "finished with and closing %d files in span %d [%s-%s)", len(entry.Files), entry.ProgressIdx, entry.Span.Key, entry.Span.EndKey)
 			readAsOfIter.Close()
-			rd.qp.Release(iterAllocs...)
 
 			for _, dir := range dirsToSend {
 				if err := dir.Close(); err != nil {
@@ -401,13 +345,6 @@ func (rd *restoreDataProcessor) openSSTs(
 	log.VEventf(ctx, 1, "ingesting %d files in span %d [%s-%s)", len(entry.Files), entry.ProgressIdx, entry.Span.Key, entry.Span.EndKey)
 
 	storeFiles := make([]storageccl.StoreFile, 0, len(entry.Files))
-	iterAllocs := make([]*quotapool.IntAlloc, 0, len(entry.Files))
-	var sstOverheadBytesPerFile uint64
-	if rd.spec.Encryption != nil {
-		sstOverheadBytesPerFile = sstReaderEncryptedOverheadBytesPerFile
-	} else {
-		sstOverheadBytesPerFile = sstReaderOverheadBytesPerFile
-	}
 
 	idx := 0
 	if resume != nil {
@@ -416,48 +353,8 @@ func (rd *restoreDataProcessor) openSSTs(
 
 	for ; idx < len(entry.Files); idx++ {
 		file := entry.Files[idx]
+
 		log.VEventf(ctx, 2, "import file %s which starts at %s", file.Path, entry.Span.Key)
-
-		alloc, err := rd.qp.TryAcquireMaybeIncreaseCapacity(ctx, sstOverheadBytesPerFile)
-		if errors.Is(err, quotapool.ErrNotEnoughQuota) {
-			// If we failed to allocate more memory, send the iterator
-			// containing the files we have right now.
-			if len(storeFiles) > 0 {
-				iterOpts := storage.IterOptions{
-					RangeKeyMaskingBelow: rd.spec.RestoreTime,
-					KeyTypes:             storage.IterKeyTypePointsAndRanges,
-					LowerBound:           keys.LocalMax,
-					UpperBound:           keys.MaxKey,
-				}
-				iter, err := storageccl.ExternalSSTReader(ctx, storeFiles, rd.spec.Encryption, iterOpts)
-				if err != nil {
-					return mergedSST{}, nil, err
-				}
-
-				log.VInfof(ctx, 2, "sending iterator after %d out of %d files due to insufficient memory", idx, len(entry.Files))
-
-				// TODO(rui): this is a placeholder value to show that a span has been
-				// partially but not completely processed. Eventually this timestamp should
-				// be the actual timestamp that we have processed up to so far.
-				completeUpTo := hlc.Timestamp{Logical: 1}
-				mSST, err := getIter(iter, dirs, iterAllocs, completeUpTo)
-				res := &resumeEntry{
-					idx:  idx,
-					done: false,
-				}
-				return mSST, res, err
-			}
-
-			alloc, err = rd.qp.Acquire(ctx, sstOverheadBytesPerFile)
-			if err != nil {
-				return mergedSST{}, nil, err
-			}
-		} else if err != nil {
-			return mergedSST{}, nil, err
-		}
-
-		iterAllocs = append(iterAllocs, alloc)
-
 		dir, err := rd.flowCtx.Cfg.ExternalStorage(ctx, file.Dir)
 		if err != nil {
 			return mergedSST{}, nil, err
@@ -477,7 +374,7 @@ func (rd *restoreDataProcessor) openSSTs(
 		return mergedSST{}, nil, err
 	}
 
-	mSST, err := getIter(iter, dirs, iterAllocs, rd.spec.RestoreTime)
+	mSST, err := getIter(iter, dirs, rd.spec.RestoreTime)
 	res := &resumeEntry{
 		idx:  idx,
 		done: true,
@@ -559,6 +456,11 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 	iter := sst.iter
 	defer sst.cleanup()
 
+	elidedPrefix, err := elidedPrefix(entry.Span.Key, sst.entry.ElidedPrefix)
+	if err != nil {
+		return summary, err
+	}
+
 	var batcher SSTBatcherExecutor
 	if rd.spec.ValidateOnly {
 		batcher = &sstBatcherNoop{}
@@ -617,19 +519,36 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 	startKeyMVCC, endKeyMVCC := storage.MVCCKey{Key: entry.Span.Key},
 		storage.MVCCKey{Key: entry.Span.EndKey}
 
+	if elidedPrefix != nil {
+		startKeyMVCC.Key = bytes.TrimPrefix(startKeyMVCC.Key, elidedPrefix)
+	}
+	if verbose {
+		log.Infof(ctx, "reading from %s to %s", startKeyMVCC, endKeyMVCC)
+	}
 	for iter.SeekGE(startKeyMVCC); ; iter.NextKey() {
 		ok, err := iter.Valid()
 		if err != nil {
 			return summary, err
 		}
 
-		if !ok || !iter.UnsafeKey().Less(endKeyMVCC) {
+		if !ok {
+			if verbose {
+				log.Infof(ctx, "iterator exhausted")
+			}
 			break
 		}
 
 		key := iter.UnsafeKey()
-		keyScratch = append(keyScratch[:0], key.Key...)
+		keyScratch = append(append(keyScratch[:0], elidedPrefix...), key.Key...)
 		key.Key = keyScratch
+
+		if !key.Less(endKeyMVCC) {
+			if verbose {
+				log.Infof(ctx, "iterator key %s exceeded end %s", key, endKeyMVCC)
+			}
+			break
+		}
+
 		v, err := iter.UnsafeValue()
 		if err != nil {
 			return summary, err
