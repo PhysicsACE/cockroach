@@ -2017,13 +2017,6 @@ func TestLogic_subquery_correlated(
 	runLogicTest(t, "subquery_correlated")
 }
 
-func TestLogic_subscription(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "subscription")
-}
-
 func TestLogic_synthetic_privileges(
 	t *testing.T,
 ) {

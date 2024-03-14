@@ -733,6 +733,7 @@ func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 				Default: param.DefaultExpr,
 				IsVariadic: (param.Class == catpb.Function_Param_VARIADIC),
 			})
+		}
 		if tree.IsOutParamClass(class) {
 			paramName := param.Name
 			if paramName == "" {

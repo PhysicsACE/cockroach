@@ -162,6 +162,8 @@ func (w *walkCtx) newFunctionalExpression(expr string) (*scpb.Expression, error)
 		}
 	}
 
+	referencedColumns := catalog.TableColSet{}
+
 	referencedFnIDs, err := schemaexpr.GetUDFIDs(e)
 	if err != nil {
 		return nil, err
@@ -171,6 +173,7 @@ func (w *walkCtx) newFunctionalExpression(expr string) (*scpb.Expression, error)
 		UsesTypeIDs:         typIDs.Ordered(),
 		UsesSequenceIDs:     seqIDs.Ordered(),
 		UsesFunctionIDs:     referencedFnIDs.Ordered(),
+		ReferencedColumnIDs: referencedColumns.Ordered(),
 	}, nil
 }
 

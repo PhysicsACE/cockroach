@@ -42,9 +42,13 @@ func init() {
 					}
 					return &scop.UpdateFunctionRelationReferences{
 						FunctionID:      this.FunctionID,
+						TableReferences: []scpb.FunctionBody_TableReference{},
+						ViewReferences:  []scpb.FunctionBody_ViewReference{},
 						SequenceIDs:     this.UsesSequenceIDs,
 					}
 				}),
+				// TODO: When UDFs can be referenced by other UDFs, add associated
+				// operations here. 
 
 			),
 		),

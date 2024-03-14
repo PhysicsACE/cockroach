@@ -464,7 +464,7 @@ func (p ParamTypesWithModes) MatchAt(typ *types.T, i int) bool {
 
 func (p ParamTypesWithModes) MatchAtIdentical(typ *types.T, i int) bool {
 	if p.AcceptsVariadic() && i >= len(p) - 1 {
-		return (typ.Family() == types.UnknownFamily || p[len(p) - 1].Typ.Identical(typ))
+		return (typ.Family() == types.UnknownFamily || types.MakeArray(p[len(p) - 1].Typ).Identical(typ))
 	}
 
 	return i < len(p) && (typ.Family() == types.UnknownFamily || p[i].Typ.Identical(typ))

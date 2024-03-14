@@ -754,3 +754,12 @@ $$;
   to:   [Function:{DescID: 112}, PUBLIC]
   kind: Precedence
   rule: dependents exist before descriptor becomes public
+
+ops
+CREATE FUNCTION f(a int default nextval('sq1')) RETURNS INT VOLATILE LANGUAGE PLpgSQL AS $$
+  BEGIN
+  RETURN a;
+  END
+$$;
+----
+

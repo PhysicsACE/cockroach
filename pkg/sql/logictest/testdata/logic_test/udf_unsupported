@@ -147,9 +147,8 @@ subtest end
 
 subtest variadic
 
-# Variadic UDFS are not currently supported.
-statement error pgcode 0A000 unimplemented: this syntax\nHINT.*\n.*88947
-CREATE FUNCTION rec(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS '1'
+statement ok
+CREATE FUNCTION rec(VARIADIC arr INT[]) RETURNS INT LANGUAGE SQL AS 'SELECT 1'
 
 subtest end
 

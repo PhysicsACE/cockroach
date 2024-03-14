@@ -129,15 +129,11 @@ func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
 			if visitor.FoundUDF {
 				panic(pgerror.Newf(pgcode.InvalidFunctionDefinition, "Cannot reference UDF inside default value expression"))
 			}
-
-			defExpr := &scpb.Expression{
-				Expr: catpb.Expression(tree.Serialize(defaultExpr)),
-			}
 			
 			b.Add(&scpb.FunctionParamDefaultExpression{
 				FunctionID: fnID,
 				Ordinal: uint32(i),
-				Expression: *defExpr,
+				Expression: *b.WrapExpression(fnID, defaultExpr),
 			})
 		}
 		paramCls, err := funcinfo.ParamClassToProto(param.Class)
