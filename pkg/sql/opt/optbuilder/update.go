@@ -234,7 +234,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	n := 0
 	subquery := 0
 	for _, set := range exprs {
-		// subscriptFlag := false
+		subscriptFlag := false
 		if set.Tuple {
 			switch t := set.Expr.(type) {
 			case *tree.Subquery:
@@ -332,11 +332,17 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 			for _, ref := range set.ColumnRefs {
 				if len(ref.Subscripts) > 0 {
-					expr = &tree.IndirectionExpr{
-						Expr: &tree.UnresolvedName{NumParts: 1, Parts: tree.NameParts{string(ref.Name)}},
-						Indirection: ref.Subscripts,
+					if _, ok := mb.refAgg[mb.targetColList[n]]; ok {
+						mb.refAgg[mb.targetColList[n]].AddAdditionalUpdate(expr)
+						// addCol(mb.refAgg[mb.targetColList[n]], mb.targetColList[n])
+						subscriptFlag = true
 					}
 				}
+			}
+
+			if subscriptFlag {
+				n++
+				continue
 			}
 
 			addCol(expr, mb.targetColList[n])
@@ -344,12 +350,12 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 		}
 	}
 
-	// for colID, expr := range mb.refAgg {
-	// 	if mb.generatedCols.Contains(colID) {
-	// 		continue
-	// 	}
-	// 	addCol(expr, colID)
-	// }
+	for colID, expr := range mb.refAgg {
+		if mb.generatedCols.Contains(colID) {
+			continue
+		}
+		addCol(expr, colID)
+	}
 
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 	mb.outScope = projectionsScope

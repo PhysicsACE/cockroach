@@ -12,6 +12,7 @@ package eval
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -293,16 +294,31 @@ func (e *evaluator) EvalIndirectionExpr(
 ) (tree.Datum, error) {
 	var subscriptIdx int
 
-	if expr.Assign {
-		return nil, errors.AssertionFailedf("assignment not supported yet")
-	}
-
 	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
+
 	if d == tree.DNull {
 		return d, nil
+	}
+
+	if expr.Assign {
+		fmt.Println("assignment updates", expr.Updates)
+		executor, err := FetchUpdateExecutor(d.ResolvedType())
+		if err != nil {
+			return nil, err
+		}
+		updateExpr := expr.Updates[0]
+		updateDatum, err := updateExpr.(tree.TypedExpr).Eval(ctx, e)
+		if err != nil {
+			return nil, err
+		}
+		res, err := executor(ctx, e, d, expr.Indirection, updateDatum)
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
 	}
 
 	switch d.ResolvedType().Family() {

@@ -557,6 +557,7 @@ func (mb *mutationBuilder) addTargetColsByColumnRefs(refs tree.ColumnRefList) {
 							NumParts: 1,
 							Parts:    tree.NameParts{string(name)},
 						},
+						Indirection: ref.Subscripts,
 						Assign: true,
 					}
 				}

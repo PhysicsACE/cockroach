@@ -2290,6 +2290,52 @@ func (j jsonArray) FetchValKeyOrIdx(key string) (JSON, error) {
 	return j.FetchValIdx(idx)
 }
 
+// Wrapper to type cast to jsonArray for external packages 
+func GetJsonArray(arr JSON) jsonArray {
+	return arr.(jsonArray)
+}
+
+// Wrapper to type cast to jsonObject for external packages
+func GetJsonObject(obj JSON) jsonObject {
+	return obj.(jsonObject)
+}
+
+func GetJsonDecoded(obj JSON) (JSON, error) {
+	switch v := obj.(type) {
+	case *jsonEncoded:
+		n, err := v.shallowDecode()
+		if err != nil {
+			return nil, err
+		}
+		return n, nil
+	default:
+		return nil, nil
+	}
+}
+
+func ConvertToJsonArray(arr []JSON) jsonArray {
+	result := make(jsonArray, len(arr))
+	copy(result, arr)
+	return result
+}
+
+func EmptyJSONObject() jsonObject { 
+	return emptyJSONObject 
+}
+
+func EmptyJSONArray() jsonArray  { 
+	return emptyJSONArray 
+}
+
+func IsEncoded(obj JSON) bool {
+	switch obj.(type) {
+	case *jsonEncoded:
+		return true
+	default:
+		return false
+	}
+}
+
 func (jsonNull) FetchValKeyOrIdx(string) (JSON, error)   { return nil, nil }
 func (jsonTrue) FetchValKeyOrIdx(string) (JSON, error)   { return nil, nil }
 func (jsonFalse) FetchValKeyOrIdx(string) (JSON, error)  { return nil, nil }
