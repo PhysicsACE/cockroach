@@ -33,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
@@ -81,8 +80,11 @@ func registerRestoreNodeShutdown(r registry.Registry) {
 
 			rd := makeRestoreDriver(t, c, sp)
 			rd.prepareCluster(ctx)
-			jobSurvivesNodeShutdown(ctx, t, c, nodeToShutdown, makeRestoreStarter(ctx, t, c,
-				gatewayNode, rd))
+			cfg := defaultNodeShutdownConfig(c, nodeToShutdown)
+			cfg.restartSettings = rd.defaultClusterSettings()
+			require.NoError(t,
+				executeNodeShutdown(ctx, t, c, cfg,
+					makeRestoreStarter(ctx, t, c, gatewayNode, rd)))
 			rd.checkFingerprint(ctx)
 		},
 	})
@@ -96,15 +98,16 @@ func registerRestoreNodeShutdown(r registry.Registry) {
 		Leases:           registry.MetamorphicLeases,
 		Timeout:          sp.timeout,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-
 			gatewayNode := 2
 			nodeToShutdown := 2
 
 			rd := makeRestoreDriver(t, c, sp)
 			rd.prepareCluster(ctx)
-
-			jobSurvivesNodeShutdown(ctx, t, c, nodeToShutdown, makeRestoreStarter(ctx, t, c,
-				gatewayNode, rd))
+			cfg := defaultNodeShutdownConfig(c, nodeToShutdown)
+			cfg.restartSettings = rd.defaultClusterSettings()
+			require.NoError(t,
+				executeNodeShutdown(ctx, t, c, cfg,
+					makeRestoreStarter(ctx, t, c, gatewayNode, rd)))
 			rd.checkFingerprint(ctx)
 		},
 	})
@@ -533,18 +536,6 @@ func (hw hardwareSpecs) makeClusterSpecs(r registry.Registry, backupCloud string
 	}
 	s := r.MakeClusterSpec(hw.nodes+addWorkloadNode, clusterOpts...)
 
-	if backupCloud == spec.AWS && s.VolumeSize != 0 {
-		// Work around an issue that RAID0s local NVMe and GP3 storage together:
-		// https://github.com/cockroachdb/cockroach/issues/98783.
-		//
-		// TODO(srosenberg): Remove this workaround when 98783 is addressed.
-		// TODO(miral): This now returns an error instead of panicking, so even though
-		// we haven't panicked here before, we should handle the error. Moot if this is
-		// removed as per TODO above.
-		s.AWS.MachineType, _, _ = spec.SelectAWSMachineType(s.CPUs, s.Mem, false /* shouldSupportLocalSSD */, vm.ArchAMD64)
-		s.AWS.MachineType = strings.Replace(s.AWS.MachineType, "d.", ".", 1)
-		s.Arch = vm.ArchAMD64
-	}
 	return s
 }
 
@@ -745,7 +736,7 @@ func (tpce tpceRestore) init(
 	spec.init(ctx, t, c, tpceCmdOptions{
 		customers:      tpce.customers,
 		racks:          sp.nodes,
-		connectionOpts: defaultTPCEConnectionOpts(),
+		connectionOpts: tpceConnectionOpts{fixtureBucket: defaultFixtureBucket},
 	})
 }
 
@@ -759,7 +750,7 @@ func (tpce tpceRestore) run(
 		customers:      tpce.customers,
 		racks:          sp.nodes,
 		threads:        sp.cpus * sp.nodes,
-		connectionOpts: defaultTPCEConnectionOpts(),
+		connectionOpts: tpceConnectionOpts{fixtureBucket: defaultFixtureBucket},
 	})
 	return err
 }
@@ -881,10 +872,23 @@ func makeRestoreDriver(t test.Test, c cluster.Cluster, sp restoreSpecs) restoreD
 	}
 }
 
+func (rd *restoreDriver) defaultClusterSettings() []install.ClusterSettingOption {
+	return []install.ClusterSettingOption{
+		install.SecureOption(false),
+	}
+}
+
+func (rd *restoreDriver) roachprodOpts() option.StartOpts {
+	opts := option.NewStartOpts(option.NoBackupSchedule)
+	opts.RoachprodOpts.ExtraArgs = append(opts.RoachprodOpts.ExtraArgs, rd.sp.extraArgs...)
+	return opts
+}
+
 func (rd *restoreDriver) prepareCluster(ctx context.Context) {
-	opts := option.DefaultStartOptsNoBackups()
-	opts.RoachprodOpts.ExtraArgs = rd.sp.extraArgs
-	rd.c.Start(ctx, rd.t.L(), opts, install.MakeClusterSettings(install.SecureOption(false)), rd.sp.hardware.getCRDBNodes())
+	rd.c.Start(ctx, rd.t.L(),
+		rd.roachprodOpts(),
+		install.MakeClusterSettings(rd.defaultClusterSettings()...),
+		rd.sp.hardware.getCRDBNodes())
 	rd.getAOST(ctx)
 }
 

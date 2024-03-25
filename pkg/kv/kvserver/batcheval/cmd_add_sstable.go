@@ -50,22 +50,30 @@ func declareKeysAddSSTable(
 	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
 ) error {
-	args := req.(*kvpb.AddSSTableRequest)
+	reqHeader := req.Header()
 	if err := DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset); err != nil {
 		return err
 	}
 	// We look up the range descriptor key to return its span.
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
-
+	var mvccStats *enginepb.MVCCStats
+	switch v := req.(type) {
+	case *kvpb.AddSSTableRequest:
+		mvccStats = v.MVCCStats
+	case *kvpb.LinkExternalSSTableRequest:
+		mvccStats = v.ExternalFile.MVCCStats
+	default:
+		return errors.AssertionFailedf("unexpected rpc request called on declareKeysAddSStable")
+	}
 	// TODO(bilal): Audit all AddSSTable callers to ensure they send MVCCStats.
-	if args.MVCCStats == nil || args.MVCCStats.RangeKeyCount > 0 {
+	if mvccStats == nil || mvccStats.RangeKeyCount > 0 {
 		// NB: The range end key is not available, so this will pessimistically
 		// latch up to args.EndKey.Next(). If EndKey falls on the range end key, the
 		// span will be tightened during evaluation.
 		// Even if we obtain latches beyond the end range here, it won't cause
 		// contention with the subsequent range because latches are enforced per
 		// range.
-		l, r := rangeTombstonePeekBounds(args.Key, args.EndKey, rs.GetStartKey().AsRawKey(), nil)
+		l, r := rangeTombstonePeekBounds(reqHeader.Key, reqHeader.EndKey, rs.GetStartKey().AsRawKey(), nil)
 		latchSpans.AddMVCC(spanset.SpanReadOnly, roachpb.Span{Key: l, EndKey: r}, header.Timestamp)
 
 		// Obtain a read only lock on range key GC key to serialize with
@@ -143,40 +151,6 @@ func EvalAddSSTable(
 	ctx, span = tracing.ChildSpan(ctx, "EvalAddSSTable")
 	defer span.Finish()
 	log.Eventf(ctx, "evaluating AddSSTable [%s,%s)", start.Key, end.Key)
-
-	// If this is a remote sst, just link it in and skip the rest of eval, since
-	// we do not do anything that touches the data inside an sst for remote ssts
-	// at the point of ingesting them.
-	if path := args.RemoteFile.Path; path != "" {
-		if len(args.Data) > 0 {
-			return result.Result{}, errors.AssertionFailedf("remote sst cannot include content")
-		}
-		log.VEventf(ctx, 1, "AddSSTable remote file %s in %s", path, args.RemoteFile.Locator)
-
-		// We have no idea if the SST being ingested contains keys that will shadow
-		// existing keys or not, so we need to force its mvcc stats to be estimates.
-		s := *args.MVCCStats
-		s.ContainsEstimates++
-		ms.Add(s)
-
-		return result.Result{
-			Replicated: kvserverpb.ReplicatedEvalResult{
-				AddSSTable: &kvserverpb.ReplicatedEvalResult_AddSSTable{
-					RemoteFileLoc:           args.RemoteFile.Locator,
-					RemoteFilePath:          path,
-					ApproximatePhysicalSize: args.RemoteFile.ApproximatePhysicalSize,
-					BackingFileSize:         args.RemoteFile.BackingFileSize,
-					Span:                    roachpb.Span{Key: start.Key, EndKey: end.Key},
-					RemoteRewriteTimestamp:  sstToReqTS,
-				},
-				// Since the remote SST could contain keys at any timestamp, consider it
-				// a history mutation.
-				MVCCHistoryMutation: &kvserverpb.ReplicatedEvalResult_MVCCHistoryMutation{
-					Spans: []roachpb.Span{{Key: start.Key, EndKey: end.Key}},
-				},
-			},
-		}, nil
-	}
 
 	if min := addSSTableCapacityRemainingLimit.Get(&cArgs.EvalCtx.ClusterSettings().SV); min > 0 {
 		cap, err := cArgs.EvalCtx.GetEngineCapacity()
@@ -550,7 +524,7 @@ func EvalAddSSTable(
 // * Only SST set operations (not explicitly verified).
 // * No intents or unversioned values.
 // * If sstTimestamp is set, all MVCC timestamps equal it.
-// * MVCCValueHeader is empty.
+// * The LocalTimestamp in the MVCCValueHeader is empty.
 // * Given MVCC stats match the SST contents.
 func assertSSTContents(sst []byte, sstTimestamp hlc.Timestamp, stats *enginepb.MVCCStats) error {
 
@@ -584,8 +558,9 @@ func assertSSTContents(sst []byte, sstTimestamp hlc.Timestamp, stats *enginepb.M
 			return errors.NewAssertionErrorWithWrappedErrf(err,
 				"SST contains invalid value for key %s", key)
 		}
-		if value.MVCCValueHeader != (enginepb.MVCCValueHeader{}) {
-			return errors.AssertionFailedf("SST contains non-empty MVCC value header for key %s", key)
+		if !value.MVCCValueHeader.LocalTimestamp.IsEmpty() {
+			return errors.AssertionFailedf("SST contains non-empty Local Timestamp in the MVCC value"+
+				" header for key %s", key)
 		}
 	}
 

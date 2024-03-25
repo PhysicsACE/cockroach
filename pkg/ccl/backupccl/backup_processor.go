@@ -487,14 +487,14 @@ func runBackupProcessor(
 						if !span.firstKeyTS.IsEmpty() {
 							splitMidKey = true
 						}
-
 						req := &kvpb.ExportRequest{
-							RequestHeader:  kvpb.RequestHeaderFromSpan(span.span),
-							ResumeKeyTS:    span.firstKeyTS,
-							StartTime:      span.start,
-							MVCCFilter:     spec.MVCCFilter,
-							TargetFileSize: batcheval.ExportRequestTargetFileSize.Get(&clusterSettings.SV),
-							SplitMidKey:    splitMidKey,
+							RequestHeader:          kvpb.RequestHeaderFromSpan(span.span),
+							ResumeKeyTS:            span.firstKeyTS,
+							StartTime:              span.start,
+							MVCCFilter:             spec.MVCCFilter,
+							TargetFileSize:         batcheval.ExportRequestTargetFileSize.Get(&clusterSettings.SV),
+							SplitMidKey:            splitMidKey,
+							IncludeMVCCValueHeader: spec.IncludeMVCCValueHeader,
 						}
 
 						// If we're doing re-attempts but are not yet in the priority regime,
@@ -635,14 +635,9 @@ func runBackupProcessor(
 							if fileCount := len(resp.Files); fileCount > 0 {
 								resumeTS = resp.Files[fileCount-1].EndKeyTS
 							}
-							resumeSpan = spanAndTime{
-								span:       *resp.ResumeSpan,
-								firstKeyTS: resumeTS,
-								start:      span.start,
-								end:        span.end,
-								attempts:   span.attempts,
-								lastTried:  span.lastTried,
-							}
+							resumeSpan = span
+							resumeSpan.span = *resp.ResumeSpan
+							resumeSpan.firstKeyTS = resumeTS
 						}
 
 						if backupKnobs, ok := flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {

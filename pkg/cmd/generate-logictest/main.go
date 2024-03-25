@@ -183,7 +183,10 @@ func (t *testdir) dump() error {
 		if cfg.Name == "3node-tenant" || strings.HasPrefix(cfg.Name, "multiregion-") {
 			tplCfg.SkipCclUnderRace = true
 		}
-		if strings.Contains(cfg.Name, "5node") || strings.Contains(cfg.Name, "fakedist") {
+		if strings.Contains(cfg.Name, "5node") ||
+			strings.Contains(cfg.Name, "fakedist") ||
+			(strings.HasPrefix(cfg.Name, "local-") && !tplCfg.Ccl) ||
+			(cfg.Name == "local" && !tplCfg.Ccl) {
 			tplCfg.UseHeavyPool = true
 		}
 		subdir := filepath.Join(t.dir, cfg.Name)
@@ -355,6 +358,14 @@ func generate() error {
 		if err != nil {
 			return err
 		}
+		readCommittedCalc := logictestbase.ConfigCalculator{
+			ConfigOverrides: []string{"local-read-committed"},
+			RunCCLConfigs:   true,
+		}
+		err = t.addCclLogicTests("TestReadCommittedLogicCCL", readCommittedCalc)
+		if err != nil {
+			return err
+		}
 		tenantCalc := logictestbase.ConfigCalculator{
 			ConfigOverrides:       []string{"3node-tenant"},
 			ConfigFilterOverrides: []string{"3node-tenant-multiregion"},
@@ -365,6 +376,10 @@ func generate() error {
 			return err
 		}
 		err = t.addLogicTests("TestTenantLogic", tenantCalc)
+		if err != nil {
+			return err
+		}
+		err = t.addExecBuildLogicTests("TestReadCommittedExecBuild", readCommittedCalc)
 		if err != nil {
 			return err
 		}

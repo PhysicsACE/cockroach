@@ -19,6 +19,7 @@ import "roachpb/data.proto";
 import "roachpb/metadata.proto";
 import "roachpb/io-formats.proto";
 import "sql/catalog/descpb/structured.proto";
+import "sql/catalog/catpb/catalog.proto";
 import "multitenant/mtinfopb/info.proto";
 import "sql/sessiondatapb/session_data.proto";
 import "util/hlc/timestamp.proto";
@@ -504,8 +505,13 @@ message RestoreDetails {
   // UnsafeRestoreIncompatibleVersion allows restoring a backup older than the min compatible
   // version.
   bool unsafe_restore_incompatible_version = 34;
+ 
+  // PostDownloadTableAutoStatsSettings contains the backed up auto stats
+  // settings for online restored tables. These setting will be restored at the
+  // end of the download job. 
+  map<uint32,cockroach.sql.catalog.catpb.AutoStatsSettings> post_download_table_auto_stats_settings = 35;
 
-  // NEXT ID: 34.
+  // NEXT ID: 36.
 }
 
 
@@ -1257,6 +1263,19 @@ message MVCCStatisticsJobProgress {
 
 }
 
+message ImportRollbackDetails {
+  // TableID is the descriptor ID of table that should be rolled back.
+  //
+  // TODO(ssd): We could consider having this job process multiple
+  // tables.
+  uint32 table_id = 1 [
+    (gogoproto.customname) = "TableID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
+  ];
+}
+
+message ImportRollbackProgress {}
+
 message Payload {
   string description = 1;
   // If empty, the description is assumed to be the statement.
@@ -1320,6 +1339,7 @@ message Payload {
     AutoConfigTaskDetails auto_config_task = 43;
     AutoUpdateSQLActivityDetails auto_update_sql_activities = 44;
     MVCCStatisticsJobDetails mvcc_statistics_details = 45;
+    ImportRollbackDetails import_rollback_details = 46;
   }
   reserved 26;
   // PauseReason is used to describe the reason that the job is currently paused
@@ -1394,6 +1414,7 @@ message Progress {
     AutoConfigTaskProgress auto_config_task = 31;
     AutoUpdateSQLActivityProgress update_sql_activity = 32;
     MVCCStatisticsJobProgress mvcc_statistics_progress = 33;
+    ImportRollbackProgress import_rollback_progress = 34;
   }
 
   uint64 trace_id = 21 [(gogoproto.nullable) = false, (gogoproto.customname) = "TraceID", (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb.TraceID"];
@@ -1430,6 +1451,7 @@ enum Type {
   AUTO_CONFIG_TASK = 22 [(gogoproto.enumvalue_customname) = "TypeAutoConfigTask"];
   AUTO_UPDATE_SQL_ACTIVITY = 23 [(gogoproto.enumvalue_customname) = "TypeAutoUpdateSQLActivity"];
   MVCC_STATISTICS_UPDATE = 24 [(gogoproto.enumvalue_customname) = "TypeMVCCStatisticsUpdate"];
+  IMPORT_ROLLBACK = 25 [(gogoproto.enumvalue_customname) = "TypeImportRollback"];
 }
 
 message Job {

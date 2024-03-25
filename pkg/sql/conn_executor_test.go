@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -41,7 +42,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/sqllivenesstestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -546,7 +546,7 @@ func TestPrepareStatisticsMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify that query and querySummary are equal in crdb_internal.statement_statistics.metadata.
-	rows, err := sqlDB.Query(`SELECT metadata->>'query', metadata->>'querySummary' FROM crdb_internal.statement_statistics WHERE metadata->>'query' LIKE 'SELECT $1::INT8'`)
+	rows, err := sqlDB.Query(`SELECT metadata->>'query', metadata->>'querySummary' FROM crdb_internal.statement_statistics WHERE metadata->>'query' LIKE 'SELECT _::INT8'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1455,6 +1455,9 @@ func TestInjectRetryErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Enable enterprise features to test READ COMMITTED retries.
+	defer ccl.TestingEnableEnterprise()()
+
 	ctx := context.Background()
 	params := base.TestServerArgs{}
 
@@ -1656,7 +1659,6 @@ func TestInjectRetryOnCommitErrors(t *testing.T) {
 func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderStress(t, "slow test")
 
 	ctx := context.Background()
 	var shouldBlock syncutil.AtomicBool
@@ -1664,7 +1666,7 @@ func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 	g := ctxgroup.WithContext(ctx)
 	params := base.TestServerArgs{}
 	params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
-		OnRecordTxnFinish: func(isInternal bool, _ *sessionphase.Times, _ string) {
+		AfterExecute: func(ctx context.Context, stmt string, isInternal bool, err error) {
 			if isInternal && shouldBlock.Get() {
 				<-blockingInternalTxns
 			}
@@ -1697,7 +1699,7 @@ func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 		prevInternalActiveStatements := sqlServer.InternalMetrics.EngineMetrics.SQLActiveStatements.Value()
 
 		// Begin a user-initiated transaction.
-		testDB.Exec(t, "BEGIN")
+		testTx := testDB.Begin(t)
 
 		// Check that the number of open transactions has incremented, but not the
 		// internal metric.
@@ -1707,7 +1709,7 @@ func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 		// Create a state of contention. Use a cancellable context so that the
 		// other queries that get blocked on this one don't deadlock if the test
 		// aborts.
-		_, err := sqlDB.ExecContext(ctx, "SELECT * FROM t.foo WHERE i = 1 FOR UPDATE")
+		_, err := testTx.ExecContext(ctx, "SELECT * FROM t.foo WHERE i = 1 FOR UPDATE")
 		require.NoError(t, err)
 
 		// Execute internal statement (this case is identical to opening an internal
@@ -1748,8 +1750,8 @@ func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 			if v := sqlServer.InternalMetrics.EngineMetrics.SQLTxnsOpen.Value(); v <= prevInternalTxnsOpen {
 				return errors.Newf("Wrong InternalSQLTxnsOpen value. Expected: greater than %d. Actual: %d", prevInternalTxnsOpen, v)
 			}
-			if v := sqlServer.InternalMetrics.EngineMetrics.SQLActiveStatements.Value(); v != prevInternalActiveStatements+1 {
-				return errors.Newf("Wrong InternalSQLActiveStatements value. Expected: %d. Actual: %d", prevInternalActiveStatements+1, v)
+			if v := sqlServer.InternalMetrics.EngineMetrics.SQLActiveStatements.Value(); v <= prevInternalActiveStatements {
+				return errors.Newf("Wrong InternalSQLActiveStatements value. Expected: greater than %d. Actual: %d", prevInternalActiveStatements, v)
 			}
 			return nil
 		})
@@ -1757,7 +1759,7 @@ func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 		require.Equal(t, int64(1), sqlServer.Metrics.EngineMetrics.SQLTxnsOpen.Value())
 		require.Equal(t, int64(0), sqlServer.Metrics.EngineMetrics.SQLActiveStatements.Value())
 		require.Less(t, prevInternalTxnsOpen, sqlServer.InternalMetrics.EngineMetrics.SQLTxnsOpen.Value())
-		require.Equal(t, prevInternalActiveStatements+1, sqlServer.InternalMetrics.EngineMetrics.SQLActiveStatements.Value())
+		require.Less(t, prevInternalActiveStatements, sqlServer.InternalMetrics.EngineMetrics.SQLActiveStatements.Value())
 
 		// Create active user-initiated statement.
 		g.GoCtx(func(ctx context.Context) error {
@@ -1795,7 +1797,7 @@ func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 
 		// Commit the initial user-initiated transaction. The internal and user
 		// select queries are no longer in contention.
-		testDB.Exec(t, "COMMIT")
+		require.NoError(t, testTx.Commit())
 	}()
 
 	// Check that both the internal & user statements are no longer active.

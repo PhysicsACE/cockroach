@@ -352,6 +352,13 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 			"crdb_internal.hide_sql_constants(create_statement) as create_statement",
 		},
 	},
+	`"".crdb_internal.cluster_replication_spans`: {
+		nonSensitiveCols: NonSensitiveColumns{
+			"job_id",
+			"resolved",
+			"resolved_age",
+		},
+	},
 	"crdb_internal.default_privileges": {
 		nonSensitiveCols: NonSensitiveColumns{
 			"database_name",
@@ -623,7 +630,7 @@ var zipInternalTablesPerNode = DebugZipTableRegistry{
 		nonSensitiveCols: NonSensitiveColumns{
 			"id",
 			"tags",
-			"startts",
+			"start_after",
 			"diff",
 			"node_id",
 			"range_id",
@@ -631,7 +638,8 @@ var zipInternalTablesPerNode = DebugZipTableRegistry{
 			"range_start",
 			"range_end",
 			"resolved",
-			"last_event_utc",
+			"resolved_age",
+			"last_event",
 			"catchup",
 		},
 	},
@@ -1277,6 +1285,35 @@ var zipSystemTables = DebugZipTableRegistry{
 			"locality",
 		},
 	},
+	// system.sql_stats_cardinality shows row counts for all of the system tables related to the SQL Stats
+	// system, grouped by aggregated timestamp. None of this information is sensitive. It aids in escalations
+	// involving the SQL Stats system.
+	"system.sql_stats_cardinality": func() TableRegistryConfig {
+		query := `
+			SELECT table_name, aggregated_ts, row_count
+			FROM (
+					SELECT 'system.statement_statistics' AS table_name, aggregated_ts, count(*) AS row_count
+					FROM system.statement_statistics
+					GROUP BY aggregated_ts
+				UNION
+					SELECT 'system.transaction_statistics' AS table_name, aggregated_ts, count(*) AS row_count
+					FROM system.transaction_statistics
+					GROUP BY aggregated_ts
+				UNION
+					SELECT 'system.statement_activity' AS table_name, aggregated_ts, count(*) AS row_count
+					FROM system.statement_activity
+					GROUP BY aggregated_ts
+				UNION
+					SELECT 'system.transaction_activity' AS table_name, aggregated_ts, count(*) AS row_count
+					FROM system.transaction_activity
+					GROUP BY aggregated_ts
+			)
+			ORDER BY table_name, aggregated_ts DESC;`
+		return TableRegistryConfig{
+			customQueryUnredacted: query,
+			customQueryRedacted:   query,
+		}
+	}(),
 	"system.sqlliveness": {
 		nonSensitiveCols: NonSensitiveColumns{
 			"session_id",
@@ -1321,8 +1358,8 @@ var zipSystemTables = DebugZipTableRegistry{
        ss.plan_hash,
        ss.app_name,
        ss.agg_interval,
-       crdb_internal.merge_stats_metadata(array_agg(ss.metadata))    AS metadata,
-       crdb_internal.merge_statement_stats(array_agg(ss.statistics)) AS statistics,
+       merge_stats_metadata(ss.metadata)    AS metadata,
+       merge_statement_stats(ss.statistics) AS statistics,
        ss.plan,
        ss.index_recommendations
      FROM system.public.statement_statistics ss
@@ -1354,8 +1391,8 @@ limit 5000;`,
        ss.plan_hash,
        ss.app_name,
        ss.agg_interval,
-       crdb_internal.merge_stats_metadata(array_agg(ss.metadata))    AS metadata,
-       crdb_internal.merge_statement_stats(array_agg(ss.statistics)) AS statistics,
+       merge_stats_metadata(ss.metadata)    AS metadata,
+       merge_statement_stats(ss.statistics) AS statistics,
        ss.plan,
        ss.index_recommendations
      FROM system.public.statement_statistics ss

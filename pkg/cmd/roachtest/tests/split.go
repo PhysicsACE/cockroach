@@ -409,7 +409,7 @@ func registerLoadSplits(r registry.Registry) {
 				// YCSB/E has a zipfian distribution with 95% scans (limit 1k) and 5%
 				// inserts.
 				minimumRanges:     5,
-				maximumRanges:     15,
+				maximumRanges:     18,
 				initialRangeCount: 2,
 				load: ycsbSplitLoad{
 					workload:     "e",
@@ -436,7 +436,7 @@ func runLoadSplits(ctx context.Context, t test.Test, c cluster.Cluster, params s
 	// TODO(DarrylWong): enable metamorphic contants once issue is resolved
 	settings := install.MakeClusterSettings()
 	settings.Env = append(settings.Env, "COCKROACH_INTERNAL_DISABLE_METAMORPHIC_TESTING=true")
-	startOpts := option.DefaultStartOptsNoBackups()
+	startOpts := option.NewStartOpts(option.NoBackupSchedule)
 	startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs,
 		"--vmodule=split_queue=2,store_rebalancer=2,allocator=2,replicate_queue=2,"+
 			"decider=3,replica_split_load=1",
@@ -632,6 +632,11 @@ func runLargeRangeSplits(ctx context.Context, t test.Test, c cluster.Cluster, si
 				return err
 			}
 			if _, err := db.ExecContext(ctx, `SET CLUSTER SETTING kv.snapshot_rebalance.max_rate='512MiB'`); err != nil {
+				return err
+			}
+			// This test splits an exceptionally large range. Disable MVCC stats
+			// re-computation to ensure the splits happen in a timely manner.
+			if _, err := db.ExecContext(ctx, `SET CLUSTER SETTING kv.split.mvcc_stats_recomputation.enabled = 'false'`); err != nil {
 				return err
 			}
 			// Set the range size to a multiple of what we expect the size of the

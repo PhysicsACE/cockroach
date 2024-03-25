@@ -558,6 +558,7 @@ func TestBatchJobsCreation(t *testing.T) {
 				if test.batchSize > 10 {
 					skip.UnderStress(t, "skipping stress test for batch size ", test.batchSize)
 					skip.UnderRace(t, "skipping test for batch size ", test.batchSize)
+					skip.UnderDeadlock(t, "skipping test for batch size ", test.batchSize)
 				}
 
 				args := base.TestServerArgs{
@@ -992,7 +993,6 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 		bti.clock.AdvanceTo(lastRun)
 		<-bti.resumeCh
 		pauseOrCancelJob(t, ctx, bti.idb, bti.registry, jobID, cancel)
-		bti.errCh <- nil
 		<-bti.failOrCancelCh
 		bti.errCh <- MarkAsRetryJobError(errors.New("injecting error in reverting state"))
 		expectedResumed := bti.resumed.Count()

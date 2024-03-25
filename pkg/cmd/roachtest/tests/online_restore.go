@@ -65,12 +65,12 @@ func registerOnlineRestore(r registry.Registry) {
 			timeout:                30 * time.Minute,
 			suites:                 registry.Suites(registry.Nightly),
 			restoreUptoIncremental: 1,
-			skip:                   "used for ad hoc testing",
+			skip:                   "used for ad hoc testing. NB this backup contains prefixes",
 		},
 		{
 			// 400GB tpce Online Restore
 			hardware:               makeHardwareSpecs(hardwareSpecs{ebsThroughput: 1000 /* MB/s */, workloadNode: true}),
-			backup:                 makeRestoringBackupSpecs(backupSpecs{nonRevisionHistory: true, version: "v23.1.11"}),
+			backup:                 makeRestoringBackupSpecs(backupSpecs{nonRevisionHistory: true, version: fixtureFromMasterVersion, numBackupsInChain: 5}),
 			timeout:                1 * time.Hour,
 			suites:                 registry.Suites(registry.Nightly),
 			restoreUptoIncremental: 1,
@@ -81,7 +81,7 @@ func registerOnlineRestore(r registry.Registry) {
 				ebsThroughput: 1000 /* MB/s */, workloadNode: true}),
 			backup: makeRestoringBackupSpecs(backupSpecs{
 				nonRevisionHistory: true,
-				version:            "v23.1.11",
+				version:            fixtureFromMasterVersion,
 				workload:           tpceRestore{customers: 500000}}),
 			timeout:                5 * time.Hour,
 			suites:                 registry.Suites(registry.Nightly),
@@ -104,10 +104,10 @@ func registerOnlineRestore(r registry.Registry) {
 						sp.skip = "used for ad hoc experiments"
 					}
 
-					sp.namePrefix = sp.namePrefix + fmt.Sprintf("workload=%t/", runWorkload)
+					sp.namePrefix = sp.namePrefix + fmt.Sprintf("workload=%t", runWorkload)
 					if !useWorkarounds {
 						sp.skip = "used for ad hoc experiments"
-						sp.namePrefix = sp.namePrefix + fmt.Sprintf("workarounds=%t", useWorkarounds)
+						sp.namePrefix = sp.namePrefix + fmt.Sprintf("/workarounds=%t", useWorkarounds)
 					}
 
 					sp.initTestName()
@@ -222,7 +222,7 @@ func registerOnlineRestore(r registry.Registry) {
 									if workloadDuration > maxWorkloadDuration {
 										workloadDuration = maxWorkloadDuration
 									}
-									fmt.Printf("let workload run for %.2f minutes", workloadDuration.Minutes())
+									t.L().Printf("let workload run for another %.2f minutes", workloadDuration.Minutes())
 									time.Sleep(workloadDuration)
 								}
 								return nil
@@ -403,7 +403,7 @@ func waitForDownloadJob(
 			}
 			if status == string(jobs.StatusSucceeded) {
 				postDownloadDelay := time.Minute
-				l.Printf("Download job completed; let workload run for %.2f minute", postDownloadDelay.Minutes())
+				l.Printf("Download job completed; let workload run for %.2f minute before proceeding", postDownloadDelay.Minutes())
 				time.Sleep(postDownloadDelay)
 				downloadJobEndTimeLowerBound = timeutil.Now().Add(-pollingInterval).Add(-postDownloadDelay)
 				return downloadJobEndTimeLowerBound, nil

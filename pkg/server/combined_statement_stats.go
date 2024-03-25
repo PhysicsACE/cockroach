@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
@@ -167,7 +168,8 @@ func getCombinedStatementStats(
 			args,
 			orderAndLimit,
 			testingKnobs,
-			activityHasAllData)
+			activityHasAllData,
+			settings)
 	}
 
 	if err != nil {
@@ -664,9 +666,10 @@ func collectCombinedStatements(
 	orderAndLimit string,
 	testingKnobs *sqlstats.TestingKnobs,
 	activityTableHasAllData bool,
+	settings *cluster.Settings,
 ) ([]serverpb.StatementsResponse_CollectedStatementStatistics, error) {
 	aostClause := testingKnobs.GetAOSTClause()
-	const expectedNumDatums = 10
+	const expectedNumDatums = 9
 	const queryFormat = `
 SELECT 
     fingerprint_id,
@@ -674,7 +677,6 @@ SELECT
     aggregated_ts,
     COALESCE(CAST(metadata -> 'distSQLCount' AS INT), 0)  AS distSQLCount,
     COALESCE(CAST(metadata -> 'fullScanCount' AS INT), 0) AS fullScanCount,
-    COALESCE(CAST(metadata -> 'failedCount' AS INT), 0)   AS failedCount,
     metadata ->> 'query'                                  AS query,
     metadata ->> 'querySummary'                           AS querySummary,
     (SELECT string_agg(elem::text, ',') 
@@ -682,9 +684,9 @@ SELECT
     statistics
 FROM (SELECT fingerprint_id,
              app_name,
-             max(aggregated_ts)                                         AS aggregated_ts,
-             crdb_internal.merge_stats_metadata(array_agg(metadata))    AS metadata,
-             crdb_internal.merge_statement_stats(array_agg(statistics)) AS statistics
+             max(aggregated_ts)                           AS aggregated_ts,
+             merge_stats_metadata(metadata)               AS metadata,
+             merge_statement_stats(statistics)            AS statistics
       FROM %s %s
       GROUP BY
           fingerprint_id,
@@ -698,18 +700,20 @@ FROM (SELECT fingerprint_id,
 	}()
 
 	if activityTableHasAllData {
-		it, err = getIterator(
-			ctx,
-			ie,
-			// The statement activity table has aggregated metadata.
-			`
+		metadataAggFn := mergeAggStmtMetadataColumnLatest
+		if !settings.Version.IsActive(ctx, clusterversion.V24_1) {
+			// Use the older, less performant metadata aggregation function for versions below 24.1.
+			metadataAggFn = mergeAggStmtMetadata_V23_2
+		}
+
+		it, err = ie.QueryIteratorEx(ctx, "console-combined-stmts-combined-stmts-activity-by-interval", nil,
+			sessiondata.NodeUserSessionDataOverride, fmt.Sprintf(`
 SELECT 
     fingerprint_id,
     app_name,
     aggregated_ts,
     COALESCE(CAST(metadata -> 'distSQLCount' AS INT), 0)  AS distSQLCount,
     COALESCE(CAST(metadata -> 'fullScanCount' AS INT), 0) AS fullScanCount,
-    COALESCE(CAST(metadata -> 'failedCount' AS INT), 0)   AS failedCount,
     metadata ->> 'query'                                  AS query,
     metadata ->> 'querySummary'                           AS querySummary,
     (SELECT string_agg(elem::text, ',') 
@@ -717,20 +721,14 @@ SELECT
     statistics
 FROM (SELECT fingerprint_id,
              app_name,
-             max(aggregated_ts)                                                AS aggregated_ts,
-             crdb_internal.merge_aggregated_stmt_metadata(array_agg(metadata)) AS metadata,
-             crdb_internal.merge_statement_stats(array_agg(statistics))        AS statistics
+             max(aggregated_ts)                                     AS aggregated_ts,
+             %s AS metadata,
+             merge_statement_stats(statistics)                      AS statistics
       FROM %s %s
       GROUP BY
           fingerprint_id,
-          app_name) %s
-%s`,
-			CrdbInternalStmtStatsCached,
-			"combined-stmts-activity-by-interval",
-			whereClause,
-			args,
-			aostClause,
-			orderAndLimit)
+          app_name) %s %s`, metadataAggFn, CrdbInternalStmtStatsCached, aostClause, whereClause, orderAndLimit), args...)
+
 		if err != nil {
 			return nil, srverrors.ServerError(ctx, err)
 		}
@@ -797,17 +795,15 @@ FROM (SELECT fingerprint_id,
 		aggregatedTs := tree.MustBeDTimestampTZ(row[2]).Time
 		distSQLCount := int64(*row[3].(*tree.DInt))
 		fullScanCount := int64(*row[4].(*tree.DInt))
-		failedCount := int64(*row[5].(*tree.DInt))
-		query := string(tree.MustBeDString(row[6]))
-		querySummary := string(tree.MustBeDString(row[7]))
-		databases := string(tree.MustBeDString(row[8]))
+		query := string(tree.MustBeDString(row[5]))
+		querySummary := string(tree.MustBeDString(row[6]))
+		databases := string(tree.MustBeDString(row[7]))
 
 		metadata := appstatspb.CollectedStatementStatistics{
 			Key: appstatspb.StatementStatisticsKey{
 				App:          app,
 				DistSQL:      distSQLCount > 0,
 				FullScan:     fullScanCount > 0,
-				Failed:       failedCount > 0,
 				Query:        query,
 				QuerySummary: querySummary,
 				Database:     databases,
@@ -815,7 +811,7 @@ FROM (SELECT fingerprint_id,
 		}
 
 		var stats appstatspb.StatementStatistics
-		statsJSON := tree.MustBeDJSON(row[9]).JSON
+		statsJSON := tree.MustBeDJSON(row[8]).JSON
 		if err = sqlstatsutil.DecodeStmtStatsStatisticsJSON(statsJSON, &stats); err != nil {
 			return nil, srverrors.ServerError(ctx, err)
 		}
@@ -883,10 +879,10 @@ func collectCombinedTransactions(
 	const queryFormat = `
 SELECT *
 FROM (SELECT app_name,
-             max(aggregated_ts)                                           AS aggregated_ts,
+             max(aggregated_ts)                   AS aggregated_ts,
              fingerprint_id,
              max(metadata),
-             crdb_internal.merge_transaction_stats(array_agg(statistics)) AS statistics
+             merge_transaction_stats(statistics)  AS statistics
       FROM %s %s
       GROUP BY
           app_name,
@@ -1021,8 +1017,8 @@ func collectStmtsForTxns(
 	const queryFormat = `
 SELECT fingerprint_id,
        transaction_fingerprint_id,
-       crdb_internal.merge_stats_metadata(array_agg(metadata))    AS metadata,
-       crdb_internal.merge_statement_stats(array_agg(statistics)) AS statistics,
+       merge_stats_metadata(metadata)    AS metadata,
+       merge_statement_stats(statistics) AS statistics,
        app_name
 FROM %s %s
 GROUP BY

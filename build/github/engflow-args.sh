@@ -3,4 +3,16 @@
 # remote execution arguments to the invocation. You must call get-engflow-keys.sh
 # before this.
 
-echo '--config engflowpublic --tls_client_certificate=/home/agent/engflow.crt --tls_client_key=/home/agent/engflow.key'
+ARGS='--config engflowpublic --tls_client_certificate=/home/agent/engflow.crt --tls_client_key=/home/agent/engflow.key --experimental_build_event_upload_retry_minimum_delay 3s --experimental_build_event_upload_max_retries 8'
+
+if [ ! -z "$GITHUB_ACTIONS_BRANCH" ]
+then
+    ARGS="$ARGS --bes_keywords branch=$GITHUB_ACTIONS_BRANCH"
+fi
+
+if [ ! -z "$GITHUB_JOB" ]
+then
+    ARGS="$ARGS --bes_keywords job=${GITHUB_JOB#EXPERIMENTAL_}"
+fi
+
+echo "$ARGS"

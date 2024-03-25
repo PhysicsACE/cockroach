@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
+	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -47,10 +49,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/raft/v3"
 )
 
 func (s *Store) Transport() *RaftTransport {
@@ -156,6 +156,12 @@ func (s *Store) ReplicateQueuePurgatoryLength() int {
 // queue purgatory.
 func (s *Store) SplitQueuePurgatoryLength() int {
 	return s.splitQueue.PurgatoryLength()
+}
+
+// LeaseQueuePurgatoryLength returns the number of replicas in lease queue
+// purgatory.
+func (s *Store) LeaseQueuePurgatoryLength() int {
+	return s.leaseQueue.PurgatoryLength()
 }
 
 // SetRaftLogQueueActive enables or disables the raft log queue.
@@ -409,11 +415,11 @@ func (r *Replica) NumPendingProposals() int {
 }
 
 func (r *Replica) IsFollowerActiveSince(
-	ctx context.Context, followerID roachpb.ReplicaID, threshold time.Duration,
+	followerID roachpb.ReplicaID, now time.Time, threshold time.Duration,
 ) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.mu.lastUpdateTimes.isFollowerActiveSince(followerID, timeutil.Now(), threshold)
+	return r.mu.lastUpdateTimes.isFollowerActiveSince(followerID, now, threshold)
 }
 
 // GetTSCacheHighWater returns the high water mark of the replica's timestamp
@@ -465,6 +471,13 @@ func (r *Replica) LargestPreviousMaxRangeSizeBytes() int64 {
 // assist load-based split (and merge) decisions.
 func (r *Replica) LoadBasedSplitter() *split.Decider {
 	return &r.loadBasedSplitter
+}
+
+// AllocatorToken returns the replica's allocator token, which should be
+// acquired before planning and executing allocator lease transfers or replica
+// changes for the range on the leaseholder.
+func (r *Replica) AllocatorToken() *plan.AllocatorToken {
+	return r.allocatorToken
 }
 
 func MakeSSTable(

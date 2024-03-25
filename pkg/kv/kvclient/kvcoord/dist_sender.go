@@ -237,6 +237,55 @@ This counts the number of ranges with an active rangefeed that are performing ca
 		Measurement: "Ranges",
 		Unit:        metric.Unit_COUNT,
 	}
+
+	metaDistSenderCircuitBreakerReplicasCount = metric.Metadata{
+		Name:        "distsender.circuit_breaker.replicas.count",
+		Help:        `Number of replicas currently tracked by DistSender circuit breakers`,
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderCircuitBreakerReplicasTripped = metric.Metadata{
+		Name:        "distsender.circuit_breaker.replicas.tripped",
+		Help:        `Number of DistSender replica circuit breakers currently tripped`,
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderCircuitBreakerReplicasTrippedEvents = metric.Metadata{
+		Name:        "distsender.circuit_breaker.replicas.tripped_events",
+		Help:        `Cumulative number of DistSender replica circuit breakers tripped over time`,
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderCircuitBreakerReplicasProbesRunning = metric.Metadata{
+		Name:        "distsender.circuit_breaker.replicas.probes.running",
+		Help:        `Number of currently running DistSender replica circuit breaker probes`,
+		Measurement: "Probes",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderCircuitBreakerReplicasProbesSuccess = metric.Metadata{
+		Name:        "distsender.circuit_breaker.replicas.probes.success",
+		Help:        `Cumulative number of successful DistSender replica circuit breaker probes`,
+		Measurement: "Probes",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderCircuitBreakerReplicasProbesFailure = metric.Metadata{
+		Name:        "distsender.circuit_breaker.replicas.probes.failure",
+		Help:        `Cumulative number of failed DistSender replica circuit breaker probes`,
+		Measurement: "Probes",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderCircuitBreakerReplicasRequestsCancelled = metric.Metadata{
+		Name:        "distsender.circuit_breaker.replicas.requests.cancelled",
+		Help:        `Cumulative number of requests cancelled when DistSender replica circuit breakers trip`,
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistSenderCircuitBreakerReplicasRequestsRejected = metric.Metadata{
+		Name:        "distsender.circuit_breaker.replicas.requests.rejected",
+		Help:        `Cumulative number of requests rejected by tripped DistSender replica circuit breakers`,
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // CanSendToFollower is used by the DistSender to determine if it needs to look
@@ -303,6 +352,13 @@ var sortByLocalityFirst = settings.RegisterBoolSetting(
 	true,
 )
 
+var ProxyBatchRequest = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"kv.dist_sender.proxy.enabled",
+	"when true, proxy batch requests that can't be routed directly to the leaseholder",
+	true,
+)
+
 // DistSenderMetrics is the set of metrics for a given distributed sender.
 type DistSenderMetrics struct {
 	BatchCount                         *metric.Counter
@@ -325,8 +381,23 @@ type DistSenderMetrics struct {
 	SlowReplicaRPCs                    *metric.Counter
 	MethodCounts                       [kvpb.NumMethods]*metric.Counter
 	ErrCounts                          [kvpb.NumErrors]*metric.Counter
+	CircuitBreaker                     DistSenderCircuitBreakerMetrics
 	DistSenderRangeFeedMetrics
 }
+
+// DistSenderCircuitBreakerMetrics is the set of circuit breaker metrics.
+type DistSenderCircuitBreakerMetrics struct {
+	Replicas                  *metric.Gauge
+	ReplicasTripped           *metric.Gauge
+	ReplicasTrippedEvents     *metric.Counter
+	ReplicasProbesRunning     *metric.Gauge
+	ReplicasProbesSuccess     *metric.Counter
+	ReplicasProbesFailure     *metric.Counter
+	ReplicasRequestsCancelled *metric.Counter
+	ReplicasRequestsRejected  *metric.Counter
+}
+
+func (DistSenderCircuitBreakerMetrics) MetricStruct() {}
 
 // DistSenderRangeFeedMetrics is a set of rangefeed specific metrics.
 type DistSenderRangeFeedMetrics struct {
@@ -356,6 +427,7 @@ func makeDistSenderMetrics() DistSenderMetrics {
 		RangeLookups:                       metric.NewCounter(metaDistSenderRangeLookups),
 		SlowRPCs:                           metric.NewGauge(metaDistSenderSlowRPCs),
 		SlowReplicaRPCs:                    metric.NewCounter(metaDistSenderSlowReplicaRPCs),
+		CircuitBreaker:                     makeDistSenderCircuitBreakerMetrics(),
 		DistSenderRangeFeedMetrics:         makeDistSenderRangeFeedMetrics(),
 	}
 	for i := range m.MethodCounts {
@@ -373,6 +445,19 @@ func makeDistSenderMetrics() DistSenderMetrics {
 		m.ErrCounts[i] = metric.NewCounter(meta)
 	}
 	return m
+}
+
+func makeDistSenderCircuitBreakerMetrics() DistSenderCircuitBreakerMetrics {
+	return DistSenderCircuitBreakerMetrics{
+		Replicas:                  metric.NewGauge(metaDistSenderCircuitBreakerReplicasCount),
+		ReplicasTripped:           metric.NewGauge(metaDistSenderCircuitBreakerReplicasTripped),
+		ReplicasTrippedEvents:     metric.NewCounter(metaDistSenderCircuitBreakerReplicasTrippedEvents),
+		ReplicasProbesRunning:     metric.NewGauge(metaDistSenderCircuitBreakerReplicasProbesRunning),
+		ReplicasProbesSuccess:     metric.NewCounter(metaDistSenderCircuitBreakerReplicasProbesSuccess),
+		ReplicasProbesFailure:     metric.NewCounter(metaDistSenderCircuitBreakerReplicasProbesFailure),
+		ReplicasRequestsCancelled: metric.NewCounter(metaDistSenderCircuitBreakerReplicasRequestsCancelled),
+		ReplicasRequestsRejected:  metric.NewCounter(metaDistSenderCircuitBreakerReplicasRequestsRejected),
+	}
 }
 
 // rangeFeedErrorCounters are various error related counters for rangefeed.
@@ -731,7 +816,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	// the stopper stops. This can only error if the server is shutting down, so
 	// ignore the returned error.
 	ds.circuitBreakers = NewDistSenderCircuitBreakers(
-		ds.stopper, ds.st, ds.transportFactory, ds.metrics)
+		ds.AmbientContext, ds.stopper, ds.st, ds.transportFactory, ds.metrics)
 	_ = ds.circuitBreakers.Start()
 
 	if cfg.TestingKnobs.LatencyFunc != nil {
@@ -1896,6 +1981,18 @@ func (ds *DistSender) sendPartialBatch(
 		attempts++
 		pErr = nil
 		// If we've invalidated the descriptor on a send failure, re-lookup.
+
+		// On a proxy request, update our routing information with what the
+		// client sent us if the client had newer information. We have already
+		// validated the client request against our local replica state in
+		// node.go and reject requests with stale information. Here we ensure
+		// our RangeCache has the same information as both the client request
+		// and our local replica before attempting the request. If the sync
+		// makes our token invalid, we handle it similarly to a RangeNotFound or
+		// NotLeaseHolderError from a remote server.
+		if ba.ProxyRangeInfo != nil {
+			routingTok.SyncTokenAndMaybeUpdateCache(ctx, &ba.ProxyRangeInfo.Lease, &ba.ProxyRangeInfo.Desc)
+		}
 		if !routingTok.Valid() {
 			var descKey roachpb.RKey
 			if isReverse {
@@ -1969,6 +2066,11 @@ func (ds *DistSender) sendPartialBatch(
 			// Set pErr so that, if we don't perform any more retries, the
 			// deduceRetryEarlyExitError() call below the loop includes this error.
 			pErr = kvpb.NewError(err)
+			// Proxy requests are not retried since we not the originator.
+			if ba.ProxyRangeInfo != nil {
+				log.VEventf(ctx, 1, "failing proxy request after error %s", err)
+				break
+			}
 			switch {
 			case IsSendError(err):
 				// We've tried all the replicas without success. Either they're all
@@ -2222,6 +2324,12 @@ func noMoreReplicasErr(ambiguousErr, replicaUnavailableErr, lastAttemptErr error
 		return replicaUnavailableErr
 	}
 
+	// Authentication and authorization errors should be propagated up rather than
+	// wrapped in a SendError and retried as they are likely to be fatal if they
+	// are returned from multiple servers.
+	if grpcutil.IsAuthError(lastAttemptErr) {
+		return lastAttemptErr
+	}
 	// TODO(bdarnell): The error from the last attempt is not necessarily the best
 	// one to return; we may want to remember the "best" error we've seen (for
 	// example, a NotLeaseHolderError conveys more information than a
@@ -2256,7 +2364,7 @@ const defaultSendClosedTimestampPolicy = roachpb.LEAD_FOR_GLOBAL_READS
 // AmbiguousResultError. Of those two, the latter has to be passed back to the
 // client, while the former should be handled by retrying with an updated range
 // descriptor. This method handles other errors returned from replicas
-// internally by retrying (NotLeaseholderError, RangeNotFoundError), and falls
+// internally by retrying (NotLeaseHolderError, RangeNotFoundError), and falls
 // back to a sendError when it runs out of replicas to try.
 //
 // routing dictates what replicas will be tried (but not necessarily their
@@ -2301,15 +2409,62 @@ func (ds *DistSender) sendToReplicas(
 		log.Fatalf(ctx, "unknown routing policy: %s", ba.RoutingPolicy)
 	}
 	desc := routing.Desc()
-	leaseholder := routing.Leaseholder()
-	replicas, err := NewReplicaSlice(ctx, ds.nodeDescs, desc, leaseholder, replicaFilter)
+	replicas, err := NewReplicaSlice(ctx, ds.nodeDescs, desc, routing.Leaseholder(), replicaFilter)
 	if err != nil {
 		return nil, err
 	}
 
+	// This client requested we proxy this request. Only proxy if we can
+	// determine the leaseholder and it agrees with the ProxyRangeInfo from
+	// the client. We don't support a proxy request to a non-leaseholder
+	// replica. If we decide to proxy this request, we will reduce our replica
+	// list to only the requested replica. If we fail on that request we fail back
+	// to the caller so they can try something else.
+	if ba.ProxyRangeInfo != nil {
+		log.VEventf(ctx, 3, "processing a proxy request to %v", ba.ProxyRangeInfo)
+		// We don't know who the leaseholder is, and it is likely that the
+		// client had stale information. Return our information to them through
+		// a NLHE and let them retry.
+		if routing.Lease().Empty() {
+			log.VEventf(ctx, 2, "proxy failed, unknown leaseholder %v", routing)
+			br := kvpb.BatchResponse{}
+			br.Error = kvpb.NewError(
+				kvpb.NewNotLeaseHolderError(roachpb.Lease{},
+					0, /* proposerStoreID */
+					routing.Desc(),
+					"client requested a proxy but we can't figure out the leaseholder"),
+			)
+			return &br, nil
+		}
+		if ba.ProxyRangeInfo.Lease.Sequence != routing.Lease().Sequence ||
+			ba.ProxyRangeInfo.Desc.Generation != routing.Desc().Generation {
+			log.VEventf(ctx, 2, "proxy failed, update client information %v != %v", ba.ProxyRangeInfo, routing)
+			br := kvpb.BatchResponse{}
+			br.Error = kvpb.NewError(
+				kvpb.NewNotLeaseHolderError(
+					*routing.Lease(),
+					0, /* proposerStoreID */
+					routing.Desc(),
+					fmt.Sprintf("proxy failed, update client information %v != %v", ba.ProxyRangeInfo, routing)),
+			)
+			return &br, nil
+		}
+
+		// On a proxy request, we only send the request to the leaseholder. If we
+		// are here then the client and server agree on the routing information, so
+		// use the leaseholder as our only replica to send to.
+		idx := replicas.Find(routing.Leaseholder().ReplicaID)
+		// This should never happen. We validated the routing above and the token
+		// is still valid.
+		if idx == -1 {
+			return nil, errors.AssertionFailedf("inconsistent routing %v %v", desc, *routing.Leaseholder())
+		}
+		replicas = replicas[idx : idx+1]
+		log.VEventf(ctx, 2, "sender requested proxy to leaseholder %v", replicas)
+	}
 	// Rearrange the replicas so that they're ordered according to the routing
 	// policy.
-	var leaseholderFirst bool
+	var routeToLeaseholder bool
 	switch ba.RoutingPolicy {
 	case kvpb.RoutingPolicy_LEASEHOLDER:
 		// First order by latency, then move the leaseholder to the front of the
@@ -2319,12 +2474,12 @@ func (ds *DistSender) sendToReplicas(
 		}
 
 		idx := -1
-		if leaseholder != nil {
-			idx = replicas.Find(leaseholder.ReplicaID)
+		if routing.Leaseholder() != nil {
+			idx = replicas.Find(routing.Leaseholder().ReplicaID)
 		}
 		if idx != -1 {
 			replicas.MoveToFront(idx)
-			leaseholderFirst = true
+			routeToLeaseholder = true
 		} else {
 			// The leaseholder node's info must have been missing from gossip when we
 			// created replicas.
@@ -2373,6 +2528,7 @@ func (ds *DistSender) sendToReplicas(
 	// This loop will retry operations that fail with errors that reflect
 	// per-replica state and may succeed on other replicas.
 	var ambiguousError, replicaUnavailableError error
+	var leaseholderUnavailable bool
 	var br *kvpb.BatchResponse
 	attempts := int64(0)
 	for first := true; ; first, attempts = false, attempts+1 {
@@ -2461,6 +2617,44 @@ func (ds *DistSender) sendToReplicas(
 		comparisonResult := ds.getLocalityComparison(ctx, ds.nodeIDGetter(), ba.Replica.NodeID)
 		ds.metrics.updateCrossLocalityMetricsOnReplicaAddressedBatchRequest(comparisonResult, int64(ba.Size()))
 
+		// Determine whether we should proxy this request through a follower to
+		// the leaseholder. The primary condition for proxying is that we would
+		// like to send the request to the leaseholder, but the transport is
+		// about to send the request through a follower.
+		requestToSend := ba
+		if !ProxyBatchRequest.Get(&ds.st.SV) {
+			// The setting is disabled, so we don't proxy this request.
+		} else if ba.ProxyRangeInfo != nil {
+			// Clear out the proxy information to prevent the recipient from
+			// sending this request onwards. This is necessary to prevent proxy
+			// chaining. We want the recipient to process the request or fail
+			// immediately. This is an extra safety measure to prevent any types
+			// of routing loops.
+			requestToSend = ba.ShallowCopy()
+			requestToSend.ProxyRangeInfo = nil
+		} else if !routeToLeaseholder {
+			// This request isn't intended for the leaseholder so we don't proxy it.
+		} else if routing.Leaseholder() == nil {
+			// NB: Normally we don't have both routeToLeaseholder and a nil
+			// leaseholder. This could be changed to an assertion.
+			log.Errorf(ctx, "attempting %v to route to leaseholder, but the leaseholder is unknown %v", ba, routing)
+		} else if ba.Replica.NodeID == routing.Leaseholder().NodeID {
+			// We are sending this request to the leaseholder, so it doesn't
+			// make sense to attempt to proxy it.
+		} else if ds.nodeIDGetter() == ba.Replica.NodeID {
+			// This condition prevents proxying a request if we are the same
+			// node as the final destination. Without this we would pass through
+			// the same DistSender stack again which is pointless.
+		} else {
+			// We passed all the conditions above and want to attempt to proxy
+			// this request. We need to copy it as we are going to modify the
+			// Header. For other replicas we may not end up setting the header.
+			requestToSend = ba.ShallowCopy()
+			rangeInfo := routing.RangeInfo()
+			requestToSend.ProxyRangeInfo = &rangeInfo
+			log.VEventf(ctx, 1, "attempt proxy request %v using %v", requestToSend, rangeInfo)
+		}
+
 		tBegin := timeutil.Now() // for slow log message
 		sendCtx, cbToken, cbErr := ds.circuitBreakers.ForReplica(desc, &curReplica).
 			Track(ctx, ba, tBegin.UnixNano())
@@ -2469,7 +2663,7 @@ func (ds *DistSender) sendToReplicas(
 			err = cbErr
 			transport.SkipReplica()
 		} else {
-			br, err = transport.SendNext(sendCtx, ba)
+			br, err = transport.SendNext(sendCtx, requestToSend)
 			tEnd := timeutil.Now()
 			cbToken.Done(br, err, tEnd.UnixNano())
 
@@ -2485,6 +2679,18 @@ func (ds *DistSender) sendToReplicas(
 				}
 			}
 		}
+		if err == nil {
+			if proxyErr, ok := br.Error.GetDetail().(*kvpb.ProxyFailedError); ok {
+				// The server proxy attempt resulted in a non-BatchRequest error, likely
+				// a communication error. Convert the wrapped error into an error on our
+				// side Depending on the type of request and what the error is we may
+				// treat the error an ambiguous error. Clear out the BatchResponse as
+				// the only information it contained was this error.
+				err = proxyErr.Unwrap()
+				br = nil
+				log.VEventf(ctx, 2, "proxy send error: %s", err)
+			}
+		}
 
 		ds.metrics.updateCrossLocalityMetricsOnReplicaAddressedBatchResponse(comparisonResult, int64(br.Size()))
 		ds.maybeIncrementErrCounters(br, err)
@@ -2495,15 +2701,6 @@ func (ds *DistSender) sendToReplicas(
 
 		} else if err != nil {
 			log.VErrEventf(ctx, 2, "RPC error: %s", err)
-
-			if grpcutil.IsAuthError(err) {
-				// Authentication or authorization error. Propagate.
-				if ambiguousError != nil {
-					return nil, kvpb.NewAmbiguousResultErrorf("error=%v [propagate] (last error: %v)",
-						ambiguousError, err)
-				}
-				return nil, err
-			}
 
 			// For most connection errors, we cannot tell whether or not the request
 			// may have succeeded on the remote server (exceptions are captured in the
@@ -2559,6 +2756,11 @@ func (ds *DistSender) sendToReplicas(
 			// retrying the writes, should it need to be propagated.
 			if withCommit && !grpcutil.RequestDidNotStart(err) {
 				ambiguousError = err
+			}
+			// If we get a gRPC error against the leaseholder, we don't want to
+			// backoff and keep trying the request against the same leaseholder.
+			if lh := routing.Leaseholder(); lh != nil && lh.IsSame(curReplica) {
+				leaseholderUnavailable = true
 			}
 		} else {
 			// If the reply contains a timestamp, update the local HLC with it.
@@ -2669,16 +2871,18 @@ func (ds *DistSender) sendToReplicas(
 					// different range during intent resolution, and that range returns a
 					// RUE. In this case we just return it directly, as br.Error.
 					return br, nil
-				} else if replicaUnavailableError == nil {
-					// This is the first time we see a RUE. Record it, such that we'll
-					// return it if all other replicas fail (regardless of error).
-					replicaUnavailableError = br.Error.GoError()
-				} else if lh := routing.Leaseholder(); lh != nil && lh.IsSame(curReplica) {
+				}
+				if lh := routing.Leaseholder(); lh != nil && lh.IsSame(curReplica) {
 					// This error came from the supposed leaseholder. Record it, such that
 					// subsequent NLHEs pointing back to this one can be ignored instead
 					// of getting stuck in a retry loop. This ensures we'll eventually
 					// error out when the transport is exhausted even if multiple replicas
 					// return NLHEs to different replicas all returning RUEs.
+					replicaUnavailableError = br.Error.GoError()
+					leaseholderUnavailable = true
+				} else if replicaUnavailableError == nil {
+					// This is the first time we see a RUE. Record it, such that we'll
+					// return it if all other replicas fail (regardless of error).
 					replicaUnavailableError = br.Error.GoError()
 				}
 				// The circuit breaker may have tripped while a commit proposal was in
@@ -2688,56 +2892,79 @@ func (ds *DistSender) sendToReplicas(
 				}
 			case *kvpb.NotLeaseHolderError:
 				ds.metrics.NotLeaseHolderErrCount.Inc(1)
-				// If we got some lease information, we use it. If not, we loop around
-				// and try the next replica.
-				if tErr.Lease != nil {
-					// Update the leaseholder in the range cache. Naively this would also
-					// happen when the next RPC comes back, but we don't want to wait out
-					// the additional RPC latency.
-
-					var updatedLeaseholder bool
-					if tErr.Lease != nil {
-						updatedLeaseholder = routing.SyncTokenAndMaybeUpdateCache(ctx, tErr.Lease, &tErr.RangeDesc)
+				// Update the leaseholder in the range cache. Naively this would also
+				// happen when the next RPC comes back, but we don't want to wait out
+				// the additional RPC latency.
+				var oldLeaseholder = routing.Leaseholder()
+				if oldLeaseholder == nil {
+					oldLeaseholder = &roachpb.ReplicaDescriptor{}
+				}
+				errDesc := &tErr.RangeDesc
+				errLease := tErr.Lease
+				// TODO(baptist): Many tests don't set the RangeDesc on NLHE. The
+				// desired behavior is undefined if it is not set. Ideally all tests
+				// should be updated to call NewNotLeaseHolderError
+				if errDesc.RangeID == 0 {
+					errDesc = routing.Desc()
+				}
+				// If there is no lease in the error, use an empty lease
+				if tErr.Lease == nil {
+					errLease = &roachpb.Lease{}
+				}
+				routing.SyncTokenAndMaybeUpdateCache(ctx, errLease, errDesc)
+				// Note that the leaseholder might not be the one indicated by
+				// the NLHE we just received, in case that error carried stale info.
+				lh := routing.Leaseholder()
+				// If we got new information, we use it. If not, we loop around and try
+				// the next replica.
+				if lh != nil && !errLease.Empty() {
+					updatedLeaseholder := !lh.IsSame(*oldLeaseholder)
+					// If we changed leaseholder, reset whether we think the
+					// leaseholder was unavailable. In the worst case this will
+					// cause an extra pass through sendToReplicas, but it
+					// prevents accidentally returning a replica unavailable
+					// error too aggressively.
+					if updatedLeaseholder {
+						leaseholderUnavailable = false
+						routeToLeaseholder = true
+						// If we changed the leaseholder, reset the transport to try all the
+						// replicas in order again. After a leaseholder change, requests to
+						// followers will be marked as potential proxy requests and point to
+						// the new leaseholder. We need to try all the replicas again before
+						// giving up.
+						// NB: We reset and retry here because if we release a SendError to
+						// the caller, it will call Evict and evict the leaseholder
+						// information we just learned from this error.
+						// TODO(baptist): If sendPartialBatch didn't evict valid range
+						// information we would not need to reset the transport here.
+						transport.Reset()
 					}
-					// Move the new leaseholder to the head of the queue for the next
-					// retry. Note that the leaseholder might not be the one indicated by
-					// the NLHE we just received, in case that error carried stale info.
-					if lh := routing.Leaseholder(); lh != nil {
-						// If we've already tried this replica and it's unavailable due to
-						// a tripped replica circuit breaker, skip it to avoid loops.
-						var lhRUE bool
-						if err := replicaUnavailableError; err != nil {
-							if rue := (*kvpb.ReplicaUnavailableError)(nil); errors.As(err, &rue) {
-								lhRUE = lh.IsSame(rue.Replica)
-							}
-						}
-						// If the leaseholder is the replica that we've just tried, and
-						// we've tried this replica a bunch of times already, let's move on
-						// and not try it again. This prevents us getting stuck on a replica
-						// that we think has the lease but keeps returning redirects to us
-						// (possibly because it hasn't applied its lease yet). Perhaps that
-						// lease expires and someone else gets a new one, so by moving on we
-						// get out of possibly infinite loops.
-						if (!lh.IsSame(curReplica) || sameReplicaRetries < sameReplicaRetryLimit) && !lhRUE {
-							moved := transport.MoveToFront(*lh)
-							if !moved {
-								// The transport always includes the client's view of the
-								// leaseholder when it's constructed. If the leaseholder can't
-								// be found on the transport then it must be the case that the
-								// routing was updated with lease information that is not
-								// compatible with the range descriptor that was used to
-								// construct the transport. A client may have an arbitrarily
-								// stale view of the leaseholder, but it is never expected to
-								// regress. As such, advancing through each replica on the
-								// transport until it's exhausted is unlikely to achieve much.
-								//
-								// We bail early by returning a SendError. The expectation is
-								// for the client to retry with a fresher eviction token.
-								log.VEventf(
-									ctx, 2, "transport incompatible with updated routing; bailing early",
-								)
-								return nil, newSendError(errors.Wrap(tErr, "leaseholder not found in transport; last error"))
-							}
+					// If the leaseholder is the replica that we've just tried, and
+					// we've tried this replica a bunch of times already, let's move on
+					// and not try it again. This prevents us getting stuck on a replica
+					// that we think has the lease but keeps returning redirects to us
+					// (possibly because it hasn't applied its lease yet). Perhaps that
+					// lease expires and someone else gets a new one, so by moving on we
+					// get out of possibly infinite loops.
+					if (!lh.IsSame(curReplica) || sameReplicaRetries < sameReplicaRetryLimit) && !leaseholderUnavailable {
+						moved := transport.MoveToFront(*lh)
+						if !moved {
+							// The transport always includes the client's view of the
+							// leaseholder when it's constructed. If the leaseholder can't
+							// be found on the transport then it must be the case that the
+							// routing was updated with lease information that is not
+							// compatible with the range descriptor that was used to
+							// construct the transport. A client may have an arbitrarily
+							// stale view of the leaseholder, but it is never expected to
+							// regress. As such, advancing through each replica on the
+							// transport until it's exhausted is unlikely to achieve much.
+							//
+							// We bail early by returning a SendError. The expectation is
+							// for the client to retry with a fresher eviction token.
+							log.VEventf(
+								ctx, 2, "transport incompatible with updated routing; bailing early",
+							)
+							return nil, newSendError(errors.Wrap(tErr, "leaseholder not found in transport; last error"))
 						}
 					}
 					// Check whether the request was intentionally sent to a follower
@@ -2746,12 +2973,17 @@ func (ds *DistSender) sendToReplicas(
 					// have a sufficient closed timestamp. In response, we should
 					// immediately redirect to the leaseholder, without a backoff
 					// period.
-					intentionallySentToFollower := first && !leaseholderFirst
+					intentionallySentToFollower := first && !routeToLeaseholder
 					// See if we want to backoff a little before the next attempt. If
 					// the lease info we got is stale and we were intending to send to
 					// the leaseholder, we backoff because it might be the case that
 					// there's a lease transfer in progress and the would-be leaseholder
 					// has not yet applied the new lease.
+					//
+					// If the leaseholder is unavailable, we don't backoff since we aren't
+					// trying the leaseholder again, instead we want to cycle through the
+					// remaining replicas to see if they have the lease before we return
+					// to sendPartialBatch.
 					//
 					// TODO(arul): The idea here is for the client to not keep sending
 					// the would-be leaseholder multiple requests and backoff a bit to let
@@ -2761,7 +2993,7 @@ func (ds *DistSender) sendToReplicas(
 					// the replica we just tried), in which case we should backoff. With
 					// this scheme we'd no longer have to track "updatedLeaseholder" state
 					// when syncing the NLHE with the range cache.
-					shouldBackoff := !updatedLeaseholder && !intentionallySentToFollower
+					shouldBackoff := !updatedLeaseholder && !intentionallySentToFollower && !leaseholderUnavailable
 					if shouldBackoff {
 						ds.metrics.InLeaseTransferBackoffs.Inc(1)
 						log.VErrEventf(ctx, 2, "backing off due to NotLeaseHolderErr with stale info")

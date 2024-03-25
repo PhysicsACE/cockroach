@@ -80,11 +80,12 @@ var (
 
 	// storageCluster is used for cluster virtualization and multi-tenant functionality.
 	storageCluster string
-	// externalProcessNodes indicates the cluster/nodes where external
-	// process SQL instances should be deployed.
-	externalProcessNodes string
 
 	revertUpdate bool
+
+	grafanaTags         []string
+	grafanaDashboardUID string
+	grafanaTimeRange    []int64
 )
 
 func initFlags() {
@@ -202,12 +203,14 @@ func initFlags() {
 		"init-target", startOpts.InitTarget, "node on which to run initialization")
 	startCmd.Flags().IntVar(&startOpts.StoreCount,
 		"store-count", startOpts.StoreCount, "number of stores to start each node with")
+	startCmd.Flags().IntVar(&startOpts.AdminUIPort,
+		"admin-ui-port", startOpts.AdminUIPort, "port to serve the admin UI on")
 
 	startInstanceCmd.Flags().StringVarP(&storageCluster, "storage-cluster", "S", "", "storage cluster")
 	_ = startInstanceCmd.MarkFlagRequired("storage-cluster")
 	startInstanceCmd.Flags().IntVar(&startOpts.SQLInstance,
 		"sql-instance", 0, "specific SQL/HTTP instance to connect to (this is a roachprod abstraction for separate-process deployments distinct from the internal instance ID)")
-	startInstanceCmd.Flags().StringVar(&externalProcessNodes, "external-cluster", externalProcessNodes, "start service in external mode, as a separate process in the given nodes")
+	startInstanceCmd.Flags().StringVar(&startOpts.VirtualClusterLocation, "external-nodes", startOpts.VirtualClusterLocation, "if set, starts service in external mode, as a separate process in the given nodes")
 
 	// Flags for processes that stop (kill) processes.
 	for _, stopProcessesCmd := range []*cobra.Command{stopCmd, stopInstanceCmd} {
@@ -341,8 +344,6 @@ func initFlags() {
 			"limit the number of files that can be created by the cockroach process")
 		cmd.Flags().IntVar(&startOpts.SQLPort,
 			"sql-port", startOpts.SQLPort, "port on which to listen for SQL clients")
-		cmd.Flags().IntVar(&startOpts.AdminUIPort,
-			"admin-ui-port", startOpts.AdminUIPort, "port to serve the admin UI on")
 	}
 
 	for _, cmd := range []*cobra.Command{
@@ -362,7 +363,7 @@ func initFlags() {
 		cmd.Flags().StringVarP(&config.Binary,
 			"binary", "b", config.Binary, "the remote cockroach binary to use")
 	}
-	for _, cmd := range []*cobra.Command{startCmd, startInstanceCmd, stopInstanceCmd, sqlCmd, pgurlCmd, adminurlCmd, runCmd, jaegerStartCmd} {
+	for _, cmd := range []*cobra.Command{startCmd, startInstanceCmd, stopInstanceCmd, sqlCmd, pgurlCmd, adminurlCmd, runCmd, jaegerStartCmd, grafanaAnnotationCmd} {
 		cmd.Flags().BoolVar(&secure,
 			"secure", false, "use a secure cluster")
 	}
@@ -373,4 +374,10 @@ func initFlags() {
 			"sql-instance", 0, "specific SQL/HTTP instance to connect to (this is a roachprod abstraction distinct from the internal instance ID)")
 	}
 
+	grafanaAnnotationCmd.Flags().StringArrayVar(&grafanaTags,
+		"tags", []string{}, "grafana annotation tags")
+	grafanaAnnotationCmd.Flags().StringVar(&grafanaDashboardUID,
+		"dashboard-uid", "", "grafana dashboard UID")
+	grafanaAnnotationCmd.Flags().Int64SliceVar(&grafanaTimeRange,
+		"time-range", []int64{}, "grafana annotation time range in epoch time")
 }

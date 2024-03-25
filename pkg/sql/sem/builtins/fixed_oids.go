@@ -2564,6 +2564,13 @@ var builtinOidsArray = []string{
 	2596: `array_agg(arg1: refcursor[]) -> refcursor[][]`,
 	2597: `array_agg(arg1: tuple[]) -> tuple[][]`,
 	2598: `setseed(seed: float) -> void`,
+	2599: `crdb_internal.execute_internally(query: string) -> string`,
+	2600: `crdb_internal.execute_internally(query: string, session_bound: bool) -> string`,
+	2601: `crdb_internal.execute_internally(query: string, overrides: string) -> string`,
+	2602: `crdb_internal.execute_internally(query: string, session_bound: bool, overrides: string) -> string`,
+	2603: `crdb_internal.execute_internally(query: string, overrides: string, use_session_txn: bool) -> string`,
+	2604: `crdb_internal.execute_internally(query: string, session_bound: bool, overrides: string, use_session_txn: bool) -> string`,
+	2605: `merge_aggregated_stmt_metadata(arg1: jsonb) -> jsonb`,
 }
 
 var builtinOidsBySignature map[string]oid.Oid

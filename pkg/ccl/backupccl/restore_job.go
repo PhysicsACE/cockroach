@@ -812,18 +812,25 @@ func shouldPreRestore(table *tabledesc.Mutable) bool {
 
 // backedUpDescriptorWithInProgressImportInto returns true if the backed up descriptor represents a table with an in
 // progress import that started in a cluster finalized to version 22.2.
-func backedUpDescriptorWithInProgressImportInto(
-	ctx context.Context, p sql.JobExecContext, desc catalog.Descriptor,
-) (bool, error) {
+func backedUpDescriptorWithInProgressImportInto(desc catalog.Descriptor) bool {
 	table, ok := desc.(catalog.TableDescriptor)
 	if !ok {
-		return false, nil
+		return false
 	}
 
-	if table.GetInProgressImportStartTime() == 0 {
-		return false, nil
+	return table.GetInProgressImportStartTime() > 0
+}
+
+// epochBasedInProgressImport returns true if the backup up descriptor
+// represents a table with an inprogress import that used
+// ImportEpochs.
+func epochBasedInProgressImport(desc catalog.Descriptor) bool {
+	table, ok := desc.(catalog.TableDescriptor)
+	if !ok {
+		return false
 	}
-	return true, nil
+
+	return table.GetInProgressImportStartTime() > 0 && table.TableDesc().ImportEpoch > 0
 }
 
 // createImportingDescriptors creates the tables that we will restore into and returns up to three
@@ -846,6 +853,7 @@ func createImportingDescriptors(
 	backupCodec keys.SQLCodec,
 	sqlDescs []catalog.Descriptor,
 	r *restoreResumer,
+	manifest backuppb.BackupManifest,
 ) (
 	dataToPreRestore *restorationDataBase,
 	preValidation *restorationDataBase,
@@ -885,22 +893,32 @@ func createImportingDescriptors(
 	for _, desc := range sqlDescs {
 		// Decide which offline tables to include in the restore:
 		//
-		// -  An offline table created by RESTORE or IMPORT PGDUMP is fully discarded.
-		//    The table will not exist in the restoring cluster.
+		// - An offline table created by RESTORE or IMPORT PGDUMP is
+		//   fully discarded.  The table will not exist in the restoring
+		//   cluster.
 		//
-		// -  An offline table undergoing an IMPORT INTO has all importing data
-		//    elided in the restore processor and is restored online to its pre import
-		//    state.
+		// - An offline table undergoing an IMPORT INTO in traditional
+		//   restore has all importing data elided in the restore
+		//   processor and is restored online to its pre import state.
+		//
+		// - An offline table undergoing an IMPORT INTO in online
+		//   restore with no ImportEpoch cannot be restored and an error
+		//   is returned.
+		//
+		// - An offline table undergoing an IMPORT INTO in online
+		//   restore with an ImportEpoch is restored with an Offline
+		//   table and a revert job is queued that will bring the table
+		//   back online.
 		if desc.Offline() {
 			if schema, ok := desc.(catalog.SchemaDescriptor); ok {
 				offlineSchemas[schema.GetID()] = struct{}{}
 			}
 
-			if hasInProgressImportInto, err := backedUpDescriptorWithInProgressImportInto(ctx, p, desc); err != nil {
-				return nil, nil, nil, err
-			} else if hasInProgressImportInto && details.ExperimentalOnline {
-				return nil, nil, nil, errors.Newf("table %s (id %d) in restoring backup has an in-progress import, but online restore cannot be run on a table with an in progress import", desc.GetName(), desc.GetID())
-			} else if !hasInProgressImportInto {
+			if backedUpDescriptorWithInProgressImportInto(desc) {
+				if details.ExperimentalOnline && !epochBasedInProgressImport(desc) {
+					return nil, nil, nil, errors.Newf("table %s (id %d) in restoring backup has an in-progress import, but online restore cannot be run on a table with an in progress import", desc.GetName(), desc.GetID())
+				}
+			} else {
 				continue
 			}
 		}
@@ -1347,6 +1365,20 @@ func createImportingDescriptors(
 					default:
 						return errors.AssertionFailedf("unknown tenant data state %v", tenantInfoCopy)
 					}
+					if p, err := roachpb.MakeTenantID(tenantInfoCopy.ID); err == nil {
+						if details.PreRewriteTenantId != nil {
+							p = *details.PreRewriteTenantId
+						}
+						ts := details.EndTime
+						if ts.IsEmpty() {
+							ts = manifest.EndTime
+						}
+						tenantInfoCopy.PreviousSourceTenant = &mtinfopb.PreviousSourceTenant{
+							ClusterID:        manifest.ClusterID,
+							TenantID:         p,
+							CutoverTimestamp: ts,
+						}
+					}
 					spanConfigs := p.ExecCfg().SpanConfigKVAccessor.WithTxn(ctx, txn.KV())
 					if _, err := sql.CreateTenantRecord(
 						ctx,
@@ -1700,7 +1732,7 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	if err != nil {
 		return err
 	}
-	preData, preValidateData, mainData, err := createImportingDescriptors(ctx, p, backupCodec, sqlDescs, r)
+	preData, preValidateData, mainData, err := createImportingDescriptors(ctx, p, backupCodec, sqlDescs, r, latestBackupManifest)
 	if err != nil {
 		return err
 	}
@@ -1926,6 +1958,9 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	}
 
 	r.restoreStats = resTotal
+	if err := r.maybeWriteDownloadJob(ctx, p.ExecCfg(), preData, mainData); err != nil {
+		return err
+	}
 
 	// Emit an event now that the restore job has completed.
 	emitRestoreJobEvent(ctx, p, jobs.StatusSucceeded, r.job)
@@ -2230,16 +2265,25 @@ func (r *restoreResumer) publishDescriptors(
 		return err
 	}
 
+	var tableAutoStatsSettings map[uint32]*catpb.AutoStatsSettings
+	if details.ExperimentalOnline {
+		tableAutoStatsSettings = make(map[uint32]*catpb.AutoStatsSettings, len(details.TableDescs))
+	}
+
 	// Write the new TableDescriptors and flip state over to public so they can be
 	// accessed.
 	for i := range details.TableDescs {
-		mutTable := all.LookupDescriptor(details.TableDescs[i].GetID()).(*tabledesc.Mutable)
+		desc := all.LookupDescriptor(details.TableDescs[i].GetID())
+		mutTable := desc.(*tabledesc.Mutable)
 
-		if details.ExperimentalOnline {
+		if details.ExperimentalOnline && mutTable.IsTable() {
 			// We disable automatic stats refresh on all restored tables until the
 			// download job finishes.
 			boolean := false
 			mutTable.AutoStatsSettings = &catpb.AutoStatsSettings{Enabled: &boolean}
+
+			// Preserve the backed up table stats so the download job re-enables them
+			tableAutoStatsSettings[uint32(details.TableDescs[i].ID)] = details.TableDescs[i].AutoStatsSettings
 		}
 
 		// Note that we don't need to worry about the re-validated indexes for descriptors
@@ -2269,6 +2313,7 @@ func (r *restoreResumer) publishDescriptors(
 			}
 			mutTable.RowLevelTTL.ScheduleID = j.ScheduleID()
 		}
+
 		newTables = append(newTables, mutTable.TableDesc())
 
 		// Convert any mutations that were in progress on the table descriptor
@@ -2279,6 +2324,17 @@ func (r *restoreResumer) publishDescriptors(
 			return err
 		}
 
+		if details.ExperimentalOnline && epochBasedInProgressImport(desc) {
+			if err := createImportRollbackJob(ctx,
+				r.execCfg.JobRegistry, txn, r.job.Payload().UsernameProto.Decode(), mutTable,
+			); err != nil {
+				return err
+			}
+		} else {
+			// If this was an importing table, it is now effectively _not_
+			// importing.
+			mutTable.FinalizeImport()
+		}
 	}
 	// For all of the newly created types, make type schema change jobs for any
 	// type descriptors that were backed up in the middle of a type schema change.
@@ -2309,7 +2365,11 @@ func (r *restoreResumer) publishDescriptors(
 	b := txn.KV().NewBatch()
 	if err := all.ForEachDescriptor(func(desc catalog.Descriptor) error {
 		d := desc.(catalog.MutableDescriptor)
-		d.SetPublic()
+		if details.ExperimentalOnline && epochBasedInProgressImport(desc) {
+			log.Infof(ctx, "table %q (%d) with in-progress IMPORT remaining offline", desc.GetName(), desc.GetID())
+		} else {
+			d.SetPublic()
+		}
 		return txn.Descriptors().WriteDescToBatch(ctx, kvTrace, d, b)
 	}); err != nil {
 		return err
@@ -2344,6 +2404,9 @@ func (r *restoreResumer) publishDescriptors(
 	details.SchemaDescs = newSchemas
 	details.DatabaseDescs = newDBs
 	details.FunctionDescs = newFunctions
+	if details.ExperimentalOnline {
+		details.PostDownloadTableAutoStatsSettings = tableAutoStatsSettings
+	}
 	if err := r.job.WithTxn(txn).SetDetails(ctx, details); err != nil {
 		return errors.Wrap(err,
 			"updating job details after publishing tables")

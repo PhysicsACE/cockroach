@@ -626,9 +626,8 @@ func (f *FlowBase) MemUsage() int64 {
 func (f *FlowBase) Cancel() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.mu.status == flowFinished || f.mu.ctxCancel == nil {
-		// The Flow is already done, nothing to cancel. ctxCancel can be nil in
-		// some tests.
+	if f.mu.status == flowFinished {
+		// The Flow is already done, nothing to cancel.
 		return
 	}
 	f.mu.ctxCancel()
@@ -726,8 +725,7 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 		}
 	}
 
-	// This closes the disk monitor opened in newFlowContext as well as the
-	// memory monitor opened in ServerImpl.setupFlow.
+	// This closes the monitors opened in ServerImpl.setupFlow.
 	if r := recover(); r != nil {
 		f.DiskMonitor.EmergencyStop(ctx)
 		f.Mon.EmergencyStop(ctx)

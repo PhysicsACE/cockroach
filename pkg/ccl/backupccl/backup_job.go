@@ -11,6 +11,7 @@ package backupccl
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"path"
 	"reflect"
@@ -214,7 +215,9 @@ func backup(
 
 	oracle := physicalplan.DefaultReplicaChooser
 	if useBulkOracle.Get(&evalCtx.Settings.SV) {
-		oracle = kvfollowerreadsccl.NewBulkOracle(dsp.ReplicaOracleConfig(evalCtx.Locality), execLocality)
+		oracle = kvfollowerreadsccl.NewBulkOracle(
+			dsp.ReplicaOracleConfig(evalCtx.Locality), execLocality, kvfollowerreadsccl.StreakConfig{},
+		)
 	}
 
 	// We don't return the compatible nodes here since PartitionSpans will
@@ -244,6 +247,7 @@ func backup(
 		backupManifest.StartTime,
 		backupManifest.EndTime,
 		backupManifest.ElidedPrefix,
+		backupManifest.ClusterVersion.AtLeast(clusterversion.V24_1.Version()),
 	)
 	if err != nil {
 		return roachpb.RowCount{}, 0, err
@@ -393,6 +397,13 @@ func backup(
 		), "running distributed backup to export %d ranges", errors.Safe(numTotalSpans))
 	}
 
+	testingKnobs := execCtx.ExecCfg().BackupRestoreTestingKnobs
+	if testingKnobs != nil && testingKnobs.RunBeforeBackupFlow != nil {
+		if err := testingKnobs.RunBeforeBackupFlow(); err != nil {
+			return roachpb.RowCount{}, 0, err
+		}
+	}
+
 	if err := ctxgroup.GoAndWait(
 		ctx,
 		jobProgressLoop,
@@ -402,6 +413,12 @@ func backup(
 		runBackup,
 	); err != nil {
 		return roachpb.RowCount{}, 0, err
+	}
+
+	if testingKnobs != nil && testingKnobs.RunAfterBackupFlow != nil {
+		if err := testingKnobs.RunAfterBackupFlow(); err != nil {
+			return roachpb.RowCount{}, 0, err
+		}
 	}
 
 	backupID := uuid.MakeV4()
@@ -816,6 +833,11 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		MaxRetries: 5,
 	}
 
+	if p.ExecCfg().BackupRestoreTestingKnobs != nil &&
+		p.ExecCfg().BackupRestoreTestingKnobs.BackupDistSQLRetryPolicy != nil {
+		retryOpts = *p.ExecCfg().BackupRestoreTestingKnobs.BackupDistSQLRetryPolicy
+	}
+
 	if err := p.ExecCfg().JobRegistry.CheckPausepoint("backup.before.flow"); err != nil {
 		return err
 	}
@@ -823,6 +845,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	// We want to retry a backup if there are transient failures (i.e. worker nodes
 	// dying), so if we receive a retryable error, re-plan and retry the backup.
 	var res roachpb.RowCount
+	var lastProgress float32
 	var numBackupInstances int
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		res, numBackupInstances, err = backup(
@@ -866,6 +889,25 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			defaultStore, details, p.User(), &kmsEnv)
 		if reloadBackupErr != nil {
 			return errors.Wrap(reloadBackupErr, "could not reload backup manifest when retrying")
+		}
+		// Re-load the job in order to update our progress object, which
+		// may have been updated since the flow started.
+		reloadedJob, reloadErr := p.ExecCfg().JobRegistry.LoadClaimedJob(ctx, b.job.ID())
+		if reloadErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Warningf(ctx, "BACKUP job %d could not reload job progress when retrying: %+v",
+				b.job.ID(), reloadErr)
+		} else {
+			curProgress := reloadedJob.FractionCompleted()
+			// If we made decent progress with the BACKUP, reset the last
+			// progress state.
+			if madeProgress := curProgress - lastProgress; madeProgress >= 0.01 {
+				log.Infof(ctx, "backport made %d%% progress, resetting retry duration", int(math.Round(float64(100*madeProgress))))
+				lastProgress = curProgress
+				r.Reset()
+			}
 		}
 	}
 

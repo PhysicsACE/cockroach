@@ -43,10 +43,10 @@ import (
 // hard coded to 640MiB.
 const MinimumStoreSize = 10 * 64 << 20
 
-// GetAbsoluteStorePath takes a (possibly relative) and returns the absolute path.
+// GetAbsoluteFSPath takes a (possibly relative) and returns the absolute path.
 // Returns an error if the path begins with '~' or Abs fails.
 // 'fieldName' is used in error strings.
-func GetAbsoluteStorePath(fieldName string, p string) (string, error) {
+func GetAbsoluteFSPath(fieldName string, p string) (string, error) {
 	if p[0] == '~' {
 		return "", fmt.Errorf("%s cannot start with '~': %s", fieldName, p)
 	}
@@ -254,9 +254,6 @@ type StoreSpec struct {
 	// storage engine has been closed. This only applies to in-memory storage
 	// engine.
 	StickyVFSID string
-	// UseFileRegistry is true if the "file registry" store version is desired.
-	// This is set by CCL code when encryption-at-rest is in use.
-	UseFileRegistry bool
 	// RocksDBOptions contains RocksDB specific options using a semicolon
 	// separated key-value syntax ("key1=value1; key2=value2").
 	RocksDBOptions string

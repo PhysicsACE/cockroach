@@ -789,11 +789,7 @@ func (s *Continue) WalkStmt(visitor StatementVisitor) Statement {
 // stmt_return
 type Return struct {
 	StatementImpl
-	Expr   Expr
-	RetVar Variable
-	// Implicit is set if this Return statement was not originally in the body
-	// and was added by us.
-	Implicit bool
+	Expr Expr
 }
 
 func (s *Return) CopyNode() *Return {
@@ -802,10 +798,9 @@ func (s *Return) CopyNode() *Return {
 }
 
 func (s *Return) Format(ctx *tree.FmtCtx) {
-	ctx.WriteString("RETURN ")
-	if s.Expr == nil {
-		ctx.FormatNode(&s.RetVar)
-	} else {
+	ctx.WriteString("RETURN")
+	if s.Expr != nil {
+		ctx.WriteByte(' ')
 		ctx.FormatNode(s.Expr)
 	}
 	ctx.WriteString(";\n")
@@ -1232,38 +1227,33 @@ func (s *Close) WalkStmt(visitor StatementVisitor) Statement {
 	return newStmt
 }
 
-// stmt_commit
-type Commit struct {
+// stmt_commit and stmt_rollback
+type TransactionControl struct {
 	StatementImpl
-	Chain bool
+	Rollback bool
+	Chain    bool
 }
 
-func (s *Commit) Format(ctx *tree.FmtCtx) {
+func (s *TransactionControl) Format(ctx *tree.FmtCtx) {
+	if s.Rollback {
+		ctx.WriteString("ROLLBACK")
+	} else {
+		ctx.WriteString("COMMIT")
+	}
+	if s.Chain {
+		ctx.WriteString(" AND CHAIN")
+	}
+	ctx.WriteString(";\n")
 }
 
-func (s *Commit) PlpgSQLStatementTag() string {
+func (s *TransactionControl) PlpgSQLStatementTag() string {
+	if s.Rollback {
+		return "stmt_rollback"
+	}
 	return "stmt_commit"
 }
 
-func (s *Commit) WalkStmt(visitor StatementVisitor) Statement {
-	newStmt, _ := visitor.Visit(s)
-	return newStmt
-}
-
-// stmt_rollback
-type Rollback struct {
-	StatementImpl
-	Chain bool
-}
-
-func (s *Rollback) Format(ctx *tree.FmtCtx) {
-}
-
-func (s *Rollback) PlpgSQLStatementTag() string {
-	return "stmt_rollback"
-}
-
-func (s *Rollback) WalkStmt(visitor StatementVisitor) Statement {
+func (s *TransactionControl) WalkStmt(visitor StatementVisitor) Statement {
 	newStmt, _ := visitor.Visit(s)
 	return newStmt
 }

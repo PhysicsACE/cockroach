@@ -85,6 +85,20 @@ func TestCCLLogic_fips_ready(
 	runCCLLogicTest(t, "fips_ready")
 }
 
+func TestCCLLogic_fk_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "fk_read_committed")
+}
+
+func TestCCLLogic_hash_sharded_index_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "hash_sharded_index_read_committed")
+}
+
 func TestCCLLogic_new_schema_changer(
 	t *testing.T,
 ) {
@@ -120,6 +134,13 @@ func TestCCLLogic_plpgsql_cursor(
 	runCCLLogicTest(t, "plpgsql_cursor")
 }
 
+func TestCCLLogic_plpgsql_into(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "plpgsql_into")
+}
+
 func TestCCLLogic_plpgsql_record(
 	t *testing.T,
 ) {
@@ -127,11 +148,25 @@ func TestCCLLogic_plpgsql_record(
 	runCCLLogicTest(t, "plpgsql_record")
 }
 
+func TestCCLLogic_plpgsql_txn(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "plpgsql_txn")
+}
+
 func TestCCLLogic_plpgsql_unsupported(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "plpgsql_unsupported")
+}
+
+func TestCCLLogic_procedure_params(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "procedure_params")
 }
 
 func TestCCLLogic_procedure_plpgsql(
@@ -167,6 +202,13 @@ func TestCCLLogic_schema_change_in_txn(
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "schema_change_in_txn")
+}
+
+func TestCCLLogic_select_for_update_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "select_for_update_read_committed")
 }
 
 func TestCCLLogic_show_create(
@@ -209,4 +251,11 @@ func TestCCLLogic_udf_volatility_check(
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "udf_volatility_check")
+}
+
+func TestCCLLogic_unique_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "unique_read_committed")
 }

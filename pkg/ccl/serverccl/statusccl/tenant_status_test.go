@@ -427,7 +427,7 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 		{stmt: `CREATE TABLE posts_t (id INT8 PRIMARY KEY, body STRING)`},
 		{
 			stmt:        `INSERT INTO posts_t VALUES (1, 'foo')`,
-			fingerprint: `INSERT INTO posts_t VALUES (_, '_')`,
+			fingerprint: `INSERT INTO posts_t VALUES (_, __more__)`,
 		},
 		{stmt: `SELECT * FROM posts_t`},
 	}
@@ -446,7 +446,7 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 		{stmt: `CREATE TABLE posts_nt (id INT8 PRIMARY KEY, body STRING)`},
 		{
 			stmt:        `INSERT INTO posts_nt VALUES (1, 'foo')`,
-			fingerprint: `INSERT INTO posts_nt VALUES (_, '_')`,
+			fingerprint: `INSERT INTO posts_nt VALUES (_, __more__)`,
 		},
 		{stmt: `SELECT * FROM posts_nt`},
 	}
@@ -499,7 +499,7 @@ func TestTenantCannotSeeNonTenantStats(t *testing.T) {
 
 		var actualStatements []string
 		for _, respStatement := range actual.Statements {
-			if respStatement.Key.KeyData.Failed {
+			if respStatement.Stats.FailureCount > 0 {
 				// We ignore failed statements here as the INSERT statement can fail and
 				// be automatically retried, confusing the test success check.
 				continue

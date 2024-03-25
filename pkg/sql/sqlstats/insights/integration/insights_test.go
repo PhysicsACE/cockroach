@@ -117,7 +117,7 @@ func TestInsightsIntegration(t *testing.T) {
 			"cpu_sql_nanos, "+
 			"COALESCE(error_code, '') error_code "+
 			"FROM crdb_internal.node_execution_insights where "+
-			"query = $1 and app_name = $2 ", "SELECT pg_sleep($1)", appName)
+			"query = $1 and app_name = $2 ", "SELECT pg_sleep(_)", appName)
 
 		var query, status string
 		var startInsights, endInsights time.Time
@@ -165,7 +165,7 @@ func TestInsightsIntegration(t *testing.T) {
 			"cpu_sql_nanos, "+
 			"COALESCE(last_error_code, '') last_error_code "+
 			"FROM crdb_internal.cluster_txn_execution_insights WHERE "+
-			"query = $1 and app_name = $2 ", "SELECT pg_sleep($1)", appName)
+			"query = $1 and app_name = $2 ", "SELECT pg_sleep(_)", appName)
 
 		var query string
 		var startInsights, endInsights time.Time
@@ -495,7 +495,7 @@ WHERE app_name = $1`, appName)
 					return row.Scan(&query, &problems, &status, &errorCode, &errorMsg)
 				})
 
-				require.Equal(t, "SELECT * FROM myusers WHERE city = '_' ; UPDATE myusers SET name = '_' WHERE city = '_'", query)
+				require.Equal(t, "SELECT * FROM myusers WHERE city = _ ; UPDATE myusers SET name = _ WHERE city = _", query)
 				expectedProblem := "{FailedExecution}"
 				replacedSlowProblems := problems
 				if problems != expectedProblem {
@@ -614,25 +614,25 @@ func TestInsightsPriorityIntegration(t *testing.T) {
 		{
 			setPriorityQuery:      "SET TRANSACTION PRIORITY LOW",
 			query:                 "INSERT INTO t(id, s) VALUES ('test', 'originalValue')",
-			queryNoValues:         "INSERT INTO t(id, s) VALUES ('_', '_')",
+			queryNoValues:         "INSERT INTO t(id, s) VALUES (_, __more__)",
 			expectedPriorityValue: "low",
 		},
 		{
 			setPriorityQuery:      "SET TRANSACTION PRIORITY NORMAL",
 			query:                 "UPDATE t set s = 'updatedValue' where id = 'test'",
-			queryNoValues:         "UPDATE t SET s = '_' WHERE id = '_'",
+			queryNoValues:         "UPDATE t SET s = _ WHERE id = _",
 			expectedPriorityValue: "normal",
 		},
 		{
 			setPriorityQuery:      "SELECT 1", // use a dummy query to validate default scenario
 			query:                 "UPDATE t set s = 'updatedValue'",
-			queryNoValues:         "UPDATE t SET s = '_'",
+			queryNoValues:         "UPDATE t SET s = _",
 			expectedPriorityValue: "normal",
 		},
 		{
 			setPriorityQuery:      "SET TRANSACTION PRIORITY HIGH",
 			query:                 "DELETE FROM t WHERE t.s = 'originalValue'",
-			queryNoValues:         "DELETE FROM t WHERE t.s = '_'",
+			queryNoValues:         "DELETE FROM t WHERE t.s = _",
 			expectedPriorityValue: "high",
 		},
 	}
@@ -760,12 +760,13 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 	// lookup this id will result in the resolver potentially missing the event.
 	txnIDCache := tc.ApplicationLayer(0).SQLServer().(*sql.Server).GetTxnIDCache()
 	txnIDCache.DrainWriteBuffer()
+	var expectedWaitingTxnFingerprintID appstatspb.TransactionFingerprintID
 	testutils.SucceedsSoon(t, func() error {
 		waitingTxnFingerprintID, ok := txnIDCache.Lookup(waitingTxnID)
 		if !ok || waitingTxnFingerprintID == appstatspb.InvalidTransactionFingerprintID {
 			return fmt.Errorf("waiting txn fingerprint not found in cache")
 		}
-
+		expectedWaitingTxnFingerprintID = waitingTxnFingerprintID
 		return nil
 	})
 
@@ -794,11 +795,12 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 		// at least 1 row matches the one we're looking for.
 		foundRow := false
 		var lastErr error
+		rowsCount := 0
 		for rows.Next() {
 			if err != nil {
 				return err
 			}
-
+			rowsCount++
 			var totalContentionFromQueryMs, contentionFromEventMs float64
 			var queryText, schemaName, dbName, tableName, indexName, waitingTxnFingerprintID string
 			err = rows.Scan(&queryText, &totalContentionFromQueryMs, &contentionFromEventMs, &schemaName, &dbName, &tableName, &indexName, &waitingTxnFingerprintID)
@@ -842,7 +844,7 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 			}
 
 			if waitingTxnFingerprintID == "0000000000000000" || waitingTxnFingerprintID == "" {
-				lastErr = fmt.Errorf("waitingTxnFingerprintID is default value\n%s", prettyPrintRow)
+				lastErr = fmt.Errorf("expected waitingTxnFingerprintID to be %d, but got %s. \nScanned row: \n%s", expectedWaitingTxnFingerprintID, waitingTxnFingerprintID, prettyPrintRow)
 				continue
 			}
 
@@ -851,6 +853,8 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 		}
 
 		if !foundRow && lastErr != nil {
+			t.Logf("rowsCount = %d", rowsCount)
+			t.Logf("ContentionRegistry: \n%s", tc.ApplicationLayer(0).ExecutorConfig().(sql.ExecutorConfig).ContentionRegistry.String())
 			return lastErr
 		}
 

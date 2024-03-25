@@ -220,6 +220,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalRepairableCatalogCorruptionsViewID: crdbInternalRepairableCatalogCorruptions,
 		catconstants.CrdbInternalKVProtectedTS:                      crdbInternalKVProtectedTSTable,
 		catconstants.CrdbInternalKVSessionBasedLeases:               crdbInternalSessionBasedLeases,
+		catconstants.CrdbInternalClusterReplicationResolvedViewID:   crdbInternalClusterReplicationResolvedView,
 	},
 	validWithNoDatabaseContext: true,
 }
@@ -877,6 +878,9 @@ CREATE TABLE crdb_internal.leases (
 	populate: func(
 		ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
 	) error {
+		if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERMETADATA); err != nil {
+			return err
+		}
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
 		var leaseEntries []crdbInternalLeasesTableEntry
 		p.LeaseMgr().VisitLeases(func(desc catalog.Descriptor, takenOffline bool, _ int, expiration tree.DTimestamp) (wantMore bool) {
@@ -1804,27 +1808,19 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   latency_seconds_max FLOAT,
   latency_seconds_p50 FLOAT,
   latency_seconds_p90 FLOAT,
-  latency_seconds_p99 FLOAT
+  latency_seconds_p99 FLOAT,
+  failure_count INT NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		shouldRedactError := false
-		// Check if the user is admin.
-		if isAdmin, err := p.HasAdminRole(ctx); err != nil {
+		// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
+		// privileges.
+		hasPriv, shouldRedactError, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+		if err != nil {
 			return err
-		} else if !isAdmin {
-			// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
-			// privileges.
-			if hasViewActivityRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
-				return err
-			} else if hasViewActivityRedacted {
-				shouldRedactError = true
-			} else if hasViewActivity, err := p.HasViewActivity(ctx); err != nil {
-				return err
-			} else if !hasViewActivity {
-				// If the user is not admin and does not have VIEWACTIVITY or VIEWACTIVITYREDACTED,
-				// return insufficient privileges error.
-				return noViewActivityOrViewActivityRedactedRoleError(p.User())
-			}
+		} else if !hasPriv {
+			// If the user is not admin and does not have VIEWACTIVITY or VIEWACTIVITYREDACTED,
+			// return insufficient privileges error.
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
 		var alloc tree.DatumAlloc
@@ -1849,9 +1845,6 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			var flags string
 			if stats.Key.DistSQL {
 				flags = "+"
-			}
-			if stats.Key.Failed {
-				flags = "!" + flags
 			}
 
 			samplePlan := sqlstatsutil.ExplainTreePlanNodeToJSON(&stats.Stats.SensitiveInfo.MostRecentPlanDescription)
@@ -1958,6 +1951,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				alloc.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P50)), // latency_seconds_p50
 				alloc.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P90)), // latency_seconds_p90
 				alloc.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.P99)), // latency_seconds_p99
+				alloc.NewDInt(tree.DInt(stats.Stats.FailureCount)),        // failure_count
 			)
 			if err != nil {
 				return err
@@ -2589,20 +2583,12 @@ func (p *planner) makeSessionsRequest(
 		ExcludeClosedSessions: excludeClosed,
 		IncludeInternal:       true,
 	}
-	hasAdmin, err := p.HasAdminRole(ctx)
+	hasViewActivityOrhasViewActivityRedacted, _, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
 	if err != nil {
 		return serverpb.ListSessionsRequest{}, err
 	}
-	if hasAdmin {
+	if hasViewActivityOrhasViewActivityRedacted {
 		req.Username = ""
-	} else {
-		hasViewActivityOrhasViewActivityRedacted, _, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
-		if err != nil {
-			return serverpb.ListSessionsRequest{}, err
-		}
-		if hasViewActivityOrhasViewActivityRedacted {
-			req.Username = ""
-		}
 	}
 	return req, nil
 }
@@ -2684,18 +2670,14 @@ func populateQueriesTable(
 	} else if !isAdmin {
 		// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
 		// privileges.
-		if hasViewActivityRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
+		if hasPriv, shouldRedact, err := p.HasViewActivityOrViewActivityRedactedRole(ctx); err != nil {
 			return err
-		} else if hasViewActivityRedacted {
-			// If the user has VIEWACTIVITYREDACTED, redact the query as it takes precedence
-			// over VIEWACTIVITY.
-			shouldRedactOtherUserQuery = true
+		} else if hasPriv {
 			canViewOtherUser = true
-		} else if !hasViewActivityRedacted {
-			if hasViewActivity, err := p.HasViewActivity(ctx); err != nil {
-				return err
-			} else if hasViewActivity {
-				canViewOtherUser = true
+			if shouldRedact {
+				// If the user has VIEWACTIVITYREDACTED, redact the query as it takes precedence
+				// over VIEWACTIVITY.
+				shouldRedactOtherUserQuery = true
 			}
 		}
 	}
@@ -2904,20 +2886,16 @@ func populateSessionsTable(
 	} else if isAdmin {
 		canViewOtherUser = true
 	} else if !isAdmin {
-		// If the user is not admin, check the VIEWACTIVITYREDACTED privilege to
-		// see if constants need to be redacted.
-		if hasViewActivityRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
+		// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
+		// privileges.
+		if hasPriv, shouldRedact, err := p.HasViewActivityOrViewActivityRedactedRole(ctx); err != nil {
 			return err
-		} else if hasViewActivityRedacted {
-			// If the user has VIEWACTIVITYREDACTED, redact the query as it takes precedence
-			// over VIEWACTIVITY.
-			shouldRedactOtherUserQuery = true
+		} else if hasPriv {
 			canViewOtherUser = true
-		} else if !hasViewActivityRedacted {
-			if hasViewActivity, err := p.HasViewActivity(ctx); err != nil {
-				return err
-			} else if hasViewActivity {
-				canViewOtherUser = true
+			if shouldRedact {
+				// If the user has VIEWACTIVITYREDACTED, redact the query as it takes precedence
+				// over VIEWACTIVITY.
+				shouldRedactOtherUserQuery = true
 			}
 		}
 	}
@@ -6978,7 +6956,7 @@ SELECT
   plan_hash,
   app_name,
   max(metadata) as metadata,
-  crdb_internal.merge_statement_stats(array_agg(DISTINCT statistics)),
+  merge_statement_stats(DISTINCT statistics),
   max(sampled_plan),
   aggregation_interval,
   array_remove(array_cat_agg(index_recommendations), NULL) AS index_recommendations
@@ -7204,20 +7182,20 @@ CREATE VIEW crdb_internal.statement_statistics_persisted_v22_2 AS
 
 var crdbInternalActiveRangeFeedsTable = virtualSchemaTable{
 	comment: `node-level table listing all currently running range feeds`,
-	// NB: startTS is exclusive; consider renaming to startAfter.
 	schema: `
 CREATE TABLE crdb_internal.active_range_feeds (
   id INT,
   tags STRING,
-  startTS STRING,
+  start_after DECIMAL,
   diff BOOL,
   node_id INT,
   range_id INT,
   created INT,
   range_start STRING,
   range_end STRING,
-  resolved STRING,
-  last_event_utc INT,
+  resolved DECIMAL,
+	resolved_age INTERVAL,
+  last_event TIMESTAMPTZ,
   catchup BOOL,
   num_errs INT,
   last_err STRING
@@ -7229,7 +7207,11 @@ CREATE TABLE crdb_internal.active_range_feeds (
 				if rf.LastValueReceived.IsZero() {
 					lastEvent = tree.DNull
 				} else {
-					lastEvent = tree.NewDInt(tree.DInt(rf.LastValueReceived.UTC().UnixNano()))
+					e, err := tree.MakeDTimestampTZ(rf.LastValueReceived, time.Microsecond)
+					if err != nil {
+						return err
+					}
+					lastEvent = e
 				}
 				var lastErr tree.Datum
 				if rf.LastErr == nil {
@@ -7241,14 +7223,17 @@ CREATE TABLE crdb_internal.active_range_feeds (
 				return addRow(
 					tree.NewDInt(tree.DInt(rfCtx.ID)),
 					tree.NewDString(rfCtx.CtxTags),
-					tree.NewDString(rf.StartAfter.AsOfSystemTime()),
+					eval.TimestampToDecimalDatum(rf.StartAfter),
 					tree.MakeDBool(tree.DBool(rfCtx.WithDiff)),
 					tree.NewDInt(tree.DInt(rf.NodeID)),
 					tree.NewDInt(tree.DInt(rf.RangeID)),
 					tree.NewDInt(tree.DInt(rf.CreatedTime.UTC().UnixNano())),
 					tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rf.Span.Key)),
 					tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rf.Span.EndKey)),
-					tree.NewDString(rf.Resolved.AsOfSystemTime()),
+					eval.TimestampToDecimalDatum(rf.Resolved),
+					tree.NewDInterval(duration.Age(
+						p.EvalContext().GetStmtTimestamp(), rf.Resolved.GoTime()), types.DefaultIntervalTypeMetadata,
+					),
 					lastEvent,
 					tree.MakeDBool(tree.DBool(rf.InCatchup)),
 					tree.NewDInt(tree.DInt(rf.NumErrs)),
@@ -7368,7 +7353,7 @@ SELECT
   fingerprint_id,
   app_name,
   max(metadata),
-  crdb_internal.merge_transaction_stats(array_agg(statistics)),
+  merge_transaction_stats(statistics),
   aggregation_interval
 FROM (
   SELECT
@@ -8926,4 +8911,27 @@ func populateFlowTokensResponse(
 		}
 	}
 	return nil
+}
+
+var crdbInternalClusterReplicationResolvedView = virtualSchemaView{
+	schema: `
+		CREATE VIEW crdb_internal.cluster_replication_spans AS WITH spans AS (
+			SELECT
+				j.id AS job_id, jsonb_array_elements(crdb_internal.pb_to_json('progress', i.value)->'streamIngest'->'checkpoint'->'resolvedSpans') AS s
+			FROM system.jobs j LEFT JOIN system.job_info i ON j.id = i.job_id AND i.info_key = 'legacy_progress' 
+			WHERE j.job_type = 'REPLICATION STREAM INGESTION'
+			) SELECT
+				job_id,
+				crdb_internal.pretty_key(decode(s->'span'->>'key', 'base64'), 0) AS start_key,
+				crdb_internal.pretty_key(decode(s->'span'->>'endKey', 'base64'), 0) AS end_key,
+				((s->'timestamp'->>'wallTime')||'.'||COALESCE((s->'timestamp'->'logical'), '0'))::decimal AS resolved,
+				date_trunc('second', ((cluster_logical_timestamp() - (s->'timestamp'->>'wallTime')::int) /1e9)::interval) AS resolved_age
+			FROM spans`,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "job_id", Typ: types.Int},
+		{Name: "start_key", Typ: types.String},
+		{Name: "end_key", Typ: types.String},
+		{Name: "resolved", Typ: types.Decimal},
+		{Name: "resolved_age", Typ: types.Interval},
+	},
 }

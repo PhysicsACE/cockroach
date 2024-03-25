@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/grafana"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
@@ -665,6 +666,11 @@ type clusterImpl struct {
 
 	// destroyState contains state related to the cluster's destruction.
 	destroyState destroyState
+
+	// grafanaTags contains the cluster and test information that grafana will separate
+	// test runs by. This is used by the roachtest grafana API to create appropriately
+	// tagged grafana annotations. If empty, grafana is not available.
+	grafanaTags []string
 }
 
 // Name returns the cluster name, i.e. something like `teamcity-....`
@@ -1365,9 +1371,8 @@ func (c *clusterImpl) FetchDebugZip(
 			cmd := roachtestutil.NewCommand("%s debug zip", test.DefaultCockroachPath).
 				Option("include-range-info").
 				Flag("exclude-files", fmt.Sprintf("'%s'", excludeFiles)).
-				Flag("url", nodePgUrl[0]).
+				Flag("url", fmt.Sprintf("'%s'", nodePgUrl[0])).
 				MaybeFlag(c.IsSecure(), "certs-dir", install.CockroachNodeCertsDir).
-				MaybeFlag(c.IsSecure(), "certs-dir", "certs").
 				Arg(zipName).
 				String()
 			if err = c.RunE(ctx, option.WithNodes(c.Node(node)), cmd); err != nil {
@@ -2074,32 +2079,35 @@ func (c *clusterImpl) StartE(
 	return nil
 }
 
-// StartServiceForVirtualClusterE can start either external or shared process
-// virtual clusters. This can be specified in startOpts.RoachprodOpts. Set the
-// `Target` to the required virtual cluster type. Refer to the virtual cluster
-// section in the struct for more information on what fields are available for
-// virtual clusters.
-//
-// With external process virtual clusters an external process will be started on
-// each node specified in the externalNodes parameter.
-//
-// With shared process virtual clusters the required queries will be run on a
-// storage node of the cluster specified in the opts parameter.
+// StartServiceForVirtualClusterE can start either external or shared
+// process virtual clusters. This can be specified by the `startOpts`
+// passed. See the `option.Start*VirtualClusterOpts` functions.
 func (c *clusterImpl) StartServiceForVirtualClusterE(
 	ctx context.Context,
 	l *logger.Logger,
-	externalNodes option.NodeListOption,
 	startOpts option.StartOpts,
 	settings install.ClusterSettings,
-	opts ...option.Option,
 ) error {
-
-	c.setStatusForClusterOpt("starting virtual cluster", startOpts.RoachtestOpts.Worker, opts...)
-	defer c.clearStatusForClusterOpt(startOpts.RoachtestOpts.Worker)
-
+	l.Printf("starting virtual cluster")
 	clusterSettingsOpts := c.configureClusterSettingOptions(c.virtualClusterSettings, settings)
 
-	if err := roachprod.StartServiceForVirtualCluster(ctx, l, c.MakeNodes(externalNodes), c.MakeNodes(opts...), startOpts.RoachprodOpts, clusterSettingsOpts...); err != nil {
+	// By default, we assume every node in the cluster is part of the
+	// storage cluster the virtual cluster needs to connect to. If the
+	// user customized the storage cluster in the `StartOpts`, we use
+	// that.
+	storageCluster := c.All()
+	if len(startOpts.SeparateProcessStorageNodes) > 0 {
+		storageCluster = startOpts.SeparateProcessStorageNodes
+	}
+
+	// If the user indicated nodes where the virtual cluster should be
+	// started, we indicate that in the roachprod opts.
+	if len(startOpts.SeparateProcessNodes) > 0 {
+		startOpts.RoachprodOpts.VirtualClusterLocation = c.MakeNodes(startOpts.SeparateProcessNodes)
+	}
+	if err := roachprod.StartServiceForVirtualCluster(
+		ctx, l, c.MakeNodes(storageCluster), startOpts.RoachprodOpts, clusterSettingsOpts...,
+	); err != nil {
 		return err
 	}
 
@@ -2114,12 +2122,10 @@ func (c *clusterImpl) StartServiceForVirtualClusterE(
 func (c *clusterImpl) StartServiceForVirtualCluster(
 	ctx context.Context,
 	l *logger.Logger,
-	externalNodes option.NodeListOption,
 	startOpts option.StartOpts,
 	settings install.ClusterSettings,
-	opts ...option.Option,
 ) {
-	if err := c.StartServiceForVirtualClusterE(ctx, l, externalNodes, startOpts, settings, opts...); err != nil {
+	if err := c.StartServiceForVirtualClusterE(ctx, l, startOpts, settings); err != nil {
 		c.t.Fatal(err)
 	}
 }
@@ -2129,18 +2135,22 @@ func (c *clusterImpl) StartServiceForVirtualCluster(
 // process virtual clusters, the corresponding service is stopped. For
 // separate process, the OS process is killed.
 func (c *clusterImpl) StopServiceForVirtualClusterE(
-	ctx context.Context, l *logger.Logger, stopOpts option.StopOpts, opts ...option.Option,
+	ctx context.Context, l *logger.Logger, stopOpts option.StopOpts,
 ) error {
-	c.setStatusForClusterOpt("stopping virtual cluster", stopOpts.RoachtestOpts.Worker, opts...)
-	defer c.clearStatusForClusterOpt(stopOpts.RoachtestOpts.Worker)
+	l.Printf("stoping virtual cluster")
+
+	nodes := c.All()
+	if len(stopOpts.SeparateProcessNodes) > 0 {
+		nodes = stopOpts.SeparateProcessNodes
+	}
 
 	return roachprod.StopServiceForVirtualCluster(
-		ctx, l, c.Name(), c.IsSecure(), stopOpts.RoachprodOpts,
+		ctx, l, c.MakeNodes(nodes), c.IsSecure(), stopOpts.RoachprodOpts,
 	)
 }
 
 func (c *clusterImpl) StopServiceForVirtualCluster(
-	ctx context.Context, l *logger.Logger, stopOpts option.StopOpts, opts ...option.Option,
+	ctx context.Context, l *logger.Logger, stopOpts option.StopOpts,
 ) {
 	if err := c.StopServiceForVirtualClusterE(ctx, l, stopOpts); err != nil {
 		c.t.Fatal(err)
@@ -2165,6 +2175,9 @@ func (c *clusterImpl) RefetchCertsFromNode(ctx context.Context, node int) error 
 	}
 	// Need to prevent world readable files or lib/pq will complain.
 	return filepath.Walk(c.localCertsDir, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return errors.Wrap(err, "walking localCertsDir failed")
+		}
 		if info.IsDir() {
 			return nil
 		}
@@ -2731,7 +2744,7 @@ func (c *clusterImpl) ConnE(
 		opt(connOptions)
 	}
 	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node), roachprod.PGURLOptions{
-		VirtualClusterName: connOptions.TenantName,
+		VirtualClusterName: connOptions.VirtualClusterName,
 		SQLInstance:        connOptions.SQLInstance,
 		Auth:               connOptions.AuthMode,
 	})
@@ -2845,6 +2858,38 @@ func (c *clusterImpl) StartGrafana(
 
 func (c *clusterImpl) StopGrafana(ctx context.Context, l *logger.Logger, dumpDir string) error {
 	return roachprod.StopGrafana(ctx, l, c.name, dumpDir)
+}
+
+// AddGrafanaAnnotation creates a grafana annotation for the centralized grafana instance.
+func (c *clusterImpl) AddGrafanaAnnotation(
+	ctx context.Context, l *logger.Logger, req grafana.AddAnnotationRequest,
+) error {
+	// If grafanaTags is empty, then grafana is not set up for this cluster.
+	if len(c.grafanaTags) == 0 {
+		return errors.New("Grafana is not available for this cluster")
+	}
+	// Add grafanaTags so we can filter annotations by test or by cluster.
+	req.Tags = append(req.Tags, c.grafanaTags...)
+
+	// CentralizedGrafanaHost is the host name for the centralized grafana instance that
+	// is set up for every roachtest run on GCE.
+	const CentralizedGrafanaHost = "grafana.testeng.crdb.io"
+
+	// The centralized grafana instance requires auth through Google IDP.
+	return roachprod.AddGrafanaAnnotation(ctx, CentralizedGrafanaHost, true /* secure */, req)
+}
+
+// AddInternalGrafanaAnnotation creates a grafana annotation for the internal grafana
+// instance spun up in roachtests through StartGrafana.
+func (c *clusterImpl) AddInternalGrafanaAnnotation(
+	ctx context.Context, l *logger.Logger, req grafana.AddAnnotationRequest,
+) error {
+	host, err := roachprod.GrafanaURL(ctx, l, c.name, false /* openInBrowser */)
+	if err != nil {
+		return err
+	}
+	// The internal grafana instance does not require auth.
+	return roachprod.AddGrafanaAnnotation(ctx, host, false /* secure */, req)
 }
 
 func (c *clusterImpl) WipeForReuse(

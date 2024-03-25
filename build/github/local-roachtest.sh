@@ -22,7 +22,8 @@ export COCKROACH_DEV_LICENSE=$(gcloud secrets versions access 1 --secret=cockroa
 set -x
 
 bazel build --config=$CROSSCONFIG $(./build/github/engflow-args.sh) \
-      --bes_keywords=local-roachtest --jobs 100 \
+      --bes_keywords integration-test-artifact-build \
+      --jobs 100 \
       //pkg/cmd/cockroach-short \
       //pkg/cmd/roachtest \
       //pkg/cmd/roachprod \
@@ -40,5 +41,5 @@ $BAZEL_BIN/pkg/cmd/roachtest/roachtest_/roachtest run acceptance \
   --cockroach "$BAZEL_BIN/pkg/cmd/cockroach-short/cockroach-short_/cockroach-short" \
   --workload "$BAZEL_BIN/pkg/cmd/workload/workload_/workload" \
   --artifacts $PWD/artifacts \
-  --artifacts-literal="${LITERAL_ARTIFACTS_DIR:-}" \
+  --github
 

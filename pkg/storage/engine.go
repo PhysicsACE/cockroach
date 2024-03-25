@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/storage/pebbleiter"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -33,7 +34,6 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
 	prometheusgo "github.com/prometheus/client_model/go"
 )
@@ -604,6 +604,7 @@ type Reader interface {
 		visitRangeDel func(start, end []byte, seqNum uint64) error,
 		visitRangeKey func(start, end []byte, keys []rangekey.Key) error,
 		visitSharedFile func(sst *pebble.SharedSSTMeta) error,
+		visitExternalFile func(sst *pebble.ExternalFile) error,
 	) error
 	// ConsistentIterators returns true if the Reader implementation guarantees
 	// that the different iterators constructed by this Reader will see the same
@@ -934,6 +935,8 @@ type Engine interface {
 	Properties() roachpb.StoreProperties
 	// Compact forces compaction over the entire database.
 	Compact() error
+	// Env returns the filesystem environment used by the Engine.
+	Env() *fs.Env
 	// Flush causes the engine to write all in-memory data to disk
 	// immediately.
 	Flush() error
@@ -941,10 +944,10 @@ type Engine interface {
 	GetMetrics() Metrics
 	// GetEncryptionRegistries returns the file and key registries when encryption is enabled
 	// on the store.
-	GetEncryptionRegistries() (*EncryptionRegistries, error)
+	GetEncryptionRegistries() (*fs.EncryptionRegistries, error)
 	// GetEnvStats retrieves stats about the engine's environment
 	// For RocksDB, this includes details of at-rest encryption.
-	GetEnvStats() (*EnvStats, error)
+	GetEnvStats() (*fs.EnvStats, error)
 	// GetAuxiliaryDir returns a path under which files can be stored
 	// persistently, and from which data can be ingested by the engine.
 	//
@@ -1034,7 +1037,7 @@ type Engine interface {
 	// that excises an ExciseSpan, and ingests either local or shared sstables or
 	// both.
 	IngestAndExciseFiles(
-		ctx context.Context, paths []string, shared []pebble.SharedSSTMeta, exciseSpan roachpb.Span) (pebble.IngestOperationStats, error)
+		ctx context.Context, paths []string, shared []pebble.SharedSSTMeta, external []pebble.ExternalFile, exciseSpan roachpb.Span) (pebble.IngestOperationStats, error)
 	// IngestExternalFiles is a variant of IngestLocalFiles that takes external
 	// files. These files can be referred to by multiple stores, but are not
 	// modified or deleted by the Engine doing the ingestion.
@@ -1077,8 +1080,6 @@ type Engine interface {
 	// of the callback since it could cause a deadlock (since the callback may
 	// be invoked while holding mutexes).
 	RegisterFlushCompletedCallback(cb func())
-	// Filesystem functionality.
-	vfs.FS
 	// CreateCheckpoint creates a checkpoint of the engine in the given directory,
 	// which must not exist. The directory should be on the same file system so
 	// that hard links can be used. If spans is not empty, the checkpoint excludes
@@ -1382,34 +1383,6 @@ func (m *Metrics) AsStoreStatsEvent() eventpb.StoreStats {
 		})
 	}
 	return e
-}
-
-// EnvStats is a set of RocksDB env stats, including encryption status.
-type EnvStats struct {
-	// TotalFiles is the total number of files reported by rocksdb.
-	TotalFiles uint64
-	// TotalBytes is the total size of files reported by rocksdb.
-	TotalBytes uint64
-	// ActiveKeyFiles is the number of files using the active data key.
-	ActiveKeyFiles uint64
-	// ActiveKeyBytes is the size of files using the active data key.
-	ActiveKeyBytes uint64
-	// EncryptionType is an enum describing the active encryption algorithm.
-	// See: ccl/storageccl/engineccl/enginepbccl/key_registry.proto
-	EncryptionType int32
-	// EncryptionStatus is a serialized enginepbccl/stats.proto::EncryptionStatus protobuf.
-	EncryptionStatus []byte
-}
-
-// EncryptionRegistries contains the encryption-related registries:
-// Both are serialized protobufs.
-type EncryptionRegistries struct {
-	// FileRegistry is the list of files with encryption status.
-	// serialized storage/engine/enginepb/file_registry.proto::FileRegistry
-	FileRegistry []byte
-	// KeyRegistry is the list of keys, scrubbed of actual key data.
-	// serialized ccl/storageccl/engineccl/enginepbccl/key_registry.proto::DataKeysRegistry
-	KeyRegistry []byte
 }
 
 // GetIntent will look up an intent given a key. It there is no intent for a

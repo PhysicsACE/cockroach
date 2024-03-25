@@ -27,12 +27,14 @@ bazel test //pkg:all_tests $ENGFLOW_FLAGS --remote_download_minimal \
       --profile=artifacts/profile.json.gz \
       ${EXTRA_TEST_ARGS:+$EXTRA_TEST_ARGS} \
       $BES_KEYWORDS_ARGS \
+      --bes_keywords "branch=${TC_BUILD_BRANCH#refs/heads/}" \
+      --bes_keywords nightly_stress \
     || status=$?
 
 # Upload results to GitHub.
 bazel build //pkg/cmd/bazci/process-bep-file $ENGFLOW_FLAGS --bes_keywords helper-binary
 _bazel/bin/pkg/cmd/bazci/process-bep-file/process-bep-file_/process-bep-file \
-    -branch $TC_BUILD_BRANCH -eventsfile artifacts/eventstream \
+    -eventsfile artifacts/eventstream \
     -cert /home/agent/engflow/engflow.crt -key /home/agent/engflow/engflow.key \
     -extra "${EXTRA_ISSUE_PARAMS:+$EXTRA_ISSUE_PARAMS}" \
     -jsonoutfile test-results.json

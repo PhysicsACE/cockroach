@@ -166,11 +166,11 @@ type plpgsqlBuilder struct {
 	// variables from a parent block can be referenced in a child block.
 	blocks []plBlock
 
-	identCounter int
+	// outParams is the set of OUT parameters for the routine.
+	outParams []ast.Variable
 
-	// hasOutParam indicates whether the routine has at least one OUT / INOUT
-	// parameter.
-	hasOutParam bool
+	isProcedure  bool
+	identCounter int
 }
 
 // routineParam is similar to tree.RoutineParam but stores the resolved type.
@@ -187,13 +187,15 @@ func newPLpgSQLBuilder(
 	colRefs *opt.ColSet,
 	routineParams []routineParam,
 	returnType *types.T,
+	isProcedure bool,
 ) *plpgsqlBuilder {
 	const initialBlocksCap = 2
 	b := &plpgsqlBuilder{
-		ob:         ob,
-		colRefs:    colRefs,
-		returnType: returnType,
-		blocks:     make([]plBlock, 0, initialBlocksCap),
+		ob:          ob,
+		colRefs:     colRefs,
+		returnType:  returnType,
+		blocks:      make([]plBlock, 0, initialBlocksCap),
+		isProcedure: isProcedure,
 	}
 	// Build the initial block for the routine parameters, which are considered
 	// PL/pgSQL variables.
@@ -209,7 +211,7 @@ func newPLpgSQLBuilder(
 			b.addVariable(param.name, param.typ)
 		}
 		if tree.IsOutParamClass(param.class) {
-			b.hasOutParam = true
+			b.outParams = append(b.outParams, param.name)
 		}
 	}
 	return b
@@ -223,6 +225,9 @@ type plBlock struct {
 	label string
 
 	// vars is an ordered list of variables declared in a PL/pgSQL block.
+	//
+	// INVARIANT: the variables of a parent (ancestor) block *always* form a
+	// prefix of the variables of a child (descendant) block.
 	vars []ast.Variable
 
 	// varTypes maps from the name of each variable in the scope to its type.
@@ -259,12 +264,26 @@ func (b *plpgsqlBuilder) buildRootBlock(
 	// actually produced by the input expression.
 	s = s.push()
 	b.ensureScopeHasExpr(s)
-	// Initialize OUT parameters to NULL.
+
+	// Initialize OUT parameters to NULL. Note that the initial block for
+	// parameters was already created in newPLpgSQLBuilder().
 	for _, param := range routineParams {
 		if param.class != tree.RoutineParamOut || param.name == "" {
 			continue
 		}
 		s = b.addPLpgSQLAssign(s, param.name, &tree.CastExpr{Expr: tree.DNull, Type: param.typ})
+	}
+	if b.isProcedure {
+		var tc transactionControlVisitor
+		ast.Walk(&tc, astBlock)
+		if tc.foundTxnControlStatement {
+			// Disable stable folding, since different parts of the routine can be run
+			// in different transactions.
+			b.ob.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
+				s = b.buildBlock(astBlock, s)
+			})
+			return s
+		}
 	}
 	return b.buildBlock(astBlock, s)
 }
@@ -281,11 +300,6 @@ func (b *plpgsqlBuilder) buildBlock(astBlock *ast.Block, s *scope) *scope {
 	if astBlock.Label != "" {
 		panic(blockLabelErr)
 	}
-	if b.block().hasExceptionHandler {
-		// The parent block has an exception handler. Exception handlers and nested
-		// blocks are not yet compatible.
-		panic(nestedBlockExceptionErr)
-	}
 	b.ensureScopeHasExpr(s)
 	block := b.pushBlock(plBlock{
 		label:     astBlock.Label,
@@ -295,6 +309,15 @@ func (b *plpgsqlBuilder) buildBlock(astBlock *ast.Block, s *scope) *scope {
 		cursors:   make(map[ast.Variable]ast.CursorDeclaration),
 	})
 	defer b.popBlock()
+	if len(astBlock.Exceptions) > 0 || b.hasExceptionHandler() {
+		// If the current block or some ancestor block has an exception handler, it
+		// is necessary to maintain the BlockState with a reference to the parent
+		// BlockState (if any).
+		block.state = &tree.BlockState{}
+		if parent := b.parentBlock(); parent != nil {
+			block.state.Parent = parent.state
+		}
+	}
 	// First, handle the variable declarations.
 	for i := range astBlock.Decls {
 		switch dec := astBlock.Decls[i].(type) {
@@ -332,13 +355,12 @@ func (b *plpgsqlBuilder) buildBlock(astBlock *ast.Block, s *scope) *scope {
 			block.cursors[dec.Name] = *dec
 		}
 	}
-	// Perform type-checking for RECORD-returning routines. This happens after
-	// building the variable declarations, so that expressions that reference
-	// those variables can be type-checked.
-	if types.IsRecordType(b.returnType) {
-		// Infer the concrete type by examining the RETURN statements. This has to
-		// happen after building the declaration block because RETURN statements can
-		// reference declared variables.
+	if types.IsRecordType(b.returnType) && !b.hasOutParam() {
+		// For a RECORD-returning routine, infer the concrete type by examining the
+		// RETURN statements. This has to happen after building the declaration
+		// block because RETURN statements can reference declared variables. Only
+		// perform this step if there are no OUT parameters, since OUT parameters
+		// will have already determined the return type.
 		recordVisitor := newRecordTypeVisitor(b.ob.ctx, b.ob.semaCtx, s, astBlock)
 		ast.Walk(recordVisitor, astBlock)
 		b.returnType = recordVisitor.typ
@@ -353,7 +375,6 @@ func (b *plpgsqlBuilder) buildBlock(astBlock *ast.Block, s *scope) *scope {
 		// The routine is volatile to prevent inlining. Only the block and
 		// variable-assignment routines need to be volatile; see the buildExceptions
 		// comment for details.
-		block.state = &tree.BlockState{}
 		block.hasExceptionHandler = true
 		blockCon := b.makeContinuation("exception_block")
 		blockCon.def.ExceptionBlock = exceptions
@@ -387,14 +408,31 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			return b.buildBlock(t, s)
 
 		case *ast.Return:
-			if b.hasOutParam && !t.Implicit {
-				// TODO(yuzefovich): we should not error out here if we have an
-				// empty RETURN (which is currently not supported by parser).
-				panic(returnWithOUTParameterErr)
+			// If the routine has OUT-parameters or a VOID return type, the RETURN
+			// statement must have no expression. Otherwise, the RETURN statement must
+			// have a non-empty expression.
+			expr := t.Expr
+			if b.hasOutParam() {
+				if expr != nil {
+					panic(returnWithOUTParameterErr)
+				}
+				expr = b.makeReturnForOutParams()
+			} else if b.returnType.Family() == types.VoidFamily {
+				if expr != nil {
+					if b.isProcedure {
+						panic(returnWithVoidParameterProcedureErr)
+					} else {
+						panic(returnWithVoidParameterErr)
+					}
+				}
+				expr = tree.DNull
+			}
+			if expr == nil {
+				panic(emptyReturnErr)
 			}
 			// RETURN is handled by projecting a single column with the expression
 			// that is being returned.
-			returnScalar := b.buildPLpgSQLExpr(t.Expr, b.returnType, s)
+			returnScalar := b.buildPLpgSQLExpr(expr, b.returnType, s)
 			b.addBarrierIfVolatile(s, returnScalar)
 			returnColName := scopeColName("").WithMetadataName(b.makeIdentifier("stmt_return"))
 			returnScope := s.push()
@@ -530,17 +568,19 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 					ElseBody:  []ast.Statement{&ast.Exit{}},
 				}},
 			}
-			newStmts := make([]ast.Statement, 0, len(stmts))
-			newStmts = append(newStmts, loop)
-			newStmts = append(newStmts, stmts[i+1:]...)
-			return b.buildPLpgSQLStatements(newStmts, s)
+			return b.buildPLpgSQLStatements(b.prependStmt(loop, stmts[i+1:]), s)
 
 		case *ast.Exit:
 			if t.Label != "" {
 				panic(exitLabelErr)
 			}
 			if t.Condition != nil {
-				panic(exitCondErr)
+				// EXIT with a condition is syntactic sugar for EXIT inside an IF stmt.
+				ifStmt := &ast.If{
+					Condition: t.Condition,
+					ThenBody:  []ast.Statement{&ast.Exit{Label: t.Label}},
+				}
+				return b.buildPLpgSQLStatements(b.prependStmt(ifStmt, stmts[i+1:]), s)
 			}
 			// EXIT statements are handled by calling the function that executes the
 			// statements after a loop. Errors if used outside a loop.
@@ -555,7 +595,13 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 				panic(continueLabelErr)
 			}
 			if t.Condition != nil {
-				panic(continueCondErr)
+				// CONTINUE with a condition is syntactic sugar for CONTINUE inside an
+				// IF stmt.
+				ifStmt := &ast.If{
+					Condition: t.Condition,
+					ThenBody:  []ast.Statement{&ast.Continue{Label: t.Label}},
+				}
+				return b.buildPLpgSQLStatements(b.prependStmt(ifStmt, stmts[i+1:]), s)
 			}
 			// CONTINUE statements are handled by calling the function that executes
 			// the loop body. Errors if used outside a loop.
@@ -581,8 +627,12 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			return b.callContinuation(&con, s)
 
 		case *ast.Execute:
-			if t.Strict {
-				panic(strictIntoErr)
+			if _, ok := t.SqlStmt.(*tree.SetTransaction); ok {
+				// SET TRANSACTION must happen immediately after a COMMIT or ROLLBACK
+				// statement. When we handle COMMIT/ROLLBACK, we check for following
+				// SET TRANSACTION statements, so encountering one here means it's in an
+				// incorrect location.
+				panic(setTxnNotAfterControlStmtErr)
 			}
 			if len(t.Target) > 1 {
 				seenTargets := make(map[ast.Variable]struct{})
@@ -593,6 +643,7 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 					seenTargets[name] = struct{}{}
 				}
 			}
+			strict := t.Strict || b.ob.evalCtx.SessionData().PLpgSQLUseStrictInto
 
 			// Create a new continuation routine to handle executing a SQL statement.
 			execCon := b.makeContinuation("_stmt_exec")
@@ -618,21 +669,32 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			b.appendPlpgSQLStmts(&retCon, stmts[i+1:])
 
 			// Ensure that the SQL statement returns at most one row.
+			limitVal := tree.DInt(1)
+			if strict {
+				// Increase the limit so that it's possible to check that there is
+				// exactly one row.
+				limitVal = tree.DInt(2)
+			}
 			stmtScope.expr = b.ob.factory.ConstructLimit(
 				stmtScope.expr,
-				b.ob.factory.ConstructConst(tree.NewDInt(tree.DInt(1)), types.Int),
+				b.ob.factory.ConstructConst(tree.NewDInt(limitVal), types.Int),
 				stmtScope.makeOrderingChoice(),
 			)
 
-			// Ensure that the SQL statement returns at least one row. The RIGHT join
-			// ensures that when the SQL statement returns no rows, it is extended
-			// with a single row of NULL values.
-			stmtScope.expr = b.ob.factory.ConstructRightJoin(
-				stmtScope.expr,
-				b.ob.factory.ConstructNoColsRow(),
-				nil, /* on */
-				memo.EmptyJoinPrivate,
-			)
+			if strict {
+				// Check that the expression produces exactly one row.
+				b.addOneRowCheck(stmtScope)
+			} else {
+				// Ensure that the SQL statement returns at least one row. The RIGHT
+				// join ensures that when the SQL statement returns no rows, it is
+				// extended with a single row of NULL values.
+				stmtScope.expr = b.ob.factory.ConstructRightJoin(
+					stmtScope.expr,
+					b.ob.factory.ConstructNoColsRow(),
+					nil, /* on */
+					memo.EmptyJoinPrivate,
+				)
+			}
 
 			// Step 2: build the INTO statement into a continuation routine that calls
 			// the previously built continuation.
@@ -785,6 +847,59 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			b.appendBodyStmt(&fetchCon, intoScope)
 			return b.callContinuation(&fetchCon, s)
 
+		case *ast.Null:
+			// PL/pgSQL NULL statements are a no-op.
+			continue
+
+		case *ast.TransactionControl:
+			// Transaction control statements are handled by a TxnControlExpr, which
+			// wraps a continuation for the remaining statements in the routine.
+			// During execution, a TxnControlExpr directs the session to commit or
+			// rollback the transaction, and supplies a plan for the continuation to
+			// run in the new transaction.
+			if t.Chain {
+				panic(txnControlWithChainErr)
+			}
+			// NOTE: postgres doesn't make the following checks until runtime (see
+			// also #119750).
+			// TODO(#88198): check the calling context, since transaction control
+			// statements are only allowed through a stack of SPs and DO blocks.
+			if b.hasExceptionHandler() {
+				panic(txnControlWithExceptionErr)
+			}
+			if !b.isProcedure {
+				panic(txnInUDFErr)
+			}
+			name := "_stmt_commit"
+			txnOpType := tree.StoredProcTxnCommit
+			if t.Rollback {
+				name = "_stmt_rollback"
+				txnOpType = tree.StoredProcTxnRollback
+			}
+			// Check the following statements for SET TRANSACTION statements, which
+			// apply to the new transaction that begins after the COMMIT/ROLLBACK.
+			//
+			// Note: SET TRANSACTION statements are only allowed immediately following
+			// COMMIT or ROLLBACK (or another SET TRANSACTION), in the same block.
+			var txnModes tree.TransactionModes
+			for stmts = stmts[i+1:]; len(stmts) > 0; stmts = stmts[1:] {
+				execStmt, ok := stmts[0].(*ast.Execute)
+				if !ok {
+					break
+				}
+				setTxnStmt, ok := execStmt.SqlStmt.(*tree.SetTransaction)
+				if !ok {
+					break
+				}
+				if err := txnModes.Merge(setTxnStmt.Modes); err != nil {
+					panic(err)
+				}
+			}
+			con := b.makeContinuation(name)
+			con.def.Volatility = volatility.Volatile
+			b.appendPlpgSQLStmts(&con, stmts)
+			return b.callContinuationWithTxnOp(&con, s, txnOpType, txnModes)
+
 		default:
 			panic(unsupportedPLStmtErr)
 		}
@@ -935,28 +1050,34 @@ func (b *plpgsqlBuilder) buildInto(stmtScope *scope, target []ast.Variable) *sco
 	return intoScope
 }
 
-// buildPLpgSQLRaise builds a call to the crdb_internal.plpgsql_raise builtin
-// function, which implements the notice-sending behavior of RAISE statements.
+// buildPLpgSQLRaise builds a Project expression which implements the
+// notice-sending behavior of RAISE statements.
 func (b *plpgsqlBuilder) buildPLpgSQLRaise(inScope *scope, args memo.ScalarListExpr) *scope {
+	raiseColName := scopeColName("").WithMetadataName(b.makeIdentifier("stmt_raise"))
+	raiseScope := inScope.push()
+	fn := b.makePLpgSQLRaiseFn(args)
+	b.ob.synthesizeColumn(raiseScope, raiseColName, types.Int, nil /* expr */, fn)
+	b.ob.constructProjectForScope(inScope, raiseScope)
+	return raiseScope
+}
+
+// makePLpgSQLRaiseFn builds a call to the crdb_internal.plpgsql_raise builtin
+// function, which implements the notice-sending behavior of RAISE statements.
+func (b *plpgsqlBuilder) makePLpgSQLRaiseFn(args memo.ScalarListExpr) opt.ScalarExpr {
 	const raiseFnName = "crdb_internal.plpgsql_raise"
-	props, overloads := builtinsregistry.GetBuiltinProperties(raiseFnName)
+	fnProps, overloads := builtinsregistry.GetBuiltinProperties(raiseFnName)
 	if len(overloads) != 1 {
 		panic(errors.AssertionFailedf("expected one overload for %s", raiseFnName))
 	}
-	raiseCall := b.ob.factory.ConstructFunction(
+	return b.ob.factory.ConstructFunction(
 		args,
 		&memo.FunctionPrivate{
 			Name:       raiseFnName,
 			Typ:        types.Int,
-			Properties: props,
+			Properties: fnProps,
 			Overload:   &overloads[0],
 		},
 	)
-	raiseColName := scopeColName("").WithMetadataName(b.makeIdentifier("stmt_raise"))
-	raiseScope := inScope.push()
-	b.ob.synthesizeColumn(raiseScope, raiseColName, types.Int, nil /* expr */, raiseCall)
-	b.ob.constructProjectForScope(inScope, raiseScope)
-	return raiseScope
 }
 
 // getRaiseArgs validates the options attached to the given PLpgSQL RAISE
@@ -1045,6 +1166,23 @@ func (b *plpgsqlBuilder) getRaiseArgs(s *scope, raise *ast.Raise) memo.ScalarLis
 		}
 	}
 	return args
+}
+
+// makeConstRaiseArgs builds the arguments for a crdb_internal.plpgsql_raise
+// function call.
+func (b *plpgsqlBuilder) makeConstRaiseArgs(
+	severity, message, detail, hint, code string,
+) memo.ScalarListExpr {
+	makeConstStr := func(str string) opt.ScalarExpr {
+		return b.ob.factory.ConstructConstVal(tree.NewDString(str), types.String)
+	}
+	return memo.ScalarListExpr{
+		makeConstStr(severity),
+		makeConstStr(message),
+		makeConstStr(detail),
+		makeConstStr(hint),
+		makeConstStr(code),
+	}
 }
 
 // A PLpgSQL RAISE statement can specify a format string, where supplied
@@ -1217,20 +1355,31 @@ func (b *plpgsqlBuilder) buildExceptions(block *ast.Block) *memo.ExceptionBlock 
 	}
 }
 
-// buildEndOfFunctionRaise builds a RAISE statement that throws an error when
-// control reaches the end of a PLpgSQL routine without reaching a RETURN
-// statement.
-func (b *plpgsqlBuilder) buildEndOfFunctionRaise(inScope *scope) *scope {
-	makeConstStr := func(str string) opt.ScalarExpr {
-		return b.ob.factory.ConstructConstVal(tree.NewDString(str), types.String)
+// handleEndOfFunction handles the case when control flow reaches the end of a
+// PL/pgSQL routine without reaching a RETURN statement.
+func (b *plpgsqlBuilder) handleEndOfFunction(inScope *scope) *scope {
+	if b.hasOutParam() || b.returnType.Family() == types.VoidFamily {
+		// Routines with OUT-parameters and VOID return types need not explicitly
+		// specify a RETURN statement.
+		var returnExpr tree.Expr = tree.DNull
+		if b.hasOutParam() {
+			returnExpr = b.makeReturnForOutParams()
+		}
+		returnScope := inScope.push()
+		colName := scopeColName("_implicit_return")
+		returnScalar := b.buildPLpgSQLExpr(returnExpr, b.returnType, inScope)
+		b.ob.synthesizeColumn(returnScope, colName, b.returnType, nil /* expr */, returnScalar)
+		b.ob.constructProjectForScope(inScope, returnScope)
+		return returnScope
 	}
-	args := memo.ScalarListExpr{
-		makeConstStr("ERROR"), /* severity */
-		makeConstStr("control reached end of function without RETURN"), /* message */
-		makeConstStr(""), /* detail */
-		makeConstStr(""), /* hint */
-		makeConstStr(pgcode.RoutineExceptionFunctionExecutedNoReturnStatement.String()), /* code */
-	}
+	// Build a RAISE statement which throws an end-of-function error if executed.
+	args := b.makeConstRaiseArgs(
+		"ERROR", /* severity */
+		"control reached end of function without RETURN", /* message */
+		"", /* detail */
+		"", /* hint */
+		pgcode.RoutineExceptionFunctionExecutedNoReturnStatement.String(), /* code */
+	)
 	con := b.makeContinuation("_end_of_function")
 	con.def.Volatility = volatility.Volatile
 	b.appendBodyStmt(&con, b.buildPLpgSQLRaise(con.s, args))
@@ -1243,6 +1392,66 @@ func (b *plpgsqlBuilder) buildEndOfFunctionRaise(inScope *scope) *scope {
 	b.ob.constructProjectForScope(inScope, eofScope)
 	b.appendBodyStmt(&con, eofScope)
 	return b.callContinuation(&con, inScope)
+}
+
+// addOneRowCheck handles INTO STRICT, where a SQL statement is required to
+// return exactly one row, or an error occurs.
+func (b *plpgsqlBuilder) addOneRowCheck(s *scope) {
+	// Add a ScalarGroupBy which passes through input columns, and also computes a
+	// row count.
+	originalCols := s.colSet()
+	aggs := make(memo.AggregationsExpr, 0, len(s.cols)+1)
+	for j := range s.cols {
+		// Create a pass-through aggregation. AnyNotNull works here because if there
+		// is more than one row, execution will halt with an error and the rows will
+		// be discarded anyway.
+		agg := b.ob.factory.ConstructAnyNotNullAgg(b.ob.factory.ConstructVariable(s.cols[j].id))
+		aggs = append(aggs, b.ob.factory.ConstructAggregationsItem(agg, s.cols[j].id))
+	}
+	rowCountColName := b.makeIdentifier("_plpgsql_row_count")
+	rowCountCol := b.ob.factory.Metadata().AddColumn(rowCountColName, types.Int)
+	rowCountAgg := b.ob.factory.ConstructCountRows()
+	aggs = append(aggs, b.ob.factory.ConstructAggregationsItem(rowCountAgg, rowCountCol))
+	s.expr = b.ob.factory.ConstructScalarGroupBy(s.expr, aggs, &memo.GroupingPrivate{})
+
+	// Add a projections which checks the row count and
+	// calls crdb_internal.plpgsql_raise to throw an error if necessary.
+	tooFewRowsArgs := b.makeConstRaiseArgs(
+		"ERROR",                     /* severity */
+		"query returned no rows",    /* message */
+		"",                          /* detail */
+		"",                          /* hint */
+		pgcode.NoDataFound.String(), /* code */
+	)
+	tooManyRowsArgs := b.makeConstRaiseArgs(
+		"ERROR",                            /* severity */
+		"query returned more than one row", /* message */
+		"",                                 /* detail */
+		"Make sure the query returns a single row, or use LIMIT 1.", /* hint */
+		pgcode.TooManyRows.String(),                                 /* code */
+	)
+	tooFewRowsFn := b.makePLpgSQLRaiseFn(tooFewRowsArgs)
+	tooManyRowsFn := b.makePLpgSQLRaiseFn(tooManyRowsArgs)
+	rowCountVar := b.ob.factory.ConstructVariable(rowCountCol)
+	scalarOne := b.ob.factory.ConstructConstVal(tree.NewDInt(1), types.Int)
+	caseExpr := b.ob.factory.ConstructCase(
+		memo.TrueSingleton,
+		memo.ScalarListExpr{
+			b.ob.factory.ConstructWhen(b.ob.factory.ConstructLt(rowCountVar, scalarOne), tooFewRowsFn),
+			b.ob.factory.ConstructWhen(b.ob.factory.ConstructGt(rowCountVar, scalarOne), tooManyRowsFn),
+		},
+		b.ob.factory.ConstructNull(types.Int),
+	)
+	rowCheckColName := b.makeIdentifier("_plpgsql_row_count_check")
+	rowCheckCol := b.ob.factory.Metadata().AddColumn(rowCheckColName, types.Int)
+	projections := memo.ProjectionsExpr{b.ob.factory.ConstructProjectionsItem(caseExpr, rowCheckCol)}
+	s.expr = b.ob.factory.ConstructProject(s.expr, projections, originalCols)
+
+	// Add an optimization barrier to ensure that the row-count checks are not
+	// eliminated by column-pruning. Then, remove the temporary columns from the
+	// output.
+	b.addBarrier(s)
+	s.expr = b.ob.factory.ConstructProject(s.expr, memo.ProjectionsExpr{}, originalCols)
 }
 
 // buildFetch projects a call to the crdb_internal.plpgsql_fetch builtin
@@ -1424,8 +1633,48 @@ func (b *plpgsqlBuilder) appendPlpgSQLStmts(con *continuation, stmts []ast.State
 // given continuation function.
 func (b *plpgsqlBuilder) callContinuation(con *continuation, s *scope) *scope {
 	if con == nil {
-		return b.buildEndOfFunctionRaise(s)
+		return b.handleEndOfFunction(s)
 	}
+	// PLpgSQL continuation routines are always in tail-call position.
+	args := b.makeContinuationArgs(con, s)
+	call := b.ob.factory.ConstructUDFCall(args, &memo.UDFCallPrivate{Def: con.def, TailCall: true})
+	b.addBarrierIfVolatile(s, call)
+
+	returnColName := scopeColName("").WithMetadataName(con.def.Name)
+	returnScope := s.push()
+	b.ob.synthesizeColumn(returnScope, returnColName, b.returnType, nil /* expr */, call)
+	b.ob.constructProjectForScope(s, returnScope)
+	return returnScope
+}
+
+// callContinuationWithTxnOp is similar to callContinuation, but wraps the
+// continuation in a TxnControlExpr that will commit or abort the current
+// transaction before resuming execution with the continuation.
+func (b *plpgsqlBuilder) callContinuationWithTxnOp(
+	con *continuation, s *scope, txnOp tree.StoredProcTxnOp, txnModes tree.TransactionModes,
+) *scope {
+	if con == nil {
+		panic(errors.AssertionFailedf("nil continuation with transaction control"))
+	}
+	if txnOp == tree.StoredProcTxnNoOp {
+		panic(errors.AssertionFailedf("no-op transaction control statement"))
+	}
+	b.addBarrier(s)
+	returnScope := s.push()
+	args := b.makeContinuationArgs(con, s)
+	txnControlExpr := b.ob.factory.ConstructTxnControl(args, &memo.TxnControlPrivate{
+		TxnOp:    txnOp,
+		TxnModes: txnModes,
+		Props:    returnScope.makePhysicalProps(),
+		Def:      con.def,
+	})
+	returnColName := scopeColName("").WithMetadataName(con.def.Name)
+	b.ob.synthesizeColumn(returnScope, returnColName, b.returnType, nil /* expr */, txnControlExpr)
+	b.ob.constructProjectForScope(s, returnScope)
+	return returnScope
+}
+
+func (b *plpgsqlBuilder) makeContinuationArgs(con *continuation, s *scope) memo.ScalarListExpr {
 	args := make(memo.ScalarListExpr, 0, len(con.def.Params))
 	addArg := func(name ast.Variable) {
 		_, source, _, err := s.FindSourceProvidingColumn(b.ob.ctx, name)
@@ -1452,15 +1701,7 @@ func (b *plpgsqlBuilder) callContinuation(con *continuation, s *scope) *scope {
 			addArg(name)
 		}
 	}
-	// PLpgSQL continuation routines are always in tail-call position.
-	call := b.ob.factory.ConstructUDFCall(args, &memo.UDFCallPrivate{Def: con.def, TailCall: true})
-	b.addBarrierIfVolatile(s, call)
-
-	returnColName := scopeColName("").WithMetadataName(con.def.Name)
-	returnScope := s.push()
-	b.ob.synthesizeColumn(returnScope, returnColName, b.returnType, nil /* expr */, call)
-	b.ob.constructProjectForScope(s, returnScope)
-	return returnScope
+	return args
 }
 
 // addBarrierIfVolatile checks if the given expression is volatile, and adds an
@@ -1476,8 +1717,14 @@ func (b *plpgsqlBuilder) addBarrierIfVolatile(s *scope, expr opt.ScalarExpr) {
 	var p props.Shared
 	memo.BuildSharedProps(expr, &p, b.ob.evalCtx)
 	if p.VolatilitySet.HasVolatile() {
-		s.expr = b.ob.factory.ConstructBarrier(s.expr)
+		b.addBarrier(s)
 	}
+}
+
+// addBarrier adds an optimization barrier to the given scope, in order to
+// prevent side effects from being duplicated, eliminated, or reordered.
+func (b *plpgsqlBuilder) addBarrier(s *scope) {
+	s.expr = b.ob.factory.ConstructBarrier(s.expr)
 }
 
 // buildPLpgSQLExpr parses and builds the given SQL expression into a ScalarExpr
@@ -1539,6 +1786,12 @@ func (b *plpgsqlBuilder) resolveVariableForAssign(name ast.Variable) *types.T {
 	panic(pgerror.Newf(pgcode.Syntax, "\"%s\" is not a known variable", name))
 }
 
+func (b *plpgsqlBuilder) prependStmt(stmt ast.Statement, stmts []ast.Statement) []ast.Statement {
+	newStmts := make([]ast.Statement, 0, len(stmts)+1)
+	newStmts = append(newStmts, stmt)
+	return append(newStmts, stmts...)
+}
+
 func (b *plpgsqlBuilder) ensureScopeHasExpr(s *scope) {
 	if s.expr == nil {
 		s.expr = b.ob.factory.ConstructNoColsRow()
@@ -1548,6 +1801,33 @@ func (b *plpgsqlBuilder) ensureScopeHasExpr(s *scope) {
 func (b *plpgsqlBuilder) makeIdentifier(id string) string {
 	b.identCounter++
 	return fmt.Sprintf("%s_%d", id, b.identCounter)
+}
+
+func (b *plpgsqlBuilder) hasOutParam() bool {
+	return len(b.outParams) > 0
+}
+
+// makeReturnForOutParams builds the implicit RETURN expression for a routine
+// with OUT-parameters.
+func (b *plpgsqlBuilder) makeReturnForOutParams() tree.Expr {
+	if len(b.outParams) == 0 {
+		panic(errors.AssertionFailedf("expected at least one out param"))
+	}
+	exprs := make(tree.Exprs, len(b.outParams))
+	for i, param := range b.outParams {
+		if param != "" {
+			exprs[i] = tree.NewUnresolvedName(string(param))
+		} else {
+			// TODO(100962): this logic will likely need to be
+			// changed.
+			exprs[i] = tree.DNull
+		}
+	}
+	if len(exprs) == 1 && !b.isProcedure {
+		// For procedures, even a single column is wrapped in a tuple.
+		return exprs[0]
+	}
+	return &tree.Tuple{Exprs: exprs}
 }
 
 // continuation holds the information necessary to pick up execution from some
@@ -1628,6 +1908,15 @@ func (b *plpgsqlBuilder) addVariable(name ast.Variable, typ *types.T) {
 // block returns the block for the current PL/pgSQL block.
 func (b *plpgsqlBuilder) block() *plBlock {
 	return &b.blocks[len(b.blocks)-1]
+}
+
+// parentBlock returns the parent block for the current PL/pgSQL block. It
+// returns nil if the current block does not have a parent.
+func (b *plpgsqlBuilder) parentBlock() *plBlock {
+	if len(b.blocks) <= 1 {
+		return nil
+	}
+	return &b.blocks[len(b.blocks)-2]
 }
 
 // pushBlock puts the given block on the stack. It is used when entering the
@@ -1720,6 +2009,24 @@ func (r *recordTypeVisitor) Visit(stmt ast.Statement) (newStmt ast.Statement, re
 	return stmt, true
 }
 
+// transactionControlVisitor is used to check for COMMIT or ROLLBACK statements
+// for a PL/pgSQL stored procedure, so that stable folding can be disabled.
+type transactionControlVisitor struct {
+	foundTxnControlStatement bool
+}
+
+var _ ast.StatementVisitor = &transactionControlVisitor{}
+
+func (tc *transactionControlVisitor) Visit(
+	stmt ast.Statement,
+) (newStmt ast.Statement, recurse bool) {
+	if _, ok := stmt.(*ast.TransactionControl); ok {
+		tc.foundTxnControlStatement = true
+		return stmt, false
+	}
+	return stmt, !tc.foundTxnControlStatement
+}
+
 var (
 	unsupportedPLStmtErr = unimplemented.New("unimplemented PL/pgSQL statement",
 		"attempted to use a PL/pgSQL statement that is not yet supported",
@@ -1742,17 +2049,8 @@ var (
 	exitLabelErr = unimplemented.New("EXIT label",
 		"EXIT statement labels are not yet supported",
 	)
-	exitCondErr = unimplemented.New("EXIT WHEN",
-		"conditional EXIT statements are not yet supported",
-	)
 	continueLabelErr = unimplemented.New("CONTINUE label",
 		"CONTINUE statement labels are not yet supported",
-	)
-	continueCondErr = unimplemented.New("CONTINUE WHEN",
-		"conditional CONTINUE statements are not yet supported",
-	)
-	strictIntoErr = unimplemented.NewWithIssuef(107854,
-		"INTO STRICT statements are not yet implemented",
 	)
 	dupIntoErr = unimplemented.New("duplicate INTO target",
 		"assigning to a variable more than once in the same INTO statement is not supported",
@@ -1790,10 +2088,29 @@ var (
 	nonCompositeErr = pgerror.New(pgcode.DatatypeMismatch,
 		"cannot return non-composite value from function returning composite type",
 	)
-	nestedBlockExceptionErr = unimplemented.New("exception handler for nested blocks",
-		"PL/pgSQL blocks cannot yet be nested within a block that has an exception handler",
-	)
 	returnWithOUTParameterErr = pgerror.New(pgcode.DatatypeMismatch,
 		"RETURN cannot have a parameter in function with OUT parameters",
+	)
+	returnWithVoidParameterErr = pgerror.New(pgcode.DatatypeMismatch,
+		"RETURN cannot have a parameter in function returning void",
+	)
+	returnWithVoidParameterProcedureErr = pgerror.New(pgcode.Syntax,
+		"RETURN cannot have a parameter in a procedure")
+	emptyReturnErr = pgerror.New(pgcode.Syntax,
+		"missing expression at or near \"RETURN;\"",
+	)
+	txnControlWithExceptionErr = errors.WithDetail(
+		pgerror.Newf(pgcode.InvalidTransactionTermination, "invalid transaction termination"),
+		"PL/pgSQL COMMIT/ROLLBACK is not allowed inside a block with exception handlers",
+	)
+	txnInUDFErr = errors.WithDetail(
+		pgerror.Newf(pgcode.InvalidTransactionTermination, "invalid transaction termination"),
+		"PL/pgSQL COMMIT/ROLLBACK is not allowed inside a user-defined function")
+	txnControlWithChainErr = unimplemented.NewWithIssue(119646,
+		"COMMIT or ROLLBACK with AND CHAIN syntax is not yet implemented",
+	)
+	setTxnNotAfterControlStmtErr = errors.WithHint(
+		pgerror.New(pgcode.ActiveSQLTransaction, "SET TRANSACTION must be called before any query"),
+		"PL/pgSQL SET TRANSACTION statements must immediately follow COMMIT or ROLLBACK",
 	)
 )

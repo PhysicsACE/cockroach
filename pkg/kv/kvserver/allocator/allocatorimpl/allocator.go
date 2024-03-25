@@ -18,12 +18,15 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -32,8 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/tracker"
 )
 
 const (
@@ -2105,7 +2106,6 @@ func (a *Allocator) nonIOOverloadedLeaseTargets(
 	}
 
 	sl, _, _ := storePool.GetStoreListFromIDs(replDescsToStoreIDs(existingReplicas), storepool.StoreFilterSuspect)
-	avgIOOverload := sl.CandidateIOOverloadScores.Mean
 
 	for _, replDesc := range existingReplicas {
 		store, ok := sl.FindStoreByID(replDesc.StoreID)
@@ -2120,7 +2120,7 @@ func (a *Allocator) nonIOOverloadedLeaseTargets(
 		// Instead, we create a buffer between the two to avoid leases moving back
 		// and forth.
 		if (replDesc.StoreID == leaseStoreID) &&
-			(!ok || !ioOverloadOptions.existingLeaseCheck(ctx, store, avgIOOverload)) {
+			(!ok || !ioOverloadOptions.ExistingLeaseCheck(ctx, store, sl)) {
 			continue
 		}
 
@@ -2128,7 +2128,7 @@ func (a *Allocator) nonIOOverloadedLeaseTargets(
 		// if it is filtered out similar to above, or the replica store doesn't
 		// pass the lease transfer IO overload check.
 		if replDesc.StoreID != leaseStoreID &&
-			(!ok || !ioOverloadOptions.transferLeaseToCheck(ctx, store, avgIOOverload)) {
+			(!ok || !ioOverloadOptions.transferLeaseToCheck(ctx, store, sl)) {
 			continue
 		}
 
@@ -2148,7 +2148,6 @@ func (a *Allocator) leaseholderShouldMoveDueToIOOverload(
 	ioOverloadOptions IOOverloadOptions,
 ) bool {
 	sl, _, _ := storePool.GetStoreListFromIDs(replDescsToStoreIDs(existingReplicas), storepool.StoreFilterSuspect)
-	avgIOOverload := sl.CandidateIOOverloadScores.Mean
 
 	// Check the existing replicas for the leaseholder, if it doesn't meet the
 	// check return that the lease should be moved due to IO overload on the
@@ -2157,17 +2156,17 @@ func (a *Allocator) leaseholderShouldMoveDueToIOOverload(
 	// overloaded.
 	for _, replDesc := range existingReplicas {
 		if store, ok := sl.FindStoreByID(replDesc.StoreID); ok && replDesc.StoreID == leaseStoreID {
-			return !ioOverloadOptions.existingLeaseCheck(ctx, store, avgIOOverload)
+			return !ioOverloadOptions.ExistingLeaseCheck(ctx, store, sl)
 		}
 	}
 
 	return false
 }
 
-// leaseholderShouldMoveDueToPreferences returns true if the current leaseholder
+// LeaseholderShouldMoveDueToPreferences returns true if the current leaseholder
 // is in violation of lease preferences _that can otherwise be satisfied_ by
 // some existing replica.
-func (a *Allocator) leaseholderShouldMoveDueToPreferences(
+func (a *Allocator) LeaseholderShouldMoveDueToPreferences(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
 	conf *roachpb.SpanConfig,
@@ -2177,6 +2176,7 @@ func (a *Allocator) leaseholderShouldMoveDueToPreferences(
 		GetFirstIndex() kvpb.RaftIndex
 	},
 	allExistingReplicas []roachpb.ReplicaDescriptor,
+	exclReplsInNeedOfSnapshots bool,
 ) bool {
 	// Defensive check to ensure that this is never called with a replica set that
 	// does not contain the leaseholder.
@@ -2203,7 +2203,7 @@ func (a *Allocator) leaseholderShouldMoveDueToPreferences(
 	// If there are any replicas that do match lease preferences, then we check if
 	// the existing leaseholder is one of them.
 	preferred := a.PreferredLeaseholders(storePool, conf, candidates)
-	if a.knobs == nil || !a.knobs.AllowLeaseTransfersToReplicasNeedingSnapshots {
+	if exclReplsInNeedOfSnapshots {
 		preferred = excludeReplicasInNeedOfSnapshots(
 			ctx, leaseRepl.RaftStatus(), leaseRepl.GetFirstIndex(), preferred)
 	}
@@ -2232,6 +2232,7 @@ func (a *Allocator) IOOverloadOptions() IOOverloadOptions {
 	return IOOverloadOptions{
 		ReplicaEnforcementLevel:      IOOverloadEnforcementLevel(ReplicaIOOverloadThresholdEnforcement.Get(&a.st.SV)),
 		LeaseEnforcementLevel:        IOOverloadEnforcementLevel(LeaseIOOverloadThresholdEnforcement.Get(&a.st.SV)),
+		UseIOThresholdMax:            a.st.Version.IsActive(context.Background(), clusterversion.V24_1_GossipMaximumIOOverload),
 		ReplicaIOOverloadThreshold:   ReplicaIOOverloadThreshold.Get(&a.st.SV),
 		LeaseIOOverloadThreshold:     LeaseIOOverloadThreshold.Get(&a.st.SV),
 		LeaseIOOverloadShedThreshold: LeaseIOOverloadShedThreshold.Get(&a.st.SV),
@@ -2269,12 +2270,13 @@ func (a *Allocator) TransferLeaseTarget(
 	opts allocator.TransferLeaseOptions,
 ) roachpb.ReplicaDescriptor {
 	if a.knobs != nil {
-		if blockFn := a.knobs.BlockTransferTarget; blockFn != nil && blockFn() {
+		if blockFn := a.knobs.BlockTransferTarget; blockFn != nil && blockFn(leaseRepl.GetRangeID()) {
 			return roachpb.ReplicaDescriptor{}
 		}
 	}
 	excludeLeaseRepl := opts.ExcludeLeaseRepl
-	if a.leaseholderShouldMoveDueToPreferences(ctx, storePool, conf, leaseRepl, existing) ||
+	excludeReplsInNeedOfSnap := a.knobs == nil || !a.knobs.AllowLeaseTransfersToReplicasNeedingSnapshots
+	if a.LeaseholderShouldMoveDueToPreferences(ctx, storePool, conf, leaseRepl, existing, excludeReplsInNeedOfSnap) ||
 		a.leaseholderShouldMoveDueToIOOverload(ctx, storePool, existing, leaseRepl.StoreID(), a.IOOverloadOptions()) {
 		// Explicitly exclude the current leaseholder from the result set if it is
 		// in violation of lease preferences that can be satisfied by some other
@@ -2633,7 +2635,8 @@ func (a *Allocator) ShouldTransferLease(
 	},
 	usageInfo allocator.RangeUsageInfo,
 ) TransferLeaseDecision {
-	if a.leaseholderShouldMoveDueToPreferences(ctx, storePool, conf, leaseRepl, existing) {
+	excludeReplsInNeedOfSnap := a.knobs == nil || !a.knobs.AllowLeaseTransfersToReplicasNeedingSnapshots
+	if a.LeaseholderShouldMoveDueToPreferences(ctx, storePool, conf, leaseRepl, existing, excludeReplsInNeedOfSnap) {
 		return TransferLeaseForPreferences
 	}
 

@@ -94,14 +94,6 @@ func (p *planner) ShowTenant(ctx context.Context, n *tree.ShowTenant) (planNode,
 }
 
 func CanManageTenant(ctx context.Context, p AuthorizationAccessor) error {
-	isAdmin, err := p.HasAdminRole(ctx)
-	if err != nil {
-		return err
-	}
-	if isAdmin {
-		return nil
-	}
-
 	return p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MANAGEVIRTUALCLUSTER)
 }
 
@@ -168,8 +160,9 @@ func (n *showTenantNode) getTenantValues(
 						// Protected timestamp might not be set yet, no need to fail.
 						log.Warningf(params.ctx, "protected timestamp unavailable for tenant %q and job %d: %v",
 							tenantInfo.Name, jobId, err)
+					} else {
+						values.protectedTimestamp = record.Timestamp
 					}
-					values.protectedTimestamp = record.Timestamp
 				}
 			}
 		case mtinfopb.DataStateReady, mtinfopb.DataStateDrop:

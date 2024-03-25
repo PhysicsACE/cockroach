@@ -115,7 +115,7 @@ go_test(
         "//pkg/sql/rowenc",
         "//pkg/sql/sem/eval",
         "//pkg/sql/types",
-        "//pkg/storage",
+        "//pkg/storage/fs",
         "//pkg/testutils",
         "//pkg/testutils/colcontainerutils",
         "//pkg/testutils/serverutils",

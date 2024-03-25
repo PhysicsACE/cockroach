@@ -3,6 +3,7 @@
 set -euxo pipefail
 
 bazel build --config crosslinux //pkg/cmd/cockroach-short \
+    --bes_keywords integration-test-artifact-build \
     --jobs 100 $(./build/github/engflow-args.sh)
 
 ARTIFACTSDIR=$PWD/artifacts
@@ -15,7 +16,6 @@ bazel test //pkg/acceptance:acceptance_test \
   --remote_download_minimal \
   "--sandbox_writable_path=$ARTIFACTSDIR" \
   "--test_tmpdir=$ARTIFACTSDIR" \
-  --bes_keywords acceptance \
   --test_arg=-l="$ARTIFACTSDIR" \
   --test_arg=-b=$COCKROACH \
   --test_env=TZ=America/New_York \

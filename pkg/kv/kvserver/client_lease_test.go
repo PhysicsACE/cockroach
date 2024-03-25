@@ -31,10 +31,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -45,8 +48,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/tracker"
 )
 
 // TestStoreRangeLease verifies that regular ranges (not some special ones at
@@ -819,7 +820,7 @@ func TestLeasePreferencesRebalance(t *testing.T) {
 func TestLeaseholderRelocate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	stickyRegistry := server.NewStickyVFSRegistry()
+	stickyRegistry := fs.NewStickyRegistry()
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
 
@@ -963,7 +964,7 @@ func TestLeasePreferencesDuringOutage(t *testing.T) {
 	// out heartbeating their liveness.
 	skip.UnderStressRace(t)
 
-	stickyRegistry := server.NewStickyVFSRegistry()
+	stickyRegistry := fs.NewStickyRegistry()
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
 	// Place all the leases in the us.
@@ -1128,8 +1129,7 @@ func TestLeasePreferencesDuringOutage(t *testing.T) {
 	require.Nil(t, pErr)
 
 	testutils.SucceedsSoon(t, func() error {
-		// Validate that we upreplicated outside of SF. NB: This will occur prior
-		// to the lease preference being satisfied.
+		// Validate that we upreplicated outside of SF.
 		require.Equal(t, 3, len(repl.Desc().Replicas().Voters().VoterDescriptors()))
 		for _, replDesc := range repl.Desc().Replicas().Voters().VoterDescriptors() {
 			serv, err := tc.FindMemberServer(replDesc.StoreID)
@@ -1201,7 +1201,7 @@ func TestLeasesDontThrashWhenNodeBecomesSuspect(t *testing.T) {
 	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 
 	// Speed up lease transfers.
-	stickyRegistry := server.NewStickyVFSRegistry()
+	stickyRegistry := fs.NewStickyRegistry()
 	manualClock := hlc.NewHybridManualClock()
 	serverArgs := make(map[int]base.TestServerArgs)
 	numNodes := 4

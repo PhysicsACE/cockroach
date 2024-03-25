@@ -11,12 +11,10 @@
 package tree
 
 import (
-	"context"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -359,18 +357,18 @@ type RoutineParam struct {
 // Format implements the NodeFormatter interface.
 func (node *RoutineParam) Format(ctx *FmtCtx) {
 	switch node.Class {
+	case RoutineParamDefault:
 	case RoutineParamIn:
-		ctx.WriteString("IN")
+		ctx.WriteString("IN ")
 	case RoutineParamOut:
-		ctx.WriteString("OUT")
+		ctx.WriteString("OUT ")
 	case RoutineParamInOut:
-		ctx.WriteString("INOUT")
+		ctx.WriteString("INOUT ")
 	case RoutineParamVariadic:
-		ctx.WriteString("VARIADIC")
+		ctx.WriteString("VARIADIC ")
 	default:
 		panic(pgerror.New(pgcode.InvalidParameterValue, "unknown routine option"))
 	}
-	ctx.WriteString(" ")
 	if node.Name != "" {
 		ctx.FormatNode(&node.Name)
 		ctx.WriteString(" ")
@@ -386,8 +384,11 @@ func (node *RoutineParam) Format(ctx *FmtCtx) {
 type RoutineParamClass int
 
 const (
+	// RoutineParamDefault indicates that RoutineParamClass was unspecified
+	// (in almost all cases it is equivalent to RoutineParamIn).
+	RoutineParamDefault RoutineParamClass = iota
 	// RoutineParamIn args can only be used as input.
-	RoutineParamIn RoutineParamClass = iota
+	RoutineParamIn
 	// RoutineParamOut args can only be used as output.
 	RoutineParamOut
 	// RoutineParamInOut args can be used as both input and output.
@@ -397,23 +398,14 @@ const (
 )
 
 // IsInParamClass returns true if the given parameter class specifies an input
-// parameter (i.e. either IN or INOUT).
+// parameter (i.e. either unspecified, IN or, INOUT).
 func IsInParamClass(class RoutineParamClass) bool {
 	switch class {
-	case RoutineParamIn, RoutineParamInOut, RoutineParamVariadic:
+	case RoutineParamDefault, RoutineParamIn, RoutineParamInOut, RoutineParamVariadic:
 		return true
 	default:
 		return false
 	}
-}
-
-// IsParamIncludedIntoSignature returns whether the parameter of the given class
-// is included into the signature of the routine (either a function, when
-// isProcedure is false, or a procedure, when isProcedure is true).
-func IsParamIncludedIntoSignature(class RoutineParamClass, isProcedure bool) bool {
-	// For procedures all parameters are included into the signature, for UDFs -
-	// only IN / INOUT parameters.
-	return isProcedure || IsInParamClass(class)
 }
 
 // IsOutParamClass returns true if the given parameter class specifies an output
@@ -498,30 +490,6 @@ func (node *RoutineObj) Format(ctx *FmtCtx) {
 		ctx.FormatNode(node.Params)
 		ctx.WriteString(")")
 	}
-}
-
-// SignatureTypes returns a slice of IN parameter types of the routine. These
-// types should be used for function resolution (i.e. they define the
-// "signature" of the function overload).
-func (node RoutineObj) SignatureTypes(
-	ctx context.Context, res TypeReferenceResolver,
-) ([]*types.T, error) {
-	var typs []*types.T
-	if node.Params != nil {
-		typs = make([]*types.T, 0, len(node.Params))
-		for _, arg := range node.Params {
-			if arg.IsInParam() {
-				// TODO(100405): we might need to include all parameters for
-				// procedures here.
-				typ, err := ResolveType(ctx, arg.Type, res)
-				if err != nil {
-					return nil, err
-				}
-				typs = append(typs, typ)
-			}
-		}
-	}
-	return typs, nil
 }
 
 // AlterFunctionOptions represents a ALTER FUNCTION...action statement.

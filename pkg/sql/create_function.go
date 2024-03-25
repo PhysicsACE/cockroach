@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
@@ -38,13 +39,16 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+type functionDependencies map[catid.DescID]struct{}
+
 type createFunctionNode struct {
 	cf *tree.CreateRoutine
 
-	dbDesc   catalog.DatabaseDescriptor
-	scDesc   catalog.SchemaDescriptor
-	planDeps planDependencies
-	typeDeps typeDependencies
+	dbDesc       catalog.DatabaseDescriptor
+	scDesc       catalog.SchemaDescriptor
+	planDeps     planDependencies
+	typeDeps     typeDependencies
+	functionDeps functionDependencies
 }
 
 func (n *createFunctionNode) ReadingOwnWrites() {}
@@ -62,7 +66,19 @@ func (n *createFunctionNode) startExec(params runParams) error {
 
 	for _, dep := range n.planDeps {
 		if dbID := dep.desc.GetParentID(); dbID != n.dbDesc.GetID() && dbID != keys.SystemDatabaseID {
-			return pgerror.Newf(pgcode.FeatureNotSupported, "the function cannot refer to other databases")
+			return pgerror.Newf(pgcode.FeatureNotSupported, "dependent relation %s cannot be from another database",
+				dep.desc.GetName())
+		}
+	}
+
+	for funcRef := range n.functionDeps {
+		funcDesc, err := params.p.Descriptors().ByIDWithLeased(params.p.Txn()).Get().Function(params.ctx, funcRef)
+		if err != nil {
+			return err
+		}
+		if dbID := funcDesc.GetParentID(); dbID != n.dbDesc.GetID() && dbID != keys.SystemDatabaseID {
+			return pgerror.Newf(pgcode.FeatureNotSupported, "dependent function %s cannot be from another database",
+				funcDesc.GetName())
 		}
 	}
 
@@ -84,7 +100,7 @@ func (n *createFunctionNode) startExec(params runParams) error {
 	var retErr error
 	params.p.runWithOptions(resolveFlags{contextDatabaseID: n.dbDesc.GetID()}, func() {
 		retErr = func() error {
-			udfMutableDesc, isNew, err := n.getMutableFuncDesc(mutScDesc, params)
+			udfMutableDesc, existing, err := n.getMutableFuncDesc(mutScDesc, params)
 			if err != nil {
 				return err
 			}
@@ -92,12 +108,12 @@ func (n *createFunctionNode) startExec(params runParams) error {
 			fnName := tree.MakeQualifiedRoutineName(n.dbDesc.GetName(), n.scDesc.GetName(), n.cf.Name.String())
 			event := eventpb.CreateFunction{
 				FunctionName: fnName.FQString(),
-				IsReplace:    !isNew,
+				IsReplace:    existing != nil,
 			}
-			if isNew {
+			if existing == nil {
 				err = n.createNewFunction(udfMutableDesc, mutScDesc, params)
 			} else {
-				err = n.replaceFunction(udfMutableDesc, params)
+				err = n.replaceFunction(udfMutableDesc, mutScDesc, params, existing)
 			}
 			if err != nil {
 				return err
@@ -142,19 +158,28 @@ func (n *createFunctionNode) createNewFunction(
 		return err
 	}
 	signatureTypes := make([]*types.T, 0, len(udfDesc.Params))
-	for _, param := range udfDesc.Params {
-		if tree.IsParamIncludedIntoSignature(funcdesc.ToTreeRoutineParamClass(param.Class), udfDesc.IsProcedure()) {
+	var outParamOrdinals []int32
+	var outParamTypes []*types.T
+	for paramIdx, param := range udfDesc.Params {
+		class := funcdesc.ToTreeRoutineParamClass(param.Class)
+		if tree.IsInParamClass(class) {
 			signatureTypes = append(signatureTypes, param.Type)
+		}
+		if class == tree.RoutineParamOut {
+			outParamOrdinals = append(outParamOrdinals, int32(paramIdx))
+			outParamTypes = append(outParamTypes, param.Type)
 		}
 	}
 	scDesc.AddFunction(
 		udfDesc.GetName(),
 		descpb.SchemaDescriptor_FunctionSignature{
-			ID:          udfDesc.GetID(),
-			ArgTypes:    signatureTypes,
-			ReturnType:  returnType,
-			ReturnSet:   udfDesc.ReturnType.ReturnSet,
-			IsProcedure: udfDesc.IsProcedure(),
+			ID:               udfDesc.GetID(),
+			ArgTypes:         signatureTypes,
+			ReturnType:       returnType,
+			ReturnSet:        udfDesc.ReturnType.ReturnSet,
+			IsProcedure:      udfDesc.IsProcedure(),
+			OutParamOrdinals: outParamOrdinals,
+			OutParamTypes:    outParamTypes,
 		},
 	)
 	if err := params.p.writeSchemaDescChange(params.ctx, scDesc, "Create Function"); err != nil {
@@ -164,22 +189,21 @@ func (n *createFunctionNode) createNewFunction(
 	return nil
 }
 
-func (n *createFunctionNode) replaceFunction(udfDesc *funcdesc.Mutable, params runParams) error {
-	// TODO(chengxiong): add validation that the function is not referenced. This
-	// is needed when we start allowing function references from other objects.
+func (n *createFunctionNode) replaceFunction(
+	udfDesc *funcdesc.Mutable,
+	scDesc *schemadesc.Mutable,
+	params runParams,
+	existing *tree.QualifiedOverload,
+) error {
 
-	if n.cf.IsProcedure && !udfDesc.IsProcedure() {
+	if n.cf.IsProcedure != udfDesc.IsProcedure() {
+		formatStr := "%q is a function"
+		if udfDesc.IsProcedure() {
+			formatStr = "%q is a procedure"
+		}
 		return errors.WithDetailf(
 			pgerror.Newf(pgcode.WrongObjectType, "cannot change routine kind"),
-			"%q is a function",
-			udfDesc.Name,
-		)
-	}
-
-	if !n.cf.IsProcedure && udfDesc.IsProcedure() {
-		return errors.WithDetailf(
-			pgerror.Newf(pgcode.WrongObjectType, "cannot change routine kind"),
-			"%q is a procedure",
+			formatStr,
 			udfDesc.Name,
 		)
 	}
@@ -194,6 +218,9 @@ func (n *createFunctionNode) replaceFunction(udfDesc *funcdesc.Mutable, params r
 	isSameUDT := types.IsOIDUserDefinedType(retType.Oid()) && retType.Oid() ==
 		udfDesc.ReturnType.Type.Oid()
 	if n.cf.ReturnType.SetOf != udfDesc.ReturnType.ReturnSet || (!retType.Equal(udfDesc.ReturnType.Type) && !isSameUDT) {
+		if udfDesc.IsProcedure() && (retType.Family() == types.VoidFamily || udfDesc.ReturnType.Type.Family() == types.VoidFamily) {
+			return pgerror.Newf(pgcode.InvalidFunctionDefinition, "cannot change whether a procedure has output parameters")
+		}
 		return pgerror.Newf(pgcode.InvalidFunctionDefinition, "cannot change return type of existing function")
 	}
 	if isSameUDT {
@@ -213,10 +240,16 @@ func (n *createFunctionNode) replaceFunction(udfDesc *funcdesc.Mutable, params r
 	} else {
 		udfDesc.Params = make([]descpb.FunctionDescriptor_Parameter, len(n.cf.Params))
 	}
+	var outParamOrdinals []int32
+	var outParamTypes []*types.T
 	for i, p := range n.cf.Params {
 		udfDesc.Params[i], err = makeFunctionParam(params.ctx, p, params.p, params.p.SemaCtx())
 		if err != nil {
 			return err
+		}
+		if p.Class == tree.RoutineParamOut {
+			outParamOrdinals = append(outParamOrdinals, int32(i))
+			outParamTypes = append(outParamTypes, udfDesc.Params[i].Type)
 		}
 	}
 
@@ -247,9 +280,50 @@ func (n *createFunctionNode) replaceFunction(udfDesc *funcdesc.Mutable, params r
 	if err := params.p.removeTypeBackReferences(params.ctx, udfDesc.DependsOnTypes, udfDesc.ID, jobDesc); err != nil {
 		return err
 	}
+	for _, id := range udfDesc.DependsOnFunctions {
+		backRefMutable, err := params.p.Descriptors().MutableByID(params.p.txn).Function(params.ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := backRefMutable.RemoveFunctionReference(udfDesc.ID); err != nil {
+			return err
+		}
+		if err := params.p.writeFuncSchemaChange(params.ctx, backRefMutable); err != nil {
+			return err
+		}
+	}
 	// Add all new references.
 	if err := n.addUDFReferences(udfDesc, params); err != nil {
 		return err
+	}
+
+	// The only allowed change is reordering OUT parameters in respect to input
+	// ones, but we have a more general "signature change" check here to be
+	// safe.
+	signatureChanged := len(existing.OutParamOrdinals) != len(outParamOrdinals)
+	for i := 0; !signatureChanged && i < len(outParamOrdinals); i++ {
+		signatureChanged = existing.OutParamOrdinals[i] != outParamOrdinals[i] ||
+			!existing.OutParamTypes.GetAt(i).Equivalent(outParamTypes[i])
+	}
+	if signatureChanged {
+		if err = scDesc.ReplaceOverload(
+			udfDesc.GetName(),
+			existing,
+			descpb.SchemaDescriptor_FunctionSignature{
+				ID:               udfDesc.GetID(),
+				ArgTypes:         existing.Types.Types(),
+				ReturnType:       retType,
+				ReturnSet:        udfDesc.ReturnType.ReturnSet,
+				IsProcedure:      n.cf.IsProcedure,
+				OutParamOrdinals: outParamOrdinals,
+				OutParamTypes:    outParamTypes,
+			},
+		); err != nil {
+			return err
+		}
+		if err = params.p.writeSchemaDescChange(params.ctx, scDesc, "Replace Function"); err != nil {
+			return err
+		}
 	}
 
 	return params.p.writeFuncSchemaChange(params.ctx, udfDesc)
@@ -257,14 +331,14 @@ func (n *createFunctionNode) replaceFunction(udfDesc *funcdesc.Mutable, params r
 
 func (n *createFunctionNode) getMutableFuncDesc(
 	scDesc catalog.SchemaDescriptor, params runParams,
-) (fnDesc *funcdesc.Mutable, isNew bool, err error) {
+) (fnDesc *funcdesc.Mutable, existing *tree.QualifiedOverload, err error) {
 	pbParams := make([]descpb.FunctionDescriptor_Parameter, len(n.cf.Params))
 	defaultSeen := false
 	variadicSeen := false
 	for i, param := range n.cf.Params {
 		pbParam, err := makeFunctionParam(params.ctx, param, params.p, params.p.SemaCtx())
 		if err != nil {
-			return nil, false, err
+			return nil, nil, err
 		}
 
 		if pbParam.Class == catpb.Function_Param_VARIADIC {
@@ -309,16 +383,18 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		FuncName: n.cf.Name,
 		Params:   n.cf.Params,
 	}
-	existing, err := params.p.matchRoutine(params.ctx, &routineObj,
-		false /* required */, tree.UDFRoutine|tree.ProcedureRoutine)
+	existing, err = params.p.matchRoutine(
+		params.ctx, &routineObj, false, /* required */
+		tree.UDFRoutine|tree.ProcedureRoutine, false, /* inDropContext */
+	)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
 
 	if existing != nil {
 		// Return an error if there is an existing match but not a replacement.
 		if !n.cf.Replace {
-			return nil, false, pgerror.Newf(
+			return nil, nil, pgerror.Newf(
 				pgcode.DuplicateFunction,
 				"function %q already exists with same argument types",
 				n.cf.Name.Object(),
@@ -327,19 +403,19 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		fnID := funcdesc.UserDefinedFunctionOIDToID(existing.Oid)
 		fnDesc, err = params.p.checkPrivilegesForDropFunction(params.ctx, fnID)
 		if err != nil {
-			return nil, false, err
+			return nil, nil, err
 		}
-		return fnDesc, false, nil
+		return fnDesc, existing, nil
 	}
 
 	funcDescID, err := params.EvalContext().DescIDGenerator.GenerateUniqueDescID(params.ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
 
 	returnType, err := tree.ResolveType(params.ctx, n.cf.ReturnType.Type, params.p)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
 
 	privileges, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
@@ -350,7 +426,7 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		privilege.Routines,
 	)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
 
 	newUdfDesc := funcdesc.NewMutableFunctionDescriptor(
@@ -365,7 +441,7 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		privileges,
 	)
 
-	return &newUdfDesc, true, nil
+	return &newUdfDesc, nil, nil
 }
 
 func (n *createFunctionNode) addUDFReferences(udfDesc *funcdesc.Mutable, params runParams) error {
@@ -444,6 +520,23 @@ func (n *createFunctionNode) addUDFReferences(udfDesc *funcdesc.Mutable, params 
 		if err := params.p.addTypeBackReference(params.ctx, id, udfDesc.ID, jobDesc); err != nil {
 			return err
 		}
+	}
+
+	udfDesc.DependsOnFunctions = make([]descpb.ID, 0, len(n.functionDeps))
+	for id := range n.functionDeps {
+		// Add a back reference.
+		backRefDesc, err := params.p.Descriptors().MutableByID(params.p.Txn()).Function(params.ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := backRefDesc.AddFunctionReference(udfDesc.ID); err != nil {
+			return err
+		}
+		if err := params.p.writeFuncSchemaChange(params.ctx, backRefDesc); err != nil {
+			return err
+		}
+		// Add a reference to the dependency in here.
+		udfDesc.DependsOnFunctions = append(udfDesc.DependsOnFunctions, id)
 	}
 
 	// Add forward references to UDF descriptor.

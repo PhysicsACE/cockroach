@@ -32,6 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -47,9 +50,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/raftpb"
-	"go.etcd.io/raft/v3/tracker"
 )
 
 var (
@@ -601,7 +601,7 @@ func (r *Replica) stepRaftGroup(req *kvserverpb.RaftMessageRequest) error {
 			wakeLeader := hasLeader && !fromLeader
 			r.maybeUnquiesceLocked(wakeLeader, false /* mayCampaign */)
 		}
-		r.mu.lastUpdateTimes.update(req.FromReplica.ReplicaID, timeutil.Now())
+		r.mu.lastUpdateTimes.update(req.FromReplica.ReplicaID, r.Clock().PhysicalTime())
 		switch req.Message.Type {
 		case raftpb.MsgPreVote, raftpb.MsgVote:
 			// If we receive a (pre)vote request, and we find our leader to be dead or
@@ -696,6 +696,12 @@ func (s handleRaftReadyStats) SafeFormat(p redact.SafePrinter, _ rune) {
 		}
 		p.SafeString(")")
 	}
+	if n := s.apply.numAddSST; n > 0 {
+		p.Printf(", apply-sst=%d", n)
+		if c := s.apply.numAddSSTCopies; c > 0 {
+			p.Printf(" (copies=%d)", c)
+		}
+	}
 	p.SafeString("]")
 
 	if n := s.apply.stateAssertions; n > 0 {
@@ -742,6 +748,19 @@ func (r *Replica) handleRaftReady(
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
 	return r.handleRaftReadyRaftMuLocked(ctx, inSnap)
+}
+
+func (r *Replica) attachRaftEntriesMonitorRaftMuLocked() {
+	r.raftMu.bytesAccount = r.store.cfg.RaftEntriesMonitor.NewAccount(
+		r.store.metrics.RaftLoadedEntriesBytes)
+}
+
+func (r *Replica) detachRaftEntriesMonitorRaftMuLocked() {
+	// Return all the used bytes back to the limiter.
+	r.raftMu.bytesAccount.Clear()
+	// De-initialize the account so that log storage Entries() calls don't track
+	// the entries anymore.
+	r.raftMu.bytesAccount = logstore.BytesAccount{}
 }
 
 // handleRaftReadyRaftMuLocked is the same as handleRaftReady but requires that
@@ -793,7 +812,20 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 			return false, err
 		}
 		if hasReady = raftGroup.HasReady(); hasReady {
+			// Since we are holding raftMu, only this Ready() call will use
+			// raftMu.bytesAccount. It tracks memory usage that this Ready incurs.
+			r.attachRaftEntriesMonitorRaftMuLocked()
+			// TODO(pav-kv): currently, Ready() only accounts for entry bytes loaded
+			// from log storage, and ignores the in-memory unstable entries. Pass a
+			// flow control struct down the stack, and do a more complete accounting
+			// in raft. This will also eliminate the "side channel" plumbing hack with
+			// this bytesAccount.
 			syncRd := raftGroup.Ready()
+			// We apply committed entries during this handleRaftReady, so it is ok to
+			// release the corresponding memory tokens at the end of this func. Next
+			// time we enter this function, the account will be empty again.
+			defer r.detachRaftEntriesMonitorRaftMuLocked()
+
 			logRaftReady(ctx, syncRd)
 			asyncRd := makeAsyncReady(syncRd)
 			softState = asyncRd.SoftState
@@ -1307,7 +1339,7 @@ func (r *Replica) tick(
 	// This is likely unintentional, and the leader should likely consider itself
 	// live even when quiesced.
 	if r.isRaftLeaderRLocked() {
-		r.mu.lastUpdateTimes.update(r.replicaID, timeutil.Now())
+		r.mu.lastUpdateTimes.update(r.replicaID, r.Clock().PhysicalTime())
 	}
 
 	r.mu.ticks++

@@ -136,11 +136,11 @@ type StartOpts struct {
 	EncryptedStores bool
 
 	// -- Options that apply only to the StartServiceForVirtualCluster target --
-	VirtualClusterName string
-	VirtualClusterID   int
-	SQLInstance        int
-	KVAddrs            string
-	KVCluster          *SyncedCluster
+	VirtualClusterName     string
+	VirtualClusterID       int
+	VirtualClusterLocation string // where separate process virtual clusters will be started
+	SQLInstance            int
+	StorageCluster         *SyncedCluster
 }
 
 func (s *StartOpts) IsVirtualCluster() bool {
@@ -205,6 +205,26 @@ func (so StartOpts) GetJoinTargets() []Node {
 		nodes = []Node{so.GetInitTarget()}
 	}
 	return nodes
+}
+
+// allowServiceRegistration is a gating function that prevents the usage of
+// service registration, with DNS services, in scenarios where it is not
+// supported. This is currently the case for non-GCE clusters and for clusters
+// that are not part of the default GCE project. For custom projects the DNS
+// services get garbage collected, hence the registration is not allowed.
+func (c *SyncedCluster) allowServiceRegistration() bool {
+	if c.IsLocal() {
+		return true
+	}
+	for _, cVM := range c.VMs {
+		if cVM.Provider != gce.ProviderName {
+			return false
+		}
+		if cVM.Project != gce.DefaultProject() {
+			return false
+		}
+	}
+	return true
 }
 
 // maybeRegisterServices registers the SQL and Admin UI DNS services
@@ -345,28 +365,50 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 		return fmt.Errorf("start SQL proxy not implemented")
 	}
 
+	// Determine if custom ports were specified in the start options.
+	customPortsSpecified := func() bool {
+		if startOpts.SQLPort != 0 && startOpts.SQLPort != config.DefaultSQLPort {
+			return true
+		}
+		if startOpts.AdminUIPort != 0 && startOpts.AdminUIPort != config.DefaultAdminUIPort {
+			return true
+		}
+		return false
+	}
+
 	// Local clusters do not support specifying ports. An error is returned if we
 	// detect that they were set.
 	if c.IsLocal() {
+		if customPortsSpecified() {
+			return fmt.Errorf("local clusters do not support specifying ports")
+		}
 		// We don't need to return an error if the ports are the default values
 		// specified in DefaultStartOps, as these have not been specified explicitly
 		// by the user.
-		if startOpts.SQLPort != 0 && startOpts.SQLPort != config.DefaultSQLPort {
-			return fmt.Errorf("local clusters do not support specifying ports")
-		}
-		if startOpts.AdminUIPort != 0 && startOpts.AdminUIPort != config.DefaultAdminUIPort {
-			return fmt.Errorf("local clusters do not support specifying ports")
-		}
 		startOpts.SQLPort = 0
 		startOpts.AdminUIPort = 0
 	}
 
-	err := c.maybeRegisterServices(ctx, l, startOpts)
-	if err != nil {
-		return err
+	if c.allowServiceRegistration() {
+		err := c.maybeRegisterServices(ctx, l, startOpts)
+		if err != nil {
+			return err
+		}
+	} else {
+		if customPortsSpecified() {
+			return fmt.Errorf("service registration is not supported for this cluster, but custom ports were specified")
+		}
+		l.Printf(strings.Join([]string{
+			"WARNING: Service registration and custom ports are not supported for this cluster.",
+			fmt.Sprintf("Setting ports to default SQL Port: %d, and Admin UI Port: %d.", config.DefaultSQLPort, config.DefaultAdminUIPort),
+			"Attempting to start any additional external SQL processes will fail.",
+		}, "\n"))
+		startOpts.SQLPort = config.DefaultSQLPort
+		startOpts.AdminUIPort = config.DefaultAdminUIPort
 	}
 
 	if startOpts.IsVirtualCluster() {
+		var err error
 		startOpts.VirtualClusterID, err = c.upsertVirtualClusterMetadata(ctx, l, startOpts)
 		if err != nil {
 			return err
@@ -374,7 +416,7 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 
 		l.Printf("virtual cluster ID: %d", startOpts.VirtualClusterID)
 
-		if err := c.distributeTenantCerts(ctx, l, startOpts.KVCluster, startOpts.VirtualClusterID); err != nil {
+		if err := c.distributeTenantCerts(ctx, l, startOpts.StorageCluster, startOpts.VirtualClusterID); err != nil {
 			return err
 		}
 	} else {
@@ -417,8 +459,8 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	// and convenient to manage.
 	if !startOpts.SkipInit {
 		storageCluster := c
-		if startOpts.KVCluster != nil {
-			storageCluster = startOpts.KVCluster
+		if startOpts.StorageCluster != nil {
+			storageCluster = startOpts.StorageCluster
 		}
 
 		// We use the `storageCluster` even if starting a virtual cluster
@@ -520,7 +562,7 @@ const (
 	DefaultPassword = "cockroachdb"
 )
 
-// NodeURL constructs a postgres URL. If sharedTenantName is not empty, it will
+// NodeURL constructs a postgres URL. If virtualClusterName is not empty, it will
 // be used as the virtual cluster name in the URL. This is used to connect to a
 // shared process running services for multiple virtual clusters.
 func (c *SyncedCluster) NodeURL(
@@ -882,7 +924,12 @@ func (c *SyncedCluster) generateStartArgs(
 		args = append(args, fmt.Sprintf("--join=%s", strings.Join(addresses, ",")))
 	}
 	if startOpts.Target == StartServiceForVirtualCluster {
-		args = append(args, fmt.Sprintf("--kv-addrs=%s", startOpts.KVAddrs))
+		storageAddrs, err := startOpts.StorageCluster.allPublicAddrs(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		args = append(args, fmt.Sprintf("--kv-addrs=%s", storageAddrs))
 		args = append(args, fmt.Sprintf("--tenant-id=%d", startOpts.VirtualClusterID))
 	}
 
@@ -1237,7 +1284,7 @@ func (c *SyncedCluster) upsertVirtualClusterMetadata(
 	ctx context.Context, l *logger.Logger, startOpts StartOpts,
 ) (int, error) {
 	runSQL := func(stmt string) (string, error) {
-		results, err := startOpts.KVCluster.ExecSQL(ctx, l, startOpts.KVCluster.Nodes[:1], "", 0, []string{
+		results, err := startOpts.StorageCluster.ExecSQL(ctx, l, startOpts.StorageCluster.Nodes[:1], "", 0, []string{
 			"--format", "csv", "-e", stmt,
 		})
 		if err != nil {

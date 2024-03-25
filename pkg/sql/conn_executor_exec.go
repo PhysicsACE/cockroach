@@ -386,11 +386,14 @@ func (ex *connExecutor) execStmtInOpenState(
 	os := ex.machine.CurState().(stateOpen)
 
 	isExtendedProtocol := portal != nil && portal.Stmt != nil
+	stmtFingerprintFmtMask := tree.FmtHideConstants | tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&ex.server.cfg.Settings.SV))
+
 	if isExtendedProtocol {
 		stmt = makeStatementFromPrepared(portal.Stmt, queryID)
 	} else {
-		stmt = makeStatement(parserStmt, queryID)
+		stmt = makeStatement(parserStmt, queryID, stmtFingerprintFmtMask)
 	}
+	stmtFingerprint := stmt.StmtNoConstants
 
 	var queryTimeoutTicker *time.Timer
 	var txnTimeoutTicker *time.Timer
@@ -533,6 +536,16 @@ func (ex *connExecutor) execStmtInOpenState(
 		}
 	}(ctx, res)
 
+	// Special handling for SET TRANSACTION statements within a stored procedure
+	// that uses COMMIT or ROLLBACK. This has to happen before the call to
+	// resetPlanner to ensure that the settings are propagated correctly.
+	if txnModes := ex.planner.storedProcTxnState.getTxnModes(); txnModes != nil {
+		_, err = ex.planner.SetTransaction(ctx, &tree.SetTransaction{Modes: *txnModes})
+		if err != nil {
+			return makeErrEvent(err)
+		}
+	}
+
 	// Note ex.metrics is Server.Metrics for the connExecutor that serves the
 	// client connection, and is Server.InternalMetrics for internal executors.
 	ex.metrics.EngineMetrics.SQLActiveStatements.Inc(1)
@@ -607,6 +620,12 @@ func (ex *connExecutor) execStmtInOpenState(
 		// TODO(radu): should we trim the "EXPLAIN ANALYZE (DEBUG)" part from
 		// stmt.SQL?
 
+		// Recompute statement fingerprint since the AST has changed.
+		flags := tree.FmtHideConstants | stmtFingerprintFmtMask
+		f := tree.NewFmtCtx(flags)
+		f.FormatNode(ast)
+		stmtFingerprint = f.CloseAndGetString()
+
 		// Clear any ExpectedTypes we set if we prepared this statement (they
 		// reflect the column types of the EXPLAIN itself and not those of the inner
 		// statement).
@@ -638,6 +657,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		stmt.ExpectedTypes = ps.Columns
 		stmt.StmtNoConstants = ps.StatementNoConstants
 		stmt.StmtSummary = ps.StatementSummary
+		stmtFingerprint = stmt.StmtNoConstants
 		res.ResetStmtType(ps.AST)
 
 		if e.DiscardRows {
@@ -815,11 +835,8 @@ func (ex *connExecutor) execStmtInOpenState(
 		if p, ok := retPayload.(payloadWithError); ok {
 			execErr = p.errorCause()
 		}
-		f := tree.NewFmtCtx(tree.FmtHideConstants)
-		f.FormatNode(ast)
 		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
-			f.CloseAndGetString(),
-			execErr != nil,
+			stmtFingerprint,
 			ex.implicitTxn(),
 			p.CurrentDatabase(),
 		)
@@ -930,6 +947,7 @@ func (ex *connExecutor) execStmtInOpenState(
 				NumAnnotations:  stmt.NumAnnotations,
 			},
 			ex.server.cfg.GenerateID(),
+			tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&ex.server.cfg.Settings.SV)),
 		)
 		var rawTypeHints []oid.Oid
 
@@ -977,7 +995,8 @@ func (ex *connExecutor) execStmtInOpenState(
 	}
 
 	// For regular statements (the ones that get to this point), we
-	// don't return any event unless an error happens.
+	// don't return any event unless an error happens, or a CALL statement
+	// performs a nested transaction COMMIT or ROLLBACK.
 
 	// For a portal (prepared stmt), since handleAOST() is called when preparing
 	// the statement, and this function is idempotent, we don't need to
@@ -1240,6 +1259,29 @@ func (ex *connExecutor) execStmtInOpenState(
 		log.VEventf(ctx, 2, "push detected for non-refreshable txn but auto-retry not possible")
 	}
 
+	// Special handling for explicit transaction management in CALL statements.
+	// A stored procedure has executed a COMMIT or ROLLBACK statement and
+	// suspended its execution. Direct the connExecutor to commit/rollback the
+	// current transaction, and then resume execution within the new transaction.
+	switch ex.extraTxnState.storedProcTxnState.txnOp {
+	case tree.StoredProcTxnCommit:
+		// Commit the current transaction. The connExecutor will open a new
+		// transaction, and then return to executing the same CALL statement.
+		ev, payload := ex.commitSQLTransaction(ctx, ast, ex.commitSQLTransactionInternal)
+		if payload != nil {
+			return ev, payload, nil
+		}
+		return eventTxnFinishCommittedPLpgSQL{}, nil, nil
+	case tree.StoredProcTxnRollback:
+		// Abort the current transaction. The connExecutor will open a new
+		// transaction, and then return to executing the same CALL statement.
+		ev, payload := ex.rollbackSQLTransaction(ctx, ast)
+		if payload != nil {
+			return ev, payload, nil
+		}
+		return eventTxnFinishAbortedPLpgSQL{}, nil, nil
+	}
+
 	// No event was generated.
 	return nil, nil, nil
 }
@@ -1292,6 +1334,10 @@ func (ex *connExecutor) handleAOST(ctx context.Context, stmt tree.Statement) err
 					return err
 				}
 			}
+			if err := ex.state.setReadOnlyMode(tree.ReadOnly); err != nil {
+				return err
+			}
+			p.extendedEvalCtx.TxnReadOnly = ex.state.readOnly.Load()
 			return nil
 		}
 		if *p.extendedEvalCtx.AsOfSystemTime == *asOf {
@@ -1963,9 +2009,9 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	if ex.server.cfg.TestingKnobs.OnTxnRetry != nil && ex.state.mu.autoRetryReason != nil {
 		ex.server.cfg.TestingKnobs.OnTxnRetry(ex.state.mu.autoRetryReason, planner.EvalContext())
 	}
-	distribute := DistributionType(DistributionTypeNone)
+	distribute := DistributionType(LocalDistribution)
 	if distributePlan.WillDistribute() {
-		distribute = DistributionTypeAlways
+		distribute = FullDistribution
 	}
 	ex.sessionTracing.TraceExecStart(ctx, "distributed")
 	stats, err = ex.execWithDistSQLEngine(
@@ -2021,7 +2067,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	}
 
 	if ex.server.cfg.TestingKnobs.AfterExecute != nil {
-		ex.server.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), res.Err())
+		ex.server.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), ex.executorType == executorTypeInternal, res.Err())
 	}
 
 	if limitsErr := ex.handleTxnRowsWrittenReadLimits(ctx); limitsErr != nil && res.Err() == nil {
@@ -2514,7 +2560,8 @@ func (ex *connExecutor) execStmtInNoTxnState(
 		}
 
 		p := &ex.planner
-		stmt := makeStatement(parserStmt, ex.server.cfg.GenerateID())
+		stmt := makeStatement(parserStmt, ex.server.cfg.GenerateID(),
+			tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&ex.server.cfg.Settings.SV)))
 		p.stmt = stmt
 		p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
 		p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
@@ -2525,11 +2572,8 @@ func (ex *connExecutor) execStmtInNoTxnState(
 			execErr = p.errorCause()
 		}
 
-		f := tree.NewFmtCtx(tree.FmtHideConstants)
-		f.FormatNode(stmt.AST)
 		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
-			f.CloseAndGetString(),
-			execErr != nil,
+			stmt.StmtNoConstants,
 			ex.implicitTxn(),
 			p.CurrentDatabase(),
 		)
@@ -3167,7 +3211,7 @@ func (ex *connExecutor) onTxnFinish(ctx context.Context, ev txnEvent, txnErr err
 		transactionFingerprintID :=
 			appstatspb.TransactionFingerprintID(ex.extraTxnState.transactionStatementsHash.Sum())
 
-		err := ex.txnFingerprintIDCache.Add(transactionFingerprintID)
+		err := ex.txnFingerprintIDCache.Add(ctx, transactionFingerprintID)
 		if err != nil {
 			if log.V(1) {
 				log.Warningf(ctx, "failed to enqueue transactionFingerprintID = %d: %s", transactionFingerprintID, err)

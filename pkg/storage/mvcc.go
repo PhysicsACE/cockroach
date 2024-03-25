@@ -2662,6 +2662,7 @@ func mvccPutInternal(
 	versionValue.Value = value
 	versionValue.LocalTimestamp = opts.LocalTimestamp
 	versionValue.OmitInRangefeeds = opts.OmitInRangefeeds
+	versionValue.ImportEpoch = opts.ImportEpoch
 
 	if buildutil.CrdbTestBuild {
 		if seq, seqOK := kvnemesisutil.FromContext(ctx); seqOK {
@@ -3744,6 +3745,14 @@ func MVCCPredicateDeleteRange(
 	maxLockConflicts int64,
 	targetLockConflictBytes int64,
 ) (*roachpb.Span, error) {
+	if endTime.IsEmpty() {
+		return nil, errors.AssertionFailedf("MVCCPredicateDeleteRange expects non-empty endTime")
+	}
+	if ms == nil {
+		return nil, errors.AssertionFailedf(
+			"MVCCStats passed in to MVCCPredicateDeleteRange must be non-nil to ensure proper stats" +
+				" computation during Delete operations")
+	}
 
 	if maxBatchSize == 0 {
 		// Set maxBatchSize to a large number to ensure MVCCPredicateDeleteRange
@@ -3770,18 +3779,35 @@ func MVCCPredicateDeleteRange(
 	var keyAlloc bufalloc.ByteAllocator
 	buf := make([]roachpb.Key, 0, rangeTombstoneThreshold)
 
-	if ms == nil {
-		return nil, errors.AssertionFailedf(
-			"MVCCStats passed in to MVCCPredicateDeleteRange must be non-nil to ensure proper stats" +
-				" computation during Delete operations")
-	}
-
 	// Check for any overlapping locks, and return them to be resolved.
 	if locks, err := ScanLocks(
 		ctx, rw, startKey, endKey, maxLockConflicts, targetLockConflictBytes, BatchEvalReadCategory); err != nil {
 		return nil, err
 	} else if len(locks) > 0 {
 		return nil, &kvpb.LockConflictError{Locks: locks}
+	}
+
+	var stopRunBasedOnPredicate func(k MVCCKey, iter *MVCCIncrementalIterator) (bool, error)
+	if predicates.ImportEpoch > 0 {
+		// TODO(ssd): We will likely eventually want something
+		// that consturcts our iterator opetions based on the
+		// predicate so that we can use a block-property
+		// filter for import epochs.
+		stopRunBasedOnPredicate = func(k MVCCKey, it *MVCCIncrementalIterator) (bool, error) {
+			rawV, err := it.UnsafeValue()
+			if err != nil {
+				return true, err
+			}
+			v, err := DecodeMVCCValue(rawV)
+			if err != nil {
+				return true, err
+			}
+			return v.ImportEpoch != predicates.ImportEpoch, nil
+		}
+	} else {
+		stopRunBasedOnPredicate = func(k MVCCKey, _ *MVCCIncrementalIterator) (bool, error) {
+			return k.Timestamp.LessEq(predicates.StartTime), nil
+		}
 	}
 
 	// continueRun returns three bools: the first is true if the current run
@@ -3835,11 +3861,12 @@ func MVCCPredicateDeleteRange(
 		}
 
 		// The latest key is a live point key. Conduct predicate filtering.
-		if k.Timestamp.LessEq(predicates.StartTime) {
+		if stop, err := stopRunBasedOnPredicate(k, iter); err != nil {
+			return false, false, false, err
+		} else if stop {
 			return false, false, false, nil
 		}
 
-		// TODO (msbutler): use MVCCValueHeader to match on job ID predicate
 		return true, false, false, nil
 	}
 
@@ -3858,16 +3885,12 @@ func MVCCPredicateDeleteRange(
 	}
 	defer pointTombstoneIter.Close()
 
-	inlineDelete := endTime.IsEmpty()
-	var ltScanner *lockTableKeyScanner
-	if !inlineDelete {
-		ltScanner, err = newLockTableKeyScanner(
-			ctx, rw, nil /* txn */, lock.Intent, maxLockConflicts, targetLockConflictBytes, BatchEvalReadCategory)
-		if err != nil {
-			return nil, err
-		}
-		defer ltScanner.close()
+	ltScanner, err := newLockTableKeyScanner(
+		ctx, rw, nil /* txn */, lock.Intent, maxLockConflicts, targetLockConflictBytes, BatchEvalReadCategory)
+	if err != nil {
+		return nil, err
 	}
+	defer ltScanner.close()
 
 	pointTombstoneBuf := newPutBuffer()
 	defer pointTombstoneBuf.release()
@@ -4582,6 +4605,7 @@ type MVCCWriteOptions struct {
 	Stats                          *enginepb.MVCCStats
 	ReplayWriteTimestampProtection bool
 	OmitInRangefeeds               bool
+	ImportEpoch                    uint32
 	// MaxLockConflicts is a maximum number of conflicting locks collected before
 	// returning LockConflictError. Even single-key writes can encounter multiple
 	// conflicting shared locks, so the limit is important to bound the number of
@@ -7753,6 +7777,7 @@ func mvccExportToWriter(
 		return maxSize
 	}
 
+	var valueScratch []byte
 	iter.SeekGE(opts.StartKey)
 	for {
 		if ok, err := iter.Valid(); err != nil {
@@ -7886,9 +7911,18 @@ func mvccExportToWriter(
 				return kvpb.BulkOpSummary{}, ExportRequestResumeInfo{}, errors.Wrapf(err, "decoding mvcc value %s", unsafeKey)
 			}
 
-			// Export only the inner roachpb.Value, not the MVCCValue header.
-			unsafeValue = mvccValue.Value.RawBytes
-
+			if !ok && opts.IncludeMVCCValueHeader {
+				buf, canRetainBuf, err := EncodeMVCCValueForExport(mvccValue, valueScratch[:0])
+				if err != nil {
+					return kvpb.BulkOpSummary{}, ExportRequestResumeInfo{}, errors.Wrapf(err, "repackaging imported mvcc value %s", unsafeKey)
+				}
+				if canRetainBuf {
+					valueScratch = buf
+				}
+				unsafeValue = buf
+			} else {
+				unsafeValue = mvccValue.Value.RawBytes
+			}
 			// Skip tombstone records when start time is zero (non-incremental)
 			// and we are not exporting all versions.
 			skip = skipTombstones && mvccValue.IsTombstone()
@@ -8054,6 +8088,14 @@ type MVCCExportOptions struct {
 	// FingerprintOptions controls how fingerprints are generated
 	// when using MVCCExportFingerprint.
 	FingerprintOptions MVCCExportFingerprintOptions
+
+	// IncludeMVCCValueHeader controls whether we include
+	// MVCCValueHeaders in the exported data. When true, the
+	// portions of the header appropriate for export are included
+	// in the encoded values. Callers should be ready to decode
+	// full MVCCValue's in this case.
+	IncludeMVCCValueHeader bool
+
 	// ScanStats, if set, is updated with iterator stats upon export success of
 	// failure. Non-iterator stats i.e., {NumGets,NumReverseScans} are left
 	// unchanged, and NumScans is incremented by 1.

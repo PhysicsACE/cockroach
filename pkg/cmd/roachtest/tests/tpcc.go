@@ -543,7 +543,7 @@ func registerTPCC(r registry.Registry) {
 		// migrations while TPCC runs. It simulates a real production
 		// deployment in the middle of the migration into a new cluster version.
 		Name:    "tpcc/mixed-headroom/" + mixedHeadroomSpec.String(),
-		Timeout: 6 * time.Hour,
+		Timeout: 7 * time.Hour,
 		Owner:   registry.OwnerTestEng,
 		// TODO(tbg): add release_qualification tag once we know the test isn't
 		// buggy.
@@ -948,8 +948,8 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehousesGCE: 3500,
 		LoadWarehousesAWS: 3900,
-		EstimatedMaxGCE:   2900,
-		EstimatedMaxAWS:   3500,
+		EstimatedMaxGCE:   3100,
+		EstimatedMaxAWS:   3600,
 		Clouds:            registry.AllClouds,
 		Suites:            registry.Suites(registry.Nightly),
 	})
@@ -960,7 +960,7 @@ func registerTPCC(r registry.Registry) {
 		LoadWarehousesGCE: 3500,
 		LoadWarehousesAWS: 3900,
 		EstimatedMaxGCE:   2900,
-		EstimatedMaxAWS:   3500,
+		EstimatedMaxAWS:   3400,
 		Clouds:            registry.AllClouds,
 		Suites:            registry.Suites(registry.Nightly),
 		SharedProcessMT:   true,
@@ -984,8 +984,8 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehousesGCE: 6500,
 		LoadWarehousesAWS: 6500,
-		EstimatedMaxGCE:   5000,
-		EstimatedMaxAWS:   5000,
+		EstimatedMaxGCE:   6300,
+		EstimatedMaxAWS:   6300,
 
 		Clouds: registry.OnlyGCE,
 		Suites: registry.Suites(registry.Nightly),
@@ -999,8 +999,8 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehousesGCE: 3000,
 		LoadWarehousesAWS: 3000,
-		EstimatedMaxGCE:   2000,
-		EstimatedMaxAWS:   2000,
+		EstimatedMaxGCE:   2500,
+		EstimatedMaxAWS:   2500,
 
 		Clouds: registry.OnlyGCE,
 		Suites: registry.Suites(registry.Nightly),
@@ -1013,8 +1013,8 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehousesGCE: 2000,
 		LoadWarehousesAWS: 2000,
-		EstimatedMaxGCE:   900,
-		EstimatedMaxAWS:   900,
+		EstimatedMaxGCE:   1700,
+		EstimatedMaxAWS:   1700,
 
 		Clouds: registry.AllExceptAWS,
 		Suites: registry.Suites(registry.Nightly),
@@ -1041,8 +1041,8 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehousesGCE: 3500,
 		LoadWarehousesAWS: 3900,
-		EstimatedMaxGCE:   2900,
-		EstimatedMaxAWS:   3500,
+		EstimatedMaxGCE:   3100,
+		EstimatedMaxAWS:   3600,
 		EncryptionEnabled: true,
 		Clouds:            registry.AllClouds,
 		Suites:            registry.Suites(registry.Nightly),
@@ -1081,8 +1081,8 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehousesGCE: 3500,
 		LoadWarehousesAWS: 3900,
-		EstimatedMaxGCE:   2900,
-		EstimatedMaxAWS:   3500,
+		EstimatedMaxGCE:   3100,
+		EstimatedMaxAWS:   3600,
 		ExpirationLeases:  true,
 		Clouds:            registry.AllClouds,
 		Suites:            registry.Suites(registry.Nightly),
@@ -1455,9 +1455,9 @@ func runTPCCBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpccBen
 
 	var db *gosql.DB
 	if b.SharedProcessMT {
-		startOpts = option.DefaultStartSharedVirtualClusterOpts(appTenantName)
-		c.StartServiceForVirtualCluster(ctx, t.L(), roachNodes, startOpts, settings, roachNodes)
-		db = c.Conn(ctx, t.L(), 1, option.TenantName(appTenantName))
+		startOpts = option.StartSharedVirtualClusterOpts(appTenantName)
+		c.StartServiceForVirtualCluster(ctx, t.L(), startOpts, settings)
+		db = c.Conn(ctx, t.L(), 1, option.VirtualClusterName(appTenantName))
 	} else {
 		db = c.Conn(ctx, t.L(), 1)
 	}

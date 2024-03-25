@@ -94,6 +94,13 @@ var cutoverSignalPollInterval = settings.RegisterDurationSetting(
 	settings.WithName("physical_replication.consumer.cutover_signal_poll_interval"),
 )
 
+var quantize = settings.RegisterDurationSettingWithExplicitUnit(
+	settings.SystemOnly,
+	"physical_replication.consumer.timestamp_granularity",
+	"the granularity at which replicated times are quantized to make tracking more efficient",
+	5*time.Second,
+)
+
 var streamIngestionResultTypes = []*types.T{
 	types.Bytes, // jobspb.ResolvedSpans
 }
@@ -767,10 +774,19 @@ func (sip *streamIngestionProcessor) bufferSST(sst *kvpb.RangeFeedSSTable) error
 	defer sp.Finish()
 	return replicationutils.ScanSST(sst, sst.Span,
 		func(keyVal storage.MVCCKeyValue) error {
+			// TODO(ssd): We technically get MVCCValueHeaders in our
+			// SSTs. But currently there are so many ways _not_ to
+			// get them that writing them here would just be
+			// confusing until we fix them all.
+			mvccValue, err := storage.DecodeValueFromMVCCValue(keyVal.Value)
+			if err != nil {
+				return err
+			}
+
 			return sip.bufferKV(&roachpb.KeyValue{
 				Key: keyVal.Key.Key,
 				Value: roachpb.Value{
-					RawBytes:  keyVal.Value,
+					RawBytes:  mvccValue.RawBytes,
 					Timestamp: keyVal.Key.Timestamp,
 				},
 			})
@@ -874,7 +890,17 @@ func (sip *streamIngestionProcessor) bufferCheckpoint(event partitionEvent) erro
 
 	lowestTimestamp := hlc.MaxTimestamp
 	highestTimestamp := hlc.MinTimestamp
+	d := quantize.Get(&sip.EvalCtx.Settings.SV)
 	for _, resolvedSpan := range resolvedSpans {
+		// If quantizing is enabled, round the timestamp down to an even multiple of
+		// the quantization amount, to maximize the number of spans that share the
+		// same resolved timestamp -- even if they were individually resolved to
+		// _slightly_ different/newer timestamps -- to allow them to merge into
+		// fewer and larger spans in the frontier.
+		if d > 0 {
+			resolvedSpan.Timestamp.Logical = 0
+			resolvedSpan.Timestamp.WallTime -= resolvedSpan.Timestamp.WallTime % int64(d)
+		}
 		if resolvedSpan.Timestamp.Less(lowestTimestamp) {
 			lowestTimestamp = resolvedSpan.Timestamp
 		}

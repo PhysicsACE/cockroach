@@ -30,11 +30,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/benignerror"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -49,10 +54,30 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/raftpb"
-	"go.etcd.io/raft/v3/tracker"
 )
+
+// EnableEstimatedMVCCStatsInSplit controls whether the MVCC stats produced
+// during splits are estimated (when enabled) or 100% accurate (when disabled).
+// Defaults to true but metamorphically changed in tests.
+var EnableEstimatedMVCCStatsInSplit = settings.RegisterBoolSetting(
+	settings.SystemVisible,
+	"kv.split.estimated_mvcc_stats.enabled",
+	"if enabled, MVCC stats will be computed estimated (as opposed to "+
+		"computed accurately) during splits",
+	util.ConstantWithMetamorphicTestBool("kv.split.estimated_mvcc_stats.enabled", true))
+
+// EnableMVCCStatsRecomputationInSplit controls whether the MVCC stats for a
+// range are re-computed at the beginning of the split (in AdminSplit). Doing so
+// prevents stats estimates by successive splits from drifting too much from the
+// real stats. However, re-computation is expensive, so it can be disabled using
+// this setting if it's causing performance issues.
+// Defaults to true but metamorphically changed in tests.
+var EnableMVCCStatsRecomputationInSplit = settings.RegisterBoolSetting(
+	settings.SystemVisible,
+	"kv.split.mvcc_stats_recomputation.enabled",
+	"if enabled, MVCC stats will be recomputed at the beginning of a split "+
+		"to prevent stats estimates from drifting",
+	util.ConstantWithMetamorphicTestBool("kv.split.mvcc_stats_recomputation.enabled", true))
 
 // mergeApplicationTimeout is the timeout when waiting for a merge command to be
 // applied on all range replicas. There doesn't appear to be any strong reason
@@ -169,11 +194,12 @@ func splitTxnAttempt(
 	ctx context.Context,
 	store *Store,
 	txn *kv.Txn,
-	rightRangeID roachpb.RangeID,
-	splitKey roachpb.RKey,
-	expiration hlc.Timestamp,
+	leftDesc *roachpb.RangeDescriptor,
+	rightDesc *roachpb.RangeDescriptor,
 	oldDesc *roachpb.RangeDescriptor,
 	reason redact.RedactableString,
+	preSplitLeftUserStats enginepb.MVCCStats,
+	preSplitStats enginepb.MVCCStats,
 ) error {
 	txn.SetDebugName(splitTxnName)
 
@@ -182,12 +208,6 @@ func splitTxnAttempt(
 	if err != nil {
 		return err
 	}
-	// TODO(tbg): return desc from conditionalGetDescValueFromDB and don't pass
-	// in oldDesc any more (just the start key).
-	desc := oldDesc
-	oldDesc = nil // prevent accidental use
-
-	leftDesc, rightDesc := prepareSplitDescs(rightRangeID, splitKey, expiration, desc)
 
 	// Update existing range descriptor for left hand side of
 	// split. Note that we mutate the descriptor for the left hand
@@ -234,8 +254,10 @@ func splitTxnAttempt(
 		Commit: true,
 		InternalCommitTrigger: &roachpb.InternalCommitTrigger{
 			SplitTrigger: &roachpb.SplitTrigger{
-				LeftDesc:  *leftDesc,
-				RightDesc: *rightDesc,
+				LeftDesc:              *leftDesc,
+				RightDesc:             *rightDesc,
+				PreSplitLeftUserStats: preSplitLeftUserStats,
+				PreSplitStats:         preSplitStats,
 			},
 		},
 	})
@@ -440,8 +462,48 @@ func (r *Replica) adminSplitWithDescriptor(
 	log.Infof(ctx, "initiating a split of this range at key %v [r%d] (%s)%s",
 		splitKey, rightRangeID, reason, extra)
 
+	leftDesc, rightDesc := prepareSplitDescs(rightRangeID, splitKey, args.ExpirationTime, desc)
+
+	// If MVCC stats estimates are enabled, pre-compute some stats here to pass to
+	// splitTrigger (where we hold latches, so it's more expensive to do so).
+	var userOnlyLeftStats enginepb.MVCCStats
+	var totalStats enginepb.MVCCStats
+	if EnableEstimatedMVCCStatsInSplit.Get(&r.store.ClusterSettings().SV) &&
+		r.ClusterSettings().Version.IsActive(ctx, clusterversion.V24_1_EstimatedMVCCStatsInSplit) {
+		// If the stats contain estimates, re-compute them to prevent estimates
+		// from compounding across splits. See makeEstimatedSplitStatsHelper for more
+		// details on how splits introduce stats estimates.
+		// This computation can be expensive, so it's guarded by the
+		// EnableMVCCStatsRecomputationInSplit cluster setting.
+		if r.GetMVCCStats().ContainsEstimates > 0 &&
+			EnableMVCCStatsRecomputationInSplit.Get(&r.store.ClusterSettings().SV) {
+			req := kvpb.RecomputeStatsRequest{
+				RequestHeader: kvpb.RequestHeader{Key: desc.StartKey.AsRawKey()},
+			}
+			var ba kv.Batch
+			ba.AddRawRequest(&req)
+			if err = r.store.DB().Run(ctx, &ba); err != nil {
+				return reply, errors.Wrapf(err, "failed to re-compute MVCCStats pre split")
+			}
+		}
+
+		// The LHS user-only stats will be used in splitTrigger to estimate the total
+		// post-split LHS stats by combining these stats with the non-user stats
+		// computed in splitTrigger. More details in makeEstimatedSplitStatsHelper.
+		userOnlyLeftStats, err = rditer.ComputeStatsForRangeUserOnly(
+			ctx, leftDesc, r.store.TODOEngine(), r.store.Clock().NowAsClockTimestamp().WallTime)
+		if err != nil {
+			return reply, errors.Wrapf(err, "unable to compute user-only pre-split stats for LHS range")
+		}
+
+		// The total stats will be used in splitTrigger to potentially fall back to
+		// accurate-stats computation, if the pre-split total stats here vary too
+		// much from the total stats at the time of the split (in splitTrigger).
+		totalStats = r.GetMVCCStats()
+	}
+
 	if err := r.store.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		return splitTxnAttempt(ctx, r.store, txn, rightRangeID, splitKey, args.ExpirationTime, desc, reason)
+		return splitTxnAttempt(ctx, r.store, txn, leftDesc, rightDesc, desc, reason, userOnlyLeftStats, totalStats)
 	}); err != nil {
 		// The ConditionFailedError can occur because the descriptors acting
 		// as expected values in the CPuts used to update the left or right
@@ -3078,6 +3140,12 @@ var traceSnapshotThreshold = settings.RegisterDurationSetting(
 		"trace logged (set to 0 to disable);", 0,
 )
 
+var externalFileSnapshotting = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.snapshot.external_files.enabled",
+	"enables sending external files as metadata during a snapshot",
+	false)
+
 // followerSendSnapshot receives a delegate snapshot request and generates the
 // snapshot from this replica. The entire process of generating and transmitting
 // the snapshot is handled, and errors are propagated back to the leaseholder.
@@ -3157,7 +3225,28 @@ func (r *Replica) followerSendSnapshot(
 	// a snapshot for a non-system range. This allows us to send metadata of
 	// sstables in shared storage as opposed to streaming their contents. Keys
 	// in higher levels of the LSM are still streamed in the snapshot.
-	sharedReplicate := r.store.cfg.SharedStorageEnabled && snap.State.Desc.StartKey.AsRawKey().Compare(keys.TableDataMin) >= 0
+	nonSystemRange := snap.State.Desc.StartKey.AsRawKey().Compare(keys.TableDataMin) >= 0
+	sharedReplicate := r.store.cfg.SharedStorageEnabled && nonSystemRange
+
+	// Use external replication if we aren't using shared
+	// replication, are dealing with a non-system range, are on at
+	// least 24.1, and our store has external files.
+	externalReplicate := !sharedReplicate && nonSystemRange &&
+		r.store.ClusterSettings().Version.IsActive(ctx, clusterversion.V24_1) &&
+		externalFileSnapshotting.Get(&r.store.ClusterSettings().SV)
+	if externalReplicate {
+		start := snap.State.Desc.StartKey.AsRawKey()
+		end := snap.State.Desc.EndKey.AsRawKey()
+		total, _, external, err := r.store.StateEngine().ApproximateDiskBytes(start, end)
+		if err != nil {
+			log.Warningf(ctx, "could not determine if store has external bytes: %v", err)
+			externalReplicate = false
+		}
+
+		// Enable ExternalReplicate only if we have more
+		// external bytes than local bytes.
+		externalReplicate = external > (total - external)
+	}
 
 	// Create new snapshot request header using the delegate snapshot request.
 	header := kvserverpb.SnapshotRequest_Header{
@@ -3178,6 +3267,7 @@ func (r *Replica) followerSendSnapshot(
 		SenderQueueName:     req.SenderQueueName,
 		SenderQueuePriority: req.SenderQueuePriority,
 		SharedReplicate:     sharedReplicate,
+		ExternalReplicate:   externalReplicate,
 	}
 	newBatchFn := func() storage.WriteBatch {
 		return r.store.TODOEngine().NewWriteBatch()
@@ -3604,7 +3694,7 @@ func (roo *replicaRelocateOneOptions) LoadSpanConfig(
 	if err != nil {
 		return nil, errors.Wrap(err, "can't relocate range")
 	}
-	conf, err := confReader.GetSpanConfigForKey(ctx, startKey)
+	conf, _, err := confReader.GetSpanConfigForKey(ctx, startKey)
 	if err != nil {
 		return nil, err
 	}
@@ -4006,19 +4096,9 @@ func (r *Replica) adminScatter(
 	}
 
 	// Loop until we hit an error or until we hit `maxAttempts` for the range.
-	// Note that we disable lease transfers until the final step as transferring
-	// the lease prevents any further action on this node.
-	var allowLeaseTransfer bool
-	requeue := true
-	canTransferLease := func(ctx context.Context, repl plan.LeaseCheckReplica, conf *roachpb.SpanConfig) bool {
-		return allowLeaseTransfer
-	}
 	for re := retry.StartWithCtx(ctx, retryOpts); re.Next(); {
 		if currentAttempt == maxAttempts {
 			break
-		}
-		if currentAttempt == maxAttempts-1 || !requeue {
-			allowLeaseTransfer = true
 		}
 		desc, conf := r.DescAndSpanConfig()
 		_, err := rq.replicaCanBeProcessed(ctx, r, false /* acquireLeaseIfNeeded */)
@@ -4026,8 +4106,8 @@ func (r *Replica) adminScatter(
 			// The replica can not be processed, so skip it.
 			break
 		}
-		requeue, err = rq.processOneChange(
-			ctx, r, desc, conf, canTransferLease, true /* scatter */, false, /* dryRun */
+		_, err = rq.processOneChange(
+			ctx, r, desc, conf, true /* scatter */, false, /* dryRun */
 		)
 		if err != nil {
 			// TODO(tbg): can this use IsRetriableReplicationError?
@@ -4052,9 +4132,14 @@ func (r *Replica) adminScatter(
 			newLeaseholderIdx := rand.Intn(len(potentialLeaseTargets))
 			targetStoreID := potentialLeaseTargets[newLeaseholderIdx].StoreID
 			if targetStoreID != r.store.StoreID() {
-				log.VEventf(ctx, 2, "randomly transferring lease to s%d", targetStoreID)
-				if err := r.AdminTransferLease(ctx, targetStoreID, false /* bypassSafetyChecks */); err != nil {
-					log.Warningf(ctx, "failed to scatter lease to s%d: %+v", targetStoreID, err)
+				if tokenErr := r.allocatorToken.TryAcquire(ctx, "scatter"); tokenErr != nil {
+					log.Warningf(ctx, "failed to scatter lease to s%d: %+v", targetStoreID, tokenErr)
+				} else {
+					defer r.allocatorToken.Release(ctx)
+					log.VEventf(ctx, 2, "randomly transferring lease to s%d", targetStoreID)
+					if err := r.AdminTransferLease(ctx, targetStoreID, false /* bypassSafetyChecks */); err != nil {
+						log.Warningf(ctx, "failed to scatter lease to s%d: %+v", targetStoreID, err)
+					}
 				}
 			}
 		}

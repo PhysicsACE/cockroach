@@ -62,8 +62,12 @@ func (s *PersistedSQLStats) Flush(ctx context.Context, stopper *stop.Stopper) {
 		return
 	}
 
-	log.Infof(ctx, "flushing %d stmt/txn fingerprints (%d bytes) after %s",
-		s.SQLStats.GetTotalFingerprintCount(), s.SQLStats.GetTotalFingerprintBytes(), timeutil.Since(s.lastFlushStarted))
+	fingerprintCount := s.SQLStats.GetTotalFingerprintCount()
+	s.cfg.FlushedFingerprintCount.Inc(fingerprintCount)
+	if log.V(1) {
+		log.Infof(ctx, "flushing %d stmt/txn fingerprints (%d bytes) after %s",
+			fingerprintCount, s.SQLStats.GetTotalFingerprintBytes(), timeutil.Since(s.lastFlushStarted))
+	}
 	s.lastFlushStarted = now
 
 	aggregatedTs := s.ComputeAggregatedTs()
@@ -111,9 +115,11 @@ func (s *PersistedSQLStats) Flush(ctx context.Context, stopper *stop.Stopper) {
 func (s *PersistedSQLStats) StmtsLimitSizeReached(ctx context.Context) (bool, error) {
 	// Doing a count check on every flush for every node adds a lot of overhead.
 	// To reduce the overhead only do the check once an hour by default.
-	intervalToCheck := sqlStatsLimitTableCheckInterval.Get(&s.cfg.Settings.SV)
+	intervalToCheck := SQLStatsLimitTableCheckInterval.Get(&s.cfg.Settings.SV)
 	if !s.lastSizeCheck.IsZero() && s.lastSizeCheck.Add(intervalToCheck).After(timeutil.Now()) {
-		log.Infof(ctx, "PersistedSQLStats.StmtsLimitSizeReached skipped with last check at: %s and check interval: %s", s.lastSizeCheck, intervalToCheck)
+		if log.V(1) {
+			log.Infof(ctx, "PersistedSQLStats.StmtsLimitSizeReached skipped with last check at: %s and check interval: %s", s.lastSizeCheck, intervalToCheck)
+		}
 		return false, nil
 	}
 
@@ -162,12 +168,13 @@ func (s *PersistedSQLStats) doFlush(ctx context.Context, workFn func() error, er
 
 	defer func() {
 		if err != nil {
-			s.cfg.FailureCounter.Inc(1)
+			s.cfg.FlushesFailed.Inc(1)
 			log.Warningf(ctx, "%s: %s", errMsg, err)
+		} else {
+			s.cfg.FlushesSuccessful.Inc(1)
 		}
 		flushDuration := s.getTimeNow().Sub(flushBegin)
-		s.cfg.FlushDuration.RecordValue(flushDuration.Nanoseconds())
-		s.cfg.FlushCounter.Inc(1)
+		s.cfg.FlushLatency.RecordValue(flushDuration.Nanoseconds())
 	}()
 
 	err = workFn()

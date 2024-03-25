@@ -277,9 +277,11 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 					return errors.Wrap(err, "checking if existing table is empty")
 				}
 				details.Tables[i].WasEmpty = len(res) == 0
-				// Update the descriptor in the job record and in the database with the ImportStartTime
+
+				// Update the descriptor in the job record and in the database
 				details.Tables[i].Desc.ImportStartWallTime = details.Walltime
-				if err := bindImportStartTime(ctx, p, tblDesc.GetID(), details.Walltime); err != nil {
+
+				if err := bindTableDescImportProperties(ctx, p, tblDesc.GetID(), details.Walltime); err != nil {
 					return err
 				}
 			}
@@ -287,6 +289,14 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 
 		if err := r.job.NoTxn().SetDetails(ctx, details); err != nil {
 			return err
+		}
+	}
+
+	if len(details.Tables) > 1 {
+		for _, tab := range details.Tables {
+			if !tab.IsNew {
+				return errors.AssertionFailedf("all tables in multi-table import must be new")
+			}
 		}
 	}
 
@@ -398,9 +408,12 @@ func (r *importResumer) prepareTablesForIngestion(
 	var err error
 	var newTableDescs []jobspb.ImportDetails_Table
 	var desc *descpb.TableDescriptor
+
+	useImportEpochs := p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V24_1)
+	useImportEpochs = useImportEpochs && importEpochs.Get(&p.ExecCfg().Settings.SV)
 	for i, table := range details.Tables {
 		if !table.IsNew {
-			desc, err = prepareExistingTablesForIngestion(ctx, txn, descsCol, table.Desc)
+			desc, err = prepareExistingTablesForIngestion(ctx, txn, descsCol, table.Desc, useImportEpochs)
 			if err != nil {
 				return importDetails, err
 			}
@@ -411,7 +424,6 @@ func (r *importResumer) prepareTablesForIngestion(
 				IsNew:      table.IsNew,
 				TargetCols: table.TargetCols,
 			}
-
 			hasExistingTables = true
 		} else {
 			// PGDUMP imports support non-public schemas.
@@ -479,7 +491,11 @@ func (r *importResumer) prepareTablesForIngestion(
 // prepareExistingTablesForIngestion prepares descriptors for existing tables
 // being imported into.
 func prepareExistingTablesForIngestion(
-	ctx context.Context, txn *kv.Txn, descsCol *descs.Collection, desc *descpb.TableDescriptor,
+	ctx context.Context,
+	txn *kv.Txn,
+	descsCol *descs.Collection,
+	desc *descpb.TableDescriptor,
+	useImportEpochs bool,
 ) (*descpb.TableDescriptor, error) {
 	if len(desc.Mutations) > 0 {
 		return nil, errors.Errorf("cannot IMPORT INTO a table with schema changes in progress -- try again later (pending mutation %s)", desc.Mutations[0].String())
@@ -499,7 +515,14 @@ func prepareExistingTablesForIngestion(
 	// Take the table offline for import.
 	// TODO(dt): audit everywhere we get table descs (leases or otherwise) to
 	// ensure that filtering by state handles IMPORTING correctly.
-	importing.SetOffline("importing")
+
+	// We only use the new OfflineForImport on 24.1, which bumps
+	// the ImportEpoch, if we are completely on 24.1.
+	if useImportEpochs {
+		importing.OfflineForImport()
+	} else {
+		importing.SetOffline(tabledesc.OfflineReasonImporting)
+	}
 
 	// TODO(dt): de-validate all the FKs.
 	if err := descsCol.WriteDesc(
@@ -584,7 +607,7 @@ func prepareNewTablesForIngestion(
 	// as tabledesc.TableDescriptor.
 	tableDescs := make([]catalog.TableDescriptor, len(newMutableTableDescriptors))
 	for i := range tableDescs {
-		newMutableTableDescriptors[i].SetOffline("importing")
+		newMutableTableDescriptors[i].SetOffline(tabledesc.OfflineReasonImporting)
 		tableDescs[i] = newMutableTableDescriptors[i]
 	}
 
@@ -709,8 +732,9 @@ func (r *importResumer) prepareSchemasForIngestion(
 	return schemaMetadata, err
 }
 
-// bindImportStarTime writes the ImportStarTime to the descriptor.
-func bindImportStartTime(
+// bindTableDescImportProperties updates the table descriptor at the start of an
+// import for a table that existed before the import.
+func bindTableDescImportProperties(
 	ctx context.Context, p sql.JobExecContext, id catid.DescID, startWallTime int64,
 ) error {
 	if err := sql.DescsTxn(ctx, p.ExecCfg(), func(
@@ -1233,6 +1257,13 @@ var retryDuration = settings.RegisterDurationSetting(
 	settings.PositiveDuration,
 )
 
+var importEpochs = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"bulkio.import.write_import_epoch.enabled",
+	"controls whether IMPORT will write ImportEpoch's to descriptors",
+	true,
+)
+
 func getFractionCompleted(job *jobs.Job) float64 {
 	p := job.Progress()
 	return float64(p.GetFractionCompleted())
@@ -1568,7 +1599,7 @@ func (r *importResumer) dropTables(
 			execCfg.Codec,
 			&execCfg.Settings.SV,
 			execCfg.DistSender,
-			intoTable,
+			intoTable.GetID(),
 			predicates, sql.RevertTableDefaultBatchSize); err != nil {
 			return errors.Wrap(err, "rolling back IMPORT INTO in non empty table via DeleteRange")
 		}

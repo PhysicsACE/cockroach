@@ -40,7 +40,7 @@ func registerDatabaseDrop(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:             "admission-control/database-drop",
-		Timeout:          10 * time.Hour,
+		Timeout:          15 * time.Hour,
 		Owner:            registry.OwnerAdmissionControl,
 		Benchmark:        true,
 		CompatibleClouds: registry.OnlyGCE,
@@ -94,7 +94,7 @@ func registerDatabaseDrop(r registry.Registry) {
 				runTPCE(ctx, t, c, tpceOptions{
 					start: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 						settings := install.MakeClusterSettings(install.NumRacksOption(crdbNodes))
-						startOpts := option.DefaultStartOptsNoBackups()
+						startOpts := option.NewStartOpts(option.NoBackupSchedule)
 						roachtestutil.SetDefaultSQLPort(c, &startOpts.RoachprodOpts)
 						if err := c.StartE(ctx, t.L(), startOpts, settings, c.Range(1, crdbNodes)); err != nil {
 							t.Fatal(err)
@@ -197,7 +197,7 @@ func registerDatabaseDrop(r registry.Registry) {
 			// test and use disk snapshots?
 			runTPCE(ctx, t, c, tpceOptions{
 				start: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					startOpts := option.DefaultStartOptsNoBackups()
+					startOpts := option.NewStartOpts(option.NoBackupSchedule)
 					roachtestutil.SetDefaultSQLPort(c, &startOpts.RoachprodOpts)
 					roachtestutil.SetDefaultAdminUIPort(c, &startOpts.RoachprodOpts)
 					settings := install.MakeClusterSettings(install.NumRacksOption(crdbNodes))

@@ -122,6 +122,14 @@ func abortTxnOp(txnID uuid.UUID) enginepb.MVCCLogicalOp {
 	})
 }
 
+func deleteRangeOp(startKey, endKey roachpb.Key, timestamp hlc.Timestamp) enginepb.MVCCLogicalOp {
+	return makeLogicalOp(&enginepb.MVCCDeleteRangeOp{
+		StartKey:  startKey,
+		EndKey:    endKey,
+		Timestamp: timestamp,
+	})
+}
+
 func makeRangeFeedEvent(val interface{}) *kvpb.RangeFeedEvent {
 	var event kvpb.RangeFeedEvent
 	event.MustSetValue(val)
@@ -810,7 +818,7 @@ func TestProcessorMemoryBudgetExceeded(t *testing.T) {
 // TestProcessorMemoryBudgetReleased that memory budget is correctly released.
 func TestProcessorMemoryBudgetReleased(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	fb := newTestBudget(40)
+	fb := newTestBudget(250)
 	p, h, stopper := newTestProcessor(t, withBudget(fb), withChanTimeout(15*time.Minute))
 	ctx := context.Background()
 	defer stopper.Stop(ctx)
@@ -1258,7 +1266,7 @@ func TestBudgetReleaseOnProcessorStop(t *testing.T) {
 	const channelCapacity = totalEvents/2 + 10
 
 	s := cluster.MakeTestingClusterSettings()
-	m := mon.NewMonitor("rangefeed", mon.MemoryResource, nil, nil, 1, math.MaxInt64, nil)
+	m := getMemoryMonitor(s)
 	m.Start(context.Background(), nil, mon.NewStandaloneBudget(math.MaxInt64))
 
 	b := m.MakeBoundAccount()
@@ -1390,7 +1398,7 @@ func TestBudgetReleaseOnLastStreamError(t *testing.T) {
 
 func newTestBudget(limit int64) *FeedBudget {
 	s := cluster.MakeTestingClusterSettings()
-	m := mon.NewMonitor("rangefeed", mon.MemoryResource, nil, nil, 1, math.MaxInt64, nil)
+	m := getMemoryMonitor(s)
 	m.Start(context.Background(), nil, mon.NewStandaloneBudget(limit))
 	b := m.MakeBoundAccount()
 	fb := NewFeedBudget(&b, 0, &s.SV)

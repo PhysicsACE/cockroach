@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -885,9 +886,6 @@ func (og *operationGenerator) addForeignKeyConstraint(
 	_ = rowsSatisfyConstraint
 	stmt.potentialExecErrors.add(pgcode.ForeignKeyViolation)
 	og.potentialCommitErrors.add(pgcode.ForeignKeyViolation)
-
-	// TODO why did I add this??
-	stmt.potentialExecErrors.add(pgcode.FeatureNotSupported)
 
 	// It's possible for the table to be dropped concurrently, while we are running
 	// validation. In which case a potential commit error is an undefined table
@@ -2844,10 +2842,10 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 		}
 		nonGeneratedCols = truncated
 	}
-	colNames := []string{}
+	nonGeneratedColNames := []string{}
 	rows := [][]string{}
 	for _, col := range nonGeneratedCols {
-		colNames = append(colNames, col.name)
+		nonGeneratedColNames = append(nonGeneratedColNames, col.name)
 	}
 	numRows := og.randIntn(3) + 1
 	for i := 0; i < numRows; i++ {
@@ -2883,7 +2881,7 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 	anyInvalidInserts := false
 	stmt = makeOpStmt(OpStmtDML)
 	for _, row := range rows {
-		invalidInsert, generatedErrors, potentialErrors, err := og.validateGeneratedExpressionsForInsert(ctx, tx, tableName, colNames, allColumns, row)
+		invalidInsert, generatedErrors, potentialErrors, err := og.validateGeneratedExpressionsForInsert(ctx, tx, tableName, nonGeneratedColNames, allColumns, row)
 		if err != nil {
 			return nil, err
 		}
@@ -2909,7 +2907,7 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 		// Verify if the new row will violate unique constraints by checking the constraints and
 		// existing rows in the database.
 		var generatedErrors codesWithConditions
-		uniqueConstraintViolation, generatedErrors, err = og.valuesViolateUniqueConstraints(ctx, tx, tableName, colNames, allColumns, rows)
+		uniqueConstraintViolation, generatedErrors, err = og.valuesViolateUniqueConstraints(ctx, tx, tableName, nonGeneratedColNames, allColumns, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -2918,7 +2916,7 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 		}
 		// Verify if the new row will violate fk constraints by checking the constraints and rows
 		// in the database.
-		fkViolation, err = og.violatesFkConstraints(ctx, tx, tableName, colNames, rows)
+		fkViolation, err = og.violatesFkConstraints(ctx, tx, tableName, nonGeneratedColNames, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -2942,7 +2940,7 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 	stmt.sql = fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES %s`,
 		tableName,
-		strings.Join(colNames, ","),
+		strings.Join(nonGeneratedColNames, ","),
 		strings.Join(formattedRows, ","),
 	)
 	return stmt, nil
@@ -3189,6 +3187,7 @@ type column struct {
 	nullable            bool
 	generated           bool
 	generatedExpression string
+	ordinal             int
 }
 
 func (og *operationGenerator) getTableColumns(
@@ -3208,14 +3207,16 @@ func (og *operationGenerator) getTableColumns(
                       ),
          columns AS (
                   SELECT c->>'computeExpr' AS generation_expression,
-                         c->>'name' AS column_name
+                         c->>'name' AS column_name,
+												 c->>'id' AS ordinal
                     FROM columns_json
                  )
   SELECT quote_ident(show_columns.column_name),
          show_columns.data_type,
          show_columns.is_nullable,
          columns.generation_expression IS NOT NULL AS is_generated,
-         COALESCE(columns.generation_expression, '') as generated_expression
+         COALESCE(columns.generation_expression, '') AS generated_expression,
+			   columns.ordinal::INT-1
     FROM [SHOW COLUMNS FROM %s] AS show_columns, columns
    WHERE show_columns.column_name != 'rowid'
          AND show_columns.column_name = columns.column_name
@@ -3231,7 +3232,7 @@ func (og *operationGenerator) getTableColumns(
 	for rows.Next() {
 		var c column
 		var typName string
-		err := rows.Scan(&c.name, &typName, &c.nullable, &c.generated, &c.generatedExpression)
+		err := rows.Scan(&c.name, &typName, &c.nullable, &c.generated, &c.generatedExpression, &c.ordinal)
 		if err != nil {
 			return nil, err
 		}
@@ -3833,12 +3834,7 @@ func (og *operationGenerator) createSchema(ctx context.Context, tx pgx.Tx) (*opS
 		opStmt.expectedExecErrors.add(pgcode.DuplicateSchema)
 	}
 
-	// TODO(sql-foundations): CREATE SCHEMA AUTHORIZATION is not currently
-	// support in the DSC. Either add support and re-enable it here or gate the
-	// AUTHORIZATION aspect by checking if the DSC is enabled or not. Previously,
-	// `username.RootUserName().Normalized()` was used for
-	// MakeRoleSpecWithRoleName.
-	stmt := randgen.MakeSchemaName(ifNotExists, schemaName, tree.MakeRoleSpecWithRoleName(""))
+	stmt := randgen.MakeSchemaName(ifNotExists, schemaName, tree.MakeRoleSpecWithRoleName(username.RootUserName().Normalized()))
 	opStmt.sql = tree.Serialize(stmt)
 	return opStmt, nil
 }
@@ -3908,6 +3904,14 @@ func (og *operationGenerator) createFunction(ctx context.Context, tx pgx.Tx) (*o
 	enumQuery := With([]CTE{
 		{"descriptors", descJSONQuery},
 		{"enums", enumDescsQuery},
+	}, `SELECT
+				quote_ident(schema_id::REGNAMESPACE::TEXT) || '.' || quote_ident(name) AS name,
+				COALESCE((descriptor->'state')::INT != 0, false) AS non_public
+			FROM enums
+		`)
+	enumMemberQuery := With([]CTE{
+		{"descriptors", descJSONQuery},
+		{"enums", enumDescsQuery},
 		{"enum_members", enumMemberDescsQuery},
 	}, `SELECT
 				quote_ident(schema_id::REGNAMESPACE::TEXT) || '.' || quote_ident(name) AS name,
@@ -3923,6 +3927,10 @@ func (og *operationGenerator) createFunction(ctx context.Context, tx pgx.Tx) (*o
 	if err != nil {
 		return nil, err
 	}
+	enumMembers, err := Collect(ctx, og, tx, pgx.RowToMap, enumMemberQuery)
+	if err != nil {
+		return nil, err
+	}
 	schemas, err := Collect(ctx, og, tx, pgx.RowTo[string], schemasQuery)
 	if err != nil {
 		return nil, err
@@ -3934,20 +3942,28 @@ func (og *operationGenerator) createFunction(ctx context.Context, tx pgx.Tx) (*o
 	useParamRefs := og.randIntn(2) == 0
 	useReturnRefs := og.randIntn(2) == 0
 
-	var droppingEnums []string
+	var nonPublicEnums []string
+	var droppingEnumMembers []string
 	var possibleBodyReferences []string
 	var possibleParamReferences []string
 	var possibleReturnReferences []string
 	var fnDuplicate bool
 
 	for i, enum := range enums {
-		if enum["dropping"].(bool) {
-			droppingEnums = append(droppingEnums, enum["name"].(string))
+		if enum["non_public"].(bool) {
+			nonPublicEnums = append(nonPublicEnums, enum["name"].(string))
 			continue
 		}
 		possibleReturnReferences = append(possibleReturnReferences, enum["name"].(string))
 		possibleParamReferences = append(possibleParamReferences, fmt.Sprintf(`enum_%d %s`, i, enum["name"]))
-		possibleBodyReferences = append(possibleBodyReferences, fmt.Sprintf(`(%s::%s IS NULL)`, enum["value"], enum["name"]))
+	}
+
+	for _, member := range enumMembers {
+		if member["dropping"].(bool) {
+			droppingEnumMembers = append(droppingEnumMembers, fmt.Sprintf(`%s::%s`, member["value"], member["name"]))
+			continue
+		}
+		possibleBodyReferences = append(possibleBodyReferences, fmt.Sprintf(`(%s::%s IS NULL)`, member["value"], member["name"]))
 	}
 
 	for _, table := range tables {
@@ -3963,8 +3979,11 @@ func (og *operationGenerator) createFunction(ctx context.Context, tx pgx.Tx) (*o
 		"Schema": func() (string, error) {
 			return PickOne(og.params.rng, schemas)
 		},
-		"DroppingEnum": func() (string, error) {
-			return PickOne(og.params.rng, droppingEnums)
+		"NonPublicEnum": func() (string, error) {
+			return PickOne(og.params.rng, nonPublicEnums)
+		},
+		"DroppingEnumMember": func() (string, error) {
+			return PickOne(og.params.rng, droppingEnumMembers)
 		},
 		"ParamRefs": func() (string, error) {
 			refs, err := PickBetween(og.params.rng, 1, 99, possibleParamReferences)
@@ -4002,7 +4021,9 @@ func (og *operationGenerator) createFunction(ctx context.Context, tx pgx.Tx) (*o
 		// 4. Reference a UDT that does not exist.
 		{pgcode.UndefinedObject, `CREATE FUNCTION { UniqueName } (IN p1 "ThisTypeDoesNotExist") RETURNS VOID LANGUAGE SQL AS $$ SELECT NULL $$`},
 		// 5. Reference an Enum that's in the process of being dropped
-		{pgcode.UndefinedTable, `CREATE FUNCTION { UniqueName } (IN p1 { DroppingEnum }) RETURNS VOID LANGUAGE SQL AS $$ SELECT NULL $$`},
+		{pgcode.UndefinedTable, `CREATE FUNCTION { UniqueName } (IN p1 { NonPublicEnum }) RETURNS VOID LANGUAGE SQL AS $$ SELECT NULL $$`},
+		// 6. Reference an Enum value that's in the process of being dropped
+		{pgcode.InvalidParameterValue, `CREATE FUNCTION { UniqueName } () RETURNS VOID LANGUAGE SQL AS $$ SELECT { DroppingEnumMember } $$`},
 	}, placeholderMap)
 	if err != nil {
 		return nil, err

@@ -1196,9 +1196,10 @@ func TestPartitionSpans(t *testing.T) {
 					},
 				}),
 			}
-			planCtx := dsp.NewPlanningCtxWithOracle(ctx, &extendedEvalContext{
-				Context: *evalCtx,
-			}, nil, nil, DistributionTypeSystemTenantOnly, physicalplan.DefaultReplicaChooser, locFilter)
+			planCtx := dsp.NewPlanningCtxWithOracle(
+				ctx, &extendedEvalContext{Context: *evalCtx}, nil, /* planner */
+				nil /* txn */, FullDistribution, physicalplan.DefaultReplicaChooser, locFilter,
+			)
 			planCtx.spanPartitionState.testingOverrideRandomSelection = tc.partitionState.testingOverrideRandomSelection
 			var spans []roachpb.Span
 			for _, s := range tc.spans {
@@ -1209,6 +1210,32 @@ func TestPartitionSpans(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			countRanges := func(parts []SpanPartition) (count int) {
+				for _, sp := range parts {
+					ri := tsp.NewSpanResolverIterator(nil, nil)
+					for _, s := range sp.Spans {
+						for ri.Seek(ctx, s, kvcoord.Ascending); ; ri.Next(ctx) {
+							if !ri.Valid() {
+								require.NoError(t, ri.Error())
+								break
+							}
+							count += 1
+							if !ri.NeedAnother() {
+								break
+							}
+						}
+					}
+				}
+				return
+			}
+
+			var rangeCount int
+			for _, p := range partitions {
+				n, ok := p.NumRanges()
+				require.True(t, ok)
+				rangeCount += n
+			}
+			require.Equal(t, countRanges(partitions), rangeCount)
 
 			// Assert that the PartitionState is what we expect it to be.
 			tc.partitionState.testingOverrideRandomSelection = nil
@@ -1221,7 +1248,7 @@ func TestPartitionSpans(t *testing.T) {
 			resMap := make(map[int][][2]string)
 			for _, p := range partitions {
 				if _, ok := resMap[int(p.SQLInstanceID)]; ok {
-					t.Fatalf("node %d shows up in multiple partitions", p)
+					t.Fatalf("node %d shows up in multiple partitions", p.SQLInstanceID)
 				}
 				var spans [][2]string
 				for _, s := range p.Spans {
@@ -1513,9 +1540,10 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	planCtx := dsp.NewPlanningCtx(ctx, &extendedEvalContext{
-		Context: eval.Context{Codec: keys.SystemSQLCodec},
-	}, nil, nil, DistributionTypeSystemTenantOnly)
+	planCtx := dsp.NewPlanningCtx(
+		ctx, &extendedEvalContext{Context: eval.Context{Codec: keys.SystemSQLCodec}},
+		nil /* planner */, nil /* txn */, FullDistribution,
+	)
 	partitions, err := dsp.PartitionSpans(ctx, planCtx, roachpb.Spans{span})
 	if err != nil {
 		t.Fatal(err)
@@ -1524,7 +1552,7 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	resMap := make(map[base.SQLInstanceID][][2]string)
 	for _, p := range partitions {
 		if _, ok := resMap[p.SQLInstanceID]; ok {
-			t.Fatalf("node %d shows up in multiple partitions", p)
+			t.Fatalf("node %d shows up in multiple partitions", p.SQLInstanceID)
 		}
 		var spans [][2]string
 		for _, s := range p.Spans {

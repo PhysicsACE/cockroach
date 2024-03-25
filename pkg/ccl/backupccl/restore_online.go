@@ -9,6 +9,7 @@
 package backupccl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -18,14 +19,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -77,47 +82,77 @@ func sendAddRemoteSSTs(
 		return genSpan(ctx, restoreSpanEntriesCh)
 	})
 
+	kr, err := MakeKeyRewriterFromRekeys(execCtx.ExecCfg().Codec, dataToRestore.getRekeys(), dataToRestore.getTenantRekeys(),
+		false /* restoreTenantFromStream */)
+	if err != nil {
+		return errors.Wrap(err, "creating key rewriter from rekeys")
+	}
+
 	fromSystemTenant := isFromSystemTenant(dataToRestore.getTenantRekeys())
 
 	restoreWorkers := int(onlineRestoreLinkWorkers.Get(&execCtx.ExecCfg().Settings.SV))
 	for i := 0; i < restoreWorkers; i++ {
-		grp.GoCtx(sendAddRemoteSSTWorker(execCtx, restoreSpanEntriesCh, requestFinishedCh, fromSystemTenant))
+		grp.GoCtx(sendAddRemoteSSTWorker(execCtx, restoreSpanEntriesCh, requestFinishedCh, kr, fromSystemTenant))
 	}
 
 	if err := grp.Wait(); err != nil {
 		return errors.Wrap(err, "failed to generate and send remote file spans")
 	}
+	return nil
+}
 
-	downloadSpans := dataToRestore.getSpans()
-
-	log.Infof(ctx, "creating job to track downloads in %d spans", len(downloadSpans))
-	downloadJobRecord := jobs.Record{
-		Description: fmt.Sprintf("Background Data Download for %s", job.Payload().Description),
-		Username:    job.Payload().UsernameProto.Decode(),
-		Details:     jobspb.RestoreDetails{DownloadSpans: downloadSpans},
-		Progress:    jobspb.RestoreProgress{},
+func assertCommonPrefix(span roachpb.Span, elidedPrefixType execinfrapb.ElidePrefix) error {
+	syntheticPrefix, err := elidedPrefix(span.Key, elidedPrefixType)
+	if err != nil {
+		return err
 	}
 
-	return execCtx.ExecCfg().InternalDB.DescsTxn(ctx, func(
-		ctx context.Context, txn descs.Txn,
-	) error {
-		_, err := execCtx.ExecCfg().JobRegistry.CreateJobWithTxn(ctx, downloadJobRecord, job.ID()+1, txn)
+	endKeyPrefix, err := elidedPrefix(span.EndKey, elidedPrefixType)
+	if err != nil {
 		return err
-	})
+	}
+	if !bytes.Equal(syntheticPrefix, endKeyPrefix) {
+		return errors.AssertionFailedf("span start key %s and end key %s have different prefixes", span.Key, span.EndKey)
+	}
+	return nil
+}
+
+// rewriteSpan rewrites the span start and end key, potentially in place.
+func rewriteSpan(
+	kr *KeyRewriter, span roachpb.Span, elidedPrefixType execinfrapb.ElidePrefix,
+) (roachpb.Span, error) {
+	var (
+		ok  bool
+		err error
+	)
+	if err = assertCommonPrefix(span, elidedPrefixType); err != nil {
+		return span, err
+	}
+	span.Key, ok, err = kr.RewriteKey(span.Key, 0)
+	if !ok || err != nil {
+		return span, errors.Wrapf(err, "span start key %s was not rewritten", span.Key)
+	}
+	span.EndKey, ok, err = kr.RewriteKey(span.EndKey, 0)
+	if !ok || err != nil {
+		return span, errors.Wrapf(err, "span end key %s was not rewritten ", span.Key)
+	}
+	return span, nil
 }
 
 func sendAddRemoteSSTWorker(
 	execCtx sql.JobExecContext,
 	restoreSpanEntriesCh <-chan execinfrapb.RestoreSpanEntry,
 	requestFinishedCh chan<- struct{},
+	kr *KeyRewriter,
 	fromSystemTenant bool,
 ) func(context.Context) error {
 	return func(ctx context.Context) error {
 		var toAdd []execinfrapb.RestoreFileSpec
 		var batchSize int64
+		var err error
 		const targetBatchSize = 440 << 20
 
-		flush := func(splitAt roachpb.Key) error {
+		flush := func(splitAt roachpb.Key, elidedPrefixType execinfrapb.ElidePrefix) error {
 			if len(toAdd) == 0 {
 				return nil
 			}
@@ -129,7 +164,7 @@ func sendAddRemoteSSTWorker(
 			}
 
 			for _, file := range toAdd {
-				if err := sendRemoteAddSSTable(ctx, execCtx, file, fromSystemTenant); err != nil {
+				if err := sendRemoteAddSSTable(ctx, execCtx, file, elidedPrefixType, fromSystemTenant); err != nil {
 					return err
 				}
 			}
@@ -140,6 +175,9 @@ func sendAddRemoteSSTWorker(
 
 		for entry := range restoreSpanEntriesCh {
 			firstSplitDone := false
+			if err := assertCommonPrefix(entry.Span, entry.ElidedPrefix); err != nil {
+				return err
+			}
 			for _, file := range entry.Files {
 				restoringSubspan := file.BackupFileEntrySpan.Intersect(entry.Span)
 				if !restoringSubspan.Valid() {
@@ -149,8 +187,13 @@ func sendAddRemoteSSTWorker(
 						entry.Span,
 					)
 				}
-
-				log.Infof(ctx, "experimental restore: sending span %s of file %s (file span: %s) as part of restore span %s",
+				// Clone the key because rewriteSpan could modify the keys in place, but
+				// we reuse backup files across restore span entries.
+				restoringSubspan, err = rewriteSpan(kr, restoringSubspan.Clone(), entry.ElidedPrefix)
+				if err != nil {
+					return err
+				}
+				log.Infof(ctx, "experimental restore: sending span %s of file %s (file span: %s) as part of restore span (old key space) %s",
 					restoringSubspan, file.Path, file.BackupFileEntrySpan, entry.Span)
 				file.BackupFileEntrySpan = restoringSubspan
 				if !firstSplitDone {
@@ -169,8 +212,8 @@ func sendAddRemoteSSTWorker(
 				// span rather than one we have added to, since we add with estimated
 				// stats and splitting a span with estimated stats is slow.
 				if batchSize+file.BackupFileEntryCounts.DataSize > targetBatchSize {
-					log.Infof(ctx, "flushing %s batch of %d SSTs due to size limit up to %s in in span %s", sz(batchSize), len(toAdd), file.BackupFileEntrySpan.Key, entry.Span)
-					if err := flush(file.BackupFileEntrySpan.Key); err != nil {
+					log.Infof(ctx, "flushing %s batch of %d SSTs due to size limit. split at %s in span (old keyspace) %s", sz(batchSize), len(toAdd), file.BackupFileEntrySpan.Key, entry.Span)
+					if err := flush(file.BackupFileEntrySpan.Key, entry.ElidedPrefix); err != nil {
 						return err
 					}
 				}
@@ -183,7 +226,11 @@ func sendAddRemoteSSTWorker(
 			// key to split on. Note that it only is safe with
 			// https://github.com/cockroachdb/cockroach/pull/114464
 			log.Infof(ctx, "flushing %s batch of %d SSTs at end of restore span entry %s", sz(batchSize), len(toAdd), entry.Span)
-			if err := flush(entry.Span.EndKey); err != nil {
+			rewrittenFlushKey, ok, err := kr.RewriteKey(entry.Span.EndKey, 0)
+			if !ok || err != nil {
+				return errors.Newf("flush key %s could not be rewritten", entry.Span.EndKey)
+			}
+			if err := flush(rewrittenFlushKey, entry.ElidedPrefix); err != nil {
 				return err
 			}
 			requestFinishedCh <- struct{}{}
@@ -217,6 +264,7 @@ func sendRemoteAddSSTable(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
 	file execinfrapb.RestoreFileSpec,
+	elidedPrefixType execinfrapb.ElidePrefix,
 	fromSystemTenant bool,
 ) error {
 	ctx, sp := tracing.ChildSpan(ctx, "backupccl.sendRemoteAddSSTable")
@@ -239,13 +287,11 @@ func sendRemoteAddSSTable(
 	if fileSize == 0 {
 		fileSize = 16 << 20
 	}
-
-	loc := kvpb.AddSSTableRequest_RemoteFile{
-		Locator:                 file.Dir.URI,
-		Path:                    file.Path,
-		ApproximatePhysicalSize: fileSize,
-		BackingFileSize:         file.BackingFileSize,
+	syntheticPrefix, err := elidedPrefix(file.BackupFileEntrySpan.Key, elidedPrefixType)
+	if err != nil {
+		return err
 	}
+
 	// TODO(dt): see if KV has any better ideas for making these up.
 	fileStats := &enginepb.MVCCStats{
 		ContainsEstimates: 1,
@@ -261,9 +307,18 @@ func sendRemoteAddSSTable(
 		batchTimestamp = execCtx.ExecCfg().DB.Clock().Now()
 	}
 
-	_, _, err := execCtx.ExecCfg().DB.AddRemoteSSTable(
-		ctx, file.BackupFileEntrySpan, loc, fileStats, batchTimestamp)
-	return err
+	loc := kvpb.LinkExternalSSTableRequest_ExternalFile{
+		Locator:                 file.Dir.URI,
+		Path:                    file.Path,
+		ApproximatePhysicalSize: fileSize,
+		BackingFileSize:         file.BackingFileSize,
+		SyntheticPrefix:         syntheticPrefix,
+		UseSyntheticSuffix:      batchTimestamp.IsSet(),
+		MVCCStats:               fileStats,
+	}
+
+	return execCtx.ExecCfg().DB.LinkExternalSSTable(
+		ctx, file.BackupFileEntrySpan, loc, batchTimestamp)
 }
 
 // checkManifestsForOnlineCompat returns an error if the set of
@@ -292,16 +347,35 @@ func checkManifestsForOnlineCompat(ctx context.Context, manifests []backuppb.Bac
 	return nil
 }
 
-// checkRewritesAreNoops returns an error if any of the rewrites in
-// the rewrite map actually require key rewriting. We currently don't
-// rewrite keys, so this would be a problem.
-func checkRewritesAreNoops(rewrites jobspb.DescRewriteMap) error {
-	for oldID, rw := range rewrites {
-		if rw.ID != oldID {
-			return pgerror.Newf(pgcode.FeatureNotSupported, "experimental online restore: descriptor rewrites not supported but required (%d -> %d)", oldID, rw.ID)
+// checkBackupElidedPrefixForOnlineCompat ensures the backup is online
+// restorable depending on the kind of elided prefix in the backup. If no
+// prefixes were stripped in the backup, the restore cannot rewrite table
+// descriptors.
+func checkBackupElidedPrefixForOnlineCompat(
+	ctx context.Context, manifests []backuppb.BackupManifest, rewrites jobspb.DescRewriteMap,
+) error {
+	elidePrefix := manifests[0].ElidedPrefix
+
+	for _, manifest := range manifests {
+		if manifest.ElidedPrefix != elidePrefix {
+			return errors.AssertionFailedf("incremental backup elided prefix is not the same as full backup")
 		}
 	}
-	return nil
+	switch elidePrefix {
+	case execinfrapb.ElidePrefix_TenantAndTable:
+		return nil
+	case execinfrapb.ElidePrefix_Tenant:
+		return errors.AssertionFailedf("online restore disallowed for restores of tenants. previous check failed.")
+	case execinfrapb.ElidePrefix_None:
+		for oldID, rw := range rewrites {
+			if rw.ID != oldID {
+				return pgerror.Newf(pgcode.FeatureNotSupported, "experimental online restore: descriptor rewrites not supported but required (%d -> %d) on backup without stripped table prefixes", oldID, rw.ID)
+			}
+		}
+		return nil
+	default:
+		return errors.AssertionFailedf("unexpected elided prefix value")
+	}
 }
 
 func (r *restoreResumer) maybeCalculateTotalDownloadSpans(
@@ -399,6 +473,40 @@ func sendDownloadSpan(ctx context.Context, execCtx sql.JobExecContext, spans roa
 		return errors.Newf("failed to download spans on %d nodes; n%d returned %v", len(resp.ErrorsByNodeID), n, err)
 	}
 	return nil
+}
+
+func (r *restoreResumer) maybeWriteDownloadJob(
+	ctx context.Context,
+	execConfig *sql.ExecutorConfig,
+	preRestoreData *restorationDataBase,
+	mainRestoreData *mainRestorationData,
+) error {
+	details := r.job.Details().(jobspb.RestoreDetails)
+	if !details.ExperimentalOnline {
+		return nil
+	}
+
+	downloadSpans := mainRestoreData.getSpans()
+	if !preRestoreData.isEmpty() {
+		// Order the pre restore data first so they are downloaded first.
+		downloadSpans = preRestoreData.getSpans()
+		downloadSpans = append(downloadSpans, mainRestoreData.getSpans()...)
+	}
+
+	log.Infof(ctx, "creating job to track downloads in %d spans", len(downloadSpans))
+	downloadJobRecord := jobs.Record{
+		Description: fmt.Sprintf("Background Data Download for %s", r.job.Payload().Description),
+		Username:    r.job.Payload().UsernameProto.Decode(),
+		Details:     jobspb.RestoreDetails{DownloadSpans: downloadSpans, PostDownloadTableAutoStatsSettings: details.PostDownloadTableAutoStatsSettings},
+		Progress:    jobspb.RestoreProgress{},
+	}
+
+	return execConfig.InternalDB.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
+	) error {
+		_, err := execConfig.JobRegistry.CreateJobWithTxn(ctx, downloadJobRecord, r.job.ID()+1, txn)
+		return err
+	})
 }
 
 // waitForDownloadToComplete waits until there are no more ExternalFileBytes
@@ -519,14 +627,52 @@ func (r *restoreResumer) cleanupAfterDownload(
 	ctx, sp := tracing.ChildSpan(ctx, "backupccl.cleanupAfterDownload")
 	defer sp.Finish()
 
-	executor := r.execCfg.InternalDB.Executor()
-
-	// Re-enable automatic stats collection on restored tables.
-	for _, table := range details.TableDescs {
-		_, err := executor.Exec(ctx, "enable-stats", nil, `ALTER TABLE $1 SET (sql_stats_automatic_collection_enabled = true);`, table.Name)
-		if err != nil {
-			log.Warningf(ctx, "could not enable automatic stats on table %s", table)
+	// Try to restore automatic stats collection preference on each restored
+	// table.
+	for id, settings := range details.PostDownloadTableAutoStatsSettings {
+		if err := sql.DescsTxn(ctx, r.execCfg, func(
+			ctx context.Context, txn isql.Txn, descsCol *descs.Collection,
+		) error {
+			b := txn.KV().NewBatch()
+			newTableDesc, err := descsCol.MutableByID(txn.KV()).Table(ctx, catid.DescID(id))
+			if err != nil {
+				return err
+			}
+			newTableDesc.AutoStatsSettings = settings
+			if err := descsCol.WriteDescToBatch(
+				ctx, false /* kvTrace */, newTableDesc, b); err != nil {
+				return err
+			}
+			if err := txn.KV().Run(ctx, b); err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+			// Re-enabling stats is best effort. The user may have dropped the table
+			// since it came online.
+			log.Warningf(ctx, "failed to re-enable auto stats on table %d", id)
 		}
 	}
 	return nil
+}
+
+func createImportRollbackJob(
+	ctx context.Context,
+	jr *jobs.Registry,
+	txn isql.Txn,
+	username username.SQLUsername,
+	tableDesc *tabledesc.Mutable,
+) error {
+	jobRecord := jobs.Record{
+		Description:   fmt.Sprintf("ROLLBACK IMPORT INTO %s", tableDesc.GetName()),
+		Username:      username,
+		NonCancelable: true,
+		DescriptorIDs: descpb.IDs{tableDesc.GetID()},
+		Details: jobspb.ImportRollbackDetails{
+			TableID: tableDesc.GetID(),
+		},
+		Progress: jobspb.ImportRollbackProgress{},
+	}
+	_, err := jr.CreateJobWithTxn(ctx, jobRecord, jr.MakeJobID(), txn)
+	return err
 }

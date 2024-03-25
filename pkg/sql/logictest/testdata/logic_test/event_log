@@ -701,15 +701,16 @@ CREATE USER u
 statement ok
 CREATE SCHEMA AUTHORIZATION u
 
+skipif config local-mixed-23.1
 query IT
 SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID'
 FROM system.eventlog
 WHERE "eventType" = 'create_schema'
 ORDER BY "timestamp", info
 ----
-1  {"EventType": "create_schema", "Owner": "root", "SchemaName": "test.sc", "Statement": "CREATE SCHEMA \"\".sc", "Tag": "CREATE SCHEMA", "User": "root"}
-1  {"EventType": "create_schema", "Owner": "root", "SchemaName": "test.s", "Statement": "CREATE SCHEMA \"\".s", "Tag": "CREATE SCHEMA", "User": "root"}
-1  {"EventType": "create_schema", "Owner": "u", "SchemaName": "test.u", "Statement": "CREATE SCHEMA AUTHORIZATION u", "Tag": "CREATE SCHEMA", "User": "root"}
+1  {"EventType": "create_schema", "Owner": "root", "SchemaName": "test.sc", "Statement": "CREATE SCHEMA test.sc", "Tag": "CREATE SCHEMA", "User": "root"}
+1  {"EventType": "create_schema", "Owner": "root", "SchemaName": "test.s", "Statement": "CREATE SCHEMA test.s", "Tag": "CREATE SCHEMA", "User": "root"}
+1  {"EventType": "create_schema", "Owner": "u", "SchemaName": "test.u", "Statement": "CREATE SCHEMA test.u AUTHORIZATION u", "Tag": "CREATE SCHEMA", "User": "root"}
 
 statement ok
 ALTER SCHEMA u RENAME TO t
@@ -1136,4 +1137,23 @@ ORDER BY "timestamp" DESC, info
 LIMIT 2
 ----
 drop_function    {"EventType": "drop_function", "FunctionName": "defaultdb.public.f", "Statement": "DROP FUNCTION \"\".\"\".f", "Tag": "DROP FUNCTION", "User": "root"}
-create_function  {"EventType": "create_function", "FunctionName": "defaultdb.public.f", "Statement": "CREATE FUNCTION defaultdb.public.f(IN input INT8)\n\tRETURNS INT8\n\tSTABLE\n\tLANGUAGE SQL\n\tAS $$SELECT 123;$$", "Tag": "CREATE FUNCTION", "User": "root"}
+create_function  {"EventType": "create_function", "FunctionName": "defaultdb.public.f", "Statement": "CREATE FUNCTION defaultdb.public.f(input INT8)\n\tRETURNS INT8\n\tSTABLE\n\tLANGUAGE SQL\n\tAS $$SELECT 123;$$", "Tag": "CREATE FUNCTION", "User": "root"}
+
+subtest event_logs_not_on_explain
+
+statement ok
+CREATE TABLE t1(n int);
+
+statement ok
+EXPLAIN (DDL) ALTER TABLE t1 ADD COLUMN j int;
+
+query IT
+SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' FROM system.eventlog
+WHERE "eventType" = 'alter_table'
+AND info::JSONB->>'Statement' LIKE 'ALTER TABLE t1%'
+ORDER BY "timestamp" DESC, info
+----
+
+
+statement ok
+DROP table t1;

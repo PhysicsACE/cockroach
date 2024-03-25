@@ -12,7 +12,6 @@ package sql
 
 import (
 	"context"
-	"math"
 	"strings"
 	"sync"
 	"time"
@@ -180,15 +179,12 @@ func MakeInternalExecutor(
 func MakeInternalExecutorMemMonitor(
 	memMetrics MemoryMetrics, settings *cluster.Settings,
 ) *mon.BytesMonitor {
-	return mon.NewMonitor(
-		"internal SQL executor",
-		mon.MemoryResource,
-		memMetrics.CurBytesCount,
-		memMetrics.MaxBytesHist,
-		-1,            /* use default increment */
-		math.MaxInt64, /* noteworthy */
-		settings,
-	)
+	return mon.NewMonitor(mon.Options{
+		Name:     "internal SQL executor",
+		CurCount: memMetrics.CurBytesCount,
+		MaxHist:  memMetrics.MaxBytesHist,
+		Settings: settings,
+	})
 }
 
 // SetSessionData binds the session variables that will be used by queries
@@ -389,9 +385,11 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 	if txn.Type() == kv.LeafTxn {
 		// If the txn is a leaf txn it is not allowed to perform mutations. For
 		// sanity, set read only on the session.
-		ex.dataMutatorIterator.applyOnEachMutator(func(m sessionDataMutator) {
-			m.SetReadOnly(true)
-		})
+		if err := ex.dataMutatorIterator.applyOnEachMutatorError(func(m sessionDataMutator) error {
+			return m.SetReadOnly(true)
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	// The new transaction stuff below requires active monitors and traces, so
@@ -862,6 +860,17 @@ func applyOverrides(o sessiondata.InternalExecutorOverride, sd *sessiondata.Sess
 	if o.OptimizerUseHistograms {
 		sd.OptimizerUseHistograms = true
 	}
+
+	if o.MultiOverride != "" {
+		overrides := strings.Split(o.MultiOverride, ",")
+		for _, override := range overrides {
+			parts := strings.Split(override, "=")
+			if len(parts) == 2 {
+				sd.Update(parts[0], parts[1])
+			}
+		}
+	}
+	// Add any new overrides above the MultiOverride.
 }
 
 func (ie *InternalExecutor) maybeNodeSessionDataOverride(

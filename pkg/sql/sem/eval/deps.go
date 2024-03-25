@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -232,6 +231,13 @@ type Planner interface {
 	RoutineExprGenerator(
 		ctx context.Context, expr *tree.RoutineExpr, args tree.Datums,
 	) ValueGenerator
+
+	// EvalTxnControlExpr produces the side effects of a COMMIT or ROLLBACK
+	// statement within a PL/pgSQL stored procedure. See the sql.planner
+	// implementation for details.
+	EvalTxnControlExpr(
+		ctx context.Context, expr *tree.TxnControlExpr, args tree.Datums,
+	) (tree.Datum, error)
 
 	// GenerateTestObjects is used to generate a large number of
 	// objets quickly.
@@ -501,13 +507,6 @@ type SessionAccessor interface {
 	// HasGlobalPrivilegeOrRoleOption checks if the current user has the
 	// given global privilege, or the equivalent role option if one exists.
 	HasGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) (bool, error)
-
-	// HasAdminRole returns true iff the current session user has the admin role.
-	HasAdminRole(ctx context.Context) (bool, error)
-
-	// HasRoleOption returns nil iff the current session user has the specified
-	// role option.
-	HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error)
 
 	// CheckPrivilege verifies that the current user has `privilege` on `descriptor`.
 	CheckPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind) error

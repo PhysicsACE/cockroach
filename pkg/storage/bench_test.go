@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
@@ -214,6 +215,25 @@ func BenchmarkMVCCExportToSST(b *testing.B) {
 				numRangeKeys:        numRangeKey,
 				exportAllRevisions:  exportAllRevisionVal,
 				useElasticCPUHandle: useElasticCPUHandle,
+			}
+			runMVCCExportToSST(b, opts)
+		})
+	}
+	withImportEpochs := []bool{false, true}
+	for _, ie := range withImportEpochs {
+		numKey := numKeys[len(numKeys)-1]
+		numRevision := numRevisions[len(numRevisions)-1]
+		numRangeKey := numRangeKeys[len(numRangeKeys)-1]
+		exportAllRevisionVal := exportAllRevisions[len(exportAllRevisions)-1]
+		b.Run(fmt.Sprintf("importEpochs=%t/numKeys=%d/numRevisions=%d/exportAllRevisions=%t",
+			ie, numKey, numRevision, exportAllRevisionVal,
+		), func(b *testing.B) {
+			opts := mvccExportToSSTOpts{
+				numKeys:            numKey,
+				numRevisions:       numRevision,
+				numRangeKeys:       numRangeKey,
+				exportAllRevisions: exportAllRevisionVal,
+				importEpochs:       ie,
 			}
 			runMVCCExportToSST(b, opts)
 		})
@@ -678,7 +698,7 @@ func loadTestData(dir string, numKeys, numBatches, batchTimeSpan, valueBytes int
 
 	eng, err := Open(
 		context.Background(),
-		Filesystem(dir),
+		fs.MustInitPhysicalTestingEnv(dir),
 		cluster.MakeTestingClusterSettings())
 	if err != nil {
 		return nil, err
@@ -1678,8 +1698,8 @@ func runMVCCAcquireLockCommon(
 }
 
 type mvccExportToSSTOpts struct {
-	numKeys, numRevisions, numRangeKeys     int
-	exportAllRevisions, useElasticCPUHandle bool
+	numKeys, numRevisions, numRangeKeys                   int
+	importEpochs, exportAllRevisions, useElasticCPUHandle bool
 
 	// percentage specifies the share of the dataset to export. 100 will be a full
 	// export, disabling the TBI optimization. <100 will be an incremental export
@@ -1741,6 +1761,9 @@ func runMVCCExportToSST(b *testing.B, opts mvccExportToSSTOpts) {
 		for j := 0; j < opts.numRevisions; j++ {
 			mvccKey := MVCCKey{Key: key, Timestamp: hlc.Timestamp{WallTime: mkWall(j), Logical: 0}}
 			mvccValue := MVCCValue{Value: roachpb.MakeValueFromString("foobar")}
+			if opts.importEpochs {
+				mvccValue.ImportEpoch = 1
+			}
 			err := batch.PutMVCC(mvccKey, mvccValue)
 			if err != nil {
 				b.Fatal(err)
@@ -1792,14 +1815,15 @@ func runMVCCExportToSST(b *testing.B, opts mvccExportToSSTOpts) {
 		startTS := hlc.Timestamp{WallTime: startWall}
 		endTS := hlc.Timestamp{WallTime: endWall}
 		_, _, err := MVCCExportToSST(ctx, st, engine, MVCCExportOptions{
-			StartKey:           MVCCKey{Key: keys.LocalMax},
-			EndKey:             roachpb.KeyMax,
-			StartTS:            startTS,
-			EndTS:              endTS,
-			ExportAllRevisions: opts.exportAllRevisions,
-			TargetSize:         0,
-			MaxSize:            0,
-			StopMidKey:         false,
+			StartKey:               MVCCKey{Key: keys.LocalMax},
+			EndKey:                 roachpb.KeyMax,
+			StartTS:                startTS,
+			EndTS:                  endTS,
+			ExportAllRevisions:     opts.exportAllRevisions,
+			TargetSize:             0,
+			MaxSize:                0,
+			StopMidKey:             false,
+			IncludeMVCCValueHeader: opts.importEpochs,
 		}, &buf)
 		if err != nil {
 			b.Fatal(err)
@@ -2092,7 +2116,7 @@ func BenchmarkMVCCScannerWithIntentsAndVersions(b *testing.B) {
 			return cmp < 0
 		})
 		sstFileName := fmt.Sprintf("tmp-ingest-%d", i)
-		sstFile, err := eng.Create(sstFileName)
+		sstFile, err := eng.Env().Create(sstFileName)
 		require.NoError(b, err)
 		// No improvement with v3 since the multiple versions are in different
 		// files.

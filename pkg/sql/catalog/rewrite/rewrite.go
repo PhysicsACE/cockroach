@@ -710,6 +710,11 @@ func SchemaDescs(schemas []*schemadesc.Mutable, descriptorRewrites jobspb.DescRe
 				if err := rewriteIDsInTypesT(sig.ReturnType, descriptorRewrites); err != nil {
 					return err
 				}
+				for _, typ := range sig.OutParamTypes {
+					if err := rewriteIDsInTypesT(typ, descriptorRewrites); err != nil {
+						return err
+					}
+				}
 				newSigs = append(newSigs, *sig)
 			}
 			if len(newSigs) > 0 {
@@ -1061,6 +1066,16 @@ func FunctionDescs(
 				return errors.AssertionFailedf(
 					"cannot restore function %q because referenced type %d was not found",
 					fnDesc.Name, typID)
+			}
+		}
+
+		for i, funcID := range fnDesc.DependsOnFunctions {
+			if funcRewrite, ok := descriptorRewrites[funcID]; ok {
+				fnDesc.DependsOnFunctions[i] = funcRewrite.ID
+			} else {
+				return errors.AssertionFailedf(
+					"cannot restore function %q because referenced function %d was not found",
+					fnDesc.Name, funcID)
 			}
 		}
 

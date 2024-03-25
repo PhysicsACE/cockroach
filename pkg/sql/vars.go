@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -404,6 +405,7 @@ var varGen = map[string]sessionVar{
 		Set: func(ctx context.Context, m sessionDataMutator, s string) error {
 			allowReadCommitted := allowReadCommittedIsolation.Get(&m.settings.SV)
 			allowSnapshot := allowSnapshotIsolation.Get(&m.settings.SV)
+			hasLicense := base.CCLDistributionAndEnterpriseEnabled(m.settings)
 			var allowedValues = []string{"serializable"}
 			if allowSnapshot {
 				allowedValues = append(allowedValues, "snapshot")
@@ -414,6 +416,7 @@ var varGen = map[string]sessionVar{
 			level, ok := tree.IsolationLevelMap[strings.ToLower(s)]
 			originalLevel := level
 			upgraded := false
+			upgradedDueToLicense := false
 			if !ok {
 				return newVarValueError(`default_transaction_isolation`, s, allowedValues...)
 			}
@@ -423,27 +426,30 @@ var varGen = map[string]sessionVar{
 				fallthrough
 			case tree.ReadCommittedIsolation:
 				level = tree.SerializableIsolation
-				if allowReadCommitted {
+				if allowReadCommitted && hasLicense {
 					level = tree.ReadCommittedIsolation
 				} else {
 					upgraded = true
+					if allowReadCommitted && !hasLicense {
+						upgradedDueToLicense = true
+					}
 				}
 			case tree.RepeatableReadIsolation:
 				upgraded = true
 				fallthrough
 			case tree.SnapshotIsolation:
 				level = tree.SerializableIsolation
-				if allowSnapshot {
+				if allowSnapshot && hasLicense {
 					level = tree.SnapshotIsolation
 				} else {
 					upgraded = true
+					if allowSnapshot && !hasLicense {
+						upgradedDueToLicense = true
+					}
 				}
 			}
-			if upgraded {
-				if f := m.upgradedIsolationLevel; f != nil {
-					f()
-				}
-				telemetry.Inc(sqltelemetry.IsolationLevelUpgradedCounter(ctx, originalLevel))
+			if f := m.upgradedIsolationLevel; upgraded && f != nil {
+				f(ctx, originalLevel, upgradedDueToLicense)
 			}
 			m.SetDefaultTransactionIsolationLevel(level)
 			return nil
@@ -1623,8 +1629,7 @@ var varGen = map[string]sessionVar{
 			if err != nil {
 				return err
 			}
-			m.SetReadOnly(b)
-			return nil
+			return m.SetReadOnly(b)
 		},
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.TxnReadOnly), nil
@@ -3204,7 +3209,7 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
-	// CockroachDB extension.
+	// CockroachDB extension (oracle compatibility).
 	`close_cursors_at_commit`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`close_cursors_at_commit`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
@@ -3217,6 +3222,40 @@ var varGen = map[string]sessionVar{
 		},
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().CloseCursorsAtCommit), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension (oracle compatibility).
+	`plpgsql_use_strict_into`: {
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().PLpgSQLUseStrictInto), nil
+		},
+		GetStringVal: makePostgresBoolGetStringValFn("plpgsql_use_strict_into"),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("plpgsql_use_strict_into", s)
+			if err != nil {
+				return err
+			}
+			m.SetPLpgSQLUseStrictInto(b)
+			return nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`optimizer_use_virtual_computed_column_stats`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_virtual_computed_column_stats`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_virtual_computed_column_stats", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseVirtualComputedColumnStats(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseVirtualComputedColumnStats), nil
 		},
 		GlobalDefault: globalTrue,
 	},

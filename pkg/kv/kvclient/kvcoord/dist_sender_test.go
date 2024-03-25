@@ -1050,6 +1050,8 @@ func TestNoBackoffOnNotLeaseHolderErrorWithoutLease(t *testing.T) {
 
 	// Lease starts on n1.
 	rangeDesc := testUserRangeDescriptor3Replicas
+	rangeDescUpdate := rangeDesc
+	rangeDescUpdate.Generation += 1
 	replicas := rangeDesc.InternalReplicas
 	lease := roachpb.Lease{
 		Replica:  replicas[0],
@@ -1063,9 +1065,7 @@ func TestNoBackoffOnNotLeaseHolderErrorWithoutLease(t *testing.T) {
 		sentTo = append(sentTo, ba.Replica.NodeID)
 		br := ba.CreateReply()
 		if ba.Replica != replicas[2] {
-			br.Error = kvpb.NewError(&kvpb.NotLeaseHolderError{
-				Replica: ba.Replica,
-			})
+			br.Error = kvpb.NewError(kvpb.NewNotLeaseHolderError(roachpb.Lease{}, ba.Replica.StoreID, &rangeDescUpdate, "test NLHE"))
 		}
 		return br, nil
 	}
@@ -1096,12 +1096,18 @@ func TestNoBackoffOnNotLeaseHolderErrorWithoutLease(t *testing.T) {
 		Lease: lease,
 	})
 
+	key := roachpb.Key("a")
 	// Send a request. It should try all three replicas once: the first two fail
 	// with NLHE, the third one succeeds. None of them should trigger backoffs.
-	_, pErr := kv.SendWrapped(ctx, ds, kvpb.NewGet(roachpb.Key("a")))
+	_, pErr := kv.SendWrapped(ctx, ds, kvpb.NewGet(key))
 	require.NoError(t, pErr.GoError())
 	require.Equal(t, []roachpb.NodeID{1, 2, 3}, sentTo)
 	require.Equal(t, int64(0), ds.Metrics().InLeaseTransferBackoffs.Count())
+	// Verify the range cache still has the previous lease and the new descriptor.
+	ri, err := ds.rangeCache.Lookup(ctx, roachpb.RKey(key))
+	require.NoError(t, err)
+	require.Equal(t, lease, ri.Lease)
+	require.Equal(t, rangeDescUpdate, ri.Desc)
 }
 
 // Test a scenario where a lease indicates a replica that, when contacted,
@@ -1347,12 +1353,11 @@ func TestDistSenderRetryOnTransportErrors(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	for _, spec := range []struct {
-		errorCode   codes.Code
-		shouldRetry bool
+		errorCode codes.Code
 	}{
-		{codes.FailedPrecondition, true},
-		{codes.PermissionDenied, false},
-		{codes.Unauthenticated, false},
+		{codes.FailedPrecondition},
+		{codes.PermissionDenied},
+		{codes.Unauthenticated},
 	} {
 		t.Run(fmt.Sprintf("retry_after_%v", spec.errorCode), func(t *testing.T) {
 			clock := hlc.NewClockForTesting(nil)
@@ -1418,13 +1423,8 @@ func TestDistSenderRetryOnTransportErrors(t *testing.T) {
 
 			get := kvpb.NewGet(roachpb.Key("a"))
 			_, pErr := kv.SendWrapped(ctx, ds, get)
-			if spec.shouldRetry {
-				require.True(t, secondReplicaTried, "Second replica was not retried")
-				require.Nil(t, pErr, "Call should not fail")
-			} else {
-				require.False(t, secondReplicaTried, "DistSender did not abort retry loop")
-				require.NotNil(t, pErr, "Call should fail")
-			}
+			require.True(t, secondReplicaTried, "Second replica was not retried")
+			require.Nil(t, pErr, "Call should not fail")
 		})
 	}
 }
@@ -5683,21 +5683,32 @@ func TestDistSenderDescEvictionAfterLeaseUpdate(t *testing.T) {
 
 	// We'll send a request that first gets a NLHE, and then a RangeNotFoundError. We
 	// then expect an updated descriptor to be used and return success.
+	// Initially the routing is (*1, 2,) - no LH
+	// 1) Send to n1 -> NLHE with LH=2 (updated - reset), transport -> (*2, 1,) - LH=2
+	// 2) Send to n2 -> not found, transport -> (2, *1,) - LH=2
+	// 3) Send to n1 -> NLHE with LH=2 (not updated - backoff), transport -> (1, *2,) - LH=2
+	// 4) Send to n2 -> not found, transport -> (1, 2, *) - LH=2
+	// Evict/Refresh transport is now (*3) - no LH
+	// 5) Send to n3 - success
 	call := 0
 	var transportFn = func(_ context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
 		br := &kvpb.BatchResponse{}
 		switch call {
-		case 0:
+		case 0, 2:
 			expRepl := desc1.Replicas().Descriptors()[0]
 			require.Equal(t, expRepl, ba.Replica)
-			br.Error = kvpb.NewError(&kvpb.NotLeaseHolderError{
-				Lease: &roachpb.Lease{Replica: desc1.Replicas().Descriptors()[1]},
-			})
-		case 1:
+			br.Error = kvpb.NewError(
+				kvpb.NewNotLeaseHolderError(
+					roachpb.Lease{Replica: desc1.Replicas().Descriptors()[1]},
+					1,
+					&desc1,
+					"store not leaseholder",
+				))
+		case 1, 3:
 			expRep := desc1.Replicas().Descriptors()[1]
 			require.Equal(t, ba.Replica, expRep)
 			br.Error = kvpb.NewError(kvpb.NewRangeNotFoundError(ba.RangeID, ba.Replica.StoreID))
-		case 2:
+		case 4:
 			expRep := desc2.Replicas().Descriptors()[0]
 			require.Equal(t, ba.Replica, expRep)
 			br = ba.CreateReply()
@@ -5745,7 +5756,7 @@ func TestDistSenderDescEvictionAfterLeaseUpdate(t *testing.T) {
 
 	_, err := ds.Send(ctx, ba)
 	require.NoError(t, err.GoError())
-	require.Equal(t, call, 3)
+	require.Equal(t, call, 5)
 	require.Equal(t, rangeLookups, 2)
 }
 

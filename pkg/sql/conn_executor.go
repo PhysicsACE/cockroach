@@ -22,6 +22,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -48,10 +49,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
@@ -72,7 +75,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxlog"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -138,11 +140,6 @@ var maxNumNonRootConnectionsReason = settings.RegisterStringSetting(
 		"server.cockroach_cloud.max_client_connections_per_gateway",
 	"cluster connections are limited",
 )
-
-// noteworthyMemoryUsageBytes is the minimum size tracked by a
-// transaction or session monitor before the monitor starts explicitly
-// logging overall usage growth in the log.
-var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_SESSION_MEMORY_USAGE", 1024*1024)
 
 // A connExecutor is in charge of executing queries received on a given client
 // connection. The connExecutor implements a state machine (dictated by the
@@ -487,13 +484,15 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		DB: NewInternalDB(
 			s, MemoryMetrics{}, sqlStatsInternalExecutorMonitor,
 		),
-		ClusterID:      s.cfg.NodeInfo.LogicalClusterID,
-		SQLIDContainer: cfg.NodeInfo.NodeID,
-		JobRegistry:    s.cfg.JobRegistry,
-		Knobs:          cfg.SQLStatsTestingKnobs,
-		FlushCounter:   serverMetrics.StatsMetrics.SQLStatsFlushStarted,
-		FailureCounter: serverMetrics.StatsMetrics.SQLStatsFlushFailure,
-		FlushDuration:  serverMetrics.StatsMetrics.SQLStatsFlushDuration,
+		ClusterID:               s.cfg.NodeInfo.LogicalClusterID,
+		SQLIDContainer:          cfg.NodeInfo.NodeID,
+		JobRegistry:             s.cfg.JobRegistry,
+		Knobs:                   cfg.SQLStatsTestingKnobs,
+		FlushesSuccessful:       serverMetrics.StatsMetrics.SQLStatsFlushesSuccessful,
+		FlushDoneSignalsIgnored: serverMetrics.StatsMetrics.SQLStatsFlushDoneSignalsIgnored,
+		FlushedFingerprintCount: serverMetrics.StatsMetrics.SQLStatsFlushFingerprintCount,
+		FlushesFailed:           serverMetrics.StatsMetrics.SQLStatsFlushesFailed,
+		FlushLatency:            serverMetrics.StatsMetrics.SQLStatsFlushLatency,
 	}, memSQLStats)
 
 	s.sqlStats = persistedSQLStats
@@ -590,11 +589,14 @@ func makeServerMetrics(cfg *ExecutorConfig) ServerMetrics {
 			}),
 			ReportedSQLStatsMemoryCurBytesCount: metric.NewGauge(MetaReportedSQLStatsMemCurBytes),
 			DiscardedStatsCount:                 metric.NewCounter(MetaDiscardedSQLStats),
-			SQLStatsFlushStarted:                metric.NewCounter(MetaSQLStatsFlushStarted),
-			SQLStatsFlushFailure:                metric.NewCounter(MetaSQLStatsFlushFailure),
-			SQLStatsFlushDuration: metric.NewHistogram(metric.HistogramOptions{
+			SQLStatsFlushesSuccessful:           metric.NewCounter(MetaSQLStatsFlushesSuccessful),
+			SQLStatsFlushDoneSignalsIgnored:     metric.NewCounter(MetaSQLStatsFlushDoneSignalsIgnored),
+			SQLStatsFlushFingerprintCount:       metric.NewCounter(MetaSQLStatsFlushFingerprintCount),
+
+			SQLStatsFlushesFailed: metric.NewCounter(MetaSQLStatsFlushesFailed),
+			SQLStatsFlushLatency: metric.NewHistogram(metric.HistogramOptions{
 				Mode:         metric.HistogramModePreferHdrLatency,
-				Metadata:     MetaSQLStatsFlushDuration,
+				Metadata:     MetaSQLStatsFlushLatency,
 				Duration:     6 * metricsSampleInterval,
 				BucketConfig: metric.IOLatencyBuckets,
 			}),
@@ -1030,35 +1032,33 @@ func (s *Server) newConnExecutor(
 ) *connExecutor {
 	// Create the various monitors.
 	// The session monitors are started in activate().
-	sessionRootMon := mon.NewMonitor(
-		"session root",
-		mon.MemoryResource,
-		memMetrics.CurBytesCount,
-		memMetrics.MaxBytesHist,
-		-1 /* increment */, math.MaxInt64, s.cfg.Settings,
-	)
-	sessionMon := mon.NewMonitor(
-		"session",
-		mon.MemoryResource,
-		memMetrics.SessionCurBytesCount,
-		memMetrics.SessionMaxBytesHist,
-		-1 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
-	)
-	sessionPreparedMon := mon.NewMonitor(
-		"session prepared statements",
-		mon.MemoryResource,
-		memMetrics.SessionPreparedCurBytesCount,
-		memMetrics.SessionPreparedMaxBytesHist,
-		1024 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
-	)
+	sessionRootMon := mon.NewMonitor(mon.Options{
+		Name:     "session root",
+		CurCount: memMetrics.CurBytesCount,
+		MaxHist:  memMetrics.MaxBytesHist,
+		Settings: s.cfg.Settings,
+	})
+	sessionMon := mon.NewMonitor(mon.Options{
+		Name:     "session",
+		CurCount: memMetrics.SessionCurBytesCount,
+		MaxHist:  memMetrics.SessionMaxBytesHist,
+		Settings: s.cfg.Settings,
+	})
+	sessionPreparedMon := mon.NewMonitor(mon.Options{
+		Name:      "session prepared statements",
+		CurCount:  memMetrics.SessionPreparedCurBytesCount,
+		MaxHist:   memMetrics.SessionPreparedMaxBytesHist,
+		Increment: 1024,
+		Settings:  s.cfg.Settings,
+	})
 	// The txn monitor is started in txnState.resetForNewSQLTxn().
-	txnMon := mon.NewMonitor(
-		"txn",
-		mon.MemoryResource,
-		memMetrics.TxnCurBytesCount,
-		memMetrics.TxnMaxBytesHist,
-		-1 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
-	)
+	txnMon := mon.NewMonitor(mon.Options{
+		Name:     "txn",
+		CurCount: memMetrics.TxnCurBytesCount,
+		MaxHist:  memMetrics.TxnMaxBytesHist,
+		Settings: s.cfg.Settings,
+	})
+	txnFingerprintIDCacheAcc := sessionMon.MakeBoundAccount()
 
 	nodeIDOrZero, _ := s.cfg.NodeInfo.NodeID.OptionalNodeID()
 	ex := &connExecutor{
@@ -1100,21 +1100,43 @@ func (s *Server) newConnExecutor(
 		indexUsageStats:           s.indexUsageStats,
 		txnIDCacheWriter:          s.txnIDCache,
 		totalActiveTimeStopWatch:  timeutil.NewStopWatch(),
-		txnFingerprintIDCache:     NewTxnFingerprintIDCache(s.cfg.Settings, sessionRootMon),
+		txnFingerprintIDCache:     NewTxnFingerprintIDCache(ctx, s.cfg.Settings, &txnFingerprintIDCacheAcc),
+		txnFingerprintIDAcc:       &txnFingerprintIDCacheAcc,
 	}
 
 	ex.state.txnAbortCount = ex.metrics.EngineMetrics.TxnAbortCount
 
 	// The transaction_read_only variable is special; its updates need to be
 	// hooked-up to the executor.
-	ex.dataMutatorIterator.setCurTxnReadOnly = func(val bool) {
-		ex.state.readOnly.Swap(val)
+	ex.dataMutatorIterator.setCurTxnReadOnly = func(readOnly bool) error {
+		mode := tree.ReadWrite
+		if readOnly {
+			mode = tree.ReadOnly
+		}
+		return ex.state.setReadOnlyMode(mode)
 	}
 	ex.dataMutatorIterator.onTempSchemaCreation = func() {
 		ex.hasCreatedTemporarySchema = true
 	}
-	ex.dataMutatorIterator.upgradedIsolationLevel = func() {
+
+	ex.dataMutatorIterator.upgradedIsolationLevel = func(
+		ctx context.Context, upgradedFrom tree.IsolationLevel, requiresNotice bool,
+	) {
+		telemetry.Inc(sqltelemetry.IsolationLevelUpgradedCounter(ctx, upgradedFrom))
 		ex.metrics.ExecutedStatementCounters.TxnUpgradedCount.Inc(1)
+		if requiresNotice {
+			const msgFmt = "%s isolation level is not allowed without an enterprise license; upgrading to SERIALIZABLE"
+			displayLevel := upgradedFrom
+			if upgradedFrom == tree.ReadUncommittedIsolation {
+				displayLevel = tree.ReadCommittedIsolation
+			} else if upgradedFrom == tree.RepeatableReadIsolation {
+				displayLevel = tree.SnapshotIsolation
+			}
+			if logIsolationLevelLimiter.ShouldLog() {
+				log.Warningf(ctx, msgFmt, displayLevel)
+			}
+			ex.planner.BufferClientNotice(ctx, pgnotice.Newf(msgFmt, displayLevel))
+		}
 	}
 
 	ex.applicationName.Store(ex.sessionData().ApplicationName)
@@ -1308,6 +1330,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	ex.mu.IdleInSessionTimeout.Stop()
 	ex.mu.IdleInTransactionSessionTimeout.Stop()
 
+	ex.txnFingerprintIDAcc.Close(ctx)
 	if closeType != panicClose {
 		ex.state.mon.Stop(ctx)
 		ex.sessionPreparedMon.Stop(ctx)
@@ -1498,6 +1521,30 @@ type connExecutor struct {
 			txnStartTime time.Time
 			// implicit is whether the transaction was implicit.
 			implicit bool
+		}
+
+		// storedProcTxnState contains fields that are used for explicit transaction
+		// management in stored procedures. Both fields are set during execution of
+		// a stored procedure through the planner. Both fields are reset by the
+		// connExecutor in execCmd, depending on the execution status (e.g. success,
+		// error, retry).
+		storedProcTxnState struct {
+			// txnOp, if not set to StoredProcTxnNoOp, indicates that the current txn
+			// should be committed or aborted. The connExecutor uses it in
+			// execStmtInOpenState to decide whether to commit or rollback the current
+			// transaction.
+			txnOp tree.StoredProcTxnOp
+
+			// txnModes allows for SET TRANSACTION statements to apply to the new txn
+			// that starts after the COMMIT/ROLLBACK.
+			txnModes *tree.TransactionModes
+
+			// resumeProc, if non-nil, contains the plan for a CALL statement that
+			// will continue execution of a stored procedure that previously suspended
+			// execution in order to commit or abort its transaction. The planner
+			// checks for resumeProc in buildExecMemo, and executes it as the next
+			// statement if it is non-nil.
+			resumeProc *memo.Memo
 		}
 
 		// shouldExecuteOnTxnRestart indicates that ex.onTxnRestart will be
@@ -1699,6 +1746,7 @@ type connExecutor struct {
 	// txnFingerprintIDCache is used to track the most recent
 	// txnFingerprintIDs executed in this session.
 	txnFingerprintIDCache *TxnFingerprintIDCache
+	txnFingerprintIDAcc   *mon.BoundAccount
 
 	// totalActiveTimeStopWatch tracks the total active time of the session.
 	// This is defined as the time spent executing transactions and statements.
@@ -2584,6 +2632,27 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		panic(errors.AssertionFailedf("unexpected advance code: %s", advInfo.code))
 	}
 
+	// Special handling for COMMIT/ROLLBACK in PL/pgSQL stored procedures. We
+	// unconditionally reset the StoredProcTxnOp because it has either
+	// successfully set in motion the commit/rollback of the current transaction,
+	// or execution failed and the PL/pgSQL command should be ignored.
+	ex.extraTxnState.storedProcTxnState.txnOp = tree.StoredProcTxnNoOp
+	switch advInfo.code {
+	case stayInPlace, rewind:
+		// Do not reset the "resume" plan. This will allow a sub-transaction
+		// within a stored procedure to be retried individually from any previous or
+		// following transactions within the stored procedure.
+		//
+		// NOTE: we will eventually reach the default case below when the retries
+		// terminate.
+	default:
+		// Finish cleaning up the stored proc state by resetting the "resume" plan
+		// and transaction modes. The stored procedure has finished execution,
+		// either successfully or with an error.
+		ex.extraTxnState.storedProcTxnState.resumeProc = nil
+		ex.extraTxnState.storedProcTxnState.txnModes = nil
+	}
+
 	if err := ex.updateTxnRewindPosMaybe(ctx, cmd, pos, advInfo); err != nil {
 		return err
 	}
@@ -2800,11 +2869,11 @@ func (ex *connExecutor) execCopyOut(
 
 		// Log the query for sampling.
 		// These fields are not available in COPY, so use the empty value.
-		f := tree.NewFmtCtx(tree.FmtHideConstants)
+		flags := tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&ex.server.cfg.Settings.SV))
+		f := tree.NewFmtCtx(flags)
 		f.FormatNode(cmd.Stmt)
 		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
 			f.CloseAndGetString(),
-			copyErr != nil,
 			ex.implicitTxn(),
 			ex.planner.CurrentDatabase(),
 		)
@@ -3065,11 +3134,11 @@ func (ex *connExecutor) execCopyIn(
 			res.SetRowsAffected(ctx, numInsertedRows)
 		}
 		// These fields are not available in COPY, so use the empty value.
-		f := tree.NewFmtCtx(tree.FmtHideConstants)
+		flags := tree.FmtHideConstants | tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&ex.server.cfg.Settings.SV))
+		f := tree.NewFmtCtx(flags)
 		f.FormatNode(cmd.Stmt)
 		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
 			f.CloseAndGetString(),
-			copyErr != nil,
 			ex.implicitTxn(),
 			ex.planner.CurrentDatabase(),
 		)
@@ -3099,7 +3168,7 @@ func (ex *connExecutor) execCopyIn(
 			// execInsertPlan
 			func(ctx context.Context, p *planner, res RestrictedCommandResult) error {
 				defer p.curPlan.close(ctx)
-				_, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, DistributionTypeNone, nil /* progressAtomic */)
+				_, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, LocalDistribution, nil /* progressAtomic */)
 				return err
 			},
 		)
@@ -3458,6 +3527,25 @@ var allowSnapshotIsolation = settings.RegisterBoolSetting(
 	false,
 )
 
+var logIsolationLevelLimiter = log.Every(10 * time.Second)
+
+// Bitmask for enabling various query fingerprint formatting styles.
+// We don't publish this setting because most users should not need
+// to tweak the fingerprint generation.
+var queryFormattingForFingerprintsMask = settings.RegisterIntSetting(
+	settings.ApplicationLevel,
+	"sql.stats.statement_fingerprint.format_mask",
+	"enables setting additional fmt flags for statement fingerprint formatting. "+
+		"Flags set here will be applied in addition to FmtHideConstants",
+	int64(tree.FmtCollapseLists|tree.FmtConstantsAsUnderscores),
+	settings.WithValidateInt(func(i int64) error {
+		if i == 0 || int64(tree.FmtCollapseLists|tree.FmtConstantsAsUnderscores)&i == i {
+			return nil
+		}
+		return errors.Newf("invalid value %d", i)
+	}),
+)
+
 func (ex *connExecutor) txnIsolationLevelToKV(
 	ctx context.Context, level tree.IsolationLevel,
 ) isolation.Level {
@@ -3465,6 +3553,8 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 		level = tree.IsolationLevel(ex.sessionData().DefaultTxnIsolationLevel)
 	}
 	upgraded := false
+	upgradedDueToLicense := false
+	hasLicense := base.CCLDistributionAndEnterpriseEnabled(ex.server.cfg.Settings)
 	allowLevelCustomization := ex.server.cfg.Settings.Version.IsActive(ctx, clusterversion.V23_2)
 	ret := isolation.Serializable
 	if allowLevelCustomization {
@@ -3475,28 +3565,34 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 			upgraded = true
 			fallthrough
 		case tree.ReadCommittedIsolation:
-			// READ COMMITTED is only allowed if the cluster setting is enabled.
-			// Otherwise  it is mapped to SERIALIZABLE.
+			// READ COMMITTED is only allowed if the cluster setting is enabled and
+			// the cluster has a license. Otherwise it is mapped to SERIALIZABLE.
 			allowReadCommitted := allowReadCommittedIsolation.Get(&ex.server.cfg.Settings.SV)
-			if allowReadCommitted {
+			if allowReadCommitted && hasLicense {
 				ret = isolation.ReadCommitted
 			} else {
 				upgraded = true
 				ret = isolation.Serializable
+				if allowReadCommitted && !hasLicense {
+					upgradedDueToLicense = true
+				}
 			}
 		case tree.RepeatableReadIsolation:
 			// REPEATABLE READ is mapped to SNAPSHOT.
 			upgraded = true
 			fallthrough
 		case tree.SnapshotIsolation:
-			// SNAPSHOT is only allowed if the cluster setting is enabled. Otherwise
-			// it is mapped to SERIALIZABLE.
+			// SNAPSHOT is only allowed if the cluster setting is enabled and the
+			// cluster has a license. Otherwise it is mapped to SERIALIZABLE.
 			allowSnapshot := allowSnapshotIsolation.Get(&ex.server.cfg.Settings.SV)
-			if allowSnapshot {
+			if allowSnapshot && hasLicense {
 				ret = isolation.Snapshot
 			} else {
 				upgraded = true
 				ret = isolation.Serializable
+				if allowSnapshot && !hasLicense {
+					upgradedDueToLicense = true
+				}
 			}
 		case tree.SerializableIsolation:
 			ret = isolation.Serializable
@@ -3504,10 +3600,11 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 			log.Fatalf(context.Background(), "unknown isolation level: %s", level)
 		}
 	}
-	if upgraded {
-		ex.metrics.ExecutedStatementCounters.TxnUpgradedCount.Inc(1)
-		telemetry.Inc(sqltelemetry.IsolationLevelUpgradedCounter(ctx, level))
+
+	if f := ex.dataMutatorIterator.upgradedIsolationLevel; upgraded && f != nil {
+		f(ctx, level, upgradedDueToLicense)
 	}
+
 	if ret != isolation.Serializable {
 		telemetry.Inc(sqltelemetry.IsolationLevelCounter(ctx, ret))
 	}
@@ -3726,6 +3823,7 @@ func (ex *connExecutor) initPlanner(ctx context.Context, p *planner) {
 	p.noticeSender = nil
 	p.preparedStatements = ex.getPrepStmtsAccessor()
 	p.sqlCursors = ex.getCursorAccessor()
+	p.storedProcTxnState = ex.getStoredProcTxnStateAccessor()
 	p.createdSequences = ex.getCreatedSequencesAccessor()
 
 	p.queryCacheSession.Init()
@@ -4216,6 +4314,12 @@ func (ex *connExecutor) getPrepStmtsAccessor() preparedStatementsAccessor {
 
 func (ex *connExecutor) getCursorAccessor() sqlCursors {
 	return connExCursorAccessor{
+		ex: ex,
+	}
+}
+
+func (ex *connExecutor) getStoredProcTxnStateAccessor() storedProcTxnStateAccessor {
+	return storedProcTxnStateAccessor{
 		ex: ex,
 	}
 }

@@ -50,14 +50,7 @@ type jobStarter func(c cluster.Cluster, l *logger.Logger) (jobspb.JobID, error)
 func jobSurvivesNodeShutdown(
 	ctx context.Context, t test.Test, c cluster.Cluster, nodeToShutdown int, startJob jobStarter,
 ) {
-	cfg := nodeShutdownConfig{
-		shutdownNode:         nodeToShutdown,
-		watcherNode:          1 + (nodeToShutdown)%c.Spec().NodeCount,
-		crdbNodes:            c.All(),
-		waitFor3XReplication: true,
-		sleepBeforeShutdown:  30 * time.Second,
-	}
-	require.NoError(t, executeNodeShutdown(ctx, t, c, cfg, startJob))
+	require.NoError(t, executeNodeShutdown(ctx, t, c, defaultNodeShutdownConfig(c, nodeToShutdown), startJob))
 }
 
 type nodeShutdownConfig struct {
@@ -68,6 +61,16 @@ type nodeShutdownConfig struct {
 	waitFor3XReplication bool
 	sleepBeforeShutdown  time.Duration
 	rng                  *rand.Rand
+}
+
+func defaultNodeShutdownConfig(c cluster.Cluster, nodeToShutdown int) nodeShutdownConfig {
+	return nodeShutdownConfig{
+		shutdownNode:         nodeToShutdown,
+		watcherNode:          1 + (nodeToShutdown)%c.Spec().NodeCount,
+		crdbNodes:            c.All(),
+		waitFor3XReplication: true,
+		sleepBeforeShutdown:  30 * time.Second,
+	}
 }
 
 // executeNodeShutdown executes a node shutdown and returns all errors back to the caller.
@@ -115,7 +118,7 @@ func executeNodeShutdown(
 		for {
 			select {
 			case <-ticker.C:
-				err := watcherDB.QueryRowContext(ctx, `SELECT status FROM [SHOW JOBS] WHERE job_id=$1`, jobID).Scan(&status)
+				err := watcherDB.QueryRowContext(ctx, `SELECT status FROM [SHOW JOB $1]`, jobID).Scan(&status)
 				if err != nil {
 					return errors.Wrap(err, "getting the job status")
 				}
@@ -128,7 +131,7 @@ func executeNodeShutdown(
 					t.L().Printf("job %d still running, waiting to succeed", jobID)
 				default:
 					// Waiting for job to complete.
-					return errors.Newf("unexpectedly found job %s in state %s", jobID, status)
+					return errors.Newf("unexpectedly found job %d in state %s", jobID, status)
 				}
 			case <-ctx.Done():
 				return errors.Wrap(ctx.Err(), "context canceled while waiting for job to finish")
@@ -162,7 +165,7 @@ func executeNodeShutdown(
 	t.Status(fmt.Sprintf("restarting %s (node restart test is done)\n", target))
 	// Don't begin another backup schedule, as the parent test driver has already
 	// set or disallowed the automatic backup schedule.
-	if err := c.StartE(ctx, t.L(), option.DefaultStartOptsNoBackups(),
+	if err := c.StartE(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule),
 		install.MakeClusterSettings(cfg.restartSettings...), target); err != nil {
 		return errors.Wrapf(err, "could not restart node %s", target)
 	}
@@ -196,4 +199,59 @@ func getJobProgress(t test.Test, db *sqlutils.SQLRunner, jobID jobspb.JobID) *jo
 		t.Fatal(err)
 	}
 	return ret
+}
+
+func AssertReasonableFractionCompleted(
+	ctx context.Context, l *logger.Logger, c cluster.Cluster, jobID jobspb.JobID, nodeToQuery int,
+) error {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	fractionsRecorded := make([]float64, 0)
+
+	for {
+		select {
+		case <-ticker.C:
+			fractionCompleted, err := getFractionProgressed(ctx, l, c, jobID, nodeToQuery)
+			if err != nil {
+				return err
+			}
+			fractionsRecorded = append(fractionsRecorded, fractionCompleted)
+			if fractionCompleted == 1 {
+				count := len(fractionsRecorded)
+				if count > 5 && fractionsRecorded[count/2] < 0.2 && fractionsRecorded[count/2] > 0.8 {
+					return errors.Newf("the median fraction completed was %.2f, which is outside (0.2,0.8)", fractionsRecorded[count/2])
+				}
+				l.Printf("not enough 'fractionCompleted' recorded to assert progress looks sane")
+				return nil
+			}
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "context canceled while waiting for job to finish")
+		}
+	}
+}
+
+func getFractionProgressed(
+	ctx context.Context, l *logger.Logger, c cluster.Cluster, jobID jobspb.JobID, nodeToQuery int,
+) (float64, error) {
+	var status string
+	var fractionCompleted float64
+	conn := c.Conn(ctx, l, nodeToQuery)
+	defer conn.Close()
+	err := conn.QueryRowContext(ctx, `SELECT status, fraction_completed FROM [SHOW JOB $1]`, jobID).Scan(&status, &fractionCompleted)
+	if err != nil {
+		return 0, errors.Wrap(err, "getting the job status and fraction completed")
+	}
+	jobStatus := jobs.Status(status)
+	switch jobStatus {
+	case jobs.StatusSucceeded:
+		if fractionCompleted != 1 {
+			return 0, errors.Newf("job completed but fraction completed is %.2f", fractionCompleted)
+		}
+		return fractionCompleted, nil
+	case jobs.StatusRunning:
+		l.Printf("job %d still running, %.2f completed, waiting to succeed", jobID, fractionCompleted)
+		return fractionCompleted, nil
+	default:
+		return 0, errors.Newf("unexpectedly found job %s in state %s", jobID, status)
+	}
 }
