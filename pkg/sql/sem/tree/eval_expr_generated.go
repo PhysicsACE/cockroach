@@ -27,6 +27,7 @@ type ExprEvaluator interface {
 	EvalAndExpr(context.Context, *AndExpr) (Datum, error)
 	EvalArray(context.Context, *Array) (Datum, error)
 	EvalArrayFlatten(context.Context, *ArrayFlatten) (Datum, error)
+	EvalAssignmentCastExpr(context.Context, *AssignmentCastExpr) (Datum, error)
 	EvalBinaryExpr(context.Context, *BinaryExpr) (Datum, error)
 	EvalCaseExpr(context.Context, *CaseExpr) (Datum, error)
 	EvalCastExpr(context.Context, *CastExpr) (Datum, error)
@@ -79,6 +80,11 @@ func (node *Array) Eval(ctx context.Context, v ExprEvaluator) (Datum, error) {
 // Eval is part of the TypedExpr interface.
 func (node *ArrayFlatten) Eval(ctx context.Context, v ExprEvaluator) (Datum, error) {
 	return v.EvalArrayFlatten(ctx, node)
+}
+
+// Eval is part of the TypedExpr interface.
+func (node *AssignmentCastExpr) Eval(ctx context.Context, v ExprEvaluator) (Datum, error) {
+	return v.EvalAssignmentCastExpr(ctx, node)
 }
 
 // Eval is part of the TypedExpr interface.

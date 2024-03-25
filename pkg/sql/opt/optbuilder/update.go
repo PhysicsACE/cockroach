@@ -12,12 +12,14 @@ package optbuilder
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -233,7 +235,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 	n := 0
 	subquery := 0
-	for _, set := range exprs {
+	for setIdx, set := range exprs {
 		subscriptFlag := false
 		if set.Tuple {
 			switch t := set.Expr.(type) {
@@ -247,22 +249,37 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 					colID := mb.targetColList[n]
 					ord := mb.tabID.ColumnOrdinal(colID)
 					targetCol := mb.tab.Column(ord)
-					subqueryScope.cols[i].name = scopeColName(targetCol.ColName())
+					newColName := string(targetCol.ColName()) + "_new_" + strconv.Itoa(setIdx) + "_" + strconv.Itoa(i)
+					subqueryScope.cols[i].name = scopeColName(tree.Name(newColName))
+					if _, ok := mb.refAgg[colID]; ok {
+						refExpr := &tree.UnresolvedName{
+							NumParts: 1,
+							Parts:    tree.NameParts{newColName},
+						}
+						// srcType := subqueryScope.cols[i].ResolvedType()
+						// targetType := mb.fetchPartialAssignmentCast(ord, mb.refAgg[colID].Paths[len(mb.refAgg[colID].Updates)])
+						// if srcType.Identical(targetType) {
+						// 	mb.refAgg[colID].AddAdditionalUpdate(refExpr)
+						// } else {
+						// 	if !cast.(srcType, targetType, cast.ContextAssignment) {
+						// 		panic(sqlerrors.NewInvalidCastError(srcType, targetType, string(targetCol.ColName())))
+						// 	}
+						// 	casted := &tree.CastExpr{
+						// 		Expr: refExpr,
+						// 		Type: targetType,
+						// 		asAssignment: true,
+						// 	}
+						// 	mb.refAgg[colID].AddAdditionalUpdate(casted)
+						// }
+						mb.refAgg[colID].AddAdditionalUpdate(refExpr)
+						mb.generatedCols.Add(colID)
+						subscriptFlag = true
+					}
 
-					// if _, ok := mb.refAgg[colID]; ok {
-					// 	generatedExpr := &tree.UnresolvedName{
-					// 		NumParts: 1,
-					// 		Parts:    tree.NameParts{string(targetCol.ColName())},
-					// 	}
-					// 	mb.refAgg[colID].AddAdditionalUpdate(generatedExpr)
-					// 	mb.generatedCols.Add(colID)
-					// 	subscriptFlag = true
-					// }
-
-					// if subscriptFlag {
-					// 	n++
-					// 	continue
-					// }
+					if subscriptFlag {
+						n++
+						continue
+					}
 
 					// Add the column ID to the list of columns to update.
 					mb.updateColIDs[ord] = subqueryScope.cols[i].id
@@ -289,19 +306,21 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 				projectionsScope.appendColumnsFromScope(subqueryScope)
 
 			case *tree.Tuple:
-				for i := range set.ColumnRefs {
-					// colID := mb.targetColList[n]
-					// if len(ref.Subscripts) > 0 {
-					// 	mb.refAgg[colID].AddAdditionalUpdate(t.Exprs[i])
-					// 	subscriptFlag = true
-					// }
+				for i, ref := range set.ColumnRefs {
+					colID := mb.targetColList[n]
+					if len(ref.Subscripts) > 0 {
+						if _, ok := mb.refAgg[colID]; ok {
+							mb.refAgg[colID].AddAdditionalUpdate(t.Exprs[i])
+							subscriptFlag = true
+						}
+					}
 
-					// if subscriptFlag {
-					// 	n++
-					// 	continue
-					// }
+					if subscriptFlag {
+						n++
+						continue
+					}
 
-					addCol(t.Exprs[i], mb.targetColList[n])
+					addCol(t.Exprs[i], colID)
 					n++
 				}
 			}
@@ -360,9 +379,9 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 	mb.outScope = projectionsScope
 
-	// if mb.generatedCols.Len() > 0 {
-	// 	mb.addGeneratedColsForUpdate()
-	// }
+	if mb.generatedCols.Len() > 0 {
+		mb.addGeneratedColsForUpdate()
+	}
 
 	// Add assignment casts for update columns.
 	mb.addAssignmentCasts(mb.updateColIDs)

@@ -577,6 +577,23 @@ func (mb *mutationBuilder) addTargetColsByColumnRefs(refs tree.ColumnRefList) {
 	}
 }
 
+func (mb *mutationBuilder) addGeneratedColsForUpdate() {
+	pb := makeProjectionBuilder(mb.b, mb.outScope)
+	mb.generatedCols.ForEach(func(colID opt.ColumnID) {
+		ord := mb.tabID.ColumnOrdinal(colID)
+		targetCol := mb.tab.Column(ord)
+		targetColName := targetCol.ColName()
+		colName := scopeColName(targetColName).WithMetadataName(
+			string(targetColName) + "_new",
+		)
+		if expr, ok := mb.refAgg[colID]; ok {
+			newCol, _ := pb.Add(colName, expr, targetCol.DatumType())
+			mb.updateColIDs[ord] = newCol
+		}
+	})
+	mb.outScope = pb.Finish()
+}
+
 // func (mb *mutationBuilder) addGeneratedColsForUpdate() {
 // 	mb.addGeneratedColsImpl(mb.updateColIDs)
 // }

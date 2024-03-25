@@ -1566,6 +1566,20 @@ func NewTypedCastExpr(expr TypedExpr, typ *types.T) *CastExpr {
 	return node
 }
 
+type AssignmentCastExpr struct {
+	Expr Expr
+	Type ResolvableTypeReference
+
+	typeAnnotation
+}
+
+func (node *AssignmentCastExpr) Format(ctx *FmtCtx) {
+	ctx.WriteString("AssignmentCast(")
+	ctx.FormatNode(node.Expr)
+	ctx.FormatTypeReference(node.Type)
+	ctx.WriteByte(')')
+}
+
 // ArraySubscripts represents a sequence of one or more array subscripts.
 type ArraySubscripts []*ArraySubscript
 
@@ -1760,6 +1774,7 @@ func (node *Array) String() string            { return AsString(node) }
 func (node *BinaryExpr) String() string       { return AsString(node) }
 func (node *CaseExpr) String() string         { return AsString(node) }
 func (node *CastExpr) String() string         { return AsString(node) }
+func (node *AssignmentCastExpr) String() string { return AsString(node) }
 func (node *CoalesceExpr) String() string     { return AsString(node) }
 func (node *ColumnAccessExpr) String() string { return AsString(node) }
 func (node *CollateExpr) String() string      { return AsString(node) }

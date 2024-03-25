@@ -855,3 +855,23 @@ func tableOrdinals(tab cat.Table, k columnKinds) []int {
 	}
 	return ordinals
 }
+
+func (mb *mutationBuilder) fetchPartialAssignmentCast(ord int, subscription tree.ArraySubscripts) *types.T {
+	targetType := mb.tab.Column(ord).DatumType()
+	Traverse:
+		for i := 0; i < len(subscription); i++ {
+			subscript := subscription[i]
+			switch typ := targetType; typ {
+			case types.ArrayFamily:
+				if subscript.Slice {
+					continue
+				}
+				targetType = typ.ArrayContents()
+			case types.JsonFamily:
+				break Traverse
+			}
+			default:
+				break Traverse
+		}
+	return targetType
+}

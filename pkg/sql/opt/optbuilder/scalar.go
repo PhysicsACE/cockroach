@@ -189,71 +189,159 @@ func (b *Builder) buildScalar(
 		// 		)
 		// 	}
 		// } else {
+		// if t.Assign {
+		// 	// begin := memo.ScalarListExpr{
+		// 	// 	b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 	// }
+		// 	// end := memo.ScalarListExpr{
+		// 	// 	b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 	// }
+
+		// 	// values := memo.ScalarListExpr{
+		// 	// 	b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 	// }
+
+		// 	// out = b.factory.ConstructIndirection(
+		// 	// 	out,
+		// 	// 	begin,
+		// 	// 	end,
+		// 	// 	values,
+		// 	// 	false,
+		// 	// )
+		// 	for i, path := range t.Paths {
+		// 		for _, subscript := range path {
+		// 			begin := memo.ScalarListExpr{
+		// 				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 			}
+		// 			end := memo.ScalarListExpr{
+		// 				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 			}
+		// 			values := memo.ScalarListExpr{
+		// 				b.buildScalar(t.Updates[i].(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 			}
+
+		// 			out = b.factory.ConstructIndirection(
+		// 				out,
+		// 				begin,
+		// 				end,
+		// 				values,
+		// 				subscript.Slice,
+		// 			)
+		// 		}
+		// 	}
+		// } else {
+		// 	for _, subscript := range t.Indirection {
+		// 		// if subscript.Slice {
+		// 		// 	panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
+		// 		// }
+
+		// 		begin := memo.ScalarListExpr{
+		// 			b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 		}
+		// 		end := memo.ScalarListExpr{
+		// 			b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 		}
+
+		// 		values := memo.ScalarListExpr{
+		// 			b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+		// 		}
+
+		// 		out = b.factory.ConstructIndirection(
+		// 			out,
+		// 			begin,
+		// 			end,
+		// 			values,
+		// 			subscript.Slice,
+		// 		)
+		// 	}
+		// }
+
 		if t.Assign {
-			// begin := memo.ScalarListExpr{
-			// 	b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
-			// }
-			// end := memo.ScalarListExpr{
-			// 	b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
-			// }
-
-			// values := memo.ScalarListExpr{
-			// 	b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
-			// }
-
-			// out = b.factory.ConstructIndirection(
-			// 	out,
-			// 	begin,
-			// 	end,
-			// 	values,
-			// 	false,
-			// )
 			for i, path := range t.Paths {
+				containsSlice := false
 				for _, subscript := range path {
+					if subscript.Slice {
+						containsSlice = true
+					}
+				}
+
+				values := memo.ScalarListExpr{
+					b.buildScalar(t.Updates[i].(tree.TypedExpr), inScope, nil, nil, colRefs),
+				}
+
+				for i := len(path) - 1; i >= 0; i-- {
+					e := out
+					for j := 0; j < i; j++ {
+						begin := memo.ScalarListExpr{
+							b.buildScalar(path[j].Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+						}
+						end := memo.ScalarListExpr{
+							b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+						}
+						if path[j].Slice {
+							end = memo.ScalarListExpr{
+								b.buildScalar(path[j].End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+							}
+						}
+						e = b.factory.ConstructIndirection(
+							e,
+							begin,
+							end,
+							memo.EmptyScalarListExpr,
+							containsSlice,
+						)
+					}
 					begin := memo.ScalarListExpr{
-						b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+						b.buildScalar(path[i].Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
 					}
 					end := memo.ScalarListExpr{
 						b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
 					}
-					values := memo.ScalarListExpr{
-						b.buildScalar(t.Updates[i].(tree.TypedExpr), inScope, nil, nil, colRefs),
+					if path[i].Slice {
+						b.buildScalar(path[i].End.(tree.TypedExpr), inScope, nil, nil, colRefs)
 					}
-
 					out = b.factory.ConstructIndirection(
-						out,
+						e,
 						begin,
 						end,
 						values,
-						subscript.Slice,
+						containsSlice,
 					)
+					values = memo.ScalarListExpr{
+						out,
+					}
 				}
 			}
-		} else {
-			for _, subscript := range t.Indirection {
-				// if subscript.Slice {
-				// 	panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
-				// }
+			break
+		} 
 
-				begin := memo.ScalarListExpr{
-					b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
-				}
-				end := memo.ScalarListExpr{
-					b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
-				}
-
-				values := memo.ScalarListExpr{
-					b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
-				}
-
-				out = b.factory.ConstructIndirection(
-					out,
-					begin,
-					end,
-					values,
-					subscript.Slice,
-				)
+		containsSlice := false 
+		for _, subscript := range t.Indirection {
+			if subscript.Slice {
+				containsSlice = true
 			}
+		}
+
+		for _, subscript := range t.Indirection {
+			begin := memo.ScalarListExpr{
+				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			}
+			end := memo.ScalarListExpr{
+				b.buildScalar(tree.DNull.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			}
+			if subscript.Slice {
+				end = memo.ScalarListExpr{
+					b.buildScalar(subscript.End.(tree.TypedExpr), inScope, nil, nil, colRefs),
+				}
+			}
+			values := memo.EmptyScalarListExpr
+			out = b.factory.ConstructIndirection(
+				out,
+				begin,
+				end,
+				values,
+				containsSlice,
+			)
 		}
 
 	case *tree.IfErrExpr:
@@ -348,6 +436,11 @@ func (b *Builder) buildScalar(
 		texpr := t.Expr.(tree.TypedExpr)
 		arg := b.buildScalar(texpr, inScope, nil, nil, colRefs)
 		out = b.factory.ConstructCast(arg, t.ResolvedType())
+	
+	case *tree.AssignmentCastExpr:
+		texpr := t.Expr.(tree.TypedExpr)
+		arg := b.buildScalar(texpr, inScope, nil, nil, colRefs)
+		out = b.factory.ConstructAssignmentCast(arg, t.ResolvedType())
 
 	case *tree.CoalesceExpr:
 		args := make(memo.ScalarListExpr, len(t.Exprs))

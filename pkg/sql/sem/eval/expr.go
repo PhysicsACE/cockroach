@@ -103,6 +103,12 @@ func (e *evaluator) EvalArrayFlatten(
 	return array, nil
 }
 
+func (e *evaluator) EvalAssignmentCastExpr(
+	ctx context.Context, expr *tree.AssignmentCastExpr,
+) (tree.Datum, error) {
+	return nil, errors.AssertionFailedf("unhandled type %T", expr)
+}
+
 func (e *evaluator) EvalBinaryExpr(ctx context.Context, expr *tree.BinaryExpr) (tree.Datum, error) {
 	left, err := expr.Left.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {

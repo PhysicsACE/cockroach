@@ -686,6 +686,27 @@ func (expr *CastExpr) TypeCheck(
 	return expr, nil
 }
 
+func (expr *AssignmentCastExpr) TypeCheck(
+	ctx context.Context, semaCtx *SemaContext, _ *types.T,
+) (TypedExpr, error) {
+	desired := types.Any
+	exprType, err := ResolveType(ctx, expr.Type, semaCtx.GetTypeResolver())
+	if err != nil {
+		return nil, err
+	}
+	if err = CheckUnsupportedType(ctx, semaCtx, exprType); err != nil {
+		return nil, err
+	}
+	typedSubExpr, err := expr.Expr.TypeCheck(ctx, semaCtx, desired)
+	if err != nil {
+		return nil, err
+	}
+	expr.Expr = typedSubExpr
+	expr.Type = exprType
+	expr.typ = exprType
+	return expr, nil
+}
+
 // TypeCheck implements the Expr interface.
 func (expr *IndirectionExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
@@ -778,10 +799,6 @@ func (expr *IndirectionExpr) TypeCheck(
 				for _, p := range t {
 					if p.Slice {
 						return nil, pgerror.Newf(pgcode.DatatypeMismatch, "jsonb subscript does not support slices")
-					}
-
-					if i > 0 {
-						return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
 					}
 
 					beginExpr, err := typeCheckAndRequire(ctx, semaCtx, p.Begin, types.Int, "ARRAY subscript")

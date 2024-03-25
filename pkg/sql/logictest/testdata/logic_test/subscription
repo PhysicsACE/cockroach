@@ -10,8 +10,8 @@ INSERT INTO json_subscript_test (id, j, extract_field, extract_int_field) VALUES
   (2, '{"field": {"field": 2}}', 'field', 0),
   (3, '[1, 2, 3]', 'nothing_to_fetch', 1)
 
-statement ok
-UPDATE json_subscript_test SET j[extract_int_field] = '3'::JSONB WHERE id = 3
+statement ok 
+UPDATE json_subscript_test SET (j[extract_int_field], j[0]) = (SELECT '3'::JSONB, '3'::JSONB) WHERE id = 3
 
 query T
 SELECT j FROM json_subscript_test WHERE id = 3
