@@ -1441,7 +1441,7 @@ func (expr *FuncExpr) TypeCheck(
 	}
 
 	srcParams := overloadImpl.params()
-	typeNames := make([]TypedExpr, srcParams.Length())
+	newExprs := make([]TypedExpr, srcParams.Length())
 	variableSeen := 0
 	var seenIdxs intsets.Fast
 	defaultList := srcParams.GetDefaults()
@@ -1452,34 +1452,29 @@ func (expr *FuncExpr) TypeCheck(
 
 	if (srcParams.Length() < len(s.typedExprs)) {
 		variadicArray := NewTypedArray(s.typedExprs[srcParams.Length() - 1:], types.MakeArray(srcParams.variadicType()))
-		typeNames[len(typeNames) - 1] = variadicArray
+		newExprs[len(newExprs) - 1] = variadicArray
 		variableSeen = len(s.typedExprs) - srcParams.Length() + 1
 		seenIdxs.Remove(srcParams.Length() - 1)
 	}
 
 	for idx, expr := range s.typedExprs[:len(s.typedExprs) - variableSeen] {
-
 		seenIdxs.Remove(idx)
-
 		if (idx == srcParams.Length() - 1 && srcParams.AcceptsVariadic()) {
 			variadicArray := NewTypedArray(s.typedExprs[idx:idx + 1], types.MakeArray(srcParams.variadicType()))
-			typeNames[idx] = variadicArray
+			newExprs[idx] = variadicArray
 			continue
 		}
-
-		typeNames[idx] = expr
+		newExprs[idx] = expr
 	}
 
 	for i, ok := seenIdxs.Next(0); ok; i, ok = seenIdxs.Next(i + 1) {
-
 		if _ , ok := defaultList[i]; ok {
-			typeNames[i] = &DefaultVal{}
+			newExprs[i] = &DefaultVal{}
 			continue
 		}
-
 	}
 
-	expr.ResExprs = typeNames
+	expr.ResExprs = newExprs
 
 	expr.Func.FunctionReference = def
 	expr.fn = overloadImpl

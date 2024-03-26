@@ -23,14 +23,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -243,7 +241,7 @@ func (n *createFunctionNode) replaceFunction(
 	var outParamOrdinals []int32
 	var outParamTypes []*types.T
 	for i, p := range n.cf.Params {
-		udfDesc.Params[i], err = makeFunctionParam(params.ctx, p, params.p, params.p.SemaCtx())
+		udfDesc.Params[i], err = makeFunctionParam(params.ctx, p, params.p)
 		if err != nil {
 			return err
 		}
@@ -336,19 +334,19 @@ func (n *createFunctionNode) getMutableFuncDesc(
 	defaultSeen := false
 	variadicSeen := false
 	for i, param := range n.cf.Params {
-		pbParam, err := makeFunctionParam(params.ctx, param, params.p, params.p.SemaCtx())
+		pbParam, err := makeFunctionParam(params.ctx, param, params.p)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		if pbParam.Class == catpb.Function_Param_VARIADIC {
 			if variadicSeen {
-				return nil, false, pgerror.Newf(pgcode.InvalidFunctionDefinition,
+				return nil, nil, pgerror.Newf(pgcode.InvalidFunctionDefinition,
 					"variadic function parameter must be the last parameter")
 			}
 
 			if !(pbParam.Type.Family() == types.ArrayFamily) {
-				return nil, false, pgerror.Newf(pgcode.InvalidFunctionDefinition,
+				return nil, nil, pgerror.Newf(pgcode.InvalidFunctionDefinition,
 					"VARIADIC parameter must be an array type")
 			}
 
@@ -360,13 +358,13 @@ func (n *createFunctionNode) getMutableFuncDesc(
 		}
 
 		if (variadicSeen) {
-			return nil, false, pgerror.Newf(pgcode.InvalidFunctionDefinition,
+			return nil, nil, pgerror.Newf(pgcode.InvalidFunctionDefinition,
 				"VARIADIC parameter must be the last parameter in the list")
 		}
 
 		if (defaultSeen) {
 			if (pbParam.DefaultExpr == "") {
-				return nil, false, pgerror.Newf(pgcode.InvalidFunctionDefinition,
+				return nil, nil, pgerror.Newf(pgcode.InvalidFunctionDefinition,
 					"Input parameters following one with a default value must also have a default value")
 			}
 		}
@@ -611,7 +609,7 @@ func resetFuncOption(udfDesc *funcdesc.Mutable) {
 }
 
 func makeFunctionParam(
-	ctx context.Context, param tree.RoutineParam, typeResolver tree.TypeReferenceResolver, semaCtx *tree.SemaContext,
+	ctx context.Context, param tree.RoutineParam, typeResolver tree.TypeReferenceResolver,
 ) (descpb.FunctionDescriptor_Parameter, error) {
 	pbParam := descpb.FunctionDescriptor_Parameter{
 		Name: string(param.Name),
@@ -628,26 +626,7 @@ func makeFunctionParam(
 	}
 
 	if param.DefaultVal != nil {
-		defaultExpr, err := schemaexpr.SanitizeVarFreeExpr(
-			ctx,
-			param.DefaultVal,
-			pbParam.Type,
-			"DEFAULT",
-			semaCtx,
-			volatility.Volatile,
-			true,
-		)
-		if err != nil {
-			return descpb.FunctionDescriptor_Parameter{}, err
-		}
-		
-		var visitor tree.UDFDisallowanceVisitor
-		tree.WalkExpr(&visitor, defaultExpr)
-		if visitor.FoundUDF {
-			return descpb.FunctionDescriptor_Parameter{},
-			unimplemented.NewWithIssue(83234, "usage of user-defined function in Default values is not supported")
-		}
-		pbParam.DefaultExpr = tree.Serialize(defaultExpr)
+		pbParam.DefaultExpr = tree.Serialize(param.DefaultVal)
 	}
 
 	return pbParam, nil

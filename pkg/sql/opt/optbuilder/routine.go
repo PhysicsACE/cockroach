@@ -235,12 +235,13 @@ func (b *Builder) buildRoutine(
 				if argDefaults == nil {
 					argDefaults = f.ResolvedOverload().Types.GetDefaults()
 				}
-				defaultStr := argDefaults[i]
-				parsedDefault, err := parser.ParseExpr(defaultStr)
-				if err != nil {
-					panic(err)
-				}
-				typ, err := parsedDefault.TypeCheck(b.ctx, b.semaCtx, types.Any)
+				// defaultStr := argDefaults[i]
+				// parsedDefault, err := parser.ParseExpr(defaultStr)
+				// if err != nil {
+				// 	panic(err)
+				// }
+				defaultExpr := o.RoutineParams[i].DefaultVal
+				typ, err := defaultExpr.TypeCheck(b.ctx, b.semaCtx, types.Any)
 				if err != nil {
 					panic(err)
 				}
@@ -255,7 +256,7 @@ func (b *Builder) buildRoutine(
 			}
 
 			args[i] = b.buildScalar(
-				pexpr.(tree.TypedExpr),
+				pexpr,
 				inScope,
 				nil,
 				nil,

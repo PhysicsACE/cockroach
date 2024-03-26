@@ -755,6 +755,22 @@ func (t *typeSchemaChanger) canRemoveEnumValueFromUDF(
 		foundUsage = foundUsage || foundUsageInCurrentWalk
 		return recurse, newExpr, err
 	}
+
+	// For each default expression present, check for enum value reference
+	for _, param := range udfDesc.GetParams() {
+		if param.DefaultExpr != "" {
+			defaultUsage, err := findUsagesOfEnumValue(param.DefaultExpr, member, typeDesc.ID)
+			if err != nil {
+				return err
+			}
+			if defaultUsage {
+				return pgerror.Newf(pgcode.DependentObjectsStillExist,
+					"could not remove enum value %q as it is being used in a default expresion of %q",
+					member.LogicalRepresentation, udfDesc.GetName())
+			}
+		}
+	}
+
 	switch udfDesc.GetLanguage() {
 	case catpb.Function_SQL:
 		parsedStmts, err := parser.Parse(udfDesc.GetFunctionBody())

@@ -37,7 +37,7 @@ func init() {
 					}
 				}),
 				emit(func(this *scpb.FunctionParamDefaultExpression) *scop.UpdateFunctionRelationReferences {
-					if len(this.UsesSequenceIDs) == 0 {
+					if len(this.UsesSequenceIDs) == 0 || len(this.UsesFunctionIDs) == 0 {
 						return nil
 					}
 					return &scop.UpdateFunctionRelationReferences{
@@ -45,11 +45,9 @@ func init() {
 						TableReferences: []scpb.FunctionBody_TableReference{},
 						ViewReferences:  []scpb.FunctionBody_ViewReference{},
 						SequenceIDs:     this.UsesSequenceIDs,
+						FunctionReferences: this.UsesFunctionIDs,
 					}
 				}),
-				// TODO: When UDFs can be referenced by other UDFs, add associated
-				// operations here. 
-
 			),
 		),
 		toAbsent(

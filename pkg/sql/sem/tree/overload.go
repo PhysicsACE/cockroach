@@ -1203,8 +1203,8 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 	}
 
 	if (s.variadic) {
-		matchVariadic := func(params TypeList) bool { return params.AcceptsVariadic() }
-		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, matchVariadic)
+		matchVariadic := func(ov overloadImpl, params TypeList) bool { return params.AcceptsVariadic() }
+		s.overloadIdxs = filterParams(s.overloadIdxs, s.overloads, s.params, matchVariadic)
 	}
 
 	// Filter out overloads which constants cannot become.
@@ -1268,9 +1268,7 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 			ambiguousCollatedTypes = true
 		}
 		rt := typ.ResolvedType()
-		s.overloadIdxs = filterParams(s.overloadIdxs, s.params, func(
-			params TypeList,
-		) bool {
+		filter := makeFilter(i, func(params TypeList, ordinal int) bool {
 			if (s.variadic && i == params.Length() - 1) {
 				return params.MatchAt(rt.ArrayContents(), i)
 			}

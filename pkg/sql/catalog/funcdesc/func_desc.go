@@ -787,7 +787,6 @@ func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 	}
 
 	signatureTypes := make(tree.ParamTypesWithModes, 0, len(desc.Params))
-	var outParamNames []string
 	for _, param := range desc.Params {
 		class := ToTreeRoutineParamClass(param.Class)
 		if tree.IsInParamClass(class) {
@@ -800,11 +799,23 @@ func (desc *immutable) ToOverload() (ret *tree.Overload, err error) {
 				IsVariadic: (param.Class == catpb.Function_Param_VARIADIC),
 			})
 		}
+		if param.DefaultExpr != "" {
+			parsed, err := parser.ParseExpr(param.DefaultExpr)
+			if err != nil {
+				return nil, err
+			}
+			ret.RoutineParams = append(ret.RoutineParams, tree.RoutineParam{
+				Name:  tree.Name(param.Name),
+				Type:  param.Type,
+				Class: class,
+				DefaultVal: parsed,
+			})
+			continue
+		}
 		ret.RoutineParams = append(ret.RoutineParams, tree.RoutineParam{
 			Name:  tree.Name(param.Name),
 			Type:  param.Type,
 			Class: class,
-			// TODO(100962): populate DefaultVal.
 		})
 	}
 	ret.ReturnType = tree.FixedReturnType(desc.ReturnType.Type)
