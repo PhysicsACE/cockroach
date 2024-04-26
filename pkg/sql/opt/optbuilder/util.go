@@ -856,22 +856,48 @@ func tableOrdinals(tab cat.Table, k columnKinds) []int {
 	return ordinals
 }
 
-func (mb *mutationBuilder) fetchPartialAssignmentCast(ord int, subscription tree.ArraySubscripts) *types.T {
+// Traverse as far down as possible where depths is min(type_depth, len(subscripts))
+// to get the type required to make the subscripted assignment
+func (mb *mutationBuilder) fetchPartialAssignmentCast(ord int, subscription tree.ArraySubscripts) (*types.T, error) {
 	targetType := mb.tab.Column(ord).DatumType()
 	Traverse:
 		for i := 0; i < len(subscription); i++ {
 			subscript := subscription[i]
-			switch typ := targetType; typ {
+			switch typ := targetType.Family(); typ {
 			case types.ArrayFamily:
 				if subscript.Slice {
 					continue
 				}
-				targetType = typ.ArrayContents()
+				targetType = targetType.ArrayContents()
 			case types.JsonFamily:
 				break Traverse
-			}
+			case types.TupleFamily:
+				if targetType.UserDefined() {
+					subscript := subscription[i]
+					if string(subscript.Name) != "" {
+						label_idx := -1
+						for i, label := range targetType.TupleLabels() {
+							if label == string(subscript.Name) {
+								label_idx = i
+								break
+							}
+						}
+						if label_idx >= 0 {
+							subscript.ColIndex = label_idx
+							targetType = targetType.TupleContents()[label_idx]
+						} else {
+							return nil, errors.AssertionFailedf("Trying to refernce non existent label '%s'", string(subscript.Name))
+						}
+
+					} else {
+						return nil, errors.AssertionFailedf("Composite data type can only be subscripted by . '_' formate")
+					}
+				} else {
+					return nil, errors.AssertionFailedf("Tuple types cannot be subscripted")
+				}
 			default:
 				break Traverse
+			}
 		}
-	return targetType
+	return targetType, nil
 }

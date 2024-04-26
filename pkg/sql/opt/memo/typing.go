@@ -187,6 +187,7 @@ func init() {
 	typingFuncMap[opt.CastOp] = typeCast
 	typingFuncMap[opt.SubqueryOp] = typeSubquery
 	typingFuncMap[opt.ColumnAccessOp] = typeColumnAccess
+	typingFuncMap[opt.ColumnMutateOp] = typeColumnMutate
 	typingFuncMap[opt.IndirectionOp] = typeIndirection
 	typingFuncMap[opt.CollateOp] = typeCollate
 	typingFuncMap[opt.ArrayFlattenOp] = typeArrayFlatten
@@ -403,6 +404,12 @@ func typeColumnAccess(e opt.ScalarExpr) *types.T {
 	colAccess := e.(*ColumnAccessExpr)
 	typ := colAccess.Input.DataType()
 	return typ.TupleContents()[colAccess.Idx]
+}
+
+func typeColumnMutate(e opt.ScalarExpr) *types.T {
+	colMutate := e.(*ColumnMutateExpr)
+	typ := colMutate.Input.DataType()
+	return typ
 }
 
 // FindBinaryOverload finds the correct type signature overload for the

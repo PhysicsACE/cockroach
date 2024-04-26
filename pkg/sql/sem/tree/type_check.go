@@ -718,60 +718,95 @@ func (expr *IndirectionExpr) TypeCheck(
 	typ := subExpr.ResolvedType()
 	expr.Expr = subExpr
 
-	switch typ.Family() {
-	case types.ArrayFamily:
-		expr.typ = typ.ArrayContents()
-		for i, t := range expr.Indirection {
+	prevArray := false
+	encounteredArray := false
+	encounteredJson := false
+
+	if len(expr.Paths) > 0 {
+		for _, p := range expr.Paths {
+			subTyp := subExpr.ResolvedType()
+			prevArray = false
+			encounteredArray = false
+			encounteredJson = false 
+			for _, t := range p {
+				switch subT := subTyp.Family(); subT {
+				case types.ArrayFamily:
+					if t.Slice {
+						return nil, unimplemented.NewWithIssuef(32551, "ARRAY slicing in %s", expr)
+					}
+					if prevArray {
+						return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
+					}
+					beginExpr, err := typeCheckAndRequire(ctx, semaCtx, t.Begin, types.Int, "ARRAY subscript")
+					if err != nil {
+						return nil, err
+					}
+					t.Begin = beginExpr
+					subTyp = subTyp.ArrayContents()
+					prevArray = true
+					encounteredArray = true
+				case types.JsonFamily:
+					if t.Slice {
+						return nil, pgerror.Newf(pgcode.DatatypeMismatch, "jsonb subscript does not support slices")
+					}
+					beginExpr, err := t.Begin.TypeCheck(ctx, semaCtx, types.Any)
+					if err != nil {
+						return nil, err
+					}
+					switch beginExpr.ResolvedType().Family() {
+					case types.IntFamily, types.StringFamily, types.UnknownFamily:
+					default:
+						return nil, errors.WithHint(
+							pgerror.Newf(
+								pgcode.DatatypeMismatch,
+								"unexpected JSON subscript type: %s",
+								beginExpr.ResolvedType().SQLString(),
+							),
+							"subscript type must be integer or text",
+						)
+					}
+					t.Begin = beginExpr
+					prevArray = false
+					encounteredJson = true
+				case types.TupleFamily:
+					subTyp = subTyp.TupleContents()[t.ColIndex]
+					encounteredArray = false
+				default:
+					return nil, pgerror.Newf(pgcode.DatatypeMismatch, "cannot subscript type %s because it is not an array or json object", subTyp)
+				}
+			}
+
+			if encounteredArray && (OnTypeCheckArraySubscript != nil) {
+				OnTypeCheckArraySubscript()
+			}
+		
+			if encounteredJson && (OnTypeCheckJSONBSubscript != nil) {
+				OnTypeCheckJSONBSubscript()
+			}
+		}
+		expr.typ = typ
+		return expr, nil
+	}
+	
+	subTyp := subExpr.ResolvedType()
+	for _, t := range expr.Indirection {
+		switch subT := subTyp.Family(); subT {
+		case types.ArrayFamily:
 			if t.Slice {
 				return nil, unimplemented.NewWithIssuef(32551, "ARRAY slicing in %s", expr)
 			}
-			if i > 0 {
+			if prevArray {
 				return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
 			}
-
 			beginExpr, err := typeCheckAndRequire(ctx, semaCtx, t.Begin, types.Int, "ARRAY subscript")
 			if err != nil {
 				return nil, err
 			}
 			t.Begin = beginExpr
-		}
-
-		if len(expr.Paths) > 0 {
-			for i, t := range expr.Paths {
-				for _, p := range t {
-					if p.Slice {
-						endExpr, err := typeCheckAndRequire(ctx, semaCtx, p.End, types.Int, "ARRAY subscript")
-						if err != nil {
-							return nil, err
-						}
-						p.End = endExpr
-					}
-
-					if i > 0 {
-						return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
-					}
-
-					beginExpr, err := typeCheckAndRequire(ctx, semaCtx, p.Begin, types.Int, "ARRAY subscript")
-					if err != nil {
-						return nil, err
-					}
-					p.Begin = beginExpr
-				}
-
-				valExpr, err := expr.Updates[i].TypeCheck(ctx, semaCtx, types.Any)
-				if err != nil {
-					return nil, err
-				}
-				expr.Updates[i] = valExpr
-			}
-		}
-
-		if OnTypeCheckArraySubscript != nil {
-			OnTypeCheckArraySubscript()
-		}
-	case types.JsonFamily:
-		expr.typ = typ
-		for _, t := range expr.Indirection {
+			subTyp = subTyp.ArrayContents()
+			prevArray = true
+			encounteredArray = true
+		case types.JsonFamily:
 			if t.Slice {
 				return nil, pgerror.Newf(pgcode.DatatypeMismatch, "jsonb subscript does not support slices")
 			}
@@ -792,49 +827,168 @@ func (expr *IndirectionExpr) TypeCheck(
 				)
 			}
 			t.Begin = beginExpr
-		}
-
-		if len(expr.Paths) > 0 {
-			for i, t := range expr.Paths {
-				for _, p := range t {
-					if p.Slice {
-						return nil, pgerror.Newf(pgcode.DatatypeMismatch, "jsonb subscript does not support slices")
-					}
-
-					beginExpr, err := typeCheckAndRequire(ctx, semaCtx, p.Begin, types.Int, "ARRAY subscript")
-					if err != nil {
-						return nil, err
-					}
-					switch beginExpr.ResolvedType().Family() {
-					case types.IntFamily, types.StringFamily, types.UnknownFamily:
-					default:
-						return nil, errors.WithHint(
-							pgerror.Newf(
-								pgcode.DatatypeMismatch,
-								"unexpected JSON subscript type: %s",
-								beginExpr.ResolvedType().SQLString(),
-							),
-							"subscript type must be integer or text",
-						)
-					}
-					p.Begin = beginExpr
-				}
-
-				valExpr, err := expr.Updates[i].TypeCheck(ctx, semaCtx, types.Any)
-				if err != nil {
-					return nil, err
-				}
-				expr.Updates[i] = valExpr
+			prevArray = false
+			encounteredJson = true
+		case types.TupleFamily:
+			if string(t.Name) == "" {
+				return nil, pgerror.Newf(pgcode.DatatypeMismatch, "Composite types must be subscripted by label name")
 			}
-		}
 
-		if OnTypeCheckJSONBSubscript != nil {
-			OnTypeCheckJSONBSubscript()
+			label_idx := -1
+			for i, label := range subTyp.TupleLabels() {
+				if label == string(t.Name) {
+					label_idx = i
+					break
+				}
+			}
+
+			if label_idx == -1 {
+				return nil, pgerror.Newf(pgcode.UndefinedColumn,
+					"could not identify column %q in %s",
+					ErrString(&t.Name), subTyp,
+				)
+			}
+
+			t.ColIndex = label_idx
+			subTyp = subTyp.TupleContents()[label_idx]
+			encounteredArray = false
+		default:
+			return nil, pgerror.Newf(pgcode.DatatypeMismatch, "cannot subscript type %s because it is not an array or json object", subTyp)
 		}
-	default:
-		return nil, pgerror.Newf(pgcode.DatatypeMismatch, "cannot subscript type %s because it is not an array or json object", typ)
 	}
+
+	if encounteredArray && (OnTypeCheckArraySubscript != nil) {
+		OnTypeCheckArraySubscript()
+	}
+
+	if encounteredJson && (OnTypeCheckJSONBSubscript != nil) {
+		OnTypeCheckJSONBSubscript()
+	}
+	
+	expr.typ = subTyp
 	return expr, nil
+
+
+	// switch typ.Family() {
+	// case types.ArrayFamily:
+	// 	expr.typ = typ.ArrayContents()
+	// 	for i, t := range expr.Indirection {
+	// 		if t.Slice {
+	// 			return nil, unimplemented.NewWithIssuef(32551, "ARRAY slicing in %s", expr)
+	// 		}
+	// 		if i > 0 {
+	// 			return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
+	// 		}
+
+	// 		beginExpr, err := typeCheckAndRequire(ctx, semaCtx, t.Begin, types.Int, "ARRAY subscript")
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 		t.Begin = beginExpr
+	// 	}
+
+	// 	if len(expr.Paths) > 0 {
+	// 		for _, t := range expr.Paths {
+	// 			for i, p := range t {
+	// 				if p.Slice {
+	// 					endExpr, err := typeCheckAndRequire(ctx, semaCtx, p.End, types.Int, "ARRAY subscript")
+	// 					if err != nil {
+	// 						return nil, err
+	// 					}
+	// 					p.End = endExpr
+	// 				}
+
+	// 				if i > 0 {
+	// 					return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
+	// 				}
+
+	// 				beginExpr, err := typeCheckAndRequire(ctx, semaCtx, p.Begin, types.Int, "ARRAY subscript")
+	// 				if err != nil {
+	// 					return nil, err
+	// 				}
+	// 				p.Begin = beginExpr
+	// 			}
+
+	// 			// valExpr, err := expr.Updates[i].TypeCheck(ctx, semaCtx, types.Any)
+	// 			// if err != nil {
+	// 			// 	return nil, err
+	// 			// }
+	// 			// expr.Updates[i] = valExpr
+	// 		}
+	// 	}
+
+	// 	if OnTypeCheckArraySubscript != nil {
+	// 		OnTypeCheckArraySubscript()
+	// 	}
+	// case types.JsonFamily:
+	// 	expr.typ = typ
+	// 	for _, t := range expr.Indirection {
+	// 		if t.Slice {
+	// 			return nil, pgerror.Newf(pgcode.DatatypeMismatch, "jsonb subscript does not support slices")
+	// 		}
+	// 		beginExpr, err := t.Begin.TypeCheck(ctx, semaCtx, types.Any)
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 		switch beginExpr.ResolvedType().Family() {
+	// 		case types.IntFamily, types.StringFamily, types.UnknownFamily:
+	// 		default:
+	// 			return nil, errors.WithHint(
+	// 				pgerror.Newf(
+	// 					pgcode.DatatypeMismatch,
+	// 					"unexpected JSON subscript type: %s",
+	// 					beginExpr.ResolvedType().SQLString(),
+	// 				),
+	// 				"subscript type must be integer or text",
+	// 			)
+	// 		}
+	// 		t.Begin = beginExpr
+	// 	}
+
+	// 	if len(expr.Paths) > 0 {
+	// 		for _, t := range expr.Paths {
+	// 			for _, p := range t {
+	// 				if p.Slice {
+	// 					return nil, pgerror.Newf(pgcode.DatatypeMismatch, "jsonb subscript does not support slices")
+	// 				}
+
+	// 				beginExpr, err := p.Begin.TypeCheck(ctx, semaCtx, types.Any)
+	// 				if err != nil {
+	// 					return nil, err
+	// 				}
+	// 				switch beginExpr.ResolvedType().Family() {
+	// 				case types.IntFamily, types.StringFamily, types.UnknownFamily:
+	// 				default:
+	// 					return nil, errors.WithHint(
+	// 						pgerror.Newf(
+	// 							pgcode.DatatypeMismatch,
+	// 							"unexpected JSON subscript type: %s",
+	// 							beginExpr.ResolvedType().SQLString(),
+	// 						),
+	// 						"subscript type must be integer or text",
+	// 					)
+	// 				}
+	// 				p.Begin = beginExpr
+	// 			}
+
+	// 			// valExpr, err := expr.Updates[i].TypeCheck(ctx, semaCtx, types.Any)
+	// 			// if err != nil {
+	// 			// 	return nil, err
+	// 			// }
+	// 			// expr.Updates[i] = valExpr
+	// 		}
+	// 	}
+
+	// 	if OnTypeCheckJSONBSubscript != nil {
+	// 		OnTypeCheckJSONBSubscript()
+	// 	}
+	// case types.TupleFamily:
+	// 	expr.typ = typ
+	// 	return expr, nil
+	// default:
+	// 	return nil, pgerror.Newf(pgcode.DatatypeMismatch, "cannot subscript type %s because it is not an array or json object", typ)
+	// }
+	// return expr, nil
 }
 
 // TypeCheck implements the Expr interface.
@@ -987,6 +1141,24 @@ func (expr *ColumnAccessExpr) TypeCheck(
 	// Otherwise, let the expression be, it's probably more complex.
 	// Just annotate the type of the result properly.
 	expr.typ = resolvedType.TupleContents()[expr.ColIndex]
+	return expr, nil
+}
+
+func (expr *ColumnMutateExpr) TypeCheck(
+	ctx context.Context, semaCtx *SemaContext, desired *types.T,
+) (TypedExpr, error) {
+	subExpr, err := expr.Expr.TypeCheck(ctx, semaCtx, types.Any)
+	if err != nil {
+		return nil, err
+	}
+
+	expr.Expr = subExpr
+	expr.typ = subExpr.ResolvedType()
+	updateExpr, err := expr.Update.TypeCheck(ctx, semaCtx, types.Any)
+	if err != nil {
+		return nil, err
+	}
+	expr.Update = updateExpr
 	return expr, nil
 }
 

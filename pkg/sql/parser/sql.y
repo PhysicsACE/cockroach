@@ -1490,6 +1490,10 @@ func (u *sqlSymUnion) showFingerprintOptions() *tree.ShowFingerprintOptions {
 %type <tree.UpdateExprs> set_clause_list
 %type <*tree.UpdateExpr> set_clause multiple_set_clause
 %type <tree.ArraySubscripts> array_subscripts
+%type <tree.ArraySubscripts> other_subscripts
+%type <tree.ArraySubscripts> field_access_ops
+%type <*tree.ArraySubscript> field_access_op
+%type <*tree.ArraySubscript> other_subscript
 %type <tree.ColumnRef> column_ref
 %type <tree.ColumnRefList> column_ref_list
 %type <tree.GroupBy> group_clause
@@ -12471,9 +12475,9 @@ insert_rest:
   {
     $$.val = &tree.Insert{Rows: $1.slct()}
   }
-| '(' insert_column_list ')' select_stmt
+| '(' column_ref_list ')' select_stmt
   {
-    $$.val = &tree.Insert{Columns: $2.nameList(), Rows: $4.slct()}
+    $$.val = &tree.Insert{Columns: $2.columnRefList(), Rows: $4.slct()}
   }
 | DEFAULT VALUES
   {
@@ -12634,7 +12638,7 @@ column_ref:
   {
     $$.val = tree.ColumnRef{Name: tree.Name($1)}
   }
-| column_name array_subscripts
+| column_name other_subscripts
   {
     $$.val = tree.ColumnRef{Name: tree.Name($1), Subscripts: $2.arraySubscripts()}
   }
@@ -15221,6 +15225,13 @@ c_expr:
   {
     $$.val = &tree.Subquery{Select: $2.selectStmt(), Exists: true}
   }
+| '(' a_expr ')' field_access_ops
+  {
+    $$.val = &tree.IndirectionExpr{
+      Expr: $2.expr(),
+      Indirection: $4.arraySubscripts(),
+    }
+  }
 
 // Productions that can be followed by a postfix operator.
 //
@@ -15239,18 +15250,43 @@ c_expr:
 //     // - .a.b[123][5456].c.d
 //     // NOT [123] directly, this is handled in c_expr above.
 //
-//     field_access_ops:
-//       field_access_op
-//     | field_access_op other_subscripts
-//
-//     field_access_op:
-//       '.' name
-//     other_subscripts:
-//       other_subscript
-//     | other_subscripts other_subscript
-//     other_subscript:
-//        field_access_op
-//     |  array_subscripts
+
+field_access_ops:
+  field_access_op
+  {
+    $$.val = tree.ArraySubscripts{$1.arraySubscript()}
+  }
+| field_access_op other_subscripts
+  {
+    $$.val = append($1.arraySubscripts(), $2.arraySubscript())
+  }
+
+field_access_op:
+ '.' name
+ {
+    $$.val = &tree.ArraySubscript{Name: tree.Name($2)}
+ }
+
+other_subscripts:
+  other_subscript
+  {
+    $$.val = tree.ArraySubscripts{$1.arraySubscript()}
+  }
+| other_subscripts other_subscript
+  {
+    $$.val = append($1.arraySubscripts(), $2.arraySubscript())
+  }
+
+other_subscript:
+  field_access_op
+  {
+    $$.val = $1.arraySubscript()
+  }
+| array_subscript
+  {
+    $$.val = $1.arraySubscript()
+  }
+
 
 d_expr:
   ICONST
@@ -15319,10 +15355,6 @@ d_expr:
 | '(' a_expr ')' '.' '*'
   {
     $$.val = &tree.TupleStar{Expr: $2.expr()}
-  }
-| '(' a_expr ')' '.' unrestricted_name
-  {
-    $$.val = &tree.ColumnAccessExpr{Expr: $2.expr(), ColName: tree.Name($5) }
   }
 | '(' a_expr ')' '.' '@' ICONST
   {

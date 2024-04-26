@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
@@ -201,9 +202,11 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 				"cannot specify both a list of column IDs and a list of column names"))
 		}
 
-		ins.Columns = make(tree.NameList, len(refColumns))
+		ins.Columns = make(tree.ColumnRefList, len(refColumns))
 		for i, ord := range resolveNumericColumnRefs(tab, refColumns) {
-			ins.Columns[i] = tab.Column(ord).ColName()
+			ins.Columns[i] = tree.ColumnRef{
+				Name: tab.Column(ord).ColName(),
+			}
 		}
 	}
 
@@ -424,13 +427,13 @@ func (mb *mutationBuilder) needExistingRows() bool {
 
 // addTargetNamedColsForInsert adds a list of user-specified column names to the
 // list of table columns that are the target of the Insert operation.
-func (mb *mutationBuilder) addTargetNamedColsForInsert(names tree.NameList) {
+func (mb *mutationBuilder) addTargetNamedColsForInsert(names tree.ColumnRefList) {
 	if len(mb.targetColList) != 0 {
 		panic(errors.AssertionFailedf("addTargetNamedColsForInsert cannot be called more than once"))
 	}
 
 	// Add target table columns by the names specified in the Insert statement.
-	mb.addTargetColsByName(names)
+	mb.addTargetRefsForInsert(names)
 
 	// Ensure that primary key columns are in the target column list, or that
 	// they have default values.
@@ -590,9 +593,30 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 	//   INSERT INTO <table> (...) VALUES (...)
 	//
 	var desiredTypes []*types.T
+	var refMap map[opt.ColumnID]int
 	if len(mb.targetColList) != 0 {
 		desiredTypes = make([]*types.T, len(mb.targetColList))
 		for i, colID := range mb.targetColList {
+			if _, ok := mb.refAgg[colID]; ok {
+				if refMap == nil {
+					refMap = make(map[opt.ColumnID]int)
+				} 
+				if _, ok := refMap[colID]; !ok {
+					refMap[colID] = 0
+				} else {
+					refMap[colID]++
+				}
+				ord := mb.tabID.ColumnOrdinal(colID)
+				targetType, err := mb.fetchPartialAssignmentCast(
+					ord,
+					mb.refAgg[colID].Paths[refMap[colID]],
+				)
+				if err != nil {
+					panic(err)
+				}
+				desiredTypes[i] = targetType
+				continue
+			}
 			desiredTypes[i] = mb.md.ColumnMeta(colID).Type
 		}
 	} else {
@@ -623,7 +647,8 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 	//   3. Add column ID to the insertColIDs list.
 	for i := range mb.outScope.cols {
 		inCol := &mb.outScope.cols[i]
-		ord := mb.tabID.ColumnOrdinal(mb.targetColList[i])
+		colID := mb.targetColList[i]
+		ord := mb.tabID.ColumnOrdinal(colID)
 
 		// Raise an error if the target column is a `GENERATED ALWAYS AS
 		// IDENTITY` column. Such a column is not allowed to be explicitly
@@ -639,11 +664,39 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 		}
 
 		// Assign name of input column.
-		inCol.name = scopeColName(tree.Name(mb.md.ColumnMeta(mb.targetColList[i]).Alias))
+		inCol.name = scopeColName(tree.Name(mb.md.ColumnMeta(colID).Alias))
+		if _, ok := mb.refAgg[colID]; ok {
+			refExpr := &tree.UnresolvedName{
+				NumParts: 1,
+				Parts:    tree.NameParts{string(inCol.name.refName)},
+			}
+			srcType := inCol.typ
+			targetType := desiredTypes[i]
+			if srcType.Identical(targetType) {
+				typedRef := mb.outScope.resolveType(refExpr, targetType)
+				mb.refAgg[colID].AddAdditionalUpdate(typedRef)
+			} else {
+				if !cast.ValidCast(srcType, targetType, cast.ContextAssignment) {
+					panic(sqlerrors.NewInvalidAssignmentCastError(srcType, targetType, string(inCol.name.refName)))
+				}
+				casted := &tree.AssignmentCastExpr{
+					Expr: refExpr,
+					Type: targetType,
+				}
+				typedCasted := mb.outScope.resolveType(casted, targetType)
+				mb.refAgg[colID].AddAdditionalUpdate(typedCasted)
+			}
+			mb.generatedCols.Add(colID)
+			continue
+		}
 
 		// Record the ID of the column that contains the value to be inserted
 		// into the corresponding target table column.
 		mb.insertColIDs[ord] = inCol.id
+	}
+
+	if mb.generatedCols.Len() > 0 {
+		mb.addGeneratedColsForInsert()
 	}
 
 	// Add assignment casts for insert columns.
@@ -860,12 +913,12 @@ func (mb *mutationBuilder) buildInputForUpsert(
 //
 // The UPSERT statement will update the value of column "b" from 2 => 2.0, but
 // will not modify column "a".
-func (mb *mutationBuilder) setUpsertCols(insertCols tree.NameList) {
+func (mb *mutationBuilder) setUpsertCols(insertCols tree.ColumnRefList) {
 	if len(insertCols) != 0 {
-		for _, name := range insertCols {
+		for _, ref := range insertCols {
 			// Table column must exist, since existence of insertCols has already
 			// been checked previously.
-			ord := findPublicTableColumnByName(mb.tab, name)
+			ord := findPublicTableColumnByName(mb.tab, ref.Name)
 			mb.updateColIDs[ord] = mb.insertColIDs[ord]
 		}
 	} else {

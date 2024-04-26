@@ -265,13 +265,19 @@ func (b *Builder) buildScalar(
 					}
 				}
 
-				values := memo.ScalarListExpr{
-					b.buildScalar(t.Updates[i].(tree.TypedExpr), inScope, nil, nil, colRefs),
-				}
+				value := b.buildScalar(t.Updates[i].(tree.TypedExpr), inScope, nil, nil, colRefs)
+				initStep := out
 
 				for i := len(path) - 1; i >= 0; i-- {
-					e := out
+					e := initStep
 					for j := 0; j < i; j++ {
+						if string(path[j].Name) != "" {
+							e = b.factory.ConstructColumnAccess(
+								e,
+								memo.TupleOrdinal(path[j].ColIndex),
+							)
+							continue
+						}
 						begin := memo.ScalarListExpr{
 							b.buildScalar(path[j].Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
 						}
@@ -291,6 +297,17 @@ func (b *Builder) buildScalar(
 							containsSlice,
 						)
 					}
+
+					if string(path[i].Name) != "" {
+						out = b.factory.ConstructColumnMutate(
+							e,
+							value,
+							memo.TupleOrdinal(path[i].ColIndex),
+						)
+						value = out
+						continue
+					}
+
 					begin := memo.ScalarListExpr{
 						b.buildScalar(path[i].Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
 					}
@@ -300,6 +317,11 @@ func (b *Builder) buildScalar(
 					if path[i].Slice {
 						b.buildScalar(path[i].End.(tree.TypedExpr), inScope, nil, nil, colRefs)
 					}
+
+					values := memo.ScalarListExpr{
+						value,
+					}
+					
 					out = b.factory.ConstructIndirection(
 						e,
 						begin,
@@ -307,9 +329,7 @@ func (b *Builder) buildScalar(
 						values,
 						containsSlice,
 					)
-					values = memo.ScalarListExpr{
-						out,
-					}
+					value = out
 				}
 			}
 			break
@@ -323,6 +343,13 @@ func (b *Builder) buildScalar(
 		}
 
 		for _, subscript := range t.Indirection {
+			if string(subscript.Name) != "" {
+				out = b.factory.ConstructColumnAccess(
+					out,
+					memo.TupleOrdinal(subscript.ColIndex),
+				)
+				continue
+			}
 			begin := memo.ScalarListExpr{
 				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
 			}
@@ -464,6 +491,11 @@ func (b *Builder) buildScalar(
 	case *tree.ColumnAccessExpr:
 		input := b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
 		out = b.factory.ConstructColumnAccess(input, memo.TupleOrdinal(t.ColIndex))
+
+	case *tree.ColumnMutateExpr:
+		input := b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		update := b.buildScalar(t.Update.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		out = b.factory.ConstructColumnMutate(input, update, memo.TupleOrdinal(t.ColIndex))
 
 	case *tree.ComparisonExpr:
 		if sub, ok := t.Right.(*subquery); ok && sub.isMultiRow() {

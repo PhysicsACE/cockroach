@@ -1186,10 +1186,14 @@ func (c *copyMachine) insertRowsInternal(ctx context.Context, finalBatch bool) (
 		vc = &tree.ValuesClause{Rows: exprs}
 	}
 
+	colRefList := make(tree.ColumnRefList, len(c.columns))
+	for _, name := range c.columns {
+		colRefList = append(colRefList, tree.ColumnRef{Name: name})
+	}
 	c.p.stmt = Statement{}
 	c.p.stmt.AST = &tree.Insert{
 		Table:   c.table,
-		Columns: c.columns,
+		Columns: colRefList,
 		Rows: &tree.Select{
 			Select: vc,
 		},

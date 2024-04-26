@@ -22,7 +22,7 @@ import (
 
 // This file houses the fetch and assignment executors for the various container types in CockroachDB
 
-type executor func(ctx context.Context, e *evaluator, container tree.Datum, subscripts tree.ArraySubscripts, update tree.Datum) (tree.Datum, error)
+type executor func(ctx context.Context, e *evaluator, container tree.Datum, subscripts tree.ArraySubscripts, update tree.Datum, containerType *types.T) (tree.Datum, error)
 
 func arrayUpdate(
 	ctx context.Context,
@@ -30,8 +30,14 @@ func arrayUpdate(
 	container tree.Datum,
 	subscripts tree.ArraySubscripts,
 	update tree.Datum,
+	containerType *types.T,
 ) (tree.Datum, error) {
-	res := tree.MustBeDArray(container)
+	var res *tree.DArray
+	if container == tree.DNull {
+		res = tree.NewDArray(containerType.ArrayContents())
+	} else {
+		res = tree.MustBeDArray(container)
+	}
 	maximum := func(a int, b int) int {
 		if a <= b {
 			return b
@@ -155,6 +161,7 @@ func jsonUpdate(
 	container   tree.Datum,
 	subscripts  tree.ArraySubscripts,
 	update      tree.Datum,
+	_ *types.T,
 ) (tree.Datum, error) {
 	v := tree.MustBeDJSON(update)
 	to := v.JSON
@@ -167,65 +174,11 @@ func jsonUpdate(
 	}
 	j := tree.MustBeDJSON(container)
 	curr := j.JSON
-	updated, err := recursiveUpdate(ctx, e, curr, subscripts, to)
+	updated, err := setValKeyOrIdx(ctx, e, curr, subscripts[0], to)
 	if err != nil {
 		return tree.DNull, err
 	}
 	return tree.NewDJSON(updated), nil
-}
-
-func recursiveUpdate(
-	ctx context.Context,
-	e *evaluator,
-	container json.JSON,
-	subscripts tree.ArraySubscripts,
-	to json.JSON,
-) (json.JSON, error) {
-	switch len(subscripts) {
-	case 0:
-		return container, nil
-	case 1:
-		return setValKeyOrIdx(ctx, e, container, subscripts[0], to)
-	default:
-		currSub := subscripts[0]
-		if currSub.Slice {
-			return nil, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
-		}
-		field, err := currSub.Begin.(tree.TypedExpr).Eval(ctx, e)
-		if err != nil {
-			return nil, err
-		}
-		curr := container
-		switch field.ResolvedType().Family() {
-		case types.StringFamily:
-			if curr, err = curr.FetchValKeyOrIdx(string(tree.MustBeDString(field))); err != nil {
-				return nil, err
-			}
-		case types.IntFamily:
-			if curr, err = curr.FetchValIdx(int(tree.MustBeDInt(field))); err != nil {
-				return nil, err
-			}
-		default:
-			return nil, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
-		}
-		var sub json.JSON
-		if curr == nil {
-			sub, err = constructPath(ctx, e, subscripts[1:], to)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			sub, err = recursiveUpdate(ctx, e, curr, subscripts[1:], to)
-			if err != nil {
-				return nil, err
-			}
-		}
-		newJSON, err := setValKeyOrIdx(ctx, e, container, subscripts[0], sub)
-		if err != nil {
-			return nil, err
-		}
-		return newJSON, nil
-	}
 }
 
 func constructPath(
@@ -234,52 +187,24 @@ func constructPath(
 	subscripts tree.ArraySubscripts,
 	to json.JSON,
 ) (json.JSON, error) {
-	switch len(subscripts) {
-	case 0:
-		return to, nil
-	case 1:
-		subscript := subscripts[0]
-		if subscript.Slice {
-			return nil, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
-		}
-		field, err := subscript.Begin.(tree.TypedExpr).Eval(ctx, e)
-		if err != nil {
-			return nil, err
-		}
-		var container json.JSON
-		switch field.ResolvedType().Family() {
-		case types.StringFamily:
-			container = json.EmptyJSONObject()
-		case types.ArrayFamily:
-			container = json.EmptyJSONArray()
-		default:
-			return nil, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
-		}
-		return setValKeyOrIdx(ctx, e, container, subscript, to)
-	default:
-		subscript := subscripts[len(subscripts) - 1]
-		if subscript.Slice {
-			return nil, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
-		}
-		field, err := subscript.Begin.(tree.TypedExpr).Eval(ctx, e)
-		if err != nil {
-			return nil, err
-		}
-		var container json.JSON
-		switch field.ResolvedType().Family() {
-		case types.StringFamily:
-			container = json.EmptyJSONObject()
-		case types.ArrayFamily:
-			container = json.EmptyJSONArray()
-		default:
-			return nil, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
-		}
-		constructed, err := setValKeyOrIdx(ctx, e, container, subscript, to)
-		if err != nil {
-			return nil, err
-		}
-		return constructPath(ctx, e, subscripts[:len(subscripts) - 1], constructed)
+	subscript := subscripts[0]
+	if subscript.Slice {
+		return nil, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
 	}
+	field, err := subscript.Begin.(tree.TypedExpr).Eval(ctx, e)
+	if err != nil {
+		return nil, err
+	}
+	var container json.JSON
+	switch field.ResolvedType().Family() {
+	case types.StringFamily:
+		container = json.EmptyJSONObject()
+	case types.ArrayFamily:
+		container = json.EmptyJSONArray()
+	default:
+		return nil, errors.AssertionFailedf("unsupported subscription type, should have been rejected during planning")
+	}
+	return setValKeyOrIdx(ctx, e, container, subscript, to)
 }
 
 func setValKeyOrIdx(
@@ -341,7 +266,6 @@ func setValKeyOrIdx(
 			return nil, errors.AssertionFailedf("Cannot replace existing key")
 	}
 }
-
 
 func FetchUpdateExecutor(typ *types.T) (executor, error) {
 	switch typ.Family() {

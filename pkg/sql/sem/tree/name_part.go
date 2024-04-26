@@ -134,10 +134,17 @@ type ArraySubscript struct {
 	Begin Expr
 	End   Expr
 	Slice bool
+	Name  Name
+	ColIndex int
 }
 
 // Format implements the NodeFormatter interface.
 func (a *ArraySubscript) Format(ctx *FmtCtx) {
+	if a.Name != "" {
+		ctx.WriteByte('.')
+		ctx.FormatNode(&a.Name)
+		return
+	}
 	ctx.WriteByte('[')
 	if a.Begin != nil {
 		ctx.FormatNode(a.Begin)

@@ -246,6 +246,41 @@ func (e *evaluator) EvalColumnAccessExpr(
 	return d.(*tree.DTuple).D[expr.ColIndex], nil
 }
 
+func (e *evaluator) EvalColumnMutateExpr(
+	ctx context.Context, expr *tree.ColumnMutateExpr,
+) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
+	if err != nil {
+		return nil, err
+	}
+	update, err := expr.Update.(tree.TypedExpr).Eval(ctx, e)
+	if err != nil {
+		return nil, err
+	}
+	typ := expr.Expr.(tree.TypedExpr).ResolvedType()
+	fmt.Println("ColumnMutate, ", d, update)
+	updatedVals := make(tree.Datums, len(typ.TupleContents()))
+	if d == tree.DNull {
+		for i := 0; i < len(updatedVals); i++ {
+			if i == expr.ColIndex {
+				updatedVals[i] = update
+				continue
+			}
+			updatedVals[i] = tree.DNull
+		}
+		return tree.NewDTuple(typ, updatedVals...), nil
+	}
+	t := tree.MustBeDTuple(d)
+	for i := 0; i < len(updatedVals); i++ {
+		if i == expr.ColIndex {
+			updatedVals[i] = update
+			continue
+		}
+		updatedVals[i] = t.D[i]
+	}
+	return tree.NewDTuple(typ, updatedVals...), nil
+}
+
 func (e *evaluator) EvalColumnItem(ctx context.Context, expr *tree.ColumnItem) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
@@ -305,13 +340,9 @@ func (e *evaluator) EvalIndirectionExpr(
 		return nil, err
 	}
 
-	if d == tree.DNull {
-		return d, nil
-	}
-
 	if expr.Assign {
-		fmt.Println("assignment updates", expr.Updates)
-		executor, err := FetchUpdateExecutor(d.ResolvedType())
+		containerType := expr.Expr.(tree.TypedExpr).ResolvedType()
+		executor, err := FetchUpdateExecutor(containerType)
 		if err != nil {
 			return nil, err
 		}
@@ -320,11 +351,15 @@ func (e *evaluator) EvalIndirectionExpr(
 		if err != nil {
 			return nil, err
 		}
-		res, err := executor(ctx, e, d, expr.Indirection, updateDatum)
+		res, err := executor(ctx, e, d, expr.Indirection, updateDatum, containerType)
 		if err != nil {
 			return nil, err
 		}
 		return res, nil
+	}
+
+	if d == tree.DNull {
+		return d, nil
 	}
 
 	switch d.ResolvedType().Family() {

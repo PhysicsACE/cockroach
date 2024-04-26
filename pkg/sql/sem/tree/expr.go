@@ -1608,7 +1608,7 @@ func (node *IndirectionExpr) AddAdditionalPath(path ArraySubscripts) {
 	node.Paths = append(node.Paths, path)
 }
 
-func (node *IndirectionExpr) AddAdditionalUpdate(val Expr) {
+func (node *IndirectionExpr) AddAdditionalUpdate(val TypedExpr) {
 	if node.Updates == nil {
 		node.Updates = make([]Expr, 0)
 	}
@@ -1766,6 +1766,34 @@ func (node *ColumnAccessExpr) Format(ctx *FmtCtx) {
 	}
 }
 
+// ColumnMutateExpr represents expressions inside mutation statements of the 
+// form E.x = ...
+type ColumnMutateExpr struct {
+	Expr     Expr
+	ColIndex int
+	Update   Expr
+	
+	typeAnnotation
+}
+
+func NewTypedColumnMutateExpr(expr TypedExpr, colIdx int, update TypedExpr) *ColumnMutateExpr {
+	return &ColumnMutateExpr{
+		Expr:     expr,
+		ColIndex: colIdx,
+		Update:   update,
+		typeAnnotation: typeAnnotation{
+			typ: expr.ResolvedType(),
+		},
+	}
+}
+
+func (node *ColumnMutateExpr) Format(ctx *FmtCtx) {
+	ctx.FormatNode(node.Expr)
+	ctx.WriteString(".")
+	fmt.Fprintf(ctx, "@%d = ", node.ColIndex+1)
+	ctx.FormatNode(node.Update)
+}
+
 func (node *AliasedTableExpr) String() string { return AsString(node) }
 func (node *ParenTableExpr) String() string   { return AsString(node) }
 func (node *JoinTableExpr) String() string    { return AsString(node) }
@@ -1777,6 +1805,7 @@ func (node *CastExpr) String() string         { return AsString(node) }
 func (node *AssignmentCastExpr) String() string { return AsString(node) }
 func (node *CoalesceExpr) String() string     { return AsString(node) }
 func (node *ColumnAccessExpr) String() string { return AsString(node) }
+func (node *ColumnMutateExpr) String() string { return AsString(node) }
 func (node *CollateExpr) String() string      { return AsString(node) }
 func (node *ComparisonExpr) String() string   { return AsString(node) }
 func (node *Datums) String() string           { return AsString(node) }

@@ -1135,7 +1135,7 @@ func (m *pgDumpReader) readFile(
 				targetColMapIdx = make([]int, len(i.Columns))
 				conv.TargetColOrds = intsets.Fast{}
 				for j := range i.Columns {
-					colName := string(i.Columns[j])
+					colName := string(i.Columns[j].Name)
 					idx, ok := m.colMap[conv][colName]
 					if !ok {
 						return errors.Newf("targeted column %q not found", colName)

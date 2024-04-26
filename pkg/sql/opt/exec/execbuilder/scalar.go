@@ -65,6 +65,7 @@ func init() {
 		opt.AssignmentCastOp: (*Builder).buildAssignmentCast,
 		opt.CoalesceOp:       (*Builder).buildCoalesce,
 		opt.ColumnAccessOp:   (*Builder).buildColumnAccess,
+		opt.ColumnMutateOp:   (*Builder).buildColumnMutate,
 		opt.ArrayOp:          (*Builder).buildArray,
 		opt.AnyOp:            (*Builder).buildAny,
 		opt.AnyScalarOp:      (*Builder).buildAnyScalar,
@@ -430,6 +431,22 @@ func (b *Builder) buildColumnAccess(
 		lbl = childTyp.TupleLabels()[colIdx]
 	}
 	return tree.NewTypedColumnAccessExpr(input, tree.Name(lbl), colIdx), nil
+}
+
+func (b *Builder) buildColumnMutate(
+	ctx *buildScalarCtx, scalar opt.ScalarExpr,
+) (tree.TypedExpr, error) {
+	colMutate := scalar.(*memo.ColumnMutateExpr)
+	input, err := b.buildScalar(ctx, colMutate.Input)
+	if err != nil {
+		return nil, err
+	}
+	update, err := b.buildScalar(ctx, colMutate.Update)
+	if err != nil {
+		return nil, err
+	}
+	idx := int(colMutate.Idx)
+	return tree.NewTypedColumnMutateExpr(input, idx, update), nil
 }
 
 func (b *Builder) buildArray(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.TypedExpr, error) {

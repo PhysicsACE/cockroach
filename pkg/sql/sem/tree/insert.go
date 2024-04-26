@@ -23,7 +23,7 @@ package tree
 type Insert struct {
 	With       *With
 	Table      TableExpr
-	Columns    NameList
+	Columns    ColumnRefList
 	Rows       *Select
 	OnConflict *OnConflict
 	Returning  ReturningClause

@@ -256,22 +256,25 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 							NumParts: 1,
 							Parts:    tree.NameParts{newColName},
 						}
-						// srcType := subqueryScope.cols[i].ResolvedType()
-						// targetType := mb.fetchPartialAssignmentCast(ord, mb.refAgg[colID].Paths[len(mb.refAgg[colID].Updates)])
-						// if srcType.Identical(targetType) {
-						// 	mb.refAgg[colID].AddAdditionalUpdate(refExpr)
-						// } else {
-						// 	if !cast.(srcType, targetType, cast.ContextAssignment) {
-						// 		panic(sqlerrors.NewInvalidCastError(srcType, targetType, string(targetCol.ColName())))
-						// 	}
-						// 	casted := &tree.CastExpr{
-						// 		Expr: refExpr,
-						// 		Type: targetType,
-						// 		asAssignment: true,
-						// 	}
-						// 	mb.refAgg[colID].AddAdditionalUpdate(casted)
-						// }
-						mb.refAgg[colID].AddAdditionalUpdate(refExpr)
+						srcType := subqueryScope.cols[i].ResolvedType()
+						targetType, err := mb.fetchPartialAssignmentCast(ord, mb.refAgg[colID].Paths[len(mb.refAgg[colID].Updates)])
+						if err != nil {
+							panic(err)
+						}
+						if srcType.Identical(targetType) {
+							typedRef := inScope.resolveType(refExpr, targetType)
+							mb.refAgg[colID].AddAdditionalUpdate(typedRef)
+						} else {
+							if !cast.ValidCast(srcType, targetType, cast.ContextAssignment) {
+								panic(sqlerrors.NewInvalidAssignmentCastError(srcType, targetType, string(targetCol.ColName())))
+							}
+							casted := &tree.AssignmentCastExpr{
+								Expr: refExpr,
+								Type: targetType,
+							}
+							typedCasted := inScope.resolveType(casted, targetType)
+							mb.refAgg[colID].AddAdditionalUpdate(typedCasted)
+						}
 						mb.generatedCols.Add(colID)
 						subscriptFlag = true
 					}
@@ -310,7 +313,27 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 					colID := mb.targetColList[n]
 					if len(ref.Subscripts) > 0 {
 						if _, ok := mb.refAgg[colID]; ok {
-							mb.refAgg[colID].AddAdditionalUpdate(t.Exprs[i])
+							ord := mb.tabID.ColumnOrdinal(colID)
+							targetCol := mb.tab.Column(ord)
+							srcExpr := inScope.resolveType(t.Exprs[i], targetCol.DatumType())
+							srcType := srcExpr.ResolvedType()
+							targetType, err := mb.fetchPartialAssignmentCast(ord, mb.refAgg[colID].Paths[len(mb.refAgg[colID].Updates)])
+							if err != nil {
+								panic(err)
+							}
+							if srcType.Identical(targetType) {
+								mb.refAgg[colID].AddAdditionalUpdate(srcExpr)
+							} else {
+								if !cast.ValidCast(srcType, targetType, cast.ContextAssignment) {
+									panic(sqlerrors.NewInvalidAssignmentCastError(srcType, targetType, string(targetCol.ColName())))
+								}
+								casted := &tree.AssignmentCastExpr{
+									Expr: t.Exprs[i],
+									Type: targetType,
+								}
+								typedCasted := inScope.resolveType(casted, targetType)
+								mb.refAgg[colID].AddAdditionalUpdate(typedCasted)
+							}
 							subscriptFlag = true
 						}
 					}
@@ -325,35 +348,35 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 				}
 			}
 		} else {
-			// expr := set.Expr
-			// if len(set.ColumnRefs) > 0 {
-			// 	panic(errors.AssertionFailedf("expected <= 1 column ref, found %d", len(set.ColumnRefs)))
-			// }
-			// colID := mb.targetColList[n]
-			// for _, ref := range set.ColumnRefs {
-			// 	if len(ref.Subscripts) > 0 {
-			// 		mb.refAgg[colID].AddAdditionalUpdate(expr)
-			// 		subscriptFlag = true
-			// 	}
-			// }
-
-			// if subscriptFlag {
-			// 	n++
-			// 	continue
-			// }
-
-			// expr := set.Expr
-			// if len(set.ColumnRefs) > 0 {
-			// 	panic(errors.AssertionFailedf("expected <= 1 column ref, found %d", len(set.ColumnRefs)))
-			// }
-
 			expr := set.Expr
-
+			colID := mb.targetColList[n]
 			for _, ref := range set.ColumnRefs {
 				if len(ref.Subscripts) > 0 {
-					if _, ok := mb.refAgg[mb.targetColList[n]]; ok {
-						mb.refAgg[mb.targetColList[n]].AddAdditionalUpdate(expr)
-						// addCol(mb.refAgg[mb.targetColList[n]], mb.targetColList[n])
+					if _, ok := mb.refAgg[colID]; ok {
+						ord := mb.tabID.ColumnOrdinal(colID)
+						targetCol := mb.tab.Column(ord)
+						srcExpr := inScope.resolveType(expr, targetCol.DatumType())
+						srcType := srcExpr.ResolvedType()
+						targetType, err := mb.fetchPartialAssignmentCast(ord, mb.refAgg[colID].Paths[len(mb.refAgg[colID].Updates)])
+						if err != nil {
+							panic(err)
+						}
+						fmt.Println("srctype vs targettype", srcType, targetType)
+						if srcType.Identical(targetType) {
+							fmt.Println("Benchod")
+							mb.refAgg[colID].AddAdditionalUpdate(srcExpr)
+						} else {
+							fmt.Println("Not Benchod")
+							if !cast.ValidCast(srcType, targetType, cast.ContextAssignment) {
+								panic(sqlerrors.NewInvalidAssignmentCastError(srcType, targetType, string(targetCol.ColName())))
+							}
+							casted := &tree.AssignmentCastExpr{
+								Expr: expr,
+								Type: targetType,
+							}
+							typedCasted := inScope.resolveType(casted, targetType)
+							mb.refAgg[colID].AddAdditionalUpdate(typedCasted)
+						}
 						subscriptFlag = true
 					}
 				}
@@ -364,7 +387,7 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 				continue
 			}
 
-			addCol(expr, mb.targetColList[n])
+			addCol(expr, colID)
 			n++
 		}
 	}

@@ -752,6 +752,13 @@ define Indirection {
     Slice  bool
 }
 
+[Scalar]
+define ColumnMutate {
+    Input  ScalarExpr
+    Update ScalarExpr
+    Idx    TupleOrdinal
+}
+
 # ArrayFlatten is an ARRAY(<subquery>) expression. ArrayFlatten takes as input
 # a subquery which returns a single column and constructs a scalar array as the
 # output. Any NULLs are included in the results, and if the subquery has an

@@ -577,7 +577,60 @@ func (mb *mutationBuilder) addTargetColsByColumnRefs(refs tree.ColumnRefList) {
 	}
 }
 
+func (mb *mutationBuilder) addTargetRefsForInsert(refs tree.ColumnRefList) {
+	for _, ref := range refs {
+		name := ref.Name
+		if ord := findPublicTableColumnByName(mb.tab, name); ord != -1 {
+			if mb.tab.Column(ord).Kind() == cat.System {
+				panic(pgerror.Newf(pgcode.InvalidColumnReference, "cannot modify system column %q", name))
+			}
+
+			tabCol := mb.tab.Column(ord)
+			if tabCol.IsMutation() {
+				panic(makeBackfillError(tabCol.ColName()))
+			}
+
+			if tabCol.IsComputed() {
+				panic(schemaexpr.CannotWriteToComputedColError(string(tabCol.ColName())))
+			}
+
+			colID := mb.tabID.ColumnID(ord)
+			if ref.Subscripts != nil {
+				if _, ok := mb.refAgg[colID]; !ok {
+					mb.refAgg[colID] = &tree.IndirectionExpr{
+						Expr: &tree.AssignmentCastExpr{
+							Expr: tree.DNull,
+							Type: tabCol.DatumType(),
+						},
+						Indirection: ref.Subscripts,
+						Assign: true,
+					}
+				}
+				mb.refAgg[colID].AddAdditionalPath(ref.Subscripts)
+			}
+
+			if mb.targetColSet.Contains(colID) {
+				if ref.Subscripts == nil {
+					panic(pgerror.Newf(pgcode.Syntax,
+						"multiple assignments to the same column %q", tabCol.ColName()))
+				}
+			}
+
+			mb.targetColSet.Add(colID)
+			mb.targetColList = append(mb.targetColList, colID)
+		}
+	}
+}
+
 func (mb *mutationBuilder) addGeneratedColsForUpdate() {
+	mb.addGeneratedColsImpl(mb.updateColIDs)
+}
+
+func (mb *mutationBuilder) addGeneratedColsForInsert() {
+	mb.addGeneratedColsImpl(mb.insertColIDs)
+}
+
+func (mb *mutationBuilder) addGeneratedColsImpl(srcCols opt.OptionalColList) {
 	pb := makeProjectionBuilder(mb.b, mb.outScope)
 	mb.generatedCols.ForEach(func(colID opt.ColumnID) {
 		ord := mb.tabID.ColumnOrdinal(colID)
@@ -588,7 +641,7 @@ func (mb *mutationBuilder) addGeneratedColsForUpdate() {
 		)
 		if expr, ok := mb.refAgg[colID]; ok {
 			newCol, _ := pb.Add(colName, expr, targetCol.DatumType())
-			mb.updateColIDs[ord] = newCol
+			srcCols[ord] = newCol
 		}
 	})
 	mb.outScope = pb.Finish()
