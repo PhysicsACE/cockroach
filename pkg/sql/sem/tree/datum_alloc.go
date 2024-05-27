@@ -49,6 +49,7 @@ type DatumAlloc struct {
 	doidAlloc         []DOid
 	dvoidAlloc        []DVoid
 	dpglsnAlloc       []DPGLSN
+	ddomainAlloc      []DDomain
 	// stringAlloc is used by all datum types that are strings (DBytes, DString, DEncodedKey).
 	stringAlloc []string
 	env         CollationEnvironment
@@ -229,6 +230,20 @@ func (a *DatumAlloc) NewDEnum(v DEnum) *DEnum {
 	buf := &a.denumAlloc
 	if len(*buf) == 0 {
 		*buf = make([]DEnum, a.AllocSize)
+	}
+	r := &(*buf)[0]
+	*r = v
+	*buf = (*buf)[1:]
+	return r
+}
+
+func (a *DatumAlloc) NewDDomain(v DDomain) *DDomain {
+	if a.AllocSize == 0 {
+		a.AllocSize = defaultDatumAllocSize
+	}
+	buf := &a.ddomainAlloc
+	if len(*buf) == 0 {
+		*buf = make([]DDomain, a.AllocSize)
 	}
 	r := &(*buf)[0]
 	*r = v

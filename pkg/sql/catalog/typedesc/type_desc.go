@@ -43,6 +43,7 @@ var _ catalog.EnumTypeDescriptor = (*immutable)(nil)
 var _ catalog.RegionEnumTypeDescriptor = (*immutable)(nil)
 var _ catalog.AliasTypeDescriptor = (*immutable)(nil)
 var _ catalog.CompositeTypeDescriptor = (*immutable)(nil)
+var _ catalog.DomainTypeDescriptor = (*immutable)(nil)
 var _ catalog.TypeDescriptor = (*Mutable)(nil)
 var _ catalog.MutableDescriptor = (*Mutable)(nil)
 
@@ -510,6 +511,10 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 		}
 	case descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE:
 		vea.Report(errors.AssertionFailedf("invalid type descriptor: kind %s should never be serialized or validated", desc.Kind.String()))
+	case descpb.TypeDescriptor_DOMAIN:
+		if desc.Domain == nil {
+			vea.Report(errors.AssertionFailedf("DOMAIN type desc has nil domain type"))
+		}
 	default:
 		vea.Report(errors.AssertionFailedf("invalid type descriptor kind %s", desc.Kind.String()))
 	}
@@ -623,6 +628,13 @@ func (desc *immutable) ValidateForwardReferences(
 					t.String(), desc.GetName(),
 				))
 			}
+		}
+	}
+
+	if d := desc.AsDomainTypeDescriptor(); d != nil {
+		if d.UnderlyingType().UserDefined() {
+			vea.Report(errors.AssertionFailedf("invalid reference to user-defined type %q from domain type %q",
+				d.UnderlyingType().String(), desc.GetName(),))
 		}
 	}
 }
@@ -772,6 +784,12 @@ func (desc *immutable) AsTypesT() *types.T {
 			catid.TypeIDToOID(desc.ArrayTypeID),
 			contents,
 			labels,
+		)
+	case descpb.TypeDescriptor_DOMAIN:
+		return types.MakeDomain(
+			catid.TypeIDToOID(desc.GetID()),
+			catid.TypeIDToOID(desc.ArrayTypeID),
+			desc.Domain.Typ,
 		)
 	}
 	panic(errors.AssertionFailedf("unsupported descriptor kind %s", desc.Kind.String()))
@@ -1015,6 +1033,37 @@ func (desc *immutable) AsCompositeTypeDescriptor() catalog.CompositeTypeDescript
 // interface.
 func (desc *immutable) AsTableImplicitRecordTypeDescriptor() catalog.TableImplicitRecordTypeDescriptor {
 	return nil
+}
+
+func (desc *immutable) AsDomainTypeDescriptor() catalog.DomainTypeDescriptor {
+	if desc.Kind == descpb.TypeDescriptor_DOMAIN {
+		return desc
+	}
+	return nil
+}
+
+func (desc *immutable) UnderlyingType() *types.T {
+	return desc.Domain.Typ
+}
+
+func (desc *immutable) Nullable() bool {
+	return desc.Domain.Nullable
+}
+
+func (desc *immutable) Collation() string {
+	return *desc.Domain.Collate
+}
+
+func (desc *immutable) DefaultExpr() string {
+	return *desc.Domain.DefaultExpr
+}
+
+func (desc *immutable) ConstraintNames() []string {
+	return desc.Domain.ConstraintNames
+}
+
+func (desc *immutable) Constraints() []string {
+	return desc.Domain.Constraints
 }
 
 // Aliased implements the catalog.AliasTypeDescriptor interface.

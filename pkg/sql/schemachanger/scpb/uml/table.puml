@@ -94,6 +94,30 @@ object CompositeTypeAttrType
 CompositeTypeAttrType :  CompositeTypeID
 CompositeTypeAttrType :  TypeT
 
+Object DomainType
+
+DomainType :  TypeID
+DomainType :  ArrayTypeID
+
+Object DomainConstraint
+
+DomainConstraint :  DomainTypeID
+DomainConstraint :  CheckConstraint
+
+Object DomainConstraintName
+
+DomainConstraintName :  DomainTypeID
+DomainConstraintName :  ConstraintName
+
+Object DomainNotNull 
+
+DomainNotNull : DomainTypeID
+
+Object DomainDefaultExpression
+
+DomainDefaultExpression : DomainTypeID
+DomainDefaultExpression : DefaultExpr
+
 object ConstraintComment
 
 ConstraintComment :  TableID
@@ -413,6 +437,10 @@ Column <|-- ColumnOnUpdateExpression
 Column <|-- ColumnType
 CompositeType <|-- CompositeTypeAttrName
 CompositeType <|-- CompositeTypeAttrType
+DomainType <|-- DomainConstraint
+DomainType <|-- DomainConstraintName
+DomainType <|-- DomainNotNull
+DomainType <|-- DomainDefaultExpression
 PrimaryIndex <|-- ConstraintComment
 SecondaryIndex <|-- ConstraintComment
 UniqueWithoutIndexConstraint <|-- ConstraintComment

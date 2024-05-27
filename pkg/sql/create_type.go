@@ -13,6 +13,8 @@ package sql
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -35,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
@@ -323,6 +326,18 @@ func (p *planner) createUserDefinedType(params runParams, n *createTypeNode) err
 		return params.p.createCompositeWithID(
 			params, id, n.n.CompositeTypeList, n.dbDesc, n.typeName,
 		)
+	case tree.Domain:
+		return params.p.createDomainWithID(
+			params,
+			id,
+			n.n.UnderlyingType,
+			n.n.Collate,
+			n.n.DefaultVal,
+			n.n.Nullable,
+			n.n.CheckExprs,
+			n.typeName,
+			n.dbDesc,
+		)
 	}
 	return unimplemented.NewWithIssue(25123, "CREATE TYPE")
 }
@@ -464,6 +479,118 @@ func CreateCompositeTypeDesc(
 	}).BuildCreatedMutableType(), nil
 }
 
+func CreateDomainTypeDesc(
+	params runParams,
+	id descpb.ID,
+	underlyingType tree.ResolvableTypeReference,
+	dbDesc catalog.DatabaseDescriptor,
+	schema catalog.SchemaDescriptor,
+	collation string,
+	defaultVal tree.Expr,
+	nullable tree.NullableConstraint,
+	checkExprs []tree.ColumnTableDefCheckExpr,
+	typeName *tree.TypeName,
+) (*typedesc.Mutable, error) {
+	NamesSeen :=  make(map[tree.Name]struct{})
+	var unnamed intsets.Fast
+	for i, check := range checkExprs {
+		if string(check.ConstraintName) != "" {
+			if _, ok := NamesSeen[check.ConstraintName]; ok {
+				return nil, pgerror.Newf(
+					pgcode.InvalidObjectDefinition, "constraint name %q used more than once", check.ConstraintName,
+				)
+			}
+			NamesSeen[check.ConstraintName] = struct{}{}
+			continue
+		}
+		unnamed.Add(i)
+	}
+
+	if unnamed.Len() > 0 {
+		unnamedCounter := ""
+		candidatePrefix := typeName.Object() + "_check"
+		for i, ok := unnamed.Next(0); ok; i, ok = unnamed.Next(i + 1) {
+			found := false
+			for !found {
+				candidate := candidatePrefix + unnamedCounter
+				if _, ok := NamesSeen[tree.Name(candidate)]; !ok {
+					checkExprs[i].ConstraintName = tree.Name(candidate)
+					found = true
+				}
+				toNumeric, _ := strconv.Atoi(unnamedCounter)
+				unnamedCounter = strconv.Itoa(toNumeric + 1)
+			}
+		}
+	}
+
+	sort.Slice(checkExprs, func(i, j int) bool {
+		return checkExprs[i].ConstraintName < checkExprs[j].ConstraintName
+	})
+
+	sortedNames := make([]string, len(checkExprs))
+	sortedConstraints := make([]string, len(checkExprs))
+	for i, check := range checkExprs {
+		sortedNames[i] = string(check.ConstraintName)
+		texpr, err := tree.TypeCheck(params.ctx, check.Expr, &params.p.semaCtx, types.Bool)
+		if err != nil {
+			return nil, err
+		}
+		sortedConstraints[i] = tree.Serialize(texpr)
+	}
+
+	typ, err := tree.ResolveType(params.ctx, underlyingType, params.p.semaCtx.TypeResolver)
+	if err != nil {
+		return nil, err
+	}
+	err = tree.CheckUnsupportedType(params.ctx, &params.p.semaCtx, typ)
+	if err != nil {
+		return nil, err
+	}
+	if typ.UserDefined() {
+		return nil, unimplemented.NewWithIssue(91779,
+			"Domain types that reference user-defined types not yet supported")
+	}
+
+	var serializedDefault string
+	if defaultVal != nil {
+		texpr, err := tree.TypeCheck(params.ctx, defaultVal, &params.p.semaCtx, typ)
+		if err != nil {
+			return nil, err
+		}
+		serializedDefault = tree.Serialize(texpr)
+	}
+
+	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+		dbDesc.GetDefaultPrivilegeDescriptor(),
+		schema.GetDefaultPrivilegeDescriptor(),
+		dbDesc.GetID(),
+		params.SessionData().User(),
+		privilege.Types,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return typedesc.NewBuilder(&descpb.TypeDescriptor{
+		Name:           typeName.Type(),
+		ID:             id,
+		ParentID:       dbDesc.GetID(),
+		ParentSchemaID: schema.GetID(),
+		Kind:           descpb.TypeDescriptor_DOMAIN,
+		Domain: &descpb.TypeDescriptor_Domain{
+			Typ:             typ,
+			Nullable:        (nullable.Nullability == tree.Null),
+			Collate:         &collation,
+			DefaultExpr:     &serializedDefault,
+			ConstraintNames: sortedNames,
+			Constraints:     sortedConstraints,
+		},
+		Version:        1,
+		Privileges:     privs,
+	}).BuildCreatedMutableType(), nil
+}
+
 func (p *planner) createEnumWithID(
 	params runParams,
 	id descpb.ID,
@@ -510,6 +637,49 @@ func (p *planner) createCompositeWithID(
 		return err
 	}
 	// Install back references to types used by this type.
+	if err := params.p.addBackRefsFromAllTypesInType(params.ctx, typeDesc); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *planner) createDomainWithID(
+	params runParams,
+    id descpb.ID,
+	underlyingType tree.ResolvableTypeReference,
+	collation string,
+	defaultVal tree.Expr,
+	nullable tree.NullableConstraint,
+	checkExprs []tree.ColumnTableDefCheckExpr,
+	typeName *tree.TypeName,
+	dbDesc catalog.DatabaseDescriptor,
+) error {
+	schema, err := getCreateTypeParams(params, typeName, dbDesc)
+	if err != nil {
+		return err
+	}
+
+	typeDesc, err := CreateDomainTypeDesc(
+		params,
+		id,
+		underlyingType,
+		dbDesc,
+		schema,
+		collation,
+		defaultVal,
+		nullable,
+		checkExprs,
+		typeName,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	if err := p.finishCreateType(params, id, typeName, typeDesc, dbDesc, schema); err != nil {
+		return err
+	}
+
 	if err := params.p.addBackRefsFromAllTypesInType(params.ctx, typeDesc); err != nil {
 		return err
 	}

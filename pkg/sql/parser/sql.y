@@ -11241,7 +11241,15 @@ create_type_stmt:
   // Shell types, gateway to define base types using the previous syntax.
 | CREATE TYPE type_name                   { return unimplementedWithIssueDetail(sqllex, 27793, "shell") }
   // Domain types.
-| CREATE DOMAIN type_name error           { return unimplementedWithIssueDetail(sqllex, 27796, "create") }
+| CREATE DOMAIN type_name AS typename col_qual_list
+  {
+    typ := $5.typeReference()
+    createDomain, err := tree.NewDomainCreateType($3.unresolvedObjectName(), typ, $6.colQuals())
+    if err != nil {
+      return setErr(sqllex, err)
+    }
+    $$.val = createDomain
+  }
 
 opt_enum_val_list:
   enum_val_list

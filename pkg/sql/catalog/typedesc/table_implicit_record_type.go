@@ -324,6 +324,10 @@ func (v *tableImplicitRecordType) AsRegionEnumTypeDescriptor() catalog.RegionEnu
 	return nil
 }
 
+func (v *tableImplicitRecordType) AsDomainTypeDescriptor() catalog.DomainTypeDescriptor {
+	return nil
+}
+
 // AsAliasTypeDescriptor implements the catalog.TypeDescriptor interface.
 func (v *tableImplicitRecordType) AsAliasTypeDescriptor() catalog.AliasTypeDescriptor {
 	return nil

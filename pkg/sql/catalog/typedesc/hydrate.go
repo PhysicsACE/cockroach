@@ -159,4 +159,19 @@ func ensureTypeMetadataIsHydrated(
 			}
 		}
 	}
+
+	if d := maybeDesc.AsDomainTypeDescriptor(); d != nil {
+		nullable := d.Nullable()
+		collation := d.Collation()
+		defaultExpr := d.DefaultExpr()
+		constraintNames := d.ConstraintNames()
+		constraints := d.Constraints()
+		tm.DomainData = &types.DomainMetadata{
+			Nullable:       nullable,
+			Collate:      collation,
+			DefaultExpr:    defaultExpr,
+			ConstraintNames: constraintNames,
+			Constraints:     constraints,
+		}
+	}
 }

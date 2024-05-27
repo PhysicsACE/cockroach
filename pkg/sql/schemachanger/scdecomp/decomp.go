@@ -217,6 +217,53 @@ func (w *walkCtx) walkType(typ catalog.TypeDescriptor) {
 				Name:            comp.GetElementLabel(i),
 			})
 		}
+	} else if domain := typ.AsDomainTypeDescriptor(); domain != nil {
+		w.ev(descriptorStatus(typ), &scpb.DomainType{
+			TypeID:      domain.GetID(),
+			ArrayTypeID: domain.GetArrayTypeID(),
+		})
+		if domain.DefaultExpr() != "" {
+			expr, err := w.NewFunctionalExpression(domain.DefaultExpr())
+			if err != nil {
+				panic(err)
+			}
+			w.ev(descriptorStatus(typ), &scpb.DomainDefaultExpression{
+				DomainTypeID: typ.GetID(),
+				Expression:  *expr,
+			})
+		}
+
+		// if !domain.Nullable() {
+		// 	w.ev(descriptorStatus(typ), &scpb.DomainNotNull{
+		// 		DomainTypeID: typ.GetID(),
+		// 	})
+		// }
+
+		constraintNames := domain.ConstraintNames()
+		constraints := domain.Constraints()
+		constraintExprs := make([]*scpb.Expression, len(constraints))
+
+		for i := 0; i < len(constraints); i++ {
+			expr, err := w.NewFunctionalExpression(constraints[i])
+			if err != nil {
+				panic(err)
+			}
+			constraintExprs[i] = expr
+		}
+
+		// dedupedConstraints := w.dedupeRefs(constraintExprs)
+
+		for i := 0; i < len(constraintNames); i++ {
+			w.ev(descriptorStatus(typ), &scpb.DomainConstraint{
+				DomainTypeID: typ.GetID(),
+				Expression:   *constraintExprs[i],
+			})
+
+			w.ev(descriptorStatus(typ), &scpb.DomainConstraintName{
+				DomainTypeID: typ.GetID(),
+				ConstraintName: constraintNames[i],
+			})
+		}
 	} else {
 		panic(errors.AssertionFailedf("unsupported type kind %q", typ.GetKind()))
 	}

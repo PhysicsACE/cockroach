@@ -73,7 +73,7 @@ var descriptorDataIsNotBeingAdded = screl.Schema.DefNotJoin1(
 func isDescriptor(e scpb.Element) bool {
 	switch e.(type) {
 	case *scpb.Database, *scpb.Schema, *scpb.Table, *scpb.View, *scpb.Sequence,
-		*scpb.AliasType, *scpb.EnumType, *scpb.CompositeType, *scpb.Function:
+		*scpb.AliasType, *scpb.EnumType, *scpb.CompositeType, *scpb.Function, *scpb.DomainType:
 		return true
 	}
 	return false
@@ -194,7 +194,7 @@ func isWithExpression(element scpb.Element) bool {
 
 func isTypeDescriptor(element scpb.Element) bool {
 	switch element.(type) {
-	case *scpb.EnumType, *scpb.AliasType, *scpb.CompositeType:
+	case *scpb.EnumType, *scpb.AliasType, *scpb.CompositeType, *scpb.DomainType:
 		return true
 	default:
 		return false

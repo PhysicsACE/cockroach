@@ -829,6 +829,8 @@ type TypeDescriptor interface {
 	// TableImplicitRecordTypeDescriptor if this type is an implicit table record
 	// type, nil otherwise.
 	AsTableImplicitRecordTypeDescriptor() TableImplicitRecordTypeDescriptor
+
+	AsDomainTypeDescriptor() DomainTypeDescriptor
 }
 
 // NonAliasTypeDescriptor is the TypeDescriptor subtype for concrete user-defined
@@ -920,6 +922,23 @@ type TableImplicitRecordTypeDescriptor interface {
 	// UnderlyingTableDescriptor returns the table descriptor underlying this
 	// implicit type.
 	UnderlyingTableDescriptor() TableDescriptor
+}
+
+type DomainTypeDescriptor interface {
+	NonAliasTypeDescriptor
+
+	// UnderlyingType returns the underlying type of the domain.
+	UnderlyingType() *types.T
+	// Nullable returns the nullability of the domain.
+	Nullable() bool
+	// Collation returns the collation of the domain.
+	Collation() string
+	// DefaultExpr returns the default expression of the domain.
+	DefaultExpr() string
+	// ConstraintNames returns the constraint names of the domain.
+	ConstraintNames() []string
+	// Constraints returns the constraints of the domain.
+	Constraints() []string
 }
 
 // TypeDescriptorResolver is an interface used during hydration of type

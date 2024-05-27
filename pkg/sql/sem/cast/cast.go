@@ -213,6 +213,23 @@ func LookupCast(src, tgt *types.T) (Cast, bool) {
 		}, true
 	}
 
+	if srcFamily == types.DomainFamily || tgtFamily == types.DomainFamily {
+		var srcTyp *types.T
+		var tgtTyp *types.T
+
+		if srcFamily == types.DomainFamily {
+			srcTyp = src.UnderlyingType()
+		} else {
+			srcTyp = src
+		}
+		if tgtFamily == types.DomainFamily {
+			tgtTyp = tgt.UnderlyingType()
+		} else {
+			tgtTyp = tgt
+		}
+		return LookupCast(srcTyp, tgtTyp)
+	}
+
 	// Enums have dynamic OIDs, so they can't be populated in castMap. Instead,
 	// we dynamically create cast structs for valid enum casts.
 	if srcFamily == types.EnumFamily && tgtFamily == types.StringFamily {

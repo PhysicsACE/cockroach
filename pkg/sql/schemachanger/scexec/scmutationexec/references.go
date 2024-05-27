@@ -265,6 +265,61 @@ func (i *immediateVisitor) UpdateTypeBackReferencesInTypes(
 	return updateBackReferencesInTypes(ctx, i, op.TypeIDs, op.BackReferencedTypeID, forwardRefs)
 }
 
+func (i *immediateVisitor) UpdateTypeBackReferencesInSequnces(
+	ctx context.Context, op scop.UpdateTypeBackReferencesInSequnces,
+) error {
+	Typ, err := i.checkOutType(ctx, op.BackReferencedTypeID)
+	if err != nil {
+		return err
+	}
+	relIDToReferences := make(map[descpb.ID][]descpb.TableDescriptor_Reference)
+	IDset := catalog.DescriptorIDSet{}
+	for _, seqID := range op.SequenceIDs {
+		dep := descpb.TableDescriptor_Reference{
+			ID:   op.BackReferencedTypeID,
+			ByID: true,
+		}
+		relIDToReferences[seqID] = append(relIDToReferences[seqID], dep)
+		IDset.Add(seqID)
+	}
+
+	for relID, refs := range relIDToReferences {
+		if err := updateBackReferencesInRelation(ctx, i, relID, op.BackReferencedTypeID, refs); err != nil {
+			return err
+		}
+	}
+	currentReferenced := catalog.MakeDescriptorIDSet(Typ.ReferencingDescriptorIDs...)
+	newReferenced := currentReferenced.Union(IDset)
+	Typ.ReferencingDescriptorIDs = newReferenced.Ordered()
+	return nil
+}
+
+func (i *immediateVisitor) UpdateTypeBackReferencesInFunctions(
+	ctx context.Context, op scop.UpdateTypeBackReferencesInFunctions,
+) error {
+	functionIDs := catalog.DescriptorIDSet{}
+	Typ, err := i.checkOutType(ctx, op.BackReferencedTypeID)
+	if err != nil {
+		return err
+	}
+	for _, fnID := range op.FunctionIDs {
+
+		backRefFunc, err := i.checkOutFunction(ctx, fnID)
+		if err != nil {
+			return err
+		}
+		if err := backRefFunc.AddTypeReference(op.BackReferencedTypeID); err != nil {
+			return err
+		}
+
+		functionIDs.Add(fnID)
+	}
+	currentReferenced := catalog.MakeDescriptorIDSet(Typ.ReferencingDescriptorIDs...)
+	newReferenced := currentReferenced.Union(functionIDs)
+	Typ.ReferencingDescriptorIDs = newReferenced.Ordered()
+	return nil
+}
+
 func (i *immediateVisitor) UpdateTableBackReferencesInSequences(
 	ctx context.Context, op scop.UpdateTableBackReferencesInSequences,
 ) error {

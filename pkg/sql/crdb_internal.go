@@ -3521,6 +3521,64 @@ func writeCreateTypeDescRow(
 			tree.DNull,                           // enum_members
 		)
 	}
+
+	if d := typeDesc.AsDomainTypeDescriptor(); d != nil {
+		name, err := tree.NewUnresolvedObjectName(2, [3]string{d.GetName(), sc.GetName()}, 0)
+		if err != nil {
+			return false, err
+		}
+
+		node := &tree.CreateType{
+			Variety: tree.Domain,
+			TypeName: name,
+			UnderlyingType: d.UnderlyingType(),
+			Collate: d.Collation(),
+		}
+
+		serializedConstraints := d.Constraints()
+		constraintNames := d.ConstraintNames()
+		constraints := make([]tree.ColumnTableDefCheckExpr, len(serializedConstraints))
+		for i := range serializedConstraints {
+			constraints[i] = tree.ColumnTableDefCheckExpr{
+				ConstraintName: tree.Name(constraintNames[i]),
+			}
+			constraints[i].Expr, err = parser.ParseExpr(serializedConstraints[i])
+			if err != nil {
+				return false, err
+			}
+		}
+
+		node.CheckExprs = constraints
+
+		nullable := d.Nullable()
+		if nullable {
+			node.Nullable = tree.NullableConstraint{
+				Nullability: tree.Null,
+			}
+		} else {
+			node.Nullable = tree.NullableConstraint{
+				Nullability: tree.NotNull,
+			}
+		}
+
+		serializedDefault := d.DefaultExpr()
+		if serializedDefault != "" {
+			node.DefaultVal, err = parser.ParseExpr(serializedDefault)
+			if err != nil {
+				return false, err
+			}
+		}
+
+		return true, addRow(
+			tree.NewDInt(tree.DInt(db.GetID())),  // database_id
+			tree.NewDString(db.GetName()),        // database_name
+			tree.NewDString(sc.GetName()),        // schema_name
+			tree.NewDInt(tree.DInt(d.GetID())),   // descriptor_id
+			tree.NewDString(d.GetName()),         // descriptor_name
+			tree.NewDString(tree.AsString(node)), // create_statement
+			tree.DNull,                           // enum_members
+		)
+	}
 	return false, errors.AssertionFailedf("unknown type descriptor kind %s", typeDesc.GetKind())
 }
 

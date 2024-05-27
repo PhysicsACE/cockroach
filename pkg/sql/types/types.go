@@ -223,6 +223,8 @@ type UserDefinedTypeMetadata struct {
 	// for a table. Note: this can be deleted if we migrate implicit record types
 	// to ordinary persisted composite types.
 	ImplicitRecordType bool
+
+	DomainData *DomainMetadata
 }
 
 // EnumMetadata is metadata about an ENUM needed for evaluation.
@@ -247,6 +249,14 @@ func (e *EnumMetadata) debugString() string {
 		e.PhysicalRepresentations,
 		e.LogicalRepresentations,
 	)
+}
+
+type DomainMetadata struct {
+	Nullable bool
+	Collate string
+	DefaultExpr string
+	ConstraintNames []string
+	Constraints []string
 }
 
 // UserDefinedTypeName is a struct representing a qualified user defined
@@ -1174,6 +1184,18 @@ func MakeEnum(typeOID, arrayTypeOID oid.Oid) *T {
 	}}
 }
 
+func MakeDomain(typeOID, arrayTypeOID oid.Oid, typ *T) *T {
+	return &T{InternalType: InternalType{
+		Family: DomainFamily,
+		Oid:    typeOID,
+		Locale: &emptyLocale,
+		UDTMetadata: &PersistentUserDefinedTypeMetadata{
+			ArrayTypeOID: arrayTypeOID,
+		},
+		UnderlyingType: typ,
+	}}
+}
+
 // MakeArray constructs a new instance of an ArrayFamily type with the given
 // element type (which may itself be an ArrayFamily type).
 func MakeArray(typ *T) *T {
@@ -1451,6 +1473,10 @@ func (t *T) TupleLabels() []string {
 	return t.InternalType.TupleLabels
 }
 
+func (t *T) UnderlyingType() *T {
+	return t.InternalType.UnderlyingType
+}
+
 // UserDefinedArrayOID returns the OID of the array type that corresponds to
 // this user defined type. This function only can only be called on user
 // defined types and returns non-zero data only for user defined types that
@@ -1520,6 +1546,7 @@ var familyNames = map[Family]redact.SafeString{
 	UuidFamily:           "uuid",
 	VoidFamily:           "void",
 	EncodedKeyFamily:     "encodedkey",
+	DomainFamily:         "domain",
 }
 
 // Name returns a user-friendly word indicating the family type.
@@ -2053,6 +2080,25 @@ func (t *T) Equivalent(other *T) bool {
 	if t.Family() == AnyFamily || other.Family() == AnyFamily {
 		return true
 	}
+
+	if t.Family() == DomainFamily || other.Family() == DomainFamily {
+		var leftComparableFamily *T
+		var rightComparableFamily *T
+		if t.UnderlyingType() != nil {
+			leftComparableFamily = t.UnderlyingType()
+		} else {
+			leftComparableFamily = t
+		}
+
+		if other.UnderlyingType() != nil {
+			rightComparableFamily = other.UnderlyingType()
+		} else {
+			rightComparableFamily = other
+		}
+
+		return leftComparableFamily.Equivalent(rightComparableFamily)
+	}
+
 	if t.Family() != other.Family() {
 		return false
 	}

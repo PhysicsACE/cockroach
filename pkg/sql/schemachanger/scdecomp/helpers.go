@@ -129,6 +129,87 @@ func (w *walkCtx) newExpression(expr string) (*scpb.Expression, error) {
 	}, nil
 }
 
+func (w *walkCtx) NewFunctionalExpression(expr string) (*scpb.Expression, error) {
+	e, err := parser.ParseExpr(expr)
+	if err != nil {
+		return nil, err
+	}
+	var seqIDs catalog.DescriptorIDSet
+	{
+		seqIdents, err := seqexpr.GetUsedSequences(e)
+		if err != nil {
+			return nil, err
+		}
+		for _, si := range seqIdents {
+			if !si.IsByID() {
+				panic(scerrors.NotImplementedErrorf(nil, /* n */
+					"sequence %q referenced by name", si.SeqName))
+			}
+			seqIDs.Add(descpb.ID(si.SeqID))
+		}
+	}
+	var typIDs catalog.DescriptorIDSet
+	{
+		visitor := &tree.TypeCollectorVisitor{OIDs: make(map[oid.Oid]struct{})}
+		tree.WalkExpr(visitor, e)
+		for oid := range visitor.OIDs {
+			if !types.IsOIDUserDefinedType(oid) {
+				continue
+			}
+			id := typedesc.UserDefinedTypeOIDToID(oid)
+			if _, found := w.cachedTypeIDClosures[id]; !found {
+				desc := w.lookupFn(id)
+				typ, err := catalog.AsTypeDescriptor(desc)
+				if err != nil {
+					return nil, err
+				}
+				w.cachedTypeIDClosures[id] = typ.GetIDClosure()
+			}
+			w.cachedTypeIDClosures[id].ForEach(typIDs.Add)
+		}
+	}
+
+	referencedFnIDs, err := schemaexpr.GetUDFIDs(e)
+	if err != nil {
+		return nil, err
+	}
+	return &scpb.Expression{
+		Expr:                catpb.Expression(expr),
+		UsesTypeIDs:         typIDs.Ordered(),
+		UsesSequenceIDs:     seqIDs.Ordered(),
+		UsesFunctionIDs:     referencedFnIDs.Ordered(),
+	}, nil
+}
+
+// func (w *walkCtx) dedupeRefs(expressions []*scpb.Expression) []*scpb.Expression {
+// 	var functionIDRefs catalog.DescriptorIDSet
+// 	var typeIDRefs catalog.DescriptorIDSet
+// 	var seqIDRefs catalog.DescriptorIDSet
+
+// 	for _, expr := range expressions {
+// 		for _, fnID := range expr.UsesFunctionIDs {
+// 			functionIDRefs.Add(fnID)
+// 		}
+
+// 		for _, typID := range expr.UsesTypeIDs {
+// 			typeIDRefs.Add(typID)
+// 		}
+
+// 		for _, seqID := range expr.UsesSequenceIDs {
+// 			seqIDRefs.Add(seqID)
+// 		}
+
+// 		expr.UsesFunctionIDs = catalog.DescriptorIDSet{}
+// 		expr.UsesTypeIDs = catalog.DescriptorIDSet{}
+// 		expr.UsesSequenceIDs = catalog.DescriptorIDSet{}
+// 	}
+
+// 	expressions[0].UsesFunctionIDs = functionIDRefs
+// 	expressions[0].UsesTypeIDs = typeIDRefs
+// 	expressions[0].UsesSequenceIDs = seqIDRefs
+// 	return expressions
+// }
+
 func newTypeT(t *types.T) *scpb.TypeT {
 	return &scpb.TypeT{
 		Type:          t,

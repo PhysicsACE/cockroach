@@ -402,6 +402,8 @@ enum Family {
     //   Oid      : T_refcursor
     RefCursorFamily = 31;
 
+    DomainFamily = 32;
+
     // AnyFamily is a special type family used during static analysis as a
     // wildcard type that matches any other type, including scalar, array, and
     // tuple types. Execution-time values should never have this type. As an
@@ -570,4 +572,6 @@ message InternalType {
 
     // UDTMetadata is populated for user defined types that are not arrays.
     optional PersistentUserDefinedTypeMetadata udt_metadata = 15 [(gogoproto.customname) = "UDTMetadata"];
+
+    optional T underlying_type = 16;
 }

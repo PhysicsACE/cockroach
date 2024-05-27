@@ -5587,6 +5587,135 @@ func (d *DEnum) MinWriteable() (Datum, bool) {
 	return nil, false
 }
 
+type DDomain struct {
+	DomainTyp *types.T
+	Value     Datum
+}
+
+func (d *DDomain) Size() uintptr {
+	return unsafe.Sizeof(d.DomainTyp) + d.Value.Size()
+}
+
+func (d *DDomain) String() string {
+	return AsString(d)
+}
+
+// ResolvedType implements the Datum interface.
+func (d *DDomain) ResolvedType() *types.T {
+	return d.DomainTyp
+}
+
+// Compare implements the Datum interface.
+func (d *DDomain) Compare(ctx CompareContext, other Datum) int {
+	res, err := d.CompareError(ctx, other)
+	if err != nil {
+		panic(err)
+	}
+	return res
+}
+
+// CompareError implements the Datum interface.
+func (d *DDomain) CompareError(ctx CompareContext, other Datum) (int, error) {
+	if other == DNull {
+		return 1, nil
+	}
+
+	underlying := d.Value
+	unwrapped := ctx.UnwrapDatum(other)
+	var comparisonTyp Datum 
+	if domain, ok := unwrapped.(*DDomain); ok {
+		comparisonTyp = domain.Value
+	} else {
+		comparisonTyp = unwrapped
+	}
+
+	res, err := underlying.CompareError(ctx, comparisonTyp)
+	if err != nil {
+		return 0, err
+	}
+	return res, nil
+}
+
+// Prev implements the Datum interface.
+func (d *DDomain) Prev(ctx CompareContext) (Datum, bool) {
+	underlyingDatum, err := d.Value.Prev(ctx)
+	if !err {
+		return nil, false
+	}
+	return &DDomain{
+		DomainTyp: d.DomainTyp,
+		Value:     underlyingDatum,
+	}, true
+}
+
+// Next implements the Datum interface.
+func (d *DDomain) Next(ctx CompareContext) (Datum, bool) {
+	underlyingDatum, err := d.Value.Next(ctx)
+	if !err {
+		return nil, false
+	}
+	return &DDomain{
+		DomainTyp: d.DomainTyp,
+		Value:     underlyingDatum,
+	}, true
+}
+
+// Max implements the Datum interface.
+func (d *DDomain) Max(ctx CompareContext) (Datum, bool) {
+	maxDaum, err := d.Value.Max(ctx)
+	if !err {
+		return nil, false
+	}
+
+	return &DDomain{
+		DomainTyp: d.DomainTyp,
+		Value:     maxDaum,
+	}, true
+}
+
+// Min implements the Datum interface.
+func (d *DDomain) Min(ctx CompareContext) (Datum, bool) {
+	minDaum, err := d.Value.Min(ctx)
+	if !err {
+		return nil, false
+	}
+
+	return &DDomain{
+		DomainTyp: d.DomainTyp,
+		Value:     minDaum,
+	}, true
+}
+
+// IsMax implements the Datum interface.
+func (d *DDomain) IsMax(ctx CompareContext) bool {
+	maxDatum, err := d.Value.Max(ctx)
+	if !err {
+		return false
+	}
+
+	return d.Value.Compare(ctx, maxDatum) == 0
+}
+
+// IsMin implements the Datum interface.
+func (d *DDomain) IsMin(ctx CompareContext) bool {
+	minDatum, err := d.Value.Min(ctx)
+	if !err {
+		return false
+	}
+
+	return d.Value.Compare(ctx, minDatum) == 0
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (d *DDomain) AmbiguousFormat() bool {
+	return true
+}
+
+
+func (d *DDomain) Format(ctx *FmtCtx) {
+	d.Value.Format(ctx)
+}
+
 // DOid is the Postgres OID datum. It can represent either an OID type or any
 // of the reg* types, such as regproc or regclass. An OID must only be
 // 32 bits, since this width encoding is enforced in the pgwire protocol.

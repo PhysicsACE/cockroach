@@ -219,6 +219,7 @@ func init() {
 	typingFuncMap[opt.AggFilterOp] = typeAsFirstArg
 	typingFuncMap[opt.WindowFromOffsetOp] = typeAsFirstArg
 	typingFuncMap[opt.WindowToOffsetOp] = typeAsFirstArg
+	// typingFuncMap[opt.ApplyConstraintsOp] = typeApplyConstraints
 
 	for _, op := range opt.BinaryOperators {
 		typingFuncMap[op] = typeAsBinary
@@ -386,6 +387,15 @@ func typeWhen(e opt.ScalarExpr) *types.T {
 func typeCast(e opt.ScalarExpr) *types.T {
 	return e.(*CastExpr).Typ
 }
+
+// func typeApplyConstraints(e opt.ScalarExpr) *types.T {
+// 	applyConstraint := e.(*ApplyConstraintExpr)
+// 	if e.Corece {
+// 		return applyConstraint.DomainType
+// 	} else {
+// 		return applyConstraint.Input.DataType()
+// 	}
+// }
 
 // typeUDFCall returns the type of a UDF call operator
 func typeUDFCall(e opt.ScalarExpr) *types.T {

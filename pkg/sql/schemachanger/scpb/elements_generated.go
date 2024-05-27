@@ -533,6 +533,171 @@ func (c *ElementCollection[E]) FilterCompositeTypeAttrType() *ElementCollection[
 	return (*ElementCollection[*CompositeTypeAttrType])(ret)
 }
 
+func (e DomainType) element() {}
+
+// Element implements ElementGetter.
+func (e * ElementProto_DomainType) Element() Element {
+	return e.DomainType
+}
+
+// ForEachCompositeType iterates over elements of type CompositeType.
+// Deprecated
+func ForEachDomainType(
+	c *ElementCollection[Element], fn func(current Status, target TargetStatus, e *DomainType),
+) {
+  c.FilterDomainType().ForEach(fn)
+}
+
+// FindCompositeType finds the first element of type CompositeType.
+// Deprecated
+func FindDomainType(
+	c *ElementCollection[Element],
+) (current Status, target TargetStatus, element *DomainType) {
+	if tc := c.FilterDomainType(); !tc.IsEmpty() {
+		var e Element
+		current, target, e = tc.Get(0)
+		element = e.(*DomainType)
+	}
+	return current, target, element
+}
+
+// CompositeTypeElements filters elements of type CompositeType.
+func (c *ElementCollection[E]) FilterDomainType() *ElementCollection[*DomainType] {
+	ret := c.genericFilter(func(_ Status, _ TargetStatus, e Element) bool {
+		_, ok := e.(*DomainType)
+		return ok
+	})
+	return (*ElementCollection[*DomainType])(ret)
+}
+
+func (e DomainConstraint) element() {}
+
+func (e * ElementProto_DomainConstraint) Element() Element {
+	return e.DomainConstraint
+}
+
+func ForEachDomainConstraint(
+	c *ElementCollection[Element], fn func(current Status, target TargetStatus, e *DomainConstraint),
+) {
+  c.FilterDomainConstraint().ForEach(fn)
+}
+
+func FindDomainConstraint(
+	c *ElementCollection[Element],
+) (current Status, target TargetStatus, element *DomainConstraint) {
+	if tc := c.FilterDomainConstraint(); !tc.IsEmpty() {
+		var e Element
+		current, target, e = tc.Get(0)
+		element = e.(*DomainConstraint)
+	}
+	return current, target, element
+}
+
+// CompositeTypeElements filters elements of type CompositeType.
+func (c *ElementCollection[E]) FilterDomainConstraint() *ElementCollection[*DomainConstraint] {
+	ret := c.genericFilter(func(_ Status, _ TargetStatus, e Element) bool {
+		_, ok := e.(*DomainConstraint)
+		return ok
+	})
+	return (*ElementCollection[*DomainConstraint])(ret)
+}
+
+func (e DomainConstraintName) element() {}
+
+func (e * ElementProto_DomainConstraintName) Element() Element {
+	return e.DomainConstraintName
+}
+
+func ForEachDomainConstraintName(
+	c *ElementCollection[Element], fn func(current Status, target TargetStatus, e *DomainConstraintName),
+) {
+  c.FilterDomainConstraintName().ForEach(fn)
+}
+
+func FindDomainConstraintName(
+	c *ElementCollection[Element],
+) (current Status, target TargetStatus, element *DomainConstraintName) {
+	if tc := c.FilterDomainConstraintName(); !tc.IsEmpty() {
+		var e Element
+		current, target, e = tc.Get(0)
+		element = e.(*DomainConstraintName)
+	}
+	return current, target, element
+}
+
+// CompositeTypeElements filters elements of type CompositeType.
+func (c *ElementCollection[E]) FilterDomainConstraintName() *ElementCollection[*DomainConstraintName] {
+	ret := c.genericFilter(func(_ Status, _ TargetStatus, e Element) bool {
+		_, ok := e.(*DomainConstraintName)
+		return ok
+	})
+	return (*ElementCollection[*DomainConstraintName])(ret)
+}
+
+func (e DomainNotNull) element() {}
+
+func (e * ElementProto_DomainNotNull) Element() Element {
+	return e.DomainNotNull
+}
+
+func ForEachDomainNotNull(
+	c *ElementCollection[Element], fn func(current Status, target TargetStatus, e *DomainNotNull),
+) {
+  c.FilterDomainNotNull().ForEach(fn)
+}
+
+func FindDomainNotNull(
+	c *ElementCollection[Element],
+) (current Status, target TargetStatus, element *DomainNotNull) {
+	if tc := c.FilterDomainNotNull(); !tc.IsEmpty() {
+		var e Element
+		current, target, e = tc.Get(0)
+		element = e.(*DomainNotNull)
+	}
+	return current, target, element
+}
+
+// CompositeTypeElements filters elements of type CompositeType.
+func (c *ElementCollection[E]) FilterDomainNotNull() *ElementCollection[*DomainNotNull] {
+	ret := c.genericFilter(func(_ Status, _ TargetStatus, e Element) bool {
+		_, ok := e.(*DomainNotNull)
+		return ok
+	})
+	return (*ElementCollection[*DomainNotNull])(ret)
+}
+
+func (e DomainDefaultExpression) element() {}
+
+func (e * ElementProto_DomainDefaultExpression) Element() Element {
+	return e.DomainDefaultExpression
+}
+
+func ForEachDomainDefaultExpression(
+	c *ElementCollection[Element], fn func(current Status, target TargetStatus, e *DomainDefaultExpression),
+) {
+  c.FilterDomainDefaultExpression().ForEach(fn)
+}
+
+func FindDomainDefaultExpression(
+	c *ElementCollection[Element],
+) (current Status, target TargetStatus, element *DomainDefaultExpression) {
+	if tc := c.FilterDomainDefaultExpression(); !tc.IsEmpty() {
+		var e Element
+		current, target, e = tc.Get(0)
+		element = e.(*DomainDefaultExpression)
+	}
+	return current, target, element
+}
+
+// CompositeTypeElements filters elements of type CompositeType.
+func (c *ElementCollection[E]) FilterDomainDefaultExpression() *ElementCollection[*DomainDefaultExpression] {
+	ret := c.genericFilter(func(_ Status, _ TargetStatus, e Element) bool {
+		_, ok := e.(*DomainDefaultExpression)
+		return ok
+	})
+	return (*ElementCollection[*DomainDefaultExpression])(ret)
+}
+
 func (e ConstraintComment) element() {}
 
 // Element implements ElementGetter.
@@ -2453,6 +2618,16 @@ func (e* ElementProto) SetElement(element Element) {
 			e.ElementOneOf = &ElementProto_CompositeTypeAttrName{ CompositeTypeAttrName: t}
 		case *CompositeTypeAttrType:
 			e.ElementOneOf = &ElementProto_CompositeTypeAttrType{ CompositeTypeAttrType: t}
+		case *DomainType:
+			e.ElementOneOf = &ElementProto_DomainType{ DomainType: t}
+		case *DomainConstraint:
+			e.ElementOneOf = &ElementProto_DomainConstraint{ DomainConstraint: t}
+		case *DomainConstraintName:
+			e.ElementOneOf = &ElementProto_DomainConstraintName{ DomainConstraintName: t}
+		case *DomainNotNull:
+			e.ElementOneOf = &ElementProto_DomainNotNull{ DomainNotNull: t}
+		case *DomainDefaultExpression:
+			e.ElementOneOf = &ElementProto_DomainDefaultExpression{ DomainDefaultExpression: t}
 		case *ConstraintComment:
 			e.ElementOneOf = &ElementProto_ConstraintComment{ ConstraintComment: t}
 		case *ConstraintWithoutIndexName:
@@ -2575,6 +2750,11 @@ func GetElementOneOfProtos() []interface{} {
 	((*ElementProto_CompositeType)(nil)),
 	((*ElementProto_CompositeTypeAttrName)(nil)),
 	((*ElementProto_CompositeTypeAttrType)(nil)),
+	((*ElementProto_DomainType)(nil)),
+	((*ElementProto_DomainConstraint)(nil)),
+	((*ElementProto_DomainConstraintName)(nil)),
+	((*ElementProto_DomainNotNull)(nil)),
+	((*ElementProto_DomainDefaultExpression)(nil)),
 	((*ElementProto_ConstraintComment)(nil)),
 	((*ElementProto_ConstraintWithoutIndexName)(nil)),
 	((*ElementProto_Database)(nil)),
@@ -2647,6 +2827,11 @@ func GetElementTypes() []interface{} {
 	((*CompositeType)(nil)),
 	((*CompositeTypeAttrName)(nil)),
 	((*CompositeTypeAttrType)(nil)),
+	((*ElementProto_DomainType)(nil)),
+	((*ElementProto_DomainConstraint)(nil)),
+	((*ElementProto_DomainConstraintName)(nil)),
+	((*ElementProto_DomainNotNull)(nil)),
+	((*ElementProto_DomainDefaultExpression)(nil)),
 	((*ConstraintComment)(nil)),
 	((*ConstraintWithoutIndexName)(nil)),
 	((*Database)(nil)),

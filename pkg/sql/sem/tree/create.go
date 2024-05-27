@@ -365,6 +365,31 @@ type CompositeTypeElem struct {
 	Type  ResolvableTypeReference
 }
 
+type NullableConstraint struct {
+	Nullability Nullability
+	ConstraintName Name
+}
+
+type NamedDomainConstraints struct {
+	Name       Name
+	Constraint DomainConstraint
+}
+
+type DomainConstraint interface {
+	domainConstraint()
+}
+
+type DomainCheck struct {
+	CheckExpr Expr
+}
+
+type DomainNotNullConstraint struct{}
+type DomainNullConstraint struct{}
+
+func (DomainNotNullConstraint) domainConstraint() {}
+func (DomainNullConstraint) domainConstraint()    {}
+func (*DomainCheck) domainConstraint()      {}
+
 // CreateType represents a CREATE TYPE statement.
 type CreateType struct {
 	TypeName *UnresolvedObjectName
@@ -376,6 +401,68 @@ type CreateType struct {
 	CompositeTypeList []CompositeTypeElem
 	// IfNotExists is true if IF NOT EXISTS was requested.
 	IfNotExists bool
+
+	UnderlyingType ResolvableTypeReference
+
+	Collate string
+
+	DefaultVal Expr
+
+	Nullable NullableConstraint
+
+	CheckExprs []ColumnTableDefCheckExpr
+}
+
+func NewDomainCreateType(
+	TypeName *UnresolvedObjectName,
+	UnderlyingType ResolvableTypeReference,
+	Constraints []NamedColumnQualification,
+) (*CreateType, error) {
+	d := &CreateType{
+		TypeName: TypeName,
+		Variety: Domain,
+		UnderlyingType: UnderlyingType,
+	}
+	nullabilitySeen := false
+	for _, c := range Constraints {
+		switch t := c.Qualification.(type) {
+		case NotNullConstraint:
+			if nullabilitySeen {
+				return nil, pgerror.Newf(pgcode.Syntax,
+					"multiple constraints on nullability of domain type")
+			}
+			d.Nullable = NullableConstraint{
+				ConstraintName: c.Name,
+				Nullability: NotNull,
+			}
+			nullabilitySeen = true
+		case NullConstraint:
+			if nullabilitySeen {
+				return nil, pgerror.Newf(pgcode.Syntax,
+					"multiple constraints on nullability of domain type")
+			}
+			d.Nullable = NullableConstraint{
+				ConstraintName: c.Name,
+				Nullability: Null,
+			}
+			nullabilitySeen = true
+		case ColumnCollation:
+			return nil, pgerror.Newf(pgcode.Syntax,
+				"COLLATE in domain definition not supported")
+		case *ColumnDefault:
+			d.DefaultVal = t.Expr
+		case *ColumnCheckConstraint:
+			d.CheckExprs = append(d.CheckExprs, ColumnTableDefCheckExpr{
+				Expr: t.Expr,
+				ConstraintName: c.Name,
+			})
+		default:
+			return nil, pgerror.Newf(pgcode.Syntax,
+				"unexpected domain constraint: %T", c.Qualification)
+		}
+	}
+
+	return d, nil
 }
 
 var _ Statement = &CreateType{}
@@ -405,6 +492,9 @@ func (node *CreateType) Format(ctx *FmtCtx) {
 			ctx.FormatTypeReference(elem.Type)
 		}
 		ctx.WriteString(")")
+	case Domain:
+		ctx.WriteString("AS DOMAIN ")
+		ctx.FormatTypeReference(node.UnderlyingType)
 	}
 }
 

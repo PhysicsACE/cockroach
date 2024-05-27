@@ -282,6 +282,27 @@ func (b *Builder) buildScalar(
 		arg := b.buildScalar(texpr, inScope, nil, nil, colRefs)
 		out = b.factory.ConstructCast(arg, t.ResolvedType())
 
+	case *tree.ApplyConstraints:
+		execScope := b.allocScope()
+		colRefs := make(opt.ColList, 1)
+		argType := t.Expr.(tree.TypedExpr).ResolvedType()
+		argColName := scopeColName(tree.Name("VALUE"))
+
+		col := b.synthesizeColumn(execScope, argColName, argType, nil /* expr */, nil, /* scalar */)
+		col.setParamOrd(0)
+		colRefs[0] = col.id
+		input := b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
+		constraints := make(memo.ScalarListExpr, len(t.Constraints))
+		for i := range t.Constraints {
+			constraints[i] = b.buildScalar(t.Constraints[i].(tree.TypedExpr), inScope, nil, nil, colRefs)
+		}
+		out = b.factory.ConstructApplyConstraint(
+			input,
+			constraints,
+			t.DomainType,
+			t.CoreceDomain,
+		)
+
 	case *tree.CoalesceExpr:
 		args := make(memo.ScalarListExpr, len(t.Exprs))
 		typ := t.ResolvedType()

@@ -1435,6 +1435,7 @@ message TypeDescriptor {
     // Represents a user-defined composite type.
     COMPOSITE = 4;
     // Add more entries as we support more user defined types.
+    DOMAIN = 5;
   }
   optional Kind kind = 5 [(gogoproto.nullable) = false];
 
@@ -1530,7 +1531,35 @@ message TypeDescriptor {
   // Composite is the list of fields if this is a composite type.
   optional Composite composite = 18;
 
-  // Next field is 19.
+  message Domain {
+    option (gogoproto.equal) = true;
+    
+    // The underlying type of the domain. Currently can only be builtin types
+    required sql.sem.types.T typ = 1;
+    // Null/Not Null constraint for the domain.
+    optional bool nullable = 2 [(gogoproto.nullable) = false];
+    // Collation for the domain type. In omitted, the collation of the underlying
+    // type is used
+    optional string collate = 3;
+    // Default expression to use for columns that have this domain as its type.
+    // If the column definition itself has a default expression specified, it
+    // overrides this default value 
+    optional string default_expr = 4;
+    // List of the constraint names for this domain type, either specified by the
+    // user or manually generated internally. Sorted in alphabetical order to
+    // specify the order of constraint execution
+    repeated string constraint_names = 5;
+    // List of constraints. One-to-one pair with constraint names. 
+    repeated string constraints = 6;
+  }
+
+  optional Domain domain = 19;
+
+  // referencing_descriptor_ids is a set of descriptors that reference this type.
+  repeated uint32 referenced_descriptor_ids = 20
+    [(gogoproto.casttype) = "ID", (gogoproto.customname) = "ReferencedDescriptorIDs"];
+
+  // Next field is 20.
 }
 
 // SchemaDescriptor represents a physical schema and is stored in a structured

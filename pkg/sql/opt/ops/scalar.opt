@@ -681,6 +681,14 @@ define AssignmentCast {
     Typ Type
 }
 
+# [Scalar]
+# define ApplyConstraints {
+#     Input ScalarExpr
+#     Constraints ScalarListExpr
+#     DomainType Type
+#     Coerce bool
+# }
+
 # IfErr is roughly a runtime try-catch operator. It has different semantics
 # depending on which of its fields are set.
 #

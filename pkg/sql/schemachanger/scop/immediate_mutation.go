@@ -520,6 +520,18 @@ type UpdateTypeBackReferencesInTypes struct {
 	BackReferencedTypeID descpb.ID
 }
 
+type UpdateTypeBackReferencesInFunctions struct {
+	immediateMutationOp
+	FunctionIDs            []descpb.ID
+	BackReferencedTypeID descpb.ID
+}
+
+type UpdateTypeBackReferencesInSequnces struct {
+	immediateMutationOp
+	SequenceIDs            []descpb.ID
+	BackReferencedTypeID descpb.ID
+}
+
 // RemoveBackReferenceInTypes removes back references to a descriptor in the
 // specified types. It is a special case of the previous op for use with views
 // and multi-region elements, where a forward reference to the type is being

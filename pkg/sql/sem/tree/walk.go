@@ -134,6 +134,16 @@ func (expr *CastExpr) Walk(v Visitor) Expr {
 	return expr
 }
 
+// func (expr *ApplyConstraints) Walk(v Visitor) Expr {
+// 	e, changed := WalkExpr(v, expr.Expr)
+// 	if changed {
+// 		exprCopy := *expr
+// 		exprCopy.Expr = e
+// 		return &exprCopy
+// 	}
+// 	return expr
+// }
+
 // Walk implements the Expr interface.
 func (expr *CollateExpr) Walk(v Visitor) Expr {
 	e, changed := WalkExpr(v, expr.Expr)
@@ -746,6 +756,8 @@ func (expr *DFloat) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
 func (expr *DEnum) Walk(_ Visitor) Expr { return expr }
+
+func (expr *DDomain) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
 func (expr *DDecimal) Walk(_ Visitor) Expr { return expr }

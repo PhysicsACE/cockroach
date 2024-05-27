@@ -120,7 +120,8 @@ func VersionSupportsElementUse(el scpb.Element, version clusterversion.ClusterVe
 		*scpb.FunctionNullInputBehavior, *scpb.FunctionBody,
 		*scpb.ColumnNotNull, *scpb.CheckConstraintUnvalidated, *scpb.UniqueWithoutIndexConstraintUnvalidated,
 		*scpb.ForeignKeyConstraintUnvalidated, *scpb.IndexZoneConfig, *scpb.TableSchemaLocked, *scpb.CompositeType,
-		*scpb.CompositeTypeAttrType, *scpb.CompositeTypeAttrName:
+		*scpb.CompositeTypeAttrType, *scpb.CompositeTypeAttrName, *scpb.DomainType, *scpb.DomainConstraint,
+		*scpb.DomainConstraintName, *scpb.DomainNotNull, *scpb.DomainDefaultExpression:
 		// These elements need v23.1 so they can be used without checking any version gates.
 		return true
 	case *scpb.SequenceOption:

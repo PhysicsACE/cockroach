@@ -661,6 +661,24 @@ func (desc *Mutable) RemoveFunctionReference(id descpb.ID) error {
 	return nil
 }
 
+func (desc *Mutable) AddTypeReference(id descpb.ID) error {
+	for _, t := range desc.DependsOnTypes {
+		if t == id {
+			return pgerror.Newf(pgcode.InvalidFunctionDefinition,
+				"cannot add dependency from descriptor %d to function %s (%d) because there will be a dependency cycle", id, desc.GetName(), desc.GetID(),
+			)
+		}
+	}
+
+	for _, d := range desc.DependedOnBy {
+		if d.ID == id {
+			return nil
+		}
+	}
+	desc.DependedOnBy = append(desc.DependedOnBy, descpb.FunctionDescriptor_Reference{ID: id})
+	return nil
+}
+
 // AddColumnReference adds back reference to a column to the function.
 func (desc *Mutable) AddColumnReference(id descpb.ID, colID descpb.ColumnID) error {
 	for _, dep := range desc.DependsOn {

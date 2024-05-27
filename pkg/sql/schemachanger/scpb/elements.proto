@@ -62,6 +62,7 @@ message ElementProto {
     AliasType alias_type = 7;
     CompositeType composite_type = 8;
     Function function = 9;
+    DomainType domain_type = 10;
 
     // Relation elements.
     ColumnFamily column_family = 20 [(gogoproto.moretags) = "parent:\"Table\""];
@@ -146,7 +147,13 @@ message ElementProto {
     FunctionNullInputBehavior function_null_input_behavior = 163 [(gogoproto.moretags) = "parent:\"Function\""];
     FunctionBody function_body = 164 [(gogoproto.moretags) = "parent:\"Function\""];
 
-    // Next element group start id: 180
+    // Domain type elements.
+    DomainConstraint domain_constraint = 180 [(gogoproto.moretags) = "parent:\"DomainType\""];
+    DomainConstraintName domain_constraint_name = 181 [(gogoproto.moretags) = "parent:\"DomainType\""];
+    DomainNotNull domain_not_null = 182 [(gogoproto.moretags) = "parent:\"DomainType\""];
+    DomainDefaultExpression domain_default_expression = 183 [(gogoproto.moretags) = "parent:\"DomainType\""];
+
+    // Next element group start id: 200
   }
 }
 
@@ -453,6 +460,11 @@ message CompositeType {
   uint32 array_type_id = 2 [(gogoproto.customname) = "ArrayTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
 }
 
+message DomainType {
+  uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  uint32 array_type_id = 2 [(gogoproto.customname) = "ArrayTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+}
+
 message Schema {
   uint32 schema_id = 1 [(gogoproto.customname) = "SchemaID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
 
@@ -626,6 +638,25 @@ message CompositeTypeAttrName {
 message CompositeTypeAttrType {
   uint32 composite_type_id = 1 [(gogoproto.customname) = "CompositeTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
   TypeT embedded_type_t = 2 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+message DomainConstraint {
+  uint32 domain_type_id = 1 [(gogoproto.customname) = "DomainTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  Expression check_constraint = 2 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+message DomainConstraintName {
+  uint32 domain_type_id = 1 [(gogoproto.customname) = "DomainTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  string constraint_name = 2;
+}
+
+message DomainNotNull {
+  uint32 domain_type_id = 1 [(gogoproto.customname) = "DomainTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+}
+
+message DomainDefaultExpression {
+  uint32 domain_type_id = 1 [(gogoproto.customname) = "DomainTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  Expression default_expr = 2 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
 message TableZoneConfig {

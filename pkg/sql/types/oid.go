@@ -239,6 +239,8 @@ func CalcArrayOid(elemTyp *T) oid.Oid {
 			}
 			return elemTyp.UserDefinedArrayOID()
 		}
+	case DomainFamily:
+		return elemTyp.UserDefinedArrayOID()
 	}
 
 	// Map the OID of the array element type to the corresponding array OID.

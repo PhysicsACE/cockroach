@@ -989,6 +989,9 @@ func (b *builderState) ResolveUserDefinedTypeType(
 		// Implicit record types are not directly modifiable.
 		panic(pgerror.Newf(pgcode.DependentObjectsStillExist,
 			"cannot modify table record type %q", typ.GetName()))
+	case descpb.TypeDescriptor_DOMAIN:
+		b.ensureDescriptor(typ.GetID())
+		b.mustOwn(typ.GetID())
 	default:
 		panic(errors.AssertionFailedf("unknown type kind %s", typ.GetKind()))
 	}

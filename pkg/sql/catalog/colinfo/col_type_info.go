@@ -140,6 +140,14 @@ func ValidateColumnDefType(ctx context.Context, version clusterversion.Handle, t
 			)
 		}
 
+	case types.DomainFamily:
+		if !version.IsActive(ctx, clusterversion.V23_2) {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"domains not supported until version 23.2",
+			)
+		}
+
 	default:
 		return pgerror.Newf(pgcode.InvalidTableDefinition,
 			"value type %s cannot be used for table columns", t.String())

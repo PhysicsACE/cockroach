@@ -365,6 +365,18 @@ func (b *Builder) buildCast(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Ty
 	return tree.NewTypedCastExpr(input, cast.Typ), nil
 }
 
+// func (b *Builder) buildApplyConstraints(
+// 	ctx *buildScalarCtx, scalar opt.ScalarExpr,
+// ) (tree.TypedExpr, error) {
+// 	apply := scalar.(*memo.ApplyConstraintExpr)
+// 	input, err := b.buildScalar(ctx, apply.Input)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	constraints := make([])
+// }
+
 // buildAssignmentCast builds an AssignmentCastExpr with input i and type T into
 // a built-in function call crdb_internal.assignment_cast(i, NULL::T).
 func (b *Builder) buildAssignmentCast(

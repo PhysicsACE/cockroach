@@ -697,6 +697,30 @@ func (expr *CastExpr) TypeCheck(
 	return expr, nil
 }
 
+// func (expr *ApplyConstraints) TypeCheck(
+// 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
+// ) (TypedExpr, error) {
+// 	subExpr, err := expr.Expr.TypeCheck(ctx, semaCtx, types.Any)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	expr.Expr = subExpr
+	
+// 	for _, c := range expr.Constraints {
+// 		constraint, err := c.TypeCheck(ctx, semaCtx, types.Bool)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		expr.Constraints[i] = constraint
+// 	}
+// 	if expr.CoreceDomain {
+// 		expr.typ = expr.DomainType
+// 	} else {
+// 		expr.typ = subExpr.ResolvedType()
+// 	}
+// 	return expr, nil
+// }
+
 // TypeCheck implements the Expr interface.
 func (expr *IndirectionExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
@@ -2019,6 +2043,10 @@ func (d *DFloat) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (Typed
 // TypeCheck implements the Expr interface. It is implemented as an idempotent
 // identity function for Datum.
 func (d *DEnum) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
+	return d, nil
+}
+
+func (d *DDomain) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
 	return d, nil
 }
 

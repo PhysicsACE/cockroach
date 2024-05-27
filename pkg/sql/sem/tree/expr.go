@@ -1713,6 +1713,49 @@ func (node *ColumnAccessExpr) Format(ctx *FmtCtx) {
 	}
 }
 
+// type ApplyConstraints struct {
+// 	Expr Expr
+// 	Constraints []Expr
+// 	ConstraintNames []string
+// 	CoerceDomain bool
+// 	DomainType *types.T
+
+// 	typeAnnotation
+// }
+
+// func (node *ApplyConstraints) Format(ctx *FmtCtx) {
+// 	ctx.FormatNode(node.Expr)
+// 	ctx.WriteString(" WITH CONSTRAINTS (")
+// 	for i := range node.Constraints {
+// 		if i > 0 {
+// 			ctx.WriteString(", ")
+// 		}
+// 		ctx.WriteString(node.ConstraintNames[i])
+// 		ctx.WriteString(" = ")
+// 		ctx.FormatNode(node.Constraints[i])
+// 	}
+// 	ctx.WriteByte(')')
+// }
+
+// func NewTypedApplyConstraints(
+// 	expr TypedExpr,
+// 	constraints []TypedExpr,
+// 	constraintNames []string,
+// 	coerce bool,
+// 	domainType *types.T,
+// 	typ *types.T,
+// ) *ApplyConstraints {
+// 	node := &ApplyConstraints{
+// 		Expr: expr,
+// 		Constraints: constraints,
+// 		ConstraintNames: constraintNames,
+// 		CoerceDomain: coerce,
+// 		DomainType: domainType,
+// 	}
+// 	node.typ = typ
+// 	return node
+// }
+
 func (node *AliasedTableExpr) String() string { return AsString(node) }
 func (node *ParenTableExpr) String() string   { return AsString(node) }
 func (node *JoinTableExpr) String() string    { return AsString(node) }
