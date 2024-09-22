@@ -290,6 +290,7 @@ func (*JoinTableExpr) tableExpr()    {}
 func (*RowsFromExpr) tableExpr()     {}
 func (*Subquery) tableExpr()         {}
 func (*StatementSource) tableExpr()  {}
+func (*TableFunc) tableExpr()        {}
 
 // StatementSource encapsulates one of the other statements as a data source.
 type StatementSource struct {

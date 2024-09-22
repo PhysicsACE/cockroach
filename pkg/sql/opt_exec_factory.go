@@ -185,6 +185,14 @@ func (ef *execFactory) ConstructScan(
 	return scan, nil
 }
 
+func ConstructTableFunctionScan(
+	tableFuncScan *tree.TableFunc,
+) (exec.Node, error) {
+	return &tableFuncScanNode{
+		tableFuncScan: tableFuncScan,
+	}, nil
+}
+
 func generateScanSpans(
 	evalCtx *eval.Context,
 	codec keys.SQLCodec,

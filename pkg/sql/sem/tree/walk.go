@@ -608,6 +608,9 @@ func (expr *TableRef) WalkTableExpr(_ Visitor) TableExpr { return expr }
 // WalkTableExpr implements the TableExpr interface.
 func (expr *UnresolvedObjectName) WalkTableExpr(_ Visitor) TableExpr { return expr }
 
+// WalkTableExpr implements the TableExpr interface.
+func (expr *TableFunc) WalkTableExpr(_ Visitor) TableExpr { return expr }
+
 // Walk implements the Expr interface.
 func (expr *UnaryExpr) Walk(v Visitor) Expr {
 	e, changed := WalkExpr(v, expr.Expr)
@@ -770,6 +773,8 @@ func (expr *DGeometry) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
 func (expr *DJSON) Walk(_ Visitor) Expr { return expr }
+
+func (expr *DJsonPath) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
 func (expr *DTSQuery) Walk(_ Visitor) Expr { return expr }

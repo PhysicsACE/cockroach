@@ -207,6 +207,10 @@ func (node *DJSON) Eval(ctx context.Context, v ExprEvaluator) (Datum, error) {
 	return node, nil
 }
 
+func (node *DJsonPath) Eval(ctx context.Context, v ExprEvaluator) (Datum, error) {
+	return node, nil
+}
+
 // Eval is part of the TypedExpr interface.
 func (node *DOid) Eval(ctx context.Context, v ExprEvaluator) (Datum, error) {
 	return node, nil

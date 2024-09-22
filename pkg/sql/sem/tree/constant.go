@@ -542,6 +542,7 @@ var (
 		types.UUIDArray,
 		types.INet,
 		types.Jsonb,
+		types.JsonPath,
 		types.PGLSN,
 		types.PGLSNArray,
 		types.RefCursor,

@@ -550,6 +550,19 @@ func (c *CustomFuncs) DerivePruneCols(e memo.RelExpr, disabledRules intsets.Fast
 		usedCols := sel.Filters.OuterCols()
 		relProps.Rule.PruneCols.DifferenceWith(usedCols)
 
+	case opt.TableFuncScanOp:
+		if disabledRules.Contains(int(opt.PruneTableFuncScanCols)) {
+			// Avoid rule cycles.
+			break
+		}
+		// Any pruneable input columns can potentially be pruned granted
+		// that the expression used to construct the root tablefunc document
+		// does not referene the column
+		tableFunc := e.(*memo.TableFuncScanExpr)
+		relProps.Rule.PruneCols = c.DerivePruneCols(tableFunc.Scan.Input, disabledRules).Copy()
+		usedCols := tableFunc.Scan.GetReferencedCols()
+		relProps.Rule.PruneCols.DifferenceWith(usedCols)
+
 	case opt.ProjectOp:
 		if disabledRules.Contains(int(opt.PruneProjectCols)) {
 			// Avoid rule cycles.

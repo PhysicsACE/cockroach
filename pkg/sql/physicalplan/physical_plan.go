@@ -744,6 +744,43 @@ func (p *PhysicalPlan) AddRendering(
 	return nil
 }
 
+func (p *PhysicalPlan) AddTableFunc(
+	ctx context.Context,
+	funcType tree.FunctionType,
+	documentExpr tree.TypedExpr,
+	nodePath *types.JsonPath,
+	columns tree.TableColumns,
+	siblingNode exec.Node,
+	childNode exec.Node,
+	lateral bool,
+	exprCtx ExprContext,
+	indexVarMap []int,
+) error {
+	if expr == nil {
+		return errors.Errorf("nil expression")
+	}
+
+	document, err := MakeExpression(ctx, documentExpr, exprCtx, indexVarMap)
+	if err != nil {
+		return err
+	}
+	p.AddNoGroupingStage(
+		execinfrapb.ProcessorCoreUnion{TableFunction: &execinfrapb.TableFunctionSpec{
+			Func:        funcType,
+			NodePath:    nodePath,
+			Document:    document,
+			Columns:     columns,
+			SiblingNode: siblingNode,
+			ChildNode:   childNode,
+			Lateral:     lateral,
+		}},
+		execinfrapb.PostProcessSpec{},
+		p.GetResultTypes(),
+		p.MergeOrdering,
+	)
+	return nil
+}
+
 // reverseProjection remaps expression variable indices to refer to internal
 // columns (i.e. before post-processing) of a processor instead of output
 // columns (i.e. after post-processing).

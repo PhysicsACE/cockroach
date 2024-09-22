@@ -402,6 +402,12 @@ enum Family {
     //   Oid      : T_refcursor
     RefCursorFamily = 31;
 
+    // JsonPathFamily is a type family for jsonpath objects, which are used
+    // for complex querying of json documents
+    //   Canonical: types.JsonPath
+    //   Oid      : T_jsonpath
+    JsonPathFamily = 32;
+
     // AnyFamily is a special type family used during static analysis as a
     // wildcard type that matches any other type, including scalar, array, and
     // tuple types. Execution-time values should never have this type. As an

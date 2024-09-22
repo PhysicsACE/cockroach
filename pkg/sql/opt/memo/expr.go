@@ -1514,3 +1514,31 @@ func (e ScalarListExpr) isConstantsAndPlaceholdersAndVariables(insideTuple bool)
 	}
 	return true
 }
+
+type TableFuncPrivate struct {
+	Input RelExpr
+	// Type of table generator function. Only support json_table for now.
+	FunctionType tree.FunctionType
+	// Alias for the table generator function as a table source.
+	Alias tree.Name
+	// Type checked expression to generate the table from.
+	Document tree.TypedExpr
+	// JsonPath to apply to document for table construction.
+	DocumentPath *types.JsonPath
+	// Columns output by this table generator function.
+	Columns []tree.TableColumn
+	// If multiple nested columns at the same nesting level, they will be
+	// unioned to construct the final results.
+	SiblingNode RelExpr
+	// Nested columns to construct for the final construction.
+	ChildNode RelExpr
+	// Whether or not this table generator function is to be laterally
+	// joined to the previous data sources in the FROM clause.
+	Lateral bool
+}
+
+func (tfp TableFuncPrivate) GetReferencedCols() opt.ColSet {
+	var colSet opt.ColSet
+	colset.UnionWith(tfp.Document.ScalarProps().OuterCols)
+	return colSet
+}

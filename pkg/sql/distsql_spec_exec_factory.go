@@ -412,6 +412,33 @@ func (e *distSQLSpecExecFactory) ConstructRender(
 	return plan, nil
 }
 
+func (e *distSQLSpecExecFactory) ConstructTableFunctionScan(
+	n exec.Node,
+	funcType tree.FunctionType,
+	documentExpr tree.TypedExpr,
+	nodePath *types.JsonPath,
+	columns tree.TableColumns,
+	siblingNode exec.Node,
+	childNode exec.Node,
+	lateral bool,
+	resultColumns colinfo.ResultColumns,
+) (exec.Node, error) {
+	physPlan, plan := getPhysPlan(n)
+	recommendation := e.checkExprsAndMaybeMergeLastStage([]tree.TypedExpr{documentExpr}, physPlan)
+
+	newColMap := identityMap(physPlan.PlanToStreamColMap, 1)
+	if err := physPlan.AddTableFunc(
+		e.ctx, funcType, documentExpr, nodePath, columns, siblingNode, childNode,
+		lateral, e.getPlanCtx(recommendation), physPlan.PlanToStreamColMap,
+	); err != nil {
+		return nil, err
+	}
+
+	physPlan.ResultColumns = resultColumns
+	physPlan.PlanToStreamColMap = newColMap
+	return plan, nil
+}
+
 func (e *distSQLSpecExecFactory) ConstructApplyJoin(
 	joinType descpb.JoinType,
 	left exec.Node,

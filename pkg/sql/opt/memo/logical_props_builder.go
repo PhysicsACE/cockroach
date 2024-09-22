@@ -308,6 +308,42 @@ func (b *logicalPropsBuilder) buildSelectProps(sel *SelectExpr, rel *props.Relat
 	}
 }
 
+func (b *logicalPropsBuilder) buildTableFuncScanProps(
+	tf *TableFuncScanExpr, rel *props.Relational,
+) {
+	BuildSharedProps(tf, &rel.Shared, b.evalCtx)
+
+	inputProps := tf.Scan.Input.Relational()
+
+	for i := range tf.Scan.ResultingColumns {
+		rel.OutputCols.Add(tf.Scan.ResultingColumns[i])
+	}
+
+	// Not Null Columns
+	rel.NotNullCols = inputProps.NotNullCols
+
+	// Outer Columns
+	rel.OuterCols.DifferenceWith(inputProps.OutputCols)
+
+	// Functional Dependencies
+	rel.FuncDeps.CopyFrom(&inputProps.FuncDeps)
+	b.addTableFuncDocumentToFuncDep(tf.Scan.Document, &rel.FuncDeps)
+
+	// Cardinality
+	// -----------
+	// If no nesting is involed in the computation, then the table function
+	// will simply add columns to each row of the input. If nesting is involved
+	// it is not possible to know the cardinality of the potential nested 
+	// cross/outer joins per input row. Thus, our best estimate for the time being
+	// is the cardinality of the table function input
+	rel.Cardinality = inputProps.Cardinality
+
+	// Statistics
+	if !b.disableStats {
+		b.sb.buildTableFuncScan(tf, rel)
+	}
+}
+
 func (b *logicalPropsBuilder) buildProjectProps(prj *ProjectExpr, rel *props.Relational) {
 	BuildSharedProps(prj, &rel.Shared, b.evalCtx)
 
@@ -2060,6 +2096,13 @@ func NullColsRejectedByFilter(evalCtx *eval.Context, filters FiltersExpr) opt.Co
 // null, based on the filter conditions.
 func (b *logicalPropsBuilder) rejectNullCols(filters FiltersExpr) opt.ColSet {
 	return NullColsRejectedByFilter(b.evalCtx, filters)
+}
+
+func (b *logicalPropsBuilder) addTableFuncDocumentToFuncDep(
+	documentExpr opt.Expr, fdset *props.FuncDepSet,
+) {
+	documentProps := documentExpr.ScalarProps()
+	fdset.AddFrom(&documentProps.FuncDeps)
 }
 
 // addFiltersToFuncDep returns the union of all functional dependencies from

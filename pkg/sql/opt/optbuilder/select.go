@@ -313,7 +313,31 @@ func (b *Builder) buildDataSource(
 		}
 		b.renameSource(source.As, outScope)
 		return outScope
+	case *tree.TableFunc:
+		md := b.factory.Metadata()
+		outScope = inScope.push()
 
+		cols := make(opt.ColList, 0, len(source.Columns))
+		for i, col := range source.Columns {
+			cols[i] = md.AddColumn(col.Name, col.Typ)
+		}
+
+		outScope.cols = make([]scopeColumn, 0, len(source.Columns))
+		for i := range cols {
+			col := md.ColumnMeta(cols[i])
+			outScope.cols[i] = scopeColumn{
+				id: c,
+				name: scopeColName(tree.Name(col.Name)),
+				table: tree.TableName{
+					objName: tree.objName{
+						ObjectName: source.Name,
+					}
+				}
+				typ: col.Type,
+			}
+		}
+		
+		return outScope
 	default:
 		panic(errors.AssertionFailedf("unknown table expr: %T", texpr))
 	}
@@ -1388,11 +1412,18 @@ func (b *Builder) buildFromTables(
 	tables tree.TableExprs, lockCtx lockingContext, inScope *scope,
 ) (outScope *scope) {
 	// If there are any lateral data sources, we need to build the join tree
-	// left-deep instead of right-deep.
+	// left-deep instead of right-deep. Need to also do the same for table
+	// functions like json_table as they requires access to columns of the
+	// previous tables in the same FROM clause.
 	for i := range tables {
 		if b.exprIsLateral(tables[i]) {
 			telemetry.Inc(sqltelemetry.LateralJoinUseCounter)
 			return b.buildFromWithLateral(tables, lockCtx, inScope)
+		}
+
+		if b.exprIsTableFunc(tables[i]) {
+			telemetry.Inc(sqltelemetry.TableFunctionUseCounter)
+			return b.buildFromTableFunc(tables, lockCtx, inScope)
 		}
 	}
 	return b.buildFromTablesRightDeep(tables, lockCtx, inScope)
@@ -1455,6 +1486,11 @@ func (b *Builder) exprIsLateral(t tree.TableExpr) bool {
 	return ok
 }
 
+func (b *Builder) exprIsTableFunc(t tree.TableExpr) bool {
+	_, ok := t.(*tree.TableFunc)
+	return ok
+}
+
 // buildFromWithLateral builds a FROM clause in the case where it contains a
 // LATERAL table.  This differs from buildFromTablesRightDeep because the
 // semantics of LATERAL require that the join tree is built left-deep (from
@@ -1473,7 +1509,7 @@ func (b *Builder) buildFromWithLateral(
 		scope := inScope
 		// Lateral expressions need to be able to refer to the expressions that
 		// have been built already.
-		if b.exprIsLateral(tables[i]) {
+		if b.exprIsLateral(tables[i]) || b.exprIsTableFunc(tables[i]) {
 			scope = outScope
 			scope.context = exprKindLateralJoin
 		}
@@ -1490,6 +1526,12 @@ func (b *Builder) buildFromWithLateral(
 	}
 
 	return outScope
+}
+
+func (b *Builder) buildFromTableFunc(
+	tables tree.TableExprs, lockCtx lockingContext, inScope *scope,
+) (outScope *scope) {
+	
 }
 
 // validateAsOf ensures that any AS OF SYSTEM TIME timestamp is consistent with

@@ -537,6 +537,14 @@ var (
 		},
 	}
 
+	JsonPath = &T{
+		InternalType: InternalType{
+			Family: JsonPathFamily,
+			Oid:    oid.T_jsonpath,
+			Locale: &emptyLocale,
+		},
+	}
+
 	// Scalar contains all types that meet this criteria:
 	//
 	//   1. Scalar type (no ArrayFamily or TupleFamily types).
@@ -1520,6 +1528,7 @@ var familyNames = map[Family]redact.SafeString{
 	UuidFamily:           "uuid",
 	VoidFamily:           "void",
 	EncodedKeyFamily:     "encodedkey",
+	JsonPathFamily:       "jsonpath",
 }
 
 // Name returns a user-friendly word indicating the family type.
@@ -1861,6 +1870,8 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 		return "void"
 	case EnumFamily:
 		return t.TypeMeta.Name.Basename()
+	case JsonPathFamily:
+		return "jsonpath"
 	default:
 		panic(errors.AssertionFailedf("unexpected Family: %v", errors.Safe(t.Family())))
 	}
@@ -2992,7 +3003,6 @@ var postgresPredefinedTypeIssues = map[string]int{
 	"box":           21286,
 	"cidr":          18846,
 	"circle":        21286,
-	"jsonpath":      22513,
 	"line":          21286,
 	"lseg":          21286,
 	"macaddr":       45813,

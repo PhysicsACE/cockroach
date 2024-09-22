@@ -1111,6 +1111,35 @@ func (sb *statisticsBuilder) colStatSelect(
 	return colStat
 }
 
+// +----------------+
+// | Table Function |
+// +----------------+
+
+func (sb *statisticsBuilder) buildTableFuncScan(tf *TableFuncScanExpr, relProps *props.Relational) {
+	s := relProps.Statistics()
+	if zeroCardinality := s.Init(relProps); zeroCardinality {
+		// Short cut if cardinality is 0.
+		return
+	}
+	s.Available = sb.availabilityFromInput(tf)
+	inputStats := tf.Scan.Input.Relational().Statistics()
+	s.RowCount = inputStats.RowCount
+	s.VirtualCols.UnionWith(inputStats.VirtualCols)
+	sb.finalizeFromCardinality(relProps)
+}
+
+func (sb *statisticsBuilder) colStatTableFuncScan(
+	colSet opt.ColSet, tf *TableFuncScanExpr,	
+) *props.ColumnStatistic {
+	relProps := tf.Relational()
+	s := relProps.Statistics()
+
+	colStat := sb.copyColStatFromChild(colSet, tf, s)
+
+	sb.finalizeFromRowCountAndDistinctCounts(colStat, s)
+	return colStat
+}
+
 // +---------+
 // | Project |
 // +---------+

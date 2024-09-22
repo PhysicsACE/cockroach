@@ -3934,6 +3934,18 @@ func (d *DBox2D) Size() uintptr {
 	return unsafe.Sizeof(*d) + unsafe.Sizeof(d.CartesianBoundingBox)
 }
 
+type DJsonPath struct {
+	jsonpath.JSONPath
+}
+
+func NewDJsonPath(j jsonpath.JSONPath) *DJsonPath {
+	return &DJsonPath{j}
+}
+
+func (d *DJsonPath) ResolvedType() *types.T {
+	return types.JsonPath
+}
+
 // DJSON is the JSON Datum.
 type DJSON struct{ json.JSON }
 
@@ -6216,6 +6228,7 @@ var baseDatumTypeSizes = map[types.Family]struct {
 	types.TSVectorFamily:       {unsafe.Sizeof(DTSVector{}), variableSize},
 	types.IntervalFamily:       {unsafe.Sizeof(DInterval{}), fixedSize},
 	types.JsonFamily:           {unsafe.Sizeof(DJSON{}), variableSize},
+	types.JsonPathFamily:       {unsafe.Sizeof(DJSONPath{}), variableSize},
 	types.UuidFamily:           {unsafe.Sizeof(DUuid{}), fixedSize},
 	types.INetFamily:           {unsafe.Sizeof(DIPAddr{}), fixedSize},
 	types.OidFamily:            {unsafe.Sizeof(DOid{}.Oid), fixedSize},

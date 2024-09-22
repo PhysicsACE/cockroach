@@ -335,6 +335,9 @@ func (b *Builder) buildRelational(e memo.RelExpr) (_ execPlan, outputCols colOrd
 
 	case *memo.ExportExpr:
 		ep, outputCols, err = b.buildExport(t)
+	
+	case *memo.TableFuncScanExpr:
+		ep, outputCols, err = b.buildTableFunc(t)
 
 	default:
 		switch {
@@ -861,6 +864,62 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (_ execPlan, outputCols colOrdM
 		}
 		b.builtScans = append(b.builtScans, scan)
 	}
+	return res, outputCols, nil
+}
+
+func (b *Builder) buildTableFunc(
+	tableFuncScan *memo.TableFuncScanExpr,
+) (_ execPlan, outputCols colOrdMap, err error) {
+	tableFuncPrivate := &tableFuncScan.Scan
+	if tableFuncPrivate == nil {
+		return execPlan{}, colOrdMap{}, errors.AssertionFailedf("expected non-nil table func scan")
+	}
+
+	if tableFuncPrivate.FunctionType != tree.JSONTABLE {
+		return execPlan{}, colOrdMap{}, errors.AssertionFailedf("Only json_table is currently supported")
+	}
+
+	root := &tableFuncScanNode{
+		FunctionType: tableFuncPrivate.FunctionType,
+	}
+	
+	if tableFuncPrivate.Input != nil {
+		inputNode, inputCols, err := b.buildRelational(tableFuncPrivate.Input)
+		if err != nil {
+			return execPlan{}, colOrdMap{}, err
+		}
+
+		root.AddInput(inputNode.root)
+	}
+
+	ctx := b.makeBuildScalarCtx()
+	documentExpr, err := b.buildScalar(&)
+
+	if tableFuncPrivate.SiblingNode != nil {
+		siblingPlan, siblingCols, err := b.buildRelational(tableFuncPrivate.SiblingNode)
+		if err != nil {
+			return execPlan{}, colOrdMap{}, err
+		}
+
+		root.AddSibling(siblingPlan.root)
+	}
+
+	if tableFuncPrivate.ChildNode != nil {
+		// Add child node to cross/outer join the results
+		childPlan, childCols, err := b.buildRelational(tableFuncPrivate.ChildNode)
+		if err != nil {
+			return execPlan{}, colOrdMap{}, err
+		}
+
+		root.AddChild(childPlan.root)
+	}
+
+	if err != nill {
+		return execPlan{}, colOrdMap{}, err
+	}
+
+	var res execPlan
+	res.root = root
 	return res, outputCols, nil
 }
 

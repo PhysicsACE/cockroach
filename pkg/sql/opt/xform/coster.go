@@ -593,6 +593,9 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 	case opt.ProjectSetOp:
 		cost = c.computeProjectSetCost(candidate.(*memo.ProjectSetExpr))
 
+	case opt.TableFuncScanOp:
+		cost = c.computeTableFuncCost(candidate.(*memo.TableFuncScanExpr))
+
 	case opt.InsertOp:
 		insertExpr, _ := candidate.(*memo.InsertExpr)
 		if len(insertExpr.FastPathUniqueChecks) != 0 {
@@ -931,6 +934,13 @@ func (c *coster) computeSelectCost(sel *memo.SelectExpr, required *physical.Requ
 	filterSetup, filterPerRow := c.computeFiltersCost(sel.Filters, intsets.Fast{})
 	cost := memo.Cost(inputRowCount) * filterPerRow
 	cost += filterSetup
+	return cost
+}
+
+func (c *coster) computeTableFuncCost(tableFunc *memo.TableFuncScanexpr) memo.Cost {
+	inputRowCount := tableFunc.Scan.Input.Relational().Statistics().RowCount
+	perRowCost := c.computeExprCost(tableFunc.Scan.Document)
+	cost := memo.Cost(inputRowCount) * perRowCost
 	return cost
 }
 
