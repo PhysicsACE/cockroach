@@ -2514,6 +2514,7 @@ GO_TARGETS = [
     "//pkg/util/json:json",
     "//pkg/util/json:json_test",
     "//pkg/util/jsonbytes:jsonbytes",
+    "//pkg/util/jsonpath:jsonpath",
     "//pkg/util/keysutil:keysutil",
     "//pkg/util/leaktest:leaktest",
     "//pkg/util/limit:limit",

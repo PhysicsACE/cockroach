@@ -237,6 +237,9 @@ type JSON interface {
 	// HasContainerLeaf returns whether this document contains in it somewhere
 	// either the empty array or the empty object.
 	HasContainerLeaf() (bool, error)
+
+	// Flatten returns a flattened version of the JSON document.
+	Flatten(*[]JSON, bool, int, int, int) (JSON, error)
 }
 
 type jsonTrue struct{}
@@ -255,13 +258,62 @@ type jsonNull struct{}
 var NullJSONValue = jsonNull{}
 
 type jsonNumber apd.Decimal
+
+func AsJsonNumber(j JSON) (jsonNumber, bool) {
+	if dec, ok := j.(jsonNumber); ok {
+		return dec, true
+	}
+	return jsonNumber{}, false
+}
+
+func IsJsonNumber(j JSON) bool {
+	_, ok := j.(jsonNumber)
+	return ok
+}
+
 type jsonString string
 
+func NewJsonString(s string) JSON {
+	return jsonString(s)
+}
+
+func AsJsonString(j JSON) (jsonString, bool) {
+	if str, ok := j.(jsonString); ok {
+		return str, true
+	}
+	return "", false
+}
+
+func IsJsonString(j JSON) bool {
+	_, ok := j.(jsonString)
+	return ok
+}
+
 type jsonArray []JSON
+
+
+func IsJsonArray(j JSON) bool {
+	_, ok := j.(jsonArray)
+	return ok
+}
+
+func AsJsonArray(j JSON) (jsonArray, bool) {
+	if arr, ok := j.(jsonArray); ok {
+		return arr, true
+	}
+	return nil, false
+}
 
 type jsonKeyValuePair struct {
 	k jsonString
 	v JSON
+}
+
+func NewJsonKeyValuePair(k jsonString, v JSON) jsonKeyValuePair {
+	return jsonKeyValuePair{
+		k: k,
+		v: v,
+	}
 }
 
 // ArrayBuilder builds JSON Array by a JSON sequence.
@@ -515,6 +567,18 @@ func (s *pairSorter) unique() {
 // jsonObject represents a JSON object as a sorted-by-key list of key-value
 // pairs, which are unique by key.
 type jsonObject []jsonKeyValuePair
+
+func IsJsonObject(j JSON) bool {
+	_, ok := j.MaybeDecode().(jsonObject)
+	return ok
+}
+
+func AsJsonObject(j JSON) (jsonObject, bool) {
+	if obj, ok := j.MaybeDecode().(jsonObject); ok {
+		return obj, true
+	}
+	return jsonObject{}, false
+}
 
 var emptyJSONObject = jsonObject(nil)
 var emptyJSONArray = jsonArray(nil)
@@ -2814,3 +2878,91 @@ func (j jsonTrue) HasContainerLeaf() (bool, error)   { return false, nil }
 func (j jsonFalse) HasContainerLeaf() (bool, error)  { return false, nil }
 func (j jsonString) HasContainerLeaf() (bool, error) { return false, nil }
 func (j jsonNumber) HasContainerLeaf() (bool, error) { return false, nil }
+
+func (j jsonNull, boundary bool, start int, end int, nestingLevel int) Flatten(res *[]JSON) {
+	if boundary {
+		if nestingLevel >= start && nestingLevel <= end {
+			res.append(j)
+		}
+	} else {
+		res.append(j)
+	}
+}
+
+func (j jsonTrue) Flatten(res *[]JSON, boundary bool, start int, end int, nestingLevel int) {
+	if boundary {
+		if nestingLevel >= start && nestingLevel <= end {
+			res.append(j)
+		}
+	} else {
+		res.append(j)
+	}
+}
+
+func (j jsonFalse) Flatten(res *[]JSON, boundary bool, start int, end int, nestingLevel int) {
+	if boundary {
+		if nestingLevel >= start && nestingLevel <= end {
+			res.append(j)
+		}
+	} else {
+		res.append(j)
+	}
+}
+
+func (j jsonString) Flatten(res *[]JSON, boundary bool, start int, end int, nestingLevel int) {
+	if boundary {
+		if nestingLevel >= start && nestingLevel <= end {
+			res.append(j)
+		}
+	} else {
+		res.append(j)
+	}
+}
+
+func (j jsonNumber) Flatten(res *[]JSON, boundary bool, start int, end int, nestingLevel int) {
+	if boundary {
+		if nestingLevel >= start && nestingLevel <= end {
+			res.append(j)
+		}
+	} else {
+		res.append(j)
+	}
+}
+
+func (j jsonArray) Flatten(res *[]JSON, boundary bool, start int, end int, nestingLevel int) {
+	if boundary {
+		if nestingLevel >= start && nestingLevel <= end {
+			for _, c := range j {
+				res.append(c)
+				c.Flatten(res, boundary, start, end, nestingLevel + 1)
+			}
+		}
+	} else {
+		for _, c := range j {
+			res.append(c)
+			c.Flatten(res)
+		}
+	}
+}
+
+func (j jsonObject) Flatten(res *[]JSON, boundary bool, start int, end int, nestingLevel int) {
+	if boundary {
+		if nestingLevel >= start && nestingLevel <= end {
+			for _, c := range j {
+				res.append(c.v)
+				c.v.Flatten(res, boundary, start, end, nestingLevel + 1)
+			}
+		}
+	} else {
+		for _, c := range j {
+			res.append(c.v)
+			c.v.Flatten(res, boundary, start, end, nestingLevel + 1)
+		}
+	}
+}
+
+func FlattenJson(j JSON, boundary bool, start int, end int) JSON {
+	res := make([]JSON, 0)
+	j.Flatten(&res, boundary, start, end, 0)
+	return jsonArray(res)
+}

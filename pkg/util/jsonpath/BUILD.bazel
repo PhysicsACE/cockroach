@@ -4,18 +4,11 @@ load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 go_library(
     name = "jsonpath",
     srcs = [
-        "config.go",
-        "contains.go",
-        "contains_testers.go",
         "encode.go",
-        "encoded.go",
-        "encoded_format.go",
-        "iterator.go",
-        "jentry.go",
-        "json.go",
-        "parser.go",
-        "random.go",
-        "tables.go",
+        "exec.go",
+        "lexer.go",
+        "nodes.go",
+        "parse.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/util/jsonpath",
     visibility = ["//visibility:public"],
@@ -37,31 +30,7 @@ go_library(
     ],
 )
 
-go_test(
-    name = "jsonpath_test",
-    size = "small",
-    srcs = [
-        "encode_jsonpath_test.go",
-        "jsonpath_test.go",
-    ],
-    data = glob(["testdata/**"]),
-    embed = [":json"],
-    deps = [
-        "//pkg/sql/inverted",
-        "//pkg/sql/pgwire/pgerror",
-        "//pkg/testutils/datapathutils",
-        "//pkg/util/encoding",
-        "//pkg/util/json",
-        "//pkg/util/randutil",
-        "//pkg/util/timeutil",
-        "//pkg/util/unique",
-        "@com_github_cockroachdb_apd_v3//:apd",
-        "@com_github_cockroachdb_redact//:redact",
-        "@com_github_stretchr_testify//require",
-    ],
-)
-
 disallowed_imports_test(
-    "json",
+    "jsonpath",
     ["//pkg/roachpb"],
 )
